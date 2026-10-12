@@ -179,7 +179,7 @@ Lock files use relative paths for portability across machines.
 │   ├── preprocess.lock
 │   └── train.lock
 ├── config.yaml          # Remote configuration
-└── state.db             # LMDB database (hash cache, generations, run cache, remote index)
+└── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)
 ```
 
 ## Key Design Decisions

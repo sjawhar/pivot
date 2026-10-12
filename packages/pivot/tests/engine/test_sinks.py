@@ -106,10 +106,16 @@ def test_format_stage_line_truncates_long_names() -> None:
 
 
 def test_format_skip_group_line_includes_range_and_count() -> None:
-    line = sinks._format_skip_group_line(start_index=1, end_index=3, total=9, count=3)
+    line = sinks._format_skip_group_line(
+        start_index=1,
+        end_index=3,
+        total=9,
+        count=3,
+        category=DisplayCategory.CACHED,
+    )
     rendered = _helper_render_markup(line)
     assert "1–3/9" in rendered, "Should include collapsed range"
-    assert "3 stages not run" in rendered, "Should include skipped count text"
+    assert "3 cached" in rendered, "Should include count with category label"
     assert "○" in rendered, "Should include skip symbol"
 
 
@@ -156,13 +162,67 @@ async def test_static_sink_prints_ran_stage_line() -> None:
     assert "1.2s" in result, "Should include duration"
 
 
-async def test_static_sink_prints_skipped_stages_individually_when_low_count() -> None:
+async def test_static_sink_shows_single_cached_stage_with_name() -> None:
+    """A single cached stage between runs shows its name (not collapsed)."""
     output = StringIO()
     console = Console(file=output, force_terminal=False, no_color=True)
     sink = sinks.StaticConsoleSink(console=console)
 
     events = [
         StageCompleted(
+            type="stage_completed",
+            seq=0,
+            stage="ran_first",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        ),
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="cached_middle",
+            status=StageStatus.CACHED,
+            reason="up-to-date",
+            duration_ms=10.0,
+            index=2,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        ),
+        StageCompleted(
+            type="stage_completed",
+            seq=2,
+            stage="ran_last",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=200.0,
+            index=3,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        ),
+    ]
+    for event in events:
+        await sink.handle(event)
+    await sink.close()
+
+    result = output.getvalue()
+    assert "cached_middle" in result, "Single cached stage should show its name"
+    assert "cached" in result, "Should show cached status"
+
+
+async def test_static_sink_collapses_consecutive_cached_stages() -> None:
+    """Two or more consecutive cached stages collapse into a single line."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    for idx in range(3):
+        event = StageCompleted(
             type="stage_completed",
             seq=idx,
             stage=f"skip_{idx}",
@@ -174,67 +234,182 @@ async def test_static_sink_prints_skipped_stages_individually_when_low_count() -
             run_id="test-run",
             input_hash=None,
         )
-        for idx in range(2)
+        await sink.handle(event)
+    await sink.close()
+
+    result = output.getvalue()
+    assert "3 cached" in result, "Should collapse with count and category"
+    assert "skip_0" not in result, "Individual names should not appear"
+    assert "skip_1" not in result, "Individual names should not appear"
+    assert "skip_2" not in result, "Individual names should not appear"
+
+
+async def test_static_sink_splits_groups_by_category() -> None:
+    """Consecutive skips of different categories form separate collapsed lines."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    # 3 cached then 2 blocked
+    for idx in range(3):
+        await sink.handle(
+            StageCompleted(
+                type="stage_completed",
+                seq=idx,
+                stage=f"cached_{idx}",
+                status=StageStatus.CACHED,
+                reason="up-to-date",
+                duration_ms=10.0,
+                index=idx + 1,
+                total=5,
+                run_id="test-run",
+                input_hash=None,
+            )
+        )
+    for idx in range(2):
+        await sink.handle(
+            StageCompleted(
+                type="stage_completed",
+                seq=3 + idx,
+                stage=f"blocked_{idx}",
+                status=StageStatus.BLOCKED,
+                reason="upstream failed",
+                duration_ms=0.0,
+                index=4 + idx,
+                total=5,
+                run_id="test-run",
+                input_hash=None,
+            )
+        )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "3 cached" in result, "Cached group should collapse separately"
+    assert "2 blocked" in result, "Blocked group should collapse separately"
+
+
+async def test_static_sink_alternating_categories_no_collapse() -> None:
+    """Alternating skip categories (cached, blocked, cached) stay individual — no group of 2+."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=0,
+            stage="stage_0",
+            status=StageStatus.CACHED,
+            reason="",
+            duration_ms=10.0,
+            index=1,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="stage_1",
+            status=StageStatus.BLOCKED,
+            reason="",
+            duration_ms=10.0,
+            index=2,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=2,
+            stage="stage_2",
+            status=StageStatus.CACHED,
+            reason="",
+            duration_ms=10.0,
+            index=3,
+            total=3,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "stage_0" in result, "Each alternating skip should show its name"
+    assert "stage_1" in result, "Each alternating skip should show its name"
+    assert "stage_2" in result, "Each alternating skip should show its name"
+
+
+async def test_static_sink_success_interrupts_cached_groups() -> None:
+    """A success stage between cached runs produces two separate groups/singles."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    events = [
+        StageCompleted(
+            type="stage_completed",
+            seq=0,
+            stage="cached_a",
+            status=StageStatus.CACHED,
+            reason="",
+            duration_ms=10.0,
+            index=1,
+            total=4,
+            run_id="test-run",
+            input_hash=None,
+        ),
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="cached_b",
+            status=StageStatus.CACHED,
+            reason="",
+            duration_ms=10.0,
+            index=2,
+            total=4,
+            run_id="test-run",
+            input_hash=None,
+        ),
+        StageCompleted(
+            type="stage_completed",
+            seq=2,
+            stage="ran_middle",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=500.0,
+            index=3,
+            total=4,
+            run_id="test-run",
+            input_hash=None,
+        ),
+        StageCompleted(
+            type="stage_completed",
+            seq=3,
+            stage="cached_c",
+            status=StageStatus.CACHED,
+            reason="",
+            duration_ms=10.0,
+            index=4,
+            total=4,
+            run_id="test-run",
+            input_hash=None,
+        ),
     ]
     for event in events:
         await sink.handle(event)
     await sink.close()
 
     result = output.getvalue()
-    assert "skip_0" in result, "Should include first skipped stage"
-    assert "skip_1" in result, "Should include second skipped stage"
-    assert "cached" in result, "Should show cached status for up-to-date stages"
-    assert "stages not run" not in result, "Should not collapse low skip counts"
-
-
-async def test_static_sink_collapses_skips_over_threshold() -> None:
-    output = StringIO()
-    console = Console(file=output, force_terminal=False, no_color=True)
-    sink = sinks.StaticConsoleSink(console=console)
-
-    for idx in range(21):
-        event = StageCompleted(
-            type="stage_completed",
-            seq=idx,
-            stage=f"skip_{idx}",
-            status=StageStatus.CACHED,
-            reason="up-to-date",
-            duration_ms=10.0,
-            index=idx + 1,
-            total=21,
-            run_id="test-run",
-            input_hash=None,
-        )
-        await sink.handle(event)
-    await sink.close()
-
-    result = output.getvalue()
-    assert "21 stages not run" in result, "Should collapse skipped stages over threshold"
-
-
-async def test_static_sink_does_not_collapse_skips_at_threshold() -> None:
-    output = StringIO()
-    console = Console(file=output, force_terminal=False, no_color=True)
-    sink = sinks.StaticConsoleSink(console=console)
-
-    for idx in range(20):
-        event = StageCompleted(
-            type="stage_completed",
-            seq=idx,
-            stage=f"skip_{idx}",
-            status=StageStatus.CACHED,
-            reason="up-to-date",
-            duration_ms=10.0,
-            index=idx + 1,
-            total=20,
-            run_id="test-run",
-            input_hash=None,
-        )
-        await sink.handle(event)
-    await sink.close()
-
-    result = output.getvalue()
-    assert "stages not run" not in result, "Should not collapse skips at threshold"
+    assert "2 cached" in result, "First pair should collapse"
+    assert "ran_middle" in result, "Success stage should show normally"
+    assert "cached_c" in result, "Trailing single cached should show its name"
+    assert "cached_a" not in result, "Collapsed pair should not show individual names"
+    assert "cached_b" not in result, "Collapsed pair should not show individual names"
 
 
 async def test_static_sink_ignores_waiting_on_lock_state_changes() -> None:
@@ -593,7 +768,7 @@ async def test_live_sink_collapses_many_skips_in_scrollback() -> None:
     await sink.close()
 
     result = output.getvalue()
-    assert "21 stages not run" in result, "Should collapse skipped stages over threshold"
+    assert "21 cached" in result, "Should collapse consecutive cached stages with category label"
 
 
 async def test_live_sink_prints_all_statuses_on_close() -> None:

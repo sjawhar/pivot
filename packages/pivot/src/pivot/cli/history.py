@@ -24,9 +24,7 @@ def history(ctx: click.Context, limit: int, output_json: bool) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    state_db_path = config.get_state_db_path()
-
-    with state.StateDB(state_db_path) as state_db:
+    with state.StateDB(config.get_state_dir()) as state_db:
         runs = state_db.list_runs(limit=limit)
 
     if output_json:
@@ -76,9 +74,7 @@ def show_cmd(ctx: click.Context, run_id: str | None, output_json: bool) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    state_db_path = config.get_state_db_path()
-
-    with state.StateDB(state_db_path) as state_db:
+    with state.StateDB(config.get_state_dir()) as state_db:
         if run_id:
             run = state_db.read_run(run_id)
             if run is None:

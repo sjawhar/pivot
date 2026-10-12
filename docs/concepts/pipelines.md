@@ -202,7 +202,7 @@ By default, all pipelines share the project-level `.pivot/` directory:
   .pivot/
     cache/             # Content-addressable cache (shared across pipelines)
     stages/            # Per-stage lock files
-    state.db           # LMDB database (generations, hashes)
+    state.lmdb/        # LMDB database (generations, hashes)
     locks/             # Artifact locks for concurrent execution
 ```
 

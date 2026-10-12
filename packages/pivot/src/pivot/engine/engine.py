@@ -948,8 +948,7 @@ class Engine:
         def _get_state_db(stage_state_dir: pathlib.Path) -> state_mod.StateDB:
             """Get or open a StateDB for the given state_dir."""
             if stage_state_dir not in state_dbs:
-                db_path = stage_state_dir / "state.db"
-                state_dbs[stage_state_dir] = state_mod.StateDB(db_path)
+                state_dbs[stage_state_dir] = state_mod.StateDB(stage_state_dir)
             return state_dbs[stage_state_dir]
 
         try:
@@ -1625,12 +1624,13 @@ class Engine:
             return True
 
         def _get_skip_state_db() -> state_mod.StateDB:
-            state_db_path = stage_state_dir / "state.db"
             if skip_state_dbs is not None:
-                if state_db_path not in skip_state_dbs:
-                    skip_state_dbs[state_db_path] = state_mod.StateDB(state_db_path, readonly=True)
-                return skip_state_dbs[state_db_path]
-            return state_mod.StateDB(state_db_path, readonly=True)
+                if stage_state_dir not in skip_state_dbs:
+                    skip_state_dbs[stage_state_dir] = state_mod.StateDB(
+                        stage_state_dir, readonly=True
+                    )
+                return skip_state_dbs[stage_state_dir]
+            return state_mod.StateDB(stage_state_dir, readonly=True)
 
         def _try_generation_skip() -> tuple[bool, str | None]:
             state_db = _get_skip_state_db()
@@ -2040,7 +2040,7 @@ class Engine:
             stages=stages_records,
         )
 
-        with state_mod.StateDB(config.get_state_db_path()) as state_db:
+        with state_mod.StateDB(config.get_state_dir()) as state_db:
             state_db.write_run(manifest)
             state_db.prune_runs(retention)
 

@@ -22,7 +22,7 @@ def _helper_hold_write_lock(db_path: str, ready: Event, hold_seconds: float) -> 
 
 
 def test_write_succeeds_within_timeout(tmp_path: pathlib.Path) -> None:
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -32,7 +32,7 @@ def test_write_succeeds_within_timeout(tmp_path: pathlib.Path) -> None:
 
 
 def test_write_timeout_raises_error(tmp_path: pathlib.Path) -> None:
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -59,7 +59,7 @@ def test_write_timeout_raises_error(tmp_path: pathlib.Path) -> None:
 
 
 def test_timeout_is_configurable(tmp_path: pathlib.Path) -> None:
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()

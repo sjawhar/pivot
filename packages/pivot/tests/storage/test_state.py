@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 def test_state_cache_hit(tmp_path: pathlib.Path) -> None:
     """Unchanged mtime/size/inode returns cached hash."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -31,7 +31,7 @@ def test_state_cache_hit(tmp_path: pathlib.Path) -> None:
 
 def test_state_cache_miss_mtime(tmp_path: pathlib.Path) -> None:
     """Changed mtime triggers cache miss."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     old_stat = test_file.stat()
@@ -50,7 +50,7 @@ def test_state_cache_miss_mtime(tmp_path: pathlib.Path) -> None:
 
 def test_state_cache_miss_size(tmp_path: pathlib.Path) -> None:
     """Changed size triggers cache miss."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("short")
     old_stat = test_file.stat()
@@ -69,7 +69,7 @@ def test_state_cache_miss_size(tmp_path: pathlib.Path) -> None:
 
 def test_state_cache_miss_inode(tmp_path: pathlib.Path) -> None:
     """Changed inode triggers cache miss."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     old_stat = test_file.stat()
@@ -96,7 +96,7 @@ def test_state_cache_miss_inode(tmp_path: pathlib.Path) -> None:
 
 def test_state_save_many(tmp_path: pathlib.Path) -> None:
     """Batch save works correctly."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     files = list[tuple[pathlib.Path, os.stat_result]]()
     entries = list[tuple[pathlib.Path, os.stat_result, str]]()
 
@@ -117,7 +117,7 @@ def test_state_save_many(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_persistence(tmp_path: pathlib.Path) -> None:
     """State survives process restart (new instance)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -133,7 +133,7 @@ def test_state_db_persistence(tmp_path: pathlib.Path) -> None:
 
 def test_state_get_missing_path(tmp_path: pathlib.Path) -> None:
     """Getting uncached path returns None."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -146,7 +146,7 @@ def test_state_get_missing_path(tmp_path: pathlib.Path) -> None:
 
 def test_state_update_existing(tmp_path: pathlib.Path) -> None:
     """Saving same path updates the cached hash."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -161,22 +161,21 @@ def test_state_update_existing(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_creates_parent_dirs(tmp_path: pathlib.Path) -> None:
     """StateDB creates parent directories if needed."""
-    db_path = tmp_path / "nested" / "deep" / "state.db"
+    state_dir = tmp_path / "nested" / "deep"
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
 
-    with state.StateDB(db_path) as db:
+    with state.StateDB(state_dir) as db:
         db.save(test_file, file_stat, "hash")
 
-    # LMDB creates a directory (state.lmdb/) not a file (state.db)
-    lmdb_path = db_path.parent / "state.lmdb"
+    lmdb_path = state_dir / "state.lmdb"
     assert lmdb_path.is_dir()
 
 
 def test_state_close(tmp_path: pathlib.Path) -> None:
     """StateDB can be closed and reopened."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -193,7 +192,7 @@ def test_state_close(tmp_path: pathlib.Path) -> None:
 
 def test_state_context_manager(tmp_path: pathlib.Path) -> None:
     """StateDB works as context manager."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -209,7 +208,7 @@ def test_state_context_manager(tmp_path: pathlib.Path) -> None:
 
 def test_state_absolute_paths(tmp_path: pathlib.Path) -> None:
     """Paths are stored as absolute for consistency."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -223,7 +222,7 @@ def test_state_absolute_paths(tmp_path: pathlib.Path) -> None:
 
 def test_state_get_many(tmp_path: pathlib.Path) -> None:
     """Batch get returns correct hashes for multiple files."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     files = list[tuple[pathlib.Path, os.stat_result]]()
     entries = list[tuple[pathlib.Path, os.stat_result, str]]()
 
@@ -244,7 +243,7 @@ def test_state_get_many(tmp_path: pathlib.Path) -> None:
 
 def test_state_get_many_mixed(tmp_path: pathlib.Path) -> None:
     """Batch get handles mix of cached and uncached files."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     # Create cached file
     cached = tmp_path / "cached.txt"
@@ -266,7 +265,7 @@ def test_state_get_many_mixed(tmp_path: pathlib.Path) -> None:
 
 def test_state_get_many_empty(tmp_path: pathlib.Path) -> None:
     """Batch get with empty list returns empty dict."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         results = db.get_many([])
@@ -276,7 +275,7 @@ def test_state_get_many_empty(tmp_path: pathlib.Path) -> None:
 
 def test_state_path_too_long_error(tmp_path: pathlib.Path) -> None:
     """PathTooLongError raised for paths exceeding LMDB key limit."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     # Create a deeply nested path that exceeds 511 bytes when encoded
     # Each segment is 50 chars, need ~10 segments to exceed limit
     nested = tmp_path
@@ -296,7 +295,7 @@ def test_state_path_too_long_error(tmp_path: pathlib.Path) -> None:
 
 def test_state_path_too_long_error_save_many(tmp_path: pathlib.Path) -> None:
     """PathTooLongError raised in save_many for paths exceeding limit."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     nested = tmp_path
     for i in range(12):
         nested = nested / ("e" * 50 + str(i))
@@ -311,7 +310,7 @@ def test_state_path_too_long_error_save_many(tmp_path: pathlib.Path) -> None:
 
 def test_state_raises_after_close(tmp_path: pathlib.Path) -> None:
     """Operations on closed StateDB raise RuntimeError."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -330,7 +329,7 @@ def test_state_raises_after_close(tmp_path: pathlib.Path) -> None:
 
 def test_generation_get_nonexistent(tmp_path: pathlib.Path) -> None:
     """Getting generation for untracked identity returns None."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     identity = "stage:output"
 
     with state.StateDB(db_path) as db:
@@ -341,7 +340,7 @@ def test_generation_get_nonexistent(tmp_path: pathlib.Path) -> None:
 
 def test_generation_increment_creates_new(tmp_path: pathlib.Path) -> None:
     """Incrementing untracked identity creates it with generation 1."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     identity = "stage:output"
 
     with state.StateDB(db_path) as db:
@@ -352,7 +351,7 @@ def test_generation_increment_creates_new(tmp_path: pathlib.Path) -> None:
 
 def test_generation_increment_existing(tmp_path: pathlib.Path) -> None:
     """Incrementing tracked identity increases generation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     identity = "stage:output"
 
     with state.StateDB(db_path) as db:
@@ -365,7 +364,7 @@ def test_generation_increment_existing(tmp_path: pathlib.Path) -> None:
 
 def test_generation_persistence(tmp_path: pathlib.Path) -> None:
     """Generations persist across DB instances."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     identity = "stage:output"
 
     with state.StateDB(db_path) as db:
@@ -380,7 +379,7 @@ def test_generation_persistence(tmp_path: pathlib.Path) -> None:
 
 def test_generation_get_many(tmp_path: pathlib.Path) -> None:
     """Batch query returns generations for multiple identities."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     identities = [f"stage:out_{i}" for i in range(3)]
 
     with state.StateDB(db_path) as db:
@@ -398,7 +397,7 @@ def test_generation_get_many(tmp_path: pathlib.Path) -> None:
 
 def test_generation_get_many_empty(tmp_path: pathlib.Path) -> None:
     """Batch query with empty list returns empty dict."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         results = db.get_many_generations([])
@@ -408,7 +407,7 @@ def test_generation_get_many_empty(tmp_path: pathlib.Path) -> None:
 
 def test_dep_generations_get_nonexistent(tmp_path: pathlib.Path) -> None:
     """Getting dep generations for unknown stage returns None."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         result = db.get_dep_generations("unknown_stage")
@@ -418,7 +417,7 @@ def test_dep_generations_get_nonexistent(tmp_path: pathlib.Path) -> None:
 
 def test_dep_generations_record_and_get(tmp_path: pathlib.Path) -> None:
     """Record and retrieve dependency generations."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     deps = {"upstream:out1": 5, "upstream:out2": 3}
 
     with state.StateDB(db_path) as db:
@@ -430,7 +429,7 @@ def test_dep_generations_record_and_get(tmp_path: pathlib.Path) -> None:
 
 def test_dep_generations_update_replaces(tmp_path: pathlib.Path) -> None:
     """Recording dep generations replaces previous values."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     old_deps = {"upstream:out1": 1, "upstream:out2": 2}
     new_deps = {"upstream:out1": 5, "upstream:out3": 1}
 
@@ -444,7 +443,7 @@ def test_dep_generations_update_replaces(tmp_path: pathlib.Path) -> None:
 
 def test_dep_generations_multiple_stages(tmp_path: pathlib.Path) -> None:
     """Different stages have independent dep generations."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     stage1_deps = {"upstream:out1": 1}
     stage2_deps = {"upstream:out2": 2, "upstream:out3": 3}
 
@@ -461,7 +460,7 @@ def test_dep_generations_multiple_stages(tmp_path: pathlib.Path) -> None:
 
 def test_dep_generations_persistence(tmp_path: pathlib.Path) -> None:
     """Dep generations persist across DB instances."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     deps = {"upstream:out": 42}
 
     with state.StateDB(db_path) as db:
@@ -480,7 +479,7 @@ def test_dep_generations_persistence(tmp_path: pathlib.Path) -> None:
 
 def test_generation_identity_is_keyed_by_producer_and_key(tmp_path: pathlib.Path) -> None:
     """Generation tracking is keyed by artifact identity, not filesystem paths."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         gen1 = db.increment_generation("stage:out1")
@@ -501,7 +500,7 @@ def test_generation_identity_is_keyed_by_producer_and_key(tmp_path: pathlib.Path
 
 def test_remote_hash_exists_false(tmp_path: pathlib.Path) -> None:
     """Unknown hash returns False."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         result = db.remote_hash_exists("origin", "abc123def456")
@@ -511,7 +510,7 @@ def test_remote_hash_exists_false(tmp_path: pathlib.Path) -> None:
 
 def test_remote_hash_exists_true(tmp_path: pathlib.Path) -> None:
     """Added hash returns True."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["abc123def456"])
@@ -522,7 +521,7 @@ def test_remote_hash_exists_true(tmp_path: pathlib.Path) -> None:
 
 def test_remote_hashes_add_multiple(tmp_path: pathlib.Path) -> None:
     """Multiple hashes can be added at once."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     hashes = ["hash1", "hash2", "hash3"]
 
     with state.StateDB(db_path) as db:
@@ -534,7 +533,7 @@ def test_remote_hashes_add_multiple(tmp_path: pathlib.Path) -> None:
 
 def test_remote_hashes_intersection(tmp_path: pathlib.Path) -> None:
     """Intersection returns only hashes known to exist on remote."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     known = {"hash1", "hash2", "hash3"}
     query = {"hash1", "hash3", "hash4", "hash5"}
 
@@ -547,7 +546,7 @@ def test_remote_hashes_intersection(tmp_path: pathlib.Path) -> None:
 
 def test_remote_hashes_intersection_empty_query(tmp_path: pathlib.Path) -> None:
     """Empty query returns empty set."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["hash1", "hash2"])
@@ -558,7 +557,7 @@ def test_remote_hashes_intersection_empty_query(tmp_path: pathlib.Path) -> None:
 
 def test_remote_hashes_intersection_no_matches(tmp_path: pathlib.Path) -> None:
     """No matches returns empty set."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["hash1", "hash2"])
@@ -569,7 +568,7 @@ def test_remote_hashes_intersection_no_matches(tmp_path: pathlib.Path) -> None:
 
 def test_remote_hashes_remove(tmp_path: pathlib.Path) -> None:
     """Removed hashes no longer exist."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["hash1", "hash2", "hash3"])
@@ -582,7 +581,7 @@ def test_remote_hashes_remove(tmp_path: pathlib.Path) -> None:
 
 def test_remote_index_clear(tmp_path: pathlib.Path) -> None:
     """Clear removes all hashes for a remote."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["hash1", "hash2"])
@@ -598,7 +597,7 @@ def test_remote_index_clear(tmp_path: pathlib.Path) -> None:
 
 def test_remote_hashes_different_remotes_independent(tmp_path: pathlib.Path) -> None:
     """Different remotes have independent hash indexes."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["hash1"])
@@ -612,7 +611,7 @@ def test_remote_hashes_different_remotes_independent(tmp_path: pathlib.Path) -> 
 
 def test_remote_hashes_persistence(tmp_path: pathlib.Path) -> None:
     """Remote hashes persist across DB instances."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["persistent_hash"])
@@ -623,7 +622,7 @@ def test_remote_hashes_persistence(tmp_path: pathlib.Path) -> None:
 
 def test_remote_get_url_returns_none_for_unknown(tmp_path: pathlib.Path) -> None:
     """remote_get_url returns None for untracked remote."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         result = db.remote_get_url("unknown")
@@ -633,7 +632,7 @@ def test_remote_get_url_returns_none_for_unknown(tmp_path: pathlib.Path) -> None
 
 def test_remote_set_url_and_get_url_roundtrip(tmp_path: pathlib.Path) -> None:
     """remote_set_url stores URL and remote_get_url retrieves it."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_url = "s3://my-bucket/prefix"
 
     with state.StateDB(db_path) as db:
@@ -645,7 +644,7 @@ def test_remote_set_url_and_get_url_roundtrip(tmp_path: pathlib.Path) -> None:
 
 def test_remote_set_url_overwrites_existing(tmp_path: pathlib.Path) -> None:
     """remote_set_url overwrites previously stored URL."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_set_url("origin", "s3://old-bucket")
@@ -657,7 +656,7 @@ def test_remote_set_url_overwrites_existing(tmp_path: pathlib.Path) -> None:
 
 def test_remote_url_persistence(tmp_path: pathlib.Path) -> None:
     """Remote URLs persist across DB instances."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_url = "s3://persistent-bucket/path"
 
     with state.StateDB(db_path) as db:
@@ -669,7 +668,7 @@ def test_remote_url_persistence(tmp_path: pathlib.Path) -> None:
 
 def test_remote_index_clear_also_deletes_url(tmp_path: pathlib.Path) -> None:
     """remote_index_clear also deletes the remote URL entry."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_set_url("origin", "s3://bucket")
@@ -682,7 +681,7 @@ def test_remote_index_clear_also_deletes_url(tmp_path: pathlib.Path) -> None:
 
 def test_remote_urls_different_remotes_independent(tmp_path: pathlib.Path) -> None:
     """Different remotes have independent URL storage."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_set_url("origin", "s3://origin-bucket")
@@ -699,7 +698,7 @@ def test_remote_urls_different_remotes_independent(tmp_path: pathlib.Path) -> No
 
 def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
     """Readonly mode allows all read operations."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -721,7 +720,7 @@ def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks save operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -738,7 +737,7 @@ def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_save_many(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks save_many operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -755,7 +754,7 @@ def test_readonly_blocks_save_many(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_increment_generation(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks increment_generation operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Just create
@@ -769,7 +768,7 @@ def test_readonly_blocks_increment_generation(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_record_dep_generations(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks record_dep_generations operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Just create
@@ -783,7 +782,7 @@ def test_readonly_blocks_record_dep_generations(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_remote_hashes_add(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks remote_hashes_add operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Just create
@@ -797,7 +796,7 @@ def test_readonly_blocks_remote_hashes_add(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_remote_hashes_remove(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks remote_hashes_remove operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["hash1"])
@@ -811,7 +810,7 @@ def test_readonly_blocks_remote_hashes_remove(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_remote_index_clear(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks remote_index_clear operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.remote_hashes_add("origin", ["hash1"])
@@ -825,7 +824,7 @@ def test_readonly_blocks_remote_index_clear(tmp_path: pathlib.Path) -> None:
 
 def test_readonly_blocks_remote_set_url(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks remote_set_url operation."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Just create
@@ -844,7 +843,7 @@ def test_readonly_blocks_remote_set_url(tmp_path: pathlib.Path) -> None:
 
 def test_apply_deferred_writes_dep_generations(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes records dependency generations."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     deferred: DeferredWrites = {"dep_generations": {"upstream:out1": 5, "upstream:out2": 3}}
 
     with state.StateDB(db_path) as db:
@@ -856,7 +855,7 @@ def test_apply_deferred_writes_dep_generations(tmp_path: pathlib.Path) -> None:
 
 def test_apply_deferred_writes_output_generations(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes increments output generations."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     output1 = "stage:output1"
     output2 = "stage:output2"
     deferred: DeferredWrites = {"increment_outputs": True}
@@ -877,7 +876,7 @@ def test_apply_deferred_writes_skips_output_increment_when_flag_absent(
     tmp_path: pathlib.Path,
 ) -> None:
     """Output generations should NOT be incremented when increment_outputs is absent."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     output1 = "stage:output1"
     deferred: DeferredWrites = {"dep_generations": {"upstream:out": 5}}
 
@@ -889,7 +888,7 @@ def test_apply_deferred_writes_skips_output_increment_when_flag_absent(
 
 def test_apply_deferred_writes_file_hash_entries(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes stores file hash entries."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     file_path = tmp_path / "input.txt"
     file_path.write_text("data")
     file_stat = file_path.stat()
@@ -915,7 +914,7 @@ def test_apply_deferred_writes_file_hash_entries(tmp_path: pathlib.Path) -> None
 
 def test_apply_deferred_writes_run_cache(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes writes run cache entry."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     run_cache_entry = run_history.RunCacheEntry(
         run_id="test_run_123",
         output_hashes=[run_history.OutputHashEntry(path="/output.csv", hash="abc123")],
@@ -937,7 +936,7 @@ def test_apply_deferred_writes_run_cache(tmp_path: pathlib.Path) -> None:
 
 def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes handles all fields atomically."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     output_path = "stage:output"
     input_path = tmp_path / "input.csv"
     input_path.write_text("data")
@@ -977,7 +976,7 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
 
 def test_apply_deferred_writes_empty(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes handles empty deferred dict."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     deferred: DeferredWrites = {}
 
     with state.StateDB(db_path) as db:
@@ -987,7 +986,7 @@ def test_apply_deferred_writes_empty(tmp_path: pathlib.Path) -> None:
 
 def test_apply_deferred_writes_readonly_blocked(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes blocked in readonly mode."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Create database
@@ -1003,7 +1002,7 @@ def test_apply_deferred_writes_readonly_blocked(tmp_path: pathlib.Path) -> None:
 
 def test_apply_deferred_writes_path_too_long_dep(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes raises PathTooLongError for long dep paths."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     long_path = "/" + "d" * 600  # Exceeds 511 byte limit
     deferred: DeferredWrites = {"dep_generations": {long_path: 1}}
 
@@ -1013,7 +1012,7 @@ def test_apply_deferred_writes_path_too_long_dep(tmp_path: pathlib.Path) -> None
 
 def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> None:
     """apply_deferred_writes raises PathTooLongError for long output paths."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     long_output = "stage:" + "o" * 600
     deferred: DeferredWrites = {"increment_outputs": True}
 
@@ -1032,7 +1031,7 @@ _TEST_SCHEMA_VERSION = 1
 
 def test_ast_hash_cache_roundtrip(tmp_path: pathlib.Path) -> None:
     """Save and retrieve AST hash."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1064,7 +1063,7 @@ def test_ast_hash_cache_roundtrip(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_miss_on_mtime_change(tmp_path: pathlib.Path) -> None:
     """Different mtime returns None (automatic invalidation)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1097,7 +1096,7 @@ def test_ast_hash_cache_miss_on_mtime_change(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_miss_on_size_change(tmp_path: pathlib.Path) -> None:
     """Different size returns None (automatic invalidation)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1130,7 +1129,7 @@ def test_ast_hash_cache_miss_on_size_change(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_miss_on_inode_change(tmp_path: pathlib.Path) -> None:
     """Different inode returns None (file replaced, even with same mtime)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1163,7 +1162,7 @@ def test_ast_hash_cache_miss_on_inode_change(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_miss_on_qualname_change(tmp_path: pathlib.Path) -> None:
     """Different qualname returns None (different function)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1196,7 +1195,7 @@ def test_ast_hash_cache_miss_on_qualname_change(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_miss_on_py_version_change(tmp_path: pathlib.Path) -> None:
     """Different Python version returns None (automatic invalidation)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1223,7 +1222,7 @@ def test_ast_hash_cache_miss_on_py_version_change(tmp_path: pathlib.Path) -> Non
 
 def test_ast_hash_cache_miss_on_schema_version_change(tmp_path: pathlib.Path) -> None:
     """Different schema version returns None (automatic invalidation)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1250,7 +1249,7 @@ def test_ast_hash_cache_miss_on_schema_version_change(tmp_path: pathlib.Path) ->
 
 def test_ast_hash_cache_persistence(tmp_path: pathlib.Path) -> None:
     """AST hashes persist across DB instances."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1285,7 +1284,7 @@ def test_ast_hash_cache_persistence(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_multiple_functions(tmp_path: pathlib.Path) -> None:
     """Multiple functions in same file have independent hashes."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1363,7 +1362,7 @@ def test_ast_hash_cache_multiple_functions(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_update_existing(tmp_path: pathlib.Path) -> None:
     """Saving same key updates the cached hash."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1409,7 +1408,7 @@ def test_ast_hash_cache_update_existing(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_many(tmp_path: pathlib.Path) -> None:
     """Batch save works correctly."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     entries: list[tuple[str, int, int, int, str, str, int, str]] = [
         ("src/a.py", 1000, 100, 1, "func_a", _TEST_PY_VERSION, _TEST_SCHEMA_VERSION, "hash_a"),
         ("src/b.py", 2000, 200, 2, "func_b", _TEST_PY_VERSION, _TEST_SCHEMA_VERSION, "hash_b"),
@@ -1441,7 +1440,7 @@ def test_ast_hash_cache_many(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_many_empty(tmp_path: pathlib.Path) -> None:
     """Batch save with empty list doesn't error."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many([])  # Should not raise
@@ -1449,7 +1448,7 @@ def test_ast_hash_cache_many_empty(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_skips_long_keys(tmp_path: pathlib.Path) -> None:
     """Long keys are silently skipped (no error)."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     # Create a path long enough to exceed 511 bytes with prefix
     long_path = "a" * 600
 
@@ -1468,7 +1467,7 @@ def test_ast_hash_cache_skips_long_keys(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_skips_empty_rel_path(tmp_path: pathlib.Path) -> None:
     """Empty rel_path is silently skipped."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         # Should not raise - silently skips invalid entries
@@ -1483,7 +1482,7 @@ def test_ast_hash_cache_skips_empty_rel_path(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_skips_empty_qualname(tmp_path: pathlib.Path) -> None:
     """Empty qualname is silently skipped."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         # Should not raise - silently skips invalid entries
@@ -1500,7 +1499,7 @@ def test_ast_hash_cache_skips_empty_qualname(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_skips_null_byte_in_path(tmp_path: pathlib.Path) -> None:
     """Null byte in rel_path is silently skipped."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         # Should not raise - silently skips invalid entries
@@ -1528,7 +1527,7 @@ def test_ast_hash_cache_skips_null_byte_in_path(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_skips_null_byte_in_qualname(tmp_path: pathlib.Path) -> None:
     """Null byte in qualname is silently skipped."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         # Should not raise - silently skips invalid entries
@@ -1556,7 +1555,7 @@ def test_ast_hash_cache_skips_null_byte_in_qualname(tmp_path: pathlib.Path) -> N
 
 def test_ast_hash_cache_readonly_blocked(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks save operations."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Create database
@@ -1583,7 +1582,7 @@ def test_ast_hash_cache_readonly_blocked(tmp_path: pathlib.Path) -> None:
 
 def test_ast_hash_cache_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
     """Readonly mode allows reading AST hashes."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1617,7 +1616,7 @@ def test_ast_hash_cache_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
 
 def test_clear_ast_hashes_deletes_all_entries(tmp_path: pathlib.Path) -> None:
     """clear_ast_hashes removes all fp: prefixed entries."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         # Add multiple AST hash entries
@@ -1704,7 +1703,7 @@ def test_clear_ast_hashes_deletes_all_entries(tmp_path: pathlib.Path) -> None:
 
 def test_clear_ast_hashes_returns_zero_when_empty(tmp_path: pathlib.Path) -> None:
     """clear_ast_hashes returns 0 when no entries exist."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         deleted = db.clear_ast_hashes()
@@ -1714,7 +1713,7 @@ def test_clear_ast_hashes_returns_zero_when_empty(tmp_path: pathlib.Path) -> Non
 
 def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None:
     """clear_ast_hashes only deletes fp: prefixed entries, not other data."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     file_stat = test_file.stat()
@@ -1741,7 +1740,7 @@ def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None
 
 def test_clear_ast_hashes_readonly_blocked(tmp_path: pathlib.Path) -> None:
     """clear_ast_hashes blocked in readonly mode."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.save_ast_hash_many(
@@ -1762,7 +1761,7 @@ def test_clear_ast_hashes_readonly_blocked(tmp_path: pathlib.Path) -> None:
 
 def test_stage_manifest_roundtrip(tmp_path: pathlib.Path) -> None:
     """Save and retrieve a stage manifest."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     key = "sm:my_stage\x003.13\x001"
     manifest = {"self:train": "aabb", "func:helper": "ccdd"}
     sources = {"src/train.py": [1000, 200, 555], "src/helper.py": [2000, 300, 666]}
@@ -1778,7 +1777,7 @@ def test_stage_manifest_roundtrip(tmp_path: pathlib.Path) -> None:
 
 def test_stage_manifest_not_found(tmp_path: pathlib.Path) -> None:
     """Returns None for unknown key."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     with state.StateDB(db_path) as db:
         result = db.get_raw(b"sm:nonexistent\x003.13\x001")
     assert result is None
@@ -1786,7 +1785,7 @@ def test_stage_manifest_not_found(tmp_path: pathlib.Path) -> None:
 
 def test_put_raw_readonly_blocked(tmp_path: pathlib.Path) -> None:
     """put_raw blocked in readonly mode."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Create database
@@ -1800,7 +1799,7 @@ def test_put_raw_readonly_blocked(tmp_path: pathlib.Path) -> None:
 
 def test_put_raw_many_readonly_blocked(tmp_path: pathlib.Path) -> None:
     """put_raw_many blocked in readonly mode."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         pass  # Create database
@@ -1814,7 +1813,7 @@ def test_put_raw_many_readonly_blocked(tmp_path: pathlib.Path) -> None:
 
 def test_put_raw_key_too_long(tmp_path: pathlib.Path) -> None:
     """put_raw raises PathTooLongError for oversized keys."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     long_key = b"k" * 512  # Exceeds 511 byte limit
 
     with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
@@ -1823,7 +1822,7 @@ def test_put_raw_key_too_long(tmp_path: pathlib.Path) -> None:
 
 def test_put_raw_many_skips_oversized_keys(tmp_path: pathlib.Path) -> None:
     """put_raw_many silently skips entries with oversized keys."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     long_key = b"k" * 512  # Exceeds 511 byte limit
     normal_key = b"sm:normal\x003.13\x001"
 
@@ -1842,7 +1841,7 @@ def test_put_raw_many_skips_oversized_keys(tmp_path: pathlib.Path) -> None:
 
 def test_put_raw_many_empty(tmp_path: pathlib.Path) -> None:
     """put_raw_many with empty list does not error."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         db.put_raw_many([])  # Should not raise
@@ -1850,7 +1849,7 @@ def test_put_raw_many_empty(tmp_path: pathlib.Path) -> None:
 
 def test_put_raw_many_persistence(tmp_path: pathlib.Path) -> None:
     """put_raw_many entries persist across DB instances."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     entries = [
         (b"sm:stage_a\x003.13\x001", b'{"m":{"self:a":"hash_a"},"s":{}}'),
         (b"sm:stage_b\x003.13\x001", b'{"m":{"self:b":"hash_b"},"s":{}}'),
@@ -1866,7 +1865,7 @@ def test_put_raw_many_persistence(tmp_path: pathlib.Path) -> None:
 
 def test_get_raw_after_close_raises(tmp_path: pathlib.Path) -> None:
     """get_raw on closed StateDB raises RuntimeError."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     db = state.StateDB(db_path)
     db.close()
@@ -1877,7 +1876,7 @@ def test_get_raw_after_close_raises(tmp_path: pathlib.Path) -> None:
 
 def test_put_raw_overwrites_existing(tmp_path: pathlib.Path) -> None:
     """put_raw with same key overwrites the previous value."""
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     key = b"sm:overwrite_test\x003.13\x001"
 
     with state.StateDB(db_path) as db:
@@ -1894,7 +1893,7 @@ def test_apply_deferred_writes_skips_output_increment_when_flag_false(
     This covers the case where the worker explicitly sets increment_outputs=False
     (as opposed to the key being absent entirely). Both should skip incrementing.
     """
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     output1 = "stage:output1"
     deferred: DeferredWrites = {"increment_outputs": False, "dep_generations": {"upstream:out": 5}}
 
@@ -1914,7 +1913,7 @@ def test_apply_deferred_writes_empty_output_paths_with_flag_true(
     A stage with no declared outputs but increment_outputs=True should
     simply be a no-op for output generation incrementing.
     """
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
     deferred: DeferredWrites = {"increment_outputs": True}
 
     with state.StateDB(db_path) as db:

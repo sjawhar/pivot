@@ -38,20 +38,20 @@ class StoreSpec(TypedDict):
 
 class CacheStore:
     _cache_dir: pathlib.Path
-    _state_db_path: pathlib.Path | None
+    _state_dir: pathlib.Path | None
     _ref_dir: pathlib.Path
 
-    def __init__(self, cache_dir: pathlib.Path, state_db_path: pathlib.Path | None) -> None:
+    def __init__(self, cache_dir: pathlib.Path, state_dir: pathlib.Path | None) -> None:
         self._cache_dir = cache_dir
-        self._state_db_path = state_db_path
+        self._state_dir = state_dir
         self._ref_dir = cache_dir / "refs"
 
     @contextlib.contextmanager
     def _state_db(self) -> Generator[state_mod.StateDB | None]:
-        if self._state_db_path is None:
+        if self._state_dir is None:
             yield None
             return
-        with state_mod.StateDB(self._state_db_path) as db:
+        with state_mod.StateDB(self._state_dir) as db:
             yield db
 
     def _ref_path(self, ref: types.ArtifactRef) -> pathlib.Path:
@@ -285,11 +285,9 @@ class WorkspaceStore:
 def store_from_spec(spec: StoreSpec) -> Store:
     kind = spec["kind"]
     if kind == "cache":
-        project_root = pathlib.Path(spec["project_root"])
-        state_db_path = project_root / ".pivot" / "cache-state"
         return CacheStore(
             cache_dir=pathlib.Path(spec["cache_dir"]),
-            state_db_path=state_db_path,
+            state_dir=pathlib.Path(spec["project_root"]) / ".pivot",
         )
     if kind == "workspace":
         cache_dir_str = spec.get("cache_dir")

@@ -84,6 +84,11 @@ def _find_tracked_hash(
     return None  # Path not found in manifest
 
 
+def _state_db_exists(state_dir: pathlib.Path) -> bool:
+    """Return True when the LMDB directory already exists."""
+    return (state_dir / "state.lmdb").exists()
+
+
 def get_stage_explanation(
     stage_name: str,
     fingerprint: dict[str, str],
@@ -138,10 +143,11 @@ def get_stage_explanation(
             upstream_stale=[],
         )
 
-    # Check generation tracking first (O(1) skip detection)
-    state_db_path = state_dir / "state.db"
-    if state_db_path.exists():
-        with state.StateDB(state_db_path, readonly=True) as state_db:
+    # Check generation tracking first (O(1) skip detection) when StateDB exists.
+    # explain/status should not create state.lmdb as a side effect.
+    # Use verify_files=False since status predicts run behavior after restoration.
+    if _state_db_exists(state_dir):
+        with state.StateDB(state_dir, readonly=True) as state_db:
             if not force and worker.can_skip_via_generation(
                 stage_name=stage_name,
                 fingerprint=fingerprint,

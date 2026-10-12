@@ -30,7 +30,7 @@ def _helper_ref(
 def test_cache_store_round_trip(tmp_path: pathlib.Path) -> None:
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / ".pivot"
-    cache_store = store.CacheStore(cache_dir=cache_dir, state_db_path=state_dir)
+    cache_store = store.CacheStore(cache_dir=cache_dir, state_dir=state_dir)
 
     ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
     output_path = cache_store.prepare_output(ref)
@@ -45,7 +45,7 @@ def test_cache_store_round_trip(tmp_path: pathlib.Path) -> None:
 
 def test_cache_store_prepare_output_commit_pattern(tmp_path: pathlib.Path) -> None:
     cache_dir = tmp_path / "cache"
-    cache_store = store.CacheStore(cache_dir=cache_dir, state_db_path=None)
+    cache_store = store.CacheStore(cache_dir=cache_dir, state_dir=None)
 
     ref = _helper_ref("stage", "output", types.ArtifactTag.DATA, loaders.Text())
     output_path = cache_store.prepare_output(ref)
@@ -58,7 +58,7 @@ def test_cache_store_prepare_output_commit_pattern(tmp_path: pathlib.Path) -> No
 
 def test_cache_store_pickle_round_trip(tmp_path: pathlib.Path) -> None:
     cache_dir = tmp_path / "cache"
-    cache_store = store.CacheStore(cache_dir=cache_dir, state_db_path=None)
+    cache_store = store.CacheStore(cache_dir=cache_dir, state_dir=None)
     ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
     output_path = cache_store.prepare_output(ref)
     output_path.write_text("pickle cache")
@@ -70,7 +70,7 @@ def test_cache_store_pickle_round_trip(tmp_path: pathlib.Path) -> None:
 
 def test_cache_store_hash_artifact_types(tmp_path: pathlib.Path) -> None:
     cache_dir = tmp_path / "cache"
-    cache_store = store.CacheStore(cache_dir=cache_dir, state_db_path=None)
+    cache_store = store.CacheStore(cache_dir=cache_dir, state_dir=None)
 
     file_ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
     file_path = cache_store.prepare_output(file_ref)

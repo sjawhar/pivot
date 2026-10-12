@@ -129,7 +129,7 @@ def _apply_deferred_writes(
 
     out_paths = [identity_key(out.identity) for out in stage_info["outs"]]
 
-    with state.StateDB(state_dir / "state.db") as state_db:
+    with state.StateDB(state_dir) as state_db:
         state_db.apply_deferred_writes(stage_name, out_paths, deferred)
 
 
@@ -482,7 +482,7 @@ def test_deferred_file_hash_writeback(
     _apply_deferred_writes("test_stage", stage_info, result)
 
     input_path = tmp_path / "input.txt"
-    with state.StateDB(stage_info["state_dir"] / "state.db", readonly=True) as state_db:
+    with state.StateDB(stage_info["state_dir"], readonly=True) as state_db:
         stat = input_path.stat()
         cached = state_db.get_many([(input_path, stat)])
         assert cached.get(input_path) is not None, (

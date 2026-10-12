@@ -25,7 +25,7 @@ Add to your `.gitignore`:
 
 ```
 .pivot/cache/
-.pivot/state.db/
+.pivot/state.lmdb/
 ```
 
 Commit the lock files — they track what ran and what outputs were produced:

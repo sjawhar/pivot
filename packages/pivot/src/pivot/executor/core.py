@@ -406,7 +406,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     missing = list[str]()
     cache_dir = config.get_cache_dir() / "files"
 
-    with state_mod.StateDB(config.get_state_db_path()) as state_db:
+    with state_mod.StateDB(config.get_state_dir()) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 

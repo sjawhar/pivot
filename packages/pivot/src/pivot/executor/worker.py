@@ -210,7 +210,7 @@ def execute_stage(
     metrics.clear()
     _ = cache_dir
     ring_buffer = _OutputRingBuffer()
-    state_db_path = stage_info["state_dir"] / "state.db"
+    state_dir = stage_info["state_dir"]
     project_root = stage_info["project_root"]
     store = store_mod.store_from_spec(stage_info["store_spec"])
 
@@ -272,7 +272,7 @@ def execute_stage(
                     )
                 lock_data = production_lock.read()
 
-                with state.StateDB(state_db_path, readonly=True) as state_db:
+                with state.StateDB(state_dir, readonly=True) as state_db:
                     outputs_missing_from_cache = False
                     if lock_data is not None and not stage_info["force"]:
                         out_paths = _get_normalized_out_paths(stage_info)
@@ -440,7 +440,7 @@ def execute_stage(
                 )
 
                 # Single StateDB open for post-execution work
-                with state.StateDB(state_db_path, readonly=True) as state_db:
+                with state.StateDB(state_dir, readonly=True) as state_db:
                     deferred = _commit_lock_and_build_deferred(
                         stage_info,
                         new_lock_data,

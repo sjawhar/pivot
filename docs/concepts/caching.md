@@ -21,7 +21,7 @@ manifest mapping each output path to its content hash.
   stages/
     clean.lock             # lock file for "clean" stage
     train.lock             # lock file for "train" stage
-  state.db                 # LMDB database
+  state.lmdb/              # LMDB database
 ```
 
 Because the cache is content-addressed:

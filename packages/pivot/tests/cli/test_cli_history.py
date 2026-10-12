@@ -38,7 +38,7 @@ def project_with_runs(
     config_io.clear_config_cache()
 
     # Write test runs to the same StateDB that both commands read from
-    state_db_path = project_dir / ".pivot" / "state.db"
+    state_db_path = project_dir / ".pivot"
     with state.StateDB(state_db_path) as db:
         for i in range(3):
             manifest = run_history.RunManifest(

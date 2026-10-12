@@ -524,7 +524,6 @@ def minimal_pipeline(
 
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
-    monkeypatch.setattr(config, "get_state_db_path", lambda: tmp_path / "state" / "state.db")
     monkeypatch.chdir(tmp_path)
 
     (tmp_path / ".pivot").mkdir(exist_ok=True)

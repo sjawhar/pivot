@@ -142,7 +142,7 @@ def test_run_cache_skip_updates_lock_file(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot" / "state.db"
+    state_db_path = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A, output gen -> 1
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
@@ -233,7 +233,7 @@ def test_explain_shows_cached_after_run_cache_skip(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot" / "state.db"
+    state_db_path = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
@@ -288,6 +288,96 @@ def test_explain_shows_cached_after_run_cache_skip(
         f"Stage should not need to run after run cache skip, got: {explanation}"
     )
     assert explanation["reason"] == "", f"Reason should be empty, got: {explanation['reason']}"
+
+
+def test_explain_uses_generation_tracking_when_state_db_exists(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """Explain answers from StateDB generations, not by rehashing deps.
+
+    Only stage outputs carry generations, so the consumer depends on a producer's
+    output. With that output file removed, a hash-based check reports it missing; only
+    the generation path can still predict "unchanged".
+    """
+    from pivot import explain
+
+    def producer_func() -> str:
+        return "produced"
+
+    def consumer_func(_0: str) -> str:
+        return "consumed"
+
+    state_dir = tmp_path / ".pivot"
+    producer_out = _output_ref("producer")
+    producer_info = _make_stage_info(
+        producer_func,
+        tmp_path,
+        fingerprint={"self:producer_func": "fp-producer"},
+        outs=[producer_out],
+    )
+    result = executor.execute_stage("producer", producer_info, worker_env, output_queue)
+    assert result["status"] == "ran"
+    _apply_deferred_writes("producer", producer_info, result, state_dir)
+
+    consumer_info = _make_stage_info(
+        consumer_func,
+        tmp_path,
+        fingerprint={"self:consumer_func": "fp-consumer"},
+        deps={"_0": producer_out},
+        outs=[_output_ref("consumer")],
+    )
+    consumer_info["store_spec"]["input_bindings"] = {}
+    result = executor.execute_stage("consumer", consumer_info, worker_env, output_queue)
+    assert result["status"] == "ran", result["reason"]
+    _apply_deferred_writes("consumer", consumer_info, result, state_dir)
+
+    workspace = store_mod.WorkspaceStore(
+        project_root=tmp_path, pipeline_name="test", input_bindings={}
+    )
+    producer_path = workspace.resolve_display_path(producer_out)
+    assert producer_path.exists()
+    producer_path.unlink()
+
+    explanation = explain.get_stage_explanation(
+        stage_name="consumer",
+        fingerprint=consumer_info["fingerprint"],
+        deps=[_identity_key(producer_out)],
+        outs_paths=[_identity_key(_output_ref("consumer"))],
+        params_instance=None,
+        overrides=None,
+        state_dir=state_dir,
+    )
+
+    assert not explanation["will_run"], explanation["reason"]
+
+
+def test_explain_does_not_create_state_db(tmp_path: pathlib.Path) -> None:
+    """Explain is read-only: it must not create state.lmdb when none exists."""
+    from pivot import explain
+    from pivot.types import LockData
+
+    state_dir = tmp_path / ".pivot"
+    lock.StageLock("test_stage", lock.get_stages_dir(state_dir)).write(
+        LockData(
+            code_manifest={"self:test_stage": "abc123"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
+    )
+
+    explanation = explain.get_stage_explanation(
+        stage_name="test_stage",
+        fingerprint={"self:test_stage": "abc123"},
+        deps=[],
+        outs_paths=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=state_dir,
+    )
+
+    assert explanation["will_run"] is False
+    assert not (state_dir / "state.lmdb").exists()
 
 
 def test_regular_execution_still_works(
@@ -360,7 +450,7 @@ def test_run_cache_skip_does_not_increment_output_generations(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot" / "state.db"
+    state_db_path = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)

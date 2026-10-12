@@ -151,7 +151,7 @@ def _get_state_db() -> "StateDB | None":
         from pivot.config import io
         from pivot.storage import state
 
-        _state_db = state.StateDB(io.get_state_db_path(), readonly=True)
+        _state_db = state.StateDB(io.get_state_dir(), readonly=True)
         return _state_db
     except Exception:
         # OSError (filesystem), ImportError (module), lmdb.Error, etc.
@@ -275,7 +275,7 @@ def flush_ast_hash_cache() -> None:
         from pivot.config import io
         from pivot.storage import state
 
-        with state.StateDB(io.get_state_db_path(), readonly=False) as db:
+        with state.StateDB(io.get_state_dir(), readonly=False) as db:
             db.save_ast_hash_many(pending)
         metrics.count("fingerprint.ast_hash_cache.flush")
     except Exception:
@@ -299,7 +299,7 @@ def flush_manifest_cache() -> None:
         from pivot.config import io
         from pivot.storage import state
 
-        with state.StateDB(io.get_state_db_path(), readonly=False) as db:
+        with state.StateDB(io.get_state_dir(), readonly=False) as db:
             db.put_raw_many(pending)
         metrics.count("fingerprint.manifest_cache.flush")
     except Exception:
@@ -362,7 +362,7 @@ def invalidate_manifests_for_paths(
 
     keys_to_delete = set[bytes]()
     try:
-        with state.StateDB(io.get_state_db_path(), readonly=True) as db:
+        with state.StateDB(io.get_state_dir(), readonly=True) as db:
             for key, raw in db.iter_prefix(b"sm:"):
                 if _manifest_references_paths(raw, changed_paths):
                     keys_to_delete.add(key)
@@ -384,7 +384,7 @@ def invalidate_manifests_for_paths(
         return
 
     try:
-        with state.StateDB(io.get_state_db_path(), readonly=False) as db:
+        with state.StateDB(io.get_state_dir(), readonly=False) as db:
             db.delete_raw_many(list(keys_to_delete))
     except Exception:
         _logger.debug(

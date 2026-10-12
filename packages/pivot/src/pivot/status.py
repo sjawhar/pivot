@@ -334,7 +334,7 @@ def get_tracked_files_status(
     results = list[TrackedFileInfo]()
 
     # Use state_db for hash caching (mtime-based)
-    with state_mod.StateDB(config.get_state_db_path()) as state_db:
+    with state_mod.StateDB(config.get_state_dir()) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
@@ -393,7 +393,7 @@ def get_remote_status(
     if not local_hashes:
         return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
-    with state_mod.StateDB(config.get_state_db_path()) as state_db:
+    with state_mod.StateDB(config.get_state_dir()) as state_db:
         status = asyncio.run(
             transfer.compare_status(local_hashes, s3_remote, state_db, resolved_name)
         )

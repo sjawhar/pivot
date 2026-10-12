@@ -89,7 +89,7 @@ def test_hash_file_uses_state_cache(tmp_path: pathlib.Path) -> None:
     """hash_file uses state cache to skip rehashing."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         cache.hash_file(test_file, state_db=db)  # First hash populates cache
@@ -341,7 +341,7 @@ def test_hash_file_state_cache_invalidation(tmp_path: pathlib.Path) -> None:
     """State cache correctly invalidates when file mtime or size changes."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("original")
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         # First hash - cache miss

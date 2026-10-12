@@ -156,5 +156,18 @@ pivot = { workspace = true }
 pivot-tui = { workspace = true }
 
 [tool.semantic_release]
-version_toml = ["pyproject.toml:project.version"]
-build_command = "uv lock --upgrade-package pivot && git add uv.lock && uv build"
+version_toml = [
+  "pyproject.toml:project.version",
+  "packages/pivot/pyproject.toml:project.version",
+  "packages/pivot-tui/pyproject.toml:project.version",
+]
+build_command = "uv lock --upgrade-package pivot --upgrade-package pivot-tui && git add uv.lock && uv build --all-packages"
+commit_message = "chore(release): {version}"
+major_on_zero = false
+allow_zero_version = true
+
+[tool.semantic_release.remote]
+# Push the release commit/tag via the checkout's SSH remote (DEPLOY_KEY) instead
+# of an HTTPS token URL. The deploy key bypasses the main branch ruleset; the
+# GITHUB_TOKEN actor does not. GH_TOKEN is still used for the GitHub release.
+ignore_token_for_push = true

@@ -13,7 +13,6 @@ _GITIGNORE_CONTENT = """\
 cache/
 
 # State database (file hashes, generation counters)
-state.db
 state.lmdb/
 
 # Config lock (ruamel.yaml temporary file)

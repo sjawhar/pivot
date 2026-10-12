@@ -160,12 +160,12 @@ class StateDB:
 
     def __init__(
         self,
-        db_path: pathlib.Path,
+        state_dir: pathlib.Path,
         readonly: bool = False,
         write_timeout: float = 30.0,
     ) -> None:
-        lmdb_path = db_path.parent / "state.lmdb"
-        lmdb_path.parent.mkdir(parents=True, exist_ok=True)
+        lmdb_path = state_dir / "state.lmdb"
+        state_dir.mkdir(parents=True, exist_ok=True)
 
         # LMDB readonly mode can't create database - create empty one first if needed
         if readonly and not lmdb_path.exists():

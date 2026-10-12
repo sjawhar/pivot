@@ -21,8 +21,7 @@ def reset() -> None:
     from pivot.config import io
     from pivot.storage import state
 
-    db_path = io.get_state_db_path()
-    with state.StateDB(db_path, readonly=False) as db:
+    with state.StateDB(io.get_state_dir(), readonly=False) as db:
         count = db.clear_ast_hashes()
 
     click.echo(f"Cleared {count} cached fingerprint entries.")

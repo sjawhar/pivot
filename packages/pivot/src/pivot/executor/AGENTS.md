@@ -18,7 +18,7 @@ Workers execute in separate processes via `loky.get_reusable_executor()`.
 ## Path Derivation
 
 Workers derive all paths from `project_root` and `state_dir` in `WorkerStageInfo`:
-- `state_db_path = stage_info["state_dir"] / "state.db"`
+- `state_dir = stage_info["state_dir"]` (passed directly to `StateDB`)
 - Workers `chdir(project_root)` before execution
 
 Do not assume paths from `cache_dir` location—it's passed separately to `execute_stage()`.
