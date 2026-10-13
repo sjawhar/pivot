@@ -648,6 +648,9 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
     try:
         from joblib import parallel_config
     except ImportError:
+        parallel_config = None
+    if parallel_config is None:
+        # Called outside the except block so a stage error is not chained onto the ImportError.
         logger.debug("joblib not installed - nested parallelism protection disabled")
         return func(**kwargs)
 
