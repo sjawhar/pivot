@@ -68,7 +68,7 @@ def test_manual_wrapped_attribute_hides_code():
     def attacker():
         return "MALICIOUS CODE"
 
-    attacker.__wrapped__ = target  # type: ignore
+    attacker.__wrapped__ = target  # type: ignore[reportAttributeAccessIssue] - deliberate wrapped-attribute attack fixture
 
     # Compare the HASH VALUES, not the full fingerprint dicts
     h_target = fingerprint.hash_function_ast(target)

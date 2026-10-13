@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import copy
 import dataclasses
 import enum
 import functools
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import project, registry, stage_def, types
+from . import exceptions, path_policy, project, registry, stage_def, types
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -153,7 +154,6 @@ def _emit_stage_info(
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     assert not hasattr(func, "_is_stage")
-    no_fp = getattr(func, "__pivot_no_fingerprint__", False)
 
     deps = dict[str, types.ArtifactRef]()
 
@@ -207,6 +207,11 @@ def _emit_stage_info(
                     )
         if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
             params_arg_name = name
+            if node.params is not None and not isinstance(node.params, base_hint):
+                raise exceptions.ParamsError(
+                    f"Stage '{qualified_name}': params type {type(node.params).__name__} "
+                    + f"does not match parameter '{name}: {base_hint.__name__}'"
+                )
             break
 
     return registry.RegistryStageInfo(
@@ -222,7 +227,8 @@ def _emit_stage_info(
         params_arg_name=params_arg_name,
         state_dir=state_dir,
         collection_params={k: str(v) for k, v in node.collection_params.items()},
-        no_fingerprint=no_fp,
+        no_fingerprint=node.no_fingerprint,
+        code_deps=list(node.code_deps),
     )
 
 
@@ -236,9 +242,13 @@ class Pipeline:
     _token: contextvars.Token[Pipeline | None] | None
     _variant_stack: list[str]
     _registry: registry.StageRegistry
+    _included_stages: dict[str, registry.RegistryStageInfo]
     _constructing: bool
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
+        reason = lock.stage_name_error(name)
+        if reason is not None:
+            raise ValueError(f"Invalid pipeline name {name!r}: {reason}")
         self._name = name
         self._stages = []
         self._inputs = {}
@@ -247,6 +257,7 @@ class Pipeline:
         self._token = None
         self._variant_stack = []
         self._registry = registry.StageRegistry()
+        self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
 
         if root is not None:
@@ -306,20 +317,23 @@ class Pipeline:
         self._registry.restore(snapshot)
 
     def include(self, other: registry.PipelineLike) -> None:
-        import copy
-
         if other is self:
             from pivot.exceptions import PipelineConfigError
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        existing_stages = set(self._registry.list_stages())
+        existing_stages = (
+            set(self._included_stages) if self._constructing else set(self._registry.list_stages())
+        )
         for stage_name in other.list_stages():
             if stage_name in existing_stages:
                 logger.debug("include: skipping duplicate stage '%s'", stage_name)
                 continue
             stage_info = copy.deepcopy(other.get_stage(stage_name))
-            self._registry.add_existing(stage_info)
+            self._included_stages[stage_name] = stage_info
+            existing_stages.add(stage_name)
+            if not self._constructing:
+                self._registry.add_existing(copy.deepcopy(stage_info))
 
         for name, path in other.input_bindings.items():
             if name in self._inputs:
@@ -333,7 +347,11 @@ class Pipeline:
                     )
             else:
                 self._inputs[name] = _InputNode(
-                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                    name=name,
+                    python_type=None,
+                    path=path,
+                    format=_get_loaders().PathOnly(),
+                    inherited=True,
                 )
         self._registry.invalidate_dag_cache()
 
@@ -374,6 +392,14 @@ class Pipeline:
             stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
             new_registry.add_existing(stage_info)
 
+        materialized_stages = set(new_registry.list_stages())
+        for stage_name, stage_info in self._included_stages.items():
+            if stage_name in materialized_stages:
+                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+                continue
+            new_registry.add_existing(copy.deepcopy(stage_info))
+            materialized_stages.add(stage_name)
+
         # Atomic swap — if any step above raises, self._registry is unchanged
         self._registry = new_registry
 
@@ -410,11 +436,44 @@ class Pipeline:
         if path is None:
             prefix = "data/external" if external else "data/raw"
             path = f"{prefix}/{name}"
+        # The store reads input bindings relative to the project root, so the path must stay
+        # inside it: no control characters, no '..', no absolute path elsewhere.
+        path_policy.require_valid_path(
+            path, path_policy.PathType.INPUT, self._root, context=f"Input '{name}'"
+        )
         if format is None:
             if t is not None:
                 format = _infer_input_format_from_type(t)
             if format is None:
                 format = _infer_format_from_extension(path)
+        existing = self._inputs.get(name)
+        if existing is not None:
+            if existing.path != path:
+                raise exceptions.PipelineConfigError(
+                    f"Input binding conflict: input '{name}' is bound to '{existing.path}' "
+                    + f"and '{path}' in the same pipeline."
+                )
+            if existing.inherited:
+                existing.python_type = t
+                existing.format = format
+                existing.inherited = False
+                return ArtifactHandle(
+                    pipeline=self,
+                    source=existing,
+                    output_key=None,
+                    python_type=t or object,
+                )
+            if existing.format != format:
+                raise exceptions.PipelineConfigError(
+                    f"Input binding conflict: input '{name}' at '{path}' changes format from "
+                    + f"{type(existing.format).__name__} to {type(format).__name__}."
+                )
+            return ArtifactHandle(
+                pipeline=self,
+                source=existing,
+                output_key=None,
+                python_type=existing.python_type or object,
+            )
         node = _InputNode(name=name, python_type=t, path=path, format=format)
         self._inputs[name] = node
         return ArtifactHandle(
@@ -443,6 +502,7 @@ class Pipeline:
     def _record_stage(
         self,
         original_func: Callable[..., object],
+        stage_wrapper: Callable[..., object],
         output_specs: list[_OutputSpec],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -510,8 +570,12 @@ class Pipeline:
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
+        # Read @no_fingerprint marks from this @stage wrapper, never from the shared function:
+        # functools.wraps copies marks set below @stage, and marks set above land here directly.
         node = _StageNode(
             original_func=original_func,
+            no_fingerprint=getattr(stage_wrapper, "__pivot_no_fingerprint__", False),
+            code_deps=list(getattr(stage_wrapper, "__pivot_code_deps__", [])),
             name=stage_name,
             params=params,
             input_handles=input_handles,
@@ -602,7 +666,11 @@ class Pipeline:
                 )
             if name not in self._inputs:
                 self._inputs[name] = _InputNode(
-                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                    name=name,
+                    python_type=None,
+                    path=path,
+                    format=_get_loaders().PathOnly(),
+                    inherited=True,
                 )
 
 
@@ -797,7 +865,7 @@ def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, _get_output_specs(), args, kwargs)
+        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
 
     wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
     wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
@@ -823,6 +891,8 @@ class _StageNode:
     variant: str | None = None
     list_input_handles: dict[str, list[ArtifactHandle]] = dataclasses.field(default_factory=dict)
     collection_params: dict[str, CollectionKind] = dataclasses.field(default_factory=dict)
+    no_fingerprint: bool = False
+    code_deps: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -831,6 +901,7 @@ class _InputNode:
     python_type: type | None
     path: str
     format: loaders_mod.Reader[object] | loaders_mod.Loader[object, object]
+    inherited: bool = False
 
 
 class ArtifactHandle:

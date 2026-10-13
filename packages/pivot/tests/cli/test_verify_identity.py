@@ -51,6 +51,7 @@ def _make_stage_info(
         "state_dir": state_dir,
         "collection_params": {},
         "no_fingerprint": False,
+        "code_deps": [],
     }
     return info
 

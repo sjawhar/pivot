@@ -21,22 +21,22 @@ def _helper_func_v2(a: int, b: int, c: int = 10) -> int:
 # --- Test helpers for functools.wraps ---
 
 
-def _caching_decorator_v1(func):  # type: ignore[no-untyped-def]
+def _caching_decorator_v1(func):  # type: ignore[no-untyped-def] - intentionally untyped test decorator
     """Decorator version 1."""
 
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def] - intentionally untyped test wrapper
         print("CACHE_V1")  # Decorator-specific logic
         return func(*args, **kwargs)
 
     return wrapper
 
 
-def _caching_decorator_v2(func):  # type: ignore[no-untyped-def]
+def _caching_decorator_v2(func):  # type: ignore[no-untyped-def] - intentionally untyped test decorator
     """Decorator version 2 - different logic."""
 
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def] - intentionally untyped test wrapper
         print("CACHE_V2")  # Different decorator logic!
         return func(*args, **kwargs)
 
@@ -132,7 +132,7 @@ def test_partial_underlying_func_change_triggers_fingerprint_change():
 def test_partial_in_closure():
     """functools.partial in closure (nonlocals) is tracked."""
 
-    def make_stage():  # type: ignore[no-untyped-def]
+    def make_stage():  # type: ignore[no-untyped-def] - intentionally untyped closure factory
         bound = functools.partial(_helper_func, 1, c=20)
 
         def stage() -> int:
@@ -241,17 +241,17 @@ def test_wrapped_uses_bytecode_not_source():
 def test_nested_wraps():
     """Multiple levels of functools.wraps are tracked."""
 
-    def decorator_a(func):  # type: ignore[no-untyped-def]
+    def decorator_a(func):  # type: ignore[no-untyped-def] - intentionally untyped test decorator
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def] - intentionally untyped test wrapper
             print("A")
             return func(*args, **kwargs)
 
         return wrapper
 
-    def decorator_b(func):  # type: ignore[no-untyped-def]
+    def decorator_b(func):  # type: ignore[no-untyped-def] - intentionally untyped test decorator
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def] - intentionally untyped test wrapper
             print("B")
             return func(*args, **kwargs)
 

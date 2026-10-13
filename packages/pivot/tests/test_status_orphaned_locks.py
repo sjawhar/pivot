@@ -32,6 +32,7 @@ def _stage_info(name: str, state_dir: pathlib.Path | None) -> RegistryStageInfo:
         state_dir=state_dir,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 

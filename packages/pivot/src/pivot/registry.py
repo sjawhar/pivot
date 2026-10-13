@@ -34,6 +34,8 @@ class RegistryStageInfo(TypedDict):
         fingerprint: Code fingerprint mapping (key -> hash), or None if not computed yet.
         params_arg_name: Name of the StageParams parameter in function signature (or None).
         state_dir: Per-stage state directory (None means use default determined at runtime).
+        no_fingerprint: Use file-level hashing instead of AST fingerprinting.
+        code_deps: Extra project-relative files hashed into a no_fingerprint stage's fingerprint.
     """
 
     func: Callable[..., Any]
@@ -49,6 +51,7 @@ class RegistryStageInfo(TypedDict):
     state_dir: pathlib.Path | None
     collection_params: dict[str, str]
     no_fingerprint: bool
+    code_deps: list[str]
 
 
 class StageRegistry:
@@ -197,7 +200,7 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
     try:
         no_fp = info["no_fingerprint"]
         if no_fp:
-            result = _compute_file_fingerprint(info["func"])
+            result = _compute_file_fingerprint(info["func"], info["code_deps"])
         else:
             result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
         for dep_name, dep in info["deps"].items():
@@ -212,11 +215,11 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
 
 
-def _compute_file_fingerprint(func: Callable[..., Any]) -> dict[str, str]:
+def _compute_file_fingerprint(func: Callable[..., Any], code_deps: list[str]) -> dict[str, str]:
     """Compute file-hash fingerprint (no AST analysis).
 
     Returns dict with keys like ``file:path/to/module.py`` -> hash.
-    Includes the stage function's source file and any ``code_deps``.
+    Includes the stage function's source file and each of ``code_deps``.
     Uses ``inspect.unwrap`` to handle stacked decorators.
     """
     result = dict[str, str]()
@@ -228,7 +231,6 @@ def _compute_file_fingerprint(func: Callable[..., Any]) -> dict[str, str]:
     rel_path = project.to_relative_path(source_file)
     result[f"file:{rel_path}"] = file_hash
 
-    code_deps: list[str] = getattr(func, "__pivot_code_deps__", [])
     root = project.get_project_root()
     for dep_path in code_deps:
         abs_path = (root / dep_path).resolve()

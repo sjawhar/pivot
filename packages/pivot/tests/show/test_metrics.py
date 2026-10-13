@@ -52,6 +52,7 @@ def _register_metric_stage(test_pipeline: PipelineLike, name: str) -> Path:
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
     metric_path = project.get_project_root() / "metrics" / f"{name}.json"
     metric_path.parent.mkdir(parents=True, exist_ok=True)

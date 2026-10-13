@@ -54,6 +54,7 @@ def _helper_stage_info(
         state_dir=state_dir,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
@@ -285,6 +286,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
     state_dir=pipeline.state_dir,
     collection_params={},
     no_fingerprint=False,
+    code_deps=[],
 ))
 """
         (pipeline_a / "pipeline.py").write_text(pipeline_a_code)
@@ -327,6 +329,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
     state_dir=pipeline.state_dir,
     collection_params={},
     no_fingerprint=False,
+    code_deps=[],
 ))
 """
         (pipeline_b / "pipeline.py").write_text(pipeline_b_code)

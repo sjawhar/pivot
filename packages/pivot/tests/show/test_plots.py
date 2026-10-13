@@ -58,6 +58,7 @@ def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactR
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 

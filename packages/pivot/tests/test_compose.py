@@ -9,7 +9,7 @@ from typing import Annotated, NotRequired, Required, TypedDict
 import pandas as pd
 import pytest
 
-from pivot import fingerprint, loaders, outputs, stage_def, types
+from pivot import exceptions, fingerprint, loaders, outputs, stage_def, types
 from pivot.compose import (
     SINGLE_OUTPUT_KEY,
     ArtifactHandle,
@@ -419,6 +419,87 @@ def test_input_no_t_uses_extension_inference() -> None:
     assert isinstance(node.format, loaders.CSV)
 
 
+def test_input_redeclaration_with_different_path_raises(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*first.csv.*second.csv"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("data", path="data/first.csv", t=str)
+        pipeline.input("data", path="data/second.csv", t=str)
+
+
+def test_input_redeclaration_with_different_format_raises(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*format"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("data", path="data/input.csv", format=loaders.CSV())
+        pipeline.input("data", path="data/input.csv", format=loaders.Text())
+
+
+def test_identical_input_redeclaration_returns_existing_node(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        original = pipeline.input("data", path="data/input.csv", format=loaders.CSV())
+        repeated = pipeline.input("data", path="data/input.csv", format=loaders.CSV())
+
+    assert original._source is repeated._source
+
+
+def test_input_redeclaration_after_reentering_pipeline_raises(tmp_path: pathlib.Path) -> None:
+    pipeline = Pipeline("test", root=tmp_path)
+    with pipeline:
+        pipeline.input("data", path="data/first.csv", t=str)
+
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*first.csv.*second.csv"),
+        pipeline,
+    ):
+        pipeline.input("data", path="data/second.csv", t=str)
+
+
+@stage
+def _helper_consume_text(data: str) -> str:
+    return data
+
+
+def test_include_binding_allows_same_path_explicit_format_takeover(tmp_path: pathlib.Path) -> None:
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        child.input("data", path="data/input.txt", t=str)
+
+    with Pipeline("parent", root=tmp_path) as parent:
+        parent.include(child)
+        data = parent.input("data", path="data/input.txt", t=str)
+        _helper_consume_text(data)
+
+    assert isinstance(parent._inputs["data"].format, loaders.Text)
+    assert isinstance(
+        parent.get_stage("parent/_helper_consume_text")["deps"]["data"].format, loaders.Text
+    )
+
+
+def test_include_binding_rejects_explicit_different_path(tmp_path: pathlib.Path) -> None:
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        child.input("data", path="data/child.txt", t=str)
+
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*child.txt.*parent.txt"),
+        Pipeline("parent", root=tmp_path) as parent,
+    ):
+        parent.include(child)
+        parent.input("data", path="data/parent.txt", t=str)
+
+
+def test_explicit_pathonly_then_text_redeclaration_still_raises(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*format"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("data", path="data/input.txt", format=loaders.PathOnly())
+        pipeline.input("data", path="data/input.txt", format=loaders.Text())
+
+
 def test_pipeline_context_basic() -> None:
     with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
         data = _helper_produce(params=stage_def.StageParams())
@@ -737,25 +818,36 @@ def test_pipeline_variant_rejects_name_lock_files_cannot_hold(
     assert repr(variant_name) in str(exc_info.value), "Error should name the bad variant"
 
 
-@pytest.mark.parametrize(
-    ("pipeline_name", "variant_name", "bad_stage"),
-    [
-        pytest.param("my pipeline", "ok", "my pipeline/_helper_produce@ok", id="pipeline_space"),
-        pytest.param(
-            "p", "v" * 190, f"p/_helper_produce@{'v' * 190}", id="qualified_name_too_long"
-        ),
-    ],
-)
-def test_pipeline_rejects_stage_name_lock_files_cannot_hold(
-    tmp_path: pathlib.Path, pipeline_name: str, variant_name: str, bad_stage: str
-) -> None:
+def test_pipeline_rejects_stage_name_lock_files_cannot_hold(tmp_path: pathlib.Path) -> None:
     """A qualified stage name the lock would reject fails at definition, not at repro."""
-    pipeline = Pipeline(pipeline_name, root=tmp_path)
+    bad_stage = f"p/_helper_produce@{'v' * 190}"
+    pipeline = Pipeline("p", root=tmp_path)
     with pytest.raises(ValueError, match="stage name") as exc_info, pipeline:  # noqa: SIM117
-        with pipeline.variant(variant_name):
+        with pipeline.variant("v" * 190):
             _helper_produce(params=stage_def.StageParams())
 
     assert repr(bad_stage) in str(exc_info.value), "Error should name the bad stage"
+
+
+@pytest.mark.parametrize(
+    "pipeline_name",
+    [
+        pytest.param("my pipeline", id="space"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="spaces"),
+        pytest.param("/etc", id="absolute"),
+        pytest.param("a//b", id="empty_segment"),
+        pytest.param(".", id="dot"),
+    ],
+)
+def test_pipeline_rejects_name_lock_files_cannot_hold(
+    tmp_path: pathlib.Path, pipeline_name: str
+) -> None:
+    """A pipeline name that would place lock files outside .pivot/stages fails on construction."""
+    with pytest.raises(ValueError, match="pipeline name") as exc_info:
+        Pipeline(pipeline_name, root=tmp_path)
+
+    assert repr(pipeline_name) in str(exc_info.value), "Error should name the bad pipeline"
 
 
 def test_pipeline_variant_accepts_lock_compatible_names(tmp_path: pathlib.Path) -> None:
@@ -780,6 +872,41 @@ def test_build_rejects_stage_params_in_typing_optional(tmp_path: pathlib.Path) -
         with Pipeline("test", root=tmp_path) as pipeline:
             raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
             _helper_typing_optional_params_stage(data=raw, params=_HelperOptionalParams(x=3))
+
+
+class _HelperParamsA(stage_def.StageParams):
+    value_a: int = 1
+
+
+class _HelperParamsB(stage_def.StageParams):
+    value_b: str = "x"
+
+
+class _HelperParamsBChild(_HelperParamsB):
+    extra: int = 2
+
+
+@stage
+def _helper_wants_params_b(params: _HelperParamsB) -> dict:
+    return {"b": params.value_b}
+
+
+def test_record_stage_rejects_params_of_wrong_type(tmp_path: pathlib.Path) -> None:
+    """A StageParams instance unrelated to the stage's params annotation fails at definition."""
+    with (
+        pytest.raises(exceptions.ParamsError, match="_HelperParamsA.*_HelperParamsB"),
+        Pipeline("test", root=tmp_path),
+    ):
+        _helper_wants_params_b(params=_HelperParamsA())  # pyright: ignore[reportArgumentType] - the error under test
+
+
+def test_record_stage_accepts_params_subclass(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        _helper_wants_params_b(params=_HelperParamsBChild())
+
+    assert isinstance(
+        pipeline.get_stage("test/_helper_wants_params_b")["params"], _HelperParamsBChild
+    )
 
 
 # --- Bug 3: list[ArtifactHandle] support ---
@@ -1128,6 +1255,7 @@ def _make_stage_info(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
@@ -1435,6 +1563,53 @@ def test_no_fingerprint_code_deps_survive_decorator_order(
     assert fp_before != fp_after, "Editing a code_deps file must change the stage fingerprint"
 
 
+def _helper_shared_impl() -> str:
+    return "output"
+
+
+def _helper_shared_impl_late() -> str:
+    return "output"
+
+
+_helper_plain_alias = stage(_helper_shared_impl)
+_helper_special_alias = no_fingerprint(code_deps=["helper.py"])(stage(_helper_shared_impl))
+# Plain alias created AFTER the marked one: functools.wraps copies whatever the function holds.
+_helper_special_alias_late = no_fingerprint(code_deps=["helper.py"])(
+    stage(_helper_shared_impl_late)
+)
+_helper_plain_alias_late = stage(_helper_shared_impl_late)
+
+
+@pytest.mark.parametrize(
+    ("plain_alias", "special_alias"),
+    [
+        pytest.param(_helper_plain_alias, _helper_special_alias, id="plain-created-first"),
+        pytest.param(_helper_plain_alias_late, _helper_special_alias_late, id="plain-created-last"),
+    ],
+)
+def test_no_fingerprint_does_not_leak_to_other_stage_of_same_function(
+    set_project_root: pathlib.Path,
+    plain_alias: Callable[[], str],
+    special_alias: Callable[[], str],
+) -> None:
+    """Marking one @stage wrapper no_fingerprint leaves other wrappers of the function alone."""
+    (set_project_root / "helper.py").write_text("value = 1\n")
+    with Pipeline("test", root=set_project_root) as plain:
+        plain_alias()
+    with Pipeline("test", root=set_project_root) as special:
+        special_alias()
+    stage_name = f"test/{plain_alias.__name__}"
+
+    plain_fp = plain.ensure_fingerprint(stage_name)
+    special_fp = special.ensure_fingerprint(stage_name)
+
+    assert plain.get_stage(stage_name)["no_fingerprint"] is False, (
+        "The plain alias must keep AST fingerprinting"
+    )
+    assert not any(k.startswith("file:") for k in plain_fp), f"Unexpected file hashing: {plain_fp}"
+    assert "file:helper.py" in special_fp, f"code_deps must apply to the marked alias: {special_fp}"
+
+
 def test_no_fingerprint_outside_stage_decorator(set_project_root: pathlib.Path) -> None:
     """@no_fingerprint() applied outside @stage must be detected through compose → registry."""
 
@@ -1517,6 +1692,33 @@ def test_cross_pipeline_input_binding_conflict_raises(tmp_path: pathlib.Path) ->
         with Pipeline("consumer", root=tmp_path) as p2:
             _ = p2.input("raw", path="data/raw/consumer.csv", t=pd.DataFrame)
             _helper_consume_dict(result)
+
+
+def test_include_inside_construction_survives_materialization(tmp_path: pathlib.Path) -> None:
+    """include() inside a Pipeline block keeps the child's snapshot after the registry rebuild."""
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        _helper_produce(params=stage_def.StageParams())
+
+    with Pipeline("parent", root=tmp_path) as parent:
+        parent.include(child)
+        _helper_repeat(params=stage_def.StageParams())
+
+    assert set(parent.list_stages()) == {"child/_helper_produce", "parent/_helper_repeat"}
+
+
+def test_include_after_construction_survives_later_materialization(tmp_path: pathlib.Path) -> None:
+    """include() after a block has the same snapshot behavior if the pipeline is re-entered."""
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        _helper_produce(params=stage_def.StageParams())
+
+    parent = Pipeline("parent", root=tmp_path)
+    parent.include(child)
+    with parent:
+        _helper_repeat(params=stage_def.StageParams())
+
+    assert set(parent.list_stages()) == {"child/_helper_produce", "parent/_helper_repeat"}
 
 
 # --- Edge-case tests for cross-pipeline composition ---
