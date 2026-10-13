@@ -224,3 +224,38 @@ def test_checkout_then_run_succeeds(
     _register_data_stage(_process_uppercase)
     assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
     assert _output("process").read_text() == "IMPORTANT DATA"
+
+
+def test_checkout_missing_restores_tracked_input_before_running(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+) -> None:
+    """run(checkout_missing=True) restores a deleted tracked input from cache, then uses it."""
+    data_file = pipeline_dir / "data.csv"
+    data_file.write_text("cached data")
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
+    data_file.unlink()
+    _register_data_stage(_process_uppercase)
+
+    results = executor.run(pipeline=test_pipeline, checkout_missing=True)
+
+    assert results["test/process"]["status"] == "ran"
+    assert data_file.read_text() == "cached data", "the tracked input is back in the workspace"
+    assert _output("process").read_text() == "CACHED DATA"
+
+
+def test_checkout_missing_reports_tracked_input_absent_from_cache(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path
+) -> None:
+    """A missing tracked input that is not cached fails, suggesting a pull, and nothing runs."""
+    track.write_pvt_file(
+        pipeline_dir / "data.csv.pvt",
+        {"path": "data.csv", "hash": "0123456789abcdef", "size": 10},
+    )
+    _register_data_stage(_process_simple)
+
+    with pytest.raises(exceptions.TrackedFileMissingError) as exc_info:
+        executor.run(pipeline=test_pipeline, checkout_missing=True)
+
+    assert "not in local cache" in str(exc_info.value)
+    assert exc_info.value.get_suggestion() == "Run 'pivot pull' to fetch from remote storage"
+    assert not _output("process").exists()
