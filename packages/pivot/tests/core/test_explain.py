@@ -12,7 +12,7 @@ import pytest
 from pivot import StageParams, compose, executor, explain, loaders, project, skip, status
 from pivot.storage import lock
 from pivot.storage import store as store_mod
-from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, HashInfo, LockData
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, HashInfo, LockData, StageExplanation
 
 
 class _UpstreamParams(StageParams):
@@ -337,8 +337,16 @@ def test_get_stage_explanation_no_lock(tmp_path: pathlib.Path) -> None:
         store=_store(tmp_path),
     )
 
-    assert result["will_run"] is True
-    assert result["reason"] == "No previous run"
+    assert result == StageExplanation(
+        stage_name="new_stage",
+        will_run=True,
+        is_forced=False,
+        reason="No previous run",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
 
 
 def test_get_stage_explanation_unchanged(tmp_path: pathlib.Path) -> None:
@@ -591,9 +599,16 @@ def test_get_stage_explanation_force_without_changes(
         force=True,
     )
 
-    assert result["will_run"] is True
-    assert result["is_forced"] is True
-    assert result["reason"] == "forced"
+    assert result == StageExplanation(
+        stage_name=stage_name,
+        will_run=True,
+        is_forced=True,
+        reason="forced",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
 
 
 def test_get_stage_explanation_force_with_code_changes(tmp_path: pathlib.Path) -> None:
