@@ -30,6 +30,7 @@ from pivot.cli import targets as cli_targets
 from pivot.engine import engine, sinks
 from pivot.engine import graph as engine_graph
 from pivot.engine import sources as engine_sources
+from pivot.engine import watch as engine_watch
 from pivot.executor import prepare_workers
 from pivot.types import (
     DisplayCategory,
@@ -81,18 +82,11 @@ def _configure_watch_sources(
 def _watch_paths_from_registry(
     all_stages: dict[str, registry.RegistryStageInfo],
 ) -> list[pathlib.Path]:
-    paths = set[pathlib.Path]()
-    for info in all_stages.values():
-        for out in info["outs"]:
-            identity = out.identity
-            path_value = identity.key if identity.key is not None else identity.producer
-            if path_value:
-                resolved = project.normalize_path(path_value)
-                # Only watch paths that exist on disk — identity-based artifacts
-                # (inter-stage deps) don't have filesystem paths to watch.
-                if resolved.exists():
-                    paths.add(resolved)
-    return sorted(paths)
+    store = cli_helpers.get_workspace_store()
+    if store is None:
+        return []
+    artifact_paths = engine_watch.build_artifact_paths(all_stages, store)
+    return engine_watch.get_watch_paths(project.get_project_root(), artifact_paths)
 
 
 def _configure_oneshot_source(

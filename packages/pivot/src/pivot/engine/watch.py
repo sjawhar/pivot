@@ -17,18 +17,61 @@ Responsibilities retained by Engine:
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING
 
+from pivot import project
+from pivot import types as pivot_types
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import StageExecutionState
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Callable
 
     import networkx as nx
 
-__all__ = ["WatchCoordinator"]
+    from pivot.registry import RegistryStageInfo
+    from pivot.storage.store import WorkspaceStore
+
+__all__ = ["WatchCoordinator", "build_artifact_paths", "get_watch_paths"]
+
+
+def build_artifact_paths(
+    stages: dict[str, RegistryStageInfo],
+    store: WorkspaceStore,
+) -> dict[pathlib.Path, pivot_types.ArtifactIdentity]:
+    """Resolve every pipeline artifact identity to its workspace path."""
+    paths = dict[pathlib.Path, pivot_types.ArtifactIdentity]()
+    output_identities = set[pivot_types.ArtifactIdentity]()
+
+    for info in stages.values():
+        for out in info["outs"]:
+            path = project.normalize_path(store.resolve_display_path(out))
+            paths[path] = out.identity
+            output_identities.add(out.identity)
+
+    for info in stages.values():
+        for dep in info["deps"].values():
+            if dep.identity in output_identities:
+                continue
+            path = project.normalize_path(store.checkout(dep))
+            paths[path] = dep.identity
+
+    return paths
+
+
+def get_watch_paths(
+    project_root: pathlib.Path,
+    artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity],
+) -> list[pathlib.Path]:
+    """Watch project sources plus existing artifact paths outside the project."""
+    root = project.normalize_path(project_root)
+    paths = {root}
+    for path in artifact_paths:
+        if path.is_relative_to(root) or not path.exists():
+            continue
+        paths.add(path if path.is_dir() else path.parent)
+    return sorted(paths)
 
 
 class WatchCoordinator:
@@ -40,17 +83,36 @@ class WatchCoordinator:
     """
 
     _graph: nx.DiGraph[str]
+    _artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity]
 
-    def __init__(self, graph: nx.DiGraph[str]) -> None:
+    def __init__(
+        self,
+        graph: nx.DiGraph[str],
+        artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity],
+    ) -> None:
         self._graph = graph
+        self._artifact_paths = artifact_paths
 
     @property
     def graph(self) -> nx.DiGraph[str]:
         return self._graph
 
-    @graph.setter
-    def graph(self, g: nx.DiGraph[str]) -> None:
-        self._graph = g
+    @property
+    def artifact_paths(self) -> dict[pathlib.Path, pivot_types.ArtifactIdentity]:
+        """Filesystem paths resolved for the graph's artifact identities."""
+        return self._artifact_paths
+
+    def resolve_identity(self, path: pathlib.Path) -> pivot_types.ArtifactIdentity | None:
+        """Resolve a filesystem event path to the matching artifact identity."""
+        current = project.normalize_path(path)
+        while True:
+            identity = self._artifact_paths.get(current)
+            if identity is not None:
+                return identity
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
 
     def should_filter_path(
         self,
@@ -58,13 +120,10 @@ class WatchCoordinator:
         *,
         get_stage_state: Callable[[str], StageExecutionState],
     ) -> bool:
-        """Check if a path change should be filtered (produced by an executing stage).
-
-        Returns True if the path's producer stage is currently between
-        PREPARING and COMPLETED (exclusive) — i.e., PREPARING, WAITING_ON_LOCK,
-        or RUNNING.
-        """
-        identity = engine_graph.parse_artifact_identity(str(path))
+        """Check if a path change should be filtered (produced by an executing stage)."""
+        identity = self.resolve_identity(path)
+        if identity is None:
+            return False
         producer = engine_graph.get_producer(self._graph, identity)
         if producer is None:
             return False
@@ -72,23 +131,23 @@ class WatchCoordinator:
         return StageExecutionState.PREPARING <= state < StageExecutionState.COMPLETED
 
     def get_affected_stages(self, paths: list[pathlib.Path]) -> list[str]:
-        """Get all stages affected by the given path changes (including downstream).
-
-        Deduplicates across paths. Returns a sorted list for deterministic ordering.
-        """
+        """Get all stages affected by the changed paths, including downstream."""
         affected = set[str]()
         for path in paths:
-            identity = engine_graph.parse_artifact_identity(str(path))
+            identity = self.resolve_identity(path)
+            if identity is None:
+                continue
             consumers = engine_graph.get_consumers(self._graph, identity)
             affected.update(consumers)
             for stage in consumers:
-                downstream = engine_graph.get_downstream_stages(self._graph, stage)
-                affected.update(downstream)
+                affected.update(engine_graph.get_downstream_stages(self._graph, stage))
         return sorted(affected)
 
     def get_producer(self, path: pathlib.Path) -> str | None:
         """Get the stage that produces a given artifact path."""
-        identity = engine_graph.parse_artifact_identity(str(path))
+        identity = self.resolve_identity(path)
+        if identity is None:
+            return None
         return engine_graph.get_producer(self._graph, identity)
 
     def should_restart_workers(self, *, parallel: bool) -> bool:

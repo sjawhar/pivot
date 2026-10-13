@@ -149,11 +149,11 @@ class Engine:
     # Orchestration state
     _graph: nx.DiGraph[str] | None
     _watch_coordinator: engine_watch.WatchCoordinator | None
+    _watch_output_stats: dict[pathlib.Path, tuple[int, int, int] | None]
     _scheduler: engine_scheduler.Scheduler
     _cancel_event: anyio.Event
     _stage_indices: dict[str, tuple[int, int]]
     _deferred_events: dict[str, list[InputEvent]]
-
     # Execution orchestration state
     _futures: dict[concurrent.futures.Future[StageResult], str]
     _worker_pool: worker_pool_mod.WorkerPool | None
@@ -199,6 +199,7 @@ class Engine:
         # Orchestration state
         self._graph = None
         self._watch_coordinator = None
+        self._watch_output_stats = dict[pathlib.Path, tuple[int, int, int] | None]()
         self._scheduler = engine_scheduler.Scheduler()
         self._cancel_event = anyio.Event()
         self._stage_indices = dict[str, tuple[int, int]]()
@@ -1911,8 +1912,8 @@ class Engine:
     ) -> float:
         """Handle a stage completing execution. Returns duration in milliseconds."""
         duration_ms = (time.perf_counter() - start_time) * 1000
-
-        # Transition to COMPLETED
+        # Record completed output state before replaying deferred file events.
+        self._record_watch_output_stats(stage_name)
         await self._set_stage_state(stage_name, StageExecutionState.COMPLETED)
 
         # Compute output summary for stages that ran (not failed)
@@ -2064,12 +2065,77 @@ class Engine:
         if self._worker_pool is not None:
             self._worker_pool.stop_accepting()
 
+    def _watches_filesystem(self) -> bool:
+        """Return whether this engine has a filesystem event source."""
+        from pivot.engine.sources import FilesystemSource
+
+        return any(isinstance(source, FilesystemSource) for source in self._sources)
+
+    def _record_watch_output_stats(self, stage_name: str) -> None:
+        """Remember output filesystem state written by a completed watched stage."""
+        if not self._watches_filesystem():
+            return
+        coordinator = self._get_watch_coordinator()
+        if coordinator is None:
+            return
+        for path, identity in coordinator.artifact_paths.items():
+            if engine_graph.get_producer(coordinator.graph, identity) != stage_name:
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                self._watch_output_stats[path] = None
+                continue
+            self._watch_output_stats[path] = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
+    def _is_own_watch_output_write(self, path: pathlib.Path) -> bool:
+        """Return whether a changed output still matches the engine's own write."""
+        normalized = project.normalize_path(path)
+        if normalized not in self._watch_output_stats:
+            return False
+        expected = self._watch_output_stats[normalized]
+        try:
+            stat = normalized.stat()
+        except FileNotFoundError:
+            return expected is None
+        return expected == (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
-        _ = event
-        # TODO: Store-based watch resolution will re-enable this handler.
-        _logger.debug("Watch data artifact handling is disabled pending store integration")
-        return
+        paths = [pathlib.Path(path) for path in event["paths"]]
+        filtered_paths = list[pathlib.Path]()
+        deferred_paths = list[tuple[str, pathlib.Path]]()
+
+        for path in paths:
+            if self._should_filter_path(path):
+                coordinator = self._get_watch_coordinator()
+                producer = coordinator.get_producer(path) if coordinator is not None else None
+                if producer is not None:
+                    deferred_paths.append((producer, path))
+                    continue
+            if self._is_own_watch_output_write(path):
+                continue
+            filtered_paths.append(path)
+
+        for producer, path in deferred_paths:
+            self._defer_event_for_stage(
+                producer,
+                DataArtifactChanged(type="data_artifact_changed", paths=[str(path)]),
+            )
+
+        if not filtered_paths:
+            return
+
+        affected = self._get_affected_stages_for_paths(filtered_paths)
+        if not affected:
+            return
+
+        _logger.info(
+            "Data changed: %d file(s) affect %d stage(s)",
+            len(filtered_paths),
+            len(affected),
+        )
+        await self._execute_affected_stages(affected)
 
     async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
         """Handle code/config changes by reloading registry and re-running.
@@ -2110,23 +2176,18 @@ class Engine:
         # Hot-reload: skip dependency validation — deps may be temporarily missing while user edits
         self._graph = engine_graph.build_graph(all_stages)
 
-        # Update watch paths if we have a FilesystemSource
+        # Update watch paths if we have a FilesystemSource.
         from pivot.engine.sources import FilesystemSource
 
-        watch_paths = [pathlib.Path(p) for p in engine_graph.get_watch_paths(self._graph)]
-
-        # In --all mode, also watch pipeline config directories so creating/removing
-        # pipeline.py triggers reload.
-        if self._all_pipelines:
-            from pivot import discovery
-
-            config_paths = discovery.glob_all_pipelines(project.get_project_root())
-            for config_path in config_paths:
-                watch_paths.append(config_path.parent)
-
-        for source in self._sources:
-            if isinstance(source, FilesystemSource):
-                source.set_watch_paths(watch_paths)
+        coordinator = self._get_watch_coordinator()
+        if coordinator is not None:
+            watch_paths = engine_watch.get_watch_paths(
+                project.get_project_root(),
+                coordinator.artifact_paths,
+            )
+            for source in self._sources:
+                if isinstance(source, FilesystemSource):
+                    source.set_watch_paths(watch_paths)
 
         # Re-run all stages
         stages = self._list_stages()
@@ -2178,17 +2239,23 @@ class Engine:
         await self._handle_run_requested(event)
 
     def _get_watch_coordinator(self) -> engine_watch.WatchCoordinator | None:
-        """Lazily create/update WatchCoordinator from current graph.
-
-        This ensures existing tests that set engine._graph directly still work
-        without needing to also set up the coordinator.
-        """
-        if self._graph is None:
+        """Lazily build watch planning from the current pipeline and graph."""
+        if self._pipeline is None:
             return None
-        if self._watch_coordinator is None:
-            self._watch_coordinator = engine_watch.WatchCoordinator(self._graph)
-        elif self._watch_coordinator.graph is not self._graph:
-            self._watch_coordinator.graph = self._graph
+        if self._graph is None:
+            self._graph = engine_graph.build_graph(self._get_all_stages())
+
+        if self._watch_coordinator is None or self._watch_coordinator.graph is not self._graph:
+            pipeline = self._require_pipeline()
+            store = store_mod.WorkspaceStore(
+                project_root=project.get_project_root(),
+                pipeline_name=pipeline.name,
+                input_bindings=pipeline.input_bindings,
+            )
+            self._watch_coordinator = engine_watch.WatchCoordinator(
+                self._graph,
+                engine_watch.build_artifact_paths(self._get_all_stages(), store),
+            )
         return self._watch_coordinator
 
     def _should_filter_path(self, path: pathlib.Path) -> bool:
@@ -2265,6 +2332,7 @@ class Engine:
         importlib.invalidate_caches()
         self._graph = None
         self._watch_coordinator = None
+        self._watch_output_stats.clear()
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
