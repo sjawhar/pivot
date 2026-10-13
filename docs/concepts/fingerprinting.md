@@ -121,8 +121,7 @@ track. Use direct attribute access and static imports instead.
 ## @pivot.no_fingerprint()
 
 For stages where AST fingerprinting doesn't work (C extensions, generated
-code, complex metaprogramming), opt out with `@no_fingerprint()`, applied
-directly to the function, under `@stage`:
+code, complex metaprogramming), opt out with `@no_fingerprint()`:
 
 ```python
 from pivot import no_fingerprint, stage
