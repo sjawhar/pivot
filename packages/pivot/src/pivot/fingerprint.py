@@ -432,7 +432,7 @@ def get_stage_fingerprint(
     _t = metrics.start()
     try:
         result = _get_stage_fingerprint_impl(func, visited)
-        if errors:
+        if token is not None and errors:
             raise exceptions.StageDefinitionError("\n\n".join(errors))
         return result
     finally:

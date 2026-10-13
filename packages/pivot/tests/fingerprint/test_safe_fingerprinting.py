@@ -115,6 +115,22 @@ def _stage_uses_three_non_scalar_values() -> int:
     return len(IMMUTABLE_TUPLE) + len(IMMUTABLE_FROZENSET) + FROZEN_DATACLASS.value
 
 
+CHILD_BAD = []
+
+
+def _child_with_non_scalar_capture() -> int:
+    return len(CHILD_BAD)
+
+
+def _make_parent_with_nested_non_scalar_capture() -> Callable[[], int]:
+    PARENT_BAD = ()
+
+    def parent() -> int:
+        return _child_with_non_scalar_capture() + len(PARENT_BAD)
+
+    return parent
+
+
 @pytest.mark.parametrize(
     ("func", "var_name", "type_name"),
     [
@@ -194,6 +210,18 @@ def test_non_scalar_capture_errors_are_aggregated() -> None:
     message = str(exc.value)
     for variable in ("IMMUTABLE_TUPLE", "IMMUTABLE_FROZENSET", "FROZEN_DATACLASS"):
         assert variable in message
+
+
+def test_nested_non_scalar_capture_errors_are_aggregated() -> None:
+    with pytest.raises(exceptions.StageDefinitionError) as exc:
+        fingerprint.get_stage_fingerprint_cached(
+            "train",
+            _make_parent_with_nested_non_scalar_capture(),
+        )
+
+    message = str(exc.value)
+    assert "CHILD_BAD" in message
+    assert "PARENT_BAD" in message
 
 
 @pytest.mark.parametrize(
