@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import concurrent.futures
+import multiprocessing
+import pathlib
+from typing import TYPE_CHECKING
+
+import pytest
+
+from pivot.cli import checkout as checkout_mod
+from pivot.storage import cache
+from pivot.types import HashInfo
+
+if TYPE_CHECKING:
+    from threading import Barrier
+
+_N_FILES = 6
+_N_DIRS = 2
+_FILE_LINES = 20_000
+
+
+def _helper_file_content(i: int) -> str:
+    return f"file {i}\n" * _FILE_LINES
+
+
+def _helper_cache_outputs(root: pathlib.Path) -> dict[str, HashInfo]:
+    """Cache file and directory outputs that share one parent, then remove them."""
+    cache_dir = root / "cache"
+    parent = root / "data" / "shared"
+    parent.mkdir(parents=True)
+    hashes = dict[str, HashInfo]()
+    for i in range(_N_FILES):
+        path = parent / f"file{i}.txt"
+        path.write_text(_helper_file_content(i))
+        hashes[str(path)] = cache.save_to_cache(
+            path, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+        )
+    for i in range(_N_DIRS):
+        path = parent / f"dir{i}"
+        path.mkdir()
+        for j in range(10):
+            (path / f"f{j}.txt").write_text(f"dir {i} file {j}\n")
+        hashes[str(path)] = cache.save_to_cache(
+            path, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+        )
+    for path in hashes:
+        cache.remove_output(pathlib.Path(path))
+    return hashes
+
+
+def _helper_checkout_all_at_barrier(
+    hashes: dict[str, HashInfo],
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+    behavior: checkout_mod.CheckoutBehavior,
+    barrier: Barrier,
+) -> list[str]:
+    """Check out every output from 8 threads, like one `pivot checkout` process."""
+    barrier.wait()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(
+                checkout_mod._restore_path_sync,
+                pathlib.Path(path),
+                output_hash,
+                cache_dir,
+                checkout_modes,
+                behavior,
+                state_dir,
+            )
+            for path, output_hash in hashes.items()
+        ]
+    failures = list[str]()
+    for future in futures:
+        exc = future.exception()
+        if exc is not None:
+            failures.append(f"{type(exc).__name__}: {exc}")
+        elif future.result()[0] == "missing":
+            failures.append(f"missing: {future.result()[1]}")
+    return failures
+
+
+@pytest.mark.parametrize(
+    "behavior",
+    [checkout_mod.CheckoutBehavior.ERROR, checkout_mod.CheckoutBehavior.FORCE],
+)
+@pytest.mark.parametrize(
+    "checkout_modes",
+    [
+        pytest.param([cache.CheckoutMode.COPY], id="copy"),
+        pytest.param(cache.DEFAULT_CHECKOUT_MODE_ORDER, id="default-order"),
+    ],
+)
+def test_concurrent_checkouts_of_same_outputs(
+    tmp_path: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+    behavior: checkout_mod.CheckoutBehavior,
+) -> None:
+    """Concurrent checkout processes of the same project all succeed (#461).
+
+    No process may observe another's half-restored output, and --force may not
+    delete an output another process is restoring.
+    """
+    hashes = _helper_cache_outputs(tmp_path)
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    parent = tmp_path / "data" / "shared"
+    n_procs = 4
+    ctx = multiprocessing.get_context("spawn")
+    failures = list[str]()
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        barrier = manager.Barrier(n_procs, timeout=60)
+        for _ in range(5):
+            results = pool.starmap(
+                _helper_checkout_all_at_barrier,
+                [(hashes, cache_dir, state_dir, checkout_modes, behavior, barrier)] * n_procs,
+            )
+            failures.extend(f for result in results for f in result)
+            for i in range(_N_FILES):
+                assert (parent / f"file{i}.txt").read_text() == _helper_file_content(i)
+            for i in range(_N_DIRS):
+                for j in range(10):
+                    assert (parent / f"dir{i}" / f"f{j}.txt").read_text() == f"dir {i} file {j}\n"
+            assert not [p.name for p in parent.iterdir() if p.name.startswith(".pivot_")]
+            for path in hashes:
+                cache.remove_output(pathlib.Path(path))
+
+    assert failures == []

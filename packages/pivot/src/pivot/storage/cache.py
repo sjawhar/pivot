@@ -39,16 +39,41 @@ _RESTORE_LOCK_PREFIX = ".pivot_restore_lock_"
 _RESTORE_TEMP_MAX_AGE = 3600  # 1 hour
 
 
-def _get_lock_path(target_path: pathlib.Path, state_dir: pathlib.Path) -> pathlib.Path:
-    """Get lock file path under state_dir/locks/ for a restore target.
+def _restore_target_token(target_path: pathlib.Path) -> str:
+    """Return a stable token identifying the logical workspace target."""
+    logical_path = target_path.parent.resolve() / target_path.name
+    return hashlib.sha256(str(logical_path).encode()).hexdigest()[:32]
 
-    Uses SHA-256 hash of the absolute target path to avoid filename length issues
-    and collisions between targets in different directories.
+
+def _get_lock_path(target_path: pathlib.Path, state_dir: pathlib.Path) -> pathlib.Path:
+    """Get lock file path under state_dir/locks/ for a logical restore target.
+
+    The final path component is intentionally not resolved: a restored symlink must
+    retain the same lock as the missing workspace path it replaced.
     """
     lock_dir = state_dir / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    path_hash = hashlib.sha256(str(target_path.resolve()).encode()).hexdigest()[:32]
-    return lock_dir / f"{_RESTORE_LOCK_PREFIX}{path_hash}"
+    return lock_dir / f"{_RESTORE_LOCK_PREFIX}{_restore_target_token(target_path)}"
+
+
+@contextlib.contextmanager
+def restore_lock(path: pathlib.Path, state_dir: pathlib.Path | None) -> Generator[None]:
+    """Hold the exclusive restore lock for path; no lock when state_dir is None.
+
+    Not reentrant: never call restore_from_cache for path while holding it.
+    The lock file is never deleted. Unlinking it would let a new restorer lock a fresh
+    file while a waiter still holds the old one, and both would restore path at once.
+    """
+    if state_dir is None:
+        yield
+        return
+    lock_fd = os.open(_get_lock_path(path, state_dir), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def atomic_write_file(
@@ -306,22 +331,10 @@ def _clear_path(path: pathlib.Path) -> None:
             path.unlink()
 
 
-def _cleanup_stale_restore_temps(parent_dir: pathlib.Path, lock_dir: pathlib.Path | None) -> None:
-    """Remove restore temp directories and stale lock files older than max age."""
+def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
+    """Remove restore temp and backup directories older than max age."""
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
-    # Clean stale lock files from centralized lock directory
-    if lock_dir is not None and lock_dir.exists():
-        for entry in os.scandir(lock_dir):
-            if entry.is_file(follow_symlinks=False) and entry.name.startswith(_RESTORE_LOCK_PREFIX):
-                try:
-                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
-                        logger.debug(f"Cleaning up stale lock file: {entry.path}")
-                        os.unlink(entry.path)
-                except OSError as e:
-                    logger.debug(f"Failed to clean up lock file {entry.path}: {e}")
-
-    # Clean temp/backup directories from data parent dir
     if not parent_dir.exists():
         return
 
@@ -339,6 +352,22 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path, lock_dir: pathlib.Pat
                 _clear_path(pathlib.Path(entry.path))
         except OSError as e:
             logger.debug(f"Failed to clean up temp {entry.path}: {e}")
+
+
+def _cleanup_fresh_restore_orphans(path: pathlib.Path) -> None:
+    """Remove fresh temp and backup entries left by an interrupted restore of path.
+
+    The caller holds path's restore lock, so entries tagged with its token cannot
+    belong to a live restore of the same target.
+    """
+    token = _restore_target_token(path)
+    prefixes = (
+        f"{_RESTORE_TEMP_PREFIX}{token}.",
+        f"{_BACKUP_TEMP_PREFIX}{token}.",
+    )
+    for entry in os.scandir(path.parent):
+        if entry.name.startswith(prefixes):
+            _clear_path(pathlib.Path(entry.path))
 
 
 def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
@@ -389,7 +418,7 @@ def _checkout_from_cache(
     *,
     executable: bool = False,
 ) -> None:
-    """Create link from workspace path to cache."""
+    """Create link or copy at path atomically, so readers never see a partial file."""
     # Idempotency: skip if already correctly linked
     if checkout_mode == CheckoutMode.SYMLINK and path.is_symlink():
         with contextlib.suppress(OSError):
@@ -400,15 +429,24 @@ def _checkout_from_cache(
             if path.stat().st_ino == cache_path.stat().st_ino:
                 return
 
-    _clear_path(path)
-
-    if checkout_mode == CheckoutMode.SYMLINK:
-        path.symlink_to(cache_path.resolve())
-    elif checkout_mode == CheckoutMode.HARDLINK:
-        os.link(cache_path, path)
-    else:
-        shutil.copy2(cache_path, path)
-        os.chmod(path, 0o755 if executable else 0o644)
+    tmp_path = path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
+    try:
+        if checkout_mode == CheckoutMode.SYMLINK:
+            tmp_path.symlink_to(cache_path.resolve())
+        elif checkout_mode == CheckoutMode.HARDLINK:
+            os.link(cache_path, tmp_path)
+        else:
+            shutil.copy2(cache_path, tmp_path)
+            os.chmod(tmp_path, 0o755 if executable else 0o644)
+        try:
+            tmp_path.replace(path)
+        except IsADirectoryError:
+            _clear_path(path)
+            tmp_path.replace(path)
+    finally:
+        # Also covers a replace() that did nothing: POSIX rename is a no-op when both
+        # names are hardlinks to the same inode, leaving tmp_path behind.
+        tmp_path.unlink(missing_ok=True)
 
 
 def _checkout_with_fallback(
@@ -612,23 +650,17 @@ def _restore_directory_from_cache(
 
     # Ensure parent exists and clean up stale temps
     path.parent.mkdir(parents=True, exist_ok=True)
-    if state_dir is not None:
-        lock_path = _get_lock_path(path, state_dir)
-        _cleanup_stale_restore_temps(path.parent, lock_path.parent)
-    else:
-        lock_path = None
-        _cleanup_stale_restore_temps(path.parent, None)
+    _cleanup_stale_restore_temps(path.parent)
 
-    # Acquire lock for this specific path to prevent concurrent restore races
-    lock_fd: int | None = None
-    try:
-        if lock_path is not None:
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    with restore_lock(path, state_dir):
+        target_token = _restore_target_token(path)
+        if state_dir is not None:
+            _cleanup_fresh_restore_orphans(path)
+        restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
         # SYMLINK fast path: create symlink at temp location, then atomic rename
         if symlink_fast_path:
-            temp_symlink = path.parent / f"{_RESTORE_TEMP_PREFIX}symlink_{secrets.token_hex(4)}"
+            temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
             try:
                 # Test symlink creation at temp location first
                 temp_symlink.symlink_to(cache_dir_path.resolve())
@@ -646,10 +678,8 @@ def _restore_directory_from_cache(
                     if not file_cache_path.exists():
                         return False
 
-        temp_path = pathlib.Path(tempfile.mkdtemp(prefix=_RESTORE_TEMP_PREFIX, dir=path.parent))
-        backup_path = (
-            path.parent / f"{_BACKUP_TEMP_PREFIX}{path.name}.{os.getpid()}.{secrets.token_hex(4)}"
-        )
+        temp_path = pathlib.Path(tempfile.mkdtemp(prefix=restore_prefix, dir=path.parent))
+        backup_path = path.parent / f"{_BACKUP_TEMP_PREFIX}{target_token}.{secrets.token_hex(4)}"
 
         # Track state for proper cleanup
         swap_completed = False
@@ -733,21 +763,6 @@ def _restore_directory_from_cache(
             # Don't delete backup if restoration failed - that's the user's data!
             if backup_path.exists() and swap_completed and not backup_restore_failed:
                 _clear_path(backup_path)
-
-    finally:
-        if lock_fd is not None and lock_path is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError as e:
-                logger.debug(f"Failed to unlock: {e}")
-            try:
-                os.close(lock_fd)
-            except OSError as e:
-                logger.debug(f"Failed to close lock fd: {e}")
-            try:
-                lock_path.unlink(missing_ok=True)
-            except OSError as e:
-                logger.debug(f"Failed to delete lock file: {e}")
 
 
 def remove_output(path: pathlib.Path) -> None:
