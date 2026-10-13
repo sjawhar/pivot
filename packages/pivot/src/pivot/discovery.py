@@ -34,6 +34,7 @@ class _ImportSession:
     root: pathlib.Path
     path_entry: str
     caller_path_entries: list[tuple[int, str]]
+    preexisting_root_modules: dict[str, _stdlib_types.ModuleType]
     owned_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(default_factory=dict)
     displaced_modules: dict[str, object] = dataclasses.field(default_factory=dict)
 
@@ -64,6 +65,13 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     if _import_session is not None:
         _end_import_session(_import_session)
     root = root.resolve()
+    preexisting_root_modules = {
+        module_name: module
+        for module_name, module in sys.modules.items()
+        if module_name != "pivot"
+        and not module_name.startswith("pivot.")
+        and _module_is_under_root(module, root)
+    }
     root_str = str(root)
     caller_path_entries = [
         (index, entry) for index, entry in enumerate(sys.path) if entry == root_str
@@ -71,7 +79,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     for index, _entry in reversed(caller_path_entries):
         del sys.path[index]
     sys.path.insert(0, root_str)
-    _import_session = _ImportSession(root, root_str, caller_path_entries)
+    _import_session = _ImportSession(root, root_str, caller_path_entries, preexisting_root_modules)
     importlib.invalidate_caches()
     return _import_session
 
@@ -104,7 +112,10 @@ def _track_root_modules(session: _ImportSession) -> None:
     for module_name, module in list(sys.modules.items()):
         if module_name == "pivot" or module_name.startswith("pivot."):
             continue
-        if _module_is_under_root(module, session.root):
+        if (
+            _module_is_under_root(module, session.root)
+            and session.preexisting_root_modules.get(module_name) is not module
+        ):
             session.owned_modules[module_name] = module
 
 

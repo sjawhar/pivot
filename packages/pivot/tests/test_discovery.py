@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false
 from __future__ import annotations
 
+import importlib
 import json
 import pathlib
 import sys
@@ -413,3 +414,18 @@ def test_discovery_restores_displaced_pipeline_module_and_caller_path(
     assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
     assert sys.modules["pipeline"] is foreign
     assert sys.path.count(str(root)) == 1
+
+
+def test_discovery_keeps_project_module_preimported_by_caller(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _write_sibling_stage_project(tmp_path / "project", "caller").parent
+    monkeypatch.syspath_prepend(str(root))
+    stages = importlib.import_module("stages")
+
+    pipeline = discovery.discover_pipeline(project_root=root)
+
+    assert pipeline is not None
+    assert sys.modules["stages"] is stages
+    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
+    assert sys.modules["stages"] is stages
