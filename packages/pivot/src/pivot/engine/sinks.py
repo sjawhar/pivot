@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
+import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 import rich.console
+import rich.file_proxy
 import rich.live
 import rich.markup
 import rich.text
@@ -255,6 +258,8 @@ class LiveConsoleSink:
     _stage_logs: dict[str, list[str]]
     _total: int
     _live: rich.live.Live | None
+    # Handlers whose stream points at the live console while a run is displayed.
+    _rerouted_handlers: list[tuple[logging.StreamHandler[Any], Any]]
 
     _RECENT_COMPLETIONS_LIMIT: int = 5
 
@@ -269,6 +274,7 @@ class LiveConsoleSink:
         self._stage_logs = dict[str, list[str]]()
         self._total = 0
         self._live = None
+        self._rerouted_handlers = list[tuple[logging.StreamHandler[Any], Any]]()
 
     def _build_live_renderable(self) -> rich.console.RenderableType:
         return _LiveRenderable(self)
@@ -336,12 +342,34 @@ class LiveConsoleSink:
     def _ensure_live(self) -> None:
         if self._live is not None:
             return
+        self._route_logging_through_console()
         self._live = rich.live.Live(
             self._build_live_renderable(),
             console=self._console,
             refresh_per_second=1,
         )
         self._live.start()
+
+    def _route_logging_through_console(self) -> None:
+        """Print stdout/stderr log records through the live console while it is drawn.
+
+        A record written straight to the terminal lands inside the pinned live area,
+        and the next redraw erases it.
+        """
+        for handler in logging.getLogger().handlers:
+            if not isinstance(handler, logging.StreamHandler):
+                continue
+            stream_handler = cast("logging.StreamHandler[Any]", handler)
+            stream: object = stream_handler.stream
+            if stream is sys.stderr or stream is sys.stdout:
+                self._rerouted_handlers.append((stream_handler, stream_handler.stream))
+                proxy = rich.file_proxy.FileProxy(self._console, stream_handler.stream)
+                _ = stream_handler.setStream(proxy)
+
+    def _restore_logging(self) -> None:
+        for handler, stream in self._rerouted_handlers:
+            _ = handler.setStream(stream)
+        self._rerouted_handlers.clear()
 
     def _update_live(self) -> None:
         if self._live is None:
@@ -394,6 +422,7 @@ class LiveConsoleSink:
             self._live.update(rich.text.Text(""))
             self._live.stop()
             self._live = None
+        self._restore_logging()
         _print_completions(
             self._console,
             self._completion_buffer,

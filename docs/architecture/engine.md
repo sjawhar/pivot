@@ -67,7 +67,7 @@ Sinks consume output events via `sink.handle()`:
 | Sink | Output | Use Case |
 |------|--------|----------|
 | `StaticConsoleSink` | Rich terminal (buffered) | Pipe/CI — buffers completions, prints a sorted report when each run ends |
-| `LiveConsoleSink` | Rich terminal (live) | TTY — live progress bar with running/completed counts for the current run |
+| `LiveConsoleSink` | Rich terminal (live) | TTY — live progress bar with running/completed counts for the current run; log records print above it |
 | `ResultCollectorSink` | Dict collection | Programmatic result access |
 | `JsonlSink` | JSONL records | `--jsonl` output for machine consumption |
 | `BroadcastEventSink` | Pub-sub | Agent RPC subscribers |
