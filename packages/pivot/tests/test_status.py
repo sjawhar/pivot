@@ -405,13 +405,13 @@ def test_remote_status_with_local_hashes(tmp_path: pathlib.Path, mocker: MockerF
 
 
 def test_suggestions_stale_stages() -> None:
-    """Should suggest run when stages are stale."""
+    """Should suggest repro (runs the whole DAG without arguments) when stages are stale."""
     suggestions = status.get_suggestions(
         stale_count=3, modified_count=0, push_count=0, pull_count=0
     )
 
     assert len(suggestions) == 1
-    assert "pivot run" in suggestions[0]
+    assert "pivot repro" in suggestions[0]
     assert "3 stale stages" in suggestions[0]
 
 
@@ -455,6 +455,36 @@ def test_suggestions_pull_files() -> None:
     assert len(suggestions) == 1
     assert "pivot pull" in suggestions[0]
     assert "3 files" in suggestions[0]
+
+
+def test_suggestions_missing_outputs_with_remote_suggests_pull_first() -> None:
+    """Outputs missing from the cache in a clone with a remote: pull before re-running."""
+    suggestions = status.get_suggestions(
+        stale_count=2,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_outputs_count=2,
+        remote_configured=True,
+    )
+
+    assert suggestions[0] == "Run `pivot pull` to restore outputs of 2 stages from the remote"
+    assert "pivot repro" in suggestions[1]
+
+
+def test_suggestions_missing_outputs_without_remote_omits_pull() -> None:
+    """Without a remote there is nothing to pull from; only repro applies."""
+    suggestions = status.get_suggestions(
+        stale_count=2,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_outputs_count=2,
+        remote_configured=False,
+    )
+
+    assert len(suggestions) == 1
+    assert "pivot repro" in suggestions[0]
 
 
 def test_suggestions_multiple() -> None:

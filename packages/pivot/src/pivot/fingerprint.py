@@ -29,7 +29,12 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
-_CACHE_SCHEMA_VERSION = 3
+# Bump when the hashing scheme changes. Version 3 strips absolute source paths from
+# marshalled code objects. Version 4 qualifies manifest keys by definition module. Version 5
+# invalidates manifests that might have been persisted after unsafe capture warnings. Version 6
+# also invalidates entries written before discovery imported pipeline.py as a real module.
+# Version 7 invalidates manifests whose source maps omitted imported project modules.
+_CACHE_SCHEMA_VERSION = 7
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -110,6 +115,17 @@ _active_source_map: dict[str, tuple[int, int, int]] | None = None
 # Stage name used for error reporting during fingerprinting.
 _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_stage_name", default=None
+)
+
+# Unsafe capture errors collected while recursively walking one stage's dependencies.
+_capture_errors: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "_capture_errors", default=None
+)
+
+# Unsafe captures are allowed only with an explicit warning and must never populate the
+# persistent manifest cache.
+_unsafe_capture_warning: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_unsafe_capture_warning", default=False
 )
 
 
@@ -201,6 +217,67 @@ def _collecting_sources() -> Iterator[dict[str, tuple[int, int, int]]]:
         yield source_map
     finally:
         _active_source_map = previous
+
+
+# Memo of the last sys.modules scan: (loaded modules, project root, project module files).
+# Every read compares it against the current sys.modules values by identity, so it is never
+# served stale. A set captured once per pass and passed explicitly would miss modules imported
+# after capture (fingerprints are computed lazily from several entry points).
+_project_modules_snapshot: (
+    tuple[list[object], pathlib.Path, list[tuple[str, pathlib.Path]]] | None
+) = None
+
+
+def _project_module_files(project_root: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
+    """Return (relative path, path) for every loaded project module.
+
+    Classifying the ~2,000 loaded modules is reused until a module is imported, removed or
+    replaced, so a fingerprint pass scans sys.modules once rather than once per stage.
+    """
+    global _project_modules_snapshot
+    loaded = list[object](sys.modules.values())
+    snapshot = _project_modules_snapshot
+    if (
+        snapshot is not None
+        and snapshot[1] == project_root
+        and len(snapshot[0]) == len(loaded)
+        and all(previous is current for previous, current in zip(snapshot[0], loaded, strict=True))
+    ):
+        return snapshot[2]
+    files = list[tuple[str, pathlib.Path]]()
+    for module in loaded:
+        # Some libraries install non-module objects in sys.modules.
+        if not isinstance(module, types.ModuleType):
+            continue
+        file = module.__dict__.get("__file__")
+        if not isinstance(file, str) or not is_user_code(module):
+            continue
+        try:
+            path = pathlib.Path(file).resolve()
+            rel_path = str(path.relative_to(project_root))
+        except (OSError, ValueError):
+            continue
+        files.append((rel_path, path))
+    _project_modules_snapshot = (loaded, project_root, files)
+    return files
+
+
+def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None:
+    """Add the file of every loaded project module to a manifest's source map.
+
+    A manifest records values bound in module namespaces, and import-time code in any project
+    module can change them without touching the walked functions' files: `from settings import
+    FACTOR`, a module rebinding an imported helper, or one module assigning another's
+    attribute. A cached manifest is therefore valid only while none of those files changed.
+    """
+    from pivot import project
+
+    for rel_path, path in _project_module_files(project.get_project_root()):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        source_map.setdefault(rel_path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
 
 
 def _try_manifest_cache_hit(stage_name: str) -> dict[str, str] | None:
@@ -401,21 +478,30 @@ def get_stage_fingerprint(
 
     Returns dict with keys:
     - 'self:<name>': Function itself (hash)
-    - 'func:<name>': Referenced helper functions (hash, transitive)
-    - 'class:<name>': Referenced class definitions (hash, transitive)
+    - 'func:<module>.<qualname>': Referenced helper functions (hash, transitive)
+    - 'class:<module>.<qualname>': Referenced class definitions (hash, transitive)
     - 'mod:<module>.<attr>': User-code module attributes (hash for callables, repr for primitives)
-    - 'const:<name>': Global constants (repr value)
+    - 'const:<module>.<name>': Global primitive constants (repr value)
     """
     if visited is None:
         visited = set()
-        # TODO (future): If parallel fingerprinting is needed, use threading.Lock
-        # to protect visited set from race conditions. Current single-threaded
-        # usage is safe.
+
+    errors = _capture_errors.get()
+    token: contextvars.Token[list[str] | None] | None = None
+    if errors is None:
+        errors = list[str]()
+        token = _capture_errors.set(errors)
 
     _t = metrics.start()
-    result = _get_stage_fingerprint_impl(func, visited)
-    metrics.end("fingerprint.get_stage_fingerprint", _t)
-    return result
+    try:
+        result = _get_stage_fingerprint_impl(func, visited)
+        if token is not None and errors:
+            raise exceptions.StageDefinitionError("\n\n".join(errors))
+        return result
+    finally:
+        metrics.end("fingerprint.get_stage_fingerprint", _t)
+        if token is not None:
+            _capture_errors.reset(token)
 
 
 def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
@@ -434,28 +520,32 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
         return cached
 
     metrics.count("fingerprint.manifest_cache.miss")
-
-    # Compute with source tracking
-    token = _current_stage_name.set(stage_name)
+    unsafe_token = _unsafe_capture_warning.set(False)
     try:
-        with _collecting_sources() as source_map:
-            manifest = get_stage_fingerprint(func)
+        # Compute with source tracking
+        token = _current_stage_name.set(stage_name)
+        try:
+            with _collecting_sources() as source_map:
+                manifest = get_stage_fingerprint(func)
+        finally:
+            _current_stage_name.reset(token)
+
+        if not _unsafe_capture_warning.get():
+            _record_project_modules(source_map)
+            key = _make_manifest_cache_key(stage_name)
+            value = json.dumps(
+                {
+                    "m": manifest,
+                    "s": {rel_path: list(stats) for rel_path, stats in source_map.items()},
+                },
+                separators=(",", ":"),
+            ).encode()
+            _pending_manifest_writes.append((key, value))
+
+        return manifest
     finally:
-        _current_stage_name.reset(token)
-
-    # Queue for flush
-    key = _make_manifest_cache_key(stage_name)
-    value = json.dumps(
-        {
-            "m": manifest,
-            "s": {rel_path: list(stats) for rel_path, stats in source_map.items()},
-        },
-        separators=(",", ":"),
-    ).encode()
-    _pending_manifest_writes.append((key, value))
-
-    metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
-    return manifest
+        _unsafe_capture_warning.reset(unsafe_token)
+        metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
 
 
 def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
@@ -544,22 +634,8 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
-    _process_closure_values(
-        closure_vars.globals,
-        func,
-        manifest,
-        visited,
-        skip_dunders=True,
-        include_modules=True,
-    )
-    _process_closure_values(
-        closure_vars.nonlocals,
-        func,
-        manifest,
-        visited,
-        skip_dunders=False,
-        include_modules=False,
-    )
+    _process_closure_values(closure_vars.globals, func, manifest, visited, skip_dunders=True)
+    _process_closure_values(closure_vars.nonlocals, func, manifest, visited, skip_dunders=False)
 
     # Discover globals referenced by nested functions/lambdas
     # (getclosurevars only sees the outer function's own bytecode)
@@ -576,12 +652,7 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
                     nested_globals_dict[name] = func_globals[name]
             if nested_globals_dict:
                 _process_closure_values(
-                    nested_globals_dict,
-                    func,
-                    manifest,
-                    visited,
-                    skip_dunders=True,
-                    include_modules=True,
+                    nested_globals_dict, func, manifest, visited, skip_dunders=True
                 )
 
     _process_type_hint_dependencies(func, manifest, visited)
@@ -622,7 +693,7 @@ def _process_class_body_dependencies(
             continue
         value = ns[name]
         if isinstance(value, type) and is_user_code(value):
-            key = f"class:{name}"
+            key = f"class:{_definition_ref(value)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, value, manifest, visited)
             if hasattr(value, "model_fields"):
@@ -634,7 +705,7 @@ def _process_class_body_dependencies(
         resolved = _resolve_dotted_path(parts, ns)
         if resolved is None or not isinstance(resolved, type) or not is_user_code(resolved):
             continue
-        key = f"class:{parts[-1]}"
+        key = f"class:{_definition_ref(resolved)}"
         if key not in manifest:
             _add_callable_to_manifest(key, resolved, manifest, visited)
         if hasattr(resolved, "model_fields"):
@@ -697,13 +768,13 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
 
     Handles Reader, Writer, and Loader (which inherits from both) instances.
     Only fingerprints methods that exist on the handler type:
-    - Reader: 'loader:<classname>:load' + empty() if overridden
-    - Writer: 'loader:<classname>:save'
+    - Reader: 'loader:<module>.<qualname>:load' + empty() if overridden
+    - Writer: 'loader:<module>.<qualname>:save'
     - Loader: All of the above
-    - Always: 'loader:<classname>:config' for dataclass field values
+    - Always: 'loader:<module>.<qualname>:config' for dataclass field values
     """
     manifest = dict[str, str]()
-    class_name = type(loader).__name__
+    class_name = _definition_ref(type(loader))
 
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
@@ -759,19 +830,24 @@ def _is_unsafe_fingerprinting_enabled() -> bool:
         return False
 
 
-def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
+def _check_non_scalar_capture(var_name: str, value: Any, stage_name: str) -> None:
     message = (
-        f"Stage '{stage_name}': closure captures mutable variable '{var_name}' "
+        f"Stage '{stage_name}': captures non-scalar variable '{var_name}' "
         + f"(type: {type(value).__name__}).\n"
-        + "Pivot cannot track changes to mutable runtime state, which may cause silent wrong "
+        + "Pivot tracks only module-level bool, int, float, str, bytes, and None values. "
+        + "Other values may change without a reliable fingerprint, which can cause silent wrong "
         + "outputs.\n"
         + "Fix: pass this data via StageParams or as a function parameter.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
     if _is_unsafe_fingerprinting_enabled():
+        _unsafe_capture_warning.set(True)
         _logger.warning(message)
         return
-    raise exceptions.StageDefinitionError(message)
+    errors = _capture_errors.get()
+    if errors is None:
+        raise exceptions.StageDefinitionError(message)
+    errors.append(message)
 
 
 def _check_data_class_methods(cls: type) -> None:
@@ -791,40 +867,48 @@ def _check_data_class_methods(cls: type) -> None:
         raise exceptions.StageDefinitionError(message)
 
 
-def _is_frozen_dataclass(value: Any) -> bool:
-    if not dataclasses.is_dataclass(value):
+def _is_user_class_instance(value: Any) -> bool:
+    """Return whether `value` is an instance of a user-defined class."""
+    return not isinstance(value, type) and is_user_code(type(value))
+
+
+def _is_callable_instance(value: Any) -> bool:
+    """Return whether `value` is a callable object rather than a function or class.
+
+    A non-user module's own public callable (`numpy.log` is a `ufunc` instance) is a library
+    function, not module-level state, so it is not a callable instance here.
+    """
+    if (
+        not callable(value)
+        or isinstance(value, (functools.partial, type))
+        or inspect.isroutine(value)
+    ):
         return False
-    cls = cast("type[Any]", type(value))
-    params = getattr(cls, "__dataclass_params__", None)
-    return bool(params and getattr(params, "frozen", False))
+    return not _is_library_export(value)
 
 
-def _is_frozen_pydantic(value: Any) -> bool:
-    cls = cast("type[Any]", type(value))
-    model_config = getattr(cls, "model_config", None)
-    if model_config is None:
+def _is_library_export(value: Any) -> bool:
+    """Return whether a non-user module binds `value` under its own `__name__`.
+
+    The module named by `__module__` is checked. An object without one (scipy.special's ufuncs,
+    such as `expit`) is looked up in every loaded module; `np.frompyfunc` products stay
+    refused because no module binds their generated names.
+    """
+    name = getattr(value, "__name__", None)
+    if not isinstance(name, str):
         return False
-    try:
-        return bool(model_config.get("frozen", False))
-    except AttributeError:
-        return False
-
-
-def _hash_unrecognized_closure_value(
-    name: str, value: Any, manifest: dict[str, str], stage_name: str
-) -> None:
-    try:
-        value_repr = repr(value)
-    except Exception:
-        _check_mutable_capture(name, value, stage_name)
-        return
-    if "0x" in value_repr:
-        _check_mutable_capture(name, value, stage_name)
-        return
-    if len(value_repr) > _REPR_SIZE_LIMIT:
-        _check_mutable_capture(name, value, stage_name)
-        return
-    manifest[f"const:{name}"] = xxhash.xxh64(value_repr.encode()).hexdigest()
+    module_name = getattr(value, "__module__", None)
+    candidates: list[types.ModuleType | None]
+    if isinstance(module_name, str):
+        candidates = [sys.modules.get(module_name)]
+    else:
+        candidates = list(sys.modules.values())
+    return any(
+        isinstance(module, types.ModuleType)
+        and module.__dict__.get(name) is value
+        and not is_user_code(module)
+        for module in candidates
+    )
 
 
 def _process_closure_values(
@@ -834,7 +918,6 @@ def _process_closure_values(
     visited: set[int],
     *,
     skip_dunders: bool,
-    include_modules: bool,
 ) -> None:
     """Process closure variable values (globals or nonlocals) and add to manifest."""
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
@@ -842,91 +925,55 @@ def _process_closure_values(
         if skip_dunders and name.startswith("__"):
             continue
 
-        # functools.partial fails is_user_code() (module is functools/stdlib)
-        # Must check before general callable check
+        binding_ref = _binding_ref(func, name)
+        # functools.partial fails is_user_code() (module is functools/stdlib).
         if isinstance(value, functools.partial):
             _process_partial_dependency(
-                name, cast("functools.partial[Any]", value), manifest, visited
+                binding_ref, cast("functools.partial[Any]", value), manifest, visited
             )
+        elif _is_callable_instance(value) or _is_user_class_instance(value):
+            _check_non_scalar_capture(name, value, stage_name)
         elif callable(value) and is_user_code(value):
-            _process_callable_dependency(name, value, manifest, visited)
+            _process_callable_dependency(binding_ref, value, manifest, visited)
         elif callable(value):
-            # Non-user-code callables (stdlib/third-party functions like typing.cast,
-            # json.dumps) are tracked via module dependency when accessed as module.func.
-            # Skip them here — their repr contains memory addresses (0x...) which would
-            # trigger _check_mutable_capture falsely.
+            # External functions, classes, and builtins are not user dependencies.
             continue
-        elif include_modules and isinstance(value, types.ModuleType):
+        elif isinstance(value, types.ModuleType):
             _process_module_dependency(name, value, func, manifest, visited)
         elif isinstance(value, logging.Logger):
             continue
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{name}"] = repr(value)
-        elif isinstance(value, (dict, list, tuple, set, frozenset)):
-            if isinstance(value, (dict, list, set)):
-                _check_mutable_capture(name, value, stage_name)
-            _process_collection_dependency(
-                name,
-                cast(
-                    "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
-                    value,
-                ),
-                manifest,
-                visited,
-            )
-        elif _is_user_class_instance(value):
-            if _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
-                _process_instance_dependency(name, value, manifest, visited)
-            else:
-                _check_mutable_capture(name, value, stage_name)
-                _process_instance_dependency(name, value, manifest, visited)
+            manifest[f"const:{binding_ref}"] = repr(value)
         else:
-            _hash_unrecognized_closure_value(name, value, manifest, stage_name)
+            _check_non_scalar_capture(name, value, stage_name)
 
 
 def _process_callable_dependency(
-    name: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+    binding_ref: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Process a callable dependency and add to manifest."""
-    # Use 'class:' prefix for type objects, 'func:' for functions
     prefix = "class" if isinstance(func, type) else "func"
-    _add_callable_to_manifest(f"{prefix}:{name}", func, manifest, visited)
+    _add_callable_to_manifest(
+        f"{prefix}:{_callable_ref(func, binding_ref)}", func, manifest, visited
+    )
 
 
 def _process_partial_dependency(
-    name: str,
+    binding_ref: str,
     partial_obj: functools.partial[Any],
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
     """Process functools.partial: hash underlying func and bound arguments."""
-    # Hash bound args and kwargs (changes to these should invalidate cache)
     args_str = _serialize_value_for_hash(partial_obj.args)
     kwargs_str = _serialize_value_for_hash(partial_obj.keywords)
-    manifest[f"partial:{name}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
-    manifest[f"partial:{name}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
+    manifest[f"partial:{binding_ref}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
+    manifest[f"partial:{binding_ref}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
 
-    # Recursively fingerprint the underlying function if it's user code
     underlying = partial_obj.func
     if callable(underlying) and is_user_code(underlying):
-        _add_callable_to_manifest(f"func:{name}.func", underlying, manifest, visited)
-
-
-def _is_user_class_instance(value: Any) -> bool:
-    """Check if value is an instance of a user-defined class."""
-    cls = cast("type[Any]", type(value))
-    # Skip built-in types and common stdlib types
-    if cls.__module__ == "builtins":
-        return False
-    return is_user_code(cls)
-
-
-def _process_instance_dependency(
-    name: str, instance: Any, manifest: dict[str, str], visited: set[int]
-) -> None:
-    """Track the class definition of a user-defined instance."""
-    cls = cast("type[Any]", type(instance))
-    _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
+        callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
+        _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
@@ -990,7 +1037,7 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
         # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
         if isinstance(origin, type) and is_user_code(origin):
             origin_type = cast("type[Any]", origin)
-            key = f"class:{origin_type.__name__}"
+            key = f"class:{_definition_ref(origin_type)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, origin_type, manifest, visited)
             if hasattr(origin_type, "model_fields"):
@@ -1011,7 +1058,7 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
     if dataclasses.is_dataclass(hint_type):
         _check_data_class_methods(hint_type)
 
-    key = f"class:{hint_type.__name__}"
+    key = f"class:{_definition_ref(hint_type)}"
     if key not in manifest:
         _add_callable_to_manifest(key, hint_type, manifest, visited)
 
@@ -1065,7 +1112,7 @@ def _hash_pydantic_schema(
     visited: set[int],
 ) -> None:
     schema_model = model
-    schema_key = f"schema:{schema_model.__name__}"
+    schema_key = f"schema:{_definition_ref(schema_model)}"
     if schema_key in manifest:
         return
     # Insert placeholder to prevent infinite recursion on self-referential models
@@ -1105,7 +1152,7 @@ def _discover_pydantic_field_types(
         return
     if isinstance(annotation, type) and is_user_code(annotation):
         annotation_type = cast("type[Any]", annotation)
-        key = f"class:{annotation_type.__name__}"
+        key = f"class:{_definition_ref(annotation_type)}"
         if key not in manifest:
             _add_callable_to_manifest(key, annotation_type, manifest, visited)
         if hasattr(annotation_type, "model_fields"):
@@ -1139,69 +1186,6 @@ def _serialize_value_for_hash(value: Any) -> str:
         return json.dumps(value, sort_keys=True, default=str)
 
     return repr(value)
-
-
-def _process_collection_dependency(
-    name: str,
-    collection: dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any],
-    manifest: dict[str, str],
-    visited: set[int],
-) -> None:
-    """Scan collection for callable user code and add to manifest."""
-    if isinstance(collection, dict):
-        # Use sorted keys for deterministic ordering
-        for key in sorted(collection.keys(), key=_sort_key):
-            value = collection[key]
-            if callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{key!r}]", value, manifest, visited)
-    else:
-        # For sequences and sets, use enumerate for index-based keys
-        # Sort sets for deterministic ordering
-        items = (
-            sorted(collection, key=_sort_key)
-            if isinstance(collection, (set, frozenset))
-            else collection
-        )
-        for i, value in enumerate(items):
-            if callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{i}]", value, manifest, visited)
-
-
-def _sort_key(value: Any) -> tuple[str, str]:
-    """Sort key that handles mixed types safely."""
-    return (type(value).__name__, str(value))
-
-
-def _is_primitive_collection(value: object, _seen: set[int] | None = None) -> bool:
-    """Check if value is a collection containing only primitives (recursively).
-
-    Uses _seen set to detect circular references and prevent infinite recursion.
-    Circular references return False (not a primitive collection).
-    """
-    if isinstance(value, (bool, int, float, str, bytes, type(None))):
-        return True
-    if isinstance(value, (list, tuple, set, frozenset)):
-        obj_id = id(cast("object", value))  # Cast: isinstance leaves element types Unknown
-        if _seen is None:
-            _seen = set()
-        if obj_id in _seen:
-            return False  # Circular reference
-        _seen.add(obj_id)
-        items = cast("list[object] | tuple[object, ...] | set[object] | frozenset[object]", value)
-        return all(_is_primitive_collection(item, _seen) for item in items)
-    if isinstance(value, dict):
-        obj_id = id(cast("object", value))  # Cast: isinstance leaves key/value types Unknown
-        if _seen is None:
-            _seen = set()
-        if obj_id in _seen:
-            return False  # Circular reference
-        _seen.add(obj_id)
-        items_dict = cast("dict[object, object]", value)
-        return all(
-            _is_primitive_collection(k, _seen) and _is_primitive_collection(v, _seen)
-            for k, v in items_dict.items()
-        )
-    return False
 
 
 def _add_callable_to_manifest(
@@ -1238,7 +1222,7 @@ def _process_module_dependency(
     for mod_name, attr_name in attrs:
         if mod_name not in (name, module_name):
             continue
-        key = f"mod:{mod_name}.{attr_name}"
+        key = f"mod:{module_name}.{attr_name}"
         if key in manifest:
             continue
         try:
@@ -1246,16 +1230,21 @@ def _process_module_dependency(
         except AttributeError:
             manifest[key] = "unknown"
             continue
-        if callable(attr_value) and is_user_code(attr_value):
+        if _is_callable_instance(attr_value) or _is_user_class_instance(attr_value):
+            _check_non_scalar_capture(
+                f"{module_name}.{attr_name}",
+                attr_value,
+                _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
+            )
+        elif callable(attr_value) and is_user_code(attr_value):
             _add_callable_to_manifest(key, attr_value, manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
-        elif _is_primitive_collection(attr_value):
-            value_str = _serialize_value_for_hash(attr_value)
-            manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
         else:
-            raise TypeError(
-                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, or collections of primitives."
+            _check_non_scalar_capture(
+                f"{module_name}.{attr_name}",
+                attr_value,
+                _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
             )
 
 
@@ -1285,6 +1274,26 @@ def _get_qualname_for_cache(func: Callable[..., Any]) -> str:
                 break
 
     return f"{qualname}:{lineno}:{col}"
+
+
+def _definition_ref(obj: Any) -> str:
+    """Return an object's module-qualified definition name for a manifest key."""
+    module = getattr(obj, "__module__", None) or "<unknown>"
+    return f"{module}.{_get_qualname_for_cache(obj)}"
+
+
+def _binding_ref(func: Callable[..., Any], name: str) -> str:
+    """Return a module-qualified reference for a value reached through `func`."""
+    module = getattr(func, "__module__", None) or "<unknown>"
+    return f"{module}.{name}"
+
+
+def _callable_ref(func: Callable[..., Any], binding_ref: str) -> str:
+    """Use callable's definition, retaining the binding path for anonymous lambdas."""
+    qualname = getattr(func, "__qualname__", "") or ""
+    if "<lambda>" in qualname:
+        return binding_ref
+    return _definition_ref(func)
 
 
 def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
@@ -1388,6 +1397,23 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.hash_function_ast", _t)
 
 
+_PORTABLE_CO_FILENAME = "<pivot>"
+
+
+def _hash_code_object(code: types.CodeType) -> str:
+    """Hash code while excluding absolute source paths."""
+    return xxhash.xxh64(marshal.dumps(_replace_code_filenames(code))).hexdigest()
+
+
+def _replace_code_filenames(code: types.CodeType) -> types.CodeType:
+    """Replace the source filename in `code` and nested code constants."""
+    constants = tuple(
+        _replace_code_filenames(value) if isinstance(value, types.CodeType) else value
+        for value in code.co_consts
+    )
+    return code.replace(co_filename=_PORTABLE_CO_FILENAME, co_consts=constants)
+
+
 def _resolve_static_callee(expr: ast.expr, globals_dict: dict[str, Any]) -> object | None:
     """Resolve a name or dotted attribute without executing user code."""
     if isinstance(expr, ast.Name):
@@ -1433,9 +1459,9 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
 
         # For wrapped functions (via functools.wraps), inspect.getsource() follows
         # __wrapped__ and returns the ORIGINAL function's source, making decorator
-        # logic invisible. Use __code__ bytecode to capture the actual wrapper.
+        # logic invisible. Use bytecode to capture the actual wrapper.
         if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
-            return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+            return _hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
 
         _t_source = metrics.start()
         try:
@@ -1443,9 +1469,9 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         except (OSError, TypeError):
             metrics.end("fingerprint.inspect_getsource", _t_source)
             if hasattr(func, "__code__"):
-                # marshal.dumps captures full code object including co_consts
-                # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
-                return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+                # Marshal captures constants as well as bytecode, so `x + 1` and `x + 999`
+                # differ. Remove embedded source paths before hashing to keep it portable.
+                return _hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
             # KNOWN ISSUE: Using id(func) is non-deterministic across runs
             # This affects lambdas without source code, causing unnecessary re-runs
             if is_user_code(func):

@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 
     from pivot.storage.track import PvtData
 
+OUTPUTS_MISSING_REASON = "Outputs missing from cache"
+"""Reason for a stage whose lock is current but whose outputs are absent locally."""
+
 
 def producer_output_hashes(
     stage_names: list[str],
@@ -240,7 +243,7 @@ def get_stage_explanation(
                 stage_name=stage_name,
                 will_run=True,
                 is_forced=force,
-                reason="Outputs missing from cache",
+                reason=OUTPUTS_MISSING_REASON,
                 code_changes=[],
                 param_changes=[],
                 dep_changes=[],

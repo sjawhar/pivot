@@ -23,8 +23,8 @@ def plots() -> None:
     "-o",
     "--output",
     type=click.Path(path_type=pathlib.Path),
-    default="pivot_plots/index.html",
-    help="Output HTML path (default: pivot_plots/index.html)",
+    default=".pivot/plots/index.html",
+    help="Output HTML path (default: .pivot/plots/index.html)",
 )
 @click.option("--open", "open_browser", is_flag=True, help="Open browser after rendering")
 @cli_decorators.with_error_handling
@@ -62,8 +62,10 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path, open_browser: boo
         click.echo("No plots found.")
         return
 
-    output_path = plots_mod.render_plots_html(plot_list, output)
-    click.echo(f"Rendered {len(plot_list)} plot(s) to {output_path}")
+    # --output is project-relative (absolute paths are rejected above), so the gallery lands
+    # in the project's .pivot/ even when run from a subdirectory.
+    output_path = plots_mod.render_plots_html(plot_list, proj_root / output)
+    click.echo(f"Rendered {len(plot_list)} plot(s) to {output_path.relative_to(proj_root)}")
 
     if open_browser:
         import webbrowser

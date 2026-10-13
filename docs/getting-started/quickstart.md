@@ -24,7 +24,7 @@ pivot init
 `pivot init` creates:
 
 - `.pivot/`: cache, state, and per-stage lock files (`.pivot/stages/`)
-- `.pivot/.gitignore`: keeps the cache and state database out of git
+- `.pivot/.gitignore`: keeps the cache, state database, artifact locks and agent socket out of git
 - `.pivotignore`: patterns for files watch mode ignores
 
 Commit the lock files under `.pivot/stages/`; they record what ran and what it produced.
