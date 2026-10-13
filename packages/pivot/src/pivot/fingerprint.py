@@ -219,7 +219,10 @@ def _collecting_sources() -> Iterator[dict[str, tuple[int, int, int]]]:
         _active_source_map = previous
 
 
-# (loaded modules, project root, project module files) from the last sys.modules scan.
+# Memo of the last sys.modules scan: (loaded modules, project root, project module files).
+# Every read compares it against the current sys.modules values by identity, so it is never
+# served stale. A set captured once per pass and passed explicitly would miss modules imported
+# after capture (fingerprints are computed lazily from several entry points).
 _project_modules_snapshot: (
     tuple[list[object], pathlib.Path, list[tuple[str, pathlib.Path]]] | None
 ) = None
