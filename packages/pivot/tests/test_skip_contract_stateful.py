@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import pathlib
 import tempfile
+import typing
 
 import hypothesis
 import yaml
@@ -67,6 +68,19 @@ def _expected(n: int, factor: int) -> dict[str, str]:
 
 
 class SkipContractMachine(stateful.RuleBasedStateMachine):
+    _tmp: tempfile.TemporaryDirectory[str]
+    root: pathlib.Path
+    _saved_cwd: str
+    _saved_root: pathlib.Path | None
+    pipeline: compose.Pipeline
+    output_paths: dict[str, pathlib.Path]
+    n: int
+    factor: int
+    label: str
+    factor_history: list[int]
+    reproduced: bool
+    last_values: dict[str, str]
+
     def __init__(self) -> None:
         super().__init__()
         self._tmp = tempfile.TemporaryDirectory()
@@ -81,7 +95,7 @@ class SkipContractMachine(stateful.RuleBasedStateMachine):
         config_io.clear_config_cache()
 
         with compose.Pipeline("test", root=self.root) as pipeline:
-            scaled = scale(pipeline.input("numbers.txt"), params=ScaleParams())
+            scaled = scale(pipeline.input("numbers.txt", t=str), params=ScaleParams())
             offsetted = offset(scaled)
             total(scaled, offsetted)
         self.pipeline = pipeline
@@ -179,6 +193,7 @@ class SkipContractMachine(stateful.RuleBasedStateMachine):
         self.last_values = expected
         self.reproduced = True
 
+    @typing.override
     def teardown(self) -> None:
         os.chdir(self._saved_cwd)
         project._project_root_cache = self._saved_root
