@@ -358,9 +358,10 @@ def _encode_jsonl_column(
     if isinstance(dtype, pandas.DatetimeTZDtype):
         # Values are ISO UTC text; metadata records the original zone for exact restoration.
         metadata: dict[str, object] = {"kind": "datetime", "timezone": str(dtype.tz)}
-        return _iso_datetime_texts(
-            series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z"
-        ), metadata
+        return (
+            _iso_datetime_texts(series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z"),
+            metadata,
+        )
     if pandas.api.types.is_datetime64_dtype(dtype):
         return _iso_datetime_texts(series), {"kind": "datetime", "timezone": None}
     if pandas.api.types.is_timedelta64_dtype(dtype):
@@ -429,6 +430,7 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     def load(self, path: pathlib.Path) -> pandas.DataFrame:
         records = list[object]()
         temporal_columns = dict[str, collections_abc.Mapping[str, object]]()
+        float_columns = dict[str, str]()
         with path.open() as f:
             for line_num, line in enumerate(f, 1):
                 if not line.strip():
@@ -462,6 +464,16 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                             temporal_columns[name] = cast(
                                 "collections_abc.Mapping[str, object]", metadata
                             )
+                        raw_float = typed_metadata.get("float_columns", {})
+                        if not isinstance(raw_float, dict):
+                            raise ValueError(f"Invalid DataFrameJSONL float metadata at {path}")
+                        float_mapping = cast("dict[object, object]", raw_float)
+                        for name, dtype in float_mapping.items():
+                            if not isinstance(name, str) or not isinstance(dtype, str):
+                                raise ValueError(
+                                    f"Invalid DataFrameJSONL float column metadata at {path}"
+                                )
+                            float_columns[name] = dtype
                         continue
                 records.append(cast("object", record))
         frame = pandas.DataFrame(records)
@@ -469,6 +481,10 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             if name not in frame.columns:
                 frame[name] = pandas.Series(pandas.NaT, index=frame.index)
             frame[name] = _restore_temporal_jsonl_column(frame[name], metadata)
+        for name, dtype in float_columns.items():
+            if name not in frame.columns:
+                frame[name] = pandas.Series(math.nan, index=frame.index)
+            frame[name] = frame[name].astype(dtype)
         return frame
 
     @override
@@ -489,8 +505,10 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
         keys = list[str]()
         columns = list[list[str]]()
         temporal_columns = dict[str, dict[str, object]]()
+        float_columns = dict[str, str]()
         for name in data.columns:
             string_name = str(name)
+            dtype = data[name].dtype
             try:
                 column, temporal_metadata = _encode_jsonl_column(data[name], encoder)
             except TypeError as e:
@@ -503,11 +521,14 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             keys.append(encoder.encode(string_name) + ":")
             if temporal_metadata is not None:
                 temporal_columns[string_name] = temporal_metadata
+            if pandas.api.types.is_float_dtype(dtype):
+                float_columns[string_name] = str(dtype)
 
         metadata = {
             _DATAFRAME_METADATA_KEY: {
                 "version": _DATAFRAME_METADATA_VERSION,
                 "temporal_columns": temporal_columns,
+                "float_columns": float_columns,
             }
         }
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -981,6 +981,7 @@ def test_dataframe_jsonl_roundtrips_date_and_time_columns(tmp_path: pathlib.Path
                 "tz": {"kind": "datetime", "timezone": "America/New_York"},
                 "delta": {"kind": "timedelta"},
             },
+            "float_columns": {},
         }
     }
     assert jsonl_records[1]["date"] == "2024-03-04T00:00:00.000000000"
@@ -1061,11 +1062,23 @@ def test_dataframe_jsonl_roundtrips_all_null_temporal_dtypes(tmp_path: pathlib.P
     pandas.testing.assert_frame_equal(loaded, df)
 
 
+def test_dataframe_jsonl_roundtrips_all_nan_float_dtype(tmp_path: pathlib.Path) -> None:
+    jsonl_file = tmp_path / "all-nan-float.jsonl"
+    frame = pandas.DataFrame({"score": pandas.Series([math.nan, math.nan], dtype="float64")})
+
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, frame)
+
+
 def test_dataframe_jsonl_refuses_extended_precision_float(tmp_path: pathlib.Path) -> None:
     df = pandas.DataFrame({"x": numpy.array([numpy.longdouble("1.0000000000000000009")])})
 
     with pytest.raises(TypeError, match="float128"):
         loaders.DataFrameJSONL().save(df, tmp_path / "float128.jsonl")
+
+
 
 
 @pytest.mark.parametrize(
