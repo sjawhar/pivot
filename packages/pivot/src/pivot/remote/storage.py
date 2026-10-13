@@ -8,6 +8,8 @@ import re
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict
 
+import xxhash
+
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
 from pivot.types import TransferResult
@@ -188,8 +190,9 @@ async def _write_all_async(fd: int, data: bytes) -> None:
 async def _stream_download_to_fd(
     response: GetObjectOutputTypeDef,
     fd: int,
-) -> None:
-    """Stream S3 response body to file descriptor in chunks with timeout."""
+) -> str:
+    """Stream S3 response body to fd and return its xxh64 integrity digest."""
+    hasher = xxhash.xxh64()
     stream = response["Body"]
     try:
         while True:
@@ -199,10 +202,12 @@ async def _stream_download_to_fd(
             )
             if not chunk:
                 break
+            hasher.update(chunk)
             await _write_all_async(fd, chunk)
     finally:
         with contextlib.suppress(Exception):
             stream.close()  # pyright: ignore[reportUnknownMemberType]
+    return hasher.hexdigest()
 
 
 async def _atomic_download(
@@ -210,10 +215,14 @@ async def _atomic_download(
     bucket: str,
     key: str,
     local_path: Path,
+    expected_hash: str,
     *,
     readonly: bool = False,
 ) -> None:
-    """Download S3 object to local path atomically via temp file with streaming.
+    """Download an expected cache blob atomically and verify its xxh64 integrity.
+
+    The digest detects accidental corruption during storage or transfer. It does not
+    authenticate remote content.
 
     Args:
         readonly: If True, set file permissions to 0o444 (for cache files).
@@ -235,9 +244,15 @@ async def _atomic_download(
                     f"Access denied to {bucket}/{key}. Check AWS credentials."
                 ) from exc
             raise exceptions.RemoteError(f"Failed to download from S3: {exc}") from exc
-        await _stream_download_to_fd(response, fd)
+        actual_hash = await _stream_download_to_fd(response, fd)
         os.close(fd)
         fd = -1  # Mark as closed
+        if actual_hash != expected_hash:
+            raise exceptions.RemoteError(
+                "Downloaded remote cache content hash mismatch: "
+                + f"expected {expected_hash}, got {actual_hash}. "
+                + "Re-push the cache entry from a trusted source."
+            )
         if readonly:
             os.chmod(tmp_path, 0o444)
         os.replace(tmp_path, local_path)
@@ -555,6 +570,7 @@ class S3Remote:
                     self._bucket,
                     _hash_to_key(self._prefix, cache_hash),
                     local_path,
+                    cache_hash,
                     readonly=readonly,
                 )
         except botocore_exc.ClientError as e:
@@ -643,6 +659,7 @@ class S3Remote:
                                 self._bucket,
                                 _hash_to_key(self._prefix, hash_),
                                 local_path,
+                                hash_,
                                 readonly=readonly,
                             )
                             completed += 1
