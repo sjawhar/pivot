@@ -11,6 +11,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,7 @@ else:
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
+    from types_aiobotocore_s3 import S3Client
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import OutputEvent
@@ -553,3 +555,26 @@ def bind_test_pipeline_helper(request: pytest.FixtureRequest) -> Generator[None]
     helpers.set_test_pipeline(request.getfixturevalue("test_pipeline"))
     yield
     helpers.set_test_pipeline(None)
+
+
+# =============================================================================
+# S3 (moto)
+# =============================================================================
+
+
+@pytest.fixture
+async def moto_s3_bucket(
+    moto_patch_session: object, aioboto3_s3_client: S3Client
+) -> AsyncGenerator[str]:
+    """Create a test bucket in moto with unique name for xdist support.
+
+    Uses pytest-aioboto3's moto_patch_session to mock S3 and aioboto3_s3_client
+    to create the bucket. Bucket name includes a unique suffix to prevent
+    conflicts when running tests in parallel with pytest-xdist.
+
+    Yields:
+        str: The bucket name (e.g., "test-bucket-a1b2c3d4").
+    """
+    bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
+    await aioboto3_s3_client.create_bucket(Bucket=bucket_name)
+    yield bucket_name
