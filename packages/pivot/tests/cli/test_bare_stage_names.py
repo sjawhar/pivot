@@ -11,6 +11,8 @@ if TYPE_CHECKING:
 
     import click.testing
 
+    from conftest import GitRepo
+
 
 class _HelperParams(StageParams):
     factor: int = 3
@@ -110,6 +112,22 @@ def test_checkout_resolves_bare_stage_name(
     output.unlink()
 
     result = runner.invoke(cli.cli, ["checkout", "_helper_upper"])
+
+    assert result.exit_code == 0, result.output
+    assert output.read_text() == "AB"
+
+
+def test_get_resolves_bare_stage_name(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner, git_repo: GitRepo
+) -> None:
+    _, commit = git_repo
+    _register(mock_discovery)
+    executor.run(pipeline=mock_discovery)
+    sha = commit("run")
+    output = _output(mock_discovery, "_helper_upper")
+    output.unlink()
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "_helper_upper"])
 
     assert result.exit_code == 0, result.output
     assert output.read_text() == "AB"
