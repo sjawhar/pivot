@@ -179,15 +179,6 @@ def _ensure_identity_keys(
     return {identity_from_key(k): v for k, v in cast("dict[str, HashInfo]", hashes).items()}
 
 
-def _ensure_identity_list(
-    paths: list[ArtifactIdentity] | list[str],
-) -> list[ArtifactIdentity]:
-    if not paths:
-        return []
-    if isinstance(paths[0], ArtifactIdentity):
-        return cast("list[ArtifactIdentity]", paths)
-    return [identity_from_key(p) for p in cast("list[str]", paths)]
-
 
 class StageLock:
     """Manages lock file for a single pipeline stage."""
@@ -241,43 +232,6 @@ class StageLock:
 
         cache.atomic_write_file(self.path, write_yaml)
 
-    def is_changed(
-        self,
-        current_fingerprint: dict[str, str],
-        current_params: dict[str, Any],
-        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
-        out_paths: list[ArtifactIdentity] | list[str] | None = None,
-    ) -> tuple[bool, str]:
-        lock_data = self.read()
-        return self.is_changed_with_lock_data(
-            lock_data, current_fingerprint, current_params, dep_hashes, out_paths
-        )
-
-    def is_changed_with_lock_data(
-        self,
-        lock_data: LockData | None,
-        current_fingerprint: dict[str, str],
-        current_params: dict[str, Any],
-        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
-        out_paths: list[ArtifactIdentity] | list[str] | None = None,
-    ) -> tuple[bool, str]:
-        if lock_data is None:
-            return True, "No previous run"
-
-        if lock_data["code_manifest"] != current_fingerprint:
-            return True, "Code changed"
-        if lock_data["params"] != current_params:
-            return True, "Params changed"
-        normalized_deps = _ensure_identity_keys(dep_hashes)
-        if lock_data["dep_hashes"] != normalized_deps:
-            return True, "Input dependencies changed"
-        if out_paths is not None:
-            locked_out_paths = sorted(lock_data["output_hashes"].keys())
-            normalized_outs = _ensure_identity_list(out_paths)
-            if sorted(normalized_outs) != locked_out_paths:
-                return True, "Output paths changed"
-
-        return False, ""
 
 
 def find_orphaned_locks(
