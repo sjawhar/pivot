@@ -12,7 +12,7 @@ from pivot.storage import cache
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterable
 
 
 @runtime_checkable
@@ -276,6 +276,19 @@ class WorkspaceStore:
         CLI commands.
         """
         return self._resolve_output_path(ref)
+
+    def output_identities_by_path(
+        self, outs: Iterable[types.ArtifactRef]
+    ) -> dict[str, types.ArtifactIdentity]:
+        """Map each output's workspace path (relative to the project root) to its identity.
+
+        The inverse of ``resolve_display_path`` over stage outputs, for resolving a
+        user-typed file path to the artifact it belongs to.
+        """
+        return {
+            str(self.resolve_display_path(out).relative_to(self._project_root)): out.identity
+            for out in outs
+        }
 
     def exists(self, ref: types.ArtifactRef) -> bool:
         path = self._resolve_path(ref)

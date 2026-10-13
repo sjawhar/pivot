@@ -304,6 +304,23 @@ def test_resolve_output_path_uses_prefixed_producer(tmp_path: pathlib.Path) -> N
     assert "ignored" not in str(path)  # pipeline_name should not appear
 
 
+def test_output_identities_by_path_maps_display_paths_to_identities(
+    tmp_path: pathlib.Path,
+) -> None:
+    ws = store.WorkspaceStore(tmp_path, "pipe", {})
+    single = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    keyed = _helper_ref("smoke/train", "model", types.ArtifactTag.DATA, loaders.CSV())
+    metric = _helper_ref("smoke/train", "score", types.ArtifactTag.METRIC, loaders.JSON())
+
+    mapping = ws.output_identities_by_path([single, keyed, metric])
+
+    assert mapping == {
+        "data/smoke/total.yaml": single.identity,
+        "data/smoke/train/model.csv": keyed.identity,
+        "metrics/smoke/train/score.json": metric.identity,
+    }
+
+
 def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:
     spec: store.StoreSpec = {
         "kind": "cache",

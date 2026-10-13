@@ -110,22 +110,6 @@ def get_stage_dep_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set
     return hashes
 
 
-def _stage_output_identities_by_path(
-    proj_root: pathlib.Path, all_stages: dict[str, RegistryStageInfo]
-) -> dict[str, types.ArtifactIdentity]:
-    """Map each registered stage output's workspace path (project-relative) to its identity."""
-    # Display paths depend only on the qualified stage name, never on the pipeline name.
-    workspace = store_mod.WorkspaceStore(
-        project_root=proj_root, pipeline_name="", input_bindings={}
-    )
-    resolved_root = proj_root.resolve()
-    return {
-        str(workspace.resolve_display_path(out).relative_to(resolved_root)): out.identity
-        for stage_info in all_stages.values()
-        for out in stage_info["outs"]
-    }
-
-
 def _get_file_hash_from_stages(
     target_identity_key: str,
     state_dir: pathlib.Path,
@@ -266,7 +250,11 @@ def get_target_hashes(
         # A workspace path of a stage output stands for that output's identity.
         if all_stages is not None:
             if output_identities is None:
-                output_identities = _stage_output_identities_by_path(proj_root, all_stages)
+                # Display paths depend only on qualified stage names, not the pipeline name.
+                workspace = store_mod.WorkspaceStore(proj_root, "", {})
+                output_identities = workspace.output_identities_by_path(
+                    out for stage_info in all_stages.values() for out in stage_info["outs"]
+                )
             target_identity = output_identities.get(rel_path, target_identity)
 
         out_hash = _get_file_hash_from_stages(
