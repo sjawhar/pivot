@@ -11,6 +11,7 @@ import cloudpickle
 import pytest
 
 from pivot import discovery
+from tests import conftest
 
 
 def test_find_config_in_dir_ignores_pivot_yaml(tmp_path: pathlib.Path) -> None:
@@ -50,7 +51,6 @@ def test_load_pipeline_from_module_requires_protocol_methods(tmp_path: pathlib.P
         "build_dag",
         "ensure_fingerprint",
         "snapshot",
-        "restore",
     ]:
         assert attr in message
 
@@ -78,9 +78,6 @@ class FakePipeline:
 
     def snapshot(self):
         return {}
-
-    def restore(self, snapshot):
-        return None
 
 
 pipeline = FakePipeline()
@@ -417,19 +414,18 @@ def test_discovery_restores_displaced_pipeline_module_and_caller_path(
     assert sys.path.count(str(root)) == 1
 
 
-def test_discovery_keeps_project_module_preimported_by_caller(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_discovery_keeps_project_module_preimported_by_caller(tmp_path: pathlib.Path) -> None:
     root = _write_sibling_stage_project(tmp_path / "project", "caller").parent
-    monkeypatch.syspath_prepend(str(root))
-    stages = importlib.import_module("stages")
+    # The caller's own import outlives discovery by design, so this test must remove it itself.
+    with conftest.stage_module_isolation(root):
+        stages = importlib.import_module("stages")
 
-    pipeline = discovery.discover_pipeline(project_root=root)
+        pipeline = discovery.discover_pipeline(project_root=root)
 
-    assert pipeline is not None
-    assert sys.modules["stages"] is stages
-    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
-    assert sys.modules["stages"] is stages
+        assert pipeline is not None
+        assert sys.modules["stages"] is stages
+        assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
+        assert sys.modules["stages"] is stages
 
 
 def test_discover_pipeline_missing_pipeline_variable_names_instance(

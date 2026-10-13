@@ -900,18 +900,6 @@ class StateDB:
     # Run cache for skip detection (like DVC's run cache)
     # -------------------------------------------------------------------------
 
-    def write_run_cache(self, stage_name: str, input_hash: str, entry: RunCacheEntry) -> None:
-        """Write a run cache entry for skip detection."""
-        self._check_closed()
-        self._check_write_allowed()
-        key = _RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode()
-        value = run_history.serialize_to_bytes(entry)
-        try:
-            with self._write_transaction(timeout=self._write_timeout) as txn:
-                txn.put(key, value)
-        except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
-
     def lookup_run_cache(self, stage_name: str, input_hash: str) -> RunCacheEntry | None:
         """Look up run cache entry for skip detection. Returns None if not found."""
         self._check_closed()

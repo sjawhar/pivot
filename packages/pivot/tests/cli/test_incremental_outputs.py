@@ -27,6 +27,23 @@ with Pipeline("incremental") as pipeline:
     update(pipeline.input("row.txt"), previous=pipeline.previous())
 """
 
+_CSV_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, incremental, loaders, stage
+
+
+@stage
+def keep(previous: pd.DataFrame) -> Annotated[pd.DataFrame, incremental, loaders.CSV()]:
+    return previous
+
+
+with Pipeline("incremental") as pipeline:
+    keep(previous=pipeline.previous())
+"""
+
 
 def _write_pipeline_and_input() -> None:
     pathlib.Path("pipeline.py").write_text(_PIPELINE)
@@ -62,3 +79,18 @@ def test_uncached_incremental_flags_are_orthogonal_through_cli(
             cli.cli, ["repro", "--force", "--allow-uncached-incremental"]
         )
         assert forced_allowed.exit_code == 0, forced_allowed.output
+
+
+def test_incremental_csv_empty_first_value_loads_on_next_run(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A CSV incremental stage can pass its first empty value through twice."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_CSV_PIPELINE)
+
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, first.output
+
+        second = runner.invoke(cli.cli, ["repro", "--force"])
+        assert second.exit_code == 0, second.output
+        assert "1 ran" in second.output

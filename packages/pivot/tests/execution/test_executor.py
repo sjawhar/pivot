@@ -107,12 +107,26 @@ def _sleep_b() -> str:
     return "b"
 
 
-def _timed(label: str, *, fail: bool = False) -> str:
-    """Record a timing interval in the worker cwd for resource scheduling checks."""
+def _timed(label: str, *, fail: bool = False, partner: str | None = None) -> str:
+    """Record a stage interval and optionally wait until a partner has started."""
     timing_path = pathlib.Path("resource_timing.log")
     with timing_path.open("a") as timing:
         timing.write(f"start {label} {time.monotonic()}\n")
-    time.sleep(0.25)
+
+    if partner is not None:
+        deadline = time.monotonic() + 30.0
+        partner_prefix = f"start {partner} "
+        while True:
+            if any(
+                line.startswith(partner_prefix) for line in timing_path.read_text().splitlines()
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"partner {partner} never started")
+            time.sleep(0.01)
+    else:
+        time.sleep(0.25)
+
     with timing_path.open("a") as timing:
         timing.write(f"end {label} {time.monotonic()}\n")
     if fail:
@@ -130,6 +144,22 @@ def _resource_b() -> str:
 
 def _resource_cpu() -> str:
     return _timed("cpu")
+
+
+def _resource_a_wait_for_b() -> str:
+    return _timed("a", partner="b")
+
+
+def _resource_b_wait_for_a() -> str:
+    return _timed("b", partner="a")
+
+
+def _resource_a_wait_for_cpu() -> str:
+    return _timed("a", partner="cpu")
+
+
+def _resource_cpu_wait_for_a() -> str:
+    return _timed("cpu", partner="a")
 
 
 def _resource_c(value: str) -> str:
@@ -630,9 +660,9 @@ def test_resource_waiting_does_not_consume_worker(
     pipeline = _resource_pipeline(
         root,
         [
-            ({"gpu": 1}, _resource_a, ()),
+            ({"gpu": 1}, _resource_a_wait_for_cpu, ()),
             ({"gpu": 1}, _resource_b, ()),
-            (None, _resource_cpu, ()),
+            (None, _resource_cpu_wait_for_a, ()),
         ],
     )
 
@@ -669,8 +699,8 @@ def test_resource_capacity_override_allows_concurrent_execution(
     pipeline = _resource_pipeline(
         root,
         [
-            ({"gpu": 1}, _resource_a, ()),
-            ({"gpu": 1}, _resource_b, ()),
+            ({"gpu": 1}, _resource_a_wait_for_b, ()),
+            ({"gpu": 1}, _resource_b_wait_for_a, ()),
         ],
     )
 
@@ -694,8 +724,8 @@ def test_configured_resource_capacity_allows_concurrent_execution(
     pipeline = _resource_pipeline(
         root,
         [
-            ({"gpu": 1}, _resource_a, ()),
-            ({"gpu": 1}, _resource_b, ()),
+            ({"gpu": 1}, _resource_a_wait_for_b, ()),
+            ({"gpu": 1}, _resource_b_wait_for_a, ()),
         ],
     )
 

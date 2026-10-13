@@ -842,3 +842,67 @@ def test_dataframe_jsonl_loader_is_picklable() -> None:
     restored = pickle.loads(pickled)
 
     assert isinstance(restored, loaders.DataFrameJSONL)
+
+
+# ==============================================================================
+# Incremental first-run values
+# ==============================================================================
+
+_LOADERS_WITH_EMPTY_VALUES: list[loaders.Loader[Any, Any]] = [
+    loaders.CSV(),
+    loaders.JSON(),
+    loaders.YAML(),
+    loaders.Text(),
+    loaders.JSONL(),
+    loaders.DataFrameJSONL(),
+]
+
+
+def test_empty_value_round_trip_cases_cover_every_builtin_loader_with_empty() -> None:
+    """Every built-in loader accepted for incremental outputs is checked below."""
+    implemented = {
+        value.__name__
+        for value in vars(loaders).values()
+        if isinstance(value, type)
+        and issubclass(value, loaders.Loader)
+        and value.empty is not loaders.Loader.empty
+    }
+    assert implemented == {type(loader).__name__ for loader in _LOADERS_WITH_EMPTY_VALUES}
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [pytest.param(loader, id=type(loader).__name__) for loader in _LOADERS_WITH_EMPTY_VALUES],
+)
+def test_incremental_loader_empty_value_round_trips(
+    loader: loaders.Loader[Any, Any], tmp_path: pathlib.Path
+) -> None:
+    """An incremental first-run value can be saved and loaded on the next run."""
+    path = tmp_path / "empty-value"
+    empty = loader.empty()
+
+    loader.save(empty, path)
+    loaded = loader.load(path)
+
+    if isinstance(empty, pandas.DataFrame):
+        pandas.testing.assert_frame_equal(loaded, empty)
+    else:
+        assert loaded == empty
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        pytest.param('a,b\n1,"unterminated\n', pandas.errors.ParserError, id="unterminated-quote"),
+        pytest.param("\n\n\n", pandas.errors.EmptyDataError, id="multiple-blank-lines"),
+    ],
+)
+def test_csv_loader_rejects_files_other_than_the_empty_frame_encoding(
+    content: str, error: type[Exception], tmp_path: pathlib.Path
+) -> None:
+    """Only the single line break written for a zero-column frame loads as empty."""
+    path = tmp_path / "bad.csv"
+    path.write_text(content)
+
+    with pytest.raises(error):
+        loaders.CSV().load(path)

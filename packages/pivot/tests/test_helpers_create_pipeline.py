@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING
 import cloudpickle
 
 from pivot import discovery, executor, project, stage_def
-from tests import helpers
+from tests import conftest, helpers
 
 if TYPE_CHECKING:
     import pathlib
 
     import pytest
+
+    from pivot.registry import PipelineLike
 
 
 class _GeneratedParams(stage_def.StageParams):
@@ -62,6 +64,17 @@ class _GeneratedParams(stage_def.StageParams):
     assert (tmp_path / "data/test/consume.txt").read_text() == "consume:configured:seed"
 
 
+def _discover(pipeline_path: pathlib.Path) -> PipelineLike:
+    """Load a root pipeline.py through discover_pipeline, which raises the real load error.
+
+    load_pipeline_from_path logs a failed import at debug level and returns None, so a test
+    asserting on its result reports only `assert None is not None`.
+    """
+    pipeline = discovery.discover_pipeline(project_root=pipeline_path.parent)
+    assert pipeline is not None, f"{pipeline_path} defines no pipeline"
+    return pipeline
+
+
 def _write_project_with_sibling_stage(root: pathlib.Path, value: str) -> pathlib.Path:
     (root / ".git").mkdir(parents=True)
     (root / ".pivot").mkdir()
@@ -99,8 +112,7 @@ def test_reusable_worker_executes_current_project_sibling_module(
     second = _write_project_with_sibling_stage(tmp_path / "second", "second")
 
     monkeypatch.setattr(project, "_project_root_cache", first.parent)
-    first_pipeline = discovery.load_pipeline_from_path(first)
-    assert first_pipeline is not None
+    first_pipeline = _discover(first)
     first_results = executor.run(
         pipeline=first_pipeline,
         parallel=True,
@@ -111,8 +123,7 @@ def test_reusable_worker_executes_current_project_sibling_module(
     assert (first.parent / "data/test/build.txt").read_text() == "first"
 
     monkeypatch.setattr(project, "_project_root_cache", second.parent)
-    second_pipeline = discovery.load_pipeline_from_path(second)
-    assert second_pipeline is not None
+    second_pipeline = _discover(second)
     second_results = executor.run(
         pipeline=second_pipeline,
         parallel=True,
@@ -152,8 +163,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
 """
     )
 
-    pipeline = discovery.load_pipeline_from_path(pipeline_path)
-    assert pipeline is not None
+    pipeline = _discover(pipeline_path)
     executor.run(pipeline=pipeline, parallel=True, max_workers=1, force=True)
     first = (tmp_path / "data/test/class_identity.txt").read_text()
     executor.run(pipeline=pipeline, parallel=True, max_workers=1, force=True)
@@ -170,30 +180,29 @@ def test_reusable_worker_executes_preimported_current_project_sibling(
     second = _write_project_with_sibling_stage(tmp_path / "second", "second")
 
     monkeypatch.setattr(project, "_project_root_cache", first.parent)
-    first_pipeline = discovery.load_pipeline_from_path(first)
-    assert first_pipeline is not None
+    first_pipeline = _discover(first)
     executor.run(pipeline=first_pipeline, parallel=True, max_workers=1, force=True)
 
-    sys.modules.pop("stages", None)
-    monkeypatch.syspath_prepend(str(second.parent))
-    second_stages = importlib.import_module("stages")
-    assert second_stages.build() == "second"
+    # This test imports B's `stages` as the caller would. Discovery leaves a caller's own import
+    # in place, so the isolation block removes it before any later test in this worker runs.
+    with conftest.stage_module_isolation(second.parent):
+        second_stages = importlib.import_module("stages")
+        assert second_stages.build() == "second"
 
-    monkeypatch.setattr(project, "_project_root_cache", second.parent)
-    second_pipeline = discovery.load_pipeline_from_path(second)
-    assert second_pipeline is not None
-    assert "stages" in cloudpickle.list_registry_pickle_by_value()
-    second_results = executor.run(
-        pipeline=second_pipeline,
-        parallel=True,
-        max_workers=1,
-        force=True,
-    )
-    assert second_results["test/build"]["status"] == "ran"
-    assert (second.parent / "data/test/build.txt").read_text() == "second"
+        monkeypatch.setattr(project, "_project_root_cache", second.parent)
+        second_pipeline = _discover(second)
+        assert "stages" in cloudpickle.list_registry_pickle_by_value()
+        second_results = executor.run(
+            pipeline=second_pipeline,
+            parallel=True,
+            max_workers=1,
+            force=True,
+        )
+        assert second_results["test/build"]["status"] == "ran"
+        assert (second.parent / "data/test/build.txt").read_text() == "second"
 
-    discovery.discover_pipeline(project_root=tmp_path / "empty")
-    sys.modules.pop("stages", None)
+        # End B's discovery session while the isolation block still owns B's sys.path entry.
+        discovery.discover_pipeline(project_root=tmp_path / "empty")
 
 
 def test_discovery_does_not_pickle_editable_src_package_by_value(

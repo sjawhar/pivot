@@ -1398,18 +1398,3 @@ def _try_skip_via_run_cache_with_store(
         output_hashes=output_hashes,
         outputs_restored=restoration.outputs_restored,
     )
-
-
-def write_run_cache_entry(
-    stage_name: str,
-    input_hash: str,
-    output_hashes: dict[str, HashInfo],
-    run_id: str,
-    state_db: state.StateDB,
-) -> None:
-    """Write run cache entry after successful execution."""
-    output_entries = [
-        run_history.output_hash_to_entry(path, oh) for path, oh in output_hashes.items()
-    ]
-    cache_entry = run_history.RunCacheEntry(run_id=run_id, output_hashes=output_entries)
-    state_db.write_run_cache(stage_name, input_hash, cache_entry)
