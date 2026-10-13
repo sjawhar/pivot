@@ -181,6 +181,24 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
     return FileHash(hash=track_data["hash"])
 
 
+def _get_tracked_hashes(proj_root: pathlib.Path) -> set[str]:
+    """Blob hashes of every .pvt-tracked file or directory in the project."""
+    hashes = set[str]()
+    for pvt_data in track.discover_pvt_files(proj_root).values():
+        hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt_data))
+    return hashes
+
+
+def _is_cached_stage_output(
+    identity: types.ArtifactIdentity, producer_info: RegistryStageInfo
+) -> bool:
+    """Whether a stage output is stored in the cache (Metrics are git-tracked, not cached)."""
+    return not any(
+        out.identity == identity and out.tag is types.ArtifactTag.METRIC
+        for out in producer_info["outs"]
+    )
+
+
 def get_target_hashes(
     targets: list[str],
     state_dir: pathlib.Path,
@@ -193,6 +211,7 @@ def get_target_hashes(
     hashes = set[str]()
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
+    tracked_hashes: set[str] | None = None
 
     for target in targets:
         original_target = target
@@ -225,8 +244,19 @@ def get_target_hashes(
                             if types.identity_key(out_path) not in non_cached_paths:
                                 hashes |= _extract_file_hashes_from_hash_info(out_hash)
                         if include_deps:
-                            for dep_hash in lock_data["dep_hashes"].values():
-                                hashes |= _extract_file_hashes_from_hash_info(dep_hash)
+                            # Only deps whose blobs pivot caches (and so pushes) can be fetched:
+                            # upstream stage outputs and .pvt-tracked inputs. Raw inputs
+                            # committed to git are never in the remote.
+                            for dep_identity, dep_hash in lock_data["dep_hashes"].items():
+                                dep_blobs = _extract_file_hashes_from_hash_info(dep_hash)
+                                producer_info = all_stages.get(dep_identity.producer)
+                                if producer_info is not None:
+                                    if _is_cached_stage_output(dep_identity, producer_info):
+                                        hashes |= dep_blobs
+                                    continue
+                                if tracked_hashes is None:
+                                    tracked_hashes = _get_tracked_hashes(proj_root)
+                                hashes |= dep_blobs & tracked_hashes
                         continue
             else:
                 resolved_identity = types.ArtifactIdentity(stage_name, target_identity.key)
