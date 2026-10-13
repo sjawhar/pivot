@@ -125,6 +125,17 @@ class _SinkRuntime:
     disabled_event: anyio.Event = field(default_factory=anyio.Event)
 
 
+_WatchOutputSignature = tuple[int, int, int] | None
+
+
+@dataclass(slots=True)
+class _WatchOutputSnapshot:
+    """Filesystem state of an output after pivot completed its write."""
+
+    is_directory: bool
+    entries: dict[pathlib.Path, _WatchOutputSignature]
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -149,7 +160,7 @@ class Engine:
     # Orchestration state
     _graph: nx.DiGraph[str] | None
     _watch_coordinator: engine_watch.WatchCoordinator | None
-    _watch_output_stats: dict[pathlib.Path, tuple[int, int, int] | None]
+    _watch_output_stats: dict[pathlib.Path, _WatchOutputSnapshot]
     _scheduler: engine_scheduler.Scheduler
     _cancel_event: anyio.Event
     _stage_indices: dict[str, tuple[int, int]]
@@ -199,7 +210,7 @@ class Engine:
         # Orchestration state
         self._graph = None
         self._watch_coordinator = None
-        self._watch_output_stats = dict[pathlib.Path, tuple[int, int, int] | None]()
+        self._watch_output_stats = dict[pathlib.Path, _WatchOutputSnapshot]()
         self._scheduler = engine_scheduler.Scheduler()
         self._cancel_event = anyio.Event()
         self._stage_indices = dict[str, tuple[int, int]]()
@@ -2071,6 +2082,25 @@ class Engine:
 
         return any(isinstance(source, FilesystemSource) for source in self._sources)
 
+    def _snapshot_watch_output(self, path: pathlib.Path) -> _WatchOutputSnapshot:
+        """Capture every currently visible path in one output's filesystem tree."""
+        entries = dict[pathlib.Path, _WatchOutputSignature]()
+
+        def _record(entry: pathlib.Path) -> None:
+            try:
+                stat = entry.stat()
+            except FileNotFoundError:
+                entries[entry] = None
+                return
+            entries[entry] = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
+        _record(path)
+        is_directory = path.is_dir()
+        if is_directory:
+            for child in path.rglob("*"):
+                _record(child)
+        return _WatchOutputSnapshot(is_directory=is_directory, entries=entries)
+
     def _record_watch_output_stats(self, stage_name: str) -> None:
         """Remember output filesystem state written by a completed watched stage."""
         if not self._watches_filesystem():
@@ -2078,39 +2108,26 @@ class Engine:
         coordinator = self._get_watch_coordinator()
         if coordinator is None:
             return
-
-        def _record(path: pathlib.Path) -> None:
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                self._watch_output_stats[path] = None
-                return
-            self._watch_output_stats[path] = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
-
         for path, identity in coordinator.artifact_paths.items():
-            if engine_graph.get_producer(coordinator.graph, identity) != stage_name:
-                continue
-            _record(path)
-            if path.is_dir():
-                for child in path.rglob("*"):
-                    if child.is_file():
-                        _record(child)
+            if engine_graph.get_producer(coordinator.graph, identity) == stage_name:
+                self._watch_output_stats[path] = self._snapshot_watch_output(path)
 
     def _is_own_watch_output_write(self, path: pathlib.Path) -> bool:
         """Return whether a changed output still matches the engine's own write."""
-        current = project.normalize_path(path)
-        while True:
-            if current in self._watch_output_stats:
-                expected = self._watch_output_stats[current]
-                try:
-                    stat = current.stat()
-                except FileNotFoundError:
-                    return expected is None
-                return expected == (stat.st_mtime_ns, stat.st_size, stat.st_ino)
-            parent = current.parent
-            if parent == current:
-                return False
-            current = parent
+        changed_path = project.normalize_path(path)
+        roots = sorted(
+            self._watch_output_stats,
+            key=lambda root: len(root.parts),
+            reverse=True,
+        )
+        for root in roots:
+            snapshot = self._watch_output_stats[root]
+            if changed_path != root and (
+                not snapshot.is_directory or not changed_path.is_relative_to(root)
+            ):
+                continue
+            return self._snapshot_watch_output(root) == snapshot
+        return False
 
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""

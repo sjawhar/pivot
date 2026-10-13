@@ -424,7 +424,7 @@ async def test_engine_distinguishes_own_and_external_directory_output_writes(
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
     ).resolve_display_path(directory_ref)
-    child_path = output_dir / "results" / "child.txt"
+    child_path = output_dir / "results" / "sub" / "child.txt"
     child_path.parent.mkdir(parents=True)
     child_path.write_text("pivot write")
     executed = list[list[str]]()
@@ -459,9 +459,10 @@ async def test_engine_distinguishes_own_and_external_directory_output_writes(
         )
         assert executed == []
 
-        child_path.write_text("external write with a new size")
+        new_external_path = output_dir / "results" / "sub" / "new.txt"
+        new_external_path.write_text("external nested write")
         await engine._handle_data_artifact_changed(
-            DataArtifactChanged(type="data_artifact_changed", paths=[str(child_path)])
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(new_external_path)])
         )
 
     assert executed == [[total_stage]]
