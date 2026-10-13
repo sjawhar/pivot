@@ -118,6 +118,7 @@ _shared_envs = dict[pathlib.Path, _SharedEnv]()
 _shared_envs_lock = threading.RLock()
 _fork_gate = _ForkGate()
 _fork_drained = False
+_inherited_env_paths = set[pathlib.Path]()
 
 
 def _open_env(lmdb_path: pathlib.Path) -> lmdb.Environment:
@@ -137,6 +138,10 @@ def _env_identity(lmdb_path: pathlib.Path) -> tuple[int, int, int, int] | None:
 
 def _acquire_shared_env(lmdb_path: pathlib.Path) -> _SharedEnv:
     """Acquire this process's shared LMDB environment lease for lmdb_path."""
+    if lmdb_path in _inherited_env_paths:
+        raise StateDBError(
+            f"StateDB {lmdb_path} was open during fork; use spawn or forkserver to access it in the child"
+        )
     with _shared_envs_lock:
         shared = _shared_envs.get(lmdb_path)
         if shared is not None and _env_identity(lmdb_path) != shared["identity"]:
@@ -197,10 +202,13 @@ def _after_fork_parent() -> None:
 
 
 def _after_fork_child() -> None:
-    global _fork_drained, _fork_gate, _shared_envs, _shared_envs_lock
+    global _fork_drained, _fork_gate, _inherited_env_paths, _shared_envs, _shared_envs_lock
 
     if _fork_drained:
         _fork_gate.after_fork_child()
+        _inherited_env_paths = set[pathlib.Path]()
+    else:
+        _inherited_env_paths = set(_shared_envs)
     _fork_drained = False
     _fork_gate = _ForkGate()
     _shared_envs = dict[pathlib.Path, _SharedEnv]()

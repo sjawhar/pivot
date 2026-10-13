@@ -297,6 +297,12 @@ transaction = db._read_transaction()
 transaction.__enter__()
 pid = os.fork()
 if pid == 0:
+    try:
+        state.StateDB(pathlib.Path(sys.argv[1]))
+    except state.StateDBError as error:
+        assert 'use spawn or forkserver' in str(error)
+    else:
+        os._exit(1)
     os._exit(0)
 _, status = os.waitpid(pid, 0)
 assert os.waitstatus_to_exitcode(status) == 0
