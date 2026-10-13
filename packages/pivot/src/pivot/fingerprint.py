@@ -231,7 +231,8 @@ def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None
 
     project_root = project.get_project_root()
     for module in list(sys.modules.values()):
-        if not isinstance(module, types.ModuleType):
+        # Some libraries install non-module objects in sys.modules.
+        if not isinstance(cast("object", module), types.ModuleType):
             continue
         file = module.__dict__.get("__file__")
         if not isinstance(file, str) or not is_user_code(module):
