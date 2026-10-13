@@ -58,6 +58,13 @@ Defaults Pivot chooses without an annotation: `DataFrame` → `DataFrameJSONL()`
 `dict`/`list` → `YAML()`, `str` → `Text()`, `plot` tag → `MatplotlibFigure()`,
 `metric` tag → `YAML()`.
 
+### Pickle is a trusted-code boundary
+
+Loading a pickle can execute arbitrary code. Only load Pickle artifacts written
+by code you trust. A cache or remote that can supply pickle bytes is a
+trusted-code boundary: content hashes identify bytes, but they do not make
+those bytes safe. The loader emits a `RuntimeWarning` when it loads a pickle.
+
 `PathOnly()` hands a stage an input path without loading content. For an output,
 it takes ownership of a file or directory created outside the project and moves
 it to Pivot's managed path; a path already inside the project is rejected. Use

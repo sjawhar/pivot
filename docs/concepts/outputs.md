@@ -116,12 +116,16 @@ field is a separate artifact with its own hash, so a change that only affects
 
 Define the `TypedDict` at module level. The field name `_single` is reserved.
 
-## Not yet available
+## Directory artifacts and incremental outputs
 
-The compositional API has no way to declare a directory output (a variable set
-of files decided at run time) or an incremental output (a stage that reads its
-own previous result). Both designs are open; until both designs are available,
-return a `dict` or `TypedDict` instead.
+A stage can return a `pathlib.Path` to a directory it created outside the
+project. `PathOnly()` moves that directory to Pivot's managed output path and
+Pivot caches it as an artifact.
+
+The declarative `DirectoryOut` annotation for a variable set of files remains
+undecided; do not add that annotation to a compositional pipeline. Incremental
+outputs (a stage that reads its own previous result) also remain unavailable.
+Until that design is available, return a `dict` or `TypedDict` instead.
 
 ## Metrics and plots
 
