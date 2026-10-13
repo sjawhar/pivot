@@ -125,19 +125,40 @@ def _module_is_under_root(module: _stdlib_types.ModuleType, root: pathlib.Path) 
         return False
 
 
+def _module_name_matches_root_path(
+    module_name: str,
+    module: _stdlib_types.ModuleType,
+    root: pathlib.Path,
+) -> bool:
+    """Return whether a module's dotted name maps directly to a path below root."""
+    parts = module_name.split(".")
+    module_file = getattr(module, "__file__", None)
+    if isinstance(module_file, str):
+        resolved = pathlib.Path(module_file).resolve()
+        return resolved in {
+            root.joinpath(*parts).with_suffix(".py"),
+            root.joinpath(*parts, "__init__.py"),
+        }
+    module_paths = getattr(module, "__path__", ())
+    return any(pathlib.Path(path).resolve() == root.joinpath(*parts) for path in module_paths)
+
+
 def _track_root_modules(session: _ImportSession) -> None:
     """Track all current user imports under root so the next session can remove them."""
     for module_name, module in list(sys.modules.items()):
         if module_name == "pivot" or module_name.startswith("pivot."):
             continue
-        if (
-            _module_is_under_root(module, session.root)
-            and session.preexisting_root_modules.get(module_name) is not module
-        ):
+        if not _module_is_under_root(module, session.root):
+            continue
+        if session.preexisting_root_modules.get(module_name) is not module:
             session.owned_modules[module_name] = module
-            if module_name not in session.preexisting_pickle_by_value_modules:
-                cloudpickle.register_pickle_by_value(module)
-                session.pickle_by_value_modules[module_name] = module
+        if (
+            _module_name_matches_root_path(module_name, module, session.root)
+            and module_name not in session.preexisting_pickle_by_value_modules
+            and module_name not in session.pickle_by_value_modules
+        ):
+            cloudpickle.register_pickle_by_value(module)
+            session.pickle_by_value_modules[module_name] = module
 
 
 def _module_name_for_path(path: pathlib.Path, root: pathlib.Path) -> str:
@@ -180,9 +201,15 @@ def _rollback_import_attempt(
     session: _ImportSession,
     owned_before: set[str],
     displaced_before: set[str],
+    pickle_by_value_before: set[str],
 ) -> None:
     """Undo root modules and collisions created by one failed pipeline import."""
     _track_root_modules(session)
+    for module_name in set(session.pickle_by_value_modules) - pickle_by_value_before:
+        module = session.pickle_by_value_modules.pop(module_name)
+        if module_name not in session.preexisting_pickle_by_value_modules:
+            with contextlib.suppress(ValueError):
+                cloudpickle.unregister_pickle_by_value(module)
     for module_name in set(session.owned_modules) - owned_before:
         module = session.owned_modules.pop(module_name)
         if sys.modules.get(module_name) is module:
@@ -310,6 +337,7 @@ def _load_pipeline_from_module(
 
     owned_before = set(session.owned_modules)
     displaced_before = set(session.displaced_modules)
+    pickle_by_value_before = set(session.pickle_by_value_modules)
     try:
         if module is None:
             _ensure_parent_modules(module_name, session)
@@ -349,7 +377,12 @@ def _load_pipeline_from_module(
                 )
         return None
     except BaseException:
-        _rollback_import_attempt(session, owned_before, displaced_before)
+        _rollback_import_attempt(
+            session,
+            owned_before,
+            displaced_before,
+            pickle_by_value_before,
+        )
         if owns_session:
             _end_import_session(session)
             if _import_session is session:

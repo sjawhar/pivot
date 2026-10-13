@@ -7,6 +7,7 @@ import pathlib
 import sys
 import types as _stdlib_types
 
+import cloudpickle
 import pytest
 
 from pivot import discovery
@@ -444,3 +445,43 @@ def test_discover_pipeline_missing_pipeline_variable_names_instance(
         discovery.DiscoveryError, match="Found Pipeline instance named 'wrong_name'"
     ):
         discovery.discover_pipeline(project_root=tmp_path)
+
+
+def test_discover_all_rolls_back_pickle_registration_for_broken_sibling(
+    tmp_path: pathlib.Path,
+) -> None:
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "broken_helper.py").write_text("VALUE = 'broken'\n")
+    (broken / "pipeline.py").write_text(
+        """
+from broken.broken_helper import VALUE
+
+raise RuntimeError(VALUE)
+"""
+    )
+    valid = tmp_path / "valid"
+    valid.mkdir()
+    (valid / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def build() -> str:
+    return "valid"
+
+
+with Pipeline("valid", root=pathlib.Path(__file__).parent) as pipeline:
+    build()
+"""
+    )
+
+    pipeline = discovery.discover_pipeline(project_root=tmp_path, all_pipelines=True)
+
+    assert pipeline is not None
+    assert pipeline.list_stages() == ["valid/build"]
+    assert "broken.broken_helper" not in sys.modules
+    assert "broken.broken_helper" not in cloudpickle.list_registry_pickle_by_value()
