@@ -55,11 +55,61 @@ class _SharedEnv(typing.TypedDict):
     users: int
 
 
+@typing.final
+class _ForkGate:
+    """Allow concurrent transactions while draining them before fork."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._transactions = 0
+        self._forking = False
+        self._local = threading.local()
+
+    @contextlib.contextmanager
+    def transaction(self) -> Generator[None]:
+        with self._condition:
+            while self._forking:
+                self._condition.wait()
+            self._transactions += 1
+        self._local.depth = getattr(self._local, "depth", 0) + 1
+        try:
+            yield
+        finally:
+            self._local.depth -= 1
+            with self._condition:
+                self._transactions -= 1
+                if self._transactions == 0:
+                    self._condition.notify_all()
+
+    def before_fork(self) -> None:
+        if getattr(self._local, "depth", 0):
+            raise RuntimeError("Cannot fork while a StateDB transaction is active")
+        self._condition.acquire()
+        self._forking = True
+        while self._transactions:
+            self._condition.wait()
+
+    def after_fork_parent(self) -> None:
+        self._forking = False
+        self._condition.notify_all()
+        self._condition.release()
+
+    def after_fork_child(self) -> None:
+        self._forking = False
+        self._condition.release()
+
+    def abort_fork(self) -> None:
+        self._forking = False
+        self._condition.notify_all()
+        self._condition.release()
+
+
+# LMDB permits one environment per process/file. Fingerprint, explain,
+# coordinator, and worker paths create StateDB independently, so passing one
+# explicit handle cannot cover their overlapping lifetimes.
 _shared_envs = dict[pathlib.Path, _SharedEnv]()
 _shared_envs_lock = threading.RLock()
-# LMDB environments cannot survive a fork. Every database transaction holds
-# this gate; the before-fork hook closes environments only after they finish.
-_fork_gate = threading.RLock()
+_fork_gate = _ForkGate()
 
 
 def _open_env(lmdb_path: pathlib.Path) -> lmdb.Environment:
@@ -112,7 +162,7 @@ def _release_shared_env(lmdb_path: pathlib.Path, shared: _SharedEnv) -> None:
 
 def _before_fork() -> None:
     """Close environments only after current StateDB operations finish."""
-    _fork_gate.acquire()
+    _fork_gate.before_fork()
     try:
         with _shared_envs_lock:
             for shared in _shared_envs.values():
@@ -121,21 +171,20 @@ def _before_fork() -> None:
                     env.close()
                     shared["env"] = None
     except BaseException:
-        _fork_gate.release()
+        _fork_gate.abort_fork()
         raise
 
 
 def _after_fork_parent() -> None:
-    _fork_gate.release()
+    _fork_gate.after_fork_parent()
 
 
 def _after_fork_child() -> None:
-    global _shared_envs, _shared_envs_lock, _fork_gate
+    global _shared_envs, _shared_envs_lock
 
     _shared_envs = dict[pathlib.Path, _SharedEnv]()
     _shared_envs_lock = threading.RLock()
-    _fork_gate.release()
-    _fork_gate = threading.RLock()
+    _fork_gate.after_fork_child()
 
 
 os.register_at_fork(
@@ -269,7 +318,7 @@ class StateDB:
         state_dir.mkdir(parents=True, exist_ok=True)
         lmdb_path = (state_dir / "state.lmdb").resolve()
 
-        with _fork_gate:
+        with _fork_gate.transaction():
             self._shared = _acquire_shared_env(lmdb_path)
         self._lmdb_path = lmdb_path
         self._owner_pid = os.getpid()
@@ -308,7 +357,7 @@ class StateDB:
     @contextlib.contextmanager
     def _read_transaction(self) -> Generator[lmdb.Transaction]:
         """Begin a short read transaction while excluding fork teardown."""
-        with _fork_gate:
+        with _fork_gate.transaction():
             self._check_closed()
             with self._env.begin() as txn:
                 yield txn
@@ -322,26 +371,27 @@ class StateDB:
         mutual exclusion. This wrapper exists because LMDB's env.begin(write=True)
         blocks indefinitely with no timeout mechanism.
         """
-        with _fork_gate:
-            self._check_closed()
-            self._check_write_allowed()
-            start = time.monotonic()
-            with self._write_lock_path.open("a+b") as lock_file:
-                while True:
-                    try:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() - start >= timeout:
-                            raise exceptions.PivotDBWriteTimeoutError(
-                                f"Timed out after {timeout:.1f}s waiting for LMDB write lock"
-                            ) from None
-                        time.sleep(0.01)
+        self._check_closed()
+        self._check_write_allowed()
+        start = time.monotonic()
+        with self._write_lock_path.open("a+b") as lock_file:
+            while True:
                 try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() - start >= timeout:
+                        raise exceptions.PivotDBWriteTimeoutError(
+                            f"Timed out after {timeout:.1f}s waiting for LMDB write lock"
+                        ) from None
+                    time.sleep(0.01)
+            try:
+                with _fork_gate.transaction():
+                    self._check_closed()
                     with self._env.begin(write=True) as txn:
                         yield txn
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     @property
     def readonly(self) -> bool:
@@ -971,7 +1021,7 @@ class StateDB:
 
     def close(self) -> None:
         """Release this StateDB's lease on the shared environment."""
-        with _fork_gate:
+        with _fork_gate.transaction():
             if self._closed:
                 return
             self._closed = True
@@ -994,7 +1044,7 @@ class StateDB:
             )
 
     def __enter__(self) -> Self:
-        with _fork_gate:
+        with _fork_gate.transaction():
             self._check_closed()
             self._check_capacity_warning()
         return self

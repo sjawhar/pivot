@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import threading
 from typing import TYPE_CHECKING
 
 from pivot.storage import state
@@ -23,6 +24,40 @@ def test_state_dbs_share_environment_for_one_state_dir(tmp_path: pathlib.Path) -
             with state.StateDB(tmp_path, readonly=True) as second_reader:
                 assert second_reader.get(cached_file, cached_stat) == "cached-hash"
         assert reader.get(cached_file, cached_stat) == "cached-hash"
+
+
+def test_read_transactions_run_concurrently(tmp_path: pathlib.Path) -> None:
+    """Fork coordination must not serialize normal LMDB readers."""
+    db = state.StateDB(tmp_path)
+    db.put_raw(b"key", b"value")
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+
+    def first_reader() -> None:
+        with db._read_transaction() as txn:
+            assert txn.get(b"key") == b"value"
+            first_entered.set()
+            release_first.wait()
+
+    def second_reader() -> None:
+        assert first_entered.wait(5)
+        with db._read_transaction() as txn:
+            assert txn.get(b"key") == b"value"
+            second_entered.set()
+
+    first = threading.Thread(target=first_reader)
+    second = threading.Thread(target=second_reader)
+    first.start()
+    second.start()
+    assert first_entered.wait(5)
+    try:
+        assert second_entered.wait(0.5)
+    finally:
+        release_first.set()
+        first.join()
+        second.join()
+        db.close()
 
 
 def test_new_state_db_uses_recreated_environment(tmp_path: pathlib.Path) -> None:
