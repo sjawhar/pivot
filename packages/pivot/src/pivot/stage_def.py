@@ -57,7 +57,7 @@ def _validate_path_not_escaped(path: pathlib.Path, project_root: pathlib.Path) -
         )
 
 
-def _validate_directory_out_key(key: str, output_name: str) -> str:
+def validate_directory_out_key(key: str, output_name: str) -> str:
     """Validate and normalize a DirectoryOut key (relative path within directory).
 
     Returns the normalized key (redundant separators removed, Unicode NFC normalized).
@@ -139,7 +139,7 @@ def _collect_directory_out_ops(
             )
 
         # Validate and normalize the key
-        normalized_key = _validate_directory_out_key(key, name)
+        normalized_key = validate_directory_out_key(key, name)
 
         # Check for duplicates after normalization
         if normalized_key in seen_normalized:

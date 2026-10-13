@@ -14,6 +14,8 @@ from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import pytest
 
 
@@ -79,7 +81,11 @@ def test_get_data_outputs_from_stages_detects_format_from_ref(
     stage_info = {"train": _make_stage_info("train", [ref])}
 
     monkeypatch.setattr(cli_helpers, "list_stages", lambda: ["train"])
-    monkeypatch.setattr(cli_helpers, "get_stage", lambda name: stage_info[name])
+
+    def mock_get_stage(name: str) -> RegistryStageInfo:
+        return stage_info[name]
+
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     assert data_module.detect_format(pathlib.Path("train")) == DataFileFormat.UNKNOWN
 
@@ -103,7 +109,11 @@ def test_get_data_outputs_from_stages_uses_store_paths(
     stage_info = {"train": _make_stage_info("train", [ref])}
 
     monkeypatch.setattr(cli_helpers, "list_stages", lambda: ["train"])
-    monkeypatch.setattr(cli_helpers, "get_stage", lambda name: stage_info[name])
+
+    def mock_get_stage(name: str) -> RegistryStageInfo:
+        return stage_info[name]
+
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     result = data_module.get_data_outputs_from_stages()
 
@@ -141,7 +151,11 @@ def test_get_data_hashes_from_head_uses_identity_keys_and_store_paths(
     stage_info = {"train": _make_stage_info("train", [ref])}
 
     monkeypatch.setattr(cli_helpers, "list_stages", lambda: ["train"])
-    monkeypatch.setattr(cli_helpers, "get_stage", lambda name: stage_info[name])
+
+    def mock_get_stage(name: str) -> RegistryStageInfo:
+        return stage_info[name]
+
+    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
 
     lock_content = """
 code_manifest: {}
@@ -153,11 +167,10 @@ outs:
     tag: data
 """
 
-    monkeypatch.setattr(
-        git,
-        "read_files_from_head",
-        lambda paths: {".pivot/stages/train.lock": lock_content},
-    )
+    def mock_read_files(paths: Sequence[str]) -> dict[str, str]:
+        return {".pivot/stages/train.lock": lock_content}
+
+    monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
 
     result = data_module.get_data_hashes_from_head()
 

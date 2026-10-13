@@ -87,7 +87,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
     if not source.output_specs:
         raise TypeError(
             f"Stage '{consumer_name}' depends on '{qualified_name}' which has no outputs "
-            f"(returns None). A stage must produce outputs to be used as a dependency."
+            + "(returns None). A stage must produce outputs to be used as a dependency."
         )
     if len(source.output_specs) == 1:
         output_spec = source.output_specs[0]
@@ -100,8 +100,8 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             available = [spec.key for spec in source.output_specs]
             raise TypeError(
                 f"Stage '{consumer_name}' received handle from multi-output stage "
-                f"'{qualified_name}' without selecting an output. "
-                f"Use handle.key or handle['key']. Available: {available}"
+                + f"'{qualified_name}' without selecting an output. "
+                + f"Use handle.key or handle['key']. Available: {available}"
             )
         output_spec = matched
         output_key = output_spec.key
@@ -201,10 +201,10 @@ def _emit_stage_info(
                 if isinstance(union_arg, type) and issubclass(union_arg, stage_def.StageParams):
                     raise TypeError(
                         f"Stage '{qualified_name}' parameter '{name}' has type "
-                        f"'{base_hint}' — StageParams must not be in a union. "
-                        f"Use 'params: {union_arg.__name__}' directly, with a "
-                        f"default if needed (params: {union_arg.__name__} = "
-                        f"{union_arg.__name__}())."
+                        + f"'{base_hint}' — StageParams must not be in a union. "
+                        + f"Use 'params: {union_arg.__name__}' directly, with a "
+                        + f"default if needed (params: {union_arg.__name__} = "
+                        + f"{union_arg.__name__}())."
                     )
         if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
             params_arg_name = name
@@ -275,7 +275,7 @@ class Pipeline:
         if self._constructing:
             raise RuntimeError(
                 "Cannot call engine-facing methods on a Pipeline that is still under "
-                "construction (inside a 'with' block). Exit the 'with' block first."
+                + "construction (inside a 'with' block). Exit the 'with' block first."
             )
 
     def list_stages(self) -> list[str]:
@@ -330,7 +330,7 @@ class Pipeline:
 
                     raise PipelineConfigError(
                         f"Input binding conflict: input '{name}' is bound to "
-                        f"'{existing_path}' and '{path}' in different pipelines."
+                        + f"'{existing_path}' and '{path}' in different pipelines."
                     )
             else:
                 self._inputs[name] = _InputNode(
@@ -342,7 +342,7 @@ class Pipeline:
         if self._token is not None:
             raise RuntimeError(
                 f"Pipeline '{self._name}' is already inside a 'with' block. "
-                "Nested 'with' on the same Pipeline is not supported."
+                + "Nested 'with' on the same Pipeline is not supported."
             )
         self._token = _active_pipeline.set(self)
         self._constructing = True
@@ -490,16 +490,16 @@ class Pipeline:
                 elif param_name in explicit_params:
                     self._validation_errors.append(
                         f"{stage_name}: parameter '{param_name}' has unsupported type "
-                        f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
-                        f"StageParams (config), or list/tuple of ArtifactHandle."
+                        + f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                        + "StageParams (config), or list/tuple of ArtifactHandle."
                     )
             elif isinstance(value, stage_def.StageParams):
                 params = value
             elif param_name in explicit_params:
                 self._validation_errors.append(
                     f"{stage_name}: parameter '{param_name}' has unsupported type "
-                    f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
-                    f"StageParams (config), or list/tuple of ArtifactHandle."
+                    + f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                    + "StageParams (config), or list/tuple of ArtifactHandle."
                 )
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
@@ -583,8 +583,8 @@ class Pipeline:
                     if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
                         raise ValueError(
                             f"Input binding conflict: input '{inp.name}' is bound to "
-                            f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
-                            f"in different pipelines."
+                            + f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
+                            + "in different pipelines."
                         )
                     foreign_bindings[inp.name] = inp.path
 
@@ -593,7 +593,7 @@ class Pipeline:
             if name in local_bindings and local_bindings[name] != path:
                 raise ValueError(
                     f"Input binding conflict: input '{name}' is bound to "
-                    f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
+                    + f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
                 )
             if name not in self._inputs:
                 self._inputs[name] = _InputNode(
@@ -720,7 +720,7 @@ def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
             if field_name == SINGLE_OUTPUT_KEY:
                 raise ValueError(
                     f"TypedDict field name {SINGLE_OUTPUT_KEY!r} is reserved by Pivot. "
-                    f"Rename the field in {hint.__name__}."
+                    + f"Rename the field in {hint.__name__}."
                 )
             specs.extend(_parse_output_type(field_hint, field_name))
         return specs

@@ -166,6 +166,7 @@ class TrackedDict(dict[str, Any]):
         super().__init__(*args, **kwargs)
         self._accessed_keys = set[str]()
 
+    @override
     def __getitem__(self, key: str) -> Any:
         self._accessed_keys.add(key)
         return super().__getitem__(key)
@@ -822,6 +823,8 @@ def _resolve_output_values(
         raise RuntimeError(
             f"Stage '{stage_name}' returned {type(result).__name__} but expected a mapping"
         )
+    # Cast needed: isinstance narrows Any to Mapping[Unknown, Unknown]; output keys are strings
+    result_map = cast("collections_abc.Mapping[str, Any]", result)
 
     value_map = dict[types.ArtifactRef, Any]()
     missing = list[str]()
@@ -829,17 +832,19 @@ def _resolve_output_values(
         key = out.identity.key
         if key is None:
             raise RuntimeError(f"Stage '{stage_name}' has multiple outputs but missing output key")
-        if key not in result:
+        if key not in result_map:
             missing.append(key)
             continue
-        value_map[out] = result[key]
+        value_map[out] = result_map[key]
 
     if missing:
         raise KeyError(
-            f"Missing return output keys: {sorted(missing)}. Return value keys: {sorted(result.keys())}"
+            f"Missing return output keys: {sorted(missing)}. Return value keys: {sorted(result_map.keys())}"
         )
 
-    extra = set(result.keys()) - {out.identity.key for out in outs if out.identity.key is not None}
+    extra = set(result_map.keys()) - {
+        out.identity.key for out in outs if out.identity.key is not None
+    }
     if extra:
         logger.warning("Extra keys in return value not declared as outputs: %s", sorted(extra))
 
@@ -858,12 +863,14 @@ def _write_output_with_store(
             )
         if not value:
             raise ValueError(f"Directory output '{ref.identity.producer}': dict must be non-empty")
-        for key, item_value in value.items():
+        # Cast needed: isinstance narrows Any to dict[Unknown, Unknown]; keys are checked below
+        value_dict = cast("dict[object, Any]", value)
+        for key, item_value in value_dict.items():
             if not isinstance(key, str):
                 raise ValueError(
                     f"Directory output '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
                 )
-            normalized = stage_def._validate_directory_out_key(key, ref.identity.producer)
+            normalized = stage_def.validate_directory_out_key(key, ref.identity.producer)
             full_path = output_path / normalized
             full_path.parent.mkdir(parents=True, exist_ok=True)
             writer.save(item_value, full_path)
@@ -948,7 +955,9 @@ def _run_stage_function_with_store(
             if isinstance(value, TrackedDict):
                 accessed[name] = set(value.accessed_keys)
             elif isinstance(value, (list, tuple)):
-                for item in value:
+                # Cast needed: isinstance narrows Any to list[Unknown] | tuple[Unknown, ...]
+                items = cast("list[object] | tuple[object, ...]", value)
+                for item in items:
                     if isinstance(item, TrackedDict):
                         accessed.setdefault(name, set()).update(item.accessed_keys)
 

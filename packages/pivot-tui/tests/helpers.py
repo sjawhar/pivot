@@ -100,7 +100,7 @@ def register_test_stage(
 
     target = pipeline or get_test_pipeline()
 
-    def _param_type_from_annotation(annotation: object) -> type | None:
+    def _param_type_from_annotation(annotation: object) -> type[object] | None:
         if annotation is inspect._empty:
             return None
         origin = typing.get_origin(annotation)

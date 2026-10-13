@@ -453,7 +453,7 @@ def get_suggestions(
     if orphan_count > 0:
         suggestions.append(
             f"{orphan_count} orphaned lock {_pluralize(orphan_count, 'file')} from "
-            f"renamed/removed stages. Old outputs may still exist on disk."
+            + "renamed/removed stages. Old outputs may still exist on disk."
         )
 
     return suggestions

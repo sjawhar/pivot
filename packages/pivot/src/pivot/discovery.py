@@ -128,7 +128,7 @@ def _load_pipeline_from_module(path: pathlib.Path) -> PipelineLike | None:
                 )
             raise DiscoveryError(
                 f"{path} defines 'pipeline' but it doesn't satisfy the Pipeline interface "
-                f"(got {type(pipeline_obj).__name__})"
+                + f"(got {type(pipeline_obj).__name__})"
             )
         return pipeline_obj
 
