@@ -152,9 +152,7 @@ def _emit_stage_info(
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     assert not hasattr(func, "_is_stage")
-    no_fp = getattr(node.func, "__pivot_no_fingerprint__", False)
-    if not no_fp:
-        no_fp = getattr(func, "__pivot_no_fingerprint__", False)
+    no_fp = getattr(func, "__pivot_no_fingerprint__", False)
 
     deps = dict[str, types.ArtifactRef]()
 
@@ -441,7 +439,6 @@ class Pipeline:
     def _record_stage(
         self,
         original_func: Callable[..., object],
-        wrapper: Callable[..., object],
         output_specs: list[_OutputSpec],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -505,7 +502,6 @@ class Pipeline:
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
         node = _StageNode(
-            func=wrapper,
             original_func=original_func,
             name=stage_name,
             params=params,
@@ -792,7 +788,7 @@ def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
+        return pipeline._record_stage(func, _get_output_specs(), args, kwargs)
 
     wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
     wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
@@ -809,7 +805,6 @@ class _OutputSpec:
 
 @dataclasses.dataclass
 class _StageNode:
-    func: Callable[..., object]
     original_func: Callable[..., object]
     name: str
     params: stage_def.StageParams | None

@@ -32,6 +32,9 @@ from pivot.decorators import no_fingerprint
 from pivot.executor.worker import _reconstruct_list_kwargs
 from pivot.registry import RegistryStageInfo, _compute_fingerprint
 
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
+
 
 def test_infer_format_dataframe() -> None:
     fmt = _infer_format(pd.DataFrame)
@@ -76,7 +79,6 @@ def test_artifact_handle_suboutput() -> None:
         _OutputSpec(key="raw_runs", python_type=dict, format=loaders.JSON()),
     ]
     stage_node = _StageNode(
-        func=stage_func,
         original_func=stage_func,
         name="train",
         params=None,
@@ -109,7 +111,6 @@ def test_artifact_handle_missing_output_raises() -> None:
         ),
     ]
     stage_node = _StageNode(
-        func=stage_func,
         original_func=stage_func,
         name="train",
         params=None,
@@ -1345,6 +1346,44 @@ def test_cross_pipeline_input_identity_not_qualified(tmp_path: pathlib.Path) -> 
 
 
 # --- @no_fingerprint decorator stacking ---
+
+
+@no_fingerprint(code_deps=["helper.py"])
+@stage
+def _helper_code_deps_above_stage() -> str:
+    return "output"
+
+
+@stage
+@no_fingerprint(code_deps=["helper.py"])
+def _helper_code_deps_below_stage() -> str:
+    return "output"
+
+
+@pytest.mark.parametrize(
+    "stage_func",
+    [
+        pytest.param(_helper_code_deps_above_stage, id="no_fingerprint-above-stage"),
+        pytest.param(_helper_code_deps_below_stage, id="no_fingerprint-below-stage"),
+    ],
+)
+def test_no_fingerprint_code_deps_survive_decorator_order(
+    stage_func: Callable[[], str], set_project_root: pathlib.Path
+) -> None:
+    """code_deps must be fingerprinted whichever side of @stage @no_fingerprint sits on."""
+    helper = set_project_root / "helper.py"
+    helper.write_text("value = 1\n")
+    with Pipeline("test", root=set_project_root) as before:
+        stage_func()
+    fp_before = before.ensure_fingerprint(f"test/{stage_func.__name__}")
+
+    helper.write_text("value = 2\n")
+    with Pipeline("test", root=set_project_root) as after:
+        stage_func()
+    fp_after = after.ensure_fingerprint(f"test/{stage_func.__name__}")
+
+    assert "file:helper.py" in fp_before, f"code_deps file must be fingerprinted, got: {fp_before}"
+    assert fp_before != fp_after, "Editing a code_deps file must change the stage fingerprint"
 
 
 def test_no_fingerprint_outside_stage_decorator(set_project_root: pathlib.Path) -> None:
