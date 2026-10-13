@@ -351,7 +351,9 @@ def test_get_target_hashes_unresolved_file_target_returns_empty(
             code_manifest={},
             params={},
             dep_hashes={},
-            output_hashes={types.ArtifactIdentity("train", "file"): FileHash(hash="aaaa")},
+            output_hashes={
+                types.ArtifactIdentity("train", "file"): FileHash(hash="aaaa000000000000")
+            },
         )
     )
 

@@ -478,10 +478,16 @@ def _to_identity_keyed_hashes(
 
 
 class OutputRestoreResult(NamedTuple):
-    """Whether output restoration succeeded and wrote workspace bytes."""
+    """Whether output restoration succeeded and wrote workspace bytes.
+
+    ``unavailable`` lists outputs that neither match their locked hash nor can be restored
+    from the cache. A check (``restore=False``) lists every such output; a restore stops at
+    the first, since the stage must run anyway.
+    """
 
     available: bool
     outputs_restored: bool
+    unavailable: list[types.ArtifactRef]
 
 
 @overload
@@ -521,37 +527,37 @@ def restore_outputs_to_hashes(
     report_changes: bool = False,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches."""
-    available = True
+    unavailable = list[types.ArtifactRef]()
     outputs_restored = False
     if not isinstance(store, store_mod.WorkspaceStore):
-        available = all(store.exists(ref) for ref in outs)
+        unavailable = [ref for ref in outs if not store.exists(ref)]
     else:
         for ref in outs:
             expected_hash = output_hashes.get(ref.identity)
-            if expected_hash is None:
-                available = False
-                break
-            output_path = store.resolve_display_path(ref)
-            try:
-                actual_hash = hash_output(output_path, state_db)
-            except OSError:
-                actual_hash = None
-            if actual_hash == expected_hash:
-                continue
-            if not store.cache_contains(ref, expected_hash):
-                available = False
-                break
+            if expected_hash is not None:
+                output_path = store.resolve_display_path(ref)
+                try:
+                    actual_hash = hash_output(output_path, state_db)
+                except OSError:
+                    actual_hash = None
+                if actual_hash == expected_hash:
+                    continue
+                if store.cache_contains(ref, expected_hash):
+                    if not restore:
+                        continue
+                    if store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
+                        outputs_restored = True
+                        continue
+            unavailable.append(ref)
             if restore:
-                if not store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
-                    available = False
-                    break
-                outputs_restored = True
+                break
     if report_changes:
         return OutputRestoreResult(
-            available=available,
+            available=not unavailable,
             outputs_restored=outputs_restored,
+            unavailable=unavailable,
         )
-    return available
+    return not unavailable
 
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
@@ -648,6 +654,9 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
     try:
         from joblib import parallel_config
     except ImportError:
+        parallel_config = None
+    if parallel_config is None:
+        # Called outside the except block so a stage error is not chained onto the ImportError.
         logger.debug("joblib not installed - nested parallelism protection disabled")
         return func(**kwargs)
 

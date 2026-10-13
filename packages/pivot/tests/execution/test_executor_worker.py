@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import queue
 import subprocess
+import sys
 import threading
 from typing import TYPE_CHECKING, cast
+
+import pytest
 
 from pivot.executor import worker
 from pivot.types import OutputMessage
@@ -19,8 +22,6 @@ from pivot.types import OutputMessage
 if TYPE_CHECKING:
     import multiprocessing as mp
     import pathlib
-
-    import pytest
 
 
 def _queue_lines(output_queue: mp.Queue[OutputMessage]) -> list[tuple[str, bool]]:
@@ -182,6 +183,23 @@ def test_execute_with_joblib_processes_override(
     """Process opt-in path still invokes the function successfully."""
     monkeypatch.setenv("PIVOT_NESTED_PARALLELISM", "processes")
     assert worker._execute_with_joblib_protection(_identity, {"value": 7}) == 7
+
+
+def _raise_value_error() -> int:
+    raise ValueError("stage failed")
+
+
+def test_stage_error_without_joblib_has_no_import_error_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without joblib, a stage's own exception is not chained onto the joblib ImportError."""
+    # A None entry in sys.modules makes `from joblib import ...` raise ImportError.
+    monkeypatch.setitem(sys.modules, "joblib", None)
+
+    with pytest.raises(ValueError, match="stage failed") as exc_info:
+        worker._execute_with_joblib_protection(_raise_value_error, {})
+
+    assert exc_info.value.__context__ is None, repr(exc_info.value.__context__)
 
 
 # Directory outputs (ArtifactTag.DIRECTORY refs) are exercised in test_worker_store.py,

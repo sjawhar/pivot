@@ -455,6 +455,44 @@ def test_identical_input_redeclaration_returns_existing_node(tmp_path: pathlib.P
     assert original._source is repeated._source
 
 
+def test_two_input_names_bound_to_one_path_raise(tmp_path: pathlib.Path) -> None:
+    """Two input names cannot share a path: the store would map both identities to one file."""
+    with (
+        pytest.raises(
+            exceptions.PipelineConfigError,
+            match=r"Input binding conflict: inputs 't\.csv' and 'alias' are both bound to "
+            + r"'data/raw/t\.csv'",
+        ),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("t.csv")
+        pipeline.input("alias", path="data/raw/t.csv")
+
+
+def test_two_input_names_bound_to_one_normalized_path_raise(tmp_path: pathlib.Path) -> None:
+    """Spelling the same path differently does not make it a second file."""
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="'t.csv' and 'alias'"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("t.csv")
+        pipeline.input("alias", path="data/./raw//t.csv")
+
+
+def test_included_input_name_bound_to_a_local_input_path_raises(tmp_path: pathlib.Path) -> None:
+    """An included pipeline's input may not share a path with a differently named local input."""
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        _helper_consume_text(child.input("shared", path="data/input.txt", t=str))
+
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="'local' and 'shared'"),
+        Pipeline("parent", root=tmp_path) as parent,
+    ):
+        parent.input("local", path="data/input.txt", t=str)
+        parent.include(child)
+
+
 def test_input_redeclaration_after_reentering_pipeline_raises(tmp_path: pathlib.Path) -> None:
     pipeline = Pipeline("test", root=tmp_path)
     with pipeline:
@@ -814,6 +852,8 @@ def test_pipeline_variant_counts_still_increment_within_same_variant(
         pytest.param("a/../b", id="traversal"),
         pytest.param("", id="empty"),
         pytest.param("x" * 201, id="too_long"),
+        pytest.param("a/b", id="slash"),
+        pytest.param("a@b", id="at"),
     ],
 )
 def test_pipeline_variant_rejects_name_lock_files_cannot_hold(

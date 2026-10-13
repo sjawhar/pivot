@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import threading
 from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 
 from pivot.storage import lock
 from pivot.types import ArtifactIdentity, DirHash, LockData, StorageLockData
@@ -41,7 +43,7 @@ def test_lock_file_read(set_project_root: Path) -> None:
     """Lock file contents can be read back."""
     cache_dir = set_project_root / ".cache"
     stage_lock = lock.StageLock("train", cache_dir)
-    dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("input"): {"hash": "xyz123"}}
+    dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("input"): {"hash": "0123456789abcdef"}}
     data = LockData(
         code_manifest={"self:train": "def456", "func:helper": "ghi789"},
         params={"learning_rate": 0.01},
@@ -368,6 +370,166 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     assert result["params"] == {}
 
 
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [{"producer": ["p/a"], "key": None, "hash": "0123456789abcdef"}],
+                "outs": [],
+            },
+            id="list-producer",
+        ),
+        pytest.param(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": {"k": 1}, "hash": "fedcba9876543210", "tag": "data"}],
+            },
+            id="mapping-key",
+        ),
+    ],
+)
+def test_lock_read_treats_wrongly_typed_identity_fields_as_missing(
+    document: dict[str, object], tmp_path: Path
+) -> None:
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    stage_lock.path.write_text(yaml.safe_dump(document))
+    assert stage_lock.read() is None
+
+
+@pytest.mark.parametrize(
+    ("code_manifest", "params"),
+    [
+        pytest.param({}, [], id="params-list"),
+        pytest.param({}, 3, id="params-int"),
+        pytest.param(["self:x"], {}, id="code-manifest-list"),
+    ],
+)
+def test_lock_read_treats_non_mapping_manifest_or_params_as_missing(
+    code_manifest: object, params: object, tmp_path: Path
+) -> None:
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    document = {"code_manifest": code_manifest, "params": params, "deps": [], "outs": []}
+    stage_lock.path.write_text(yaml.safe_dump(document))
+    assert stage_lock.read() is None
+
+
+_DEP: dict[str, object] = {"producer": "p/a", "key": None, "hash": "0123456789abcdef"}
+_OUT: dict[str, object] = {"key": "o", "hash": "fedcba9876543210", "tag": "data"}
+_MANIFEST_ENTRY: dict[str, object] = {
+    "relpath": "f.txt",
+    "hash": "00112233445566ff",
+    "size": 1,
+    "isexec": False,
+}
+
+
+@pytest.mark.parametrize(
+    ("field", "document"),
+    [
+        pytest.param("code_manifest", {"code_manifest": {"self:x": 1}}, id="manifest-int-value"),
+        pytest.param("code_manifest", {"code_manifest": {1: "h"}}, id="manifest-int-key"),
+        pytest.param("params", {"params": {1: "v"}}, id="params-int-key"),
+        pytest.param("deps", {"deps": {"producer": "p/a"}}, id="deps-mapping"),
+        pytest.param("outs", {"outs": "o"}, id="outs-string"),
+        pytest.param(
+            "deps[0].producer", {"deps": [{**_DEP, "producer": None}]}, id="null-producer"
+        ),
+        pytest.param("deps[0].producer", {"deps": [{**_DEP, "producer": ""}]}, id="empty-producer"),
+        pytest.param("deps[0].key", {"deps": [{**_DEP, "key": 3}]}, id="int-dep-key"),
+        pytest.param("deps[0].hash", {"deps": [{**_DEP, "hash": ["aa"]}]}, id="list-dep-hash"),
+        pytest.param("deps[0].hash", {"deps": [{**_DEP, "hash": "abc"}]}, id="short-dep-hash"),
+        pytest.param("outs[0].hash", {"outs": [{**_OUT, "hash": 7}]}, id="int-out-hash"),
+        pytest.param("outs[0].hash", {"outs": [{**_OUT, "hash": "abc"}]}, id="short-out-hash"),
+        pytest.param(
+            "outs[0].hash",
+            {"outs": [{**_OUT, "hash": "0123456789ABCDEF"}]},
+            id="uppercase-out-hash",
+        ),
+        pytest.param(
+            "outs[0].hash",
+            {"outs": [{**_OUT, "hash": "0123456789abcdefa"}]},
+            id="long-out-hash",
+        ),
+        pytest.param(
+            "outs[0].hash",
+            {"outs": [{**_OUT, "hash": "../../etc/passwd"}]},
+            id="traversal-out-hash",
+        ),
+        pytest.param("outs[0].tag", {"outs": [{**_OUT, "tag": ["data"]}]}, id="list-tag"),
+        pytest.param(
+            "outs[0].manifest",
+            {"outs": [{**_OUT, "manifest": dict[str, object]()}]},
+            id="mapping-manifest",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].size",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "size": "1"}]}]},
+            id="string-manifest-size",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": None}]}]},
+            id="null-manifest-relpath",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].hash",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "hash": "abc"}]}]},
+            id="short-manifest-hash",
+        ),
+        pytest.param("merkle_id", {"merkle_id": ["m"]}, id="list-merkle-id"),
+        pytest.param("schema_version", {"schema_version": "2"}, id="string-schema-version"),
+    ],
+)
+def test_lock_read_treats_wrongly_typed_fields_as_missing_and_names_them(
+    field: str,
+    document: dict[str, object],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every field is type-checked once; the debug log names the field that failed."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    base: dict[str, object] = {"code_manifest": {}, "params": {}, "deps": [], "outs": []}
+    stage_lock.path.write_text(yaml.safe_dump({**base, **document}))
+
+    with caplog.at_level(logging.DEBUG, logger="pivot.storage.lock"):
+        assert stage_lock.read() is None
+
+    assert any(field in record.getMessage() for record in caplog.records), caplog.text
+
+
+def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
+    """The validator accepts each optional field the writer and older locks produce."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    document = {
+        "schema_version": 2,
+        "code_manifest": {"self:stage": "h"},
+        "params": {"lr": 0.1, "nested": {"a": [1, 2]}},
+        "deps": [{**_DEP, "display": "data/raw/a.csv", "size": 3}],
+        "outs": [
+            {**_OUT, "key": None, "manifest": [_MANIFEST_ENTRY]},
+            {**_OUT, "key": "m", "tag": "metric", "size": 4},
+        ],
+        "merkle_id": "abc",
+    }
+    stage_lock.path.write_text(yaml.safe_dump(document))
+
+    result = stage_lock.read()
+
+    assert result is not None
+    assert result["params"] == {"lr": 0.1, "nested": {"a": [1, 2]}}
+    assert "merkle_id" in result
+    assert result["merkle_id"] == "abc"
+
+
 # ==============================================================================
 # Directory outputs: lock display fields
 # ==============================================================================
@@ -386,16 +548,16 @@ def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
         + "deps:\n"
         + "  - producer: input\n"
         + "    key: null\n"
-        + "    hash: dep_hash\n"
+        + "    hash: d0d0d0d0d0d0d0d0\n"
         + "    display: data/raw/input.csv\n"
         + "outs:\n"
         + "  - key: results\n"
-        + "    hash: out_hash\n"
+        + "    hash: 0e0e0e0e0e0e0e0e\n"
         + "    tag: directory\n"
         + "    display: results/\n"
         + "    manifest:\n"
         + "      - relpath: task_a.json\n"
-        + "        hash: hash_a\n"
+        + "        hash: a0a0a0a0a0a0a0a0\n"
         + "        size: 100\n"
         + "        isexec: false\n"
     )
@@ -403,11 +565,13 @@ def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
     result = stage_lock.read()
 
     assert result is not None
-    assert result["dep_hashes"] == {_id("input"): {"hash": "dep_hash"}}
+    assert result["dep_hashes"] == {_id("input"): {"hash": "d0d0d0d0d0d0d0d0"}}
     assert result["output_hashes"] == {
         _id("dir_out_stage", "results"): DirHash(
-            hash="out_hash",
-            manifest=[{"relpath": "task_a.json", "hash": "hash_a", "size": 100, "isexec": False}],
+            hash="0e0e0e0e0e0e0e0e",
+            manifest=[
+                {"relpath": "task_a.json", "hash": "a0a0a0a0a0a0a0a0", "size": 100, "isexec": False}
+            ],
         )
     }
 
@@ -449,12 +613,12 @@ def test_pipeline_prefixed_stage_name_creates_subdirectory(tmp_path: Path) -> No
 def test_lock_roundtrip_identity_keys(tmp_path: Path) -> None:
     """LockData dep_hashes and output_hashes use ArtifactIdentity keys through roundtrip."""
     dep_hashes: dict[ArtifactIdentity, HashInfo] = {
-        _id("input"): {"hash": "aaa"},
-        _id("features", "embeddings"): {"hash": "bbb"},
+        _id("input"): {"hash": "aaaaaaaaaaaaaaaa"},
+        _id("features", "embeddings"): {"hash": "bbbbbbbbbbbbbbbb"},
     }
     output_hashes: dict[ArtifactIdentity, HashInfo] = {
-        _id("train"): {"hash": "ccc"},
-        _id("train", "metrics"): {"hash": "ddd"},
+        _id("train"): {"hash": "cccccccccccccccc"},
+        _id("train", "metrics"): {"hash": "dddddddddddddddd"},
     }
     data = LockData(
         code_manifest={"self:train": "fp1"},
@@ -470,21 +634,23 @@ def test_lock_roundtrip_identity_keys(tmp_path: Path) -> None:
     # Keys must be ArtifactIdentity, not strings
     assert _id("input") in loaded["dep_hashes"]
     assert _id("features", "embeddings") in loaded["dep_hashes"]
-    assert loaded["dep_hashes"][_id("input")]["hash"] == "aaa"
-    assert loaded["dep_hashes"][_id("features", "embeddings")]["hash"] == "bbb"
+    assert loaded["dep_hashes"][_id("input")]["hash"] == "aaaaaaaaaaaaaaaa"
+    assert loaded["dep_hashes"][_id("features", "embeddings")]["hash"] == "bbbbbbbbbbbbbbbb"
 
     assert _id("train") in loaded["output_hashes"]
     assert _id("train", "metrics") in loaded["output_hashes"]
-    assert loaded["output_hashes"][_id("train")]["hash"] == "ccc"
-    assert loaded["output_hashes"][_id("train", "metrics")]["hash"] == "ddd"
+    assert loaded["output_hashes"][_id("train")]["hash"] == "cccccccccccccccc"
+    assert loaded["output_hashes"][_id("train", "metrics")]["hash"] == "dddddddddddddddd"
 
 
 def test_lock_roundtrip_dir_hash_with_identity_keys(tmp_path: Path) -> None:
     """DirHash manifests survive roundtrip with ArtifactIdentity keys."""
     dep_hashes: dict[ArtifactIdentity, HashInfo] = {
         _id("data_dir"): DirHash(
-            hash="tree_aaa",
-            manifest=[{"relpath": "a.csv", "hash": "h1", "size": 100, "isexec": False}],
+            hash="aaaaaaaaaaaaaaa0",
+            manifest=[
+                {"relpath": "a.csv", "hash": "1111111111111111", "size": 100, "isexec": False}
+            ],
         )
     }
     data = LockData(
@@ -499,7 +665,7 @@ def test_lock_roundtrip_dir_hash_with_identity_keys(tmp_path: Path) -> None:
 
     assert loaded is not None
     info = loaded["dep_hashes"][_id("data_dir")]
-    assert info["hash"] == "tree_aaa"
+    assert info["hash"] == "aaaaaaaaaaaaaaa0"
     assert "manifest" in info
 
 

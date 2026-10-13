@@ -297,7 +297,7 @@ def test_update_import_artifact_removed(tmp_path: pathlib.Path, mocker: MockerFi
     _setup_resolve_mocks(
         mocker,
         remote_url=remote_url,
-        lock_outs=[{"key": None, "tag": "data", "hash": "bbb222"}],
+        lock_outs=[{"key": None, "tag": "data", "hash": "bbb2220000000000"}],
         rev_lock="newsha",
         stage_name="eval",
     )

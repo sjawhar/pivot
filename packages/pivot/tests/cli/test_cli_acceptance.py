@@ -12,8 +12,6 @@ import pathlib
 import subprocess
 import sys
 
-import pytest
-
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
@@ -215,10 +213,6 @@ with Pipeline("m") as pipeline:
 """
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 25 (F6): metric-only edit must not use OUTPUTS_MISSING_REASON",
-)
 def test_status_does_not_suggest_pull_for_an_edited_metric(tmp_path: pathlib.Path) -> None:
     """Pull never restores metrics (they are git-tracked), so it must not be suggested for one."""
     root = _project(tmp_path, {"pipeline.py": _METRIC_ONLY_PIPELINE, "data/raw/t.csv": "a\n1\n"})

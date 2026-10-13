@@ -1335,14 +1335,14 @@ params: {}
 deps: []
 outs:
   - key: null
-    hash: deadbeef
+    hash: deadbeef00000000
     tag: data
 """
     _mock_head_lock(monkeypatch, lock_content)
 
     result = data.get_data_hashes_from_head()
 
-    assert result == {"data/process_data.csv": "deadbeef"}
+    assert result == {"data/process_data.csv": "deadbeef00000000"}
 
 
 def test_get_data_hashes_from_head_no_lock_file(

@@ -175,31 +175,8 @@ class WorkspaceStore:
             return self._project_root / binding
         return self._project_root / "data" / "raw" / name
 
-    def _format_extension(self, fmt: object) -> str:
-        return loaders.format_extension(fmt)
-
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        stage_name = ref.identity.producer
-        prefix = "data"
-        if ref.tag == types.ArtifactTag.METRIC:
-            prefix = "metrics"
-        elif ref.tag == types.ArtifactTag.PLOT:
-            prefix = "plots"
-
-        key = ref.identity.key
-        if ref.tag == types.ArtifactTag.DIRECTORY:
-            if key is None:
-                rel = pathlib.Path(prefix) / stage_name
-            else:
-                rel = pathlib.Path(prefix) / stage_name / key
-            return self._project_root / rel
-
-        ext = self._format_extension(ref.format)
-        if key is None:
-            rel = pathlib.Path(prefix) / f"{stage_name}.{ext}"
-        else:
-            rel = pathlib.Path(prefix) / stage_name / f"{key}.{ext}"
-        return self._project_root / rel
+        return self._project_root / relative_output_path(ref)
 
     def _resolve_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         if self._is_input_ref(ref):
@@ -317,6 +294,32 @@ class WorkspaceStore:
     def exists(self, ref: types.ArtifactRef) -> bool:
         path = self._resolve_path(ref)
         return path.exists()
+
+
+def relative_output_path(ref: types.ArtifactRef) -> pathlib.Path:
+    """Return an output's workspace path relative to the project root.
+
+    This is the one rule that places outputs: ``<prefix>/<stage>.<ext>`` for a single output,
+    ``<prefix>/<stage>/<key>.<ext>`` for a keyed one, and no extension for a directory. The
+    prefix is ``metrics`` or ``plots`` for tagged outputs and ``data`` otherwise.
+    """
+    stage_name = ref.identity.producer
+    prefix = "data"
+    if ref.tag == types.ArtifactTag.METRIC:
+        prefix = "metrics"
+    elif ref.tag == types.ArtifactTag.PLOT:
+        prefix = "plots"
+
+    key = ref.identity.key
+    if ref.tag == types.ArtifactTag.DIRECTORY:
+        if key is None:
+            return pathlib.Path(prefix) / stage_name
+        return pathlib.Path(prefix) / stage_name / key
+
+    ext = loaders.format_extension(ref.format)
+    if key is None:
+        return pathlib.Path(prefix) / f"{stage_name}.{ext}"
+    return pathlib.Path(prefix) / stage_name / f"{key}.{ext}"
 
 
 def store_from_spec(spec: StoreSpec) -> Store:

@@ -136,14 +136,12 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
     """Returns hash from lock file committed to HEAD."""
     repo_path, commit = git_repo
     _register_plot_stage(mock_discovery, "test_stage")
-    _write_lock(
-        repo_path, "test_stage", [{"key": None, "hash": "committed_hash_123", "tag": "plot"}]
-    )
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "c0aa17ed12300000", "tag": "plot"}])
     commit("initial")
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result == {"plots/test_stage.png": "committed_hash_123"}
+    assert result == {"plots/test_stage.png": "c0aa17ed12300000"}
 
 
 def test_get_plot_hashes_from_head_matches_keyed_output(
@@ -161,15 +159,15 @@ def test_get_plot_hashes_from_head_matches_keyed_output(
         repo_path,
         "test_stage",
         [
-            {"key": "chart", "hash": "chart_hash", "tag": "plot"},
-            {"key": "table", "hash": "table_hash", "tag": "data"},
+            {"key": "chart", "hash": "c4a47000000000aa", "tag": "plot"},
+            {"key": "table", "hash": "7ab1e000000000bb", "tag": "data"},
         ],
     )
     commit("initial")
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result == {"plots/test_stage/chart.png": "chart_hash"}
+    assert result == {"plots/test_stage/chart.png": "c4a47000000000aa"}
 
 
 def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
@@ -179,13 +177,13 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     """Returns committed hash, not uncommitted changes."""
     repo_path, commit = git_repo
     _register_plot_stage(mock_discovery, "test_stage")
-    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "original_hash", "tag": "plot"}])
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "0a191a1000000000", "tag": "plot"}])
     commit("initial")
-    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "modified_hash", "tag": "plot"}])
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "3d1f1ed000000000", "tag": "plot"}])
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result == {"plots/test_stage.png": "original_hash"}, (
+    assert result == {"plots/test_stage.png": "0a191a1000000000"}, (
         "Should return committed hash, not modified"
     )
 

@@ -36,8 +36,8 @@ def test_resolve_targets_stage_matches_lock_entries_by_identity_key(
         "params": {},
         "deps": [],
         "outs": [
-            {"key": None, "hash": "hash1", "tag": "data"},
-            {"key": "model", "hash": "hash2", "tag": "data"},
+            {"key": None, "hash": "1111111111111111", "tag": "data"},
+            {"key": "model", "hash": "2222222222222222", "tag": "data"},
         ],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
@@ -54,8 +54,8 @@ def test_resolve_targets_stage_matches_lock_entries_by_identity_key(
 
     assert len(targets) == 1
     assert targets[0]["hashes"] == {
-        "data/train.csv": {"hash": "hash1"},
-        "data/train/model.pkl": {"hash": "hash2"},
+        "data/train.csv": {"hash": "1111111111111111"},
+        "data/train/model.pkl": {"hash": "2222222222222222"},
     }
     assert set(targets[0]["paths"]) == set(targets[0]["hashes"])
 
@@ -72,8 +72,8 @@ def test_resolve_targets_keyed_target_restores_only_that_output(
         "params": {},
         "deps": [],
         "outs": [
-            {"key": "model", "hash": "hash2", "tag": "data"},
-            {"key": "table", "hash": "hash3", "tag": "data"},
+            {"key": "model", "hash": "2222222222222222", "tag": "data"},
+            {"key": "table", "hash": "3333333333333333", "tag": "data"},
         ],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
@@ -100,13 +100,13 @@ def test_resolve_targets_multiple_stages(
         "code_manifest": {},
         "params": {},
         "deps": [],
-        "outs": [{"key": None, "hash": "train_hash", "tag": "data"}],
+        "outs": [{"key": None, "hash": "7a17a17a17a17a10", "tag": "data"}],
     }
     eval_lock = {
         "code_manifest": {},
         "params": {},
         "deps": [],
-        "outs": [{"key": None, "hash": "eval_hash", "tag": "data"}],
+        "outs": [{"key": None, "hash": "e1a1e1a1e1a1e1a1", "tag": "data"}],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(train_lock))
     (repo_path / ".pivot" / "stages" / "eval.lock").write_text(yaml.dump(eval_lock))
@@ -136,7 +136,7 @@ def test_resolve_targets_stage_with_only_metrics(
         "code_manifest": {},
         "params": {},
         "deps": [],
-        "outs": [{"key": "score", "hash": "metric_hash", "tag": "metric"}],
+        "outs": [{"key": "score", "hash": "3e7c3e7c3e7c3e7c", "tag": "metric"}],
     }
     (repo_path / ".pivot" / "stages" / "eval.lock").write_text(yaml.dump(lock_content))
 
