@@ -2054,6 +2054,8 @@ def test_stage_returning_path_inside_workspace_is_rejected(
     )
 
 
+
+
 # --- YAML metrics must be safe-readable by downstream stages ---
 
 
@@ -2108,3 +2110,23 @@ def test_metric_dataframe_fails_at_write_with_stage_and_type(
     assert result["status"] == types.StageStatus.FAILED
     assert "metricsafe/_helper_metric_dataframe" in result["reason"]
     assert "DataFrame" in result["reason"]
+
+
+@stage
+def _helper_metric_longdouble(params: stage_def.StageParams) -> Annotated[dict, metric]:
+    return {"mean": numpy.longdouble("1.0000000000000000009")}
+
+
+def test_metric_longdouble_fails_at_write_with_stage_and_type(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        _helper_metric_longdouble(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_longdouble", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.FAILED
+    assert "metricsafe/_helper_metric_longdouble" in result["reason"]
+    assert "longdouble" in result["reason"]

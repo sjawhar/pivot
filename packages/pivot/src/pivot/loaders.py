@@ -171,7 +171,13 @@ class YAML[T](Loader[T, T]):
             if isinstance(value, numpy.ndarray):
                 return plain(value.tolist(), location)
             if isinstance(value, numpy.generic):
-                return plain(value.item(), location)
+                unwrapped = value.item()
+                if isinstance(unwrapped, numpy.generic):
+                    raise TypeError(
+                        f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
+                        + "Convert extended-precision NumPy values explicitly."
+                    )
+                return plain(unwrapped, location)
             if type(value) in (
                 type(None),
                 bool,
