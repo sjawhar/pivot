@@ -315,15 +315,7 @@ def test_no_fingerprint_missing_code_deps_file(
     "stage_func",
     [
         pytest.param(_helper_code_deps_inside_stage, id="no_fingerprint-inside-stage"),
-        pytest.param(
-            _helper_code_deps_outside_stage,
-            id="no_fingerprint-outside-stage",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=AssertionError,
-                reason="red test for Task 15 (compose code_deps lost when @no_fingerprint is above @stage)",
-            ),
-        ),
+        pytest.param(_helper_code_deps_outside_stage, id="no_fingerprint-outside-stage"),
     ],
 )
 def test_no_fingerprint_code_deps_tracked_through_pipeline(
