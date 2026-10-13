@@ -65,16 +65,19 @@ A `DataFrameJSONL()` output starts with one metadata record, then ordinary row
 records:
 
 ```json
-{"__pivot_dataframe_metadata__": {"version": 1, "temporal_columns": {...}}}
-{"name":"alice","created_at":"2026-10-13T12:00:00.000Z"}
+{"__pivot_dataframe_metadata__":{"version":1,"columns":[{"name":"name","dtype":"object"},{"name":"created_at","dtype":"datetime64[ns, UTC]"}],"temporal_columns":{"created_at":{"kind":"datetime","timezone":"UTC"}}}}
+{"name":"alice","created_at":"2026-10-13T12:00:00.000000000Z"}
 ```
 
-Pivot uses the header to restore only the columns it marked as temporal, retain
-the original timezone names, and preserve all-null `datetime` and `timedelta`
-dtypes. It never guesses that an ISO-shaped string column is temporal.
+`columns` lists every column's name and dtype in order, so a zero-row frame
+keeps its columns and dtypes. Pivot uses `temporal_columns` to restore only the
+columns it marked as temporal, retain the original timezone names, and preserve
+all-null `datetime` and `timedelta` dtypes. It never guesses that an ISO-shaped
+string column is temporal.
 
 Non-Pivot JSONL readers see the explicit first record and must skip it before
-reading data rows. Treat `__pivot_dataframe_metadata__` as reserved.
+reading data rows. Treat `__pivot_dataframe_metadata__` as reserved: a
+DataFrame with a column of that name cannot be written.
 
 ### Pickle is a trusted-code boundary
 
