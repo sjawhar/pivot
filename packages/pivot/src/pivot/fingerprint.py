@@ -33,7 +33,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # marshalled code objects. Version 4 qualifies manifest keys by definition module. Version 5
 # invalidates manifests that might have been persisted after unsafe capture warnings. Version 6
 # also invalidates entries written before discovery imported pipeline.py as a real module.
-_CACHE_SCHEMA_VERSION = 6
+# Version 7 invalidates manifests whose source maps omitted imported project modules.
+_CACHE_SCHEMA_VERSION = 7
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -216,6 +217,32 @@ def _collecting_sources() -> Iterator[dict[str, tuple[int, int, int]]]:
         yield source_map
     finally:
         _active_source_map = previous
+
+
+def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None:
+    """Add the file of every loaded project module to a manifest's source map.
+
+    A manifest records values bound in module namespaces, and import-time code in any project
+    module can change them without touching the walked functions' files: `from settings import
+    FACTOR`, a module rebinding an imported helper, or one module assigning another's
+    attribute. A cached manifest is therefore valid only while none of those files changed.
+    """
+    from pivot import project
+
+    project_root = project.get_project_root()
+    for module in list(sys.modules.values()):
+        if not isinstance(module, types.ModuleType):
+            continue
+        file = module.__dict__.get("__file__")
+        if not isinstance(file, str) or not is_user_code(module):
+            continue
+        try:
+            path = pathlib.Path(file).resolve()
+            rel_path = str(path.relative_to(project_root))
+            stat = path.stat()
+        except (OSError, ValueError):
+            continue
+        source_map.setdefault(rel_path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
 
 
 def _try_manifest_cache_hit(stage_name: str) -> dict[str, str] | None:
@@ -469,6 +496,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
             _current_stage_name.reset(token)
 
         if not _unsafe_capture_warning.get():
+            _record_project_modules(source_map)
             key = _make_manifest_cache_key(stage_name)
             value = json.dumps(
                 {

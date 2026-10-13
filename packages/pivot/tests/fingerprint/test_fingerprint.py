@@ -2233,6 +2233,30 @@ def my_stage():
         sys.modules.pop("collected_stage", None)
 
 
+def test_cached_manifest_source_map_includes_module_attribute_source(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `module.NAME` read records that module's file, so editing it invalidates the cache."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "f8_settings.py").write_text("FACTOR = 10\n")
+    (tmp_path / "f8_stage.py").write_text(
+        "import f8_settings\n\n\ndef scale(x):\n    return x * f8_settings.FACTOR\n"
+    )
+    writes = list[tuple[bytes, bytes]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name: None)
+    try:
+        stage_module = importlib.import_module("f8_stage")
+        fingerprint.get_stage_fingerprint_cached("f8/scale", stage_module.scale)
+    finally:
+        sys.modules.pop("f8_stage", None)
+        sys.modules.pop("f8_settings", None)
+
+    ((_key, raw),) = writes
+    assert "f8_settings.py" in json.loads(raw)["s"]
+
+
 # ==============================================================================
 # Stage manifest cache tests
 # ==============================================================================
