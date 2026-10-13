@@ -136,3 +136,59 @@ def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: path
     assert "Run `pivot pull` to restore outputs of 1 stage from the remote" in out
     assert "Run `pivot repro` to execute 1 stale stage" in out
     assert out.index("pivot pull") < out.index("pivot repro"), out
+
+
+def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> None:
+    """Config lock, artifact locks and the agent socket must not show up as untracked files."""
+    root = _project(tmp_path, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    _ok(_pivot(root, "repro"))
+    (root / ".pivot" / "agent.sock").touch()
+
+    created = sorted(
+        str(p.relative_to(root)) for p in (root / ".pivot").iterdir() if p.name != ".gitignore"
+    )
+    assert ".pivot/config.yaml.lock" in created, created
+    assert ".pivot/locks" in created, created
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all", ".pivot"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    untracked = sorted(line[3:] for line in status.stdout.splitlines())
+    # Only committed state (config, ignore file, per-stage lock files) may be untracked.
+    runtime = [
+        path
+        for path in untracked
+        if path not in {".pivot/.gitignore", ".pivot/config.yaml"}
+        and not path.startswith(".pivot/stages/")
+    ]
+    assert runtime == [], untracked
+
+
+def test_stage_locks_of_pipelines_named_like_runtime_dirs_stay_committable(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`.pivot/.gitignore` entries are anchored: a pipeline named `cache` or `locks` keeps its locks."""
+    root = _project(tmp_path, {})
+    lock_files = [
+        ".pivot/stages/cache/train.lock",
+        ".pivot/stages/locks/train.lock",
+        ".pivot/stages/state.lmdb/train.lock",
+    ]
+    for rel in lock_files:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("{}")
+
+    check = subprocess.run(
+        ["git", "check-ignore", "--verbose", *lock_files],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert check.returncode == 1, f"lock files ignored:\n{check.stdout}"

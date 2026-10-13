@@ -8,15 +8,23 @@ from pivot import exceptions, ignore
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
+# Entries are anchored to .pivot/ so a pipeline named e.g. "cache" or "locks" keeps its
+# committed lock files under .pivot/stages/<pipeline>/.
 _GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
-cache/
+/cache/
 
 # State database (file hashes, generation counters)
-state.lmdb/
+/state.lmdb/
 
-# Config lock (ruamel.yaml temporary file)
-config.yaml.lock
+# Artifact and restore locks (flock files for concurrent execution)
+/locks/
+
+# Agent RPC socket (left behind by TUI and --serve sessions)
+/agent.sock
+
+# Config lock (held while editing config.yaml)
+/config.yaml.lock
 """
 
 
