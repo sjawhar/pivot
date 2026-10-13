@@ -72,8 +72,11 @@ jobs:
         package:
           - name: pivot
             path: packages/pivot/tests
+            # pyproject.toml's fail_under = 90 measures packages/pivot/src, so only this row binds it
+            extra_args: --cov --cov-report=term
           - name: pivot-tui
             path: packages/pivot-tui/tests
+            extra_args: ""
 
     steps:
       - uses: actions/checkout@v5
@@ -96,4 +99,4 @@ jobs:
           echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
 
       - name: Run tests for ${{ matrix.package.name }}
-        run: pytest ${{ matrix.package.path }} -n auto
+        run: pytest ${{ matrix.package.path }} -n auto ${{ matrix.package.extra_args }}
