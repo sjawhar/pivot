@@ -7,23 +7,29 @@ parallelism, and the value plumbing between the store and the stage function.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import io
 import logging
+import os
 import pathlib
 import queue
 import random
 import re
+import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 import joblib.parallel
 import numpy
 import pytest
 
 from pivot import exceptions, loaders, metrics, stage_def, types
+from pivot import project as pivot_project
 from pivot.executor import worker
 from pivot.storage import artifact_lock, cache, lock, state
 from pivot.storage import store as store_mod
@@ -296,6 +302,31 @@ def test_invalid_params_yaml_override_fails_the_stage(
     assert result["reason"] == "Invalid params override in params.yaml: 1 validation error(s)"
 
 
+def _reports_project_root(data: str) -> str:
+    _ = data
+    return str(pivot_project.get_project_root())
+
+
+def test_stage_sees_its_own_project_root_inside_another_project(
+    tmp_path: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused worker may hold a previous project's root; walking up would find the outer one."""
+    inner = tmp_path / "inner"
+    (inner / ".pivot").mkdir(parents=True)
+    (inner / "raw.txt").write_text("hello")
+    monkeypatch.setattr(pivot_project, "_project_root_cache", tmp_path)
+
+    result = worker.execute_stage(
+        _STAGE, _stage_info(_reports_project_root, inner, worker_env), worker_env, output_queue
+    )
+
+    assert result["status"] == StageStatus.RAN, result["reason"]
+    assert _output_path(inner).read_text() == str(inner)
+
+
 # =============================================================================
 # Reasons a run or skip reports
 # =============================================================================
@@ -481,6 +512,120 @@ def test_stage_exit_is_a_failure_with_a_reason(
     assert (result["status"], result["reason"]) == (StageStatus.FAILED, reason)
 
 
+def _returns_empty_dict(data: str) -> dict[str, str]:
+    _ = data
+    return {}
+
+
+def _returns_int_key(data: str) -> dict[int, str]:
+    return {1: data}
+
+
+_DIRECTORY_OUT = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
+
+
+@pytest.mark.parametrize(
+    ("func", "outs", "error"),
+    [
+        pytest.param(
+            _returns_none,
+            [_ref(_STAGE)],
+            f"RuntimeError: Stage '{_STAGE}' has output annotations but returned None",
+            id="none-for-an-output",
+        ),
+        pytest.param(
+            _returns_value,
+            [_ref(_STAGE, "a"), _ref(_STAGE, "b")],
+            f"RuntimeError: Stage '{_STAGE}' returned str but expected a mapping",
+            id="str-for-several-outputs",
+        ),
+        pytest.param(
+            _returns_value,
+            [_DIRECTORY_OUT],
+            f"RuntimeError: Directory output for '{_STAGE}' expects dict, got str",
+            id="str-for-a-directory",
+        ),
+        pytest.param(
+            _returns_empty_dict,
+            [_DIRECTORY_OUT],
+            f"ValueError: Directory output '{_STAGE}': dict must be non-empty",
+            id="empty-directory",
+        ),
+        pytest.param(
+            _returns_int_key,
+            [_DIRECTORY_OUT],
+            f"ValueError: Directory output for '{_STAGE}': keys must be strings, got int",
+            id="non-string-member-name",
+        ),
+    ],
+)
+def test_return_value_that_does_not_fit_the_outputs_fails_with_the_cause(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    func: Callable[[str], object],
+    outs: list[types.ArtifactRef],
+    error: str,
+) -> None:
+    result = worker.execute_stage(
+        _STAGE, _stage_info(func, project, worker_env, outs=outs), worker_env, output_queue
+    )
+
+    assert result["status"] == StageStatus.FAILED
+    assert result["reason"].splitlines()[-1] == error
+
+
+@dataclasses.dataclass(frozen=True)
+class _WritesNothing(loaders.Writer[object]):
+    """A writer with a bug: it never creates the file it is given."""
+
+    @override
+    def save(self, data: object, path: pathlib.Path) -> None:
+        _ = data, path
+
+
+@pytest.mark.parametrize(
+    "no_commit", [pytest.param(True, id="no-commit"), pytest.param(False, id="commit")]
+)
+def test_output_the_writer_never_created_fails_the_stage(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    no_commit: bool,
+) -> None:
+    info = _stage_info(
+        _upper,
+        project,
+        worker_env,
+        outs=[_ref(_STAGE, loader=_WritesNothing())],
+        no_commit=no_commit,
+    )
+
+    result = worker.execute_stage(_STAGE, info, worker_env, output_queue)
+
+    expected = project.resolve() / "data" / f"{_STAGE}.dat"
+    assert (result["status"], result["reason"]) == (
+        StageStatus.FAILED,
+        f"Stage did not produce output: {expected}",
+    )
+
+
+def test_unreadable_state_database_fails_the_stage_without_a_run_cache_key(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """A failure before dependency hashing reports input_hash None (types.py StageResult)."""
+    (project / ".pivot" / "state.lmdb").write_text("not a database")
+
+    result = worker.execute_stage(
+        _STAGE, _stage_info(_upper, project, worker_env), worker_env, output_queue
+    )
+
+    assert result["status"] == StageStatus.FAILED
+    assert result["reason"].splitlines()[-1].startswith("lmdb.Error: ")
+    assert result["input_hash"] is None
+    assert not _output_path(project).exists()
+
+
 def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
@@ -599,8 +744,12 @@ def test_directory_output_creates_nested_member_directories(
 def test_every_missing_output_key_is_reported() -> None:
     outs = [_ref(_STAGE, "a"), _ref(_STAGE, "b"), _ref(_STAGE, "c")]
 
-    with pytest.raises(KeyError, match=re.escape("Missing return output keys: ['a', 'c']")):
+    with pytest.raises(KeyError) as exc_info:
         worker._resolve_output_values({"b": 1}, outs, _STAGE)
+
+    assert exc_info.value.args == (
+        "Missing return output keys: ['a', 'c']. Return value keys: ['b']",
+    )
 
 
 def test_undeclared_return_keys_are_warned_and_dropped(caplog: pytest.LogCaptureFixture) -> None:
@@ -645,9 +794,29 @@ def test_path_output_checks_dependencies_through_symlinks(tmp_path: pathlib.Path
     link.symlink_to(external, target_is_directory=True)
 
     worker._reject_path_inside_project(_path_ref(), produced, project_root, [unrelated])
-    with pytest.raises(exceptions.StageDefinitionError, match="overlaps dependency"):
+    with pytest.raises(exceptions.StageDefinitionError) as exc_info:
         worker._reject_path_inside_project(_path_ref(), produced, project_root, [link])
+    assert str(exc_info.value) == (
+        f"Stage '{_STAGE}' returned {produced}, which overlaps dependency {link}. "
+        + "Pivot cannot move a path the stage received as input."
+    )
     assert produced.read_bytes() == b"result"
+
+
+def test_path_output_inside_the_project_tells_the_author_where_to_write(
+    tmp_path: pathlib.Path,
+) -> None:
+    produced = tmp_path / "result.bin"
+    produced.write_bytes(b"result")
+
+    with pytest.raises(exceptions.StageDefinitionError) as exc_info:
+        worker._reject_path_inside_project(_path_ref(), produced, tmp_path)
+
+    assert str(exc_info.value) == (
+        f"Stage '{_STAGE}' returned {produced}, which is inside the project ({tmp_path}). "
+        + "Pivot moves a returned path to the stage's output path, so it must be a file or "
+        + "directory the stage created outside the project, e.g. under tempfile.mkdtemp()."
+    )
 
 
 def test_list_and_tuple_dependencies_are_rebuilt_in_index_order() -> None:
@@ -699,12 +868,19 @@ def test_first_run_gives_every_incremental_input_its_empty_value(tmp_path: pathl
     assert values == {"prev_a": {}, "prev_b": ""}
 
 
-def test_incremental_input_without_recorded_output_names_the_fix(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize(
+    "recorded",
+    [pytest.param(False, id="not-in-the-lock"), pytest.param(True, id="not-in-the-cache")],
+)
+def test_incremental_input_that_cannot_be_restored_names_the_fix(
+    tmp_path: pathlib.Path, recorded: bool
+) -> None:
     store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")
     ref = _incremental("a", cast("loaders.Loader[object, object]", loaders.Text()))
     state_dir = tmp_path / ".pivot"
     lock_path = lock.StageLock(_STAGE, lock.get_stages_dir(state_dir)).path
-    lock_data = LockData(code_manifest={}, params={}, dep_hashes={}, output_hashes={})
+    output_hashes = {ref.identity: FileHash(hash="0123456789abcdef")} if recorded else {}
+    lock_data = LockData(code_manifest={}, params={}, dep_hashes={}, output_hashes=output_hashes)
 
     with pytest.raises(exceptions.CacheRestoreError) as exc_info:
         worker._prepare_incremental_inputs(
@@ -779,6 +955,46 @@ def test_queue_writer_reads_subprocess_bytes_until_end_of_file(
 
     assert ring.snapshot() == [("ok", False), ("\ufffd", False)]
     assert elapsed < 4.0, "the reader thread must stop at end of file"
+
+
+_LEAKED_CHILD_SCRIPT = textwrap.dedent(
+    """
+    import pathlib, queue, subprocess, sys
+    from pivot.executor import worker
+
+    writer = worker._QueueWriter(
+        "s", queue.Queue(), is_stderr=False, ring_buffer=worker._OutputRingBuffer()
+    )
+    writer.__enter__()
+    child = subprocess.Popen(
+        ["sleep", "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=writer.fileno(),
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pathlib.Path(sys.argv[1]).write_text(str(child.pid))
+    writer.__exit__(None, None, None)
+    """
+)
+
+
+def test_background_child_holding_stage_stdout_does_not_keep_the_worker_alive(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage may leave a process running that inherited its stdout; the worker still exits."""
+    pid_file = tmp_path / "child.pid"
+    try:
+        subprocess.run(
+            [sys.executable, "-c", _LEAKED_CHILD_SCRIPT, str(pid_file)],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    finally:
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
 
 # =============================================================================
