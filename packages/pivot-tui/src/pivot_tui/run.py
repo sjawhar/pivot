@@ -163,10 +163,17 @@ class TuiUpdate(textual.message.Message):
 
 
 class TuiShutdown(textual.message.Message):
-    """Message sent when TuiSink is closing.
+    """Message sent when the engine thread finishes.
 
-    Used by both run mode and watch mode to signal clean shutdown.
+    Used by both run mode and watch mode. ``error`` describes the exception that ended the
+    engine, or is None when it finished normally.
     """
+
+    error: str | None
+
+    def __init__(self, error: str | None = None) -> None:
+        self.error = error
+        super().__init__()
 
 
 _TUI_BINDINGS: list[textual.binding.BindingType] = [
@@ -452,25 +459,30 @@ class PivotApp(textual.app.App[None]):
         except Exception:
             _logger.exception("Error handling TUI update for %s: %s", msg["type"], msg)
 
-    def on_tui_shutdown(self, _event: TuiShutdown) -> None:  # pragma: no cover
-        """Handle TuiSink shutdown signal (both run and watch modes).
+    def on_tui_shutdown(self, event: TuiShutdown) -> None:  # pragma: no cover
+        """Handle the engine finishing (both run and watch modes).
 
-        In run mode: signals execution is complete, triggers exit with bell notification
-        In watch mode: logs shutdown, TUI continues until user quits
+        In run mode: execution is complete; exit with a bell notification.
+        In watch mode: a normal finish keeps the TUI up until the user quits; an engine
+        crash exits with return code 1 so the command fails.
         """
         self._write_to_log('{"type": "shutdown"}\n')
-        if not self._watch_mode:
-            # Run mode: notify user and exit after shutdown signal
-            with self._quit_lock:
-                if self._quitting:
-                    return
-                self._quitting = True
+        if self._watch_mode and event.error is None:
+            return
+        with self._quit_lock:
+            if self._quitting:
+                return
+            self._quitting = True
+        if event.error is None:
             self.bell()
-            if self._event_poller is not None:
-                self._event_poller.stop()
-            self._shutdown_event.set()
-            self._close_log_file()
+        if self._event_poller is not None:
+            self._event_poller.stop()
+        self._shutdown_event.set()
+        self._close_log_file()
+        if event.error is None:
             self.exit()
+        else:
+            self.exit(return_code=1)
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         """Handle log message."""

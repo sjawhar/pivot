@@ -357,14 +357,19 @@ def run_tui_with_engine(
     socket_ready = threading.Event()
     # Set when the engine finishes or the TUI exits; the poller thread stops on it.
     poller_stop = threading.Event()
+    # The exception that ended the engine; raised once the TUI has exited.
+    engine_errors = list[BaseException]()
 
     def engine_thread_target() -> None:
         """Run the async Engine in a background thread with its own event loop."""
+        error_text: str | None = None
         try:
             result = anyio.run(engine_fn, socket_ready)
             if result_future is not None and not result_future.done():
                 result_future.set_result(result)
         except BaseException as e:
+            error_text = f"{type(e).__name__}: {e}"
+            engine_errors.append(e)
             if result_future is not None and not result_future.done():
                 result_future.set_exception(e)
         finally:
@@ -372,7 +377,7 @@ def run_tui_with_engine(
             poller_stop.set()
             # Signal TUI to exit when engine completes (success or failure)
             with contextlib.suppress(Exception):
-                app.post_message(tui_run.TuiShutdown())
+                app.post_message(tui_run.TuiShutdown(error=error_text))
 
     # Start engine in background thread
     engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
@@ -446,6 +451,10 @@ def run_tui_with_engine(
     poller_thread.join()
     if result_future is not None:
         engine_thread.join(timeout=5.0)
+
+    # A crashed engine fails the command with its own error, not the TUI's return code.
+    if engine_errors:
+        raise engine_errors[0]
 
     # Textual sets a non-zero return code when the app exits on an unhandled exception;
     # surface it so callers (scripts, agents) can tell the TUI died.

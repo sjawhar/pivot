@@ -824,6 +824,34 @@ def test_on_tui_shutdown_no_bell_in_watch_mode(mocker: MockerFixture) -> None:
     mock_bell.assert_not_called()
 
 
+def test_on_tui_shutdown_without_error_keeps_watch_mode_running(mocker: MockerFixture) -> None:
+    """A watch-mode shutdown with no error leaves the TUI up until the user quits."""
+    app = run_tui.PivotApp(stage_names=["stage1"], watch_mode=True)
+    mocker.patch.object(app, "_write_to_log")
+    mock_exit = mocker.patch.object(app, "exit")
+
+    app.on_tui_shutdown(run_tui.TuiShutdown())
+
+    mock_exit.assert_not_called()
+
+
+def test_on_tui_shutdown_with_engine_error_exits_watch_mode_nonzero(
+    mocker: MockerFixture,
+) -> None:
+    """A crashed watch engine ends the TUI with a non-zero return code."""
+    app = run_tui.PivotApp(stage_names=["stage1"], watch_mode=True)
+    mock_poller = mocker.MagicMock()
+    app.set_event_poller(mock_poller)
+    mocker.patch.object(app, "_write_to_log")
+    mocker.patch.object(app, "_close_log_file")
+    mock_exit = mocker.patch.object(app, "exit")
+
+    app.on_tui_shutdown(run_tui.TuiShutdown(error="RuntimeError('engine crashed')"))
+
+    mock_exit.assert_called_once_with(return_code=1)
+    mock_poller.stop.assert_called_once()
+
+
 def test_on_tui_shutdown_stops_event_poller(mocker: MockerFixture) -> None:
     """on_tui_shutdown calls event_poller.stop() in run mode."""
     app = run_tui.PivotApp(stage_names=["stage1"])
