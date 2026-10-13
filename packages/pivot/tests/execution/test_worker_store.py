@@ -76,7 +76,6 @@ def _make_worker_stage_info(
     )
 
 
-
 def test_execute_stage_uses_store_spec_for_io(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:

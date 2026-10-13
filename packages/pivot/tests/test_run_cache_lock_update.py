@@ -259,6 +259,8 @@ def test_run_cache_skip_restores_cached_output(
     )
     output_path = workspace.resolve_display_path(_output_ref("test_stage"))
     assert output_path.read_text() == "processed: state_A"
+
+
 def test_explain_shows_cached_after_run_cache_skip(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
@@ -572,9 +574,7 @@ def test_run_cache_restore_bumps_output_generation_and_invalidates_downstream(
         outs=[producer_out],
         run_id="producer_A_restored",
     )
-    restored = executor.execute_stage(
-        "producer", producer_restore_info, worker_env, output_queue
-    )
+    restored = executor.execute_stage("producer", producer_restore_info, worker_env, output_queue)
     assert restored["status"] == "cached"
     assert "run cache" in restored["reason"]
     _apply_deferred_writes("producer", producer_restore_info, restored, state_db_path)
@@ -591,4 +591,6 @@ def test_run_cache_restore_bumps_output_generation_and_invalidates_downstream(
 
     downstream = executor.execute_stage("consumer", consumer_b_info, worker_env, output_queue)
     assert downstream["reason"] != "unchanged (generation)"
-    assert workspace.resolve_display_path(consumer_out).read_text() == "consumed: processed: state_A"
+    assert (
+        workspace.resolve_display_path(consumer_out).read_text() == "consumed: processed: state_A"
+    )

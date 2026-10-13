@@ -12,7 +12,6 @@ import pytest
 from pivot import compose, executor, loaders
 from pivot.storage import store as store_mod
 
-
 _JSON_RESULT = Annotated[dict[str, int], loaders.JSON[dict[str, int]]()]
 
 

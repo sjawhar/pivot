@@ -62,7 +62,6 @@ from pivot import (
     parameters,
     project,
     registry,
-    types,
 )
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config

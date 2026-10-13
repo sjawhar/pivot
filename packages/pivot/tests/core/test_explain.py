@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import pathlib
+from typing import ClassVar
 
+import pydantic
 import pygtrie
 import pytest
-import pydantic
-
 
 from pivot import explain, loaders, project, skip
 from pivot.storage import lock
 from pivot.storage import store as store_mod
 from pivot.storage.track import PvtData
-from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, LockData
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, HashInfo, LockData
 
 
 def _input_ref(name: str) -> ArtifactRef:
@@ -83,7 +83,7 @@ def _write_lock(
     code_manifest: dict[str, str],
     *,
     params: dict[str, object] | None = None,
-    dep_hashes: dict[ArtifactIdentity, dict[str, str]] | None = None,
+    dep_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
 ) -> None:
     lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).write(
         LockData(
@@ -252,8 +252,8 @@ def test_diff_params_unchanged() -> None:
     ],
 )
 def test_diff_deps_change(
-    old: dict[str, dict[str, str]],
-    new: dict[str, dict[str, str]],
+    old: dict[str, HashInfo],
+    new: dict[str, HashInfo],
     expected_identity: ArtifactIdentity,
     expected_old_hash: str | None,
     expected_new_hash: str | None,
@@ -274,13 +274,13 @@ def test_diff_deps_change(
 def test_diff_deps_directory_with_manifest() -> None:
     """Handles directory dependencies with manifests."""
     identity = ArtifactIdentity("data_dir", None)
-    old = {
+    old: dict[ArtifactIdentity, HashInfo] = {
         identity: {
             "hash": "tree_abc",
             "manifest": [{"relpath": "a.csv", "hash": "h1", "size": 10, "isexec": False}],
         }
     }
-    new = {
+    new: dict[ArtifactIdentity, HashInfo] = {
         identity: {
             "hash": "tree_def",
             "manifest": [{"relpath": "a.csv", "hash": "h2", "size": 10, "isexec": False}],
@@ -298,7 +298,7 @@ def test_diff_deps_directory_with_manifest() -> None:
 def test_diff_deps_unchanged() -> None:
     """Returns no changes when dependency hashes are unchanged."""
     identity = ArtifactIdentity("data.csv", None)
-    dep_hashes = {identity: {"hash": "abc123"}}
+    dep_hashes: dict[ArtifactIdentity, HashInfo] = {identity: {"hash": "abc123"}}
 
     assert skip.diff_dep_hashes(dep_hashes, dep_hashes) == []
 
@@ -516,7 +516,7 @@ def test_get_stage_explanation_invalid_params(tmp_path: pathlib.Path) -> None:
     """Returns will_run with details when parameter overrides are invalid."""
 
     class StrictParams(pydantic.BaseModel):
-        model_config = pydantic.ConfigDict(extra="forbid")
+        model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="forbid")
         learning_rate: float = 0.01
 
     state_dir = tmp_path / ".pivot"

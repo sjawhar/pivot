@@ -158,8 +158,6 @@ class WorkerStageInfo(TypedDict):
     collection_params: dict[str, str]
 
 
-
-
 def _make_result(
     status: Literal[StageStatus.RAN, StageStatus.CACHED, StageStatus.FAILED],
     reason: str,
@@ -1200,7 +1198,9 @@ def can_skip_via_generation(
         return False
 
     normalized_outs = sorted(outs_paths)
-    locked_out_paths = sorted(types.identity_key(identity) for identity in lock_data["output_hashes"])
+    locked_out_paths = sorted(
+        types.identity_key(identity) for identity in lock_data["output_hashes"]
+    )
     if normalized_outs != locked_out_paths:
         return False
     if not deps:

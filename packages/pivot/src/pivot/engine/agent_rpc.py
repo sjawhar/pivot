@@ -17,8 +17,8 @@ from pivot import explain as explain_mod
 from pivot import parameters, project, types
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
-from pivot.storage import store as store_mod
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
+from pivot.storage import store as store_mod
 from pivot.types import DataDiffResult, OnError, StageExplanation
 
 if TYPE_CHECKING:
@@ -297,9 +297,7 @@ class AgentRpcHandler:
                         overrides = parameters.load_params_yaml()
                     except Exception as e:
                         raise ValueError(f"Failed to load params.yaml: {e}") from e
-                    all_stages = {
-                        name: pipeline.get_stage(name) for name in pipeline.list_stages()
-                    }
+                    all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
                     producer_hashes = explain_mod.producer_output_hashes(
                         list(all_stages),
                         all_stages,

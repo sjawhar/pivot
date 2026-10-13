@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Any, TypeGuard, cast
+from typing import TYPE_CHECKING, TypeGuard, cast
 
 import yaml
 
@@ -179,7 +179,6 @@ def _ensure_identity_keys(
     return {identity_from_key(k): v for k, v in cast("dict[str, HashInfo]", hashes).items()}
 
 
-
 class StageLock:
     """Manages lock file for a single pipeline stage."""
 
@@ -231,7 +230,6 @@ class StageLock:
                 yaml.dump(storage_data, f, Dumper=yaml_config.Dumper, sort_keys=False)
 
         cache.atomic_write_file(self.path, write_yaml)
-
 
 
 def find_orphaned_locks(

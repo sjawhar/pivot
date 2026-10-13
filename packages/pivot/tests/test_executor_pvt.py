@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import pathlib
-
-import click.testing
+from typing import TYPE_CHECKING
 
 from pivot import cli, compose, executor
 from pivot.storage import store as store_mod
+
+if TYPE_CHECKING:
+    import click.testing
 
 
 @compose.stage
@@ -15,7 +17,9 @@ def _count_images(images: pathlib.Path) -> str:
     return str(len(list(images.iterdir())))
 
 
-def _register_count_images(pipeline: compose.Pipeline, *, input_path: str = "images") -> pathlib.Path:
+def _register_count_images(
+    pipeline: compose.Pipeline, *, input_path: str = "images"
+) -> pathlib.Path:
     with compose.Pipeline(pipeline.name, root=pipeline.root) as builder:
         images = builder.input("images", t=pathlib.Path, path=input_path)
         _count_images(images)

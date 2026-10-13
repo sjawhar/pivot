@@ -164,9 +164,7 @@ def get_stage_explanation(
         state_context = contextlib.nullcontext(None)
     with state_context as state_db:
         known_hashes = producer_hashes or {}
-        pending_deps = {
-            name: ref for name, ref in deps.items() if ref.identity not in known_hashes
-        }
+        pending_deps = {name: ref for name, ref in deps.items() if ref.identity not in known_hashes}
         str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(
             pending_deps,
             store,

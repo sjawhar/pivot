@@ -131,8 +131,6 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
         )
 
 
-
-
 def test_atomic_write_no_partial_file(tmp_path: Path) -> None:
     """Write failure should not leave partial lock file."""
     stage_lock = lock.StageLock("atomic_test", tmp_path)
@@ -346,8 +344,6 @@ def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
     assert "dep_generations" not in result
 
 
-
-
 def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     """Lock files with extra keys (forward compatibility) are accepted."""
     stage_lock = lock.StageLock("future", tmp_path)
@@ -362,8 +358,6 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     assert result is not None
     assert result["code_manifest"] == {}
     assert result["params"] == {}
-
-
 
 
 # ==============================================================================
