@@ -143,12 +143,22 @@ def status(
     # Compute counts once for suggestions and output
     if explain and pipeline_explanations:
         stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
-        stage_reasons = [e["reason"] for e in pipeline_explanations]
+        stage_reasons = [(e["stage_name"], e["reason"]) for e in pipeline_explanations]
     else:
         stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
-        stage_reasons = [s["reason"] for s in pipeline_status]
-    missing_outputs_count = sum(
-        1 for reason in stage_reasons if reason == explain_mod.OUTPUTS_MISSING_REASON
+        stage_reasons = [(s["name"], s["reason"]) for s in pipeline_status]
+    outputs_missing = [
+        name for name, reason in stage_reasons if reason == explain_mod.OUTPUTS_MISSING_REASON
+    ]
+    # Pull can restore only cacheable outputs; a metric-only mismatch is not pullable.
+    missing_outputs_count = (
+        len(
+            status_mod.stages_missing_cacheable_outputs(
+                outputs_missing, cli_helpers.get_all_stages(), cli_helpers.get_pipeline()
+            )
+        )
+        if outputs_missing
+        else 0
     )
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0

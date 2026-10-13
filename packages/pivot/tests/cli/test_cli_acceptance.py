@@ -192,3 +192,35 @@ def test_stage_locks_of_pipelines_named_like_runtime_dirs_stay_committable(
     )
 
     assert check.returncode == 1, f"lock files ignored:\n{check.stdout}"
+
+
+_METRIC_ONLY_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, metric, stage
+
+
+@stage
+def summarize(raw: pd.DataFrame) -> Annotated[dict, metric]:
+    return {"rows": int(len(raw))}
+
+
+with Pipeline("m") as pipeline:
+    summarize(pipeline.input("t.csv"))
+"""
+
+
+def test_status_does_not_suggest_pull_for_an_edited_metric(tmp_path: pathlib.Path) -> None:
+    """Pull never restores metrics (they are git-tracked), so it must not be suggested for one."""
+    root = _project(tmp_path, {"pipeline.py": _METRIC_ONLY_PIPELINE, "data/raw/t.csv": "a\n1\n"})
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    metric_file = root / "metrics" / "m" / "summarize.yaml"
+    assert metric_file.is_file()
+    metric_file.write_text("rows: 999\n")
+
+    out = _ok(_pivot(root, "status"))
+
+    assert "pivot pull" not in out, out
