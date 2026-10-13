@@ -1,10 +1,13 @@
 import dataclasses
 import enum
 import functools
+import importlib.machinery
 import json
 import logging
 import math
 import re
+import sys
+import types
 import typing
 from collections.abc import Callable
 from typing import ClassVar
@@ -71,6 +74,27 @@ class _ExternalCallable:
 EXTERNAL_CALLABLE = _ExternalCallable()
 COMPILED_PATTERN = re.compile("x")
 NUMPY_LOG = np.log  # What `from numpy import log` binds: a ufunc, a callable instance.
+
+
+def _scaled(value: float) -> float:
+    return value * 2
+
+
+# np.frompyfunc products carry no `__module__`, like scipy.special's ufuncs (`expit`).
+MODULELESS_UFUNC = np.frompyfunc(_scaled, 1, 1)
+
+
+def _stage_uses_moduleless_ufunc() -> object:
+    return MODULELESS_UFUNC(1.0)
+
+
+def _install_library_module(monkeypatch: pytest.MonkeyPatch, binds: dict[str, object]) -> None:
+    """Register a third-party module (it lives under site-packages) that binds `binds`."""
+    module = types.ModuleType("fake_special")
+    module.__file__ = "/opt/venv/lib/python3.13/site-packages/fake_special/_ufuncs.py"
+    module.__spec__ = importlib.machinery.ModuleSpec("fake_special", loader=None)
+    vars(module).update(binds)
+    monkeypatch.setitem(sys.modules, "fake_special", module)
 
 
 def _callable_helper() -> int:
@@ -299,6 +323,25 @@ def test_nonlocal_stdlib_module_is_allowed() -> None:
     assert "self:stage" in fingerprint.get_stage_fingerprint(stage)
 
 
+def test_moduleless_ufunc_exported_by_library_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`from scipy.special import expit`: the library binds the ufunc under its own name."""
+    _install_library_module(monkeypatch, {MODULELESS_UFUNC.__name__: MODULELESS_UFUNC})
+
+    assert "self:_stage_uses_moduleless_ufunc" in fingerprint.get_stage_fingerprint(
+        _stage_uses_moduleless_ufunc
+    )
+
+
+def test_moduleless_ufunc_bound_under_another_name_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A library binding the object under a different name does not make it the library's."""
+    _install_library_module(monkeypatch, {"alias": MODULELESS_UFUNC})
+
+    with pytest.raises(exceptions.StageDefinitionError, match="MODULELESS_UFUNC"):
+        fingerprint.get_stage_fingerprint(_stage_uses_moduleless_ufunc)
+
+
 @pytest.mark.parametrize(
     ("func", "variable", "type_name"),
     [
@@ -313,6 +356,12 @@ def test_nonlocal_stdlib_module_is_allowed() -> None:
             "COMPILED_PATTERN",
             "Pattern",
             id="compiled-regex",
+        ),
+        pytest.param(
+            _stage_uses_moduleless_ufunc,
+            "MODULELESS_UFUNC",
+            "ufunc",
+            id="frompyfunc-of-user-function",
         ),
     ],
 )

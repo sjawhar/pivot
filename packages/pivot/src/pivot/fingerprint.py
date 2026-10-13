@@ -854,15 +854,27 @@ def _is_callable_instance(value: Any) -> bool:
 
 
 def _is_library_export(value: Any) -> bool:
-    """Return whether `value` is bound under its own name in its own non-user module."""
-    module_name = getattr(value, "__module__", None)
+    """Return whether a non-user module binds `value` under its own `__name__`.
+
+    The module named by `__module__` is checked. An object without one (scipy.special's ufuncs,
+    such as `expit`) is looked up in every loaded module; `np.frompyfunc` products stay
+    refused because no module binds their generated names.
+    """
     name = getattr(value, "__name__", None)
-    if not isinstance(module_name, str) or not isinstance(name, str):
+    if not isinstance(name, str):
         return False
-    module = sys.modules.get(module_name)
-    if module is None or is_user_code(module):
-        return False
-    return vars(module).get(name) is value
+    module_name = getattr(value, "__module__", None)
+    candidates: list[types.ModuleType | None]
+    if isinstance(module_name, str):
+        candidates = [sys.modules.get(module_name)]
+    else:
+        candidates = list(sys.modules.values())
+    return any(
+        isinstance(module, types.ModuleType)
+        and module.__dict__.get(name) is value
+        and not is_user_code(module)
+        for module in candidates
+    )
 
 
 def _process_closure_values(
