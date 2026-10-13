@@ -2054,8 +2054,6 @@ def test_stage_returning_path_inside_workspace_is_rejected(
     )
 
 
-
-
 # --- YAML metrics must be safe-readable by downstream stages ---
 
 
