@@ -416,3 +416,9 @@ def run_tui_with_engine(
     poller_thread.join(timeout=2.0)
     if result_future is not None:
         engine_thread.join(timeout=5.0)
+
+    # Textual sets a non-zero return code when the app exits on an unhandled exception;
+    # surface it so callers (scripts, agents) can tell the TUI died.
+    return_code = app.return_code
+    if return_code:
+        raise SystemExit(return_code)

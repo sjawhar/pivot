@@ -38,11 +38,15 @@ class _FakeApp:
     posted: list[object]
     event_poller: object | None
     ran: bool
+    return_code: int | None
+    run_return_code: int
 
-    def __init__(self) -> None:
+    def __init__(self, *, run_return_code: int = 0) -> None:
         self.posted = list[object]()
         self.event_poller = None
         self.ran = False
+        self.return_code = None
+        self.run_return_code = run_return_code
 
     def post_message(self, message: object) -> bool:
         self.posted.append(message)
@@ -53,6 +57,7 @@ class _FakeApp:
 
     def run(self) -> None:
         self.ran = True
+        self.return_code = self.run_return_code
 
 
 class _FakeRpcPivotClient:
@@ -772,3 +777,29 @@ def test_run_tui_with_engine_skips_setting_done_future(tmp_path: pathlib.Path) -
 
     assert result_future.set_result_called is False
     assert result_future.set_exception_called is False
+
+
+def test_run_tui_with_engine_exits_nonzero_when_app_crashes(
+    mocker: MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    """A TUI that exits with a non-zero return code (unhandled exception) fails the command."""
+    app = _FakeApp(run_return_code=1)
+
+    async def _engine_fn(socket_ready: threading.Event) -> None:
+        socket_ready.set()
+
+    _FakeRpcPivotClient.instances = []
+    _FakeRpcPivotClient.failures_before_success = 0
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            oneshot=False,
+            suppress_keyboard_interrupt=True,
+        )
+
+    assert exc_info.value.code == 1
