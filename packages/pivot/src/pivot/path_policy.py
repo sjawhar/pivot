@@ -17,6 +17,7 @@ class PathType(enum.StrEnum):
     """Classification of paths for policy enforcement."""
 
     DEP = "dependency"
+    INPUT = "input"
     OUT = "output"
     CWD = "working directory"
     VAR = "vars file"
@@ -33,6 +34,10 @@ class PathPolicy(TypedDict):
 POLICIES: dict[PathType, PathPolicy] = {
     PathType.DEP: PathPolicy(
         allow_absolute=True,
+        symlink_escape_action="warn",
+    ),
+    PathType.INPUT: PathPolicy(
+        allow_absolute=False,
         symlink_escape_action="warn",
     ),
     PathType.OUT: PathPolicy(

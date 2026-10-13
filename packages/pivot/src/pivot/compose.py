@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import exceptions, project, registry, stage_def, types
+from . import exceptions, path_policy, project, registry, stage_def, types
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -418,6 +418,11 @@ class Pipeline:
         if path is None:
             prefix = "data/external" if external else "data/raw"
             path = f"{prefix}/{name}"
+        # The store reads input bindings relative to the project root, so the path must stay
+        # inside it: no control characters, no '..', no absolute path elsewhere.
+        path_policy.require_valid_path(
+            path, path_policy.PathType.INPUT, self._root, context=f"Input '{name}'"
+        )
         if format is None:
             if t is not None:
                 format = _infer_input_format_from_type(t)

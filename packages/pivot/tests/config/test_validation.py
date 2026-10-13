@@ -33,3 +33,47 @@ def test_blank_pipeline_name_raises_error(tmp_path: pathlib.Path, name: str) -> 
         compose.Pipeline(name, root=tmp_path) as pipeline,
     ):
         _helper_reader(pipeline.input("data", path="data/input.csv", t=str))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param("data\x00.csv", id="null-byte"),
+        pytest.param("file\nname.csv", id="newline"),
+        pytest.param("file\rname.csv", id="carriage-return"),
+    ],
+)
+def test_input_path_with_control_character_raises_error(tmp_path: pathlib.Path, path: str) -> None:
+    """Input paths with null bytes or line breaks are rejected as a security error."""
+    with (
+        pytest.raises(exceptions.SecurityValidationError),
+        compose.Pipeline("bad_input", root=tmp_path) as pipeline,
+    ):
+        _helper_reader(pipeline.input("data", path=path, t=str))
+
+
+@pytest.mark.parametrize(
+    "outside", [pytest.param(True, id="absolute"), pytest.param(False, id="parent-traversal")]
+)
+def test_input_path_outside_project_raises_error(tmp_path: pathlib.Path, outside: bool) -> None:
+    """An input path that escapes the project root is rejected as a security error."""
+    root = tmp_path / "project"
+    root.mkdir()
+    secret = tmp_path / "secret_outside.txt"
+    secret.write_text("TOP SECRET")
+    path = str(secret) if outside else "../secret_outside.txt"
+
+    with (
+        pytest.raises(exceptions.SecurityValidationError),
+        compose.Pipeline("escape", root=root) as pipeline,
+    ):
+        _helper_reader(pipeline.input("data", path=path, t=str))
+
+
+def test_input_name_escaping_default_directory_raises_error(tmp_path: pathlib.Path) -> None:
+    """The default path data/raw/<name> is validated too, so the name cannot escape the root."""
+    with (
+        pytest.raises(exceptions.SecurityValidationError),
+        compose.Pipeline("escape_name", root=tmp_path) as pipeline,
+    ):
+        _helper_reader(pipeline.input("../../../etc/passwd", t=str))
