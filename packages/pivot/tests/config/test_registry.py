@@ -13,7 +13,7 @@ import pytest
 from pydantic import BaseModel
 from tests import helpers
 
-from pivot import compose, exceptions, fingerprint, loaders, registry, stage_def, types
+from pivot import compose, exceptions, fingerprint, registry, stage_def, types
 from pivot.registry import PipelineLike, RegistryStageInfo, StageRegistry
 
 
@@ -72,20 +72,17 @@ def _helper_info(
     name: str,
     *,
     func: Callable[..., Any] = _stage3_no_deps,
-    deps: dict[str, types.ArtifactRef] | None = None,
-    resources: dict[str, int | str] | None = None,
-    variant: str | None = None,
     fingerprint_: dict[str, str] | None = None,
     state_dir: pathlib.Path | None = None,
 ) -> RegistryStageInfo:
     return RegistryStageInfo(
         func=func,
         name=name,
-        deps=deps or {},
+        deps={},
         outs=[],
         params=None,
-        resources=resources or {},
-        variant=variant,
+        resources={},
+        variant=None,
         signature=None,
         fingerprint=fingerprint_,
         params_arg_name=None,
@@ -94,15 +91,6 @@ def _helper_info(
         no_fingerprint=False,
         code_deps=[],
         incremental_inputs={},
-    )
-
-
-def _helper_input_ref(name: str) -> types.ArtifactRef:
-    return types.ArtifactRef(
-        identity=types.ArtifactIdentity(name, None),
-        format=loaders.PathOnly(),
-        python_type=pathlib.Path,
-        tag=types.ArtifactTag.DATA,
     )
 
 
@@ -526,53 +514,6 @@ def test_registry_snapshot_empty() -> None:
     snapshot = reg.snapshot()
 
     assert snapshot == {}
-
-
-def test_registry_restore_replaces_stages() -> None:
-    """restore() should replace all stages with snapshot contents."""
-    reg = StageRegistry()
-    reg.add_existing(_helper_info("current"))
-
-    dep = _helper_input_ref("dep")
-    backup = _helper_info("backup", func=lambda: 42, deps={"_0": dep})
-
-    reg.restore({"backup": backup})
-
-    assert reg.list_stages() == ["backup"]
-    assert reg.get("backup")["deps"] == {"_0": dep}
-
-
-def test_registry_restore_empty_snapshot() -> None:
-    """restore() with empty snapshot should clear registry."""
-    reg = StageRegistry()
-    reg.add_existing(_helper_info("test"))
-
-    reg.restore({})
-
-    assert reg.list_stages() == []
-
-
-def test_registry_restore_preserves_metadata() -> None:
-    """restore() should preserve all stage metadata."""
-    reg = StageRegistry()
-    deps = {"_0": _helper_input_ref("a"), "_1": _helper_input_ref("b")}
-    original = _helper_info(
-        "original",
-        func=lambda: "test",
-        deps=deps,
-        resources={"gpu": 1},
-        variant="v1",
-        fingerprint_={"self:original": "abc123"},
-    )
-
-    reg.restore({"original": original})
-
-    assert reg.list_stages() == ["original"]
-    restored = reg.get("original")
-    assert restored["deps"] == deps
-    assert restored["resources"] == {"gpu": 1}
-    assert restored["variant"] == "v1"
-    assert restored["fingerprint"] == {"self:original": "abc123"}
 
 
 def test_registry_add_existing_stage(tmp_path: pathlib.Path) -> None:

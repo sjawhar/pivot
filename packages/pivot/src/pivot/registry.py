@@ -133,37 +133,12 @@ class StageRegistry:
         self._cached_dag = None
 
     def snapshot(self) -> dict[str, RegistryStageInfo]:
-        """Create a snapshot of current registry state for backup/restore.
+        """Return a shallow copy of the registered stages.
 
-        Returns a shallow copy of the internal stages dict. Use with `restore()`
-        to implement atomic reload patterns where you want to preserve the previous
-        valid state if the reload fails.
-
-        Example:
-            backup = registry.snapshot()
-            registry.clear()
-            try:
-                reload_stages()
-            except Exception:
-                registry.restore(backup)  # Rollback on failure
+        Engine reload keeps this copy of the previous pipeline's stages to report which
+        stages the reloaded pipeline added, removed, or modified.
         """
         return dict(self._stages)
-
-    def restore(self, snapshot: dict[str, RegistryStageInfo]) -> None:
-        """Restore registry state from a previous snapshot.
-
-        Replaces all current stages with the snapshot contents. Typically used
-        to rollback after a failed reload operation.
-
-        Args:
-            snapshot: Previously captured state from `snapshot()`
-        """
-        self._stages = dict(snapshot)
-        self._cached_dag = None
-
-    def get_all_output_paths(self) -> set[str]:
-        """Get all registered output paths (for watch mode filtering)."""
-        return set[str]()
 
 
 @runtime_checkable
@@ -191,8 +166,6 @@ class PipelineLike(Protocol):
     def invalidate_dag_cache(self) -> None: ...
 
     def snapshot(self) -> dict[str, RegistryStageInfo]: ...
-
-    def restore(self, snapshot: dict[str, RegistryStageInfo]) -> None: ...
 
     def include(self, other: PipelineLike) -> None: ...
 

@@ -20,7 +20,6 @@ import pytest
 from moto import server as moto_server
 
 from pivot import project
-from pivot.cli import console
 from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
@@ -196,13 +195,11 @@ def _default_project_root(tmp_path_factory: pytest.TempPathFactory) -> pathlib.P
 
 
 @pytest.fixture(autouse=True)
-def reset_pivot_state(
-    mocker: MockerFixture, _default_project_root: pathlib.Path
-) -> Generator[None]:
+def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
     """Reset global pivot state between tests.
 
-    CliRunner can leave console singleton pointing to closed streams,
-    project root cache pointing to old directories, and merged config cached.
+    CliRunner can leave the project root cache pointing to old directories and merged
+    config cached.
 
     Sets project root to a default directory with .pivot to prevent
     ProjectNotInitializedError. Tests that need a specific project root
@@ -211,7 +208,6 @@ def reset_pivot_state(
     Tests using isolated_filesystem() that create their own .pivot should
     reset the cache: project._project_root_cache = None
     """
-    mocker.patch.object(console, "_console", None)
     # Direct assignment (not mocker.patch) so tests can override by setting to None
     project._project_root_cache = _default_project_root
     config_io.clear_config_cache()
