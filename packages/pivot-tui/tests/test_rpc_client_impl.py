@@ -188,12 +188,10 @@ async def test_explain(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_explain_dep_changes_carry_artifact_identity(tmp_path: Path) -> None:
-    """explain() rebuilds dep_changes identities from the engine's JSON encoding."""
+    """explain() rebuilds dep_changes identities from the {producer, key} wire form."""
     from pivot.types import ArtifactIdentity, ChangeType
 
     async with _connected(tmp_path / "t.sock") as (server, client):
-        # The engine's StageExplanation carries an ArtifactIdentity NamedTuple; json.dumps
-        # sends it as a JSON array, exactly as agent_rpc does for the real explain RPC.
         server.set_explanation(
             "train",
             {
@@ -205,10 +203,10 @@ async def test_explain_dep_changes_carry_artifact_identity(tmp_path: Path) -> No
                 "param_changes": [],
                 "dep_changes": [
                     {
-                        "identity": ArtifactIdentity("prepare", "features"),
+                        "identity": {"producer": "prepare", "key": "features"},
                         "old_hash": "aaa",
                         "new_hash": "bbb",
-                        "change_type": ChangeType.MODIFIED,
+                        "change_type": "modified",
                     }
                 ],
                 "upstream_stale": [],
@@ -219,6 +217,34 @@ async def test_explain_dep_changes_carry_artifact_identity(tmp_path: Path) -> No
     dep = result["dep_changes"][0]
     assert dep["identity"] == ArtifactIdentity("prepare", "features")
     assert dep["change_type"] == ChangeType.MODIFIED
+
+
+@pytest.mark.anyio
+async def test_explain_rejects_array_identity(tmp_path: Path) -> None:
+    """The wire has one identity encoding; a [producer, key] array is a protocol error."""
+    async with _connected(tmp_path / "t.sock") as (server, client):
+        server.set_explanation(
+            "train",
+            {
+                "stage_name": "train",
+                "will_run": True,
+                "is_forced": False,
+                "reason": "Input dependencies changed",
+                "code_changes": [],
+                "param_changes": [],
+                "dep_changes": [
+                    {
+                        "identity": ["prepare", "features"],
+                        "old_hash": "aaa",
+                        "new_hash": "bbb",
+                        "change_type": "modified",
+                    }
+                ],
+                "upstream_stale": [],
+            },
+        )
+        with pytest.raises(RpcProtocolError, match="expected dict"):
+            await client.explain("train")
 
 
 # --- events_since ---

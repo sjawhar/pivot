@@ -453,7 +453,7 @@ async def test_run_app_selecting_stage_with_dep_change_from_wire_shows_input_pan
         "run_id": "run-dep",
         "explanation": explanation,
     }
-    wire = json.loads(json.dumps(event, default=agent_rpc._json_default))
+    wire = json.loads(agent_rpc._encode_wire(event))
     msg = event_poller._make_started_message(wire)
     assert msg is not None
 

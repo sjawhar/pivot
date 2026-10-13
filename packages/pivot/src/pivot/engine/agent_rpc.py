@@ -56,6 +56,28 @@ def _identity_json(ref: types.ArtifactRef) -> types.ArtifactIdentityJson:
     return types.identity_to_json(ref.identity)
 
 
+def _to_wire(value: object) -> object:
+    """Return ``value`` with every ArtifactIdentity in its ``{producer, key}`` object form.
+
+    ArtifactIdentity is a NamedTuple, which ``json.dumps`` would write as an array without
+    consulting ``default``, so identities are converted before encoding.
+    """
+    if isinstance(value, types.ArtifactIdentity):
+        return types.identity_to_json(value)
+    if isinstance(value, dict):
+        mapping = cast("dict[str, object]", value)
+        return {key: _to_wire(item) for key, item in mapping.items()}
+    if isinstance(value, (list, tuple)):
+        items = cast("list[object] | tuple[object, ...]", value)
+        return [_to_wire(item) for item in items]
+    return value
+
+
+def _encode_wire(message: object) -> bytes:
+    """Encode one JSON-RPC message as a newline-terminated line, as clients receive it."""
+    return json.dumps(_to_wire(message), default=_json_default).encode() + b"\n"
+
+
 # JSON-RPC 2.0: id can be string, number, or null (for notifications)
 type JsonRpcId = str | int | None
 
@@ -511,8 +533,7 @@ class AgentRpcSource:
                     response = await self._handle_request(request, send)
 
                     if response is not None and not await self._send_response(
-                        conn,
-                        json.dumps(response, default=_json_default).encode() + b"\n",
+                        conn, _encode_wire(response)
                     ):
                         return
 

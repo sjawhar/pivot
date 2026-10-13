@@ -35,6 +35,8 @@ Example response:
 }
 ```
 
+**Artifact identities:** every artifact identity in a response, including those inside `stage_info`, `explain` and the events returned by `events_since`, is sent as an object `{"producer": "<stage>", "key": "<output key or null>"}`.
+
 ## Available Methods
 
 | Method | Type | Params | Description |

@@ -265,35 +265,22 @@ def _as_str_list(value: object) -> list[str]:
     return items
 
 
-def _as_identity_list(value: object) -> list[ArtifactIdentity]:
-    if not isinstance(value, list):
-        raise RpcProtocolError("list", type(value).__name__)
-    items = list[ArtifactIdentity]()
-    for item in value:
-        d = _as_dict(item)
-        producer = d.get("producer")
-        if not isinstance(producer, str):
-            raise RpcProtocolError("str (producer)", type(producer).__name__)
-        key = d.get("key")
-        if key is not None and not isinstance(key, str):
-            raise RpcProtocolError("str | None (key)", type(key).__name__)
-        items.append(ArtifactIdentity(producer, key))
-    return items
-
-
-def _as_wire_identity(value: object) -> ArtifactIdentity:
-    """Rebuild an ArtifactIdentity from its JSON form.
-
-    ArtifactIdentity is a NamedTuple, so ``json.dumps`` writes it as ``[producer, key]``.
-    """
-    if not isinstance(value, list) or len(value) != 2:
-        raise RpcProtocolError("[producer, key] identity", type(value).__name__)
-    producer, key = value
+def _as_identity(value: object) -> ArtifactIdentity:
+    """Decode the ``{producer, key}`` wire form of an ArtifactIdentity."""
+    d = _as_dict(value)
+    producer = d.get("producer")
     if not isinstance(producer, str):
         raise RpcProtocolError("str (producer)", type(producer).__name__)
+    key = d.get("key")
     if key is not None and not isinstance(key, str):
         raise RpcProtocolError("str | None (key)", type(key).__name__)
     return ArtifactIdentity(producer, key)
+
+
+def _as_identity_list(value: object) -> list[ArtifactIdentity]:
+    if not isinstance(value, list):
+        raise RpcProtocolError("list", type(value).__name__)
+    return [_as_identity(item) for item in cast("list[object]", value)]
 
 
 def _as_optional_str(value: object, field: str) -> str | None:
@@ -311,7 +298,7 @@ def _as_dep_changes(value: list[object]) -> list[DepChange]:
             raise RpcProtocolError("str (change_type)", type(change_type).__name__)
         changes.append(
             DepChange(
-                identity=_as_wire_identity(d["identity"]),
+                identity=_as_identity(d["identity"]),
                 old_hash=_as_optional_str(d["old_hash"], "old_hash"),
                 new_hash=_as_optional_str(d["new_hash"], "new_hash"),
                 change_type=ChangeType(change_type),

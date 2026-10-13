@@ -1412,7 +1412,7 @@ def test_f13_started_event_dep_change_identity_survives_rpc_wire() -> None:
         "run_id": "run",
         "explanation": explanation,
     }
-    wire = json.loads(json.dumps(event, default=agent_rpc._json_default))
+    wire = json.loads(agent_rpc._encode_wire(event))
 
     msg = event_poller._make_started_message(wire)
 

@@ -488,6 +488,65 @@ async def test_agent_rpc_source_handles_status_query(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_sends_artifact_identities_as_objects(tmp_path: Path) -> None:
+    """Identities inside events and explanations use stage_info's {producer, key} form."""
+    from pivot import types
+
+    buffer = EventBuffer(max_events=10)
+    buffer.handle_sync(
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=1,
+            total=1,
+            run_id="run",
+            explanation=types.StageExplanation(
+                stage_name="train",
+                will_run=True,
+                is_forced=False,
+                reason="Input dependencies changed",
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[
+                    types.DepChange(
+                        identity=types.ArtifactIdentity("prepare", "features"),
+                        old_hash="aaa",
+                        new_hash="bbb",
+                        change_type=types.ChangeType.MODIFIED,
+                    )
+                ],
+                upstream_stale=[],
+            ),
+        )
+    )
+    socket_path = tmp_path / "agent.sock"
+    handler = AgentRpcHandler(engine=MagicMock(), event_buffer=buffer)
+    source = AgentRpcSource(socket_path=socket_path, handler=handler)
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {
+                "jsonrpc": "2.0",
+                "method": "events_since",
+                "params": {"version": 0},
+                "id": 1,
+            }
+            await conn.send(json.dumps(request).encode() + b"\n")
+            response = json.loads((await conn.receive(65536)).decode())
+        tg.cancel_scope.cancel()
+
+        event = response["result"]["events"][0]["event"]
+        assert event["explanation"]["dep_changes"][0]["identity"] == {
+            "producer": "prepare",
+            "key": "features",
+        }
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_rejects_oversized_messages(tmp_path: Path) -> None:
     """AgentRpcSource rejects messages larger than 1MB to prevent memory exhaustion."""
     socket_path = tmp_path / "agent.sock"
