@@ -14,7 +14,7 @@ pivot repro --tui
 pivot repro --watch --tui
 
 # Run specific stages
-pivot repro train evaluate --tui
+pivot repro demo/train demo/evaluate --tui
 ```
 
 The TUI requires the `pivot-tui` package. Install it with:
@@ -55,7 +55,7 @@ The TUI uses a two-panel layout:
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Stage List** (left) — shows all stages with status symbols. Stages are grouped by matrix variants and sorted by DAG level. Use `j`/`k` to navigate, `/` to filter by name, `Enter` to collapse groups.
+**Stage List** (left) — shows all stages with status symbols. Variants of one stage (`train@a`, `train@b`) are grouped together and stages are sorted by DAG level. Use `j`/`k` to navigate, `/` to filter by name, `Enter` to collapse groups.
 
 **Detail Panel** (right) — three tabs:
 

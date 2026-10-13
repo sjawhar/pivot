@@ -16,10 +16,9 @@ def _normalize_data(df: DataFrame) -> DataFrame:
     """Private helper - changes here WILL trigger re-runs."""
     return df.dropna()  # Any change here invalidates dependent stages
 
-def train(
-    params: TrainParams,
-    data: Annotated[DataFrame, Dep("input.csv", CSV())],
-) -> Annotated[DataFrame, Out("output.csv", CSV())]:
+
+@stage
+def train(data: DataFrame, params: TrainParams) -> DataFrame:
     return _normalize_data(data)
 ```
 

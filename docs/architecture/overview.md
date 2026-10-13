@@ -6,7 +6,7 @@ Pivot is designed for high-performance pipeline execution with automatic code ch
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (pipeline.py or pivot.yaml)             │
+│  User Pipeline Code (pipeline.py: @stage + Pipeline)        │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -156,8 +156,8 @@ Lock files use relative paths for portability across machines.
 
 ## Data Flow
 
-1. **Discovery** - CLI discovers pipeline (pipeline.py or pivot.yaml)
-2. **Registration** - Stages registered from Python code (or YAML config)
+1. **Discovery** - CLI finds and runs `pipeline.py`
+2. **Construction** - `@stage` calls inside `with Pipeline(...)` record stages; the block's exit builds the `StageRegistry`
 3. **DAG Construction** - Build dependency graph from outputs/inputs
 4. **Fingerprinting** - Hash code, params, and dependency content
 5. **Comparison** - Compare fingerprints with lock files
@@ -175,9 +175,10 @@ Lock files use relative paths for portability across machines.
 │       ├── ab/
 │       │   └── cdef...  # Files keyed by xxhash64
 │       └── ...
-├── stages/              # Per-stage lock files
-│   ├── preprocess.lock
-│   └── train.lock
+├── stages/              # Per-stage lock files, one directory per pipeline
+│   └── demo/
+│       ├── preprocess.lock
+│       └── train.lock
 ├── config.yaml          # Remote configuration
 └── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)
 ```

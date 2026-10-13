@@ -83,8 +83,6 @@ except AttributeError:
 | Library | Module | Purpose |
 |---------|--------|---------|
 | ruamel.yaml | `config/io.py` | User config (preserves comments) |
-| ruamel.yaml | `dvc_import.py` | Generated pivot.yaml (clean formatting) |
-| PyYAML | `pipeline/yaml.py` | pivot.yaml parsing (read-only) |
 | PyYAML | `storage/lock.py` | Lock file parsing |
 | PyYAML | `loaders.py` | YAML data loader |
 | PyYAML | `parameters.py` | params.yaml files |

@@ -59,9 +59,9 @@ class Loader[W, R = W](Writer[W], Reader[R], ABC):
 
 ### Step 1: Choose the Right Base Class
 
-- **`Reader[R]`** - Use when you only need to read data (e.g., for `Dep()` only)
-- **`Writer[W]`** - Use when you only need to write data (e.g., for `Out()` only, like plots)
-- **`Loader[T]`** - Use when you need both read and write (most common, required for `IncrementalOut`)
+- **`Reader[R]`** - Use when you only need to read data (an input format passed to `pipeline.input(..., format=...)`)
+- **`Writer[W]`** - Use when you only need to write data (a leaf output nobody reads back, like a plot)
+- **`Loader[T]`** - Use when you need both read and write (most common: any output a downstream stage consumes)
 
 ### Step 2: Define the Loader Class
 
@@ -96,7 +96,7 @@ Here are examples using each base class:
 ```python
 from pivot.loaders import Reader, Writer, Loader
 
-# Reader-only: for dependencies you only read
+# Reader-only: for inputs you only read
 @dataclasses.dataclass(frozen=True)
 class ConfigReader(Reader[dict]):
     """Read-only config loader."""
@@ -116,7 +116,7 @@ class PlotWriter(Writer[Figure]):
         data.savefig(path, dpi=self.dpi)
 
 
-# Bidirectional: for read/write (required for IncrementalOut)
+# Bidirectional: for outputs that downstream stages read back
 @dataclasses.dataclass(frozen=True)
 class Parquet(Loader[pandas.DataFrame]):
     """Parquet file loader - Loader[T] is shorthand for Loader[T, T]."""
@@ -236,22 +236,23 @@ Parquet(compression="gzip")
 ## Usage Example
 
 ```python
-from typing import Annotated, TypedDict
+from typing import Annotated
 
 import pandas
-from pivot import outputs
+from pivot import Pipeline, stage
 from myproject.loaders import Parquet
 
 
-class ProcessOutputs(TypedDict):
-    data: Annotated[pandas.DataFrame, outputs.Out("data.parquet", Parquet())]
+@stage
+def process(raw: pandas.DataFrame) -> Annotated[pandas.DataFrame, Parquet()]:
+    return raw.dropna()
 
 
-def process(
-    raw: Annotated[pandas.DataFrame, outputs.Dep("raw.parquet", Parquet())],
-) -> ProcessOutputs:
-    return {"data": raw.dropna()}
+with Pipeline("demo") as pipeline:
+    process(pipeline.input("raw.parquet", format=Parquet()))
 ```
+
+The loader on the return type writes the output and reads it back for downstream stages; `format=` reads the raw input.
 
 ## Adding to Built-in Loaders
 
@@ -259,8 +260,9 @@ To add a loader to Pivot's built-in set:
 
 1. Add to `src/pivot/loaders.py`
 2. Export in `__all__`
-3. Add documentation to `docs/concepts/dependencies.md`
-4. Add tests
+3. Map its type to a file extension in `format_extension()` and, if it is a default for a Python type, in `compose._DEFAULT_FORMATS`
+4. Add documentation to `docs/concepts/loaders.md`
+5. Add tests
 
 ## Checklist
 
