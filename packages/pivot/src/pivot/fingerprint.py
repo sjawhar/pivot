@@ -1403,18 +1403,12 @@ def _resolve_static_callee(expr: ast.expr, globals_dict: dict[str, Any]) -> obje
         return None
 
 
-def _strip_resource_stage_decorator(
-    tree: ast.Module, globals_dict: dict[str, Any]
-) -> None:
+def _strip_resource_stage_decorator(tree: ast.Module, globals_dict: dict[str, Any]) -> None:
     """Exclude only the outer Pivot resource decorator from a stage code hash."""
     from pivot import compose
 
     outer = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ),
+        (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))),
         None,
     )
     if outer is None:
@@ -1477,8 +1471,9 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.ast_parse", _t_parse)
 
         _t_norm = metrics.start()
-        if hasattr(func, "__pivot_resources__") and isinstance(tree, ast.Module):
-            _strip_resource_stage_decorator(tree, func.__globals__)
+        if hasattr(func, "__pivot_resources__"):
+            globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
+            _strip_resource_stage_decorator(tree, globals_dict)
         tree = _normalize_ast(tree)
         ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
         metrics.end("fingerprint.normalize_and_dump", _t_norm)

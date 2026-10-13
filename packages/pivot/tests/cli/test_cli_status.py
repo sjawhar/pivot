@@ -304,7 +304,6 @@ def test_status_keeps_stage_cached_when_only_resources_change(
         assert "0 stale" in result.output
 
 
-
 def test_status_keeps_aliased_resource_stage_cached(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
@@ -363,6 +362,7 @@ def test_status_detects_user_decorator_change_on_resource_stage(
         assert result.exit_code == 0, result.output
         assert "0 cached" in result.output
         assert "1 stale" in result.output
+
 
 def test_status_verbose_shows_all_stages(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
