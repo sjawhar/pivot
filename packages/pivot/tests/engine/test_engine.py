@@ -1108,7 +1108,7 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
         mock_pipeline.get.return_value = MagicMock()
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
-        engine._reload_registry = lambda: ({}, None)  # type: ignore[assignment] - test mock
+        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass
@@ -1144,7 +1144,7 @@ async def test_engine_code_reload_restores_project_watch_root(
     async with Engine(pipeline=pipeline) as engine:
         engine.add_source(source)
         engine._stored_parallel = False
-        engine._reload_registry = lambda: ({}, None)  # type: ignore[assignment] - test seam
+        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test seam
 
         async def _ignore_reload(*_args: object) -> None:
             pass
@@ -1216,7 +1216,7 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
 
-        engine._reload_registry = lambda: ({}, None)  # type: ignore[assignment] - test mock
+        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass

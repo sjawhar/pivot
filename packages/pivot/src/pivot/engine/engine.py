@@ -341,6 +341,9 @@ class Engine:
         if self._output_send is None or self._output_recv is None:
             raise RuntimeError("Engine must be used as async context manager")
 
+        if self._watches_filesystem():
+            self._fingerprint_watched_stages()
+
         # Create fresh dispatch completion event (Events can only be set once)
         self._dispatch_complete = anyio.Event()
 
@@ -2128,6 +2131,24 @@ class Engine:
 
         return any(isinstance(source, FilesystemSource) for source in self._sources)
 
+    def _fingerprint_watched_stages(self) -> None:
+        """Fingerprint every stage before a watched engine starts its sources.
+
+        A code reload diffs the edited pipeline against these cached fingerprints; computing
+        the old ones after the edit would read the edited source and report nothing modified.
+        This runs synchronously before any source or run starts, so the startup run's skip
+        check reuses the cached values and no stage is fingerprinted on two threads at once.
+        """
+        pipeline = self._pipeline
+        if pipeline is None:
+            return
+        for stage_name in pipeline.list_stages():
+            try:
+                _ = pipeline.ensure_fingerprint(stage_name)
+            except exceptions.PivotError as exc:
+                # The startup run reports the same error when it fingerprints the stage.
+                _logger.debug("Fingerprinting failed for stage '%s': %s", stage_name, exc)
+
     def _snapshot_watch_output(self, path: pathlib.Path) -> _WatchOutputSnapshot:
         """Capture every currently visible path in one output's filesystem tree."""
         entries = dict[pathlib.Path, _WatchOutputSignature]()
@@ -2233,16 +2254,15 @@ class Engine:
         # Invalidate manifest cache entries for changed source files
         fingerprint.invalidate_manifests_for_paths(event["paths"])
 
-        # Reload registry - returns old_stages on success, None on failure
-        reload_result = self._reload_registry()
+        # Reload registry - returns the old stages on success, None on failure
+        old_stages = self._reload_registry()
 
-        if reload_result is None:
+        if old_stages is None:
             _logger.error("Pipeline invalid - waiting for fix")
             return
 
         # Emit reload event
-        old_stages, old_pipeline_ref = reload_result
-        await self._emit_reload_event(old_stages, old_pipeline_ref)
+        await self._emit_reload_event(old_stages)
 
         # Flush manifest cache so cached manifests survive the reload
         fingerprint.flush_manifest_cache()
@@ -2412,17 +2432,14 @@ class Engine:
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
-    def _reload_registry(
-        self,
-    ) -> tuple[dict[str, RegistryStageInfo], registry.PipelineLike | None] | None:
+    def _reload_registry(self) -> dict[str, RegistryStageInfo] | None:
         """Reload the pipeline by re-importing pipeline definition.
 
-        Returns old_stages and old_pipeline_ref if reload succeeded, None if pipeline is invalid.
-        The caller should emit the reload event using the returned old_stages.
+        Returns the old pipeline's stages if reload succeeded, None if the pipeline is invalid.
+        The caller should emit the reload event using the returned stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
-        old_pipeline_ref = old_pipeline if old_pipeline else None
         root = project.get_project_root()
 
         # Clear project modules from sys.modules
@@ -2438,7 +2455,7 @@ class Engine:
                 return None
 
             self._pipeline = new_pipeline
-            return old_stages, old_pipeline_ref
+            return old_stages
         except Exception as e:
             _logger.warning(f"Pipeline invalid: {e}")
             # Restore old pipeline on failure
@@ -2465,12 +2482,13 @@ class Engine:
         for name in to_remove:
             del sys.modules[name]
 
-    async def _emit_reload_event(
-        self,
-        old_stages: dict[str, RegistryStageInfo],
-        old_pipeline_ref: registry.PipelineLike | None,
-    ) -> None:
-        """Emit PipelineReloaded event with diff information."""
+    async def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
+        """Emit PipelineReloaded event with diff information.
+
+        Old fingerprints are the ones cached before the edit (see
+        ``_fingerprint_watched_stages``); recomputing them now would read the edited source.
+        A stage without a cached old fingerprint counts as modified.
+        """
         new_stage_names = self._list_stages()
         new_stages_set = set(new_stage_names)
         old_stage_names = set(old_stages.keys())
@@ -2478,43 +2496,24 @@ class Engine:
         added = sorted(new_stages_set - old_stage_names)
         removed = sorted(old_stage_names - new_stages_set)
 
-        # Detect modified stages by comparing fingerprints
-        modified = list[str]()
+        # Fingerprint every new stage: shared ones are compared now, and all of them are the
+        # baseline the next reload compares against.
         pipeline = self._require_pipeline()
-        new_pipeline_ref = pipeline
-        for stage_name in sorted(old_stage_names & new_stages_set):
-            had_error = False
-            if old_pipeline_ref is None:
-                old_fp = None
-                had_error = True
-                _logger.warning(
-                    "Fingerprinting failed for stage '%s' during reload (old registry unavailable)",
-                    stage_name,
-                )
-            else:
-                try:
-                    old_fp = old_pipeline_ref.ensure_fingerprint(stage_name)
-                except exceptions.PivotError as exc:
-                    old_fp = None
-                    had_error = True
-                    _logger.warning(
-                        "Fingerprinting failed for stage '%s' during reload (old registry): %s",
-                        stage_name,
-                        exc,
-                    )
-
+        new_fingerprints = dict[str, dict[str, str] | None]()
+        for stage_name in new_stage_names:
             try:
-                new_fp = new_pipeline_ref.ensure_fingerprint(stage_name)
+                new_fingerprints[stage_name] = pipeline.ensure_fingerprint(stage_name)
             except exceptions.PivotError as exc:
-                new_fp = None
-                had_error = True
+                new_fingerprints[stage_name] = None
                 _logger.warning(
-                    "Fingerprinting failed for stage '%s' during reload (new registry): %s",
-                    stage_name,
-                    exc,
+                    "Fingerprinting failed for stage '%s' during reload: %s", stage_name, exc
                 )
 
-            if had_error or old_fp != new_fp:
+        modified = list[str]()
+        for stage_name in sorted(old_stage_names & new_stages_set):
+            old_fp = old_stages[stage_name]["fingerprint"]
+            new_fp = new_fingerprints[stage_name]
+            if old_fp is None or new_fp is None or old_fp != new_fp:
                 modified.append(stage_name)
 
         await self.emit(
