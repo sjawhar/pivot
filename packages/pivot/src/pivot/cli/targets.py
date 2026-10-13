@@ -52,6 +52,11 @@ def parse_identity_target(target: str) -> types.ArtifactIdentity:
     return types.identity_from_key(target)
 
 
+def format_identity_display(identity: types.ArtifactIdentity, path: str) -> str:
+    """Format a stage output's identity and workspace path for human-facing CLI output."""
+    return f"{types.identity_key(identity)} → {path}"
+
+
 def resolve_cli_target(
     target: str,
     all_stages: Mapping[str, RegistryStageInfo],
