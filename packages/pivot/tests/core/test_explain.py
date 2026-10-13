@@ -406,6 +406,87 @@ def test_get_stage_explanation_without_state_db_has_no_side_effects(
     assert not (state_dir / "state.lmdb").exists()
 
 
+def _output_ref(producer: str, key: str, tag: ArtifactTag) -> ArtifactRef:
+    return ArtifactRef(
+        identity=ArtifactIdentity(producer, key),
+        format=loaders.YAML(),
+        python_type=dict,
+        tag=tag,
+    )
+
+
+def _explain_with_outputs(
+    tmp_path: pathlib.Path, outs: list[ArtifactRef], edit: dict[ArtifactRef, str | None]
+) -> StageExplanation:
+    """Lock `outs` at their current bytes, apply `edit` (None deletes), and explain the stage."""
+    state_dir = tmp_path / ".pivot"
+    store = _store(tmp_path)
+    output_hashes = dict[ArtifactIdentity, HashInfo]()
+    for ref in outs:
+        path = store.resolve_display_path(ref)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("value: 1\n")
+        output_hashes[ref.identity] = executor.worker.hash_output(path)
+    manifest = {"self:summarize": "abc123"}
+    lock.StageLock("s", lock.get_stages_dir(state_dir)).write(
+        LockData(code_manifest=manifest, params={}, dep_hashes={}, output_hashes=output_hashes)
+    )
+    for ref, text in edit.items():
+        path = store.resolve_display_path(ref)
+        if text is None:
+            path.unlink()
+        else:
+            path.write_text(text)
+
+    return explain.get_stage_explanation(
+        stage_name="s",
+        fingerprint=manifest,
+        deps={},
+        outs=outs,
+        params_instance=None,
+        overrides=None,
+        state_dir=state_dir,
+        store=store,
+    )
+
+
+def test_get_stage_explanation_edited_metric_is_not_missing_from_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hand-edited metric is uncached by design, so pull cannot restore it: say what changed."""
+    table = _output_ref("s", "table", ArtifactTag.DATA)
+    stats = _output_ref("s", "stats", ArtifactTag.METRIC)
+
+    result = _explain_with_outputs(tmp_path, [stats, table], {stats: "value: 999\n"})
+
+    assert result["will_run"] is True
+    assert result["reason"] != explain.OUTPUTS_MISSING_REASON
+    assert result["reason"] == "Metric output changed: s:stats"
+
+
+def test_get_stage_explanation_deleted_metric_is_reported_missing(tmp_path: pathlib.Path) -> None:
+    """A deleted metric names the metric, not the cache."""
+    stats = _output_ref("s", "stats", ArtifactTag.METRIC)
+
+    result = _explain_with_outputs(tmp_path, [stats], {stats: None})
+
+    assert result["will_run"] is True
+    assert result["reason"] == "Metric output missing: s:stats"
+
+
+def test_get_stage_explanation_missing_cacheable_output_keeps_cache_reason(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A cacheable output pull could restore keeps the cache reason, even beside a metric edit."""
+    table = _output_ref("s", "table", ArtifactTag.DATA)
+    stats = _output_ref("s", "stats", ArtifactTag.METRIC)
+
+    result = _explain_with_outputs(tmp_path, [stats, table], {stats: "value: 999\n", table: None})
+
+    assert result["will_run"] is True
+    assert result["reason"] == explain.OUTPUTS_MISSING_REASON
+
+
 def test_get_stage_explanation_code_changed(tmp_path: pathlib.Path) -> None:
     """Returns detailed code changes when code differs."""
     state_dir = tmp_path / ".pivot"
