@@ -19,6 +19,13 @@ def _incremental_tag() -> types.ArtifactTag:
 def _increment(previous: dict[str, int]) -> dict[str, int]:
     return {"count": previous.get("count", 0) + 1}
 
+_incremental_invocations = list[int]()
+
+
+def _counting_increment(previous: dict[str, int]) -> dict[str, int]:
+    _incremental_invocations.append(1)
+    return {"count": previous.get("count", 0) + 1}
+
 
 def _increment_from_input(data: str, previous: dict[str, int]) -> dict[str, int]:
     _ = data
@@ -127,6 +134,29 @@ def test_incremental_first_run_injects_loader_empty_and_forced_run_restores_prev
 
     assert second["status"] is types.StageStatus.RAN
     assert loaders.JSON[dict[str, int]]().load(_output_path(tmp_path, "cache")) == {"count": 2}
+
+def test_unchanged_incremental_stage_is_cached_and_restores_missing_workspace_output(
+    worker_env: pathlib.Path,
+    tmp_path: pathlib.Path,
+    output_queue: Any,
+) -> None:
+    """An unchanged incremental stage skips user code and restores its output on demand."""
+    _incremental_invocations.clear()
+    output = _output_ref("cached", loaders.JSON[dict[str, int]]())
+    info = _worker_info(_counting_increment, tmp_path, output)
+
+    first = worker.execute_stage("incremental/cached", info, worker_env, output_queue)
+    second = worker.execute_stage("incremental/cached", info, worker_env, output_queue)
+
+    output_path = _output_path(tmp_path, "cached")
+    output_path.unlink()
+    restored = worker.execute_stage("incremental/cached", info, worker_env, output_queue)
+
+    assert first["status"] is types.StageStatus.RAN
+    assert second["status"] is types.StageStatus.CACHED
+    assert restored["status"] is types.StageStatus.CACHED
+    assert _incremental_invocations == [1]
+    assert loaders.JSON[dict[str, int]]().load(output_path) == {"count": 1}
 
 
 def test_incremental_stage_never_restores_an_older_run_cache_entry(
