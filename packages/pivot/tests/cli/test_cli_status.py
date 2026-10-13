@@ -140,6 +140,38 @@ with Pipeline("test") as pipeline:
     process(pipeline.input("input.txt"))
 """
 
+
+_HOSTILE_RESOURCE_DECORATOR_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+class Bomb:
+    def __getattribute__(self, name):
+        if name == "__dict__":
+            raise RuntimeError("fingerprinting evaluated unrelated decorator")
+        return object.__getattribute__(self, name)
+
+    def stage(self, *, resources: dict[str, int]):
+        def decorate(func):
+            return func
+        return decorate
+
+
+bomb = Bomb()
+
+
+@bomb.stage(resources={"delta": DELTA})
+@stage(resources={"gpu": 1})
+def process(input_file: str) -> str:
+    return "done"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
 _STAGES_A_B_PIPELINE = """\
 from __future__ import annotations
 
@@ -357,6 +389,26 @@ def test_status_detects_user_decorator_change_on_resource_stage(
         assert repro.exit_code == 0, repro.output
 
         pipeline_path.write_text(_USER_DECORATOR_RESOURCE_PIPELINE.replace("MARKER", "marker_two"))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "0 cached" in result.output
+        assert "1 stale" in result.output
+
+
+def test_status_keeps_hostile_decorator_unevaluated_and_hashed(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Fingerprinting does not inspect an unrelated decorator owner."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_HOSTILE_RESOURCE_DECORATOR_PIPELINE.replace("DELTA", "1"))
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_HOSTILE_RESOURCE_DECORATOR_PIPELINE.replace("DELTA", "2"))
         result = runner.invoke(cli.cli, ["status"])
 
         assert result.exit_code == 0, result.output

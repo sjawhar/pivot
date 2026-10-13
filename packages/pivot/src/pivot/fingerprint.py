@@ -1395,12 +1395,10 @@ def _resolve_static_callee(expr: ast.expr, globals_dict: dict[str, Any]) -> obje
     if not isinstance(expr, ast.Attribute):
         return None
     owner = _resolve_static_callee(expr.value, globals_dict)
-    if owner is None:
+    if not isinstance(owner, types.ModuleType):
         return None
-    try:
-        return vars(owner).get(expr.attr)
-    except TypeError:
-        return None
+    namespace = object.__getattribute__(owner, "__dict__")
+    return namespace.get(expr.attr)
 
 
 def _strip_resource_stage_decorator(tree: ast.Module, globals_dict: dict[str, Any]) -> None:
