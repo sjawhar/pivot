@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pydantic
+
 from pivot import executor, loaders
 from pivot.storage import cache, lock, state
 from pivot.storage import store as store_mod
@@ -594,3 +596,118 @@ def test_run_cache_restore_bumps_output_generation_and_invalidates_downstream(
     assert (
         workspace.resolve_display_path(consumer_out).read_text() == "consumed: processed: state_A"
     )
+
+
+def test_run_cache_hit_with_matching_outputs_preserves_generation_skip(
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    tmp_path: pathlib.Path,
+) -> None:
+    """A cache hit that writes no bytes preserves the downstream generation fast path."""
+
+    class ConstantOutputParams(pydantic.BaseModel):
+        factor: int
+
+    input_file = tmp_path / "input.txt"
+    input_file.write_text("input")
+
+    def producer_func(_0: str, params: ConstantOutputParams) -> str:
+        _ = params
+        return "constant"
+
+    def consumer_func(_0: str) -> str:
+        return f"consumed: {_0}"
+
+    producer_out = _output_ref("producer")
+    consumer_out = _output_ref("consumer")
+    state_db_path = tmp_path / ".pivot"
+
+    producer_a = _make_stage_info(
+        producer_func,
+        tmp_path,
+        fingerprint={"self:producer": "fp-producer"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[producer_out],
+        run_id="producer_10",
+    )
+    producer_a["params"] = ConstantOutputParams(factor=10)
+    producer_a["params_arg_name"] = "params"
+    consumer = _make_stage_info(
+        consumer_func,
+        tmp_path,
+        fingerprint={"self:consumer": "fp-consumer"},
+        deps={"_0": producer_out},
+        outs=[consumer_out],
+        run_id="consumer",
+    )
+
+    first_producer = executor.execute_stage("producer", producer_a, worker_env, output_queue)
+    assert first_producer["status"] == "ran"
+    _apply_deferred_writes("producer", producer_a, first_producer, state_db_path)
+    first_consumer = executor.execute_stage("consumer", consumer, worker_env, output_queue)
+    assert first_consumer["status"] == "ran"
+    _apply_deferred_writes("consumer", consumer, first_consumer, state_db_path)
+
+    producer_b = _make_stage_info(
+        producer_func,
+        tmp_path,
+        fingerprint={"self:producer": "fp-producer"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[producer_out],
+        run_id="producer_20",
+    )
+    producer_b["params"] = ConstantOutputParams(factor=20)
+    producer_b["params_arg_name"] = "params"
+    second_producer = executor.execute_stage("producer", producer_b, worker_env, output_queue)
+    assert second_producer["status"] == "ran"
+    _apply_deferred_writes("producer", producer_b, second_producer, state_db_path)
+
+    consumer_after_second_producer = _make_stage_info(
+        consumer_func,
+        tmp_path,
+        fingerprint={"self:consumer": "fp-consumer"},
+        deps={"_0": producer_out},
+        outs=[consumer_out],
+        run_id="consumer_after_20",
+    )
+    consumer_after_second_producer["force"] = True
+    forced_consumer = executor.execute_stage(
+        "consumer", consumer_after_second_producer, worker_env, output_queue
+    )
+    assert forced_consumer["status"] == "ran"
+    _apply_deferred_writes(
+        "consumer", consumer_after_second_producer, forced_consumer, state_db_path
+    )
+
+    producer_restore = _make_stage_info(
+        producer_func,
+        tmp_path,
+        fingerprint={"self:producer": "fp-producer"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[producer_out],
+        run_id="producer_10_restored",
+    )
+    producer_restore["params"] = ConstantOutputParams(factor=10)
+    producer_restore["params_arg_name"] = "params"
+    restored_producer = executor.execute_stage(
+        "producer", producer_restore, worker_env, output_queue
+    )
+    assert restored_producer["status"] == "cached"
+    assert "run cache" in restored_producer["reason"]
+    _apply_deferred_writes("producer", producer_restore, restored_producer, state_db_path)
+
+    with state.StateDB(state_db_path) as db:
+        assert db.get_generation(_identity_key(producer_out)) == 2
+
+    no_op_consumer = _make_stage_info(
+        consumer_func,
+        tmp_path,
+        fingerprint={"self:consumer": "fp-consumer"},
+        deps={"_0": producer_out},
+        outs=[consumer_out],
+        run_id="consumer_no_op",
+    )
+    result = executor.execute_stage("consumer", no_op_consumer, worker_env, output_queue)
+
+    assert result["status"] == "cached"
+    assert result["reason"] == "unchanged (generation)"

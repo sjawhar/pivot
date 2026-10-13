@@ -18,7 +18,7 @@ import random
 import sys
 import threading
 import traceback
-from typing import IO, TYPE_CHECKING, Any, Literal, TypedDict, cast, override
+from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast, overload, override
 
 import pydantic
 
@@ -374,7 +374,7 @@ def execute_stage(
                                 production_lock,
                                 state_db,
                                 file_hash_entries=file_hash_entries,
-                                increment_outputs=True,
+                                increment_outputs=run_cache_skip["outputs_restored"],
                             )
                             return StageResult(
                                 status=StageStatus.CACHED,
@@ -478,6 +478,14 @@ def _to_identity_keyed_hashes(
     return {types.identity_key(identity): info for identity, info in hashes.items()}
 
 
+class OutputRestoreResult(NamedTuple):
+    """Whether output restoration succeeded and wrote workspace bytes."""
+
+    available: bool
+    outputs_restored: bool
+
+
+@overload
 def restore_outputs_to_hashes(
     store: store_mod.Store,
     outs: list[types.ArtifactRef],
@@ -486,27 +494,65 @@ def restore_outputs_to_hashes(
     *,
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
-) -> bool:
-    """Verify outputs match recorded hashes and restore cacheable mismatches."""
-    if not isinstance(store, store_mod.WorkspaceStore):
-        return all(store.exists(ref) for ref in outs)
+    report_changes: Literal[False] = False,
+) -> bool: ...
 
-    for ref in outs:
-        expected_hash = output_hashes.get(ref.identity)
-        if expected_hash is None:
-            return False
-        output_path = store.resolve_display_path(ref)
-        try:
-            actual_hash = hash_output(output_path, state_db)
-        except OSError:
-            actual_hash = None
-        if actual_hash == expected_hash:
-            continue
-        if not store.cache_contains(ref, expected_hash):
-            return False
-        if restore and not store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
-            return False
-    return True
+
+@overload
+def restore_outputs_to_hashes(
+    store: store_mod.Store,
+    outs: list[types.ArtifactRef],
+    output_hashes: dict[types.ArtifactIdentity, HashInfo],
+    state_db: state.StateDB | None,
+    *,
+    state_dir: pathlib.Path | None = None,
+    restore: bool = True,
+    report_changes: Literal[True],
+) -> OutputRestoreResult: ...
+
+
+def restore_outputs_to_hashes(
+    store: store_mod.Store,
+    outs: list[types.ArtifactRef],
+    output_hashes: dict[types.ArtifactIdentity, HashInfo],
+    state_db: state.StateDB | None,
+    *,
+    state_dir: pathlib.Path | None = None,
+    restore: bool = True,
+    report_changes: bool = False,
+) -> bool | OutputRestoreResult:
+    """Verify outputs match recorded hashes and restore cacheable mismatches."""
+    available = True
+    outputs_restored = False
+    if not isinstance(store, store_mod.WorkspaceStore):
+        available = all(store.exists(ref) for ref in outs)
+    else:
+        for ref in outs:
+            expected_hash = output_hashes.get(ref.identity)
+            if expected_hash is None:
+                available = False
+                break
+            output_path = store.resolve_display_path(ref)
+            try:
+                actual_hash = hash_output(output_path, state_db)
+            except OSError:
+                actual_hash = None
+            if actual_hash == expected_hash:
+                continue
+            if not store.cache_contains(ref, expected_hash):
+                available = False
+                break
+            if restore:
+                if not store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
+                    available = False
+                    break
+                outputs_restored = True
+    if report_changes:
+        return OutputRestoreResult(
+            available=available,
+            outputs_restored=outputs_restored,
+        )
+    return available
 
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
@@ -1335,6 +1381,7 @@ class RunCacheSkipResult(TypedDict):
     """Result from successful run cache skip."""
 
     output_hashes: dict[str, HashInfo]
+    outputs_restored: bool
 
 
 def _try_skip_via_run_cache_with_store(
@@ -1360,15 +1407,21 @@ def _try_skip_via_run_cache_with_store(
     if output_hashes.keys() != expected_keys:
         return None
     identity_hashes = _to_identity_hashes(output_hashes)
-    if not restore_outputs_to_hashes(
+
+    restoration = restore_outputs_to_hashes(
         store,
         stage_outs,
         identity_hashes,
         state_db,
         state_dir=state_dir,
-    ):
+        report_changes=True,
+    )
+    if not restoration.available:
         return None
-    return RunCacheSkipResult(output_hashes=output_hashes)
+    return RunCacheSkipResult(
+        output_hashes=output_hashes,
+        outputs_restored=restoration.outputs_restored,
+    )
 
 
 def write_run_cache_entry(
