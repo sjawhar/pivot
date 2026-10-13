@@ -153,7 +153,6 @@ def _emit_stage_info(
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     assert not hasattr(func, "_is_stage")
-    no_fp = getattr(func, "__pivot_no_fingerprint__", False)
 
     deps = dict[str, types.ArtifactRef]()
 
@@ -222,7 +221,8 @@ def _emit_stage_info(
         params_arg_name=params_arg_name,
         state_dir=state_dir,
         collection_params={k: str(v) for k, v in node.collection_params.items()},
-        no_fingerprint=no_fp,
+        no_fingerprint=node.no_fingerprint,
+        code_deps=list(node.code_deps),
     )
 
 
@@ -443,6 +443,7 @@ class Pipeline:
     def _record_stage(
         self,
         original_func: Callable[..., object],
+        stage_wrapper: Callable[..., object],
         output_specs: list[_OutputSpec],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -510,8 +511,12 @@ class Pipeline:
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
+        # Read @no_fingerprint marks from this @stage wrapper, never from the shared function:
+        # functools.wraps copies marks set below @stage, and marks set above land here directly.
         node = _StageNode(
             original_func=original_func,
+            no_fingerprint=getattr(stage_wrapper, "__pivot_no_fingerprint__", False),
+            code_deps=list(getattr(stage_wrapper, "__pivot_code_deps__", [])),
             name=stage_name,
             params=params,
             input_handles=input_handles,
@@ -797,7 +802,7 @@ def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, _get_output_specs(), args, kwargs)
+        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
 
     wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
     wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
@@ -823,6 +828,8 @@ class _StageNode:
     variant: str | None = None
     list_input_handles: dict[str, list[ArtifactHandle]] = dataclasses.field(default_factory=dict)
     collection_params: dict[str, CollectionKind] = dataclasses.field(default_factory=dict)
+    no_fingerprint: bool = False
+    code_deps: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass

@@ -129,7 +129,7 @@ def test_no_fingerprint_stage_skips_when_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
-    fingerprint_map = registry._compute_file_fingerprint(_helper_no_fingerprint_stage)
+    fingerprint_map = registry._compute_file_fingerprint(_helper_no_fingerprint_stage, [])
     out = _output_ref("no_fp")
     stage_info = _make_stage_info(
         _helper_no_fingerprint_stage,
@@ -163,7 +163,7 @@ def test_no_fingerprint_reruns_on_source_file_change(
     spec.loader.exec_module(mod)
     decorators.no_fingerprint()(mod.stage_func)
 
-    fp1 = registry._compute_file_fingerprint(mod.stage_func)
+    fp1 = registry._compute_file_fingerprint(mod.stage_func, [])
     assert any(k.startswith("file:") for k in fp1), "Fingerprint should include file: keys"
 
     out = _output_ref("src_fp")
@@ -182,7 +182,7 @@ def test_no_fingerprint_reruns_on_source_file_change(
     spec2.loader.exec_module(mod2)
     decorators.no_fingerprint()(mod2.stage_func)
 
-    fp2 = registry._compute_file_fingerprint(mod2.stage_func)
+    fp2 = registry._compute_file_fingerprint(mod2.stage_func, [])
     assert fp1 != fp2, "Fingerprint should change when source file is modified"
 
     stage_info_changed = _make_stage_info(
@@ -204,7 +204,9 @@ def test_no_fingerprint_reruns_on_code_deps_change(
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     (tmp_path / "helper.py").write_text("value = 1\n")
 
-    fingerprint_map = registry._compute_file_fingerprint(_helper_no_fingerprint_with_code_dep)
+    fingerprint_map = registry._compute_file_fingerprint(
+        _helper_no_fingerprint_with_code_dep, ["helper.py"]
+    )
     assert "file:helper.py" in fingerprint_map, "Fingerprint should include helper.py"
 
     out = _output_ref("no_fp_dep")
@@ -220,7 +222,9 @@ def test_no_fingerprint_reruns_on_code_deps_change(
     _apply_deferred_writes("no_fp_dep", stage_info, result1)
 
     (tmp_path / "helper.py").write_text("value = 2\n")
-    fingerprint_changed = registry._compute_file_fingerprint(_helper_no_fingerprint_with_code_dep)
+    fingerprint_changed = registry._compute_file_fingerprint(
+        _helper_no_fingerprint_with_code_dep, ["helper.py"]
+    )
     stage_info_changed = _make_stage_info(
         _helper_no_fingerprint_with_code_dep,
         tmp_path,
@@ -240,7 +244,7 @@ def test_no_fingerprint_skip_unrelated_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
-    fingerprint_map = registry._compute_file_fingerprint(_helper_no_fingerprint_stage)
+    fingerprint_map = registry._compute_file_fingerprint(_helper_no_fingerprint_stage, [])
 
     out = _output_ref("no_fp")
     stage_info = _make_stage_info(
@@ -269,7 +273,7 @@ def test_no_fingerprint_mixed_pipeline(
     ast_fingerprint = fingerprint.get_stage_fingerprint_cached(
         "ast_stage", _helper_ast_fingerprint_stage
     )
-    no_fp_fingerprint = registry._compute_file_fingerprint(_helper_no_fingerprint_stage)
+    no_fp_fingerprint = registry._compute_file_fingerprint(_helper_no_fingerprint_stage, [])
 
     ast_out = _output_ref("ast_stage")
     no_fp_out = _output_ref("no_fp")
@@ -308,7 +312,7 @@ def test_no_fingerprint_missing_code_deps_file(
 ) -> None:
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     with pytest.raises(FileNotFoundError, match="nonexistent.py"):
-        registry._compute_file_fingerprint(_helper_no_fingerprint_missing_dep)
+        registry._compute_file_fingerprint(_helper_no_fingerprint_missing_dep, ["nonexistent.py"])
 
 
 @pytest.mark.parametrize(

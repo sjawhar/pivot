@@ -1128,6 +1128,7 @@ def _make_stage_info(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
@@ -1433,6 +1434,34 @@ def test_no_fingerprint_code_deps_survive_decorator_order(
 
     assert "file:helper.py" in fp_before, f"code_deps file must be fingerprinted, got: {fp_before}"
     assert fp_before != fp_after, "Editing a code_deps file must change the stage fingerprint"
+
+
+def _helper_shared_impl() -> str:
+    return "output"
+
+
+_helper_plain_alias = stage(_helper_shared_impl)
+_helper_special_alias = no_fingerprint(code_deps=["helper.py"])(stage(_helper_shared_impl))
+
+
+def test_no_fingerprint_does_not_leak_to_other_stage_of_same_function(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Marking one @stage wrapper no_fingerprint leaves other wrappers of the function alone."""
+    (set_project_root / "helper.py").write_text("value = 1\n")
+    with Pipeline("test", root=set_project_root) as plain:
+        _helper_plain_alias()
+    with Pipeline("test", root=set_project_root) as special:
+        _helper_special_alias()
+
+    plain_fp = plain.ensure_fingerprint("test/_helper_shared_impl")
+    special_fp = special.ensure_fingerprint("test/_helper_shared_impl")
+
+    assert plain.get_stage("test/_helper_shared_impl")["no_fingerprint"] is False, (
+        "The plain alias must keep AST fingerprinting"
+    )
+    assert not any(k.startswith("file:") for k in plain_fp), f"Unexpected file hashing: {plain_fp}"
+    assert "file:helper.py" in special_fp, f"code_deps must apply to the marked alias: {special_fp}"
 
 
 def test_no_fingerprint_outside_stage_decorator(set_project_root: pathlib.Path) -> None:

@@ -82,6 +82,7 @@ def _register_plot_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
@@ -146,6 +147,7 @@ def _register_mixed_output_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 

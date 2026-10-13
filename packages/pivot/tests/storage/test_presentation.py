@@ -40,6 +40,7 @@ def _make_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
