@@ -24,7 +24,7 @@ def _stage_info(name: str, state_dir: pathlib.Path | None) -> RegistryStageInfo:
         deps={},
         outs=[],
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint=None,

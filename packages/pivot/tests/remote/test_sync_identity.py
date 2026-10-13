@@ -38,7 +38,7 @@ def _make_stage_info(
         "deps": {},
         "outs": outs,
         "params": None,
-        "mutex": [],
+        "resources": {},
         "variant": None,
         "signature": None,
         "fingerprint": None,

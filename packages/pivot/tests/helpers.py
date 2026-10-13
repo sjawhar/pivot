@@ -117,7 +117,7 @@ def register_test_stage(
     func: Callable[..., Any],
     name: str | None = None,
     params: type[stage_def.StageParams] | stage_def.StageParams | None = None,
-    mutex: list[str] | None = None,
+    resources: dict[str, int | str] | None = None,
     *,
     deps: Mapping[str, DepValue] | None = None,
     pipeline: PipelineLike | None = None,
@@ -134,7 +134,7 @@ def register_test_stage(
         name: Stage name (defaults to the function name).
         params: StageParams class or instance. ``None`` instantiates the
             function's StageParams parameter type with its defaults.
-        mutex: Mutex groups, written into the registered stage info.
+        resources: Scheduler resources written into the registered stage info.
         deps: Value for each dependency parameter: an ArtifactHandle (another
             stage's output, e.g. a previous ``register_test_stage`` return value,
             or ``pipeline.input(...)``), a list of handles, or a ``str`` naming an
@@ -189,8 +189,8 @@ def register_test_stage(
     if qualified_name in target.list_stages():
         raise exceptions.ValidationError(f"Stage '{qualified_name}' already registered")
     target.include(builder)
-    if mutex:
-        target.get_stage(qualified_name)["mutex"] = list(mutex)
+    if resources:
+        target.get_stage(qualified_name)["resources"] = dict(resources)
     return handle
 
 

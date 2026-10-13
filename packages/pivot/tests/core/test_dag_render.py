@@ -42,7 +42,7 @@ def _create_stage(
         deps={f"_{i}": _artifact_ref(dep) for i, dep in enumerate(dep_identities)},
         outs=[_artifact_ref(out) for out in out_identities],
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=None,
         fingerprint={},

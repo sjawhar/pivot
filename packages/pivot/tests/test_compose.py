@@ -566,7 +566,7 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     assert stage_a["params"] is not None
     assert isinstance(stage_a["params"], stage_def.StageParams)
     assert stage_a["params_arg_name"] == "params"
-    assert stage_a["mutex"] == []
+    assert stage_a["resources"] == {}
     assert stage_a["variant"] is None
     assert stage_a["signature"] == inspect.signature(inspect.unwrap(_helper_build_stage_a))
     assert stage_a["state_dir"] == tmp_path / ".pivot"
@@ -1257,7 +1257,7 @@ def _make_stage_info(
         deps=deps or {},
         outs=outs or [],
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(func),
         fingerprint=None,

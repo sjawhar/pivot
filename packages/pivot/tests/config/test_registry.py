@@ -73,7 +73,7 @@ def _helper_info(
     *,
     func: Callable[..., Any] = _stage3_no_deps,
     deps: dict[str, types.ArtifactRef] | None = None,
-    mutex: list[str] | None = None,
+    resources: dict[str, int | str] | None = None,
     variant: str | None = None,
     fingerprint_: dict[str, str] | None = None,
     state_dir: pathlib.Path | None = None,
@@ -84,7 +84,7 @@ def _helper_info(
         deps=deps or {},
         outs=[],
         params=None,
-        mutex=mutex or [],
+        resources=resources or {},
         variant=variant,
         signature=None,
         fingerprint=fingerprint_,
@@ -559,7 +559,7 @@ def test_registry_restore_preserves_metadata() -> None:
         "original",
         func=lambda: "test",
         deps=deps,
-        mutex=["gpu"],
+        resources={"gpu": 1},
         variant="v1",
         fingerprint_={"self:original": "abc123"},
     )
@@ -569,7 +569,7 @@ def test_registry_restore_preserves_metadata() -> None:
     assert reg.list_stages() == ["original"]
     restored = reg.get("original")
     assert restored["deps"] == deps
-    assert restored["mutex"] == ["gpu"]
+    assert restored["resources"] == {"gpu": 1}
     assert restored["variant"] == "v1"
     assert restored["fingerprint"] == {"self:original": "abc123"}
 

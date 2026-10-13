@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import pytest
 
-from pivot import compose, exceptions, executor, loaders, project
+from pivot import compose, config, exceptions, executor, loaders, project
 from pivot.executor import core as executor_core
 from tests import helpers
 
@@ -126,6 +126,7 @@ def _resource_a() -> str:
 
 def _resource_b() -> str:
     return _timed("b")
+
 
 def _resource_cpu() -> str:
     return _timed("cpu")
@@ -481,9 +482,7 @@ def _assert_serial(root: pathlib.Path, first: str, second: str) -> None:
     assert not _overlap(intervals[first], intervals[second]), intervals
 
 
-# mutex=["gpu"] -> resources={"gpu": 1}
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
-def test_mutex_prevents_concurrent_execution(
+def test_resource_prevents_concurrent_execution(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Shared GPU capacity serializes two otherwise independent stages."""
@@ -501,9 +500,7 @@ def test_mutex_prevents_concurrent_execution(
     _assert_serial(root, "a", "b")
 
 
-# mutex=["gpu"] -> resources={"gpu": 1}
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
-def test_mutex_releases_on_completion(
+def test_resource_releases_on_completion(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A resource is released after a successful owner completes."""
@@ -520,9 +517,9 @@ def test_mutex_releases_on_completion(
     assert intervals["b"][0] >= intervals["a"][1], intervals
 
 
-# mutex=["gpu"] -> resources={"gpu": 1}
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
-def test_mutex_releases_on_failure(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resource_releases_on_failure(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A resource is released after its owner fails so keep-going work proceeds."""
     root = _resource_root(tmp_path, monkeypatch)
     failing = _resource_stage({"gpu": 1}, _resource_fail)
@@ -539,15 +536,13 @@ def test_mutex_releases_on_failure(tmp_path: pathlib.Path, monkeypatch: pytest.M
     assert intervals["b"][0] >= intervals["fail"][1], intervals
 
 
-# mutex=["gpu", "cpu"] -> resources={"gpu": 1, "cpu": 1}
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
-def test_multiple_mutex_groups_per_stage(
+def test_multiple_resources_per_stage(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A stage reserves every requested resource, not just the first one."""
+    """A stage reserves every requested resource before another stage is admitted."""
     root = _resource_root(tmp_path, monkeypatch)
     stage_a = _resource_stage({"gpu": 1, "cpu": 1}, _resource_a)
-    stage_b = _resource_stage({"cpu": 1}, _resource_b)
+    stage_b = _resource_stage({"gpu": 1}, _resource_b)
     pipeline = compose.Pipeline("resources", root=root)
     with pipeline:
         stage_a()
@@ -557,9 +552,9 @@ def test_multiple_mutex_groups_per_stage(
     _assert_serial(root, "a", "b")
 
 
-# mutex=["gpu"] -> resources={"gpu": 1}
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
-def test_mutex_with_dependencies(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resource_with_dependencies(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Resource scheduling preserves a handle edge and serializes independent GPU work."""
     root = _resource_root(tmp_path, monkeypatch)
     stage_a = _resource_stage({"gpu": 1}, _resource_a)
@@ -580,7 +575,7 @@ def test_mutex_with_dependencies(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
     _assert_serial(root, "b", "c")
 
 
-def test_no_mutex_stages_unaffected(
+def test_stages_without_declared_resources_unaffected(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Stages with no resource request still execute normally."""
@@ -597,9 +592,7 @@ def test_no_mutex_stages_unaffected(
     assert set(intervals) == {"a", "b"}
 
 
-# mutex=["gpu"] -> resources={"gpu": 1}
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
-def test_mutex_names_are_case_insensitive(
+def test_resource_names_are_case_insensitive(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Resource names normalize case before capacity matching."""
@@ -615,11 +608,7 @@ def test_mutex_names_are_case_insensitive(
     _assert_serial(root, "a", "b")
 
 
-# mutex=["*"] -> resources={"cpu": "all"}
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
-def test_exclusive_mutex_runs_alone(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cpu_all_runs_alone(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A full CPU reservation excludes a simultaneous ordinary CPU reservation."""
     root = _resource_root(tmp_path, monkeypatch)
     exclusive = _resource_stage({"cpu": "all"}, _resource_a)
@@ -633,7 +622,6 @@ def test_exclusive_mutex_runs_alone(
     _assert_serial(root, "a", "b")
 
 
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
 def test_resource_waiting_does_not_consume_worker(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -655,7 +643,6 @@ def test_resource_waiting_does_not_consume_worker(
     assert not _overlap(intervals["a"], intervals["b"]), intervals
 
 
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
 def test_cpu_all_excludes_bare_stage(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -674,7 +661,71 @@ def test_cpu_all_excludes_bare_stage(
     _assert_serial(root, "a", "b")
 
 
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
+def test_resource_capacity_override_allows_concurrent_execution(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit capacity lets two GPU stages run in parallel."""
+    root = _resource_root(tmp_path, monkeypatch)
+    pipeline = _resource_pipeline(
+        root,
+        [
+            ({"gpu": 1}, _resource_a, ()),
+            ({"gpu": 1}, _resource_b, ()),
+        ],
+    )
+
+    executor.run(pipeline=pipeline, max_workers=2, resource_capacity={"gpu": 2})
+
+    intervals = _timing_intervals(root)
+    assert _overlap(intervals["a"], intervals["b"]), intervals
+
+
+def test_configured_resource_capacity_allows_concurrent_execution(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project's resources config sets capacity when no CLI override is supplied."""
+    from pivot.config import io as config_io
+
+    root = _resource_root(tmp_path, monkeypatch)
+    config_path = root / ".pivot" / "config.yaml"
+    config_path.parent.mkdir(exist_ok=True)
+    config_path.write_text("resources:\n  gpu: 2\n")
+    config_io.clear_config_cache()
+    pipeline = _resource_pipeline(
+        root,
+        [
+            ({"gpu": 1}, _resource_a, ()),
+            ({"gpu": 1}, _resource_b, ()),
+        ],
+    )
+
+    executor.run(pipeline=pipeline, max_workers=2)
+
+    intervals = _timing_intervals(root)
+    assert _overlap(intervals["a"], intervals["b"]), intervals
+    assert config.get_resource_capacities() == {"gpu": 2}
+    config_io.clear_config_cache()
+
+
+def test_cli_capacity_overrides_configured_resource_capacity(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-run capacity wins over the project resource capacity."""
+    from pivot.config import io as config_io
+
+    root = _resource_root(tmp_path, monkeypatch)
+    config_path = root / ".pivot" / "config.yaml"
+    config_path.parent.mkdir(exist_ok=True)
+    config_path.write_text("resources:\n  gpu: 1\n")
+    config_io.clear_config_cache()
+    pipeline = _resource_pipeline(root, [({"gpu": 2}, _resource_a, ())])
+
+    result = executor.run(pipeline=pipeline, resource_capacity={"gpu": 2})
+
+    assert result["resources/_resource_a"]["status"] == "ran"
+    config_io.clear_config_cache()
+
+
 def test_resource_changes_leave_stage_cached(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -682,13 +733,22 @@ def test_resource_changes_leave_stage_cached(
     root = _resource_root(tmp_path, monkeypatch)
     pipeline = _resource_pipeline(root, [({"gpu": 1}, _resource_a, ())])
 
-    assert executor.run(pipeline=pipeline)["resources/_resource_a"]["status"] == "ran"
+    assert (
+        executor.run(pipeline=pipeline, resource_capacity={"gpu": 2})["resources/_resource_a"][
+            "status"
+        ]
+        == "ran"
+    )
     pipeline.get_stage("resources/_resource_a")["resources"] = {"gpu": 2}
 
-    assert executor.run(pipeline=pipeline)["resources/_resource_a"]["status"] == "cached"
+    assert (
+        executor.run(pipeline=pipeline, resource_capacity={"gpu": 2})["resources/_resource_a"][
+            "status"
+        ]
+        == "cached"
+    )
 
 
-@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
 def test_resource_request_above_capacity_fails_before_submission(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
 ) -> None:
@@ -700,8 +760,8 @@ def test_resource_request_above_capacity_fails_before_submission(
     submit = mocker.patch.object(worker_pool.WorkerPool, "submit")
 
     with pytest.raises(
-        ValueError,
-        match=r"resources/_resource_a.*gpu.*3.*1",
+        exceptions.ValidationError,
+        match=r"resources/_resource_a.*3.*gpu.*1",
     ):
         executor.run(pipeline=pipeline)
 

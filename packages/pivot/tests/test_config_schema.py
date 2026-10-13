@@ -54,6 +54,19 @@ def test_config_defaults_has_default_remote() -> None:
     assert defaults.default_remote == ""
 
 
+def test_config_defaults_has_resources_section() -> None:
+    defaults = config.PivotConfig.get_default()
+    assert defaults.resources == {}
+
+
+def test_pivot_config_validates_positive_resource_capacities() -> None:
+    assert config.PivotConfig(resources={"GPU": 2}).resources == {"gpu": 2}
+    with pytest.raises(pydantic.ValidationError):
+        config.PivotConfig(resources={"gpu": 0})
+    with pytest.raises(pydantic.ValidationError):
+        config.PivotConfig(resources={"GPU": 1, "gpu": 2})
+
+
 def test_pivot_config_rejects_invalid_remote_name() -> None:
     """PivotConfig Pydantic validator rejects invalid remote names."""
     with pytest.raises(pydantic.ValidationError) as exc_info:

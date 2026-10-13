@@ -751,6 +751,7 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
             single_stage=False,
             parallel=False,
             max_workers=4,
+            resource_capacity={"gpu": 2},
             no_commit=True,
             on_error=OnError.KEEP_GOING,
             cache_dir=None,
@@ -777,6 +778,7 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
         assert engine._stored_on_error == OnError.KEEP_GOING
         assert engine._stored_parallel is False
         assert engine._stored_max_workers == 4
+        assert engine._stored_resource_capacity == {"gpu": 2}
 
 
 @pytest.mark.anyio
@@ -789,6 +791,7 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
         engine._stored_on_error = OnError.KEEP_GOING
         engine._stored_parallel = True
         engine._stored_max_workers = 4
+        engine._stored_resource_capacity = {"gpu": 2}
 
         # Mock _orchestrate_execution to capture what params it receives
         captured_kwargs: dict[str, object] = {}
@@ -810,6 +813,7 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
         assert captured_kwargs["on_error"] == OnError.KEEP_GOING, "on_error should use stored value"
         assert captured_kwargs["parallel"] is True, "parallel should use stored value"
         assert captured_kwargs["max_workers"] == 4, "max_workers should use stored value"
+        assert captured_kwargs["resource_capacity"] == {"gpu": 2}
 
 
 @pytest.mark.anyio
@@ -821,6 +825,7 @@ async def test_engine_execute_affected_stages_propagates_non_parallel_mode() -> 
         engine._stored_max_workers = None
         engine._stored_no_commit = False
         engine._stored_on_error = OnError.FAIL
+        engine._stored_resource_capacity = {}
 
         captured_kwargs: dict[str, object] = {}
 
@@ -876,6 +881,7 @@ async def test_engine_cancel_during_active_execution() -> None:
             single_stage=False,
             parallel=True,
             max_workers=None,
+            resource_capacity={},
             no_commit=False,
             on_error=OnError.FAIL,
             cache_dir=None,
@@ -980,6 +986,7 @@ async def test_engine_concurrent_run_requests_coalesced() -> None:
             single_stage=False,
             parallel=True,
             max_workers=None,
+            resource_capacity={},
             no_commit=False,
             on_error=OnError.FAIL,
             cache_dir=None,
@@ -994,6 +1001,7 @@ async def test_engine_concurrent_run_requests_coalesced() -> None:
             single_stage=False,
             parallel=True,
             max_workers=None,
+            resource_capacity={},
             no_commit=False,
             on_error=OnError.FAIL,
             cache_dir=None,
@@ -1461,7 +1469,7 @@ async def test_coordinator_skip_avoids_worker_dispatch(
     async with Engine(pipeline=pipeline) as engine:
         engine._graph = engine_graph.build_graph({stage_name: stage_info})
         await engine._initialize_orchestration([stage_name], max_workers=1)
-        engine._scheduler.acquire_mutexes(stage_name)
+        engine._scheduler.acquire_resources(stage_name)
         await engine._set_stage_state(stage_name, StageExecutionState.PREPARING)
         engine._worker_pool = MagicMock()
 
@@ -1537,7 +1545,7 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
     async with Engine(pipeline=pipeline) as engine:
         engine._graph = engine_graph.build_graph({stage_name: stage_info})
         await engine._initialize_orchestration([stage_name], max_workers=1)
-        engine._scheduler.acquire_mutexes(stage_name)
+        engine._scheduler.acquire_resources(stage_name)
         await engine._set_stage_state(stage_name, StageExecutionState.PREPARING)
         engine._worker_pool = MagicMock()
 

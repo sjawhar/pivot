@@ -57,7 +57,7 @@ def _make_stage_info(outs: list[types.ArtifactRef]) -> RegistryStageInfo:
         "deps": {},
         "outs": outs,
         "params": None,
-        "mutex": [],
+        "resources": {},
         "variant": None,
         "signature": None,
         "fingerprint": None,

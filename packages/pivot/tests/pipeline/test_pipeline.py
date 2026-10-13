@@ -36,7 +36,7 @@ def _helper_make_stage_info(
         deps=deps or {},
         outs=outs,
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_fn),
         fingerprint=None,

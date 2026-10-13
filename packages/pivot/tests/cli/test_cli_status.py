@@ -54,6 +54,22 @@ with Pipeline("test") as pipeline:
     process(pipeline.input("input.txt"))
 """
 
+
+_RESOURCE_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+@stage(resources={"gpu": CAPACITY})
+def process(input_file: str) -> str:
+    return "done"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
 _STAGES_A_B_PIPELINE = """\
 from __future__ import annotations
 
@@ -194,6 +210,26 @@ def test_status_shows_cached_stages(
 
         assert result.exit_code == 0
         assert "Pipeline Status" in result.output
+        assert "1 cached" in result.output
+        assert "0 stale" in result.output
+
+
+def test_status_keeps_stage_cached_when_only_resources_change(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Scheduler resource declarations do not invalidate a stage fingerprint."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_RESOURCE_PIPELINE.replace("CAPACITY", "1"))
+
+        repro = runner.invoke(cli.cli, ["repro", "--resources", "gpu=2"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_RESOURCE_PIPELINE.replace("CAPACITY", "2"))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
         assert "1 cached" in result.output
         assert "0 stale" in result.output
 

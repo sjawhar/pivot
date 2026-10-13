@@ -46,7 +46,7 @@ def _helper_stage_info(
         deps={},
         outs=outs,
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint=None,
@@ -278,7 +278,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
         )
     ],
     params=None,
-    mutex=[],
+    resources={},
     variant=None,
     signature=inspect.signature(stage_func),
     fingerprint=None,
@@ -321,7 +321,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
         )
     ],
     params=None,
-    mutex=[],
+    resources={},
     variant=None,
     signature=inspect.signature(stage_func),
     fingerprint=None,
