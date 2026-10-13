@@ -689,38 +689,40 @@ pivot fetch [TARGETS...] [OPTIONS]
 
 ### `pivot import`
 
-Import an artifact from a remote Pivot repository.
+Import a stage output from another Pivot repository.
 
 ```bash
-pivot import REPO_URL PATH [OPTIONS]
+pivot import REPO_URL ARTIFACT --out PATH [OPTIONS]
 ```
 
 **Arguments:**
 
-- `REPO_URL` - URL of the remote Pivot repository
-- `PATH` - Path to the artifact within the remote repository
+- `REPO_URL` - URL of the source Pivot repository (HTTPS, SSH, or `file://`)
+- `ARTIFACT` - Identity of the output in the source repo: `pipeline/stage` for a single-output stage, `pipeline/stage:key` for one field of a multi-output stage, as printed by `pivot list --deps` there
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--rev REV` | Git ref to import from (branch, tag, commit; default: main) |
-| `--out PATH` | Local output path (default: same as source path) |
+| `--out PATH` | Local path to write the file to (without it, the identity string is used as the path) |
 | `--force` | Overwrite existing files |
 | `--no-download` | Create .pvt metadata without downloading |
 
 **Examples:**
 
 ```bash
-# Import a model from another repo
-pivot import https://github.com/org/ml-models model.pkl
+# Import a single-output stage's result
+pivot import https://github.com/org/ml-models training/train --out data/raw/model.pkl
 
-# Import from a specific tag
-pivot import https://github.com/org/data data.csv --rev v1.0
+# Import one field of a multi-output stage, from a tag
+pivot import https://github.com/org/data prep/split:test --rev v1.0 --out data/raw/test.csv
 
-# Create metadata only (download later with pivot pull)
-pivot import https://github.com/org/data data.csv --no-download
+# Create metadata only (download later with pivot update)
+pivot import https://github.com/org/data prep/split:test --out data/raw/test.csv --no-download
 ```
+
+The imported file is tracked by a `.pvt` sidecar next to it; read it in a pipeline with `pipeline.input("model.pkl")`.
 
 ---
 
