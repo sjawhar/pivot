@@ -621,7 +621,7 @@ def test_get_metric_info_from_head_with_metric_stage(
     _register_metric_stage(mock_discovery, "my_stage")
 
     lock_content = yaml.dump(
-        make_valid_lock_content(outs=[{"key": None, "hash": "abc123", "tag": "metric"}])
+        make_valid_lock_content(outs=[{"key": None, "hash": "abc1230000000000", "tag": "metric"}])
     )
     mocker.patch.object(
         git,
@@ -631,7 +631,7 @@ def test_get_metric_info_from_head_with_metric_stage(
 
     result = metrics.get_metric_info_from_head()
 
-    assert result == {"metrics/my_stage.json": "abc123"}
+    assert result == {"metrics/my_stage.json": "abc1230000000000"}
 
 
 def test_get_metric_info_from_head_no_lock_file(

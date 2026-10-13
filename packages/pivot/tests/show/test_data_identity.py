@@ -126,7 +126,7 @@ params: {}
 deps: []
 outs:
   - key: null
-    hash: deadbeef
+    hash: deadbeef00000000
     tag: data
 """
 
@@ -134,4 +134,4 @@ outs:
 
     result = data_module.get_data_hashes_from_head()
 
-    assert result == {"data/train.csv": "deadbeef"}
+    assert result == {"data/train.csv": "deadbeef00000000"}

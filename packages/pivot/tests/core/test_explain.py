@@ -78,7 +78,7 @@ def test_get_stage_explanation_with_allow_missing_stale_pvt(
     normalized_path = str(project.normalize_path(data_path))
     dep = _input_ref("data.csv")
     tracked_files: dict[str, PvtData] = {
-        normalized_path: PvtData(path="data.csv", hash="new_pvt_hash", size=100)
+        normalized_path: PvtData(path="data.csv", hash="2222222222222222", size=100)
     }
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     tracked_trie[pathlib.Path(normalized_path).parts] = normalized_path
@@ -86,7 +86,7 @@ def test_get_stage_explanation_with_allow_missing_stale_pvt(
         LockData(
             code_manifest={"self:pvt_stage": "abc"},
             params={},
-            dep_hashes={dep.identity: {"hash": "old_lock_hash"}},
+            dep_hashes={dep.identity: {"hash": "1111111111111111"}},
             output_hashes={},
         )
     )
@@ -556,7 +556,7 @@ def test_get_stage_explanation_deps_changed(tmp_path: pathlib.Path) -> None:
         state_dir,
         "dep_stage",
         {"self:dep_stage": "abc"},
-        dep_hashes={dep.identity: {"hash": "old_data_hash"}},
+        dep_hashes={dep.identity: {"hash": "0d0d0d0d0d0d0d0d"}},
     )
 
     result = explain.get_stage_explanation(
@@ -573,7 +573,7 @@ def test_get_stage_explanation_deps_changed(tmp_path: pathlib.Path) -> None:
     assert result["will_run"] is True
     assert "dep" in result["reason"].lower() or "input" in result["reason"].lower()
     assert len(result["dep_changes"]) == 1
-    assert result["dep_changes"][0]["old_hash"] == "old_data_hash"
+    assert result["dep_changes"][0]["old_hash"] == "0d0d0d0d0d0d0d0d"
     assert result["dep_changes"][0]["change_type"] == "modified"
 
 
@@ -592,7 +592,7 @@ def test_get_stage_explanation_multiple_changes(tmp_path: pathlib.Path) -> None:
         "multi_stage",
         {"self:multi_stage": "old_code"},
         params={"epochs": 5},
-        dep_hashes={dep.identity: {"hash": "old_hash"}},
+        dep_hashes={dep.identity: {"hash": "0000000000000001"}},
     )
 
     result = explain.get_stage_explanation(
@@ -884,10 +884,10 @@ def test_get_stage_explanation_with_allow_missing_uses_pvt_hash(
         state_dir,
         "pvt_stage",
         {"self:pvt_stage": "abc"},
-        dep_hashes={dep.identity: {"hash": "pvt_hash_123"}},
+        dep_hashes={dep.identity: {"hash": "1234123412341234"}},
     )
     tracked_files: dict[str, PvtData] = {
-        normalized_path: PvtData(path="data.csv", hash="pvt_hash_123", size=100)
+        normalized_path: PvtData(path="data.csv", hash="1234123412341234", size=100)
     }
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     tracked_trie[pathlib.Path(normalized_path).parts] = normalized_path
@@ -946,7 +946,7 @@ def test_get_stage_explanation_allow_missing_uses_lock_file_hash(
         state_dir,
         "lock_fallback_stage",
         {"self:lock_fallback_stage": "abc"},
-        dep_hashes={dep.identity: {"hash": "lock_hash_123"}},
+        dep_hashes={dep.identity: {"hash": "4321432143214321"}},
     )
 
     result = explain.get_stage_explanation(

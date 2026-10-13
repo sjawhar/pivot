@@ -165,10 +165,10 @@ def test_get_stage_output_hashes_file_output(lock_project: Path) -> None:
     """Extracts hash from file output in lock file."""
     state_dir = lock_project / ".pivot"
 
-    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash="abc123def45678")})
+    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash="abc123def4567800")})
 
     result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
-    assert result == {"abc123def45678"}
+    assert result == {"abc123def4567800"}
 
 
 def test_get_stage_output_hashes_directory_output(lock_project: Path) -> None:
@@ -180,15 +180,15 @@ def test_get_stage_output_hashes_directory_output(lock_project: Path) -> None:
         "my_stage",
         outs={
             "output_dir": _helper_dir_hash(
-                "treehash1234567",
-                ("file1.txt", "filehash1234567", 100),
-                ("file2.txt", "filehash2345678", 200),
+                "7ee1a5b1234567aa",
+                ("file1.txt", "f11e1a5b12345670", 100),
+                ("file2.txt", "f11e2a5b23456780", 200),
             )
         },
     )
 
     result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
-    assert result == {"filehash1234567", "filehash2345678"}
+    assert result == {"f11e1a5b12345670", "f11e2a5b23456780"}
 
 
 def test_get_stage_output_hashes_multiple_stages(lock_project: Path) -> None:
@@ -196,11 +196,11 @@ def test_get_stage_output_hashes_multiple_stages(lock_project: Path) -> None:
     state_dir = lock_project / ".pivot"
 
     for i, stage in enumerate(["stage_a", "stage_b"]):
-        _helper_write_lock(state_dir, stage, outs={None: FileHash(hash=f"hash{i}{'0' * 11}")})
+        _helper_write_lock(state_dir, stage, outs={None: FileHash(hash=f"a{i}{'0' * 14}")})
 
     result = transfer.get_stage_output_hashes(state_dir, ["stage_a", "stage_b"])
-    assert "hash0" + "0" * 11 in result
-    assert "hash1" + "0" * 11 in result
+    assert "a0" + "0" * 14 in result
+    assert "a1" + "0" * 14 in result
 
 
 # -----------------------------------------------------------------------------
@@ -216,13 +216,13 @@ def test_get_stage_dep_hashes(lock_project: Path) -> None:
         state_dir,
         "my_stage",
         deps={
-            "input.csv": FileHash(hash="dep1hash1234567"),
-            "config.yaml": FileHash(hash="dep2hash1234567"),
+            "input.csv": FileHash(hash="de01a5b123456700"),
+            "config.yaml": FileHash(hash="de02a5b123456700"),
         },
     )
 
     result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
-    assert result == {"dep1hash1234567", "dep2hash1234567"}
+    assert result == {"de01a5b123456700", "de02a5b123456700"}
 
 
 def test_get_stage_dep_hashes_with_manifest(lock_project: Path) -> None:
@@ -234,15 +234,15 @@ def test_get_stage_dep_hashes_with_manifest(lock_project: Path) -> None:
         "my_stage",
         deps={
             "input_dir": _helper_dir_hash(
-                "dirtreehash1234",
-                ("a.txt", "afilehash123456", 10),
-                ("b.txt", "bfilehash123456", 20),
+                "d17ee1a5b1234560",
+                ("a.txt", "af11ea5b12345600", 10),
+                ("b.txt", "bf11ea5b12345600", 20),
             )
         },
     )
 
     result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
-    assert result == {"afilehash123456", "bfilehash123456"}
+    assert result == {"af11ea5b12345600", "bf11ea5b12345600"}
 
 
 def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:

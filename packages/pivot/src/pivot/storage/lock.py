@@ -123,9 +123,10 @@ def _manifest_error(value: object, field: str) -> str | None:
         if not isinstance(raw, dict):
             return entry_field
         entry = cast("dict[str, object]", raw)
-        for name in ("relpath", "hash"):
-            if not _is_nonempty_str(entry.get(name)):
-                return f"{entry_field}.{name}"
+        if not _is_nonempty_str(entry.get("relpath")):
+            return f"{entry_field}.relpath"
+        if not cache.is_valid_hash(entry.get("hash")):
+            return f"{entry_field}.hash"
         if not _is_int(entry.get("size")):
             return f"{entry_field}.size"
         if not isinstance(entry.get("isexec"), bool):
@@ -138,9 +139,10 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | None:
     if not isinstance(raw, dict):
         return field
     entry = cast("dict[str, object]", raw)
-    # Null and empty hashes come from stages never executed locally (e.g. pulled with
-    # incomplete state); they violate FileHash/DirHash's `hash: str` as much as a list does.
-    if not _is_nonempty_str(entry.get("hash")):
+    # Every recorded hash is a cache key (cache.get_cache_path). Null and empty hashes come
+    # from stages never executed locally (e.g. pulled with incomplete state); a hand-edited
+    # short or non-hex one would otherwise fail every restore instead of meaning stale.
+    if not cache.is_valid_hash(entry.get("hash")):
         return f"{field}.hash"
     if list_key == "deps" and not _is_nonempty_str(entry.get("producer")):
         return f"{field}.producer"

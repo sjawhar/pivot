@@ -442,6 +442,8 @@ def test_status_verbose_shows_all_stages(
     [
         pytest.param("producer", id="list-producer"),
         pytest.param("params", id="list-params"),
+        pytest.param("out-hash", id="short-out-hash"),
+        pytest.param("dep-hash", id="short-dep-hash"),
         pytest.param("delete", id="deleted-lock-control"),
     ],
 )
@@ -468,6 +470,10 @@ def test_status_and_repro_treat_a_wrongly_shaped_lock_as_missing(
             if corrupt == "producer":
                 assert document["deps"][0]["producer"] == "test/stage_a"
                 document["deps"][0]["producer"] = ["test/stage_a"]
+            elif corrupt == "out-hash":
+                document["outs"][0]["hash"] = "abc"
+            elif corrupt == "dep-hash":
+                document["deps"][0]["hash"] = "abc"
             else:
                 document["params"] = []
             lock_path.write_text(yaml.safe_dump(document))
@@ -491,6 +497,8 @@ def test_status_and_repro_treat_a_wrongly_shaped_lock_as_missing(
 
     assert repaired["deps"][0]["producer"] == "test/stage_a"
     assert repaired["params"] == {}
+    assert len(repaired["deps"][0]["hash"]) == cache.XXHASH64_HEX_LENGTH, repaired
+    assert len(repaired["outs"][0]["hash"]) == cache.XXHASH64_HEX_LENGTH, repaired
     assert status_after.exit_code == 0, status_after.output
     assert "2 cached, 0 stale" in status_after.output, status_after.output
 

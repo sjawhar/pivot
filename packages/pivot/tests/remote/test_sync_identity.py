@@ -79,8 +79,8 @@ def test_get_target_hashes_resolves_identity_key(tmp_path: pathlib.Path) -> None
         stage_name,
         tmp_path,
         output_hashes={
-            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc123"),
-            types.ArtifactIdentity(stage_name, "metrics"): types.FileHash(hash="def456"),
+            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc1230000000000"),
+            types.ArtifactIdentity(stage_name, "metrics"): types.FileHash(hash="def4560000000000"),
         },
     )
 
@@ -91,7 +91,7 @@ def test_get_target_hashes_resolves_identity_key(tmp_path: pathlib.Path) -> None
         all_stages={stage_name: stage_info},
     )
 
-    assert hashes == {"abc123"}
+    assert hashes == {"abc1230000000000"}
 
 
 def test_get_target_hashes_resolves_bare_stage_name_and_key(tmp_path: pathlib.Path) -> None:
@@ -129,7 +129,7 @@ def test_get_file_hash_from_stages_matches_identity_key(tmp_path: pathlib.Path) 
         stage_name,
         tmp_path,
         output_hashes={
-            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc123"),
+            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc1230000000000"),
         },
     )
 
@@ -139,7 +139,7 @@ def test_get_file_hash_from_stages_matches_identity_key(tmp_path: pathlib.Path) 
         all_stages={stage_name: stage_info},
     )
 
-    assert out_hash == types.FileHash(hash="abc123")
+    assert out_hash == types.FileHash(hash="abc1230000000000")
 
 
 def test_get_target_hashes_empty_targets(tmp_path: pathlib.Path) -> None:
@@ -158,7 +158,7 @@ def test_get_target_hashes_skips_metric_outputs(tmp_path: pathlib.Path) -> None:
         stage_name,
         tmp_path,
         output_hashes={
-            types.ArtifactIdentity(stage_name, "score"): types.FileHash(hash="metric123"),
+            types.ArtifactIdentity(stage_name, "score"): types.FileHash(hash="3e7c123000000000"),
         },
     )
 
@@ -183,8 +183,8 @@ def test_get_target_hashes_multiple_outputs_per_stage(tmp_path: pathlib.Path) ->
         stage_name,
         tmp_path,
         output_hashes={
-            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="data123"),
-            types.ArtifactIdentity(stage_name, "loss"): types.FileHash(hash="metric456"),
+            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="da7a123000000000"),
+            types.ArtifactIdentity(stage_name, "loss"): types.FileHash(hash="3e7c456000000000"),
         },
     )
 
@@ -195,7 +195,7 @@ def test_get_target_hashes_multiple_outputs_per_stage(tmp_path: pathlib.Path) ->
     )
 
     # Only data output, not metric
-    assert hashes == {"data123"}
+    assert hashes == {"da7a123000000000"}
 
 
 def test_get_target_hashes_identity_key_target(tmp_path: pathlib.Path) -> None:
@@ -208,7 +208,7 @@ def test_get_target_hashes_identity_key_target(tmp_path: pathlib.Path) -> None:
         stage_name,
         tmp_path,
         output_hashes={
-            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc123"),
+            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc1230000000000"),
         },
     )
 
@@ -218,7 +218,7 @@ def test_get_target_hashes_identity_key_target(tmp_path: pathlib.Path) -> None:
         all_stages={stage_name: stage_info},
     )
 
-    assert hashes == {"abc123"}
+    assert hashes == {"abc1230000000000"}
 
 
 def test_get_target_hashes_include_deps(tmp_path: pathlib.Path) -> None:
@@ -231,7 +231,7 @@ def test_get_target_hashes_include_deps(tmp_path: pathlib.Path) -> None:
         stage_name,
         tmp_path,
         output_hashes={
-            types.ArtifactIdentity(stage_name, None): types.FileHash(hash="out123"),
+            types.ArtifactIdentity(stage_name, None): types.FileHash(hash="0123000000000000"),
         },
     )
 
@@ -242,10 +242,10 @@ def test_get_target_hashes_include_deps(tmp_path: pathlib.Path) -> None:
             code_manifest={},
             params={},
             dep_hashes={
-                types.ArtifactIdentity("source", None): types.FileHash(hash="dep456"),
+                types.ArtifactIdentity("source", None): types.FileHash(hash="de45600000000000"),
             },
             output_hashes={
-                types.ArtifactIdentity(stage_name, None): types.FileHash(hash="out123"),
+                types.ArtifactIdentity(stage_name, None): types.FileHash(hash="0123000000000000"),
             },
         )
     )
@@ -257,5 +257,5 @@ def test_get_target_hashes_include_deps(tmp_path: pathlib.Path) -> None:
         all_stages={stage_name: stage_info},
     )
 
-    assert "out123" in hashes
-    assert "dep456" in hashes
+    assert "0123000000000000" in hashes
+    assert "de45600000000000" in hashes

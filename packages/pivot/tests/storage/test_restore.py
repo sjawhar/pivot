@@ -27,10 +27,10 @@ params:
 deps:
   - producer: source
     key: data.csv
-    hash: def456
+    hash: de4560000000000f
 outs:
   - key: null
-    hash: ghi789
+    hash: 0789000000000000
     tag: data
 """
     result = restore._parse_lock_data_from_bytes(content)
@@ -120,7 +120,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [{"key": None, "hash": "def456", "tag": "data"}],
+        "outs": [{"key": None, "hash": "de45600000000000", "tag": "data"}],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
@@ -140,7 +140,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
     assert targets[0]["target_type"] == "stage"
     assert targets[0]["original_target"] == "train"
     assert targets[0]["paths"] == ["data/train.pkl"]
-    assert targets[0]["hashes"] == {"data/train.pkl": {"hash": "def456"}}
+    assert targets[0]["hashes"] == {"data/train.pkl": {"hash": "de45600000000000"}}
 
 
 def test_resolve_targets_stage_without_lock_at_revision(
@@ -386,7 +386,7 @@ def test_restore_targets_from_revision_output_with_stage(
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [{"key": None, "hash": "def456", "tag": "data"}],
+        "outs": [{"key": None, "hash": "de45600000000000", "tag": "data"}],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
