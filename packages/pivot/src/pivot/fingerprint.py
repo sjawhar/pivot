@@ -571,22 +571,8 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
-    _process_closure_values(
-        closure_vars.globals,
-        func,
-        manifest,
-        visited,
-        skip_dunders=True,
-        include_modules=True,
-    )
-    _process_closure_values(
-        closure_vars.nonlocals,
-        func,
-        manifest,
-        visited,
-        skip_dunders=False,
-        include_modules=False,
-    )
+    _process_closure_values(closure_vars.globals, func, manifest, visited, skip_dunders=True)
+    _process_closure_values(closure_vars.nonlocals, func, manifest, visited, skip_dunders=False)
 
     # Discover globals referenced by nested functions/lambdas
     # (getclosurevars only sees the outer function's own bytecode)
@@ -603,12 +589,7 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
                     nested_globals_dict[name] = func_globals[name]
             if nested_globals_dict:
                 _process_closure_values(
-                    nested_globals_dict,
-                    func,
-                    manifest,
-                    visited,
-                    skip_dunders=True,
-                    include_modules=True,
+                    nested_globals_dict, func, manifest, visited, skip_dunders=True
                 )
 
     _process_type_hint_dependencies(func, manifest, visited)
@@ -844,7 +825,6 @@ def _process_closure_values(
     visited: set[int],
     *,
     skip_dunders: bool,
-    include_modules: bool,
 ) -> None:
     """Process closure variable values (globals or nonlocals) and add to manifest."""
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
@@ -865,7 +845,7 @@ def _process_closure_values(
         elif callable(value):
             # External functions, classes, and builtins are not user dependencies.
             continue
-        elif include_modules and isinstance(value, types.ModuleType):
+        elif isinstance(value, types.ModuleType):
             _process_module_dependency(name, value, func, manifest, visited)
         elif isinstance(value, logging.Logger):
             continue

@@ -288,6 +288,15 @@ def test_common_function_and_class_references_are_allowed() -> None:
     fingerprint.get_stage_fingerprint(_stage_uses_common_callables)
 
 
+def test_nonlocal_stdlib_module_is_allowed() -> None:
+    import time
+
+    def stage() -> None:
+        time.sleep(0)
+
+    assert "self:stage" in fingerprint.get_stage_fingerprint(stage)
+
+
 @pytest.mark.parametrize(
     ("func", "variable", "type_name"),
     [
