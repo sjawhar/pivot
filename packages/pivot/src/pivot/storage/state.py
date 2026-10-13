@@ -3,9 +3,12 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import logging
+import os
 import pathlib
 import struct
+import threading
 import time
+import typing
 from typing import TYPE_CHECKING, Self
 
 import lmdb
@@ -15,7 +18,6 @@ from pivot import exceptions, run_history
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Generator, Iterable
 
     from pivot.fingerprint import AstHashEntry
@@ -42,6 +44,181 @@ _MAX_KEY_SIZE = 511
 # Common error message for MapFullError
 _DB_FULL_MSG = (
     f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
+)
+
+
+class _SharedEnv(typing.TypedDict):
+    """One process-local lease over an LMDB environment."""
+
+    env: lmdb.Environment | None
+    identity: tuple[int, int, int, int]
+    users: int
+
+
+_FORK_DRAIN_TIMEOUT = 1.0
+
+
+@typing.final
+class _ForkGate:
+    """Allow concurrent transactions while draining them before fork."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._transactions = 0
+        self._forking = False
+
+    @contextlib.contextmanager
+    def transaction(self) -> Generator[None]:
+        with self._condition:
+            while self._forking:
+                self._condition.wait()
+            self._transactions += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._transactions -= 1
+                if self._transactions == 0:
+                    self._condition.notify_all()
+
+    def before_fork(self) -> bool:
+        """Block new transactions and return whether existing ones drained."""
+        self._condition.acquire()
+        self._forking = True
+        deadline = time.monotonic() + _FORK_DRAIN_TIMEOUT
+        while self._transactions:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._forking = False
+                self._condition.notify_all()
+                self._condition.release()
+                return False
+            self._condition.wait(remaining)
+        return True
+
+    def after_fork_parent(self) -> None:
+        self._forking = False
+        self._condition.notify_all()
+        self._condition.release()
+
+    def after_fork_child(self) -> None:
+        self._forking = False
+        self._condition.release()
+
+    def abort_fork(self) -> None:
+        self._forking = False
+        self._condition.notify_all()
+        self._condition.release()
+
+
+# LMDB permits one environment per process/file. Fingerprint, explain,
+# coordinator, and worker paths create StateDB independently, so passing one
+# explicit handle cannot cover their overlapping lifetimes.
+_shared_envs = dict[pathlib.Path, _SharedEnv]()
+_shared_envs_lock = threading.RLock()
+_fork_gate = _ForkGate()
+_fork_drained = False
+_inherited_env_paths = set[pathlib.Path]()
+
+
+def _open_env(lmdb_path: pathlib.Path) -> lmdb.Environment:
+    """Open a writable environment shared by readonly and writable StateDBs."""
+    return lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, max_spare_txns=0)
+
+
+def _env_identity(lmdb_path: pathlib.Path) -> tuple[int, int, int, int] | None:
+    """Return the identity of the data and lock files for an LMDB environment."""
+    try:
+        data_stat = (lmdb_path / "data.mdb").stat()
+        lock_stat = (lmdb_path / "lock.mdb").stat()
+    except FileNotFoundError:
+        return None
+    return data_stat.st_dev, data_stat.st_ino, lock_stat.st_dev, lock_stat.st_ino
+
+
+def _acquire_shared_env(lmdb_path: pathlib.Path) -> _SharedEnv:
+    """Acquire this process's shared LMDB environment lease for lmdb_path."""
+    if lmdb_path in _inherited_env_paths:
+        raise StateDBError(
+            f"StateDB {lmdb_path} was open during fork; use spawn or forkserver to access it in the child"
+        )
+    with _shared_envs_lock:
+        shared = _shared_envs.get(lmdb_path)
+        if shared is not None and _env_identity(lmdb_path) != shared["identity"]:
+            shared = None
+        if shared is None:
+            env = _open_env(lmdb_path)
+            identity = _env_identity(lmdb_path)
+            if identity is None:
+                raise RuntimeError(f"LMDB environment files missing after open: {lmdb_path}")
+            shared = _SharedEnv(env=env, identity=identity, users=0)
+            _shared_envs[lmdb_path] = shared
+        elif shared["env"] is None:
+            shared["env"] = _open_env(lmdb_path)
+        shared["users"] += 1
+        return shared
+
+
+def _release_shared_env(lmdb_path: pathlib.Path, shared: _SharedEnv) -> None:
+    """Release a StateDB's lease and close its environment when it is unused."""
+    with _shared_envs_lock:
+        shared["users"] -= 1
+        if shared["users"] != 0:
+            return
+        if _shared_envs.get(lmdb_path) is shared:
+            del _shared_envs[lmdb_path]
+        env = shared["env"]
+        shared["env"] = None
+        if env is not None:
+            env.close()
+
+
+def _before_fork() -> None:
+    """Drain StateDB transactions, then close environments before a fork."""
+    global _fork_drained
+
+    _fork_drained = _fork_gate.before_fork()
+    if not _fork_drained:
+        return
+    try:
+        with _shared_envs_lock:
+            for shared in _shared_envs.values():
+                env = shared["env"]
+                if env is not None:
+                    env.close()
+                    shared["env"] = None
+    except BaseException:
+        _fork_gate.abort_fork()
+        _fork_drained = False
+        raise
+
+
+def _after_fork_parent() -> None:
+    global _fork_drained
+
+    if _fork_drained:
+        _fork_gate.after_fork_parent()
+    _fork_drained = False
+
+
+def _after_fork_child() -> None:
+    global _fork_drained, _fork_gate, _inherited_env_paths, _shared_envs, _shared_envs_lock
+
+    if _fork_drained:
+        _fork_gate.after_fork_child()
+        _inherited_env_paths = set[pathlib.Path]()
+    else:
+        _inherited_env_paths = set(_shared_envs)
+    _fork_drained = False
+    _fork_gate = _ForkGate()
+    _shared_envs = dict[pathlib.Path, _SharedEnv]()
+    _shared_envs_lock = threading.RLock()
+
+
+os.register_at_fork(
+    before=_before_fork,
+    after_in_parent=_after_fork_parent,
+    after_in_child=_after_fork_child,
 )
 
 
@@ -143,16 +320,18 @@ def _match_cached_hash(value: bytes | None, fs_stat: os.stat_result) -> str | No
 class StateDB:
     """LMDB cache of file hashes and generation counters.
 
-    Multi-process safe: Each process independently instantiates StateDB and opens
-    the same LMDB environment file. LMDB handles inter-process synchronization via
-    file-system locking (MVCC). Workers open in readonly mode to avoid write contention;
-    state changes are deferred and applied atomically by the coordinator.
-
-    Concurrent `pivot run` invocations are safe—each gets its own StateDB instances
-    with automatic MVCC snapshot isolation. Readers never block writers and vice versa.
+    StateDB instances for one state directory share one LMDB environment within
+    a process. Separate processes open independent environments and LMDB's
+    file locks provide MVCC isolation between them. Readonly StateDB instances
+    enforce that restriction at the StateDB boundary; the shared environment is
+    writable so a later writer can use it safely. Forking closes shared
+    environments before the child is created, so both processes reopen their
+    own environment lazily.
     """
 
-    _env: lmdb.Environment
+    _shared: _SharedEnv
+    _lmdb_path: pathlib.Path
+    _owner_pid: int
     _closed: bool
     _readonly: bool
     _write_timeout: float
@@ -164,23 +343,37 @@ class StateDB:
         readonly: bool = False,
         write_timeout: float = 30.0,
     ) -> None:
-        lmdb_path = state_dir / "state.lmdb"
         state_dir.mkdir(parents=True, exist_ok=True)
+        lmdb_path = (state_dir / "state.lmdb").resolve()
 
-        # LMDB readonly mode can't create database - create empty one first if needed
-        if readonly and not lmdb_path.exists():
-            lmdb.open(str(lmdb_path), map_size=_MAP_SIZE).close()
-
-        self._env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, readonly=readonly)
+        with _fork_gate.transaction():
+            self._shared = _acquire_shared_env(lmdb_path)
+        self._lmdb_path = lmdb_path
+        self._owner_pid = os.getpid()
         self._closed = False
         self._readonly = readonly
         self._write_timeout = write_timeout
         self._write_lock_path = lmdb_path / "pivot-write.lock"
 
+    @property
+    def _env(self) -> lmdb.Environment:
+        """Return this instance's process-local shared LMDB environment."""
+        self._check_closed()
+        with _shared_envs_lock:
+            env = self._shared["env"]
+            if env is None:
+                env = _open_env(self._lmdb_path)
+                self._shared["env"] = env
+            return env
+
     def _check_closed(self) -> None:
-        """Raise if database is closed."""
+        """Raise if the database is closed or was inherited across a fork."""
         if self._closed:
             raise RuntimeError("Cannot operate on closed StateDB")
+        if self._owner_pid != os.getpid():
+            raise RuntimeError(
+                "Cannot use StateDB inherited across fork; create a new StateDB in the child process"
+            )
 
     def _check_write_allowed(self) -> None:
         """Raise if database is read-only."""
@@ -188,6 +381,14 @@ class StateDB:
             raise RuntimeError(
                 "Internal error: worker attempted write to readonly StateDB. This is a bug in Pivot. Please report it."
             )
+
+    @contextlib.contextmanager
+    def _read_transaction(self) -> Generator[lmdb.Transaction]:
+        """Begin a short read transaction while excluding fork teardown."""
+        with _fork_gate.transaction():
+            self._check_closed()
+            with self._env.begin() as txn:
+                yield txn
 
     @contextlib.contextmanager
     def _write_transaction(self, timeout: float = 30.0) -> Generator[lmdb.Transaction]:
@@ -213,8 +414,10 @@ class StateDB:
                         ) from None
                     time.sleep(0.01)
             try:
-                with self._env.begin(write=True) as txn:
-                    yield txn
+                with _fork_gate.transaction():
+                    self._check_closed()
+                    with self._env.begin(write=True) as txn:
+                        yield txn
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -226,7 +429,7 @@ class StateDB:
     def get(self, path: pathlib.Path, fs_stat: os.stat_result) -> str | None:
         """Return cached hash if file metadata matches, else None."""
         self._check_closed()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             value = txn.get(_make_key_file_hash(path))
         return _match_cached_hash(value, fs_stat)
 
@@ -238,7 +441,7 @@ class StateDB:
         if not items:
             return {}
         results = dict[pathlib.Path, str | None]()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             for path, fs_stat in items:
                 value = txn.get(_make_key_file_hash(path))
                 results[path] = _match_cached_hash(value, fs_stat)
@@ -301,7 +504,7 @@ class StateDB:
             )
         except InvalidAstHashKeyError:
             return None
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             value = txn.get(key)
         if value is None:
             return None
@@ -363,7 +566,7 @@ class StateDB:
     def get_raw(self, key: bytes) -> bytes | None:
         """Get raw value by key. Returns None if not found."""
         self._check_closed()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             return txn.get(key)
 
     def put_raw(self, key: bytes, value: bytes) -> None:
@@ -412,7 +615,7 @@ class StateDB:
         """Return all raw key-value pairs matching a prefix."""
         self._check_closed()
         results = list[tuple[bytes, bytes]]()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             cursor = txn.cursor()
             if cursor.set_range(prefix):
                 for key, value in cursor:
@@ -429,7 +632,7 @@ class StateDB:
         """Get generation counter for an output identity. Returns None if not tracked."""
         self._check_closed()
         key = _make_key_output_generation(identity)
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             value = txn.get(key)
         if value is None:
             return None
@@ -441,7 +644,7 @@ class StateDB:
         if not identities:
             return {}
         results = dict[str, int | None]()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             for identity in identities:
                 key = _make_key_output_generation(identity)
                 value = txn.get(key)
@@ -474,7 +677,7 @@ class StateDB:
         self._check_closed()
         prefix = _DEP_PREFIX + stage_name.encode() + b":"
         results = dict[str, int]()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             cursor = txn.cursor()
             if cursor.set_range(prefix):
                 for key, value in cursor:
@@ -522,7 +725,7 @@ class StateDB:
         """Check if hash is known to exist on remote."""
         self._check_closed()
         key = _REMOTE_PREFIX + f"{remote_name}:{hash_}".encode()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             return txn.get(key) is not None
 
     def remote_hashes_intersection(self, remote_name: str, hashes: set[str]) -> set[str]:
@@ -532,7 +735,7 @@ class StateDB:
             return set()
         prefix = _REMOTE_PREFIX + remote_name.encode() + b":"
         found = set[str]()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             for hash_ in hashes:
                 key = prefix + hash_.encode()
                 if txn.get(key) is not None:
@@ -566,7 +769,7 @@ class StateDB:
         """Get stored URL for a remote. Returns None if not tracked."""
         self._check_closed()
         key = _REMOTE_URL_PREFIX + remote_name.encode()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             value = txn.get(key)
         if value is None:
             return None
@@ -625,7 +828,7 @@ class StateDB:
         self._check_closed()
 
         key = _RUN_PREFIX + run_id.encode()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             value = txn.get(key)
         if value is None:
             return None
@@ -640,7 +843,7 @@ class StateDB:
         self._check_closed()
 
         runs = list[run_history.RunManifest]()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             cursor = txn.cursor()
             # Position at the end of the run: prefix range by seeking past it
             # Use "run;\xff" as upper bound (semicolon > colon in ASCII)
@@ -713,7 +916,7 @@ class StateDB:
         """Look up run cache entry for skip detection. Returns None if not found."""
         self._check_closed()
         key = _RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             value = txn.get(key)
         if value is None:
             return None
@@ -730,7 +933,7 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         to_delete = list[bytes]()
-        with self._env.begin() as txn:
+        with self._read_transaction() as txn:
             cursor = txn.cursor()
             if cursor.set_range(_RUNCACHE_PREFIX):
                 key = cursor.key()
@@ -845,10 +1048,13 @@ class StateDB:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def close(self) -> None:
-        """Close the database."""
-        if not self._closed:
-            self._env.close()
+        """Release this StateDB's lease on the shared environment."""
+        with _fork_gate.transaction():
+            if self._closed:
+                return
             self._closed = True
+            if self._owner_pid == os.getpid():
+                _release_shared_env(self._lmdb_path, self._shared)
 
     def _check_capacity_warning(self) -> None:
         """Warn if database is approaching capacity limit (80% utilization)."""
@@ -866,7 +1072,9 @@ class StateDB:
             )
 
     def __enter__(self) -> Self:
-        self._check_capacity_warning()
+        with _fork_gate.transaction():
+            self._check_closed()
+            self._check_capacity_warning()
         return self
 
     def __exit__(self, *_: object) -> None:
