@@ -102,6 +102,31 @@ pivot status --explain
 
 Each stage takes its configuration as a `StageParams` subclass (a Pydantic model) defined next to it. Parameter values are recorded in the stage's lock file, so changing one re-runs that stage. A `params.yaml` at the project root can override values per stage without editing code.
 
+### Incremental Outputs
+
+An incremental stage receives its own prior output without creating a DAG
+self-edge. Tag the return type, then bind the parameter with
+`pipeline.previous()`:
+
+```python
+from typing import Annotated
+
+from pivot import Pipeline, incremental, stage
+
+
+@stage
+def update_cache(previous: dict[str, int]) -> Annotated[dict[str, int], incremental]:
+    return {"count": previous.get("count", 0) + 1}
+
+
+with Pipeline("state") as pipeline:
+    update_cache(previous=pipeline.previous())
+```
+
+The first run receives the loader's empty value. Later runs restore a writable
+copy of the last cached output before calling the stage. Use a `Loader` with
+`load()`, `save()`, and `empty()`; writer-only formats are rejected.
+
 ### S3 Remote Cache
 
 Share outputs across machines and CI:

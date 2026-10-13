@@ -18,6 +18,7 @@ Pivot picks a writer from it:
 | `Annotated[T, <loader>]` | that loader | the loader's extension |
 | `Annotated[dict, metric]` | YAML, stored under `metrics/` | `.yaml` |
 | `Annotated[Figure, plot]` | PNG via `MatplotlibFigure()`, stored under `plots/` | `.png` |
+| `Annotated[T, incremental]` | the type's default `Loader`, restored before the stage runs | the loader's extension |
 | a `TypedDict` | one output per field, each field typed as above | per field |
 
 Any other type fails when the pipeline is built:
@@ -116,16 +117,43 @@ field is a separate artifact with its own hash, so a change that only affects
 
 Define the `TypedDict` at module level. The field name `_single` is reserved.
 
-## Directory artifacts and incremental outputs
+## Directory artifacts
 
 A stage can return a `pathlib.Path` to a directory it created outside the
 project. `PathOnly()` moves that directory to Pivot's managed output path and
 Pivot caches it as an artifact.
 
 The declarative `DirectoryOut` annotation for a variable set of files remains
-undecided; do not add that annotation to a compositional pipeline. Incremental
-outputs (a stage that reads its own previous result) also remain unavailable.
-Until that design is available, return a `dict` or `TypedDict` instead.
+undecided; do not add that annotation to a compositional pipeline.
+
+## Incremental outputs
+
+Tag a return value with `incremental` when the stage needs its own prior output.
+Bind the matching parameter to `pipeline.previous()`, or use
+`pipeline.previous("key")` for a field of a `TypedDict` result. The first run
+receives the loader's `empty()` value; later runs restore the cached output as a
+writable copy before calling the stage. Previous-output parameters do not create
+DAG edges.
+
+```python
+from typing import Annotated
+
+from pivot import Pipeline, incremental, stage
+
+
+@stage
+def update_cache(previous: dict[str, int]) -> Annotated[dict[str, int], incremental]:
+    return {"count": previous.get("count", 0) + 1}
+
+
+with Pipeline("state") as pipeline:
+    update_cache(previous=pipeline.previous())
+```
+
+An incremental output requires a full `Loader` with `load()`, `save()`, and
+`empty()`; a writer-only format such as `MatplotlibFigure()` is rejected. An
+existing incremental output without a lock-file cache entry is refused unless
+`pivot repro --allow-uncached-incremental` is explicit.
 
 ## Metrics and plots
 

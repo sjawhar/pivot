@@ -11,10 +11,10 @@ Workers execute in separate processes via `loky.get_reusable_executor()`.
 | `func` | Stage function (must be picklable) |
 | `fingerprint` | Code manifest for change detection |
 | `deps` | Input dependency paths |
-| `outs` | Output specs (post-expansion `ExpandedOut` instances) |
+| `outs` | Output artifact references |
+| `incremental_inputs` | Parameter-to-own-output identities for prior incremental values |
 | `project_root` | Absolute path to project root |
 | `state_dir` | Absolute path to `.pivot/` directory |
-
 ## Path Derivation
 
 Workers derive all paths from `project_root` and `state_dir` in `WorkerStageInfo`:
