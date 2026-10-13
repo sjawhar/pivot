@@ -227,12 +227,14 @@ class YAML[T](Loader[T, T]):
 class Text(Loader[str, str]):
     """Plain text file loader.
 
-    Saves atomically via temp file + rename to prevent corruption.
+    Line endings round-trip exactly: neither load nor save translates ``\\r``,
+    ``\\r\\n`` or ``\\n``. Saves atomically via temp file + rename to prevent corruption.
     """
 
     @override
     def load(self, path: pathlib.Path) -> str:
-        return path.read_text()
+        with path.open(newline="") as f:
+            return f.read()
 
     @override
     def save(self, data: str, path: pathlib.Path) -> None:
@@ -243,7 +245,7 @@ class Text(Loader[str, str]):
 
         fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".txt.tmp")
         try:
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", newline="") as f:
                 f.write(data)
             os.rename(tmp_path_str, path)
         except Exception:

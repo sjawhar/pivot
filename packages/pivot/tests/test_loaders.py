@@ -301,6 +301,24 @@ def test_text_loader_save_type_error() -> None:
         loader.save(123, pathlib.Path("test.txt"))  # pyright: ignore[reportArgumentType]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("a\rb\r", id="cr"),
+        pytest.param("a\r\nb\r\n", id="crlf"),
+        pytest.param("a\nb\n", id="lf"),
+        pytest.param("a\r\nb\rc\nd", id="mixed"),
+    ],
+)
+def test_text_loader_roundtrips_line_endings_exactly(tmp_path: pathlib.Path, text: str) -> None:
+    txt_file = tmp_path / "endings.txt"
+
+    loaders.Text().save(text, txt_file)
+
+    assert txt_file.read_bytes() == text.encode(), "save must not translate line endings"
+    assert loaders.Text().load(txt_file) == text
+
+
 def test_text_loader_empty() -> None:
     """Text loader returns empty string for empty()."""
     loader = loaders.Text()
