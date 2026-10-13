@@ -1,6 +1,7 @@
 # pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
 import importlib.machinery
@@ -10,6 +11,8 @@ import pathlib
 import sys
 import types as _stdlib_types
 from typing import Final
+
+import cloudpickle
 
 from pivot import fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
@@ -37,6 +40,10 @@ class _ImportSession:
     preexisting_root_modules: dict[str, _stdlib_types.ModuleType]
     owned_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(default_factory=dict)
     displaced_modules: dict[str, object] = dataclasses.field(default_factory=dict)
+    preexisting_pickle_by_value_modules: set[str] = dataclasses.field(default_factory=set)
+    pickle_by_value_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 _import_session: _ImportSession | None = None
@@ -47,6 +54,11 @@ def _end_import_session(session: _ImportSession) -> None:
     for module_name, module in session.owned_modules.items():
         if sys.modules.get(module_name) is module:
             sys.modules.pop(module_name, None)
+    for module_name, module in session.pickle_by_value_modules.items():
+        if module_name in session.preexisting_pickle_by_value_modules:
+            continue
+        with contextlib.suppress(ValueError):
+            cloudpickle.unregister_pickle_by_value(module)
     for module_name, previous in session.displaced_modules.items():
         if isinstance(previous, _stdlib_types.ModuleType):
             sys.modules[module_name] = previous
@@ -79,7 +91,13 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     for index, _entry in reversed(caller_path_entries):
         del sys.path[index]
     sys.path.insert(0, root_str)
-    _import_session = _ImportSession(root, root_str, caller_path_entries, preexisting_root_modules)
+    _import_session = _ImportSession(
+        root,
+        root_str,
+        caller_path_entries,
+        preexisting_root_modules,
+        preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
+    )
     importlib.invalidate_caches()
     return _import_session
 
@@ -117,6 +135,9 @@ def _track_root_modules(session: _ImportSession) -> None:
             and session.preexisting_root_modules.get(module_name) is not module
         ):
             session.owned_modules[module_name] = module
+            if module_name not in session.preexisting_pickle_by_value_modules:
+                cloudpickle.register_pickle_by_value(module)
+                session.pickle_by_value_modules[module_name] = module
 
 
 def _module_name_for_path(path: pathlib.Path, root: pathlib.Path) -> str:
