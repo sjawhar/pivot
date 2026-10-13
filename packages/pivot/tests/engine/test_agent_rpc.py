@@ -105,6 +105,27 @@ async def test_agent_rpc_source_accepts_connections(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_source_signals_ready_once_listening(tmp_path: Path) -> None:
+    """``ready`` is set only once the socket accepts connections, so a client can connect."""
+    import functools
+    import threading
+
+    socket_path = tmp_path / "agent.sock"
+    ready = threading.Event()
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+    source = AgentRpcSource(socket_path=socket_path, ready=ready)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(functools.partial(source.run, send))
+        with anyio.fail_after(5):
+            while not ready.is_set():
+                await anyio.sleep(0.01)
+        connection = await anyio.connect_unix(str(socket_path))
+        await connection.aclose()
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_client_eof_is_not_an_error(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

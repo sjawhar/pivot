@@ -418,6 +418,7 @@ class AgentRpcSource:
     _socket_path: Path
     _handler: AgentRpcHandler | None
     _resource_capacity: dict[str, int]
+    _ready: threading.Event | None
 
     def __init__(
         self,
@@ -425,10 +426,13 @@ class AgentRpcSource:
         socket_path: Path,
         handler: AgentRpcHandler | None = None,
         resource_capacity: dict[str, int] | None = None,
+        ready: threading.Event | None = None,
     ) -> None:
+        """``ready`` is set once the socket is listening, so clients can connect."""
         self._socket_path = socket_path
         self._handler = handler
         self._resource_capacity = dict(resource_capacity or {})
+        self._ready = ready
 
     async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
         """Listen for agent connections and process requests."""
@@ -441,6 +445,8 @@ class AgentRpcSource:
 
         try:
             self._socket_path.chmod(0o600)  # Owner-only access
+            if self._ready is not None:
+                self._ready.set()
             async with listener, anyio.create_task_group() as tg:
                 while True:
                     conn = await listener.accept()

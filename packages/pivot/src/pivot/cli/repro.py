@@ -416,10 +416,10 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     engine=eng,
                     event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
                 )
-                eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                eng.add_source(
+                    AgentRpcSource(socket_path=socket_path, handler=rpc_handler, ready=socket_ready)
+                )
                 eng.add_sink(BroadcastEventSink())
-
-                socket_ready.set()
 
                 _configure_watch_sources(
                     eng,
@@ -634,10 +634,10 @@ def _run_oneshot_mode(
                     engine=eng,
                     event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
                 )
-                eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                eng.add_source(
+                    AgentRpcSource(socket_path=socket_path, handler=rpc_handler, ready=socket_ready)
+                )
                 eng.add_sink(BroadcastEventSink())
-
-                socket_ready.set()
 
                 _configure_oneshot_source(
                     eng,
