@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Annotated, NotRequired, Required, TypedDict
 import pandas as pd
 import pytest
 
-from pivot import exceptions, fingerprint, loaders, outputs, stage_def, types
+from pivot import exceptions, fingerprint, loaders, stage_def, types
 from pivot.compose import (
     SINGLE_OUTPUT_KEY,
     ArtifactHandle,
@@ -626,7 +626,7 @@ def test_external_input_produces_bindings(tmp_path: pathlib.Path) -> None:
         ext = pipeline.input("ext_data.jsonl", t=list, external=True)
 
         @stage
-        def consume(data: list = ext) -> Annotated[list, outputs.Out("out.json", loaders.JSON())]:
+        def consume(data: list = ext) -> list:
             return data
 
     legacy = pipeline
