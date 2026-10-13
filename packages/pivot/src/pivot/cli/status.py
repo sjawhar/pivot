@@ -153,11 +153,15 @@ def status(
     # print it (quiet) or there is no remote to pull from.
     missing_outputs_count = 0
     if not quiet and remote_config.list_remotes():
-        missing_outputs_count = sum(
-            1
-            for _, reason, upstream_stale in stage_reasons
-            if reason == explain_mod.OUTPUTS_MISSING_REASON and not upstream_stale
-        )
+        # Stages arrive in execution order. A stage is pullable when its outputs are missing
+        # and every stale upstream is itself pullable: in a plain clone the downstream stages
+        # are stale only because their upstream's outputs are missing too, and pull restores
+        # all of them. A stage downstream of a stage that must recompute is recomputed by repro.
+        pullable = set[str]()
+        for name, reason, upstream_stale in stage_reasons:
+            if reason == explain_mod.OUTPUTS_MISSING_REASON and pullable.issuperset(upstream_stale):
+                pullable.add(name)
+        missing_outputs_count = len(pullable)
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0

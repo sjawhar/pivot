@@ -253,10 +253,8 @@ with Pipeline("k") as pipeline:
 """
 
 
-def test_status_does_not_suggest_pull_for_stage_whose_upstream_is_stale(
-    tmp_path: pathlib.Path,
-) -> None:
-    """repro recomputes a stage downstream of a stale one, so pulling its outputs is wasted."""
+def _chain_clone(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Run the two-stage chain, commit locks with outputs ignored, and return a fresh clone."""
     src = tmp_path / "src"
     src.mkdir()
     _project(src, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
@@ -271,6 +269,14 @@ def test_status_does_not_suggest_pull_for_stage_whose_upstream_is_stale(
     )
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    return clone
+
+
+def test_status_does_not_suggest_pull_for_stage_whose_upstream_is_stale(
+    tmp_path: pathlib.Path,
+) -> None:
+    """repro recomputes a stage downstream of a stale one, so pulling its outputs is wasted."""
+    clone = _chain_clone(tmp_path)
     pipeline_py = clone / "pipeline.py"
     pipeline_py.write_text(pipeline_py.read_text().replace("raw * 2", "raw * 3"))
 
@@ -278,3 +284,12 @@ def test_status_does_not_suggest_pull_for_stage_whose_upstream_is_stale(
 
     assert "Run `pivot repro` to execute 2 stale stages" in out, out
     assert "pivot pull" not in out, out
+
+
+def test_status_in_plain_clone_counts_every_stage_pull_restores(tmp_path: pathlib.Path) -> None:
+    """A downstream stage stale only because its upstream's outputs are also missing is pullable."""
+    clone = _chain_clone(tmp_path)
+
+    out = _ok(_pivot(clone, "status"))
+
+    assert "Run `pivot pull` to restore outputs of 2 stages from the remote" in out, out
