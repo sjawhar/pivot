@@ -6,11 +6,14 @@ import logging
 import pathlib
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
+import pygtrie
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 from pivot import exceptions, fingerprint, project, stage_def, types
 from pivot.storage import cache
+from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
     from inspect import Signature
@@ -60,9 +63,11 @@ class StageRegistry:
     """Registry for pipeline stages and DAG construction."""
 
     _stages: dict[str, RegistryStageInfo]
+    _output_paths: pygtrie.Trie[types.ArtifactIdentity]
 
     def __init__(self) -> None:
         self._stages = dict[str, RegistryStageInfo]()
+        self._output_paths = pygtrie.Trie()
         self._cached_dag: DiGraph[str] | None = None
 
     def add_existing(self, stage_info: RegistryStageInfo) -> None:
@@ -73,6 +78,9 @@ class StageRegistry:
 
         Raises:
             ValidationError: If stage name already exists.
+            OutputPathConflictError: If an output's workspace path equals, contains, or lies
+                inside the path of an output already registered. Each worker resolves paths
+                in its own store, so this is the only place that sees every output at once.
         """
         name = stage_info["name"]
         if name in self._stages:
@@ -82,6 +90,17 @@ class StageRegistry:
                 raise ValueError(
                     f"Output producer '{out.identity.producer}' for stage '{name}' must match stage name"
                 )
+        added = list[tuple[str, ...]]()
+        try:
+            for out in stage_info["outs"]:
+                parts = store_mod.relative_output_path(out).parts
+                _check_output_path_free(self._output_paths, parts, out.identity)
+                self._output_paths[parts] = out.identity
+                added.append(parts)
+        except exceptions.OutputPathConflictError:
+            for parts in added:
+                del self._output_paths[parts]
+            raise
         self._stages[name] = stage_info
         self._cached_dag = None
 
@@ -122,6 +141,7 @@ class StageRegistry:
     def clear(self) -> None:
         """Clear all registered stages (for testing)."""
         self._stages.clear()
+        self._output_paths = pygtrie.Trie()
         self._cached_dag = None
 
     def invalidate_dag_cache(self) -> None:
@@ -168,6 +188,36 @@ class PipelineLike(Protocol):
     def snapshot(self) -> dict[str, RegistryStageInfo]: ...
 
     def include(self, other: PipelineLike) -> None: ...
+
+
+def _check_output_path_free(
+    paths: pygtrie.Trie[types.ArtifactIdentity],
+    parts: tuple[str, ...],
+    identity: types.ArtifactIdentity,
+) -> None:
+    """Raise if ``parts`` equals, contains, or lies inside a registered output path."""
+    new = f"'{types.identity_key(identity)}'"
+    path = "/".join(parts)
+    if parts in paths:
+        other = f"'{types.identity_key(paths[parts])}'"
+        raise exceptions.OutputPathConflictError(
+            f"Output path conflict: {new} and {other} both write {path}."
+        )
+    if paths.has_subtrie(parts):
+        inner_parts = next(iter(paths.keys(prefix=parts)))
+        inner = f"'{types.identity_key(paths[inner_parts])}'"
+        raise exceptions.OutputPathConflictError(
+            f"Output path conflict: {inner} writes {'/'.join(inner_parts)}, "
+            + f"inside the directory {path} that {new} writes."
+        )
+    enclosing = paths.shortest_prefix(parts)
+    if enclosing is not None and enclosing.is_set:
+        outer = enclosing.value
+        assert outer is not None  # is_set guarantees a stored value
+        raise exceptions.OutputPathConflictError(
+            f"Output path conflict: {new} writes {path}, inside the directory "
+            + f"{'/'.join(enclosing.key)} that '{types.identity_key(outer)}' writes."
+        )
 
 
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:

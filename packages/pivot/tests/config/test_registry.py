@@ -13,7 +13,7 @@ import pytest
 from pydantic import BaseModel
 from tests import helpers
 
-from pivot import compose, exceptions, fingerprint, registry, stage_def, types
+from pivot import compose, exceptions, fingerprint, loaders, registry, stage_def, types
 from pivot.registry import PipelineLike, RegistryStageInfo, StageRegistry
 
 
@@ -74,12 +74,13 @@ def _helper_info(
     func: Callable[..., Any] = _stage3_no_deps,
     fingerprint_: dict[str, str] | None = None,
     state_dir: pathlib.Path | None = None,
+    outs: list[types.ArtifactRef] | None = None,
 ) -> RegistryStageInfo:
     return RegistryStageInfo(
         func=func,
         name=name,
         deps={},
-        outs=[],
+        outs=outs or [],
         params=None,
         resources={},
         variant=None,
@@ -533,6 +534,77 @@ def test_registry_add_existing_collision_raises() -> None:
 
     with pytest.raises(exceptions.ValidationError, match="already registered"):
         reg.add_existing(_helper_info("existing"))
+
+
+def _helper_out(
+    producer: str, key: str | None, tag: types.ArtifactTag = types.ArtifactTag.DATA
+) -> types.ArtifactRef:
+    return types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer=producer, key=key),
+        format=loaders.DataFrameJSONL(),
+        python_type=object,
+        tag=tag,
+    )
+
+
+def test_add_existing_rejects_two_outputs_at_one_path() -> None:
+    """A keyed output of 'demo/x' and the single output of 'demo/x/y' are one file."""
+    reg = StageRegistry()
+    reg.add_existing(_helper_info("demo/x", outs=[_helper_out("demo/x", "y")]))
+
+    with pytest.raises(exceptions.OutputPathConflictError) as exc_info:
+        reg.add_existing(_helper_info("demo/x/y", outs=[_helper_out("demo/x/y", None)]))
+
+    message = str(exc_info.value)
+    assert "'demo/x:y'" in message, message
+    assert "'demo/x/y'" in message, message
+    assert "data/demo/x/y.jsonl" in message, message
+    assert reg.list_stages() == ["demo/x"], "A rejected stage must not be registered"
+
+
+@pytest.mark.parametrize("directory_first", [True, False], ids=["directory-first", "file-first"])
+def test_add_existing_rejects_output_inside_another_output(directory_first: bool) -> None:
+    """A directory output may not contain another artifact's file, in either order."""
+    directory = _helper_info(
+        "demo/x", outs=[_helper_out("demo/x", None, types.ArtifactTag.DIRECTORY)]
+    )
+    nested = _helper_info("demo/x/y", outs=[_helper_out("demo/x/y", None)])
+    first, second = (directory, nested) if directory_first else (nested, directory)
+    reg = StageRegistry()
+    reg.add_existing(first)
+
+    with pytest.raises(exceptions.OutputPathConflictError) as exc_info:
+        reg.add_existing(second)
+
+    message = str(exc_info.value)
+    assert "'demo/x'" in message, message
+    assert "'demo/x/y'" in message, message
+    assert "inside" in message, message
+
+
+def test_add_existing_accepts_paths_sharing_a_name_prefix() -> None:
+    """Paths that share characters but not a path component are separate files."""
+    reg = StageRegistry()
+    reg.add_existing(
+        _helper_info("demo/x", outs=[_helper_out("demo/x", None, types.ArtifactTag.DIRECTORY)])
+    )
+    reg.add_existing(_helper_info("demo/xy", outs=[_helper_out("demo/xy", "y")]))
+    reg.add_existing(_helper_info("demo/x@v1", outs=[_helper_out("demo/x@v1", None)]))
+    # A metric lives under metrics/, so it does not sit inside the data/demo/x directory.
+    reg.add_existing(
+        _helper_info("demo/x/y", outs=[_helper_out("demo/x/y", None, types.ArtifactTag.METRIC)])
+    )
+
+    assert len(reg.list_stages()) == 4
+
+
+def test_clear_forgets_output_paths() -> None:
+    """A cleared registry accepts the same outputs again."""
+    reg = StageRegistry()
+    reg.add_existing(_helper_info("demo/x", outs=[_helper_out("demo/x", None)]))
+    reg.clear()
+
+    reg.add_existing(_helper_info("demo/x", outs=[_helper_out("demo/x", None)]))
 
 
 def test_registry_add_existing_invalidates_dag_cache(tmp_path: pathlib.Path) -> None:

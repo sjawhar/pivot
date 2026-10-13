@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 _VALID_STAGE_NAME = re.compile(
     r"[a-zA-Z0-9_@./-]+"
 )  # Allow / for pipeline-prefixed names, . for DVC matrix keys
+_VALID_VARIANT_NAME = re.compile(r"[a-zA-Z0-9_.-]+")
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 
@@ -69,6 +70,18 @@ def stage_name_error(name: str) -> str | None:
     if len(name) > _MAX_STAGE_NAME_LEN:
         return f"too long ({len(name)} > {_MAX_STAGE_NAME_LEN} characters)"
     return None
+
+
+def variant_name_error(name: str) -> str | None:
+    """Return why ``name`` cannot be a variant name, or None if it can.
+
+    A variant is one part of a stage name, so it follows the stage-name rule without ``/``
+    or ``@``: those separate a stage name's pipeline and variant parts, and a variant
+    containing them could name the same lock file and outputs as another stage.
+    """
+    if not _VALID_VARIANT_NAME.fullmatch(name):
+        return "use only letters, digits and the characters _ . -"
+    return stage_name_error(name)
 
 
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:

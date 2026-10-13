@@ -507,7 +507,7 @@ class Pipeline:
         All stages registered within the block get @{name} appended to their stage name.
         Nesting is supported: variant("a") inside variant("b") → @b@a suffix.
         """
-        reason = lock.stage_name_error(name)
+        reason = lock.variant_name_error(name)
         if reason is not None:
             raise ValueError(f"Invalid variant name {name!r}: {reason}")
         self._variant_stack.append(name)

@@ -814,6 +814,8 @@ def test_pipeline_variant_counts_still_increment_within_same_variant(
         pytest.param("a/../b", id="traversal"),
         pytest.param("", id="empty"),
         pytest.param("x" * 201, id="too_long"),
+        pytest.param("a/b", id="slash"),
+        pytest.param("a@b", id="at"),
     ],
 )
 def test_pipeline_variant_rejects_name_lock_files_cannot_hold(

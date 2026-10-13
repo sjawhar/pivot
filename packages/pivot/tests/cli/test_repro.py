@@ -243,6 +243,64 @@ with Pipeline("demo") as pipeline:
     assert "Tip: Ensure all dependency files exist or are produced by other stages" in result.output
 
 
+# Pipeline "demo" stage "x" field "y" and pipeline "demo/x" stage "y" both map to
+# data/demo/x/y.jsonl.
+_COLLIDING_OUTPUTS_PIPELINE = """
+from typing import TypedDict
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class XResult(TypedDict):
+    y: pd.DataFrame
+
+
+@stage
+def x(raw: pd.DataFrame) -> XResult:
+    out = raw.copy()
+    out["who"] = "x field y"
+    return {"y": out}
+
+
+@stage
+def y(raw: pd.DataFrame) -> pd.DataFrame:
+    out = raw.copy()
+    out["who"] = "stage y"
+    return out
+
+
+with Pipeline("demo/x") as inner:
+    y(inner.input("t.csv"))
+
+with Pipeline("demo") as pipeline:
+    x(pipeline.input("t.csv"))
+
+pipeline.include(inner)
+"""
+
+
+def test_repro_refuses_two_outputs_that_map_to_one_path(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Two artifacts resolving to one workspace file fail at load, naming both, before any write."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "t.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(_COLLIDING_OUTPUTS_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["repro"])
+        shared_file_written = (cwd / "data" / "demo" / "x" / "y.jsonl").exists()
+
+    assert result.exit_code != 0, result.output
+    assert "Output path conflict" in result.output, result.output
+    assert "'demo/x:y'" in result.output, result.output
+    assert "'demo/x/y'" in result.output, result.output
+    assert "data/demo/x/y.jsonl" in result.output, result.output
+    assert not shared_file_written, "Neither stage may run once their paths collide"
+
+
 # =============================================================================
 # Explain Mode Tests
 # =============================================================================
