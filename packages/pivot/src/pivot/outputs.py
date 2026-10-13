@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, runtime_checkable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders_module
@@ -135,26 +135,3 @@ class DirectoryOut[T]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
             raise ValueError(f"DirectoryOut path must end with '/': {self.path!r}")
 
 
-@runtime_checkable
-class BaseOut(Protocol):
-    """Protocol for the legacy path-bearing output specifications."""
-
-    @property
-    def path(self) -> PathType:
-        """File path(s) for this output."""
-        ...
-
-    @property
-    def cache(self) -> bool:
-        """Whether this output should be cached."""
-        ...
-
-    @property
-    def loader(self) -> loaders_module.Writer[Any] | loaders_module.Loader[Any, Any]:
-        """Writer or Loader for this output."""
-        ...
-
-
-def is_directory_out(spec: BaseOut) -> TypeGuard[DirectoryOut[Any]]:
-    """Type guard to narrow output spec to DirectoryOut."""
-    return isinstance(spec, DirectoryOut)

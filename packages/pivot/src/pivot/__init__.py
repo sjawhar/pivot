@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING
 
 __version__ = "0.2.0a1"
 
-# Public API - only exports that users need when writing pipelines
-# Internal modules like BaseOut and show.* are accessible via their full paths
+# Public API - only exports that users need when writing pipelines.
+# Internal modules are accessible via their full paths.
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders

@@ -1,6 +1,6 @@
 import pytest
 
-from pivot import loaders, outputs
+from pivot import loaders, outputs, stage_def
 
 
 def test_out_cache_default_true() -> None:
@@ -83,6 +83,12 @@ def test_out_instances_are_out() -> None:
     assert isinstance(metric, outputs.Out)
     assert isinstance(plot, outputs.Out)
 
+def test_legacy_path_output_plumbing_is_not_exposed() -> None:
+    """Compositional outputs do not retain the removed path-bearing helpers."""
+    assert not hasattr(outputs, "BaseOut")
+    assert not hasattr(outputs, "is_directory_out")
+    assert not hasattr(stage_def, "save_return_outputs")
+
 
 # DirectoryOut tests
 
@@ -110,14 +116,6 @@ def test_directory_out_non_string_path_raises_error() -> None:
         )
 
 
-def test_directory_out_implements_base_out_protocol() -> None:
-    """DirectoryOut should implement BaseOut protocol (not inherit from Out)."""
-    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
-    # DirectoryOut is a standalone class that implements BaseOut protocol
-    assert isinstance(dir_out, outputs.BaseOut)
-    assert hasattr(dir_out, "path")
-    assert hasattr(dir_out, "cache")
-    assert hasattr(dir_out, "loader")
 
 
 def test_directory_out_frozen() -> None:
@@ -133,16 +131,3 @@ def test_directory_out_cache_default_true() -> None:
     assert dir_out.cache is True
 
 
-# TypeGuard tests
-
-
-def test_is_directory_out_true_for_directory_out() -> None:
-    """is_directory_out should return True for DirectoryOut."""
-    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
-    assert outputs.is_directory_out(dir_out) is True
-
-
-def test_is_directory_out_false_for_out() -> None:
-    """is_directory_out should return False for a regular output."""
-    out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
-    assert outputs.is_directory_out(out) is False
