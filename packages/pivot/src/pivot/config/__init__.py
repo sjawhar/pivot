@@ -13,6 +13,7 @@ from pivot.config.io import get_merged_config as get_merged_config
 from pivot.config.io import get_remote_connect_timeout as get_remote_connect_timeout
 from pivot.config.io import get_remote_jobs as get_remote_jobs
 from pivot.config.io import get_remote_retries as get_remote_retries
+from pivot.config.io import get_resource_capacities as get_resource_capacities
 from pivot.config.io import get_run_history_retention as get_run_history_retention
 from pivot.config.io import get_state_dir as get_state_dir
 from pivot.config.io import get_watch_debounce as get_watch_debounce

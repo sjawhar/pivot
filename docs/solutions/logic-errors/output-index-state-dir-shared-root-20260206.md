@@ -21,7 +21,7 @@ The `_write_output_index()` method in `Pipeline` derived the producing pipeline'
 
 ## Environment
 
-- Module: Pipeline (`src/pivot/pipeline/pipeline.py`)
+- Module: Pipeline (the path-based pipeline module; the compositional API in `compose.py` has no output index and no three-tier discovery: cross-pipeline dependencies are imported handles, collected by `Pipeline._upstream_closure()`)
 - Method: `_write_output_index()`
 - Python Version: 3.13+
 - Date: 2026-02-06
@@ -82,13 +82,13 @@ This correctly identifies `eval_pipeline/difficulty` for a stage function define
 
 1. Stage functions are always defined in source files within their pipeline's directory tree
 2. `inspect.getfile()` gives the actual source file, not the shared state directory
-3. Walking up finds the nearest `pipeline.py` or `pivot.yaml`, which is the pipeline's config
+3. Walking up finds the nearest `pipeline.py`, which is the pipeline's config
 4. Falls back to `state_dir` derivation for functions that can't be inspected (builtins, exec'd code)
 
 ## Prevention
 
-- **Don't use `state_dir` as a proxy for "pipeline directory"** — `state_dir` is about state storage, not source code location. These are different concepts that happen to coincide for single-pipeline projects but diverge for multi-pipeline setups.
-- **Test with shared-root sub-pipelines** — the split pipeline architecture (code in `eval_pipeline/X/`, data in `data/X/`, shared project root) is the primary use case. Always include a test where `root=project.get_project_root()` is used by multiple pipelines.
+- **Don't use `state_dir` as a proxy for "pipeline directory"** — `state_dir` is about state storage, not source code location. These are different concepts that happen to coincide for single-pipeline projects but diverge for multi-pipeline setups. In the compositional API the owning pipeline is part of the stage name (`<pipeline>/<stage>`); use that.
+- **Test with shared-root sub-pipelines** — code in `eval_pipeline/X/`, data in `data/X/`, one project root is the primary layout. Always include a test with several pipelines under one project root.
 
 ## Related Issues
 

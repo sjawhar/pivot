@@ -7,7 +7,7 @@ is handled by callers after this function when changed=True.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from pivot.types import (
     ArtifactIdentity,
@@ -30,6 +30,7 @@ def check_stage(
     *,
     explain: bool = False,
     force: bool = False,
+    run_cache_allowed: bool = True,
 ) -> ChangeDecision:
     """Single source of truth for Tier 2 skip detection.
 
@@ -41,22 +42,36 @@ def check_stage(
     - Tier 3 (run cache) after this returns changed=True
     """
     if force and not explain:
-        return ChangeDecision(changed=True, reason="forced")
+        return ChangeDecision(changed=True, reason="forced", run_cache_allowed=run_cache_allowed)
 
     if lock_data is None:
-        return ChangeDecision(changed=True, reason="No previous run")
+        return ChangeDecision(
+            changed=True, reason="No previous run", run_cache_allowed=run_cache_allowed
+        )
 
     # Fast path: cheap dict equality, no detailed diffs or path conversion.
     if not explain:
         if lock_data["code_manifest"] != fingerprint:
-            return ChangeDecision(changed=True, reason="Code changed")
+            return ChangeDecision(
+                changed=True, reason="Code changed", run_cache_allowed=run_cache_allowed
+            )
         if lock_data["params"] != params:
-            return ChangeDecision(changed=True, reason="Params changed")
+            return ChangeDecision(
+                changed=True, reason="Params changed", run_cache_allowed=run_cache_allowed
+            )
         if not _dep_hashes_match(lock_data["dep_hashes"], dep_hashes):
-            return ChangeDecision(changed=True, reason="Input dependencies changed")
+            return ChangeDecision(
+                changed=True,
+                reason="Input dependencies changed",
+                run_cache_allowed=run_cache_allowed,
+            )
         if sorted(lock_data["output_hashes"].keys()) != sorted(out_paths):
-            return ChangeDecision(changed=True, reason="Output paths changed")
-        return ChangeDecision(changed=False, reason="")
+            return ChangeDecision(
+                changed=True,
+                reason="Output paths changed",
+                run_cache_allowed=run_cache_allowed,
+            )
+        return ChangeDecision(changed=False, reason="", run_cache_allowed=run_cache_allowed)
 
     # Explain path: full diffs for all categories.
     code_changes = diff_code_manifests(lock_data["code_manifest"], fingerprint)
@@ -75,6 +90,7 @@ def check_stage(
         code_changes=code_changes,
         param_changes=param_changes,
         dep_changes=dep_changes,
+        run_cache_allowed=run_cache_allowed,
     )
 
 
@@ -184,7 +200,7 @@ def diff_dep_hashes(
                 )
             )
         else:
-            if _dep_hash_changed(old[key], new[key]):
+            if old[key] != new[key]:
                 changes.append(
                     DepChange(
                         identity=key,
@@ -199,26 +215,4 @@ def diff_dep_hashes(
 def _dep_hashes_match(
     old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
 ) -> bool:
-    if old.keys() != new.keys():
-        return False
-    return not any(_dep_hash_changed(old[key], new[key]) for key in old)
-
-
-def _dep_hash_changed(old: HashInfo, new: HashInfo) -> bool:
-    old_accessed = _get_accessed_hashes(old)
-    if old_accessed is None:
-        return old != new
-
-    new_accessed = _get_accessed_hashes(new)
-    if new_accessed is None:
-        return True
-    return any(new_accessed.get(dep_key) != dep_hash for dep_key, dep_hash in old_accessed.items())
-
-
-def _get_accessed_hashes(info: HashInfo) -> dict[str, str] | None:
-    raw: dict[str, object] = cast("dict[str, object]", cast("object", info))
-    if "accessed_hashes" in raw:
-        return cast("dict[str, str]", raw["accessed_hashes"])
-    if "manifest" in info:
-        return {entry["relpath"]: entry["hash"] for entry in info["manifest"]}
-    return None
+    return old == new

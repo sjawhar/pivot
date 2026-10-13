@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import copy
 import dataclasses
 import enum
 import functools
@@ -15,7 +16,8 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import project, registry, stage_def, types
+from . import exceptions, path_policy, project, registry, stage_def, types
+from .storage import lock
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +45,16 @@ class _PlotTag:
     pass
 
 
+class _IncrementalTag:
+    pass
+
+
 metric = _MetricTag()
 plot = _PlotTag()
+incremental = _IncrementalTag()
 
 SINGLE_OUTPUT_KEY = stage_def.SINGLE_OUTPUT_KEY
+_T = TypeVar("_T")
 
 
 class CollectionKind(enum.StrEnum):
@@ -56,8 +64,9 @@ class CollectionKind(enum.StrEnum):
 
 __all__ = [
     "ArtifactHandle",
-    "CollectionKind",
-    "SINGLE_OUTPUT_KEY",
+    "incremental",
+    "metric",
+    "plot",
     "_InputNode",
     "_OutputSpec",
     "_StageNode",
@@ -87,7 +96,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
     if not source.output_specs:
         raise TypeError(
             f"Stage '{consumer_name}' depends on '{qualified_name}' which has no outputs "
-            f"(returns None). A stage must produce outputs to be used as a dependency."
+            + "(returns None). A stage must produce outputs to be used as a dependency."
         )
     if len(source.output_specs) == 1:
         output_spec = source.output_specs[0]
@@ -100,8 +109,8 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             available = [spec.key for spec in source.output_specs]
             raise TypeError(
                 f"Stage '{consumer_name}' received handle from multi-output stage "
-                f"'{qualified_name}' without selecting an output. "
-                f"Use handle.key or handle['key']. Available: {available}"
+                + f"'{qualified_name}' without selecting an output. "
+                + f"Use handle.key or handle['key']. Available: {available}"
             )
         output_spec = matched
         output_key = output_spec.key
@@ -110,6 +119,8 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         dep_tag = types.ArtifactTag.METRIC
     elif isinstance(output_spec.tag, _PlotTag):
         dep_tag = types.ArtifactTag.PLOT
+    elif isinstance(output_spec.tag, _IncrementalTag):
+        dep_tag = types.ArtifactTag.INCREMENTAL
     else:
         dep_tag = types.ArtifactTag.DATA
 
@@ -152,9 +163,6 @@ def _emit_stage_info(
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     assert not hasattr(func, "_is_stage")
-    no_fp = getattr(node.func, "__pivot_no_fingerprint__", False)
-    if not no_fp:
-        no_fp = getattr(func, "__pivot_no_fingerprint__", False)
 
     deps = dict[str, types.ArtifactRef]()
 
@@ -173,6 +181,8 @@ def _emit_stage_info(
             out_tag = types.ArtifactTag.METRIC
         elif isinstance(output_spec.tag, _PlotTag):
             out_tag = types.ArtifactTag.PLOT
+        elif isinstance(output_spec.tag, _IncrementalTag):
+            out_tag = types.ArtifactTag.INCREMENTAL
         else:
             out_tag = types.ArtifactTag.DATA
 
@@ -201,29 +211,44 @@ def _emit_stage_info(
                 if isinstance(union_arg, type) and issubclass(union_arg, stage_def.StageParams):
                     raise TypeError(
                         f"Stage '{qualified_name}' parameter '{name}' has type "
-                        f"'{base_hint}' — StageParams must not be in a union. "
-                        f"Use 'params: {union_arg.__name__}' directly, with a "
-                        f"default if needed (params: {union_arg.__name__} = "
-                        f"{union_arg.__name__}())."
+                        + f"'{base_hint}' — StageParams must not be in a union. "
+                        + f"Use 'params: {union_arg.__name__}' directly, with a "
+                        + f"default if needed (params: {union_arg.__name__} = "
+                        + f"{union_arg.__name__}())."
                     )
         if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
             params_arg_name = name
+            if node.params is not None and not isinstance(node.params, base_hint):
+                raise exceptions.ParamsError(
+                    f"Stage '{qualified_name}': params type {type(node.params).__name__} "
+                    + f"does not match parameter '{name}: {base_hint.__name__}'"
+                )
             break
+
+    output_identities = {
+        spec.key: out.identity for spec, out in zip(node.output_specs, outs, strict=True)
+    }
+    incremental_inputs = {
+        param_name: output_identities[output_key]
+        for param_name, output_key in node.incremental_inputs.items()
+    }
 
     return registry.RegistryStageInfo(
         func=func,
         name=qualified_name,
         deps=deps,
         outs=outs,
+        incremental_inputs=incremental_inputs,
         params=node.params,
-        mutex=[],
+        resources=dict(getattr(func, "__pivot_resources__", {})),
         variant=node.variant,
         signature=inspect.signature(func),
         fingerprint=None,
         params_arg_name=params_arg_name,
         state_dir=state_dir,
         collection_params={k: str(v) for k, v in node.collection_params.items()},
-        no_fingerprint=no_fp,
+        no_fingerprint=node.no_fingerprint,
+        code_deps=list(node.code_deps),
     )
 
 
@@ -237,17 +262,24 @@ class Pipeline:
     _token: contextvars.Token[Pipeline | None] | None
     _variant_stack: list[str]
     _registry: registry.StageRegistry
+    _included_stages: dict[str, registry.RegistryStageInfo]
+    _previous_markers: list[_PreviousOutputMarker]
     _constructing: bool
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
+        reason = lock.stage_name_error(name)
+        if reason is not None:
+            raise ValueError(f"Invalid pipeline name {name!r}: {reason}")
         self._name = name
         self._stages = []
         self._inputs = {}
         self._call_counts = {}
         self._validation_errors = []
         self._token = None
-        self._variant_stack = []
+        self._variant_stack = list[str]()
         self._registry = registry.StageRegistry()
+        self._previous_markers = list[_PreviousOutputMarker]()
+        self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
 
         if root is not None:
@@ -275,7 +307,7 @@ class Pipeline:
         if self._constructing:
             raise RuntimeError(
                 "Cannot call engine-facing methods on a Pipeline that is still under "
-                "construction (inside a 'with' block). Exit the 'with' block first."
+                + "construction (inside a 'with' block). Exit the 'with' block first."
             )
 
     def list_stages(self) -> list[str]:
@@ -301,26 +333,24 @@ class Pipeline:
         self._require_materialized()
         return self._registry.snapshot()
 
-    def restore(self, snapshot: dict[str, registry.RegistryStageInfo]) -> None:
-        self._require_materialized()
-        self._registry.invalidate_dag_cache()
-        self._registry.restore(snapshot)
-
     def include(self, other: registry.PipelineLike) -> None:
-        import copy
-
         if other is self:
             from pivot.exceptions import PipelineConfigError
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        existing_stages = set(self._registry.list_stages())
+        existing_stages = (
+            set(self._included_stages) if self._constructing else set(self._registry.list_stages())
+        )
         for stage_name in other.list_stages():
             if stage_name in existing_stages:
                 logger.debug("include: skipping duplicate stage '%s'", stage_name)
                 continue
             stage_info = copy.deepcopy(other.get_stage(stage_name))
-            self._registry.add_existing(stage_info)
+            self._included_stages[stage_name] = stage_info
+            existing_stages.add(stage_name)
+            if not self._constructing:
+                self._registry.add_existing(copy.deepcopy(stage_info))
 
         for name, path in other.input_bindings.items():
             if name in self._inputs:
@@ -330,11 +360,15 @@ class Pipeline:
 
                     raise PipelineConfigError(
                         f"Input binding conflict: input '{name}' is bound to "
-                        f"'{existing_path}' and '{path}' in different pipelines."
+                        + f"'{existing_path}' and '{path}' in different pipelines."
                     )
             else:
                 self._inputs[name] = _InputNode(
-                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                    name=name,
+                    python_type=None,
+                    path=path,
+                    format=_get_loaders().PathOnly(),
+                    inherited=True,
                 )
         self._registry.invalidate_dag_cache()
 
@@ -342,7 +376,7 @@ class Pipeline:
         if self._token is not None:
             raise RuntimeError(
                 f"Pipeline '{self._name}' is already inside a 'with' block. "
-                "Nested 'with' on the same Pipeline is not supported."
+                + "Nested 'with' on the same Pipeline is not supported."
             )
         self._token = _active_pipeline.set(self)
         self._constructing = True
@@ -374,6 +408,14 @@ class Pipeline:
             qualified_name = f"{self._name}/{node.name}"
             stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
             new_registry.add_existing(stage_info)
+
+        materialized_stages = set(new_registry.list_stages())
+        for stage_name, stage_info in self._included_stages.items():
+            if stage_name in materialized_stages:
+                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+                continue
+            new_registry.add_existing(copy.deepcopy(stage_info))
+            materialized_stages.add(stage_name)
 
         # Atomic swap — if any step above raises, self._registry is unchanged
         self._registry = new_registry
@@ -411,11 +453,44 @@ class Pipeline:
         if path is None:
             prefix = "data/external" if external else "data/raw"
             path = f"{prefix}/{name}"
+        # The store reads input bindings relative to the project root, so the path must stay
+        # inside it: no control characters, no '..', no absolute path elsewhere.
+        path_policy.require_valid_path(
+            path, path_policy.PathType.INPUT, self._root, context=f"Input '{name}'"
+        )
         if format is None:
             if t is not None:
                 format = _infer_input_format_from_type(t)
             if format is None:
                 format = _infer_format_from_extension(path)
+        existing = self._inputs.get(name)
+        if existing is not None:
+            if existing.path != path:
+                raise exceptions.PipelineConfigError(
+                    f"Input binding conflict: input '{name}' is bound to '{existing.path}' "
+                    + f"and '{path}' in the same pipeline."
+                )
+            if existing.inherited:
+                existing.python_type = t
+                existing.format = format
+                existing.inherited = False
+                return ArtifactHandle(
+                    pipeline=self,
+                    source=existing,
+                    output_key=None,
+                    python_type=t or object,
+                )
+            if existing.format != format:
+                raise exceptions.PipelineConfigError(
+                    f"Input binding conflict: input '{name}' at '{path}' changes format from "
+                    + f"{type(existing.format).__name__} to {type(format).__name__}."
+                )
+            return ArtifactHandle(
+                pipeline=self,
+                source=existing,
+                output_key=None,
+                python_type=existing.python_type or object,
+            )
         node = _InputNode(name=name, python_type=t, path=path, format=format)
         self._inputs[name] = node
         return ArtifactHandle(
@@ -432,6 +507,9 @@ class Pipeline:
         All stages registered within the block get @{name} appended to their stage name.
         Nesting is supported: variant("a") inside variant("b") → @b@a suffix.
         """
+        reason = lock.stage_name_error(name)
+        if reason is not None:
+            raise ValueError(f"Invalid variant name {name!r}: {reason}")
         self._variant_stack.append(name)
         try:
             yield
@@ -441,7 +519,7 @@ class Pipeline:
     def _record_stage(
         self,
         original_func: Callable[..., object],
-        wrapper: Callable[..., object],
+        stage_wrapper: Callable[..., object],
         output_specs: list[_OutputSpec],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -457,6 +535,11 @@ class Pipeline:
         if self._variant_stack:
             for variant in self._variant_stack:
                 stage_name = f"{stage_name}@{variant}"
+
+        qualified_name = f"{self._name}/{stage_name}"
+        reason = lock.stage_name_error(qualified_name)
+        if reason is not None:
+            raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
 
         sig = inspect.signature(original_func)
         try:
@@ -476,9 +559,64 @@ class Pipeline:
         input_handles = dict[str, ArtifactHandle]()
         list_input_handles = dict[str, list[ArtifactHandle]]()
         collection_params = dict[str, CollectionKind]()
+        incremental_inputs = dict[str, str]()
         params: stage_def.StageParams | None = None
         for param_name, value in bound.arguments.items():
-            if isinstance(value, ArtifactHandle):
+            if isinstance(value, _PreviousOutputMarker):
+                if value.pipeline is not self:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' received p.previous() from "
+                        + f"Pipeline '{value.pipeline.name}', not this stage call."
+                    )
+                    continue
+                if value.consumed_by is not None:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' reuses p.previous() already "
+                        + f"bound to {value.consumed_by}."
+                    )
+                    continue
+                value.consumed_by = stage_name
+                if value.key is None:
+                    if len(output_specs) != 1:
+                        self._validation_errors.append(
+                            f"{stage_name}: parameter '{param_name}' uses p.previous() but "
+                            + "the stage has multiple outputs; name an incremental output key."
+                        )
+                        continue
+                    output_spec = output_specs[0]
+                else:
+                    output_spec = next(
+                        (spec for spec in output_specs if spec.key == value.key), None
+                    )
+                    if output_spec is None:
+                        self._validation_errors.append(
+                            f"{stage_name}: parameter '{param_name}' uses p.previous({value.key!r}) "
+                            + f"but '{value.key}' is not an output key."
+                        )
+                        continue
+                if not isinstance(output_spec.tag, _IncrementalTag):
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' uses p.previous("
+                        + (f"{value.key!r}" if value.key is not None else "")
+                        + f") but output '{output_spec.key}' is not tagged incremental."
+                    )
+                    continue
+                existing_param = next(
+                    (
+                        existing
+                        for existing, output_key in incremental_inputs.items()
+                        if output_key == output_spec.key
+                    ),
+                    None,
+                )
+                if existing_param is not None:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameters '{existing_param}' and '{param_name}' both "
+                        + f"bind p.previous() to incremental output '{output_spec.key}'."
+                    )
+                    continue
+                incremental_inputs[param_name] = output_spec.key
+            elif isinstance(value, ArtifactHandle):
                 input_handles[param_name] = value
             elif isinstance(value, (list, tuple)):
                 items = list[Any](value)
@@ -490,23 +628,26 @@ class Pipeline:
                 elif param_name in explicit_params:
                     self._validation_errors.append(
                         f"{stage_name}: parameter '{param_name}' has unsupported type "
-                        f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
-                        f"StageParams (config), or list/tuple of ArtifactHandle."
+                        + f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                        + "StageParams (config), or list/tuple of ArtifactHandle."
                     )
             elif isinstance(value, stage_def.StageParams):
                 params = value
             elif param_name in explicit_params:
                 self._validation_errors.append(
                     f"{stage_name}: parameter '{param_name}' has unsupported type "
-                    f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
-                    f"StageParams (config), or list/tuple of ArtifactHandle."
+                    + f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                    + "StageParams (config), or list/tuple of ArtifactHandle."
                 )
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
+        # Read @no_fingerprint marks from this @stage wrapper, never from the shared function:
+        # functools.wraps copies marks set below @stage, and marks set above land here directly.
         node = _StageNode(
-            func=wrapper,
             original_func=original_func,
+            no_fingerprint=getattr(stage_wrapper, "__pivot_no_fingerprint__", False),
+            code_deps=list(getattr(stage_wrapper, "__pivot_code_deps__", [])),
             name=stage_name,
             params=params,
             input_handles=input_handles,
@@ -515,6 +656,7 @@ class Pipeline:
             variant=variant_str,
             list_input_handles=list_input_handles,
             collection_params=collection_params,
+            incremental_inputs=incremental_inputs,
         )
         self._stages.append(node)
 
@@ -532,7 +674,20 @@ class Pipeline:
             python_type=dict,
         )
 
+    def previous(self, key: str | None = None) -> Any:
+        """Mark a parameter as this stage call's prior incremental output."""
+        if not self._constructing:
+            raise ValueError("p.previous() may only be used inside a Pipeline stage call.")
+        marker = _PreviousOutputMarker(pipeline=self, key=key)
+        self._previous_markers.append(marker)
+        return marker
+
     def _validate(self) -> None:
+        for marker in self._previous_markers:
+            if marker.consumed_by is None:
+                self._validation_errors.append(
+                    "p.previous() must be passed as an argument to a stage call."
+                )
         if self._validation_errors:
             msg = (
                 f'Pipeline "{self._name}" has {len(self._validation_errors)} '
@@ -583,8 +738,8 @@ class Pipeline:
                     if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
                         raise ValueError(
                             f"Input binding conflict: input '{inp.name}' is bound to "
-                            f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
-                            f"in different pipelines."
+                            + f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
+                            + "in different pipelines."
                         )
                     foreign_bindings[inp.name] = inp.path
 
@@ -593,11 +748,15 @@ class Pipeline:
             if name in local_bindings and local_bindings[name] != path:
                 raise ValueError(
                     f"Input binding conflict: input '{name}' is bound to "
-                    f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
+                    + f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
                 )
             if name not in self._inputs:
                 self._inputs[name] = _InputNode(
-                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                    name=name,
+                    python_type=None,
+                    path=path,
+                    format=_get_loaders().PathOnly(),
+                    inherited=True,
                 )
 
 
@@ -707,8 +866,8 @@ def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
 # --- Return type analysis ---
 
 
-def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
-    """Parse a type hint into OutputSpec(s)."""
+def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec]:
+    """Parse a stage return type into output specifications."""
     origin = get_origin(hint)
     if origin is typing.Required or origin is typing.NotRequired:
         hint = get_args(hint)[0]
@@ -720,36 +879,59 @@ def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
             if field_name == SINGLE_OUTPUT_KEY:
                 raise ValueError(
                     f"TypedDict field name {SINGLE_OUTPUT_KEY!r} is reserved by Pivot. "
-                    f"Rename the field in {hint.__name__}."
+                    + f"Rename the field in {hint.__name__}."
                 )
-            specs.extend(_parse_output_type(field_hint, field_name))
+            specs.extend(_parse_output_type(field_hint, field_name, stage_name))
         return specs
 
-    # Check for Annotated
-    if get_origin(hint) is Annotated:
-        args = get_args(hint)
-        base_type = args[0]
-        tag: _MetricTag | _PlotTag | None = None
-        fmt: loaders_mod.Writer[object] | None = None
-        loaders = _get_loaders()
-        for arg in args[1:]:
-            if isinstance(arg, (_MetricTag, _PlotTag)):
-                tag = arg
-            elif isinstance(arg, loaders.Writer):
-                fmt = typing.cast("loaders_mod.Writer[object]", arg)
+    if get_origin(hint) is not Annotated:
+        return [_OutputSpec(key=key, python_type=hint, format=_infer_format(hint))]
 
-        if fmt is None:
-            if isinstance(tag, _PlotTag):
-                fmt = typing.cast("loaders_mod.Writer[object]", loaders.MatplotlibFigure())
-            elif isinstance(tag, _MetricTag):
-                fmt = typing.cast("loaders_mod.Writer[object]", loaders.YAML())
-            else:
-                fmt = _infer_format(base_type)
-        return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
+    args = get_args(hint)
+    base_type = args[0]
+    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
+    fmt: loaders_mod.Writer[object] | None = None
+    loaders = _get_loaders()
+    for metadata in args[1:]:
+        if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
+            if tag is not None:
+                raise exceptions.StageDefinitionError(
+                    f"Stage '{stage_name}' output '{key}' cannot combine "
+                    + f"{type(tag).__name__.removeprefix('_').removesuffix('Tag').lower()} "
+                    + f"with {type(metadata).__name__.removeprefix('_').removesuffix('Tag').lower()}."
+                )
+            tag = metadata
+        elif isinstance(metadata, loaders.Writer):
+            if fmt is not None:
+                raise exceptions.StageDefinitionError(
+                    f"Stage '{stage_name}' output '{key}' has more than one loader."
+                )
+            fmt = typing.cast("loaders_mod.Writer[object]", metadata)
+        else:
+            metadata_name = (
+                metadata.__name__ if isinstance(metadata, type) else type(metadata).__name__
+            )
+            raise exceptions.StageDefinitionError(
+                f"Stage '{stage_name}' output '{key}' has unsupported Annotated metadata "
+                + f"'{metadata_name}'."
+            )
 
-    # Plain type
-    fmt = _infer_format(hint)
-    return [_OutputSpec(key=key, python_type=hint, format=fmt)]
+    if fmt is None:
+        if isinstance(tag, _PlotTag):
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders.MatplotlibFigure())
+        elif isinstance(tag, _MetricTag):
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders.YAML())
+        else:
+            fmt = _infer_format(base_type)
+
+    if isinstance(tag, _IncrementalTag) and (
+        not isinstance(fmt, loaders.Loader) or type(fmt).empty is loaders.Loader.empty
+    ):
+        raise exceptions.StageDefinitionError(
+            f"Stage '{stage_name}' output '{key}' is incremental but loader "
+            + f"'{type(fmt).__name__}' does not implement empty()."
+        )
+    return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
 
 
 def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
@@ -758,19 +940,61 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
     return_hint = hints.get("return")
     if return_hint is None:
         msg = f"Stage function {func.__name__} must have a return type annotation"
-        raise ValueError(msg)
+        raise exceptions.StageDefinitionError(msg)
     if return_hint is type(None):
         return []
-    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY)
+    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY, func.__name__)
 
 
 # --- @stage decorator ---
 
-_T = TypeVar("_T")
+
+def _normalize_stage_resources(resources: dict[str, int | str] | None) -> dict[str, int | str]:
+    """Normalize and validate a stage's scheduler resource requests."""
+    if resources is None:
+        return dict[str, int | str]()
+
+    normalized = dict[str, int | str]()
+    for name, request in resources.items():
+        normalized_name = name.strip().casefold()
+        if not normalized_name:
+            raise ValueError("Stage resource names must not be empty")
+        if normalized_name in normalized:
+            raise ValueError(f"Stage resource {name!r} is declared more than once")
+        if isinstance(request, str):
+            if request.casefold() != "all":
+                raise ValueError(
+                    f"Stage resource {normalized_name!r} must request a positive integer or 'all'"
+                )
+            if normalized_name != "cpu":
+                raise ValueError("Only the 'cpu' resource supports an 'all' request")
+            normalized[normalized_name] = "all"
+        elif not isinstance(request, bool) and request > 0:
+            normalized[normalized_name] = request
+        else:
+            raise ValueError(
+                f"Stage resource {normalized_name!r} must request a positive integer or 'all'"
+            )
+    return normalized
 
 
-def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
-    """Mark a function as a pipeline stage.
+@typing.overload
+def stage[**P, R](func: Callable[P, R], /) -> Callable[P, R]: ...
+
+
+@typing.overload
+def stage[**P, R](
+    *, resources: dict[str, int | str]
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def stage[**P, R](
+    func: Callable[P, R] | None = None,
+    /,
+    *,
+    resources: dict[str, int | str] | None = None,
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+    """Mark a function as a pipeline stage with optional scheduler resources.
 
     In pipeline context (inside ``with Pipeline()``): records a DAG node, returns ArtifactHandle.
     Outside pipeline context: calls the function normally (for tests/notebooks).
@@ -779,6 +1003,15 @@ def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
     at decoration time. This allows stage modules to use in-body imports for heavy
     dependencies while still having type annotations that reference those types.
     """
+    if func is None:
+        return lambda decorated: _stage(decorated, resources)
+    return _stage(func, resources)
+
+
+def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None) -> Callable[P, R]:
+    """Build a stage wrapper for a validated resource declaration."""
+    normalized_resources = _normalize_stage_resources(resources)
+    setattr(func, "__pivot_resources__", normalized_resources)  # noqa: B010
     _cached_specs: list[_OutputSpec] | None = None
 
     def _get_output_specs() -> list[_OutputSpec]:
@@ -804,12 +1037,11 @@ class _OutputSpec:
     key: str
     python_type: type
     format: loaders_mod.Writer[object]
-    tag: _MetricTag | _PlotTag | None = None
+    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
 
 
 @dataclasses.dataclass
 class _StageNode:
-    func: Callable[..., object]
     original_func: Callable[..., object]
     name: str
     params: stage_def.StageParams | None
@@ -819,6 +1051,16 @@ class _StageNode:
     variant: str | None = None
     list_input_handles: dict[str, list[ArtifactHandle]] = dataclasses.field(default_factory=dict)
     collection_params: dict[str, CollectionKind] = dataclasses.field(default_factory=dict)
+    no_fingerprint: bool = False
+    code_deps: list[str] = dataclasses.field(default_factory=list)
+    incremental_inputs: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class _PreviousOutputMarker:
+    pipeline: Pipeline
+    key: str | None
+    consumed_by: str | None = None
 
 
 @dataclasses.dataclass
@@ -827,6 +1069,7 @@ class _InputNode:
     python_type: type | None
     path: str
     format: loaders_mod.Reader[object] | loaders_mod.Loader[object, object]
+    inherited: bool = False
 
 
 class ArtifactHandle:

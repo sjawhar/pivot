@@ -18,18 +18,18 @@ import random
 import sys
 import threading
 import traceback
-from typing import IO, TYPE_CHECKING, Any, Literal, TypedDict, cast, override
+from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast, overload, override
 
 import pydantic
 
 from pivot import (
     exceptions,
+    loaders,
     metrics,
-    outputs,
     parameters,
-    path_utils,
     project,
     run_history,
+    skip,
     stage_def,
     types,
 )
@@ -52,7 +52,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
+    from collections.abc import Callable, Generator
     from inspect import Signature
     from multiprocessing import Queue
     from types import TracebackType
@@ -155,24 +155,7 @@ class WorkerStageInfo(TypedDict):
     project_root: pathlib.Path
     state_dir: pathlib.Path
     collection_params: dict[str, str]
-
-
-class TrackedDict(dict[str, Any]):
-    """Dict wrapper that records which keys were accessed."""
-
-    _accessed_keys: set[str]
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
-        self._accessed_keys = set[str]()
-
-    def __getitem__(self, key: str) -> Any:
-        self._accessed_keys.add(key)
-        return super().__getitem__(key)
-
-    @property
-    def accessed_keys(self) -> frozenset[str]:
-        return frozenset(self._accessed_keys)
+    incremental_inputs: dict[str, types.ArtifactIdentity]
 
 
 def _make_result(
@@ -180,19 +163,15 @@ def _make_result(
     reason: str,
     ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
-    accessed_dep_keys: dict[str, set[str]] | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
-    result = StageResult(
+    return StageResult(
         status=status,
         reason=reason,
         input_hash=input_hash,
         output_lines=ring_buffer.snapshot(),
         metrics=metrics.get_entries(),
     )
-    if accessed_dep_keys is not None:
-        result["accessed_dep_keys"] = accessed_dep_keys
-    return result
 
 
 def execute_stage(
@@ -284,7 +263,7 @@ def execute_stage(
                             current_params=current_params,
                             lock_data=lock_data,
                             state_db=state_db,
-                            verify_files=True,
+                            store=store,
                         ):
                             out_specs = _get_output_specs(stage_info)
                             deps_list = _deps_list_for_input_hash(
@@ -293,11 +272,12 @@ def execute_stage(
                             input_hash = run_history.compute_input_hash(
                                 current_fingerprint, current_params, deps_list, out_specs
                             )
-                            restored = _outputs_exist_with_store(
+                            restored = restore_outputs_to_hashes(
                                 store,
                                 stage_outs,
-                                lock_data,
-                                stage_info["state_dir"],
+                                lock_data["output_hashes"],
+                                state_db,
+                                state_dir=stage_info["state_dir"],
                             )
                             if restored:
                                 return _make_result(
@@ -326,9 +306,8 @@ def execute_stage(
                             ring_buffer,
                         )
 
-                    skip_reason, run_reason, input_hash = _check_skip_or_run(
+                    skip_reason, run_reason, input_hash, run_cache_allowed = _check_skip_or_run(
                         stage_info,
-                        production_lock,
                         lock_data,
                         current_fingerprint,
                         current_params,
@@ -345,11 +324,12 @@ def execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
-                        restored = _outputs_exist_with_store(
+                        restored = restore_outputs_to_hashes(
                             store,
                             stage_outs,
-                            lock_data,
-                            stage_info["state_dir"],
+                            lock_data["output_hashes"],
+                            state_db,
+                            state_dir=stage_info["state_dir"],
                         )
                         if restored:
                             return _make_result(
@@ -361,13 +341,14 @@ def execute_stage(
                         run_reason = "outputs missing from cache"
 
                     # Check run cache for previously executed configuration (skip if forcing)
-                    if run_reason and not stage_info["force"]:
+                    if run_reason and not stage_info["force"] and run_cache_allowed:
                         run_cache_skip = _try_skip_via_run_cache_with_store(
                             stage_name,
                             input_hash,
                             stage_outs,
                             store,
                             state_db,
+                            state_dir=stage_info["state_dir"],
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -393,7 +374,7 @@ def execute_stage(
                                 production_lock,
                                 state_db,
                                 file_hash_entries=file_hash_entries,
-                                increment_outputs=False,
+                                increment_outputs=run_cache_skip["outputs_restored"],
                             )
                             return StageResult(
                                 status=StageStatus.CACHED,
@@ -404,7 +385,7 @@ def execute_stage(
                                 deferred_writes=deferred,
                             )
 
-                output_paths, accessed_dep_keys = _run_stage_function_with_store(
+                output_paths = _run_stage_function_with_store(
                     stage_info["func"],
                     stage_name,
                     output_queue,
@@ -415,6 +396,10 @@ def execute_stage(
                     store,
                     stage_info["params_arg_name"],
                     stage_info["collection_params"],
+                    stage_info["incremental_inputs"],
+                    lock_data,
+                    state_dir,
+                    project_root,
                 )
                 if no_commit:
                     output_hashes = _hash_output_paths(output_paths)
@@ -428,7 +413,6 @@ def execute_stage(
                         run_reason,
                         ring_buffer,
                         input_hash=input_hash,
-                        accessed_dep_keys=accessed_dep_keys,
                     )
 
                 # Build lock data
@@ -450,18 +434,16 @@ def execute_stage(
                         state_db,
                         file_hash_entries=file_hash_entries,
                     )
-                    result = StageResult(
+                    return StageResult(
                         status=StageStatus.RAN,
                         reason=run_reason,
                         input_hash=input_hash,
                         output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
                         deferred_writes=deferred,
-                        accessed_dep_keys=accessed_dep_keys,
                     )
-                    return result
-        except exceptions.OutputMissingError as e:
-            return _make_result(StageStatus.FAILED, str(e), ring_buffer, input_hash=input_hash)
+        except (exceptions.OutputMissingError, exceptions.CacheRestoreError) as exc:
+            return _make_result(StageStatus.FAILED, str(exc), ring_buffer, input_hash=input_hash)
         except SystemExit as e:
             return _make_result(
                 StageStatus.FAILED,
@@ -485,11 +467,6 @@ def execute_stage(
             )
 
 
-def _canonicalize_out(path: str) -> str:
-    """Canonicalize output path via path_utils.canonicalize_artifact_path."""
-    return path_utils.canonicalize_artifact_path(path, project.get_project_root())
-
-
 def _to_identity_hashes(hashes: dict[str, HashInfo]) -> dict[types.ArtifactIdentity, HashInfo]:
     return {types.identity_from_key(key): info for key, info in hashes.items()}
 
@@ -500,26 +477,81 @@ def _to_identity_keyed_hashes(
     return {types.identity_key(identity): info for identity, info in hashes.items()}
 
 
-def _outputs_exist_with_store(
+class OutputRestoreResult(NamedTuple):
+    """Whether output restoration succeeded and wrote workspace bytes."""
+
+    available: bool
+    outputs_restored: bool
+
+
+@overload
+def restore_outputs_to_hashes(
     store: store_mod.Store,
     outs: list[types.ArtifactRef],
-    lock_data: LockData | None = None,
+    output_hashes: dict[types.ArtifactIdentity, HashInfo],
+    state_db: state.StateDB | None,
+    *,
     state_dir: pathlib.Path | None = None,
-) -> bool:
-    if not isinstance(store, store_mod.WorkspaceStore):
-        return all(store.exists(ref) for ref in outs)
+    restore: bool = True,
+    report_changes: Literal[False] = False,
+) -> bool: ...
 
-    for ref in outs:
-        if store.exists(ref):
-            continue
-        if lock_data is None:
-            return False
-        hash_info = lock_data["output_hashes"].get(ref.identity)
-        if hash_info is None:
-            return False
-        if not store.restore_from_cache(ref, hash_info, state_dir=state_dir):
-            return False
-    return True
+
+@overload
+def restore_outputs_to_hashes(
+    store: store_mod.Store,
+    outs: list[types.ArtifactRef],
+    output_hashes: dict[types.ArtifactIdentity, HashInfo],
+    state_db: state.StateDB | None,
+    *,
+    state_dir: pathlib.Path | None = None,
+    restore: bool = True,
+    report_changes: Literal[True],
+) -> OutputRestoreResult: ...
+
+
+def restore_outputs_to_hashes(
+    store: store_mod.Store,
+    outs: list[types.ArtifactRef],
+    output_hashes: dict[types.ArtifactIdentity, HashInfo],
+    state_db: state.StateDB | None,
+    *,
+    state_dir: pathlib.Path | None = None,
+    restore: bool = True,
+    report_changes: bool = False,
+) -> bool | OutputRestoreResult:
+    """Verify outputs match recorded hashes and restore cacheable mismatches."""
+    available = True
+    outputs_restored = False
+    if not isinstance(store, store_mod.WorkspaceStore):
+        available = all(store.exists(ref) for ref in outs)
+    else:
+        for ref in outs:
+            expected_hash = output_hashes.get(ref.identity)
+            if expected_hash is None:
+                available = False
+                break
+            output_path = store.resolve_display_path(ref)
+            try:
+                actual_hash = hash_output(output_path, state_db)
+            except OSError:
+                actual_hash = None
+            if actual_hash == expected_hash:
+                continue
+            if not store.cache_contains(ref, expected_hash):
+                available = False
+                break
+            if restore:
+                if not store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
+                    available = False
+                    break
+                outputs_restored = True
+    if report_changes:
+        return OutputRestoreResult(
+            available=available,
+            outputs_restored=outputs_restored,
+        )
+    return available
 
 
 def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
@@ -555,183 +587,29 @@ def _deps_list_for_input_hash(
 
 def _check_skip_or_run(
     stage_info: WorkerStageInfo,
-    stage_lock: lock.StageLock,
     lock_data: LockData | None,
     current_fingerprint: dict[str, str],
     current_params: dict[str, Any],
     dep_hashes: dict[str, HashInfo],
-) -> tuple[str | None, str, str]:
-    """Determine if stage can skip or must run.
-
-    Returns (skip_reason, run_reason, input_hash) where exactly one of skip/run reason is meaningful:
-    - If skip_reason is not None: stage can skip, run_reason is empty
-    - If skip_reason is None: stage must run, run_reason explains why
-    - input_hash is always returned for run cache recording
-    """
-    out_paths = _get_normalized_out_paths(stage_info)
+) -> tuple[str | None, str, str, bool]:
+    """Determine if stage can skip or must run."""
+    out_identities = [out.identity for out in stage_info["outs"]]
     out_specs = _get_output_specs(stage_info)
     deps_list = _deps_list_for_input_hash(stage_info, dep_hashes)
     input_hash = run_history.compute_input_hash(
         current_fingerprint, current_params, deps_list, out_specs
     )
-
-    if lock_data is None:
-        return None, "No previous run", input_hash
-
-    changed, run_reason = stage_lock.is_changed_with_lock_data(
-        lock_data, current_fingerprint, current_params, dep_hashes, out_paths
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint=current_fingerprint,
+        params=current_params,
+        dep_hashes=_to_identity_hashes(dep_hashes),
+        out_paths=out_identities,
+        run_cache_allowed=not bool(stage_info["incremental_inputs"]),
     )
-    if not changed:
-        return "unchanged", "", input_hash
-
-    return None, run_reason, input_hash
-
-
-def _cleanup_restored_paths(restored_paths: list[pathlib.Path]) -> None:
-    """Remove partially restored outputs to leave a clean state."""
-    for path in restored_paths:
-        cache.remove_output(path)
-
-
-def _restore_outputs(
-    output_path_strings: list[str],
-    output_hash_map: dict[str, HashInfo],
-    files_cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-    *,
-    use_normalized_paths: bool = False,
-    state_db: state.StateDB | None = None,
-    state_dir: pathlib.Path | None = None,
-) -> bool:
-    """Restore outputs from cache - shared logic for lock file and run cache paths.
-
-    Returns True if all outputs exist or were restored. On failure, cleans up
-    any partially restored outputs to leave the filesystem in a clean state.
-
-    For files and directories, also verifies content matches the cached hash and
-    reconciles any differences (restores missing/corrupted files, removes extra files).
-
-    Args:
-        output_path_strings: Path strings to restore (preserves trailing slash for DirectoryOut)
-        output_hash_map: Map of path string -> hash (from lock data or run cache)
-        files_cache_dir: Cache directory for file restoration
-        checkout_modes: Checkout modes for cache restoration
-        use_normalized_paths: If True, normalize paths for lookup (lock data uses
-            normalized paths). If False, use raw paths (run cache uses raw paths).
-        state_db: Optional state database for hash caching during file verification.
-        state_dir: Per-stage state directory for lock files during directory restores.
-    """
-    restored_paths = list[pathlib.Path]()
-
-    for path_str in output_path_strings:
-        path = pathlib.Path(path_str)
-        lookup_key = _canonicalize_out(path_str) if use_normalized_paths else path_str
-
-        # Check if output is recorded
-        if lookup_key not in output_hash_map:
-            _cleanup_restored_paths(restored_paths)
-            return False
-
-        output_hash = output_hash_map[lookup_key]
-
-        # Verify content matches cached hash (directories and files)
-        if is_dir_hash(output_hash):
-            needs_restore = _directory_needs_restore(path, output_hash, state_db)
-        else:
-            needs_restore = _file_needs_restore(path, output_hash, state_db)
-
-        if not needs_restore:
-            continue
-
-        try:
-            restored = cache.restore_from_cache(
-                path,
-                output_hash,
-                files_cache_dir,
-                checkout_modes=checkout_modes,
-                state_dir=state_dir,
-            )
-        except OSError:
-            _cleanup_restored_paths(restored_paths)
-            return False
-
-        if restored:
-            restored_paths.append(path)
-        else:
-            _cleanup_restored_paths(restored_paths)
-            return False
-
-    return True
-
-
-def restore_outputs_from_cache(
-    stage_outs: Sequence[outputs.ExpandedOut],
-    lock_data: LockData,
-    files_cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-    *,
-    state_db: state.StateDB | None = None,
-    state_dir: pathlib.Path | None = None,
-) -> bool:
-    """Restore missing outputs from cache for lock file skip detection."""
-    # Non-cached outputs (Metric) are git-tracked — just verify they exist
-    for out in stage_outs:
-        if not out.cache and not pathlib.Path(out.path).exists():
-            return False
-
-    # Only restore cached outputs from cache
-    cached_path_strings = [out.path for out in stage_outs if out.cache]
-    output_hashes: dict[str, HashInfo] = _to_identity_keyed_hashes(lock_data["output_hashes"])
-    return _restore_outputs(
-        cached_path_strings,
-        output_hashes,
-        files_cache_dir,
-        checkout_modes,
-        use_normalized_paths=True,
-        state_db=state_db,
-        state_dir=state_dir,
-    )
-
-
-def _directory_needs_restore(
-    path: pathlib.Path, cached_hash: DirHash, state_db: state.StateDB | None = None
-) -> bool:
-    """Check if directory content differs from cached manifest.
-
-    Returns True if restoration is needed (missing files, extra files,
-    or content mismatch).
-
-    Uses hash_directory() internally to ensure the same filtering is applied
-    (ignoring __pycache__, .venv, etc.). This ensures consistency between
-    hashing and restore checks.
-    """
-    if not path.exists():
-        return True
-
-    try:
-        current_hash, _ = cache.hash_directory(path, state_db)
-    except OSError:
-        return True
-
-    # Compare tree hashes - they include all content and structure
-    return current_hash != cached_hash["hash"]
-
-
-def _file_needs_restore(
-    path: pathlib.Path, cached_hash: FileHash, state_db: state.StateDB | None = None
-) -> bool:
-    """Check if file content differs from cached hash.
-
-    Returns True if restoration is needed (file missing or content mismatch).
-    """
-    if not path.exists():
-        return True
-
-    try:
-        current_hash, _ = cache.hash_file(path, state_db)
-        return current_hash != cached_hash["hash"]
-    except OSError:
-        return True
+    if decision["changed"]:
+        return None, decision["reason"], input_hash, decision["run_cache_allowed"]
+    return "unchanged", "", input_hash, decision["run_cache_allowed"]
 
 
 def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:
@@ -789,16 +667,15 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
         return func(**kwargs)
 
 
-def _load_dep_from_store(ref: types.ArtifactRef, store: store_mod.Store) -> Any:
-    path = store.checkout(ref)
+def _load_dep_from_path(ref: types.ArtifactRef, path: pathlib.Path) -> Any:
+    """Load an artifact after the caller has resolved its workspace/cache path."""
     loader = cast("Any", ref.format)
     if ref.tag is types.ArtifactTag.DIRECTORY:
-        dir_path = pathlib.Path(path)
         values = dict[str, Any]()
-        for file_path in sorted(p for p in dir_path.rglob("*") if p.is_file()):
-            rel_key = file_path.relative_to(dir_path).as_posix()
+        for file_path in sorted(p for p in path.rglob("*") if p.is_file()):
+            rel_key = file_path.relative_to(path).as_posix()
             values[rel_key] = loader.load(file_path)
-        return TrackedDict(values)
+        return values
     return loader.load(path)
 
 
@@ -822,6 +699,8 @@ def _resolve_output_values(
         raise RuntimeError(
             f"Stage '{stage_name}' returned {type(result).__name__} but expected a mapping"
         )
+    # Cast needed: isinstance narrows Any to Mapping[Unknown, Unknown]; output keys are strings
+    result_map = cast("collections_abc.Mapping[str, Any]", result)
 
     value_map = dict[types.ArtifactRef, Any]()
     missing = list[str]()
@@ -829,26 +708,77 @@ def _resolve_output_values(
         key = out.identity.key
         if key is None:
             raise RuntimeError(f"Stage '{stage_name}' has multiple outputs but missing output key")
-        if key not in result:
+        if key not in result_map:
             missing.append(key)
             continue
-        value_map[out] = result[key]
+        value_map[out] = result_map[key]
 
     if missing:
         raise KeyError(
-            f"Missing return output keys: {sorted(missing)}. Return value keys: {sorted(result.keys())}"
+            f"Missing return output keys: {sorted(missing)}. Return value keys: {sorted(result_map.keys())}"
         )
 
-    extra = set(result.keys()) - {out.identity.key for out in outs if out.identity.key is not None}
+    extra = set(result_map.keys()) - {
+        out.identity.key for out in outs if out.identity.key is not None
+    }
     if extra:
         logger.warning("Extra keys in return value not declared as outputs: %s", sorted(extra))
 
     return value_map
 
 
+def _paths_overlap(first: pathlib.Path, second: pathlib.Path) -> bool:
+    """Return whether either path contains the other."""
+    return first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _reject_path_inside_project(
+    ref: types.ArtifactRef,
+    value: object,
+    project_root: pathlib.Path,
+    dependency_paths: collections_abc.Collection[pathlib.Path] = (),
+) -> None:
+    """A PathOnly output is moved to the output path; never move a file pivot does not own."""
+    if not isinstance(value, pathlib.Path):
+        raise TypeError(
+            f"Stage '{ref.identity.producer}' returned {type(value).__name__}; "
+            + "a PathOnly output must return pathlib.Path"
+        )
+    source = value if value.is_absolute() else project_root / value
+    lexical_root = project_root.absolute()
+    lexical_source = source.absolute()
+    resolved_root = project_root.resolve()
+    resolved_source = source.resolve()
+    if lexical_source.is_relative_to(lexical_root) or resolved_source.is_relative_to(resolved_root):
+        raise exceptions.StageDefinitionError(
+            f"Stage '{ref.identity.producer}' returned {value}, which is inside the project "
+            + f"({project_root}). Pivot moves a returned path to the stage's output path, so it "
+            + "must be a file or directory the stage created outside the project, e.g. under "
+            + "tempfile.mkdtemp()."
+        )
+    for dependency_path in dependency_paths:
+        lexical_dependency = dependency_path.absolute()
+        resolved_dependency = dependency_path.resolve()
+        if any(
+            _paths_overlap(source_path, dependency_variant)
+            for source_path in (lexical_source, resolved_source)
+            for dependency_variant in (lexical_dependency, resolved_dependency)
+        ):
+            raise exceptions.StageDefinitionError(
+                f"Stage '{ref.identity.producer}' returned {value}, which overlaps dependency "
+                + f"{dependency_path}. Pivot cannot move a path the stage received as input."
+            )
+
+
 def _write_output_with_store(
-    ref: types.ArtifactRef, value: Any, store: store_mod.Store
+    ref: types.ArtifactRef,
+    value: Any,
+    store: store_mod.Store,
+    project_root: pathlib.Path,
+    dependency_paths: collections_abc.Collection[pathlib.Path] = (),
 ) -> pathlib.Path:
+    if isinstance(ref.format, loaders.PathOnly) and ref.tag is not types.ArtifactTag.DIRECTORY:
+        _reject_path_inside_project(ref, value, project_root, dependency_paths)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
     if ref.tag is types.ArtifactTag.DIRECTORY:
@@ -858,13 +788,24 @@ def _write_output_with_store(
             )
         if not value:
             raise ValueError(f"Directory output '{ref.identity.producer}': dict must be non-empty")
-        for key, item_value in value.items():
+        # Cast needed: isinstance narrows Any to dict[Unknown, Unknown]; keys are checked below
+        value_dict = cast("dict[object, Any]", value)
+        members = list[tuple[pathlib.Path, Any]]()
+        for key, item_value in value_dict.items():
             if not isinstance(key, str):
                 raise ValueError(
-                    f"Directory output '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
+                    f"Directory output for '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
                 )
-            normalized = stage_def._validate_directory_out_key(key, ref.identity.producer)
-            full_path = output_path / normalized
+            normalized = stage_def.validate_directory_out_key(key, ref.identity.producer)
+            if isinstance(ref.format, loaders.PathOnly):
+                _reject_path_inside_project(
+                    ref,
+                    cast("object", item_value),
+                    project_root,
+                    dependency_paths,
+                )
+            members.append((output_path / normalized, item_value))
+        for full_path, item_value in members:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             writer.save(item_value, full_path)
         return output_path
@@ -900,6 +841,49 @@ def _reconstruct_list_kwargs(
     return result
 
 
+def _prepare_incremental_inputs(
+    stage_name: str,
+    outs: list[types.ArtifactRef],
+    incremental_inputs: dict[str, types.ArtifactIdentity],
+    lock_data: LockData | None,
+    store: store_mod.Store,
+    state_dir: pathlib.Path,
+) -> dict[str, Any]:
+    """Restore previous incremental outputs and load them for the stage call."""
+    if not incremental_inputs:
+        return {}
+    if not isinstance(store, store_mod.WorkspaceStore):
+        raise RuntimeError("Incremental outputs require a workspace store.")
+
+    outs_by_identity = {out.identity: out for out in outs}
+    values = dict[str, Any]()
+    for param_name, identity in incremental_inputs.items():
+        ref = outs_by_identity[identity]
+        loader = cast("loaders.Loader[Any, Any]", ref.format)
+        if lock_data is None:
+            values[param_name] = loader.empty()
+            continue
+
+        output_hash = lock_data["output_hashes"].get(identity)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        if output_hash is None:
+            raise exceptions.CacheRestoreError(
+                f"Cache missing for incremental output '{types.identity_key(identity)}'. "
+                + f"Run 'pivot pull' to restore it, or remove '{stage_lock.path}' and rerun "
+                + "to reset this incremental output."
+            )
+        output_path = store.resolve_display_path(ref)
+        cache.remove_output(output_path)
+        if not store.restore_from_cache(ref, output_hash, state_dir=state_dir):
+            raise exceptions.CacheRestoreError(
+                f"Cache missing for incremental output '{types.identity_key(identity)}'. "
+                + f"Run 'pivot pull' to restore it, or remove '{stage_lock.path}' and rerun "
+                + "to reset this incremental output."
+            )
+        values[param_name] = _load_dep_from_path(ref, output_path)
+    return values
+
+
 def _run_stage_function_with_store(
     func: Callable[..., Any],
     stage_name: str,
@@ -911,7 +895,11 @@ def _run_stage_function_with_store(
     store: store_mod.Store,
     params_arg_name: str | None,
     collection_params: dict[str, str],
-) -> tuple[dict[types.ArtifactRef, pathlib.Path], dict[str, set[str]]]:
+    incremental_inputs: dict[str, types.ArtifactIdentity],
+    lock_data: LockData | None,
+    state_dir: pathlib.Path,
+    project_root: pathlib.Path,
+) -> dict[types.ArtifactRef, pathlib.Path]:
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
         _QueueWriter(stage_name, output_queue, is_stderr=True, ring_buffer=ring_buffer),
@@ -925,13 +913,21 @@ def _run_stage_function_with_store(
                 )
             kwargs[params_arg_name] = params
 
-        accessed = dict[str, set[str]]()
+        dependency_paths = list[pathlib.Path]()
         for name, ref in deps.items():
-            loaded = _load_dep_from_store(ref, store)
-            if isinstance(loaded, TrackedDict):
-                kwargs[name] = loaded
-            else:
-                kwargs[name] = loaded
+            dependency_path = store.checkout(ref)
+            dependency_paths.append(dependency_path)
+            kwargs[name] = _load_dep_from_path(ref, dependency_path)
+        kwargs.update(
+            _prepare_incremental_inputs(
+                stage_name,
+                outs,
+                incremental_inputs,
+                lock_data,
+                store,
+                state_dir,
+            )
+        )
 
         kwargs = _reconstruct_list_kwargs(kwargs, collection_params)
 
@@ -942,17 +938,15 @@ def _run_stage_function_with_store(
         output_values = _resolve_output_values(result, outs, stage_name)
         output_paths = dict[types.ArtifactRef, pathlib.Path]()
         for ref, value in output_values.items():
-            output_paths[ref] = _write_output_with_store(ref, value, store)
+            output_paths[ref] = _write_output_with_store(
+                ref,
+                value,
+                store,
+                project_root,
+                dependency_paths,
+            )
 
-        for name, value in kwargs.items():
-            if isinstance(value, TrackedDict):
-                accessed[name] = set(value.accessed_keys)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, TrackedDict):
-                        accessed.setdefault(name, set()).update(item.accessed_keys)
-
-        return output_paths, accessed
+        return output_paths
 
 
 def _hash_output_paths(
@@ -1146,12 +1140,7 @@ def hash_dependencies(
     store: store_mod.Store | None = None,
     state_db: state.StateDB | None = None,
 ) -> tuple[dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]]:
-    """Hash all dependency files and directories.
-
-    Returns (hashes, missing_files, unreadable_files).
-    For directories, includes full manifest with file hashes/sizes for provenance.
-    Paths are normalized (symlinks preserved) for portability in lock files.
-    """
+    """Hash all dependencies and collect file-hash cache write-backs."""
     _t = metrics.start()
     hashes = dict[str, HashInfo]()
     missing = list[str]()
@@ -1163,17 +1152,17 @@ def hash_dependencies(
         for ref in deps.values():
             key = types.identity_key(ref.identity)
             try:
-                hash_info = store.hash_artifact(ref)
+                hash_info = store.hash_artifact(ref, state_db)
                 hashes[key] = hash_info
                 if not is_dir_hash(hash_info) and isinstance(store, store_mod.WorkspaceStore):
                     path = store.checkout(ref)
-                    stat = path.stat()
+                    fs_stat = path.stat()
                     file_hash_entries.append(
                         (
                             str(path),
-                            stat.st_mtime_ns,
-                            stat.st_size,
-                            stat.st_ino,
+                            fs_stat.st_mtime_ns,
+                            fs_stat.st_size,
+                            fs_stat.st_ino,
                             hash_info["hash"],
                         )
                     )
@@ -1190,14 +1179,14 @@ def hash_dependencies(
                     tree_hash, manifest = cache.hash_directory(path, state_db)
                     hashes[dep] = DirHash(hash=tree_hash, manifest=manifest)
                 else:
-                    file_hash, file_stat = cache.hash_file(path, state_db)
+                    file_hash, fs_stat = cache.hash_file(path, state_db)
                     hashes[dep] = FileHash(hash=file_hash)
                     file_hash_entries.append(
                         (
                             str(normalized_path),
-                            file_stat.st_mtime_ns,
-                            file_stat.st_size,
-                            file_stat.st_ino,
+                            fs_stat.st_mtime_ns,
+                            fs_stat.st_size,
+                            fs_stat.st_ino,
                             file_hash,
                         )
                     )
@@ -1217,66 +1206,62 @@ def hash_dependencies(
 def can_skip_via_generation(
     stage_name: str,
     fingerprint: dict[str, str],
-    deps: dict[str, types.ArtifactRef] | list[str],
+    deps: dict[str, types.ArtifactRef],
     outs_paths: list[str],
     current_params: dict[str, Any],
     lock_data: LockData,
     state_db: state.StateDB,
-    verify_files: bool = True,
+    store: store_mod.Store,
 ) -> bool:
-    """Check if stage can skip using O(1) generation tracking.
-
-    Generation tracking avoids hashing files by tracking monotonic generation counters.
-    Set verify_files=False for status prediction.
-    """
+    """Check generation counters and cached dependency hashes without rehashing."""
     if lock_data["code_manifest"] != fingerprint:
         return False
     if lock_data["params"] != current_params:
         return False
 
-    # Compare output identities (outs_paths is already normalized by _get_normalized_out_paths)
     normalized_outs = sorted(outs_paths)
     locked_out_paths = sorted(
-        types.identity_key(k) if isinstance(k, types.ArtifactIdentity) else k
-        for k in lock_data["output_hashes"]
+        types.identity_key(identity) for identity in lock_data["output_hashes"]
     )
     if normalized_outs != locked_out_paths:
         return False
-
     if not deps:
         return True
 
     recorded_gens = state_db.get_dep_generations(stage_name)
     if not recorded_gens:
         return False
-
-    dep_keys = (
-        [types.identity_key(ref.identity) for ref in deps.values()]
-        if isinstance(deps, dict)
-        else list(deps)
-    )
+    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
     current_gens = state_db.get_many_generations(dep_keys)
-
-    for dep_key in dep_keys:
+    stats = list[tuple[pathlib.Path, os.stat_result]]()
+    paths_by_key = dict[str, pathlib.Path]()
+    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
+        expected_hash = lock_data["dep_hashes"].get(ref.identity)
+        if expected_hash is None or is_dir_hash(expected_hash):
+            return False
         current_gen = current_gens.get(dep_key)
-        if current_gen is None:
+        if current_gen is None or current_gen != recorded_gens.get(dep_key):
             return False
-        if current_gen != recorded_gens.get(dep_key):
+        try:
+            path = store.checkout(ref)
+            stats.append((path, path.stat()))
+            paths_by_key[dep_key] = path
+        except OSError:
             return False
-
+    cached_hashes = state_db.get_many(stats)
+    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
+        cached_hash = cached_hashes[paths_by_key[dep_key]]
+        if cached_hash != lock_data["dep_hashes"][ref.identity]["hash"]:
+            return False
     return True
 
 
 def compute_dep_generation_map(
-    deps: dict[str, types.ArtifactRef] | list[str],
+    deps: dict[str, types.ArtifactRef],
     state_db: state.StateDB,
 ) -> dict[str, int]:
     """Compute dependency identity -> generation map for recording."""
-    dep_keys = (
-        [types.identity_key(ref.identity) for ref in deps.values()]
-        if isinstance(deps, dict)
-        else list(deps)
-    )
+    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
     current_gens = state_db.get_many_generations(dep_keys)
 
     gen_record = dict[str, int]()
@@ -1284,7 +1269,6 @@ def compute_dep_generation_map(
         gen = current_gens.get(dep_key)
         if gen is not None:
             gen_record[dep_key] = gen
-
     return gen_record
 
 
@@ -1335,17 +1319,17 @@ def _build_deferred_writes(
     if gen_record:
         result["dep_generations"] = gen_record
 
-    # Run cache entry — only cached outputs belong in run cache
+    # Incremental outputs continue from the latest lock state and never use the run cache.
     outs = stage_info["outs"]
-    if outs and isinstance(outs[0], outputs.BaseOut):
-        expanded_outs = cast("Sequence[outputs.ExpandedOut]", outs)
-        cached_paths = {out.path for out in expanded_outs if out.cache}
-    else:
-        cached_paths = {
+    cached_paths = (
+        set[str]()
+        if any(out.tag is types.ArtifactTag.INCREMENTAL for out in outs)
+        else {
             types.identity_key(out.identity)
             for out in outs
             if out.tag is not types.ArtifactTag.METRIC
         }
+    )
     output_entries = [
         run_history.output_hash_to_entry(path, oh)
         for path, oh in output_hashes.items()
@@ -1373,6 +1357,7 @@ class RunCacheSkipResult(TypedDict):
     """Result from successful run cache skip."""
 
     output_hashes: dict[str, HashInfo]
+    outputs_restored: bool
 
 
 def _try_skip_via_run_cache_with_store(
@@ -1381,38 +1366,35 @@ def _try_skip_via_run_cache_with_store(
     stage_outs: list[types.ArtifactRef],
     store: store_mod.Store,
     state_db: state.StateDB,
+    *,
+    state_dir: pathlib.Path,
 ) -> RunCacheSkipResult | None:
-    """Try to skip using run cache for store-based outputs.
-
-    For store-based stages, outputs are already in the store, so we just need to
-    check if they exist and get their hashes.
-    """
+    """Restore all cached outputs from a matching run-cache entry."""
+    if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
+        return None
     entry = state_db.lookup_run_cache(stage_name, input_hash)
     if entry is None:
         return None
+    output_hashes = {
+        output["path"]: run_history.entry_to_output_hash(output)
+        for output in entry["output_hashes"]
+    }
+    expected_keys = {types.identity_key(ref.identity) for ref in stage_outs}
+    if output_hashes.keys() != expected_keys:
+        return None
+    identity_hashes = _to_identity_hashes(output_hashes)
 
-    output_hashes: dict[str, HashInfo] = {}
-    for ref in stage_outs:
-        if not store.exists(ref):
-            return None
-        identity_key = types.identity_key(ref.identity)
-        output_hashes[identity_key] = store.hash_artifact(ref)
-
+    restoration = restore_outputs_to_hashes(
+        store,
+        stage_outs,
+        identity_hashes,
+        state_db,
+        state_dir=state_dir,
+        report_changes=True,
+    )
+    if not restoration.available:
+        return None
     return RunCacheSkipResult(
         output_hashes=output_hashes,
+        outputs_restored=restoration.outputs_restored,
     )
-
-
-def write_run_cache_entry(
-    stage_name: str,
-    input_hash: str,
-    output_hashes: dict[str, HashInfo],
-    run_id: str,
-    state_db: state.StateDB,
-) -> None:
-    """Write run cache entry after successful execution."""
-    output_entries = [
-        run_history.output_hash_to_entry(path, oh) for path, oh in output_hashes.items()
-    ]
-    cache_entry = run_history.RunCacheEntry(run_id=run_id, output_hashes=output_entries)
-    state_db.write_run_cache(stage_name, input_hash, cache_entry)

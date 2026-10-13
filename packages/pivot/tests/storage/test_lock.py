@@ -131,185 +131,6 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
         )
 
 
-def test_stage_changed_no_previous_run(tmp_path: Path) -> None:
-    """Stage is marked changed when no lock file exists."""
-    stage_lock = lock.StageLock("new_stage", tmp_path)
-
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={"self:new_stage": "abc"},
-        current_params={},
-        dep_hashes={},
-    )
-
-    assert changed is True
-    assert "no previous run" in reason.lower()
-
-
-def test_stage_unchanged_when_identical(tmp_path: Path) -> None:
-    """Stage is not changed when fingerprint, params, and deps match."""
-    stage_lock = lock.StageLock("stable", tmp_path)
-    fingerprint = {"self:stable": "abc", "func:helper": "def"}
-    params = {"lr": 0.01}
-    dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("data"): {"hash": "xyz"}}
-
-    stage_lock.write(
-        LockData(
-            code_manifest=fingerprint,
-            params=params,
-            dep_hashes=dep_hashes,
-            output_hashes={},
-        )
-    )
-
-    changed, reason = stage_lock.is_changed(fingerprint, params, dep_hashes)
-
-    assert changed is False
-    assert reason == ""
-
-
-def test_stage_changed_code_modified(tmp_path: Path) -> None:
-    """Stage is marked changed when code fingerprint differs."""
-    stage_lock = lock.StageLock("modified", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:modified": "old_hash"},
-            params={},
-            dep_hashes={},
-            output_hashes={},
-        )
-    )
-
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={"self:modified": "new_hash"},
-        current_params={},
-        dep_hashes={},
-    )
-
-    assert changed is True
-    assert "code changed" in reason.lower()
-
-
-def test_stage_changed_new_dependency(tmp_path: Path) -> None:
-    """Stage is marked changed when new code dependency added."""
-    stage_lock = lock.StageLock("extended", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:extended": "hash1"},
-            params={},
-            dep_hashes={},
-            output_hashes={},
-        )
-    )
-
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={"self:extended": "hash1", "func:new_helper": "hash2"},
-        current_params={},
-        dep_hashes={},
-    )
-
-    assert changed is True
-    assert "code changed" in reason.lower()
-
-
-def test_stage_changed_params_modified(tmp_path: Path) -> None:
-    """Stage is marked changed when params differ."""
-    stage_lock = lock.StageLock("tuned", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:tuned": "hash"},
-            params={"learning_rate": 0.01},
-            dep_hashes={},
-            output_hashes={},
-        )
-    )
-
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={"self:tuned": "hash"},
-        current_params={"learning_rate": 0.001},
-        dep_hashes={},
-    )
-
-    assert changed is True
-    assert "params changed" in reason.lower()
-
-
-def test_stage_changed_dep_hash_modified(tmp_path: Path) -> None:
-    """Stage is marked changed when input file hash differs."""
-    stage_lock = lock.StageLock("consumer", tmp_path)
-    dep_id = _id("input")
-    old_dep_hashes: dict[ArtifactIdentity, HashInfo] = {dep_id: {"hash": "old_hash"}}
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:consumer": "hash"},
-            params={},
-            dep_hashes=old_dep_hashes,
-            output_hashes={},
-        )
-    )
-
-    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {dep_id: {"hash": "new_hash"}}
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={"self:consumer": "hash"},
-        current_params={},
-        dep_hashes=new_dep_hashes,
-    )
-
-    assert changed is True
-    assert "input" in reason.lower() or "dep" in reason.lower()
-
-
-def test_stage_changed_dep_added(tmp_path: Path) -> None:
-    """Stage is marked changed when new input dependency added."""
-    stage_lock = lock.StageLock("consumer", tmp_path)
-    old_dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("a"): {"hash": "hash_a"}}
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:consumer": "hash"},
-            params={},
-            dep_hashes=old_dep_hashes,
-            output_hashes={},
-        )
-    )
-
-    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {
-        _id("a"): {"hash": "hash_a"},
-        _id("b"): {"hash": "hash_b"},
-    }
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={"self:consumer": "hash"},
-        current_params={},
-        dep_hashes=new_dep_hashes,
-    )
-
-    assert changed is True
-
-
-def test_stage_changed_dep_removed(tmp_path: Path) -> None:
-    """Stage is marked changed when input dependency removed."""
-    stage_lock = lock.StageLock("consumer", tmp_path)
-    old_dep_hashes: dict[ArtifactIdentity, HashInfo] = {
-        _id("a"): {"hash": "hash_a"},
-        _id("b"): {"hash": "hash_b"},
-    }
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:consumer": "hash"},
-            params={},
-            dep_hashes=old_dep_hashes,
-            output_hashes={},
-        )
-    )
-
-    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("a"): {"hash": "hash_a"}}
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={"self:consumer": "hash"},
-        current_params={},
-        dep_hashes=new_dep_hashes,
-    )
-
-    assert changed is True
-
-
 def test_atomic_write_no_partial_file(tmp_path: Path) -> None:
     """Write failure should not leave partial lock file."""
     stage_lock = lock.StageLock("atomic_test", tmp_path)
@@ -353,7 +174,15 @@ def test_lock_directory_created(tmp_path: Path) -> None:
         pytest.param("../etc/passwd", id="path_traversal"),
         pytest.param("stage with spaces", id="spaces"),
         pytest.param("stage\nwith\nnewlines", id="newlines"),
+        pytest.param("stage\n", id="trailing_newline"),
         pytest.param("../../traversal", id="double_traversal"),
+        pytest.param("/f", id="leading_slash"),
+        pytest.param("/etc/f", id="absolute"),
+        pytest.param("a//f", id="empty_segment"),
+        pytest.param("a/", id="trailing_slash"),
+        pytest.param("./f", id="dot_segment"),
+        pytest.param("a/./f", id="inner_dot_segment"),
+        pytest.param("   ", id="spaces_only"),
     ],
 )
 def test_invalid_stage_name_rejected(tmp_path: Path, invalid_name: str) -> None:
@@ -523,52 +352,6 @@ def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
     assert "dep_generations" not in result
 
 
-@pytest.mark.parametrize(
-    ("missing_key", "lock_content"),
-    [
-        ("code_manifest", "params: {}\ndeps: []\nouts: []\n"),
-        ("params", "code_manifest: {}\ndeps: []\nouts: []\n"),
-        ("deps", "code_manifest: {}\nparams: {}\nouts: []\n"),
-        ("outs", "code_manifest: {}\nparams: {}\ndeps: []\n"),
-    ],
-)
-def test_is_changed_with_missing_required_key_triggers_rerun(
-    tmp_path: Path, missing_key: str, lock_content: str
-) -> None:
-    """Lock file missing any required key triggers re-run."""
-    stage_lock = lock.StageLock("missing", tmp_path)
-    stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
-    stage_lock.path.write_text(lock_content)
-
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={},
-        current_params={},
-        dep_hashes={},
-    )
-
-    # Missing required key - read() returns None, treated as no previous run
-    assert changed is True, f"Missing {missing_key} should trigger re-run"
-    assert "no previous run" in reason.lower()
-
-
-def test_is_changed_with_null_values_triggers_rerun(tmp_path: Path) -> None:
-    """Lock file with null values triggers re-run (corrupted data)."""
-    stage_lock = lock.StageLock("nulls", tmp_path)
-    stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
-    # All required keys present but with null values
-    stage_lock.path.write_text("code_manifest: null\nparams: null\ndeps: null\nouts: null\n")
-
-    changed, reason = stage_lock.is_changed(
-        current_fingerprint={},
-        current_params={},
-        dep_hashes={},
-    )
-
-    # Null values are not valid - read() returns None, treated as no previous run
-    assert changed is True
-    assert "no previous run" in reason.lower()
-
-
 def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     """Lock files with extra keys (forward compatibility) are accepted."""
     stage_lock = lock.StageLock("future", tmp_path)
@@ -585,160 +368,6 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     assert result["params"] == {}
 
 
-# =============================================================================
-# Output Path Change Detection Tests
-# =============================================================================
-
-
-def test_stage_changed_output_path_added(tmp_path: Path) -> None:
-    """Stage is marked changed when a new output path is added."""
-    stage_lock = lock.StageLock("producer", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:producer": "hash"},
-            params={},
-            dep_hashes={},
-            output_hashes={_id("producer", "output"): {"hash": "abc123"}},
-        )
-    )
-
-    changed, reason = stage_lock.is_changed_with_lock_data(
-        lock_data=stage_lock.read(),
-        current_fingerprint={"self:producer": "hash"},
-        current_params={},
-        dep_hashes={},
-        out_paths=[_id("producer", "output"), _id("producer", "new_output")],
-    )
-
-    assert changed is True
-    assert "output" in reason.lower()
-
-
-def test_stage_changed_output_path_removed(tmp_path: Path) -> None:
-    """Stage is marked changed when an output path is removed."""
-    stage_lock = lock.StageLock("producer", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:producer": "hash"},
-            params={},
-            dep_hashes={},
-            output_hashes={
-                _id("producer", "output1"): {"hash": "abc123"},
-                _id("producer", "output2"): {"hash": "def456"},
-            },
-        )
-    )
-
-    changed, reason = stage_lock.is_changed_with_lock_data(
-        lock_data=stage_lock.read(),
-        current_fingerprint={"self:producer": "hash"},
-        current_params={},
-        dep_hashes={},
-        out_paths=[_id("producer", "output1")],
-    )
-
-    assert changed is True
-    assert "output" in reason.lower()
-
-
-def test_stage_changed_output_path_modified(tmp_path: Path) -> None:
-    """Stage is marked changed when output path changes (e.g., out_path_overrides)."""
-    stage_lock = lock.StageLock("producer", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:producer": "hash"},
-            params={},
-            dep_hashes={},
-            output_hashes={_id("producer", "output"): {"hash": "abc123"}},
-        )
-    )
-
-    changed, reason = stage_lock.is_changed_with_lock_data(
-        lock_data=stage_lock.read(),
-        current_fingerprint={"self:producer": "hash"},
-        current_params={},
-        dep_hashes={},
-        out_paths=[_id("producer", "results_output")],
-    )
-
-    assert changed is True
-    assert "output" in reason.lower()
-
-
-def test_stage_unchanged_with_same_output_paths(tmp_path: Path) -> None:
-    """Stage is not changed when output paths match (order-independent)."""
-    stage_lock = lock.StageLock("producer", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:producer": "hash"},
-            params={},
-            dep_hashes={},
-            output_hashes={
-                _id("producer", "output1"): {"hash": "abc123"},
-                _id("producer", "output2"): {"hash": "def456"},
-            },
-        )
-    )
-
-    changed, reason = stage_lock.is_changed_with_lock_data(
-        lock_data=stage_lock.read(),
-        current_fingerprint={"self:producer": "hash"},
-        current_params={},
-        dep_hashes={},
-        out_paths=[_id("producer", "output2"), _id("producer", "output1")],
-    )
-
-    assert changed is False
-    assert reason == ""
-
-
-def test_stage_unchanged_when_out_paths_none(tmp_path: Path) -> None:
-    """When out_paths not passed, skip output path check."""
-    stage_lock = lock.StageLock("producer", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:producer": "hash"},
-            params={},
-            dep_hashes={},
-            output_hashes={_id("producer", "output"): {"hash": "abc123"}},
-        )
-    )
-
-    changed, reason = stage_lock.is_changed_with_lock_data(
-        lock_data=stage_lock.read(),
-        current_fingerprint={"self:producer": "hash"},
-        current_params={},
-        dep_hashes={},
-    )
-
-    assert changed is False
-    assert reason == ""
-
-
-def test_dep_identity_change_invalidates_cache(tmp_path: Path) -> None:
-    """Verify dep identity changes correctly invalidate cache."""
-    stage_lock = lock.StageLock("consumer", tmp_path)
-    stage_lock.write(
-        LockData(
-            code_manifest={"self:consumer": "hash"},
-            params={},
-            dep_hashes={_id("data", "old"): {"hash": "abc123"}},
-            output_hashes={},
-        )
-    )
-
-    new_dep_hashes: dict[ArtifactIdentity, HashInfo] = {_id("data", "new"): {"hash": "abc123"}}
-    changed, reason = stage_lock.is_changed_with_lock_data(
-        lock_data=stage_lock.read(),
-        current_fingerprint={"self:consumer": "hash"},
-        current_params={},
-        dep_hashes=new_dep_hashes,
-    )
-
-    assert changed is True
-    assert "input" in reason.lower() or "dep" in reason.lower()
-
-
 # ==============================================================================
 # DirectoryOut trailing slash preservation
 # ==============================================================================
@@ -752,23 +381,23 @@ def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(
         "code_manifest: {self:dir_out_stage: fingerprint}\n"
-        "params: {}\n"
-        "schema_version: 2\n"
-        "deps:\n"
-        "  - producer: input\n"
-        "    key: null\n"
-        "    hash: dep_hash\n"
-        "    display: data/raw/input.csv\n"
-        "outs:\n"
-        "  - key: results\n"
-        "    hash: out_hash\n"
-        "    tag: directory\n"
-        "    display: results/\n"
-        "    manifest:\n"
-        "      - relpath: task_a.json\n"
-        "        hash: hash_a\n"
-        "        size: 100\n"
-        "        isexec: false\n"
+        + "params: {}\n"
+        + "schema_version: 2\n"
+        + "deps:\n"
+        + "  - producer: input\n"
+        + "    key: null\n"
+        + "    hash: dep_hash\n"
+        + "    display: data/raw/input.csv\n"
+        + "outs:\n"
+        + "  - key: results\n"
+        + "    hash: out_hash\n"
+        + "    tag: directory\n"
+        + "    display: results/\n"
+        + "    manifest:\n"
+        + "      - relpath: task_a.json\n"
+        + "        hash: hash_a\n"
+        + "        size: 100\n"
+        + "        isexec: false\n"
     )
 
     result = stage_lock.read()

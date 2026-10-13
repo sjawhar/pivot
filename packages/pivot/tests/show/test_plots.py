@@ -3,78 +3,55 @@ from __future__ import annotations
 
 import inspect
 import json
-import pathlib
-import subprocess
 import typing
 from typing import TYPE_CHECKING
 
 import yaml
 
-from conftest import init_git_repo
-from pivot import loaders, project
+from pivot import loaders
 from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import plots
-from pivot.storage import lock
 from pivot.types import (
     ArtifactIdentity,
     ArtifactRef,
     ArtifactTag,
     ChangeType,
-    LockData,
     OutputFormat,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from pytest_mock import MockerFixture
-
     from conftest import GitRepo
     from pivot.compose import Pipeline
 
 
 # =============================================================================
-# Helper to register Plot outputs
+# Helpers: register stages whose outputs have real identities
 # =============================================================================
 
 
-def _register_plot_stage(
-    test_pipeline: PipelineLike,
-    name: str,
-    plot_path: str,
-    x: str | None = None,
-    y: str | None = None,
-    template: str | None = None,
-) -> None:
-    """Register a test stage with a Plot output directly in the registry.
+def _ref(
+    stage: str, key: str | None, tag: ArtifactTag, fmt: loaders.Writer[typing.Any]
+) -> ArtifactRef:
+    return ArtifactRef(
+        identity=ArtifactIdentity(stage, key), format=fmt, python_type=object, tag=tag
+    )
 
-    This bypasses the annotation-based registration since Plot outputs
-    can't be expressed through annotations (they require outputs.Plot).
-    """
 
+def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactRef]) -> None:
     def _stage_func() -> None:
         pass
-
-    identity_path = plot_path
-    path_obj = pathlib.Path(plot_path)
-    if path_obj.is_absolute():
-        identity_path = project.to_relative_path(path_obj)
 
     pipeline = typing.cast("Pipeline", test_pipeline)
     pipeline._registry._stages[name] = RegistryStageInfo(
         func=_stage_func,
         name=name,
         deps={},
-        outs=[
-            ArtifactRef(
-                identity=ArtifactIdentity(identity_path, None),
-                format=loaders.PathOnly(),
-                python_type=pathlib.Path,
-                tag=ArtifactTag.PLOT,
-            )
-        ],
+        outs=outs,
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
@@ -82,71 +59,22 @@ def _register_plot_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
-def _register_mixed_output_stage(
-    test_pipeline: PipelineLike,
-    name: str,
-    out_path: str,
-    metric_path: str,
-    plot_path: str,
-) -> None:
-    """Register a test stage with Out, Metric, and Plot outputs."""
-
-    def _stage_func() -> None:
-        pass
-
-    out_identity = out_path
-    out_obj = pathlib.Path(out_path)
-    if out_obj.is_absolute():
-        out_identity = project.to_relative_path(out_obj)
-
-    metric_identity = metric_path
-    metric_obj = pathlib.Path(metric_path)
-    if metric_obj.is_absolute():
-        metric_identity = project.to_relative_path(metric_obj)
-
-    plot_identity = plot_path
-    plot_obj = pathlib.Path(plot_path)
-    if plot_obj.is_absolute():
-        plot_identity = project.to_relative_path(plot_obj)
-
-    pipeline = typing.cast("Pipeline", test_pipeline)
-    pipeline._registry._stages[name] = RegistryStageInfo(
-        func=_stage_func,
-        name=name,
-        deps={},
-        outs=[
-            ArtifactRef(
-                identity=ArtifactIdentity(out_identity, None),
-                format=loaders.PathOnly(),
-                python_type=pathlib.Path,
-                tag=ArtifactTag.DATA,
-            ),
-            ArtifactRef(
-                identity=ArtifactIdentity(metric_identity, None),
-                format=loaders.JSON(),
-                python_type=dict,
-                tag=ArtifactTag.METRIC,
-            ),
-            ArtifactRef(
-                identity=ArtifactIdentity(plot_identity, None),
-                format=loaders.PathOnly(),
-                python_type=pathlib.Path,
-                tag=ArtifactTag.PLOT,
-            ),
-        ],
-        params=None,
-        mutex=[],
-        variant=None,
-        signature=inspect.signature(_stage_func),
-        fingerprint={"_code": "fake_hash"},
-        params_arg_name=None,
-        state_dir=None,
-        collection_params={},
-        no_fingerprint=False,
+def _register_plot_stage(test_pipeline: PipelineLike, name: str) -> None:
+    """Register a stage with one plot output, written by pivot to plots/<name>.png."""
+    _register_stage(
+        test_pipeline, name, [_ref(name, None, ArtifactTag.PLOT, loaders.MatplotlibFigure())]
     )
+
+
+def _write_lock(repo_path: Path, stage_name: str, outs: list[dict[str, object]]) -> None:
+    stages_dir = repo_path / ".pivot" / "stages"
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    lock_content = {"code_manifest": {}, "params": {}, "deps": [], "outs": outs}
+    (stages_dir / f"{stage_name}.lock").write_text(yaml.dump(lock_content))
 
 
 # =============================================================================
@@ -162,114 +90,29 @@ def test_collect_plots_from_stages_empty(mock_discovery: PipelineLike) -> None:
 
 
 def test_collect_plots_from_stages_finds_plots(mock_discovery: PipelineLike) -> None:
-    """Finds Plot outputs from registered stages."""
-    plot_path = mock_discovery.root / "plot.png"
-    plot_path.write_bytes(b"data")
-
-    _register_plot_stage(mock_discovery, "my_stage", str(plot_path), x="epoch", y="loss")
+    """A stage's plot output is listed at its workspace path."""
+    _register_plot_stage(mock_discovery, "my_stage")
 
     result = plots.collect_plots_from_stages()
 
-    assert len(result) == 1
-    assert result[0]["stage_name"] == "my_stage"
-    assert result[0]["x"] is None
-    assert result[0]["y"] is None
+    assert result == [plots.PlotInfo(path="plots/my_stage.png", stage_name="my_stage")]
 
 
 def test_collect_plots_from_stages_ignores_non_plots(mock_discovery: PipelineLike) -> None:
-    """Ignores Out and Metric outputs, only returns Plot outputs."""
-    out_file = mock_discovery.root / "output.txt"
-    metric_file = mock_discovery.root / "metrics.json"
-    plot_file = mock_discovery.root / "chart.png"
-    out_file.write_text("data")
-    metric_file.write_text("{}")
-    plot_file.write_bytes(b"png")
-
-    _register_mixed_output_stage(
+    """Ignores data and metric outputs, only returns plot outputs."""
+    _register_stage(
         mock_discovery,
         "mixed_stage",
-        str(out_file),
-        str(metric_file),
-        str(plot_file),
+        [
+            _ref("mixed_stage", "out", ArtifactTag.DATA, loaders.CSV()),
+            _ref("mixed_stage", "score", ArtifactTag.METRIC, loaders.YAML()),
+            _ref("mixed_stage", "chart", ArtifactTag.PLOT, loaders.MatplotlibFigure()),
+        ],
     )
 
     result = plots.collect_plots_from_stages()
 
-    assert len(result) == 1
-    assert result[0]["path"] == "chart.png"
-
-
-# =============================================================================
-# get_plot_hashes_from_lock Tests
-# =============================================================================
-
-
-def test_get_plot_hashes_from_lock_no_lock_file(mock_discovery: PipelineLike) -> None:
-    """Returns None for plots without lock files."""
-    plot_file = mock_discovery.root / "plot.png"
-    plot_file.write_bytes(b"data")
-
-    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
-
-    result = plots.get_plot_hashes_from_lock()
-
-    # Result keys are relative to project root
-    assert "plot.png" in result
-    assert result["plot.png"] is None
-
-
-def test_get_plot_hashes_from_lock_with_hash(mock_discovery: PipelineLike) -> None:
-    """Returns None when lock format doesn't include paths."""
-    plot_file = mock_discovery.root / "plot.png"
-    plot_file.write_bytes(b"data")
-
-    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
-
-    # Create lock file with hash
-    state_dir = mock_discovery.root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-    stage_lock = lock.StageLock("test_stage", stages_dir)
-    stage_lock.write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={ArtifactIdentity("plot.png", None): {"hash": "abc123def456"}},
-        )
-    )
-
-    result = plots.get_plot_hashes_from_lock()
-
-    # Result keys are relative to project root
-    assert result["plot.png"] is None
-
-
-def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: PipelineLike) -> None:
-    """Returns None for plots without path-mapped hashes."""
-    plot_file = mock_discovery.root / "plot.png"
-    plot_file.write_bytes(b"data")
-
-    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
-
-    # Create lock file with None hash (uncached output)
-    state_dir = mock_discovery.root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-    stage_lock = lock.StageLock("test_stage", stages_dir)
-    stage_lock.write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={},
-            output_hashes={ArtifactIdentity("plot.png", None): {"hash": "abc123"}},
-        )
-    )
-
-    result = plots.get_plot_hashes_from_lock()
-
-    # Result keys are relative to project root
-    assert result["plot.png"] is None
+    assert result == [plots.PlotInfo(path="plots/mixed_stage/chart.png", stage_name="mixed_stage")]
 
 
 # =============================================================================
@@ -278,123 +121,88 @@ def test_get_plot_hashes_from_lock_with_none_hash(mock_discovery: PipelineLike) 
 
 
 def test_get_plot_hashes_from_head_no_git_repo(mock_discovery: PipelineLike) -> None:
-    """Returns empty dict when not in a git repo."""
-    plot_file = mock_discovery.root / "plot.png"
-    plot_file.write_bytes(b"data")
-
-    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
+    """Without a git HEAD every plot maps to None."""
+    _register_plot_stage(mock_discovery, "test_stage")
 
     result = plots.get_plot_hashes_from_head()
 
-    # No git repo, so all plots have None hash
-    assert "plot.png" in result
-    assert result["plot.png"] is None
+    assert result == {"plots/test_stage.png": None}
 
 
 def test_get_plot_hashes_from_head_returns_committed_hash(
     git_repo: GitRepo,
     mock_discovery: PipelineLike,
-    mocker: MockerFixture,
 ) -> None:
     """Returns hash from lock file committed to HEAD."""
     repo_path, commit = git_repo
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-
-    plot_file = repo_path / "plot.png"
-    plot_file.write_bytes(b"data")
-
-    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
-
-    # Create and commit lock file with hash
-    state_dir = repo_path / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-    lock_content = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [
-            {
-                "key": None,
-                "hash": "committed_hash_123",
-                "tag": "plot",
-                "display": "plot.png",
-            }
-        ],
-    }
-    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
-
+    _register_plot_stage(mock_discovery, "test_stage")
+    _write_lock(
+        repo_path, "test_stage", [{"key": None, "hash": "committed_hash_123", "tag": "plot"}]
+    )
     commit("initial")
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result["plot.png"] == "committed_hash_123"
+    assert result == {"plots/test_stage.png": "committed_hash_123"}
+
+
+def test_get_plot_hashes_from_head_matches_keyed_output(
+    git_repo: GitRepo,
+    mock_discovery: PipelineLike,
+) -> None:
+    """A keyed plot output takes the hash recorded under its own key."""
+    repo_path, commit = git_repo
+    _register_stage(
+        mock_discovery,
+        "test_stage",
+        [_ref("test_stage", "chart", ArtifactTag.PLOT, loaders.MatplotlibFigure())],
+    )
+    _write_lock(
+        repo_path,
+        "test_stage",
+        [
+            {"key": "chart", "hash": "chart_hash", "tag": "plot"},
+            {"key": "table", "hash": "table_hash", "tag": "data"},
+        ],
+    )
+    commit("initial")
+
+    result = plots.get_plot_hashes_from_head()
+
+    assert result == {"plots/test_stage/chart.png": "chart_hash"}
 
 
 def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     git_repo: GitRepo,
     mock_discovery: PipelineLike,
-    mocker: MockerFixture,
 ) -> None:
     """Returns committed hash, not uncommitted changes."""
     repo_path, commit = git_repo
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-
-    plot_file = repo_path / "plot.png"
-    plot_file.write_bytes(b"data")
-
-    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
-
-    # Create and commit lock file with original hash
-    state_dir = repo_path / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-    lock_content = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [{"key": None, "hash": "original_hash", "tag": "plot", "display": "plot.png"}],
-    }
-    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
-
+    _register_plot_stage(mock_discovery, "test_stage")
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "original_hash", "tag": "plot"}])
     commit("initial")
-
-    # Update lock file but don't commit
-    updated_lock = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [{"key": None, "hash": "modified_hash", "tag": "plot", "display": "plot.png"}],
-    }
-    (stages_dir / "test_stage.lock").write_text(yaml.dump(updated_lock))
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "modified_hash", "tag": "plot"}])
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result["plot.png"] == "original_hash", "Should return committed hash, not modified"
+    assert result == {"plots/test_stage.png": "original_hash"}, (
+        "Should return committed hash, not modified"
+    )
 
 
 def test_get_plot_hashes_from_head_no_lock_in_head(
     git_repo: GitRepo,
     mock_discovery: PipelineLike,
-    mocker: MockerFixture,
 ) -> None:
     """Returns None for plots with no lock file in HEAD."""
     repo_path, commit = git_repo
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-
-    plot_file = repo_path / "plot.png"
-    plot_file.write_bytes(b"data")
-
-    # Create initial commit with something else
     (repo_path / "readme.txt").write_text("readme")
     commit("initial")
-
-    _register_plot_stage(mock_discovery, "test_stage", str(plot_file))
+    _register_plot_stage(mock_discovery, "test_stage")
 
     result = plots.get_plot_hashes_from_head()
 
-    assert "plot.png" in result
-    assert result["plot.png"] is None
+    assert result == {"plots/test_stage.png": None}
 
 
 # =============================================================================
@@ -611,13 +419,7 @@ def test_render_plots_html_creates_file(tmp_path: Path) -> None:
     plot_file = tmp_path / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
-    plot_info = plots.PlotInfo(
-        path=str(plot_file),
-        stage_name="test_stage",
-        x=None,
-        y=None,
-        template=None,
-    )
+    plot_info = plots.PlotInfo(path=str(plot_file), stage_name="test_stage")
     output_path = tmp_path / "output" / "index.html"
 
     result = plots.render_plots_html([plot_info], output_path)
@@ -641,13 +443,7 @@ def test_render_plots_html_empty_list(tmp_path: Path) -> None:
 
 def test_render_plots_html_skips_missing_files(tmp_path: Path) -> None:
     """Skips plots whose files don't exist."""
-    plot_info = plots.PlotInfo(
-        path=str(tmp_path / "nonexistent.png"),
-        stage_name="test_stage",
-        x=None,
-        y=None,
-        template=None,
-    )
+    plot_info = plots.PlotInfo(path=str(tmp_path / "nonexistent.png"), stage_name="test_stage")
     output_path = tmp_path / "index.html"
 
     result = plots.render_plots_html([plot_info], output_path)
@@ -661,13 +457,7 @@ def test_render_plots_html_creates_parent_dirs(tmp_path: Path) -> None:
     plot_file = tmp_path / "plot.png"
     plot_file.write_bytes(b"data")
 
-    plot_info = plots.PlotInfo(
-        path=str(plot_file),
-        stage_name="test",
-        x=None,
-        y=None,
-        template=None,
-    )
+    plot_info = plots.PlotInfo(path=str(plot_file), stage_name="test")
     output_path = tmp_path / "deep" / "nested" / "index.html"
 
     result = plots.render_plots_html([plot_info], output_path)
@@ -681,13 +471,7 @@ def test_render_plots_html_escapes_xss(tmp_path: Path) -> None:
     plot_file = tmp_path / "plot.png"
     plot_file.write_bytes(b"data")
 
-    plot_info = plots.PlotInfo(
-        path=str(plot_file),
-        stage_name="<script>alert('xss')</script>",
-        x=None,
-        y=None,
-        template=None,
-    )
+    plot_info = plots.PlotInfo(path=str(plot_file), stage_name="<script>alert('xss')</script>")
     output_path = tmp_path / "index.html"
 
     result = plots.render_plots_html([plot_info], output_path)
@@ -695,146 +479,3 @@ def test_render_plots_html_escapes_xss(tmp_path: Path) -> None:
     content = result.read_text()
     assert "<script>" not in content, "Script tags should be escaped"
     assert "&lt;script&gt;" in content, "HTML entities should be used"
-
-
-# =============================================================================
-# get_output_hashes_from_revision Tests
-# =============================================================================
-
-
-def test_get_output_hashes_from_revision_no_git_repo(set_project_root: Path) -> None:
-    """Returns empty dict when not in a git repo."""
-    result = plots.get_output_hashes_from_revision("HEAD")
-
-    assert result == {}
-
-
-def test_get_output_hashes_from_revision_returns_hashes(set_project_root: Path) -> None:
-    """Returns output hashes from lock files at revision."""
-    init_git_repo(set_project_root)
-
-    # Create and commit lock file with hash
-    state_dir = set_project_root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-    lock_content = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [{"key": None, "hash": "abc123", "tag": "plot", "display": "output.csv"}],
-    }
-    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
-
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
-
-    result = plots.get_output_hashes_from_revision("HEAD")
-
-    assert result == {"output.csv": "abc123"}
-
-
-def test_get_output_hashes_from_revision_multiple_stages(set_project_root: Path) -> None:
-    """Returns hashes from multiple stages."""
-    init_git_repo(set_project_root)
-
-    state_dir = set_project_root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create lock files for two stages
-    lock_content_stage1 = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [{"key": None, "hash": "hash1", "tag": "plot", "display": "plots/chart1.png"}],
-    }
-    lock_content_stage2 = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [{"key": None, "hash": "hash2", "tag": "plot", "display": "plots/chart2.png"}],
-    }
-    (stages_dir / "stage1.lock").write_text(yaml.dump(lock_content_stage1))
-    (stages_dir / "stage2.lock").write_text(yaml.dump(lock_content_stage2))
-
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
-
-    result = plots.get_output_hashes_from_revision("HEAD")
-
-    assert result == {"plots/chart1.png": "hash1", "plots/chart2.png": "hash2"}
-
-
-def test_get_output_hashes_from_revision_normalizes_paths(set_project_root: Path) -> None:
-    """Normalizes paths (e.g., ./foo.csv -> foo.csv)."""
-    init_git_repo(set_project_root)
-
-    state_dir = set_project_root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-    lock_content = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [{"key": None, "hash": "abc123", "tag": "plot", "display": "output.csv"}],
-    }
-    (stages_dir / "test_stage.lock").write_text(yaml.dump(lock_content))
-
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
-
-    result = plots.get_output_hashes_from_revision("HEAD")
-
-    assert "output.csv" in result, "Path should be normalized"
-    assert "./output.csv" not in result
-
-
-def test_get_output_hashes_from_revision_invalid_revision(set_project_root: Path) -> None:
-    """Returns empty dict for invalid revision."""
-    init_git_repo(set_project_root)
-
-    (set_project_root / "readme.txt").write_text("content")
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
-
-    result = plots.get_output_hashes_from_revision("nonexistent-branch")
-
-    assert result == {}
-
-
-def test_get_output_hashes_from_revision_no_lock_files(set_project_root: Path) -> None:
-    """Returns empty dict when no lock files exist at revision."""
-    init_git_repo(set_project_root)
-
-    (set_project_root / "readme.txt").write_text("content")
-    subprocess.run(["git", "add", "."], cwd=set_project_root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=set_project_root,
-        check=True,
-        capture_output=True,
-    )
-
-    result = plots.get_output_hashes_from_revision("HEAD")
-
-    assert result == {}

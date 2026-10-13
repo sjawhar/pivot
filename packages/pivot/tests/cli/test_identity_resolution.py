@@ -56,8 +56,9 @@ def _make_stage_info(outs: list[types.ArtifactRef]) -> RegistryStageInfo:
         "name": "dummy",
         "deps": {},
         "outs": outs,
+        "incremental_inputs": {},
         "params": None,
-        "mutex": [],
+        "resources": {},
         "variant": None,
         "signature": None,
         "fingerprint": None,
@@ -65,6 +66,7 @@ def _make_stage_info(outs: list[types.ArtifactRef]) -> RegistryStageInfo:
         "state_dir": None,
         "collection_params": {},
         "no_fingerprint": False,
+        "code_deps": [],
     }
     return info
 
@@ -74,7 +76,8 @@ def test_resolve_cli_target_stage() -> None:
     ref = _helper_ref("train", None, types.ArtifactTag.DATA, loaders.CSV())
     all_stages = {"train": _make_stage_info([ref])}
 
-    result = cli_targets.resolve_cli_target("train", all_stages, lambda _: False)
+    result = cli_targets.resolve_cli_target("train", all_stages)
+    assert result is not None
 
     assert result["kind"] == "identity"
     assert result["stage_name"] == "train"
@@ -88,7 +91,8 @@ def test_resolve_cli_target_specific_key() -> None:
     ref_score = _helper_ref("train", "score", types.ArtifactTag.METRIC, loaders.JSON())
     all_stages = {"train": _make_stage_info([ref_model, ref_score])}
 
-    result = cli_targets.resolve_cli_target("train:model", all_stages, lambda _: False)
+    result = cli_targets.resolve_cli_target("train:model", all_stages)
+    assert result is not None
 
     assert result["kind"] == "identity"
     assert result["stage_name"] == "train"
@@ -96,20 +100,21 @@ def test_resolve_cli_target_specific_key() -> None:
     assert result["refs"] == [ref_model]
 
 
-def test_resolve_cli_target_pvt() -> None:
-    """File path with .pvt sidecar resolves to PvtTarget."""
-    result = cli_targets.resolve_cli_target(
-        "data/external/raw.csv", {}, lambda path: path == "data/external/raw.csv"
-    )
+def test_resolve_cli_target_bare_name_resolves_to_qualified_stage() -> None:
+    """A bare stage name resolves to the unique pipeline-qualified stage."""
+    ref = _helper_ref("eval/train", None, types.ArtifactTag.DATA, loaders.CSV())
+    all_stages = {"eval/train": _make_stage_info([ref])}
 
-    assert result["kind"] == "pvt"
-    assert result["path"] == "data/external/raw.csv"
+    result = cli_targets.resolve_cli_target("train", all_stages)
+
+    assert result is not None
+    assert result["stage_name"] == "eval/train"
+    assert result["identity"] == types.ArtifactIdentity("eval/train", None)
 
 
-def test_resolve_cli_target_unknown_raises() -> None:
-    """Unknown target raises TargetValidationError."""
-    with pytest.raises(cli_targets.TargetValidationError, match="not_a_stage"):
-        cli_targets.resolve_cli_target("not_a_stage", {}, lambda _: False)
+def test_resolve_cli_target_non_stage_returns_none() -> None:
+    """A target naming no registered stage is left to the caller as a file path."""
+    assert cli_targets.resolve_cli_target("data/external/raw.csv", {}) is None
 
 
 def test_resolve_cli_target_stage_with_bad_key_raises() -> None:
@@ -118,7 +123,7 @@ def test_resolve_cli_target_stage_with_bad_key_raises() -> None:
     all_stages = {"train": _make_stage_info([ref])}
 
     with pytest.raises(cli_targets.TargetValidationError, match="no_such_key"):
-        cli_targets.resolve_cli_target("train:no_such_key", all_stages, lambda _: False)
+        cli_targets.resolve_cli_target("train:no_such_key", all_stages)
 
 
 # ---------------------------------------------------------------------------

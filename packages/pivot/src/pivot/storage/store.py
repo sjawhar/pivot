@@ -12,7 +12,7 @@ from pivot.storage import cache
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterable
 
 
 @runtime_checkable
@@ -23,7 +23,9 @@ class Store(Protocol):
 
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str: ...
 
-    def hash_artifact(self, ref: types.ArtifactRef) -> types.HashInfo: ...
+    def hash_artifact(
+        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+    ) -> types.HashInfo: ...
 
     def exists(self, ref: types.ArtifactRef) -> bool: ...
 
@@ -99,10 +101,19 @@ class CacheStore:
         ref_path.symlink_to(cache_path.resolve())
         return output_hash["hash"]
 
-    def hash_artifact(self, ref: types.ArtifactRef) -> types.HashInfo:
+    def hash_artifact(
+        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+    ) -> types.HashInfo:
         ref_path = self._ref_path(ref)
         if not ref_path.exists() and not ref_path.is_symlink():
             raise FileNotFoundError(ref_path)
+
+        if state_db is not None:
+            if ref_path.is_dir():
+                tree_hash, manifest = cache.hash_directory(ref_path, state_db)
+                return types.DirHash(hash=tree_hash, manifest=manifest)
+            file_hash, _ = cache.hash_file(ref_path, state_db)
+            return types.FileHash(hash=file_hash)
 
         with self._state_db() as db:
             if ref_path.is_dir():
@@ -221,7 +232,7 @@ class WorkspaceStore:
 
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str:
         self._output_producers.add(ref.identity.producer)
-        if ref.tag == types.ArtifactTag.DIRECTORY:
+        if path.is_dir():
             tree_hash, _ = cache.hash_directory(path, None)
             return tree_hash
         file_hash, _ = cache.hash_file(path, None)
@@ -259,13 +270,26 @@ class WorkspaceStore:
             state_dir=state_dir,
         )
 
-    def hash_artifact(self, ref: types.ArtifactRef) -> types.HashInfo:
+    def hash_artifact(
+        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+    ) -> types.HashInfo:
         path = self._resolve_path(ref)
-        if ref.tag == types.ArtifactTag.DIRECTORY:
-            tree_hash, manifest = cache.hash_directory(path, None)
+        if ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir():
+            tree_hash, manifest = cache.hash_directory(path, state_db)
             return types.DirHash(hash=tree_hash, manifest=manifest)
-        file_hash, _ = cache.hash_file(path, None)
+        file_hash, _ = cache.hash_file(path, state_db)
         return types.FileHash(hash=file_hash)
+
+    def cache_contains(self, ref: types.ArtifactRef, output_hash: types.HashInfo) -> bool:
+        """Return whether this output can be restored from the local cache."""
+        if self._cache_dir is None or ref.tag is types.ArtifactTag.METRIC:
+            return False
+        if types.is_dir_hash(output_hash):
+            return all(
+                cache.get_cache_path(self._cache_dir, entry["hash"]).exists()
+                for entry in output_hash["manifest"]
+            )
+        return cache.get_cache_path(self._cache_dir, output_hash["hash"]).exists()
 
     def resolve_display_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         """Resolve the workspace path for an artifact, for display/CLI use.
@@ -276,6 +300,19 @@ class WorkspaceStore:
         CLI commands.
         """
         return self._resolve_output_path(ref)
+
+    def output_identities_by_path(
+        self, outs: Iterable[types.ArtifactRef]
+    ) -> dict[str, types.ArtifactIdentity]:
+        """Map each output's workspace path (relative to the project root) to its identity.
+
+        The inverse of ``resolve_display_path`` over stage outputs, for resolving a
+        user-typed file path to the artifact it belongs to.
+        """
+        return {
+            str(self.resolve_display_path(out).relative_to(self._project_root)): out.identity
+            for out in outs
+        }
 
     def exists(self, ref: types.ArtifactRef) -> bool:
         path = self._resolve_path(ref)

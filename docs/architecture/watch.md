@@ -13,8 +13,8 @@ pivot repro --watch
 The Engine monitors:
 
 - **Stage function code** - Python files (`.py`) defining stages
-- **Input data files** - Files declared as `deps`
-- **Configuration files** - `pivot.yaml`, `pivot.yml`, `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore`
+- **Input data files** - Files declared with `pipeline.input()`
+- **Configuration files** - `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore` (`engine/sources.py` `_CONFIG_FILE_NAMES`)
 
 When changes are detected, only affected stages and their downstream dependencies re-run.
 
@@ -72,7 +72,7 @@ When a dependency file changes:
 
 ### Code or Config Changes
 
-When Python files or `pivot.yaml` change:
+When Python files or `pipeline.py` change:
 
 1. FilesystemSource emits `CodeOrConfigChanged(paths=[...])`
 2. Engine invalidates caches and reloads registry

@@ -5,7 +5,7 @@ import inspect
 import pathlib
 from typing import TYPE_CHECKING, Any, cast
 
-from pivot import loaders, outputs, project, types
+from pivot import loaders, project, types
 from pivot.cli import completion
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -42,8 +42,9 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         name=name,
         deps={},
         outs=outs,
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
@@ -51,6 +52,7 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
@@ -106,7 +108,7 @@ def test_resolve_output_paths_uses_store_display_path(
     )
 
     resolved, missing = cli_targets.resolve_output_paths(
-        ["train"], mock_discovery.root, outputs.Metric
+        ["train"], mock_discovery.root, types.ArtifactTag.METRIC
     )
 
     assert missing == []
@@ -173,16 +175,16 @@ def test_resolve_targets_to_stages_stage_name_only(
     assert unresolved == []
 
 
-def test_resolve_output_paths_metric_excluded(
+def test_resolve_output_paths_excludes_outputs_with_other_tags(
     mock_discovery: PipelineLike,
 ) -> None:
-    """Metric outputs should not be included in resolved paths."""
+    """Only outputs carrying the requested tag resolve; a metric output is not a plot."""
     metric_ref = _helper_ref("eval", "score", types.ArtifactTag.METRIC, loaders.JSON(), dict)
     _register_stage(mock_discovery, "eval", [metric_ref])
 
     resolved, missing = cli_targets.resolve_output_paths(
-        ["eval"], mock_discovery.root, outputs.Metric
+        ["eval"], mock_discovery.root, types.ArtifactTag.PLOT
     )
 
-    # Metrics should be found since we're looking for Metric type
-    assert len(resolved) >= 0
+    assert resolved == set()
+    assert missing == []

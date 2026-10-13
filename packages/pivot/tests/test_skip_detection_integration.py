@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from pivot import executor, loaders, stage_def
 from pivot.executor import worker
 from pivot.storage import cache, lock, state
+from pivot.storage import store as store_mod
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, identity_key
 
 if TYPE_CHECKING:
@@ -108,6 +109,7 @@ def _make_stage_info(
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
         "collection_params": {},
+        "incremental_inputs": {},
     }
 
 
@@ -488,3 +490,93 @@ def test_deferred_file_hash_writeback(
         assert cached.get(input_path) is not None, (
             "File hash should be in StateDB after deferred write-back"
         )
+
+
+def test_generation_skip_rejects_modified_producer_output(
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    tmp_path: pathlib.Path,
+) -> None:
+    """A consumer run alone must not generation-skip a modified stage output."""
+    (tmp_path / "input.txt").write_text("original")
+
+    def producer_func(_0: str) -> str:
+        return _0.upper()
+
+    def consumer_func(_0: str) -> str:
+        return f"Final: {_0}"
+
+    producer_out = _output_ref("producer")
+    producer_info = _make_stage_info(
+        producer_func,
+        tmp_path,
+        fingerprint={"self:producer": "fp-producer"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[producer_out],
+    )
+    consumer_info = _make_stage_info(
+        consumer_func,
+        tmp_path,
+        fingerprint={"self:consumer": "fp-consumer"},
+        deps={"_0": producer_out},
+        outs=[_output_ref("consumer")],
+    )
+
+    producer_result = executor.execute_stage("producer", producer_info, worker_env, output_queue)
+    assert producer_result["status"] == "ran"
+    _apply_deferred_writes("producer", producer_info, producer_result)
+
+    consumer_result = executor.execute_stage("consumer", consumer_info, worker_env, output_queue)
+    assert consumer_result["status"] == "ran"
+    _apply_deferred_writes("consumer", consumer_info, consumer_result)
+
+    workspace = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="test",
+        input_bindings={},
+    )
+    producer_path = workspace.resolve_display_path(producer_out)
+    producer_path.write_text("TAMPERED")
+
+    rerun = executor.execute_stage("consumer", consumer_info, worker_env, output_queue)
+
+    assert rerun["status"] == "ran", rerun
+    assert rerun["reason"] == "Input dependencies changed"
+
+
+def test_hash_skip_restores_modified_output(
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    tmp_path: pathlib.Path,
+) -> None:
+    """A lock-matching stage restores an output modified outside Pivot."""
+    (tmp_path / "input.txt").write_text("original")
+
+    def stage_func(_0: str) -> str:
+        return _0.upper()
+
+    output_ref = _output_ref("producer")
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:producer": "fp-producer"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[output_ref],
+    )
+
+    first = executor.execute_stage("producer", stage_info, worker_env, output_queue)
+    assert first["status"] == "ran"
+    _apply_deferred_writes("producer", stage_info, first)
+
+    workspace = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="test",
+        input_bindings={},
+    )
+    output_path = workspace.resolve_display_path(output_ref)
+    output_path.write_text("TAMPERED")
+
+    restored = executor.execute_stage("producer", stage_info, worker_env, output_queue)
+
+    assert restored["status"] == "cached", restored
+    assert output_path.read_text() == "ORIGINAL"

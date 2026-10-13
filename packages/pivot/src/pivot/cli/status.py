@@ -57,7 +57,7 @@ def status(
     stages_list = cli_helpers.stages_to_list(stages)
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is not None:
-        cli_helpers.validate_stages_exist(stages_list)
+        stages_list = cli_helpers.resolve_stage_names(stages_list)
 
     project_root = project.get_project_root()
     resolved_cache_dir = config.get_cache_dir()
@@ -78,7 +78,7 @@ def status(
     if show_stages and pipeline is not None:
         all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)
-        orphaned_locks = status_mod.find_orphaned_lock_files(set(all_stages.keys()))
+        orphaned_locks = status_mod.find_orphaned_lock_files(all_stages)
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(

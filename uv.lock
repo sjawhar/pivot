@@ -1375,17 +1375,16 @@ wheels = [
 
 [[package]]
 name = "lmdb"
-version = "1.7.5"
+version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c7/a3/3756f2c6adba4a1413dba55e6c81a20b38a868656517308533e33cb59e1c/lmdb-1.7.5.tar.gz", hash = "sha256:f0604751762cb097059d5412444c4057b95f386c7ed958363cf63f453e5108da", size = 883490, upload-time = "2025-10-15T03:39:44.038Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1f/80/24a4064047b1c98ac73c0ad806f16bcd2d800c2eb460d6e6c2961034b8a1/lmdb-3.0.0.tar.gz", hash = "sha256:06dda0723545e14d56ac7dcd6f582d9922c2ed5e16f1c3f8d0e670a96ec2ee65", size = 1202795, upload-time = "2026-10-02T20:03:36.266Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/38/f8/03275084218eacdbdf7e185d693e1db4cb79c35d18fac47fa0d388522a0d/lmdb-1.7.5-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:66ae02fa6179e46bb69fe446b7e956afe8706ae17ec1d4cd9f7056e161019156", size = 101508, upload-time = "2025-10-15T03:39:07.228Z" },
-    { url = "https://files.pythonhosted.org/packages/20/b9/bc33ae2e4940359ba2fc412e6a755a2f126bc5062b4aaf35edd3a791f9a5/lmdb-1.7.5-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:bf65c573311ac8330c7908257f76b28ae3576020123400a81a6b650990dc028c", size = 100105, upload-time = "2025-10-15T03:39:08.491Z" },
-    { url = "https://files.pythonhosted.org/packages/fa/f6/22f84b776a64d3992f052ecb637c35f1764a39df4f2190ecc5a3a1295bd7/lmdb-1.7.5-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:97bcb3fc12841a8828db918e494fe0fd016a73d2680ad830d75719bb3bf4e76a", size = 301500, upload-time = "2025-10-15T03:39:09.463Z" },
-    { url = "https://files.pythonhosted.org/packages/2a/4d/8e6be8d7d5a30d47fa0ce4b55e3a8050ad689556e6e979d206b4ac67b733/lmdb-1.7.5-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:865f374f6206ab4aacb92ffb1dc612ee1a31a421db7c89733abe06b81ac87cb0", size = 302285, upload-time = "2025-10-15T03:39:10.856Z" },
-    { url = "https://files.pythonhosted.org/packages/5e/dc/7e04fb31a8f88951db81ac677e3ccb3e09248eda40e6ad52f74fd9370c32/lmdb-1.7.5-cp313-cp313-win_amd64.whl", hash = "sha256:82a04d5ca2a6a799c8db7f209354c48aebb49ff338530f5813721fc4c68e4450", size = 99447, upload-time = "2025-10-15T03:39:12.151Z" },
-    { url = "https://files.pythonhosted.org/packages/5b/50/e3f97efab17b3fad4afde99b3c957ecac4ffbefada6874a57ad0c695660a/lmdb-1.7.5-cp313-cp313-win_arm64.whl", hash = "sha256:0ad85a15acbfe8a42fdef92ee5e869610286d38507e976755f211be0fc905ca7", size = 94145, upload-time = "2025-10-15T03:39:13.461Z" },
-    { url = "https://files.pythonhosted.org/packages/bd/2c/982cb5afed533d0cb8038232b40c19b5b85a2d887dec74dfd39e8351ef4b/lmdb-1.7.5-py3-none-any.whl", hash = "sha256:fc344bb8bc0786c87c4ccb19b31f09a38c08bd159ada6f037d669426fea06f03", size = 148539, upload-time = "2025-10-15T03:39:42.982Z" },
+    { url = "https://files.pythonhosted.org/packages/11/6e/0c51d01d4c9d46f78ec28757ccfbfb6db206b07508258b12e7f7e6896ae9/lmdb-3.0.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:3e6c26010ddd5473d43e543beef3bd745f4bd5e8fdc7148de10d2b86603d0479", size = 198730, upload-time = "2026-10-02T20:03:11.153Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/9b/e0da84e94732dab610d2af82f485d98a7543c1efd1a6c33c42108d975abc/lmdb-3.0.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:f7545d6f78117419292eea27fb2b9f7551c840a29f7c4739924cebfe396e934b", size = 197242, upload-time = "2026-10-02T20:03:12.573Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/41/d6e0f509702d66cdcef8b27c51eb4b32d2c120636dace453fb46d3faa93e/lmdb-3.0.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5badcac838f9ce06601de42d02db7d9bed9276e2d99046074304d8eda72b7700", size = 567973, upload-time = "2026-10-02T20:03:13.939Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/dd/15cc6956f302beac546d2696aafa6cd4c1233a027a9e9dca37d041818352/lmdb-3.0.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:169bf3966a529beeb1b5fcaada312e6cf50a71e0f1548166da9f1c087695b588", size = 572084, upload-time = "2026-10-02T20:03:15.261Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/8b/a22909ceaa6c74db23a281540aa705749decafbbf23526c0f11f09f762eb/lmdb-3.0.0-cp313-cp313-win_amd64.whl", hash = "sha256:9d063bf15d94ae444fabc1bcf65e51452e96f14c3f21d0ec42163f41c56241a6", size = 188317, upload-time = "2026-10-02T20:03:16.541Z" },
+    { url = "https://files.pythonhosted.org/packages/70/75/d6172bc1a88834e34b823f33ef2bed28e86bb3a21e75913fd9f576f042b0/lmdb-3.0.0-cp313-cp313-win_arm64.whl", hash = "sha256:0979febf547d8a2fc10527caa247d2d470df61b475da5046f2586814f4226fe6", size = 187214, upload-time = "2026-10-02T20:03:17.751Z" },
 ]
 
 [[package]]
@@ -2051,6 +2050,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "anyio" },
     { name = "click" },
+    { name = "cloudpickle" },
     { name = "deepmerge" },
     { name = "dulwich" },
     { name = "filelock" },
@@ -2069,6 +2069,7 @@ dependencies = [
     { name = "tabulate" },
     { name = "tqdm" },
     { name = "watchfiles" },
+    { name = "wcwidth" },
     { name = "xxhash" },
 ]
 
@@ -2125,6 +2126,7 @@ requires-dist = [
     { name = "basedpyright", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "botocore-stubs", marker = "extra == 'dev'", specifier = ">=1.35.0" },
     { name = "click", specifier = ">=8.0" },
+    { name = "cloudpickle", specifier = ">=3.0" },
     { name = "deepmerge", specifier = ">=2.0" },
     { name = "dulwich", specifier = ">=0.22.0" },
     { name = "dvc", marker = "extra == 'dvc'", specifier = ">=3.0" },
@@ -2171,6 +2173,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.66" },
     { name = "types-aioboto3", extras = ["all"], marker = "extra == 'dev'", specifier = ">=13.0.0" },
     { name = "watchfiles", specifier = ">=1.0" },
+    { name = "wcwidth", specifier = ">=0.2.0" },
     { name = "xxhash", specifier = ">=3.0" },
 ]
 provides-extras = ["dvc", "matplotlib", "s3", "tui", "docs", "dev"]

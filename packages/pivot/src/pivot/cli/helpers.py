@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
 
-from pivot import exceptions, project
+from pivot import exceptions, names, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -77,6 +77,33 @@ def get_workspace_store() -> WorkspaceStore | None:
     )
 
 
+def require_workspace_store() -> WorkspaceStore:
+    """Get the WorkspaceStore for the Pipeline in context, raising NoPipelineError if none."""
+    store = get_workspace_store()
+    if store is None:
+        raise NoPipelineError()
+    return store
+
+
+def parse_resource_capacities(
+    _ctx: click.Context, _param: click.Parameter, values: tuple[str, ...]
+) -> dict[str, int]:
+    """Parse repeatable ``NAME=CAPACITY`` resource overrides for run commands."""
+    capacities = dict[str, int]()
+    for value in values:
+        name, separator, capacity_text = value.partition("=")
+        normalized_name = name.strip().casefold()
+        if not separator or not normalized_name or not capacity_text.isdecimal():
+            raise click.BadParameter("must use NAME=POSITIVE_INTEGER")
+        capacity = int(capacity_text)
+        if capacity <= 0:
+            raise click.BadParameter("capacity must be a positive integer")
+        if normalized_name in capacities:
+            raise click.BadParameter(f"resource {normalized_name!r} was supplied more than once")
+        capacities[normalized_name] = capacity
+    return capacities
+
+
 def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any
     """Handle non-standard JSON types in JSONL output."""
     if isinstance(obj, enum.Enum):
@@ -111,14 +138,20 @@ def stages_to_list(stages: tuple[str, ...]) -> list[str] | None:
     return list(stages) if stages else None
 
 
-def validate_stages_exist(stages: list[str] | None) -> None:
-    """Validate that specified stages exist in the registry."""
+def resolve_stage_names(stages: list[str] | None) -> list[str] | None:
+    """Resolve bare or pipeline-qualified stage names to registered stage names.
+
+    Raises StageNotFoundError naming every target that matches no registered stage.
+    """
     if not stages:
-        return
-    registered = set(list_stages())
-    unknown = [s for s in stages if s not in registered]
+        return stages
+    registered = list_stages()
+    known = dict.fromkeys(registered)
+    resolved = [names.resolve_stage_name(stage, known) for stage in stages]
+    unknown = [stage for stage, name in zip(stages, resolved, strict=True) if name not in known]
     if unknown:
-        raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
+        raise exceptions.StageNotFoundError(unknown, available_stages=registered)
+    return resolved
 
 
 class TransferProgress:

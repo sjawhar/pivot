@@ -12,6 +12,7 @@ from pivot import config, project, registry, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.cli import targets as cli_targets
 from pivot.storage import cache, lock, track
 from pivot.types import HashInfo, is_dir_hash
 
@@ -196,14 +197,18 @@ async def _checkout_files_async(
     return (failures, restored, skipped)
 
 
+def _all_stages_in_context() -> dict[str, registry.RegistryStageInfo]:
+    pipeline = cli_decorators.get_pipeline_from_context()
+    return {} if pipeline is None else cli_helpers.get_all_stages()
+
+
 def _dedupe_targets(targets: tuple[str, ...]) -> list[str]:
-    """Deduplicate targets by normalized absolute path.
+    """Deduplicate targets: stage outputs by resolved identity, files by normalized path.
 
     Handles both data paths (data.txt) and .pvt paths (data.txt.pvt) resolving
     to the same file.
     """
-    pipeline = cli_decorators.get_pipeline_from_context()
-    stage_names: set[str] = set(cli_helpers.list_stages()) if pipeline is not None else set()
+    all_stages = _all_stages_in_context()
     seen = set[str]()
     unique = list[str]()
     for target in targets:
@@ -212,17 +217,13 @@ def _dedupe_targets(targets: tuple[str, ...]) -> list[str]:
         if target_path.suffix == ".pvt":
             target = str(track.get_data_path(target_path))
 
-        identity = types.identity_from_key(target)
-        if identity.producer in stage_names:
-            identity_key = types.identity_key(identity)
-            if identity_key not in seen:
-                seen.add(identity_key)
-                unique.append(target)
-            continue
-
-        abs_path = str(project.normalize_path(target))
-        if abs_path not in seen:
-            seen.add(abs_path)
+        resolved = cli_targets.resolve_cli_target(target, all_stages)
+        if resolved is not None:
+            dedupe_key = types.identity_key(resolved["identity"])
+        else:
+            dedupe_key = str(project.normalize_path(target))
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
             unique.append(target)
     return unique
 
@@ -240,43 +241,26 @@ def _validate_and_build_files(
         click.ClickException: For path traversal or unknown targets.
     """
     files = dict[str, HashInfo]()
-    store = cli_helpers.get_workspace_store()
-    identity_outputs: dict[types.ArtifactIdentity, tuple[str, HashInfo]] = {}
-    stage_output_groups: dict[str, list[tuple[str, HashInfo]]] = {}
-    stage_names: set[str] = set()
-    if store is not None:
-        stage_names = set(cli_helpers.list_stages())
-        for stage_name in stage_names:
-            stage_info = cli_helpers.get_stage(stage_name)
-            for ref in stage_info["outs"]:
-                if ref.tag is types.ArtifactTag.METRIC:
-                    continue
-                resolved_path = str(store.resolve_display_path(ref))
-                if resolved_path not in stage_outputs:
-                    continue
-                output_hash = stage_outputs[resolved_path]
-                identity_outputs[ref.identity] = (resolved_path, output_hash)
-                stage_output_groups.setdefault(ref.identity.producer, []).append(
-                    (resolved_path, output_hash)
-                )
+    all_stages = _all_stages_in_context()
 
     for target in targets:
-        identity = types.identity_from_key(target)
-        if identity in identity_outputs:
-            resolved_path, output_hash = identity_outputs[identity]
-            files[resolved_path] = output_hash
+        resolved = cli_targets.resolve_cli_target(target, all_stages)
+        if resolved is not None:
+            store = cli_helpers.require_workspace_store()
+            cached = {
+                path: stage_outputs[path]
+                for ref in resolved["refs"]
+                if ref.tag is not types.ArtifactTag.METRIC
+                and (path := str(store.resolve_display_path(ref))) in stage_outputs
+            }
+            if not cached:
+                stage_name = resolved["stage_name"]
+                raise click.ClickException(
+                    f"Stage '{stage_name}' has no cached outputs. "
+                    + f"Run 'pivot repro {stage_name}' first."
+                )
+            files.update(cached)
             continue
-        if identity.key is None and identity.producer in stage_output_groups:
-            for resolved_path, output_hash in stage_output_groups[identity.producer]:
-                files[resolved_path] = output_hash
-            continue
-
-        # Stage identity key with no cached outputs — give a helpful error
-        if identity.producer in stage_names:
-            raise click.ClickException(
-                f"Stage '{identity.producer}' has no cached outputs. "
-                + f"Run 'pivot repro {identity.producer}' first."
-            )
 
         # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
         abs_path = project.normalize_path(target)

@@ -1,6 +1,6 @@
 # pyright: reportMissingImports=false
+from dataclasses import dataclass, field
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 
@@ -8,8 +8,8 @@ from pivot import loaders
 from pivot.engine import graph as engine_graph
 from pivot.exceptions import CyclicGraphError
 from pivot.registry import RegistryStageInfo
-from pivot.storage.store import Store
-from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
+from pivot.storage import state as state_mod
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, HashInfo
 
 
 def _artifact_ref(identity: ArtifactIdentity) -> ArtifactRef:
@@ -36,8 +36,9 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         name=name,
         deps={f"_{i}": _artifact_ref(dep) for i, dep in enumerate(dep_identities)},
         outs=[_artifact_ref(out) for out in out_identities],
+        incremental_inputs={},
         params=None,
-        mutex=list[str](),
+        resources={},
         variant=None,
         signature=None,
         fingerprint=dict[str, str](),
@@ -45,7 +46,39 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
+
+
+@dataclass
+class _DependencyStore:
+    """Minimal Store fake for dependency-source validation."""
+
+    exists_value: bool
+    checkout_path: Path | None
+    exists_calls: list[ArtifactRef] = field(default_factory=list)
+
+    def exists(self, ref: ArtifactRef) -> bool:
+        self.exists_calls.append(ref)
+        return self.exists_value
+
+    def checkout(self, ref: ArtifactRef) -> Path:
+        if self.checkout_path is None:
+            raise FileNotFoundError(ref)
+        return self.checkout_path
+
+    def prepare_output(self, ref: ArtifactRef) -> Path:
+        raise AssertionError(f"not used by dependency validation: {ref}")
+
+    def commit(self, ref: ArtifactRef, path: Path) -> str:
+        raise AssertionError(f"not used by dependency validation: {ref} {path}")
+
+    def hash_artifact(
+        self,
+        ref: ArtifactRef,
+        state_db: state_mod.StateDB | None = None,
+    ) -> HashInfo:
+        raise AssertionError(f"not used by dependency validation: {ref} {state_db}")
 
 
 # --- Basic DAG construction tests ---
@@ -187,8 +220,9 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             name="producer",
             deps={},
             outs=[_artifact_ref(producer_out)],
+            incremental_inputs={},
             params=None,
-            mutex=list[str](),
+            resources={},
             variant=None,
             signature=None,
             fingerprint=dict[str, str](),
@@ -196,14 +230,16 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             state_dir=None,
             collection_params={},
             no_fingerprint=False,
+            code_deps=[],
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
             name="consumer",
             deps={"_0": _artifact_ref(missing_dep)},
             outs=[_artifact_ref(ArtifactIdentity("consumer", "output.csv"))],
+            incremental_inputs={},
             params=None,
-            mutex=list[str](),
+            resources={},
             variant=None,
             signature=None,
             fingerprint=dict[str, str](),
@@ -211,6 +247,7 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             state_dir=None,
             collection_params={},
             no_fingerprint=False,
+            code_deps=[],
         ),
     }
 
@@ -242,8 +279,9 @@ def test_validate_dependency_sources_uses_store() -> None:
             name="consumer",
             deps={"_0": external_dep},
             outs=[_artifact_ref(ArtifactIdentity("output.csv", None))],
+            incremental_inputs={},
             params=None,
-            mutex=list[str](),
+            resources={},
             variant=None,
             signature=None,
             fingerprint=dict[str, str](),
@@ -251,17 +289,16 @@ def test_validate_dependency_sources_uses_store() -> None:
             state_dir=None,
             collection_params={},
             no_fingerprint=False,
+            code_deps=[],
         ),
     }
 
-    store = Mock(spec=Store)
-    store.exists.return_value = True
+    store = _DependencyStore(exists_value=True, checkout_path=Path("input.sql"))
     errors = engine_graph.validate_dependency_sources(stages, store=store)
     assert not errors
-    store.exists.assert_called_once_with(external_dep)
+    assert store.exists_calls == [external_dep]
 
-    store = Mock(spec=Store)
-    store.exists.return_value = False
+    store = _DependencyStore(exists_value=False, checkout_path=Path("missing/input.sql"))
     errors = engine_graph.validate_dependency_sources(stages, store=store)
     assert len(errors) == 1
 
@@ -274,8 +311,9 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             name="consumer",
             deps={"_0": external_dep},
             outs=[_artifact_ref(ArtifactIdentity("consumer", "output.csv"))],
+            incremental_inputs={},
             params=None,
-            mutex=list[str](),
+            resources={},
             variant=None,
             signature=None,
             fingerprint=dict[str, str](),
@@ -283,6 +321,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             state_dir=None,
             collection_params={},
             no_fingerprint=False,
+            code_deps=[],
         ),
     }
 
@@ -294,8 +333,9 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             name="producer",
             deps={},
             outs=[_artifact_ref(ArtifactIdentity("producer", "output.csv"))],
+            incremental_inputs={},
             params=None,
-            mutex=list[str](),
+            resources={},
             variant=None,
             signature=None,
             fingerprint=dict[str, str](),
@@ -303,14 +343,16 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             state_dir=None,
             collection_params={},
             no_fingerprint=False,
+            code_deps=[],
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
             name="consumer",
             deps={"_0": _artifact_ref(ArtifactIdentity("producer", "missing.csv"))},
             outs=[_artifact_ref(ArtifactIdentity("consumer", "output.csv"))],
+            incremental_inputs={},
             params=None,
-            mutex=list[str](),
+            resources={},
             variant=None,
             signature=None,
             fingerprint=dict[str, str](),
@@ -318,6 +360,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             state_dir=None,
             collection_params={},
             no_fingerprint=False,
+            code_deps=[],
         ),
     }
 

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 import flatten_dict
 import yaml
 
-from pivot import config, git, outputs, project, types, yaml_config
+from pivot import config, git, project, types, yaml_config
 from pivot.show import common
 from pivot.types import ChangeType, MetricData, MetricValue, OutputFormat
 
@@ -21,44 +21,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _METRIC_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".csv"})
-
-
-def _metric_read_path(
-    out: types.ArtifactRef | outputs.BaseOut,
-    project_root: pathlib.Path,
-) -> tuple[str, pathlib.Path] | None:
-    if isinstance(out, types.ArtifactRef):
-        if out.tag is not types.ArtifactTag.METRIC:
-            return None
-        path_key = types.identity_key(out.identity)
-        # Resolve identity to actual workspace path via WorkspaceStore
-        from pivot.cli import helpers as cli_helpers
-
-        store = cli_helpers.get_workspace_store()
-        if store is not None:
-            path = store.resolve_display_path(out)
-            return path_key, path
-        # Fallback: use project_root / path_key (may not exist)
-        path = project_root / path_key
-        return path_key, path
-    if isinstance(out, outputs.Metric):
-        path = pathlib.Path(str(out.path))
-        return str(path), path
-    return None
-
-
-def _metric_lock_key(
-    out: types.ArtifactRef | outputs.BaseOut,
-    project_root: pathlib.Path,
-) -> str | None:
-    if isinstance(out, types.ArtifactRef):
-        if out.tag is not types.ArtifactTag.METRIC:
-            return None
-        return types.identity_key(out.identity)
-    if isinstance(out, outputs.Metric):
-        abs_path = str(project.normalize_path(str(out.path)))
-        return project.to_relative_path(abs_path, project_root)
-    return None
 
 
 class MetricDiff(TypedDict):
@@ -153,30 +115,43 @@ def _flatten_dict(data: dict[str, object]) -> MetricData:
     return cast("MetricData", flatten_dict.flatten(data, reducer="dot"))
 
 
-def collect_metrics_from_stages() -> dict[str, dict[str, MetricData]]:
-    """Collect metrics by parsing Metric output files from disk.
+def _metric_outs_by_stage() -> dict[str, list[types.ArtifactRef]]:
+    from pivot.cli import helpers as cli_helpers
 
-    Returns {stage_name: {path: {key: value}}}
+    outs_by_stage = dict[str, list[types.ArtifactRef]]()
+    for stage_name in cli_helpers.list_stages():
+        metric_outs = [
+            out
+            for out in cli_helpers.get_stage(stage_name)["outs"]
+            if out.tag is types.ArtifactTag.METRIC
+        ]
+        if metric_outs:
+            outs_by_stage[stage_name] = metric_outs
+    return outs_by_stage
+
+
+def collect_metrics_from_stages() -> dict[str, dict[str, MetricData]]:
+    """Collect metrics by parsing metric output files from disk.
+
+    Returns {stage_name: {path: {key: value}}}, paths relative to the project root.
     """
     from pivot.cli import helpers as cli_helpers
 
-    result = dict[str, dict[str, MetricData]]()
+    store = cli_helpers.require_workspace_store()
     project_root = project.get_project_root()
-    for stage_name in cli_helpers.list_stages():
-        stage_info = cli_helpers.get_stage(stage_name)
+    result = dict[str, dict[str, MetricData]]()
+    for stage_name, metric_outs in _metric_outs_by_stage().items():
         stage_metrics = dict[str, MetricData]()
-        for out in stage_info["outs"]:
-            info = _metric_read_path(out, project_root)
-            if info is None:
-                continue
-            path_key, path = info
+        for out in metric_outs:
+            path = store.resolve_display_path(out)
+            rel_path = project.to_relative_path(path, project_root)
             if not path.exists():
-                logger.warning(f"Metric file not found: {path_key} (stage: {stage_name})")
+                logger.warning(f"Metric file not found: {rel_path} (stage: {stage_name})")
                 continue
             try:
-                stage_metrics[path_key] = parse_metric_file(path)
+                stage_metrics[rel_path] = parse_metric_file(path)
             except MetricsError as e:
-                logger.warning(f"Failed to parse metrics from {path_key}: {e}")
+                logger.warning(f"Failed to parse metrics from {rel_path}: {e}")
         if stage_metrics:
             result[stage_name] = stage_metrics
     return result
@@ -323,44 +298,12 @@ def _parse_csv_content(content: str) -> MetricData:
 
 
 def get_metric_info_from_head() -> dict[str, str | None]:
-    """Read metric file hashes from lock files at git HEAD.
-
-    Returns paths relative to project root mapping to hashes (or None if no hash).
-    Returns empty dict if not in a git repo or no HEAD commit exists.
-    """
+    """Map each metric output's workspace path to its hash in the lock files at git HEAD."""
     from pivot.cli import helpers as cli_helpers
 
-    result = dict[str, str | None]()
-    proj_root = project.get_project_root()
-
-    # Collect lock file paths and metric paths per stage
-    stage_metric_paths = dict[str, list[str]]()  # stage_name -> [rel_metric_paths]
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        for out in info["outs"]:
-            rel_path = _metric_lock_key(out, proj_root)
-            if rel_path is None:
-                continue
-            stage_metric_paths.setdefault(stage_name, []).append(rel_path)
-            result[rel_path] = None
-
-    # Read all lock files from HEAD in one batch
-    lock_data_map = common.read_lock_files_from_head(list(stage_metric_paths.keys()))
-
-    # Parse lock files and extract metric hashes
-    for stage_name, metric_paths in stage_metric_paths.items():
-        lock_data = lock_data_map.get(stage_name)
-        if lock_data is None:
-            continue
-
-        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
-
-        # Match our metric paths against storage paths
-        for metric_rel_path in metric_paths:
-            if metric_rel_path in path_to_hash:
-                result[metric_rel_path] = path_to_hash[metric_rel_path]
-
-    return result
+    return common.output_hashes_from_head(
+        _metric_outs_by_stage(), cli_helpers.require_workspace_store()
+    )
 
 
 def collect_metrics_from_head(

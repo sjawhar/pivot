@@ -322,9 +322,7 @@ def verify(
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    # Validate stages exist
-    stages_list = cli_helpers.stages_to_list(stages)
-    cli_helpers.validate_stages_exist(stages_list)
+    stages_list = cli_helpers.resolve_stage_names(cli_helpers.stages_to_list(stages))
 
     # Check if any stages are registered
     all_stages = cli_helpers.get_all_stages()

@@ -137,14 +137,6 @@ def parse_stage_name(name: str) -> tuple[str, str]:
     return (name, "")
 
 
-class StageDisplayStatus(enum.StrEnum):
-    """Display status for stage progress output."""
-
-    FINGERPRINTING = "fingerprinting"
-    RUNNING = "running"
-    WAITING = "waiting"
-
-
 class OnError(enum.StrEnum):
     """Error handling mode."""
 
@@ -175,7 +167,6 @@ class StageResult(TypedDict):
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
-    accessed_dep_keys: NotRequired[dict[str, set[str]]]
 
 
 # =============================================================================
@@ -290,6 +281,7 @@ class ArtifactTag(enum.StrEnum):
     METRIC = "metric"
     PLOT = "plot"
     DIRECTORY = "directory"
+    INCREMENTAL = "incremental"
 
 
 @dataclasses.dataclass(eq=False)
@@ -336,8 +328,6 @@ class DepEntry(TypedDict):
     key: str | None
     hash: str
     display: NotRequired[str]
-    accessed_keys: NotRequired[list[str]]
-    accessed_hashes: NotRequired[dict[str, str]]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -466,6 +456,7 @@ class ChangeDecision(TypedDict, total=False):
     changed: Required[bool]
     reason: Required[str]
     code_changes: list[CodeChange]
+    run_cache_allowed: Required[bool]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
 
@@ -716,19 +707,6 @@ class TuiReloadMessage(TypedDict):
     stages_added: list[str]
     stages_removed: list[str]
     stages_modified: list[str]
-
-
-TuiMessage = TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage | None
-
-
-def is_tui_status_message(msg: TuiMessage) -> TypeGuard[TuiStatusMessage]:
-    """TypeGuard to narrow TuiMessage to TuiStatusMessage."""
-    return msg is not None and msg["type"] == TuiMessageType.STATUS
-
-
-def is_tui_log_message(msg: TuiMessage) -> TypeGuard[TuiLogMessage]:
-    """TypeGuard to narrow TuiMessage to TuiLogMessage."""
-    return msg is not None and msg["type"] == TuiMessageType.LOG
 
 
 # =============================================================================

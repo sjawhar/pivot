@@ -4,11 +4,17 @@ This directory contains all tests for Pivot's automatic code change detection (f
 
 ## Test Files
 
-> **Status:** Test files were removed during the compositional API rewrite.
-> Tests need to be rebuilt. The change detection matrix below documents the
-> expected behaviors that tests should cover.
+- **`test_fingerprint.py`** - Unit tests for fingerprinting functions
+- **`test_integration.py`** - End-to-end tests with real Python files on disk
+- **`test_change_detection.py`** - Comprehensive change detection behavior tests
+- **`test_pydantic_defaults.py`** - Tests for Pydantic default data tracking
+- **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
+- **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
+- **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
+- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (data class methods, dynamic name access)
+- **`test_no_fingerprint.py`** - Worker skip/re-run behavior for `@no_fingerprint()` stages (file-level hashing)
 
-See `tests/test_compose.py` for loader fingerprint collision tests.
+Loader fingerprint collision tests live in `tests/test_compose.py`.
 
 ---
 
@@ -98,7 +104,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Module constant captured            | ✅        | `test_change_detection.py::test_module_constant_captured_via_module_attr`               |
 | Module primitive collection         | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
 | Nested attribute (`X.sub.func`)     | ⚠️        | `test_fingerprint.py::test_extract_nested_attr_access` (extracted but not fully tested) |
-| Multiple attrs from same module     | ✅        | `test_fingerprint.py::test_multiple_module_attrs_detected`                              |
+| Multiple attrs from same module     | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
 | Both import styles in same stage    | ✅        | `test_integration.py::test_both_import_styles_in_same_stage`                            |
 
 ---
@@ -127,8 +133,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                                | Detected? | Test Reference                                                            |
 | ------------------------------------------ | --------- | ------------------------------------------------------------------------- |
-| Stdlib function (e.g., `json.dumps`)       | 🚫        | `test_integration.py::test_stdlib_marked_callable_not_hashed`             |
-| Stdlib via module attr                     | 🚫        | `test_change_detection.py::test_stdlib_function_marked_callable`          |
+| Stdlib function (e.g., `json.dumps`)       | 🚫        | `test_integration.py::test_stdlib_module_attrs_not_tracked`               |
+| Stdlib via module attr                     | 🚫        | `test_change_detection.py::test_stdlib_module_attrs_not_tracked`          |
 | Third-party function (e.g., `numpy.array`) | 🚫        | `test_fingerprint.py::test_is_user_code_non_user` (pytest.fixture tested) |
 | Third-party package version change         | ❌        | **NO TEST** - versions not tracked                                        |
 | Pivot framework code (`StageParams`, etc.) | 🚫        | `test_fingerprint.py::test_is_user_code_pivot_is_framework`               |
@@ -182,7 +188,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | User-defined generic origin (`MyGeneric[int]`) | ✅   | `test_fingerprint.py::test_user_defined_generic_origin_tracked`                 |
 | Dotted string forward ref in class body   | ✅        | `test_fingerprint.py::test_collect_annotation_names_dotted_string_forward_ref`  |
 | Module not in sys.modules                 | ✅        | `test_fingerprint.py::test_is_user_code_module_not_in_sys_modules`              |
-| Attribute doesn't exist on module         | ✅        | `test_fingerprint.py::test_module_attr_with_attribute_error`                    |
+| Attribute doesn't exist on module         | ✅        | **NO TEST** - recorded as `"unknown"` in the manifest                           |
 | Function with complex AST                 | ✅        | `test_fingerprint.py::test_hash_complex_ast`                                    |
 | AST syntax error fallback                 | ✅        | `test_fingerprint.py::test_hash_function_syntax_error_fallback`                 |
 | Child manifest merge (no duplicate self:) | ✅        | `test_fingerprint.py::test_fingerprint_merges_child_manifest`                   |
@@ -247,6 +253,8 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 | ---------------------------------------------- | --------- | ------------------------------------------------------------------------------- |
 | Stage source file content change               | ✅        | `test_no_fingerprint.py::test_no_fingerprint_reruns_on_source_file_change`      |
 | `code_deps` file content change                | ✅        | `test_no_fingerprint.py::test_no_fingerprint_reruns_on_code_deps_change`        |
+| `code_deps` via `Pipeline`, `@no_fingerprint` inside `@stage` | ✅ | `test_no_fingerprint.py::test_no_fingerprint_code_deps_tracked_through_pipeline[no_fingerprint-inside-stage]` |
+| `code_deps` via `Pipeline`, `@no_fingerprint` outside `@stage` | ❌ | `test_no_fingerprint.py::test_no_fingerprint_code_deps_tracked_through_pipeline[no_fingerprint-outside-stage]` (strict xfail, red test) |
 | Unrelated file change (no re-run)              | ✅        | `test_no_fingerprint.py::test_no_fingerprint_skip_unrelated_change`             |
 | Comment/whitespace change in source file       | ✅        | Not separately tested — file hash changes on any content change                 |
 | Helper function in different file              | ❌        | Not detected unless listed in `code_deps`                                       |

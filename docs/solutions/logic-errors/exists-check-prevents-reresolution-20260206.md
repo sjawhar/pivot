@@ -21,8 +21,8 @@ tags: [pipeline, discovery, resolution, exists-check, skip-detection, dag, pivot
 
 ## Environment
 
-- Module: Pipeline (`src/pivot/pipeline/pipeline.py`)
-- Method: `resolve_external_dependencies()`, line ~367
+- Module: Pipeline (the path-based pipeline module; the compositional API in `compose.py` does not resolve external dependencies by path: a consumer imports the producer's handle and `Pipeline._upstream_closure()` adds the producer stages)
+- Method: `resolve_external_dependencies()`
 - Python Version: 3.13+
 - Date: 2026-02-06
 

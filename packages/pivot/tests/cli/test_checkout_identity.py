@@ -45,8 +45,9 @@ def _helper_stage_info(
         name=name,
         deps={},
         outs=outs,
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint=None,
@@ -54,6 +55,7 @@ def _helper_stage_info(
         state_dir=state_dir,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
@@ -208,8 +210,8 @@ def test_checkout_unknown_identity_target_raises(
     result = runner.invoke(cli.cli, ["checkout", "train:nope"])
 
     assert result.exit_code != 0
-    assert "has no cached outputs" in result.output
-    assert "pivot repro train" in result.output
+    assert "Stage 'train' has no output key 'nope'" in result.output
+    assert "train:model" in result.output
 
 
 def test_checkout_directory_output_restores_contents(
@@ -276,8 +278,9 @@ pipeline._registry.add_existing(RegistryStageInfo(
             tag=types.ArtifactTag.DATA,
         )
     ],
+    incremental_inputs={},
     params=None,
-    mutex=[],
+    resources={},
     variant=None,
     signature=inspect.signature(stage_func),
     fingerprint=None,
@@ -285,6 +288,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
     state_dir=pipeline.state_dir,
     collection_params={},
     no_fingerprint=False,
+    code_deps=[],
 ))
 """
         (pipeline_a / "pipeline.py").write_text(pipeline_a_code)
@@ -318,8 +322,9 @@ pipeline._registry.add_existing(RegistryStageInfo(
             tag=types.ArtifactTag.DATA,
         )
     ],
+    incremental_inputs={},
     params=None,
-    mutex=[],
+    resources={},
     variant=None,
     signature=inspect.signature(stage_func),
     fingerprint=None,
@@ -327,6 +332,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
     state_dir=pipeline.state_dir,
     collection_params={},
     no_fingerprint=False,
+    code_deps=[],
 ))
 """
         (pipeline_b / "pipeline.py").write_text(pipeline_b_code)

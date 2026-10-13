@@ -10,8 +10,7 @@ _REMOTES_PREFIX = "remotes."
 # Valid remote name pattern (alphanumeric, hyphens, underscores) - public for completion module
 VALID_REMOTE_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-# Type alias for config values after validation
-ConfigValue = str | int | list[str] | dict[str, str] | None
+ConfigValue = str | int | list[str] | dict[str, str] | dict[str, int] | None
 
 
 class CheckoutMode(enum.StrEnum):
@@ -114,6 +113,9 @@ class PivotConfig(pydantic.BaseModel):
     watch: WatchConfig = pydantic.Field(default_factory=WatchConfig)
     display: DisplayConfig = pydantic.Field(default_factory=DisplayConfig)
     diff: DiffConfig = pydantic.Field(default_factory=DiffConfig)
+    resources: dict[str, Annotated[int, pydantic.Field(gt=0)]] = pydantic.Field(
+        default_factory=dict
+    )
     default_remote: str = ""
     remotes: dict[str, str] = pydantic.Field(default_factory=dict)
 
@@ -131,6 +133,20 @@ class PivotConfig(pydantic.BaseModel):
             except ValueError as e:
                 raise ValueError(f"Remote '{name}' {e}") from None
         return v
+
+    @pydantic.field_validator("resources")
+    @classmethod
+    def validate_resources(cls, v: dict[str, int]) -> dict[str, int]:
+        """Normalize case-insensitive resource names and reject ambiguous entries."""
+        normalized = dict[str, int]()
+        for name, capacity in v.items():
+            normalized_name = name.strip().casefold()
+            if not normalized_name:
+                raise ValueError("resource names must not be empty")
+            if normalized_name in normalized:
+                raise ValueError(f"resource {name!r} is declared more than once")
+            normalized[normalized_name] = capacity
+        return normalized
 
     @classmethod
     def get_default(cls) -> Self:
@@ -152,6 +168,7 @@ CONFIG_KEY_DESCRIPTIONS: dict[str, str] = {
     "watch.debounce": "Debounce delay (ms)",
     "display.precision": "Decimal precision for metrics",
     "diff.max_rows": "Max rows for diff operations",
+    "resources": "Scheduler resource capacities",
     "default_remote": "Default remote name",
 }
 
@@ -275,6 +292,12 @@ def validate_config_value(key: str, value: Any) -> ConfigValue:
                     msg = "; ".join(err["msg"] for err in e.errors())
                 else:
                     msg = "must be an integer"
+                raise exceptions.ConfigValidationError(f"'{key}': {msg}") from None
+        case "resources":
+            try:
+                return PivotConfig(resources=value).resources
+            except pydantic.ValidationError as e:
+                msg = "; ".join(err["msg"] for err in e.errors())
                 raise exceptions.ConfigValidationError(f"'{key}': {msg}") from None
 
         case _:

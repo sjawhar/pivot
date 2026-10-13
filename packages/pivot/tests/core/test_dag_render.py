@@ -41,8 +41,9 @@ def _create_stage(
         name=name,
         deps={f"_{i}": _artifact_ref(dep) for i, dep in enumerate(dep_identities)},
         outs=[_artifact_ref(out) for out in out_identities],
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=None,
         fingerprint={},
@@ -50,6 +51,7 @@ def _create_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 

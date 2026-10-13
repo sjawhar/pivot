@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
-_CACHE_SCHEMA_VERSION = 2
+_CACHE_SCHEMA_VERSION = 3
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1388,6 +1388,40 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.hash_function_ast", _t)
 
 
+def _resolve_static_callee(expr: ast.expr, globals_dict: dict[str, Any]) -> object | None:
+    """Resolve a name or dotted attribute without executing user code."""
+    if isinstance(expr, ast.Name):
+        return globals_dict.get(expr.id)
+    if not isinstance(expr, ast.Attribute):
+        return None
+    owner = _resolve_static_callee(expr.value, globals_dict)
+    if not isinstance(owner, types.ModuleType):
+        return None
+    namespace = object.__getattribute__(owner, "__dict__")
+    return namespace.get(expr.attr)
+
+
+def _strip_resource_stage_decorator(tree: ast.Module, globals_dict: dict[str, Any]) -> None:
+    """Exclude only the outer Pivot resource decorator from a stage code hash."""
+    from pivot import compose
+
+    outer = next(
+        (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))),
+        None,
+    )
+    if outer is None:
+        return
+    outer.decorator_list = [
+        decorator
+        for decorator in outer.decorator_list
+        if not (
+            isinstance(decorator, ast.Call)
+            and any(keyword.arg == "resources" for keyword in decorator.keywords)
+            and _resolve_static_callee(decorator.func, globals_dict) is compose.stage
+        )
+    ]
+
+
 def _compute_function_hash(func: Callable[..., Any]) -> str:
     """Compute hash for a function (uncached implementation)."""
     _t = metrics.start()
@@ -1435,6 +1469,9 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.ast_parse", _t_parse)
 
         _t_norm = metrics.start()
+        if hasattr(func, "__pivot_resources__"):
+            globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
+            _strip_resource_stage_decorator(tree, globals_dict)
         tree = _normalize_ast(tree)
         ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
         metrics.end("fingerprint.normalize_and_dump", _t_norm)

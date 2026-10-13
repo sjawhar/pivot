@@ -259,7 +259,7 @@ def test_code_function_added() -> None:
     assert added[0]["key"] == "func:helper"
 
 
-def test_group_dep_ignores_unaccessed_keys() -> None:
+def test_group_dep_detects_added_key() -> None:
     lock_data = _helper_make_lock_data(
         dep_hashes={
             _id("group"): DirHash(
@@ -276,19 +276,19 @@ def test_group_dep_ignores_unaccessed_keys() -> None:
         params={"lr": 0.01},
         dep_hashes={
             _id("group"): DirHash(
-                hash="group_hash",
+                hash="group_hash_with_y",
                 manifest=[
                     {"relpath": "x", "hash": "hash_x", "size": 1, "isexec": False},
-                    {"relpath": "y", "hash": "hash_y_changed", "size": 1, "isexec": False},
+                    {"relpath": "y", "hash": "hash_y", "size": 1, "isexec": False},
                 ],
             )
         },
         out_paths=[_id("stage", "output")],
         explain=True,
     )
-    assert result["changed"] is False
+    assert result["changed"] is True
     dep_changes = result.get("dep_changes", [])
-    assert dep_changes == []
+    assert dep_changes[0]["identity"] == _id("group")
 
 
 def test_group_dep_detects_accessed_key_change() -> None:

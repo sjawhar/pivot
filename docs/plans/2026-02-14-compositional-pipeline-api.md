@@ -55,9 +55,12 @@ Parameters are either:
 - **Artifact inputs** — any parameter whose value is an `ArtifactHandle` at pipeline
   definition time.
 - **Stage params** — a `StageParams` subclass, passed directly.
+- **Previous output** — a parameter bound to `p.previous()` or
+  `p.previous("key")`. It receives this stage's own previous value for an output tagged
+  `incremental`, or the loader's empty value on the first run. It creates no DAG edge.
 
-The distinction is positional: if the caller passes a handle, it's a dep. If they pass
-a params object, it's params. No marker annotations needed.
+The call-site value establishes a parameter's role: handles are dependencies, parameter
+objects are configuration, and previous-output markers refer to this stage's prior output.
 
 ### Serialization Format
 
@@ -108,6 +111,39 @@ class TaskWeightsResult(TypedDict):
 @stage
 def compute_task_weights(runs: pd.DataFrame) -> TaskWeightsResult:
     return {"filtered_runs": df, "task_weights": metrics}
+```
+
+### Incremental Outputs
+
+An incremental output receives its previous value on the next run. Tag a return type with
+`incremental`, then bind the corresponding parameter to `p.previous()`. The loader's empty
+value is supplied on the first run.
+
+```python
+@stage
+def update_cache(
+    new_rows: pd.DataFrame,
+    previous: dict,
+) -> Annotated[dict, incremental]:
+    merged = dict(previous)
+    merged.update({row.id: row.score for row in new_rows.itertuples()})
+    return merged
+
+
+class Outputs(TypedDict):
+    cache: Annotated[dict, incremental]
+    report: pd.DataFrame
+
+
+@stage
+def judge(items: pd.DataFrame, previous_cache: dict) -> Outputs:
+    ...
+
+
+with Pipeline("demo") as pipeline:
+    rows = pipeline.input("rows.csv")
+    update_cache(rows, previous=pipeline.previous())
+    judge(rows, previous_cache=pipeline.previous("cache"))
 ```
 
 ## Pipeline Definition

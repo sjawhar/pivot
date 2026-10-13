@@ -16,6 +16,7 @@ dependencies = [
   "aiohttp>=3.9",
   "anyio>=4.0",
   "click>=8.0",
+  "cloudpickle>=3.0",
   "deepmerge>=2.0",
   "dulwich>=0.22.0",
   "filelock>=3.12.0",
@@ -34,6 +35,7 @@ dependencies = [
   "tabulate>=0.9.0",
   "tqdm>=4.66",
   "watchfiles>=1.0",
+  "wcwidth>=0.2.0",
   "xxhash>=3.0",
 ]
 

@@ -8,19 +8,21 @@ fast as possible.
 ## Content-Addressable Cache
 
 Every output file is hashed with `xxhash64` and stored under
-`.pivot/cache/<hash[:2]>/<hash[2:]>` (a two-level directory structure using
-the first two hex characters as a prefix). The per-stage lock file records a
-manifest mapping each output path to its content hash.
+`.pivot/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure
+using the first two hex characters as a prefix). The per-stage lock file
+records each output's content hash.
 
 ```
 .pivot/
   cache/
-    a1/
-      b2c3d4e5f6g7h8    # cached file (content-addressed)
-    ...
+    files/
+      a1/
+        b2c3d4e5f6g7h8     # cached file (content-addressed)
+      ...
   stages/
-    clean.lock             # lock file for "clean" stage
-    train.lock             # lock file for "train" stage
+    demo/
+      clean.lock           # lock file for stage "demo/clean"
+      train.lock           # lock file for stage "demo/train"
   state.lmdb/              # LMDB database
 ```
 
@@ -40,8 +42,8 @@ successful run:
 |-----------------|----------|
 | `code_manifest` | [Fingerprint](fingerprinting.md) dict (key → hash) |
 | `params` | Serialised [parameters](parameters.md) dict |
-| `dep_hashes` | Input file hashes (path → xxhash64) |
-| `output_hashes` | Output file hashes (path → xxhash64) |
+| `deps` | One entry per input: producer, key, content hash |
+| `outs` | One entry per output: key, content hash, tag (`data`, `metric`, `plot`) |
 
 This is the ground truth for "what did the stage look like last time it
 ran?" The skip algorithm compares current state against these fields.
@@ -55,8 +57,8 @@ to more expensive checks only when needed.
 ### Tier 1: Generation Tracking — O(1)
 
 StateDB maintains a monotonic **generation counter** for every output
-file. When a stage runs and produces `output.csv`, the generation for
-that path is incremented. The stage also records the generation of each
+file. When a stage runs and produces `data/demo/clean.jsonl`, the generation
+for that file is incremented. The stage also records the generation of each
 dependency at the time it ran.
 
 On the next run, the worker checks: "are my dependency generations the
@@ -88,7 +90,7 @@ combination of:
 - Code fingerprint
 - Current parameters
 - Dependency hashes
-- Output path specs
+- Output specs (identities and formats)
 
 This input hash is looked up in the run cache
 (`runcache:<stage>:<input_hash>` in StateDB). If a previous run with
@@ -178,7 +180,7 @@ Restore tracked files and stage outputs from cache:
 
 ```
 $ pivot checkout                   # restore all
-$ pivot checkout train             # restore specific stage outputs
+$ pivot checkout demo/train        # restore specific stage outputs
 $ pivot checkout --only-missing    # skip files that already exist
 $ pivot checkout --force           # overwrite existing files
 ```
@@ -188,7 +190,7 @@ $ pivot checkout --force           # overwrite existing files
 Record current outputs in lock files and cache without re-running:
 
 ```
-$ pivot commit train
+$ pivot commit demo/train
 ```
 
 ## Relationship to Other Concepts

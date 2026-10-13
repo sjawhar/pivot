@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-import pathlib
 from typing import TYPE_CHECKING, TypedDict, cast
 
 import aiohttp
 import yaml
 
-from pivot import exceptions, project
+from pivot import exceptions, project, types
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github
 from pivot.remote import storage as remote_storage
@@ -17,6 +16,7 @@ from pivot.storage import cache, track
 from pivot.storage import lock as storage_lock
 
 if TYPE_CHECKING:
+    import pathlib
     from collections.abc import Callable
 
     from pivot.types import DirManifestEntry, OutEntry, StorageLockData
@@ -128,6 +128,36 @@ async def read_remote_config(
     return url
 
 
+async def _list_github_lock_paths(
+    owner: str,
+    repo: str,
+    directory: str,
+    rev: str,
+    token: str | None,
+    session: aiohttp.ClientSession | None,
+) -> list[str] | None:
+    """List lock files under directory, relative to it, descending into pipeline dirs.
+
+    The contents API lists a single level, and pipeline-prefixed stage names
+    (``smoke/total``) keep their lock files in subdirectories.
+    """
+    entries = await github.list_directory(owner, repo, directory, rev, token, session=session)
+    if entries is None:
+        return None
+    lock_paths = [name for name in entries if name.endswith(".lock")]
+    subdirs = [name for name in entries if not name.endswith(".lock")]
+    nested = await asyncio.gather(
+        *[
+            _list_github_lock_paths(owner, repo, f"{directory}/{d}", rev, token, session)
+            for d in subdirs
+        ]
+    )
+    for subdir, sub_paths in zip(subdirs, nested, strict=True):
+        if sub_paths is not None:
+            lock_paths.extend(f"{subdir}/{p}" for p in sub_paths)
+    return lock_paths
+
+
 async def list_remote_lock_files(
     repo_url: str,
     rev: str,
@@ -137,13 +167,8 @@ async def list_remote_lock_files(
 ) -> list[str]:
     if github.is_github_url(repo_url):
         owner, repo = github.parse_github_url(repo_url)
-        entries = await github.list_directory(
-            owner,
-            repo,
-            ".pivot/stages",
-            rev,
-            _maybe_token(repo_url, token),
-            session=session,
+        entries = await _list_github_lock_paths(
+            owner, repo, ".pivot/stages", rev, _maybe_token(repo_url, token), session
         )
     else:
         entries = await _run_blocking(
@@ -156,12 +181,8 @@ async def list_remote_lock_files(
     if entries is None:
         raise exceptions.RemoteError("Remote repo has no .pivot/stages directory")
 
-    stage_names = list[str]()
-    for entry in [str(e) for e in entries]:
-        name = pathlib.Path(entry).name
-        if not name.endswith(".lock"):
-            continue
-        stage_names.append(name[: -len(".lock")])
+    # Entries are relative to .pivot/stages, so nested paths are pipeline-prefixed names
+    stage_names = [entry.removesuffix(".lock") for entry in entries if entry.endswith(".lock")]
 
     if not stage_names:
         raise exceptions.RemoteError("Remote repo has no lock files")
@@ -192,32 +213,24 @@ async def read_remote_lock_file(
     return data
 
 
-def _entry_size(entry: OutEntry) -> int:
+def _entry_identity(stage: str, entry: OutEntry) -> str:
+    """Identity key of a lock output entry: ``stage`` or ``stage:key``."""
+    return types.identity_key(types.ArtifactIdentity(stage, entry["key"]))
+
+
+def _entry_size(entry: OutEntry, identity: str) -> int:
     if "size" in entry:
         return int(entry["size"])
     if "manifest" in entry:
         return sum(int(m["size"]) for m in entry["manifest"])
-    entry_display = _entry_display(entry)
-    logger.warning("Lock entry '%s' has no size information", entry_display)
+    logger.warning("Lock entry '%s' has no size information", identity)
     return 0
 
 
-def _entry_display(entry: OutEntry) -> str:
-    raw = cast("dict[str, object]", cast("object", entry))
-    path_value = raw.get("path")
-    if isinstance(path_value, str):
-        return path_value
-    display = entry.get("display", entry.get("key", "unknown"))
-    if display is None:
-        return "unknown"
-    return display
-
-
-def _iter_manifest_paths(entry: OutEntry) -> list[tuple[str, DirManifestEntry]]:
+def _iter_manifest_paths(identity: str, entry: OutEntry) -> list[tuple[str, DirManifestEntry]]:
     if "manifest" not in entry:
         return []
-    base = _entry_display(entry).rstrip("/")
-    return [(f"{base}/{m['relpath']}", m) for m in entry["manifest"]]
+    return [(f"{identity}/{m['relpath']}", m) for m in entry["manifest"]]
 
 
 async def resolve_remote_path(
@@ -260,23 +273,23 @@ async def _resolve_remote_path_with_session(
         if lock_data is None:
             continue
         for entry in lock_data["outs"]:
-            entry_display = _entry_display(entry)
-            available.add(entry_display)
-            for full_path, _ in _iter_manifest_paths(entry):
-                available.add(full_path)
+            identity = _entry_identity(stage, entry)
+            manifest_paths = _iter_manifest_paths(identity, entry)
+            available.add(identity)
+            available.update(full_path for full_path, _ in manifest_paths)
 
-            if entry_display == path:
+            if identity == path:
                 if "manifest" in entry:
                     message = (
                         "Cannot import directory output "
                         + f"'{path}'. Import individual files instead, "
-                        + f"e.g., '{path.rstrip('/')}/{{filename}}'"
+                        + f"e.g., '{path}/{{filename}}'"
                     )
                     raise exceptions.PivotError(message)
-                matches.append((stage, path, entry["hash"], _entry_size(entry)))
+                matches.append((stage, path, entry["hash"], _entry_size(entry, identity)))
                 continue
 
-            for full_path, manifest_entry in _iter_manifest_paths(entry):
+            for full_path, manifest_entry in manifest_paths:
                 if full_path == path:
                     matches.append(
                         (
@@ -298,7 +311,7 @@ async def _resolve_remote_path_with_session(
         else:
             available_list = "(none)"
         raise exceptions.PivotError(
-            f"Path '{path}' not found in remote outputs. Available outputs: {available_list}"
+            f"Artifact '{path}' not found in remote outputs. Available outputs: {available_list}"
         )
 
     if len(matches) > 1:

@@ -1,21 +1,11 @@
 import os
 import sys
-import time
 from collections.abc import Mapping, Sequence
-from typing import Any, Self, TextIO
+from typing import TextIO
 
 import click
-from tqdm import tqdm
 
-from pivot.types import (
-    ArtifactIdentity,
-    DisplayCategory,
-    StageDisplayStatus,
-    StageExplanation,
-    StageStatus,
-    categorize_stage_result,
-    identity_key,
-)
+from pivot.types import ArtifactIdentity, StageExplanation, identity_key
 
 # ANSI color codes
 _COLORS = {
@@ -25,7 +15,6 @@ _COLORS = {
     "green": "\033[32m",
     "yellow": "\033[33m",
     "red": "\033[31m",
-    "blue": "\033[34m",
     "cyan": "\033[36m",
 }
 
@@ -41,13 +30,7 @@ def _supports_color(stream: TextIO) -> bool:
 
 
 class Console:
-    """Console output handler with colors and progress tracking.
-
-    Can be used as a context manager to ensure progress bar cleanup:
-        with Console() as con:
-            con.stage_start(...)
-            con.stage_result(...)
-    """
+    """Plain-text CLI output for run summaries and stage explanations, with optional color."""
 
     stream: TextIO
     use_color: bool
@@ -61,25 +44,6 @@ class Console:
         """
         self.stream = stream or sys.stderr
         self.use_color = color if color is not None else _supports_color(self.stream)
-        self._current_stage: str | None = None
-        self._stage_start: float | None = None
-        # tqdm[T] type is invariant and tricky to annotate - use Any for internal state
-        self._progress_bar: Any = None
-        self._is_tty: bool = hasattr(self.stream, "isatty") and self.stream.isatty()
-
-    def __enter__(self) -> Self:
-        """Enter context manager."""
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        """Exit context manager, ensuring progress bar cleanup."""
-        self.close()
-
-    def close(self) -> None:
-        """Close progress bar if active."""
-        if self._progress_bar is not None:
-            self._progress_bar.close()
-            self._progress_bar = None
 
     def _color(self, text: str, *codes: str) -> str:
         """Apply color codes to text."""
@@ -89,103 +53,8 @@ class Console:
         return f"{prefix}{text}{_COLORS['reset']}"
 
     def _echo(self, message: str) -> None:
-        """Output message, using tqdm.write() if progress bar is active."""
-        if self._progress_bar is not None:
-            # tqdm.write() clears bar, prints, redraws bar - use same stream as bar
-            self._progress_bar.write(message, file=self.stream)
-        else:
-            click.echo(message, file=self.stream, color=self.use_color)
-
-    def _ensure_progress_bar(self, total: int) -> None:
-        """Initialize progress bar if on TTY and not already created."""
-        if self._progress_bar is None and self._is_tty:
-            self._progress_bar = tqdm(
-                total=total,
-                desc="Pipeline",
-                file=self.stream,
-                dynamic_ncols=True,
-                leave=True,
-            )
-
-    def stage_start(
-        self,
-        name: str,
-        index: int,
-        total: int,
-        status: StageDisplayStatus,
-    ) -> None:
-        """Print stage start message."""
-        # Use click.unstyle to strip any ANSI codes from stage name
-        name = click.unstyle(name)
-        self._current_stage = name
-        self._stage_start = time.perf_counter()
-
-        self._ensure_progress_bar(total)
-
-        progress = self._color(f"[{index}/{total}]", "dim")
-
-        match status:
-            case StageDisplayStatus.FINGERPRINTING:
-                status_text = self._color("fingerprinting", "dim")
-            case StageDisplayStatus.RUNNING:
-                status_text = self._color("running", "blue", "bold")
-            case StageDisplayStatus.WAITING:
-                status_text = self._color("waiting", "dim")
-
-        self._echo(f"{progress} {name}: {status_text}...")
-
-    def stage_result(
-        self,
-        name: str,
-        index: int,
-        total: int,
-        status: StageStatus,
-        reason: str = "",
-        duration: float | None = None,
-    ) -> None:
-        """Print stage result message."""
-        name = click.unstyle(name)
-        progress = self._color(f"[{index}/{total}]", "dim")
-
-        # Determine display status and text based on status and reason
-        category = categorize_stage_result(status)
-        match category:
-            case DisplayCategory.SUCCESS:
-                status_text = self._color("ran", "green", "bold")
-            case DisplayCategory.CACHED:
-                status_text = self._color("cached", "yellow")
-            case DisplayCategory.BLOCKED:
-                status_text = self._color("blocked", "red")
-            case DisplayCategory.CANCELLED:
-                status_text = self._color("cancelled", "yellow", "dim")
-            case DisplayCategory.FAILED:
-                status_text = self._color("FAILED", "red", "bold")
-            case _:
-                status_text = self._color(str(status), "dim")
-
-        # Calculate duration if not provided
-        if duration is None and self._stage_start is not None:
-            duration = time.perf_counter() - self._stage_start
-
-        parts = [f"{progress} {name}: {status_text}"]
-        if reason:
-            parts.append(self._color(f"({reason})", "dim"))
-        if duration is not None:
-            parts.append(self._color(f"[{duration:.2f}s]", "dim"))
-
-        self._echo(" ".join(parts))
-        self._current_stage = None
-        self._stage_start = None
-
-        # Update progress bar on completion
-        if self._progress_bar is not None:
-            self._progress_bar.update(1)
-
-    def parallel_group_start(self, group_index: int, stage_names: list[str]) -> None:
-        """Print parallel group start message."""
-        stages_str = ", ".join(click.unstyle(n) for n in stage_names)
-        header = self._color(f"=== Parallel group {group_index} ===", "cyan", "bold")
-        self._echo(f"\n{header} ({len(stage_names)} stages: {stages_str})")
+        """Output message to the console stream."""
+        click.echo(message, file=self.stream, color=self.use_color)
 
     def summary(
         self,
@@ -197,9 +66,6 @@ class Console:
         total_duration: float,
     ) -> None:
         """Print execution summary."""
-        # Close progress bar before printing summary
-        self.close()
-
         self._echo("")  # blank line
 
         ran_text = self._color(str(ran), "green") if ran > 0 else str(ran)
@@ -225,21 +91,6 @@ class Console:
         self._echo(header)
         for name in failed_names:
             self._echo(f"  {self._color(name, 'red')}")
-
-    def error(self, message: str, suggestion: str | None = None) -> None:
-        """Print error message with optional suggestion."""
-        prefix = self._color("Error:", "red", "bold")
-        self._echo(f"{prefix} {message}")
-        if suggestion:
-            hint = self._color("Tip:", "cyan")
-            self._echo(f"  {hint} {suggestion}")
-
-    def stage_output(self, name: str, line: str, is_stderr: bool = False) -> None:
-        """Print captured stage output."""
-        name = click.unstyle(name)
-        prefix = self._color(f"  [{name}]", "dim")
-        line_colored = self._color(line, "red") if is_stderr else line
-        self._echo(f"{prefix} {line_colored}")
 
     def _print_changes(
         self,
@@ -308,15 +159,3 @@ class Console:
         run_text = self._color(str(will_run), "green") if will_run > 0 else str(will_run)
         unchanged_text = self._color(str(unchanged), "yellow") if unchanged > 0 else str(unchanged)
         self._echo(f"Summary: {run_text} will run, {unchanged_text} unchanged")
-
-
-# Global console instance for convenience
-_console: Console | None = None
-
-
-def get_console() -> Console:
-    """Get or create global console instance."""
-    global _console
-    if _console is None:
-        _console = Console()
-    return _console

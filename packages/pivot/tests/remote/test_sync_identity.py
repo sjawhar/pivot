@@ -37,8 +37,9 @@ def _make_stage_info(
         "name": name,
         "deps": {},
         "outs": outs,
+        "incremental_inputs": {},
         "params": None,
-        "mutex": [],
+        "resources": {},
         "variant": None,
         "signature": None,
         "fingerprint": None,
@@ -46,6 +47,7 @@ def _make_stage_info(
         "state_dir": state_dir,
         "collection_params": {},
         "no_fingerprint": False,
+        "code_deps": [],
     }
     return info
 
@@ -90,6 +92,32 @@ def test_get_target_hashes_resolves_identity_key(tmp_path: pathlib.Path) -> None
     )
 
     assert hashes == {"abc123"}
+
+
+def test_get_target_hashes_resolves_bare_stage_name_and_key(tmp_path: pathlib.Path) -> None:
+    """A bare suffix resolves before remote sync treats the target as a workspace path."""
+    stage_name = "smoke/train"
+    data_ref = _helper_ref(stage_name, "model", types.ArtifactTag.DATA, loaders.CSV())
+    stage_info = _make_stage_info(stage_name, [data_ref], state_dir=tmp_path)
+    _write_stage_lock(
+        stage_name,
+        tmp_path,
+        output_hashes={data_ref.identity: types.FileHash(hash="aabbccddeeff0011")},
+    )
+
+    bare_stage_hashes = sync.get_target_hashes(
+        ["train"], tmp_path, all_stages={stage_name: stage_info}
+    )
+    bare_key_hashes = sync.get_target_hashes(
+        ["train:model"], tmp_path, all_stages={stage_name: stage_info}
+    )
+    qualified_key_hashes = sync.get_target_hashes(
+        ["smoke/train:model"], tmp_path, all_stages={stage_name: stage_info}
+    )
+
+    assert bare_stage_hashes == {"aabbccddeeff0011"}
+    assert bare_key_hashes == {"aabbccddeeff0011"}
+    assert qualified_key_hashes == {"aabbccddeeff0011"}
 
 
 def test_get_file_hash_from_stages_matches_identity_key(tmp_path: pathlib.Path) -> None:

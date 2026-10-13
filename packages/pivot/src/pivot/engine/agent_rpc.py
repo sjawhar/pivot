@@ -14,10 +14,11 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from pydantic import BaseModel, ValidationError, field_validator
 
 from pivot import explain as explain_mod
-from pivot import parameters, types
+from pivot import parameters, project, types
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
+from pivot.storage import store as store_mod
 from pivot.types import DataDiffResult, OnError, StageExplanation
 
 if TYPE_CHECKING:
@@ -296,19 +297,31 @@ class AgentRpcHandler:
                         overrides = parameters.load_params_yaml()
                     except Exception as e:
                         raise ValueError(f"Failed to load params.yaml: {e}") from e
+                    all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
+                    producer_hashes = explain_mod.producer_output_hashes(
+                        list(all_stages),
+                        all_stages,
+                        config_io.get_state_dir(),
+                    )
+                    store = store_mod.WorkspaceStore(
+                        project_root=project.get_project_root(),
+                        pipeline_name=pipeline.name,
+                        input_bindings=pipeline.input_bindings,
+                        cache_dir=config_io.get_cache_dir() / "files",
+                    )
                     return explain_mod.get_stage_explanation(
                         stage_name=stage,
                         fingerprint=fingerprint,
-                        deps=[
-                            types.identity_key(dep.identity) for dep in reg_info["deps"].values()
-                        ],
-                        outs_paths=[types.identity_key(out.identity) for out in reg_info["outs"]],
+                        deps=reg_info["deps"],
+                        outs=list(reg_info["outs"]),
                         params_instance=reg_info["params"],
                         overrides=overrides,
                         state_dir=registry_mod.get_stage_state_dir(
                             reg_info, config_io.get_state_dir()
                         ),
+                        store=store,
                         allow_missing=True,
+                        producer_hashes=producer_hashes,
                     )
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
@@ -382,10 +395,18 @@ class AgentRpcSource:
 
     _socket_path: Path
     _handler: AgentRpcHandler | None
+    _resource_capacity: dict[str, int]
 
-    def __init__(self, *, socket_path: Path, handler: AgentRpcHandler | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        socket_path: Path,
+        handler: AgentRpcHandler | None = None,
+        resource_capacity: dict[str, int] | None = None,
+    ) -> None:
         self._socket_path = socket_path
         self._handler = handler
+        self._resource_capacity = dict(resource_capacity or {})
 
     async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
         """Listen for agent connections and process requests."""
@@ -427,9 +448,21 @@ class AgentRpcSource:
                         "id": None,
                     }
                     with anyio.move_on_after(1.0):  # Brief timeout for error send
-                        await conn.send(json.dumps(error_response).encode() + b"\n")
+                        await self._send_response(
+                            conn,
+                            json.dumps(error_response).encode() + b"\n",
+                        )
             except Exception:
                 _logger.exception("Error handling agent connection")
+
+    async def _send_response(self, conn: SocketStream, response: bytes) -> bool:
+        """Send one response, treating a client-side close as a normal disconnect."""
+        try:
+            await conn.send(response)
+        except anyio.BrokenResourceError:
+            _logger.debug("Agent client disconnected")
+            return False
+        return True
 
     async def _process_requests(
         self,
@@ -447,14 +480,23 @@ class AgentRpcSource:
                     "error": {"code": -32600, "message": "Request too large"},
                     "id": None,
                 }
-                await conn.send(json.dumps(error_response).encode() + b"\n")
+                if not await self._send_response(
+                    conn,
+                    json.dumps(error_response).encode() + b"\n",
+                ):
+                    return
                 return
 
             # Limit receive size to prevent single-chunk overflow
             max_to_receive = _MAX_MESSAGE_SIZE - len(buffer)
-            chunk = await conn.receive(max_to_receive)
+
+            try:
+                chunk = await conn.receive(max_to_receive)
+            except anyio.EndOfStream:
+                _logger.debug("Agent client disconnected")
+                return
             if not chunk:
-                break
+                return
 
             buffer += chunk
 
@@ -468,10 +510,11 @@ class AgentRpcSource:
                     request = json.loads(line.decode())
                     response = await self._handle_request(request, send)
 
-                    if response is not None:
-                        await conn.send(
-                            json.dumps(response, default=_json_default).encode() + b"\n"
-                        )
+                    if response is not None and not await self._send_response(
+                        conn,
+                        json.dumps(response, default=_json_default).encode() + b"\n",
+                    ):
+                        return
 
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     error_response = {
@@ -479,7 +522,11 @@ class AgentRpcSource:
                         "error": {"code": -32700, "message": "Parse error"},
                         "id": None,
                     }
-                    await conn.send(json.dumps(error_response).encode() + b"\n")
+                    if not await self._send_response(
+                        conn,
+                        json.dumps(error_response).encode() + b"\n",
+                    ):
+                        return
 
     async def _handle_request(
         self,
@@ -529,6 +576,7 @@ class AgentRpcSource:
                 single_stage=False,
                 parallel=True,
                 max_workers=None,
+                resource_capacity=dict(self._resource_capacity),
                 no_commit=False,
                 on_error=on_error,
                 cache_dir=None,

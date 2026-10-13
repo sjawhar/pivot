@@ -68,9 +68,9 @@ def build_params_instance[T: pydantic.BaseModel](
 ) -> T:
     """Build Pydantic model instance with overrides applied.
 
-    For matrix stages (name contains '@'), overrides are applied in order:
-    1. Base stage name overrides (e.g., 'process' applies to all variants)
-    2. Full variant name overrides (e.g., 'process@v1' for specific variant)
+    For variants (stage names containing '@'), overrides are applied in order:
+    1. Base stage name overrides (e.g., 'demo/process' applies to all variants)
+    2. Full variant name overrides (e.g., 'demo/process@v1' for one variant)
 
     Args:
         params_cls: The Pydantic BaseModel class
@@ -91,13 +91,13 @@ def build_params_instance[T: pydantic.BaseModel](
 
 
 def _get_merged_overrides(stage_name: str, overrides: ParamsOverrides) -> dict[str, Any]:
-    """Get merged overrides for a stage, applying matrix inheritance.
+    """Get merged overrides for a stage, applying base-name overrides to variants.
 
     Deep-copies values from overrides to prevent mutation of shared structures.
     """
     merged = dict[str, Any]()
 
-    # For matrix stages, apply base name overrides first
+    # For variants, apply base name overrides first
     if "@" in stage_name:
         base_name = stage_name.split("@")[0]
         if base_name:  # Guard against names starting with @
@@ -116,9 +116,9 @@ def apply_overrides[T: pydantic.BaseModel](
 ) -> T:
     """Apply overrides to an existing params instance with deep merging.
 
-    For matrix stages (name contains '@'), overrides are applied in order:
-    1. Base stage name overrides (e.g., 'process' applies to all variants)
-    2. Full variant name overrides (e.g., 'process@v1' for specific variant)
+    For variants (stage names containing '@'), overrides are applied in order:
+    1. Base stage name overrides (e.g., 'demo/process' applies to all variants)
+    2. Full variant name overrides (e.g., 'demo/process@v1' for one variant)
 
     Nested BaseModel fields are merged recursively - only specified keys are
     overridden, preserving unspecified nested values.

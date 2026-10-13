@@ -48,23 +48,22 @@ Lambdas defined in actual source files (like `my_lambda = lambda x: x * 2` in a 
 Use named module-level functions instead of lambdas in stage definitions:
 
 ```python
-from typing import Annotated
 import pandas as pd
-from pivot import Dep, Out
-from pivot.loaders import CSV
-from pivot.pipeline import Pipeline
+
+from pivot import Pipeline, stage
+
 
 # GOOD: Named module-level function has stable fingerprint
-def process_data(
-    data: Annotated[pd.DataFrame, Dep("input.csv", CSV())],
-) -> Annotated[pd.DataFrame, Out("output.csv", CSV())]:
+@stage
+def process_data(data: pd.DataFrame) -> pd.DataFrame:
     return data.dropna()
 
-pipeline = Pipeline("my_pipeline")
-pipeline.register(process_data)
+
+with Pipeline("my_pipeline") as pipeline:
+    process_data(pipeline.input("input.csv"))
 ```
 
-**Key requirement:** Stage functions must be module-level named functions, not lambdas or closures. This ensures `inspect.getsource()` can retrieve the source code for deterministic fingerprinting.
+**Key requirement:** Stage functions and the helpers they call must be named functions defined in source files, not dynamically created lambdas. This ensures `inspect.getsource()` can retrieve the source code for deterministic fingerprinting.
 
 For Pydantic model defaults, use named functions for `default_factory`:
 
@@ -81,25 +80,16 @@ class Params(pydantic.BaseModel):
     items: list[str] = pydantic.Field(default_factory=default_items)
 ```
 
-For callbacks and transformations passed to stages:
+For helpers a stage calls:
 
 ```python
-# BAD: Inline lambda in stage parameter
-def train(
-    params: TrainParams,
-    transform: Callable = lambda x: x.lower(),  # Unstable
-):
-    ...
+# BAD: Dynamically created lambda (eval, exec, notebook)
+transform = eval("lambda x: x.lower()")  # Unstable
+
 
 # GOOD: Module-level named function
-def default_transform(x):
-    return x.lower()
-
-def train(
-    params: TrainParams,
-    transform: Callable = default_transform,  # Stable
-):
-    ...
+def transform(x):
+    return x.lower()  # Stable
 ```
 
 ## Key Insight

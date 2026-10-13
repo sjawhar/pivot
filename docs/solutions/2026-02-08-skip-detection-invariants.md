@@ -85,23 +85,19 @@ Lock files and StateDB use different path semantics:
 Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → hash) are cached in StateDB under the `sm:` prefix, along with source maps that record which source files contributed to the manifest.
 
 **Flush boundaries** (where pending manifest cache writes are committed to StateDB):
-- After discovery (`discovery.py` — when stages are found via `pivot.yaml`/`pipeline.py`)
-- After YAML config load
-- After module load
+- After discovery loads `pipeline.py` (`discovery.py`)
 - In watch mode, before reload
 
 **Selective invalidation in watch mode:** When a source file changes, the engine uses a reverse index to find which manifest cache entries depend on that file, and invalidates only those entries. This avoids re-fingerprinting all stages when only one source file changed. The reverse index is built by scanning all `sm:` entries' source maps.
 
 ## Safe Fingerprinting
 
-Pivot fingerprints stage functions by hashing their AST and the ASTs of any helper functions they call. Closures that capture **mutable** variables (lists, dicts, instances) are problematic because their runtime state isn't tracked by the AST hash — a change to a captured list won't trigger re-execution.
+Pivot fingerprints stage functions by hashing their AST and the ASTs of any helper functions they call. A module-level `bool`, `int`, `float`, `str`, `bytes` or `None` that a stage reads is recorded by value (`const:` keys), so editing it re-runs the stage. Any other module-level value a stage reads (tuple, list, dict, set, frozenset, enum member, class instance) is not safely trackable: its contents can change without the AST changing.
 
-By default, mutable closure captures raise `StageDefinitionError` with a message explaining the issue and suggesting alternatives (StageParams or Dep inputs).
+By default, such captures raise `StageDefinitionError` with a message that names the variable and suggests moving it into `StageParams`.
 
 **Escape hatches:**
-- Config: `core.unsafe_fingerprinting: true` in `pivot.yaml`
+- Config: `core.unsafe_fingerprinting: true` in `.pivot/config.yaml` (`pivot config set core.unsafe_fingerprinting true`)
 - Environment: `PIVOT_UNSAFE_FINGERPRINTING=1`
 
-When enabled, mutable captures produce a warning instead of an error. This is unsafe because it can lead to silent wrong outputs — the captured value may change without triggering re-execution.
-
-Immutable captures (strings, numbers, tuples, frozen dataclasses, frozensets) are always allowed since they can't change after creation.
+When enabled, these captures produce a warning instead of an error. This is unsafe because it can lead to silent wrong outputs: the captured value may change without triggering re-execution.

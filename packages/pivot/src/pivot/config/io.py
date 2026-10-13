@@ -331,6 +331,11 @@ def get_max_workers() -> int:
     return merged.core.max_workers
 
 
+def get_resource_capacities() -> dict[str, int]:
+    """Get configured scheduler resource capacities."""
+    return dict(get_merged_config().resources)
+
+
 def get_remote_jobs() -> int:
     """Get remote transfer parallel jobs from merged config."""
     merged = get_merged_config()

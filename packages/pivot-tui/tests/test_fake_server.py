@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 import anyio
 import pytest
 
+from helpers import wait_for_socket as _wait_for_socket
 from pivot_tui.testing import FakeRpcServer
 
 if TYPE_CHECKING:
@@ -79,13 +80,6 @@ class _FakeRpcServer(Protocol):
 anyio = cast("_Anyio", anyio)  # type: ignore[reportGeneralTypeIssues] - module cast
 pytest = cast("_Pytest", pytest)  # type: ignore[reportGeneralTypeIssues] - module cast
 FakeRpcServer = cast("type[_FakeRpcServer]", FakeRpcServer)
-
-
-async def _wait_for_socket(socket_path: Path, timeout: float = 1.0) -> None:
-    with anyio.move_on_after(timeout):
-        while not socket_path.exists():
-            await anyio.sleep(0.01)
-    assert socket_path.exists(), "Socket should exist"
 
 
 async def _send_request(socket_path: Path, request: dict[str, object]) -> dict[str, object]:

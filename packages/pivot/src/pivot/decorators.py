@@ -15,6 +15,8 @@ def no_fingerprint(code_deps: list[str] | None = None) -> Callable[[F], F]:
         raise TypeError("Use @no_fingerprint() with parentheses, not @no_fingerprint")
 
     def decorator(func: F) -> F:
+        # Marks only the object decorated: a function shared by several @stage wrappers must
+        # not change for all of them. @stage's functools.wraps copies marks set below it.
         setattr(func, "__pivot_no_fingerprint__", True)  # noqa: B010
         setattr(func, "__pivot_code_deps__", code_deps or [])  # noqa: B010
         return func

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import pathlib
 import typing
 from typing import TYPE_CHECKING
 
@@ -25,24 +24,11 @@ if TYPE_CHECKING:
     from tests.conftest import ValidLockContentFactory
 
 
-def _register_metric_stage(
-    test_pipeline: PipelineLike,
-    name: str,
-    metric_path: str,
-) -> None:
-    """Register a test stage with a Metric output directly in the registry.
-
-    This bypasses the annotation-based registration since Metric outputs
-    can't be expressed through annotations (they require outputs.Metric).
-    """
+def _register_metric_stage(test_pipeline: PipelineLike, name: str) -> Path:
+    """Register a stage with one JSON metric output; return the workspace path pivot writes."""
 
     def _stage_func() -> None:
         pass
-
-    identity_path = metric_path
-    path_obj = pathlib.Path(metric_path)
-    if path_obj.is_absolute():
-        identity_path = project.to_relative_path(path_obj)
 
     pipeline = typing.cast("Pipeline", test_pipeline)
     pipeline._registry._stages[name] = RegistryStageInfo(
@@ -51,14 +37,15 @@ def _register_metric_stage(
         deps={},
         outs=[
             ArtifactRef(
-                identity=ArtifactIdentity(identity_path, None),
+                identity=ArtifactIdentity(name, None),
                 format=loaders.JSON(),
                 python_type=dict,
                 tag=ArtifactTag.METRIC,
             )
         ],
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
@@ -66,7 +53,11 @@ def _register_metric_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
+    metric_path = project.get_project_root() / "metrics" / f"{name}.json"
+    metric_path.parent.mkdir(parents=True, exist_ok=True)
+    return metric_path
 
 
 # =============================================================================
@@ -561,63 +552,36 @@ def test_parse_metric_content_invalid_yaml() -> None:
 # =============================================================================
 
 
-def test_collect_metrics_from_stages_with_metric_output(
-    tmp_path: Path,
-    mock_discovery: PipelineLike,
-    mocker: MockerFixture,
-) -> None:
-    """Collect metrics from stages with Metric outputs."""
-    metric_file = tmp_path / "metrics.json"
+def test_collect_metrics_from_stages_with_metric_output(mock_discovery: PipelineLike) -> None:
+    """A stage's metric output is read from its workspace path and keyed by that path."""
+    metric_file = _register_metric_stage(mock_discovery, "my_stage")
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
-
-    # Patch get_workspace_store to return None so _metric_read_path uses
-    # the fallback path (project_root / path_key) which is tmp_path / "metrics.json"
-    mocker.patch(
-        "pivot.cli.helpers.get_workspace_store",
-        return_value=None,
-    )
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
 
     result = metrics.collect_metrics_from_stages()
 
-    assert "my_stage" in result
-    assert "metrics.json" in result["my_stage"]
-    assert result["my_stage"]["metrics.json"]["accuracy"] == 0.95
+    assert result == {"my_stage": {"metrics/my_stage.json": {"accuracy": 0.95}}}
 
 
 def test_collect_metrics_from_stages_missing_file(
-    tmp_path: Path,
     mock_discovery: PipelineLike,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Missing metric file logs warning and skips."""
-    _register_metric_stage(mock_discovery, "my_stage", str(tmp_path / "nonexistent.json"))
+    _register_metric_stage(mock_discovery, "my_stage")
 
     result = metrics.collect_metrics_from_stages()
 
     assert "my_stage" not in result
-    assert "Metric file not found" in caplog.text
+    assert "Metric file not found: metrics/my_stage.json" in caplog.text
 
 
 def test_collect_metrics_from_stages_parse_error(
-    tmp_path: Path,
     mock_discovery: PipelineLike,
-    mocker: MockerFixture,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Parse error in metric file logs warning and skips."""
-    metric_file = tmp_path / "metrics.json"
+    metric_file = _register_metric_stage(mock_discovery, "my_stage")
     metric_file.write_text("{invalid json}")
-
-    # Patch get_workspace_store to return None so _metric_read_path uses
-    # the fallback path (project_root / path_key) which is tmp_path / "metrics.json"
-    mocker.patch(
-        "pivot.cli.helpers.get_workspace_store",
-        return_value=None,
-    )
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
 
     result = metrics.collect_metrics_from_stages()
 
@@ -625,28 +589,14 @@ def test_collect_metrics_from_stages_parse_error(
     assert "Failed to parse metrics" in caplog.text
 
 
-def test_collect_all_stage_metrics_flat(
-    tmp_path: Path,
-    mock_discovery: PipelineLike,
-    mocker: MockerFixture,
-) -> None:
+def test_collect_all_stage_metrics_flat(mock_discovery: PipelineLike) -> None:
     """Collect and flatten metrics from all stages."""
-    metric_file = tmp_path / "metrics.json"
+    metric_file = _register_metric_stage(mock_discovery, "my_stage")
     metric_file.write_text(json.dumps({"accuracy": 0.95}))
-
-    # Patch get_workspace_store to return None so _metric_read_path uses
-    # the fallback path (project_root / path_key) which is tmp_path / "metrics.json"
-    mocker.patch(
-        "pivot.cli.helpers.get_workspace_store",
-        return_value=None,
-    )
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
 
     result = metrics.collect_all_stage_metrics_flat()
 
-    assert "metrics.json" in result
-    assert result["metrics.json"]["accuracy"] == 0.95
+    assert result == {"metrics/my_stage.json": {"accuracy": 0.95}}
 
 
 # =============================================================================
@@ -661,29 +611,17 @@ def test_get_metric_info_from_head_no_stages(mock_discovery: PipelineLike) -> No
 
 
 def test_get_metric_info_from_head_with_metric_stage(
-    tmp_path: Path,
     mock_discovery: PipelineLike,
     mocker: MockerFixture,
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
-    """Collect metric hashes from lock files at HEAD."""
+    """Collect metric hashes from lock files at HEAD, keyed by workspace path."""
     from pivot import git
 
-    metric_file = tmp_path / "metrics.json"
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
+    _register_metric_stage(mock_discovery, "my_stage")
 
     lock_content = yaml.dump(
-        make_valid_lock_content(
-            outs=[
-                {
-                    "key": None,
-                    "hash": "abc123",
-                    "tag": "metric",
-                    "path": "metrics.json",
-                }
-            ]
-        )
+        make_valid_lock_content(outs=[{"key": None, "hash": "abc123", "tag": "metric"}])
     )
     mocker.patch.object(
         git,
@@ -693,41 +631,33 @@ def test_get_metric_info_from_head_with_metric_stage(
 
     result = metrics.get_metric_info_from_head()
 
-    assert "metrics.json" in result
-    assert result["metrics.json"] == "abc123"
+    assert result == {"metrics/my_stage.json": "abc123"}
 
 
 def test_get_metric_info_from_head_no_lock_file(
-    tmp_path: Path,
     mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Missing lock file returns None hash."""
     from pivot import git
 
-    metric_file = tmp_path / "metrics.json"
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
+    _register_metric_stage(mock_discovery, "my_stage")
 
     mocker.patch.object(git, "read_files_from_head", return_value={})
 
     result = metrics.get_metric_info_from_head()
 
-    assert "metrics.json" in result
-    assert result["metrics.json"] is None
+    assert result == {"metrics/my_stage.json": None}
 
 
 def test_get_metric_info_from_head_invalid_lock_yaml(
-    tmp_path: Path,
     mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Invalid YAML in lock file returns None hash."""
     from pivot import git
 
-    metric_file = tmp_path / "metrics.json"
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
+    _register_metric_stage(mock_discovery, "my_stage")
 
     mocker.patch.object(
         git,
@@ -737,21 +667,17 @@ def test_get_metric_info_from_head_invalid_lock_yaml(
 
     result = metrics.get_metric_info_from_head()
 
-    assert "metrics.json" in result
-    assert result["metrics.json"] is None
+    assert result == {"metrics/my_stage.json": None}
 
 
 def test_get_metric_info_from_head_lock_missing_outs(
-    tmp_path: Path,
     mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Lock file without 'outs' key returns None hash."""
     from pivot import git
 
-    metric_file = tmp_path / "metrics.json"
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
+    _register_metric_stage(mock_discovery, "my_stage")
 
     lock_content = yaml.dump({"deps": []})
     mocker.patch.object(
@@ -762,21 +688,17 @@ def test_get_metric_info_from_head_lock_missing_outs(
 
     result = metrics.get_metric_info_from_head()
 
-    assert "metrics.json" in result
-    assert result["metrics.json"] is None
+    assert result == {"metrics/my_stage.json": None}
 
 
 def test_get_metric_info_from_head_outs_not_list(
-    tmp_path: Path,
     mock_discovery: PipelineLike,
     mocker: MockerFixture,
 ) -> None:
     """Lock file with non-list 'outs' returns None hash."""
     from pivot import git
 
-    metric_file = tmp_path / "metrics.json"
-
-    _register_metric_stage(mock_discovery, "my_stage", str(metric_file))
+    _register_metric_stage(mock_discovery, "my_stage")
 
     lock_content = yaml.dump({"outs": "not a list"})
     mocker.patch.object(
@@ -787,8 +709,7 @@ def test_get_metric_info_from_head_outs_not_list(
 
     result = metrics.get_metric_info_from_head()
 
-    assert "metrics.json" in result
-    assert result["metrics.json"] is None
+    assert result == {"metrics/my_stage.json": None}
 
 
 def test_collect_metrics_from_head_from_cache(

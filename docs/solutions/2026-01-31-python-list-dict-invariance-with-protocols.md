@@ -1,72 +1,49 @@
 ---
 tags: [python, typing, protocols, generics]
 category: gotcha
-module: outputs
-symptoms: ["Type parameter '_T@list' is invariant", "list[Subclass] not assignable to list[BaseClass]", "Consider switching from 'list' to 'Sequence'"]
+module: type-system
+symptoms: ["invariant list value type", "invariant dictionary value type", "Consider switching from list to Sequence"]
 ---
 
-# Python List/Dict Invariance with Protocols
+# Python List and Dict Invariance with Protocols
 
 ## Problem
 
-When introducing a `BaseOut` Protocol as a common interface for `Out`, `DirectoryOut`, and `IncrementalOut`, type errors appeared at multiple call sites:
+A mutable container does not become covariant merely because its members satisfy
+a protocol:
 
 ```python
-# In RegistryStageInfo TypedDict
-outs: list[Out[Any]]  # Contains Out instances
+class Descriptor(Protocol):
+    ...
 
-# In WorkerStageInfo TypedDict
-outs: list[BaseOut]  # Expects BaseOut Protocol
-
-# Error when passing RegistryStageInfo.outs to WorkerStageInfo:
-# "list[Out[Any]]" is not assignable to "list[BaseOut]"
-# Type parameter "_T@list" is invariant
+file_descriptors: list[FileDescriptor]
+all_descriptors: list[Descriptor] = file_descriptors  # type error
 ```
 
-Similarly with dicts:
-```python
-out_specs: dict[str, Out[Any]]  # Source
-out_specs: dict[str, BaseOut]   # Target
-
-# Error: "dict[str, Out[Any]]" is not assignable to "dict[str, BaseOut]"
-# Type parameter "_VT@dict" is invariant
-```
-
-## Root Cause
-
-Python's `list` and `dict` are **invariant** in their type parameters, not covariant. This means even if `Out` satisfies the `BaseOut` Protocol, `list[Out]` is not a subtype of `list[BaseOut]`.
-
-The reason is type safety: a `list[BaseOut]` could have a `DirectoryOut` appended to it, but a `list[Out]` cannot safely accept a `DirectoryOut`.
+The assignment would let callers append another `Descriptor` implementation to
+a list that promises only `FileDescriptor` values.
 
 ## Solution
 
-Two approaches work:
+For read-only consumers, use covariant container interfaces:
 
-### 1. Use Covariant Types (Sequence/Mapping)
-
-For read-only access, use covariant container types:
 ```python
-from typing import Sequence, Mapping
+from collections.abc import Mapping, Sequence
 
-outs: Sequence[BaseOut]  # Covariant - accepts list[Out]
-out_specs: Mapping[str, BaseOut]  # Covariant in values
+
+def inspect_all(items: Sequence[Descriptor], by_name: Mapping[str, Descriptor]) -> None:
+    ...
 ```
 
-### 2. Unify the Types
+For mutation, keep a consistent concrete element type across the interface:
 
-If all code paths construct and consume the same concrete types, use a consistent type throughout:
 ```python
-# Both TypedDicts use the same type
-outs: list[BaseOut]
-out_specs: dict[str, BaseOut]
+descriptors: list[Descriptor] = []
+descriptors.append(FileDescriptor())
 ```
-
-This was the chosen solution - changing `RegistryStageInfo` to use `BaseOut` since it can contain any output type (`Out`, `DirectoryOut`, `IncrementalOut`).
 
 ## Key Insight
 
-When introducing a base Protocol/ABC for a type hierarchy, audit all container usages. Lists and dicts of the old type won't automatically work where the new base type is expected. Either:
-1. Switch to covariant containers (`Sequence`, `Mapping`) for read-only access
-2. Update all container types to use the base type consistently
-
-The type checker's error message "Consider switching from 'list' to 'Sequence'" is a helpful hint, but unifying the types may be cleaner when mutation is needed.
+`list` and `dict` are invariant because mutation must remain type safe.
+`Sequence` and `Mapping` are covariant read-only views. Choose a read-only
+interface whenever the callee does not mutate the collection.
