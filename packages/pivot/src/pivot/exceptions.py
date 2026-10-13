@@ -211,7 +211,7 @@ class CacheRestoreError(CacheError):
     """Raised when restoring outputs from cache fails."""
 
 
-class UncachedIncrementalOutputError(CacheError):
+class UncachedIncrementalArtifactError(CacheError):
     """Raised when an incremental output exists without a cache entry."""
 
 

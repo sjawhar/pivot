@@ -914,7 +914,7 @@ class Engine:
             )
             if uncached:
                 files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
-                raise pivot_exceptions.UncachedIncrementalOutputError(
+                raise pivot_exceptions.UncachedIncrementalArtifactError(
                     "The following incremental output files exist but are not in cache:\n"
                     + f"{files_list}\n\n"
                     + "Running the pipeline will DELETE these files and they cannot be restored.\n"

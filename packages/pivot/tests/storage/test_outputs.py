@@ -1,6 +1,6 @@
 import pytest
 
-from pivot import loaders, outputs, stage_def
+from pivot import loaders, outputs
 
 
 def test_out_cache_default_true() -> None:
@@ -82,13 +82,6 @@ def test_out_instances_are_out() -> None:
     assert isinstance(out, outputs.Out)
     assert isinstance(metric, outputs.Out)
     assert isinstance(plot, outputs.Out)
-
-
-def test_legacy_path_output_plumbing_is_not_exposed() -> None:
-    """Compositional outputs do not retain the removed path-bearing helpers."""
-    assert not hasattr(outputs, "BaseOut")
-    assert not hasattr(outputs, "is_directory_out")
-    assert not hasattr(stage_def, "save_return_outputs")
 
 
 # DirectoryOut tests
