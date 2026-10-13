@@ -63,7 +63,7 @@ Defaults Pivot chooses without an annotation: `DataFrame` → `DataFrameJSONL()`
 Loading a pickle can execute arbitrary code. Only load Pickle artifacts written
 by code you trust. A cache or remote that can supply pickle bytes is a
 trusted-code boundary: content hashes identify bytes, but they do not make
-those bytes safe. The loader emits a `RuntimeWarning` when it loads a pickle.
+those bytes safe.
 
 `PathOnly()` hands a stage an input path without loading content. For an output,
 it takes ownership of a file or directory created outside the project and moves
