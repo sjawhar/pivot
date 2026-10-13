@@ -830,10 +830,11 @@ def test_concurrent_restore_uses_locking(
         cast("object", mp_manager.Queue()),
     )
     state_dir = tmp_path / ".pivot"
-    p1 = multiprocessing.Process(
+    ctx = multiprocessing.get_context("spawn")
+    p1 = ctx.Process(
         target=_restore_worker, args=(test_dir, output_hash, cache_dir, state_dir, result_queue)
     )
-    p2 = multiprocessing.Process(
+    p2 = ctx.Process(
         target=_restore_worker, args=(test_dir, output_hash, cache_dir, state_dir, result_queue)
     )
     p1.start()
