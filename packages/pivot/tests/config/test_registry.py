@@ -258,7 +258,7 @@ def test_register_uses_default_params_value(tmp_path: pathlib.Path) -> None:
 
 @pytest.mark.xfail(
     strict=True,
-    reason="red test (owner TBD): compose accepts a StageParams instance whose type does not "
+    reason="red test for Task 18: compose accepts a StageParams instance whose type does not "
     + "match the stage's params annotation (main raised ParamsError at registration)",
 )
 def test_register_params_type_mismatch_raises_error(tmp_path: pathlib.Path) -> None:

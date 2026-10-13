@@ -25,13 +25,11 @@ def test_valid_inputs_pass_silently(tmp_path: pathlib.Path) -> None:
     assert pipeline.list_stages() == ["valid/_helper_reader"]
 
 
-_EMPTY_NAME_REASON = (
-    "red test (owner TBD): Pipeline accepts an empty or whitespace-only name, "
-    + "producing stage names like '/stage'"
+@pytest.mark.xfail(
+    strict=True,
+    reason="red test for Task 18: Pipeline accepts an empty or whitespace-only name, "
+    + "producing stage names like '/stage'",
 )
-
-
-@pytest.mark.xfail(strict=True, reason=_EMPTY_NAME_REASON)
 @pytest.mark.parametrize("name", [pytest.param("", id="empty"), pytest.param("   ", id="spaces")])
 def test_blank_pipeline_name_raises_error(tmp_path: pathlib.Path, name: str) -> None:
     """An empty or whitespace-only pipeline name is rejected at definition time."""
@@ -44,7 +42,7 @@ def test_blank_pipeline_name_raises_error(tmp_path: pathlib.Path, name: str) -> 
 
 @pytest.mark.xfail(
     strict=True,
-    reason="red test (owner TBD): Pipeline.input accepts paths containing control characters",
+    reason="red test for Task 18: Pipeline.input accepts paths containing control characters",
 )
 @pytest.mark.parametrize(
     "path",
@@ -59,5 +57,28 @@ def test_input_path_with_control_character_raises_error(tmp_path: pathlib.Path, 
     with (
         pytest.raises(exceptions.SecurityValidationError),
         compose.Pipeline("bad_input", root=tmp_path) as pipeline,
+    ):
+        _helper_reader(pipeline.input("data", path=path, t=str))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="red test for Task 18: Pipeline.input accepts a path outside the project root, "
+    + "and the stage then reads that file",
+)
+@pytest.mark.parametrize(
+    "outside", [pytest.param(True, id="absolute"), pytest.param(False, id="parent-traversal")]
+)
+def test_input_path_outside_project_raises_error(tmp_path: pathlib.Path, outside: bool) -> None:
+    """An input path that escapes the project root is rejected as a security error."""
+    root = tmp_path / "project"
+    root.mkdir()
+    secret = tmp_path / "secret_outside.txt"
+    secret.write_text("TOP SECRET")
+    path = str(secret) if outside else "../secret_outside.txt"
+
+    with (
+        pytest.raises(exceptions.SecurityValidationError),
+        compose.Pipeline("escape", root=root) as pipeline,
     ):
         _helper_reader(pipeline.input("data", path=path, t=str))
