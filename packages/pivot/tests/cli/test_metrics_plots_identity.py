@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import pathlib
+import re
 from typing import TYPE_CHECKING, Annotated
 
 import matplotlib.figure
@@ -10,9 +12,8 @@ import matplotlib.figure
 from pivot import cli, compose, executor
 
 if TYPE_CHECKING:
-    import pathlib
-
     import click.testing
+    import pytest
 
     from conftest import GitRepo
 
@@ -115,3 +116,41 @@ def test_plots_show_without_targets_renders_plot(
     html = (root / "out" / "index.html").read_text()
     assert "<p>1 plot(s)</p>" in html
     assert f"<h3>{_PLOT_REL}</h3>" in html
+
+
+def test_plots_show_default_writes_gallery_under_pivot_dir_with_relative_src(
+    runner: click.testing.CliRunner, git_repo: GitRepo, mock_discovery: compose.Pipeline
+) -> None:
+    root, _ = git_repo
+    _run_and_commit(mock_discovery, git_repo, "abc")
+
+    result = runner.invoke(cli.cli, ["plots", "show"])
+
+    assert result.exit_code == 0, result.output
+    gallery = root / ".pivot" / "plots" / "index.html"
+    assert gallery.is_file(), result.output
+    assert not (root / "pivot_plots").exists()
+    src = re.search(r'<img src="([^"]+)"', gallery.read_text())
+    assert src is not None
+    assert not pathlib.Path(src.group(1)).is_absolute(), src.group(1)
+    assert (gallery.parent / src.group(1)).resolve() == (root / _PLOT_REL).resolve()
+
+
+def test_plots_show_from_subdirectory_writes_gallery_at_project_root(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mock_discovery: compose.Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = git_repo
+    _run_and_commit(mock_discovery, git_repo, "abc")
+    sub = root / "sub"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+
+    result = runner.invoke(cli.cli, ["plots", "show"])
+
+    assert result.exit_code == 0, result.output
+    assert "Rendered 1 plot(s) to .pivot/plots/index.html" in result.output
+    assert (root / ".pivot" / "plots" / "index.html").is_file()
+    assert not (sub / ".pivot").exists(), "must not create a stray .pivot in the subdirectory"

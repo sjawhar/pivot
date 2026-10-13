@@ -82,7 +82,7 @@ Lock files and StateDB use different path semantics:
 
 ## Manifest Cache
 
-Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → hash) are cached in StateDB under the `sm:` prefix, along with source maps that record which source files contributed to the manifest.
+Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → hash) are cached in StateDB under the `sm:` prefix, along with source maps that record which source files contributed to the manifest. A source map holds the files of the functions walked plus the file of every project module loaded when the manifest was computed: a manifest records values bound in other modules' namespaces (`settings.FACTOR`, `from settings import FACTOR`, a module rebinding an imported helper), and an edit to any of those modules must invalidate the entry. A cache hit requires every recorded file's mtime, size and inode to be unchanged. Manifests computed with unsafe-capture warnings are never cached. `pivot fingerprint reset` clears both `fp:` and `sm:` entries.
 
 **Flush boundaries** (where pending manifest cache writes are committed to StateDB):
 - After discovery loads `pipeline.py` (`discovery.py`)

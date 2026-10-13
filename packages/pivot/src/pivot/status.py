@@ -92,6 +92,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
+"""Reason prefix for a stage that is current on its own but has a stale upstream."""
+
 
 def _discover_tracked_files(
     allow_missing: bool,
@@ -248,7 +251,11 @@ def _compute_explanations_with_upstream(
         reason = (
             exp["reason"]
             if exp["will_run"]
-            else (f"Upstream stale ({', '.join(upstream_stale)})" if upstream_stale else "")
+            else (
+                f"{UPSTREAM_STALE_REASON_PREFIX} ({', '.join(upstream_stale)})"
+                if upstream_stale
+                else ""
+            )
         )
 
         # Create new explanation with upstream_stale populated
@@ -439,12 +446,22 @@ def get_suggestions(
     push_count: int,
     pull_count: int,
     orphan_count: int = 0,
+    missing_outputs_count: int = 0,
+    remote_configured: bool = False,
 ) -> list[str]:
     suggestions = list[str]()
 
+    # A clone whose locks are current but whose outputs are absent: pulling restores them
+    # without recomputing, so it comes before the repro suggestion.
+    if missing_outputs_count > 0 and remote_configured:
+        suggestions.append(
+            f"Run `pivot pull` to restore outputs of {missing_outputs_count} "
+            + f"{_pluralize(missing_outputs_count, 'stage')} from the remote"
+        )
+
     if stale_count > 0:
         suggestions.append(
-            f"Run `pivot run` to execute {stale_count} stale {_pluralize(stale_count, 'stage')}"
+            f"Run `pivot repro` to execute {stale_count} stale {_pluralize(stale_count, 'stage')}"
         )
 
     if modified_count > 0:

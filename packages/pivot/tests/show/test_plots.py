@@ -479,3 +479,19 @@ def test_render_plots_html_escapes_xss(tmp_path: Path) -> None:
     content = result.read_text()
     assert "<script>" not in content, "Script tags should be escaped"
     assert "&lt;script&gt;" in content, "HTML entities should be used"
+
+
+def test_render_plots_html_img_src_is_relative_to_html_file(tmp_path: Path) -> None:
+    """A plot outside the HTML file's directory is referenced by a relative path, never absolute."""
+    plot_file = tmp_path / "plots" / "p" / "chart.png"
+    plot_file.parent.mkdir(parents=True)
+    plot_file.write_bytes(b"data")
+    output_path = tmp_path / ".pivot" / "plots" / "index.html"
+
+    plots.render_plots_html(
+        [plots.PlotInfo(path=str(plot_file), stage_name="p/chart")], output_path
+    )
+
+    content = output_path.read_text()
+    assert '<img src="../../plots/p/chart.png"' in content, content
+    assert f'src="{tmp_path}' not in content, "img src must not be absolute"

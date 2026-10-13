@@ -375,7 +375,7 @@ def test_register_captures_transitive_dependencies(test_pipeline: PipelineLike) 
 
     fp = test_pipeline.ensure_fingerprint("test/my_stage")
     assert "self:my_stage" in fp
-    assert "func:helper" in fp
+    assert f"func:{helper.__module__}.{helper.__qualname__}" in fp
 
 
 def test_multiple_stages_registered(
@@ -397,7 +397,7 @@ def test_stage_captures_user_code_helpers() -> None:
     fp = fingerprint.get_stage_fingerprint(stage_uses_helper)
 
     # Should capture the helper (user code)
-    assert "func:helper_uses_math" in fp
+    assert f"func:{__name__}.helper_uses_math" in fp
     # math.pi is stdlib - should NOT be in fingerprint
     assert "mod:math.pi" not in fp
 
@@ -412,7 +412,7 @@ def test_register_captures_constants(test_pipeline: PipelineLike) -> None:
     helpers.register_test_stage(uses_constant)
 
     fp = test_pipeline.ensure_fingerprint("test/uses_constant")
-    assert "const:LEARNING_RATE" in fp
+    assert f"const:{__name__}.LEARNING_RATE" in fp
 
 
 def test_registry_build_dag_integration(tmp_path: pathlib.Path) -> None:

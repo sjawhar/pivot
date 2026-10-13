@@ -485,7 +485,7 @@ pivot plots show [TARGETS...] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--output` / `-o PATH` | Output HTML path (default: `pivot_plots/index.html`) |
+| `--output` / `-o PATH` | Output HTML path (default: `.pivot/plots/index.html`, ignored by git). Image paths are relative to the HTML file. |
 | `--open` | Open browser after rendering |
 
 ---
@@ -954,7 +954,7 @@ Manage function fingerprinting cache.
 
 #### `pivot fingerprint reset`
 
-Reset cached function fingerprints. Use after encountering stale cache issues or when troubleshooting unexpected stage re-runs.
+Reset cached function fingerprints and cached stage manifests. Use after encountering stale cache issues or when troubleshooting unexpected stage re-runs.
 
 ```bash
 pivot fingerprint reset

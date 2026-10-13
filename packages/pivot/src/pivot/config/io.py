@@ -42,6 +42,11 @@ def get_config_path(scope: models.ConfigScope) -> pathlib.Path:
             return get_local_config_path()
 
 
+def _config_lock_path(path: pathlib.Path) -> pathlib.Path:
+    """Lock file guarding a config file: ``config.yaml`` -> ``config.yaml.lock``."""
+    return path.with_name(f"{path.name}.lock")
+
+
 def _load_yaml(path: pathlib.Path, *, as_dict: bool) -> Any:
     """Load YAML config with error handling."""
     if not path.exists():
@@ -106,7 +111,7 @@ def edit_config(
         # File is automatically saved on context exit
     """
     path = get_config_path(scope)
-    lock_path = path.with_suffix(".lock")
+    lock_path = _config_lock_path(path)
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -260,7 +265,7 @@ def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.
     """Remove config value from specified scope. Returns True if removed."""
     keys = parse_dotted_key(key)
     path = get_config_path(scope)
-    lock_path = path.with_suffix(".lock")
+    lock_path = _config_lock_path(path)
 
     if not path.exists():
         return False
