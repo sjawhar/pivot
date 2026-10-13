@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import pathlib
 import shutil
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import pytest
 
-from pivot import compose, executor, loaders
+from pivot import executor, loaders
+from pivot.storage import cache
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -182,28 +183,33 @@ def test_cache_files_are_readonly_and_properly_structured(
 
 
 def _stage_fails_after_partial_write() -> _JSON_RESULT:
-    """Fail before returning any JSON so Pivot must not write a lock or output."""
+    """Write a partial JSON payload to Pivot's output path, then fail."""
+    output_path = pathlib.Path("data/test/failing.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text('{"partial": ')
     raise RuntimeError("Stage failed intentionally")
 
 
 def test_stage_failure_leaves_workspace_consistent(
     mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed stage commits neither an output nor a lock and can be replaced safely."""
+    """Partial failure has no lock/cache entry and same-name retry succeeds."""
     root = _prepare_project(mock_discovery, monkeypatch)
     helpers.register_test_stage(_stage_fails_after_partial_write, name="failing")
-
-    executor.run(pipeline=mock_discovery)
-
     output_file = helpers.get_output_path("failing")
     lock_file = root / ".pivot/stages/test/failing.lock"
-    assert not output_file.exists()
+
+    results = executor.run(pipeline=mock_discovery)
+    assert results["test/failing"]["status"] == "failed"
     assert not lock_file.exists()
+    assert output_file.read_text() == '{"partial": '
+    partial_hash, _ = cache.hash_file(output_file)
+    assert not cache.get_cache_path(root / ".pivot/cache/files", partial_hash).exists()
 
-    retry = compose.Pipeline("retry", root=root)
-    helpers.register_test_stage(
-        _stage_produces_single_file_with_marker, name="failing", pipeline=retry
-    )
-    executor.run(pipeline=retry)
+    output_file.unlink()
+    cast("Any", mock_discovery)._registry.clear()
+    helpers.register_test_stage(_stage_produces_single_file_with_marker, name="failing")
+    retry = executor.run(pipeline=mock_discovery)
 
-    _assert_json(root / "data/retry/failing.json", {"value": 42, "run": 1})
+    assert retry["test/failing"]["status"] == "ran"
+    _assert_json(output_file, {"value": 42, "run": 1})
