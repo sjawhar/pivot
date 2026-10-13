@@ -6,24 +6,20 @@ import pytest
 from pivot.engine import graph as engine_graph
 from pivot.engine.scheduler import Scheduler
 from pivot.engine.types import NodeType, StageExecutionState
-from pivot.executor import core as executor_core
 
 
 def _helper_init_scheduler(
     *,
     execution_order: list[str],
     edges: list[tuple[str, str]] | None = None,
-    stage_mutex: dict[str, list[str]] | None = None,
+    stage_resources: dict[str, dict[str, int]] | None = None,
+    resource_capacity: dict[str, int] | None = None,
 ) -> Scheduler:
-    """Create a Scheduler using only the public API.
-
-    Args:
-        execution_order: Stage names in topological order.
-        edges: (upstream, downstream) stage dependency pairs.
-        stage_mutex: Per-stage mutex list. Defaults to empty list per stage.
-    """
-    if stage_mutex is None:
-        stage_mutex = {name: list[str]() for name in execution_order}
+    """Create a Scheduler using only its public resource API."""
+    if stage_resources is None:
+        stage_resources = {name: {"cpu": 1} for name in execution_order}
+    if resource_capacity is None:
+        resource_capacity = {"cpu": len(execution_order)}
 
     if edges:
         g: nx.DiGraph[str] | None = nx.DiGraph()
@@ -38,14 +34,19 @@ def _helper_init_scheduler(
         g = None
 
     scheduler = Scheduler()
-    scheduler.initialize(execution_order, g, stage_mutex=stage_mutex)
+    scheduler.initialize(
+        execution_order,
+        g,
+        stage_resources=stage_resources,
+        resource_capacity=resource_capacity,
+    )
     return scheduler
 
 
-def _helper_startable_in_order(scheduler: Scheduler, running_count: int) -> list[str]:
+def _helper_startable_in_order(scheduler: Scheduler) -> list[str]:
     startable: list[str] = []
     for name in list(scheduler.stage_states.keys()):
-        if scheduler.can_start(name, running_count=running_count):
+        if scheduler.can_start(name):
             startable.append(name)
     return startable
 
@@ -56,15 +57,11 @@ def test_can_start_requires_ready_and_no_upstream() -> None:
         edges=[("upstream", "stage")],
     )
 
-    assert scheduler.can_start("stage", running_count=0) is False, (
-        "PENDING stage should not be startable"
-    )
+    assert scheduler.can_start("stage") is False, "PENDING stage should not be startable"
 
     scheduler.set_state("upstream", StageExecutionState.COMPLETED)
     scheduler.on_stage_completed("upstream", failed=False)
-    assert scheduler.can_start("stage", running_count=0) is True, (
-        "READY stage with no upstream should be startable"
-    )
+    assert scheduler.can_start("stage") is True, "READY stage with no upstream should be startable"
 
     scheduler = _helper_init_scheduler(
         execution_order=["upstream_a", "upstream_b", "stage"],
@@ -72,53 +69,40 @@ def test_can_start_requires_ready_and_no_upstream() -> None:
     )
     scheduler.set_state("upstream_a", StageExecutionState.COMPLETED)
     scheduler.on_stage_completed("upstream_a", failed=False)
-    assert scheduler.can_start("stage", running_count=0) is False, (
-        "READY stage with unfinished upstream should not be startable"
-    )
+    assert scheduler.can_start("stage") is False, "READY stage should wait for all upstreams"
 
 
-def test_can_start_respects_named_mutex() -> None:
+def test_can_start_respects_resource_capacity() -> None:
     scheduler = _helper_init_scheduler(
         execution_order=["holder", "stage"],
-        stage_mutex={"holder": ["mutex"], "stage": ["mutex"]},
+        stage_resources={"holder": {"cpu": 1, "gpu": 1}, "stage": {"cpu": 1, "gpu": 1}},
+        resource_capacity={"cpu": 2, "gpu": 1},
     )
 
-    scheduler.acquire_mutexes("holder")
+    scheduler.acquire_resources("holder")
 
-    assert scheduler.can_start("stage", running_count=0) is False, (
-        "stage should not start when its mutex is held"
-    )
+    assert scheduler.can_start("stage") is False, "stage should wait while GPU is held"
 
-    scheduler.release_mutexes("holder")
-    assert scheduler.can_start("stage", running_count=0) is True, (
-        "stage should start when its mutex is released"
-    )
+    scheduler.release_resources("holder")
+    assert scheduler.can_start("stage") is True, "stage should start after GPU is released"
 
 
-def test_can_start_respects_exclusive_mutex_and_running() -> None:
+def test_can_start_respects_full_cpu_resource() -> None:
     scheduler = _helper_init_scheduler(
         execution_order=["exclusive", "normal"],
-        stage_mutex={"exclusive": [executor_core.EXCLUSIVE_MUTEX], "normal": []},
+        stage_resources={"exclusive": {"cpu": 2}, "normal": {"cpu": 1}},
+        resource_capacity={"cpu": 2},
     )
 
-    assert scheduler.can_start("exclusive", running_count=1) is False, (
-        "exclusive stage should not start when other stages are running"
-    )
-
-    assert scheduler.can_start("exclusive", running_count=0) is True, (
-        "exclusive stage should start when nothing else is running"
-    )
-
-    scheduler.acquire_mutexes("exclusive")
-    assert scheduler.can_start("normal", running_count=0) is False, (
-        "normal stage should not start when exclusive mutex is held"
-    )
+    assert scheduler.can_start("exclusive") is True
+    scheduler.acquire_resources("exclusive")
+    assert scheduler.can_start("normal") is False
 
 
 def test_ready_selection_respects_stage_state_insertion_order() -> None:
     scheduler = _helper_init_scheduler(execution_order=["second", "first", "third"])
 
-    assert _helper_startable_in_order(scheduler, running_count=0) == [
+    assert _helper_startable_in_order(scheduler) == [
         "second",
         "first",
         "third",
@@ -189,11 +173,7 @@ def test_on_stage_completed_cascades_failure() -> None:
     scheduler = _helper_init_scheduler(
         execution_order=["A", "B"],
         edges=[("A", "B")],
-        stage_mutex={"A": ["mutex"], "B": ["mutex"]},
     )
-
-    scheduler.acquire_mutexes("A")
-    scheduler.release_mutexes("A")
     newly_ready, newly_blocked = scheduler.on_stage_completed("A", failed=True)
 
     assert scheduler.get_state("B") == StageExecutionState.BLOCKED, (
@@ -306,25 +286,26 @@ def test_state_enum_comparison_for_monotonicity_guard() -> None:
     )
 
 
-def test_release_mutexes_raises_on_underflow() -> None:
-    """Releasing a mutex that was never acquired should raise ValueError."""
+def test_release_resources_raises_on_underflow() -> None:
+    """Releasing resources that were never acquired fails loudly."""
     scheduler = _helper_init_scheduler(
         execution_order=["stage"],
-        stage_mutex={"stage": ["my_mutex"]},
+        stage_resources={"stage": {"cpu": 1, "gpu": 1}},
+        resource_capacity={"cpu": 1, "gpu": 1},
     )
-    # Release without acquire — should fail loud
-    with pytest.raises(ValueError, match="Mutex.*released when not held"):
-        scheduler.release_mutexes("stage")
+    with pytest.raises(ValueError, match="Resource.*released when not held"):
+        scheduler.release_resources("stage")
 
 
-def test_initialize_validates_stage_mutex_consistency() -> None:
-    """initialize() raises if stage_mutex keys don't match execution_order."""
+def test_initialize_validates_stage_resource_consistency() -> None:
+    """initialize() raises when resource mapping keys don't match execution order."""
     scheduler = Scheduler()
-    with pytest.raises(ValueError, match="stage_mutex"):
+    with pytest.raises(ValueError, match="stage resource"):
         scheduler.initialize(
             execution_order=["A", "B"],
             graph=None,
-            stage_mutex={"A": [], "C": []},  # Missing B, has extra C
+            stage_resources={"A": {"cpu": 1}, "C": {"cpu": 1}},
+            resource_capacity={"cpu": 2},
         )
 
 
@@ -359,7 +340,8 @@ def test_initialize_resets_stop_starting_new() -> None:
     scheduler.initialize(
         execution_order=["stage"],
         graph=None,
-        stage_mutex={"stage": []},
+        stage_resources={"stage": {"cpu": 1}},
+        resource_capacity={"cpu": 1},
     )
     assert scheduler.stop_starting_new is False, (
         "initialize() should reset stop_starting_new for watch-mode re-runs"

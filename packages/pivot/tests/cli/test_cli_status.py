@@ -54,6 +54,124 @@ with Pipeline("test") as pipeline:
     process(pipeline.input("input.txt"))
 """
 
+
+_RESOURCE_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+@stage(resources={"gpu": CAPACITY})
+def process(input_file: str) -> str:
+    return "done"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
+
+_ALIASED_RESOURCE_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage as task
+
+
+@task(resources={"gpu": CAPACITY})
+def process(input_file: str) -> str:
+    return "done"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
+
+_NESTED_RESOURCE_DECORATOR_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+@stage(resources={"gpu": 1})
+def process(input_file: str) -> str:
+    class Other:
+        @staticmethod
+        def stage(*, resources: dict[str, int]):
+            def decorate(func):
+                return func
+            return decorate
+
+    other = Other()
+
+    @other.stage(resources={"delta": DELTA})
+    def nested() -> str:
+        return "done"
+
+    return nested()
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
+
+_USER_DECORATOR_RESOURCE_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+def marker_one(func):
+    return func
+
+
+def marker_two(func):
+    return func
+
+
+@MARKER
+@stage(resources={"gpu": 1})
+def process(input_file: str) -> str:
+    return "done"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
+
+_HOSTILE_RESOURCE_DECORATOR_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+class Bomb:
+    def __getattribute__(self, name):
+        if name == "__dict__":
+            raise RuntimeError("fingerprinting evaluated unrelated decorator")
+        return object.__getattribute__(self, name)
+
+    def stage(self, *, resources: dict[str, int]):
+        def decorate(func):
+            return func
+        return decorate
+
+
+bomb = Bomb()
+
+
+@bomb.stage(resources={"delta": DELTA})
+@stage(resources={"gpu": 1})
+def process(input_file: str) -> str:
+    return "done"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
 _STAGES_A_B_PIPELINE = """\
 from __future__ import annotations
 
@@ -196,6 +314,106 @@ def test_status_shows_cached_stages(
         assert "Pipeline Status" in result.output
         assert "1 cached" in result.output
         assert "0 stale" in result.output
+
+
+def test_status_keeps_stage_cached_when_only_resources_change(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Scheduler resource declarations do not invalidate a stage fingerprint."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_RESOURCE_PIPELINE.replace("CAPACITY", "1"))
+
+        repro = runner.invoke(cli.cli, ["repro", "--resources", "gpu=2"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_RESOURCE_PIPELINE.replace("CAPACITY", "2"))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "1 cached" in result.output
+        assert "0 stale" in result.output
+
+
+def test_status_keeps_aliased_resource_stage_cached(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An aliased Pivot stage decorator excludes resources from its fingerprint."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_ALIASED_RESOURCE_PIPELINE.replace("CAPACITY", "1"))
+
+        repro = runner.invoke(cli.cli, ["repro", "--resources", "gpu=2"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_ALIASED_RESOURCE_PIPELINE.replace("CAPACITY", "2"))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "1 cached" in result.output
+        assert "0 stale" in result.output
+
+
+def test_status_detects_nested_unrelated_resource_decorator_change(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A nested decorator that is not Pivot's stage decorator remains fingerprinted."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_NESTED_RESOURCE_DECORATOR_PIPELINE.replace("DELTA", "1"))
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_NESTED_RESOURCE_DECORATOR_PIPELINE.replace("DELTA", "2"))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "0 cached" in result.output
+        assert "1 stale" in result.output
+
+
+def test_status_detects_user_decorator_change_on_resource_stage(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A user decorator remains in a resource stage's fingerprint."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_USER_DECORATOR_RESOURCE_PIPELINE.replace("MARKER", "marker_one"))
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_USER_DECORATOR_RESOURCE_PIPELINE.replace("MARKER", "marker_two"))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "0 cached" in result.output
+        assert "1 stale" in result.output
+
+
+def test_status_keeps_hostile_decorator_unevaluated_and_hashed(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Fingerprinting does not inspect an unrelated decorator owner."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_HOSTILE_RESOURCE_DECORATOR_PIPELINE.replace("DELTA", "1"))
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_HOSTILE_RESOURCE_DECORATOR_PIPELINE.replace("DELTA", "2"))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "0 cached" in result.output
+        assert "1 stale" in result.output
 
 
 def test_status_verbose_shows_all_stages(

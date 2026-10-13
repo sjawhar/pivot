@@ -39,7 +39,7 @@ def _create_stage(
         outs=[_artifact_ref(out) for out in outs],
         incremental_inputs={},
         params=None,
-        mutex=list[str](),
+        resources={},
         variant=None,
         signature=None,
         fingerprint=dict[str, str](),

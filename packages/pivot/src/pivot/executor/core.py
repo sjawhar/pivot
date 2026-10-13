@@ -26,9 +26,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Special mutex that means "run exclusively" - no other stages run concurrently
-EXCLUSIVE_MUTEX = "*"
-
 
 def _noop() -> None:
     """Module-level for pickling."""
@@ -155,6 +152,7 @@ def run(
     cache_dir: pathlib.Path | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
+    resource_capacity: dict[str, int] | None = None,
     on_error: OnError | str = OnError.FAIL,
     allow_uncached_incremental: bool = False,
     force: bool = False,
@@ -174,6 +172,7 @@ def run(
         cache_dir: Directory for lock files. Defaults to .pivot/cache.
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
+        resource_capacity: Per-run resource capacity overrides.
         on_error: Error handling mode - "fail" or "keep_going".
         allow_uncached_incremental: If True, skip the uncached incremental-output safety check.
         force: If True, bypass cache and force all stages to re-execute.
@@ -189,6 +188,7 @@ def run(
         cache_dir=cache_dir,
         parallel=parallel,
         max_workers=max_workers,
+        resource_capacity=resource_capacity,
         on_error=on_error,
         allow_uncached_incremental=allow_uncached_incremental,
         force=force,
@@ -204,6 +204,7 @@ def _run_inner(
     cache_dir: pathlib.Path | None,
     parallel: bool,
     max_workers: int | None,
+    resource_capacity: dict[str, int] | None,
     on_error: OnError | str,
     allow_uncached_incremental: bool,
     force: bool,
@@ -250,6 +251,7 @@ def _run_inner(
                 single_stage=single_stage,
                 parallel=parallel,
                 max_workers=max_workers,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 cache_dir=cache_dir,

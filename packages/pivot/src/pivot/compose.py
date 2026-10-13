@@ -54,6 +54,7 @@ plot = _PlotTag()
 incremental = _IncrementalTag()
 
 SINGLE_OUTPUT_KEY = stage_def.SINGLE_OUTPUT_KEY
+_T = TypeVar("_T")
 
 
 class CollectionKind(enum.StrEnum):
@@ -239,7 +240,7 @@ def _emit_stage_info(
         outs=outs,
         incremental_inputs=incremental_inputs,
         params=node.params,
-        mutex=[],
+        resources=dict(getattr(func, "__pivot_resources__", {})),
         variant=node.variant,
         signature=inspect.signature(func),
         fingerprint=None,
@@ -952,11 +953,53 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
 
 # --- @stage decorator ---
 
-_T = TypeVar("_T")
+
+def _normalize_stage_resources(resources: dict[str, int | str] | None) -> dict[str, int | str]:
+    """Normalize and validate a stage's scheduler resource requests."""
+    if resources is None:
+        return dict[str, int | str]()
+
+    normalized = dict[str, int | str]()
+    for name, request in resources.items():
+        normalized_name = name.strip().casefold()
+        if not normalized_name:
+            raise ValueError("Stage resource names must not be empty")
+        if normalized_name in normalized:
+            raise ValueError(f"Stage resource {name!r} is declared more than once")
+        if isinstance(request, str):
+            if request.casefold() != "all":
+                raise ValueError(
+                    f"Stage resource {normalized_name!r} must request a positive integer or 'all'"
+                )
+            if normalized_name != "cpu":
+                raise ValueError("Only the 'cpu' resource supports an 'all' request")
+            normalized[normalized_name] = "all"
+        elif not isinstance(request, bool) and request > 0:
+            normalized[normalized_name] = request
+        else:
+            raise ValueError(
+                f"Stage resource {normalized_name!r} must request a positive integer or 'all'"
+            )
+    return normalized
 
 
-def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
-    """Mark a function as a pipeline stage.
+@typing.overload
+def stage[**P, R](func: Callable[P, R], /) -> Callable[P, R]: ...
+
+
+@typing.overload
+def stage[**P, R](
+    *, resources: dict[str, int | str]
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def stage[**P, R](
+    func: Callable[P, R] | None = None,
+    /,
+    *,
+    resources: dict[str, int | str] | None = None,
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+    """Mark a function as a pipeline stage with optional scheduler resources.
 
     In pipeline context (inside ``with Pipeline()``): records a DAG node, returns ArtifactHandle.
     Outside pipeline context: calls the function normally (for tests/notebooks).
@@ -965,6 +1008,15 @@ def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
     at decoration time. This allows stage modules to use in-body imports for heavy
     dependencies while still having type annotations that reference those types.
     """
+    if func is None:
+        return lambda decorated: _stage(decorated, resources)
+    return _stage(func, resources)
+
+
+def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None) -> Callable[P, R]:
+    """Build a stage wrapper for a validated resource declaration."""
+    normalized_resources = _normalize_stage_resources(resources)
+    setattr(func, "__pivot_resources__", normalized_resources)  # noqa: B010
     _cached_specs: list[_OutputSpec] | None = None
 
     def _get_output_specs() -> list[_OutputSpec]:

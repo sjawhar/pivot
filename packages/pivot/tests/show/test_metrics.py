@@ -45,7 +45,7 @@ def _register_metric_stage(test_pipeline: PipelineLike, name: str) -> Path:
         ],
         incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},

@@ -33,7 +33,7 @@ def _make_stage(
         ],
         incremental_inputs={},
         params=None,
-        mutex=list[str](),
+        resources={},
         variant=None,
         signature=None,
         fingerprint=dict[str, str](),

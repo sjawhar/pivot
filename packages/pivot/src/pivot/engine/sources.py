@@ -62,6 +62,7 @@ class OneShotSource:
         single_stage: bool = False,
         parallel: bool = True,
         max_workers: int | None = None,
+        resource_capacity: dict[str, int] | None = None,
         no_commit: bool = False,
         on_error: OnError = OnError.FAIL,
         cache_dir: Path | None = None,
@@ -77,6 +78,7 @@ class OneShotSource:
             single_stage: If True, run only the specified stages.
             parallel: If True, run stages in parallel.
             max_workers: Maximum worker processes.
+            resource_capacity: CLI resource capacity overrides.
             no_commit: If True, don't update lockfiles.
             on_error: Error handling mode.
             cache_dir: Directory for lock files.
@@ -91,6 +93,7 @@ class OneShotSource:
             single_stage=single_stage,
             parallel=parallel,
             max_workers=max_workers,
+            resource_capacity=dict(resource_capacity or {}),
             no_commit=no_commit,
             on_error=on_error,
             cache_dir=cache_dir,

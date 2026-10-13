@@ -73,7 +73,6 @@ def register_test_stage(
     func: Callable[..., Any],
     name: str | None = None,
     params: type[stage_def.StageParams] | stage_def.StageParams | None = None,
-    mutex: list[str] | None = None,
     variant: str | None = None,
     dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
     out_path_overrides: Mapping[str, outputs.PathType] | None = None,
@@ -86,7 +85,6 @@ def register_test_stage(
         func: The stage function.
         name: Stage name (defaults to function name).
         params: Stage parameters class or instance.
-        mutex: Mutex groups.
         variant: Variant name.
         dep_path_overrides: Override paths for dependencies.
         out_path_overrides: Override paths for outputs.
@@ -143,7 +141,6 @@ def register_test_stage(
                     param_name, t=param_type, path=override_path
                 )
 
-        _ = mutex
         _ = variant
         _ = out_path_overrides
         stage_func(**kwargs)

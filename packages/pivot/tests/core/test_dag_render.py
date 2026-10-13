@@ -43,7 +43,7 @@ def _create_stage(
         outs=[_artifact_ref(out) for out in out_identities],
         incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=None,
         fingerprint={},

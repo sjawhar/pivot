@@ -52,7 +52,7 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
 The Engine uses event-driven orchestration for maximum parallelism:
 
 1. **Stage States** - Each stage has its own state (PENDING → READY → PREPARING → WAITING_ON_LOCK → RUNNING → COMPLETED)
-2. **Scheduler** - `Scheduler` owns stage state, upstream/downstream sets, and mutex decisions
+2. **Scheduler** - `Scheduler` owns stage state, upstream/downstream sets, and resource permits
 3. **Ready Queue** - Engine asks Scheduler for eligible stages
 4. **Event Emission** - StageStarted/StageCompleted events to sinks
 
@@ -114,17 +114,34 @@ queue for log streaming and a shutdown event for the drain thread.
 
 Workers stay alive between stages, so expensive imports (numpy, pandas) only happen once per worker, not once per stage.
 
-## Mutex Handling
+## Stage resources
 
-The scheduler supports mutex groups: stages sharing a group never run at the same time, and the special group `*` runs a stage with nothing else executing. Groups are read from each stage's `RegistryStageInfo["mutex"]`.
+Stages can reserve scheduler-held resources while they execute:
 
-Mutex groups cannot be declared in the compositional API yet: `@stage` and `Pipeline` always record an empty list (`compose.py` `_emit_stage_info`). How a stage declares its groups is an open design question.
+```python
+@stage(resources={"gpu": 1})
+def train(data: pd.DataFrame) -> Model: ...
 
-### Implementation
 
-1. Track active mutex groups (including `*` for exclusive)
-2. Before scheduling, check for conflicts
-3. Wait for conflicting stages to complete
+@stage(resources={"cpu": "all"})
+def compact(data: pd.DataFrame) -> pd.DataFrame: ...
+```
+
+Resource names are case-insensitive. Every scheduled stage, including bare `@stage` functions, holds one `cpu` unit. The `cpu` capacity is the effective worker count, so `cpu: "all"` runs without another stage. Other resources default to capacity 1, which serializes stages sharing that resource.
+
+Set a project capacity in `.pivot/config.yaml` or override it for one command:
+
+```yaml
+resources:
+  gpu: 2
+```
+
+```bash
+pivot repro --resources gpu=2
+pivot run --resources gpu=2 report/train
+```
+
+The scheduler acquires every permit immediately before submitting a stage and releases them when it completes. A stage waiting for a resource does not consume a worker. Resource declarations tune concurrency only; they are not part of stage fingerprints.
 
 ## Stage Execution
 

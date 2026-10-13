@@ -1260,7 +1260,7 @@ def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactR
         outs=outs,
         incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
