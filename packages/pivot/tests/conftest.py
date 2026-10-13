@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import click.testing
 import pytest
+from moto import server as moto_server
 
 from pivot import project
 from pivot.cli import console
@@ -560,6 +561,23 @@ def bind_test_pipeline_helper(request: pytest.FixtureRequest) -> Generator[None]
 # =============================================================================
 # S3 (moto)
 # =============================================================================
+
+
+@pytest.fixture(scope="session")
+def moto_services() -> Generator[dict[str, str]]:
+    """Serve moto in-process, replacing pytest-aioboto3's moto_services.
+
+    The plugin's fixture runs ``moto_server`` as a subprocess with stdout/stderr
+    piped and never read; after ~70 requests in one pytest process the pipe
+    buffer fills with request logs, moto_server blocks writing, and every
+    later S3 call hangs. ThreadedMotoServer has no pipe to fill.
+    """
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    server = moto_server.ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    host, port = server.get_host_and_port()
+    yield {"s3": f"http://{host}:{port}"}
+    server.stop()
 
 
 @pytest.fixture
