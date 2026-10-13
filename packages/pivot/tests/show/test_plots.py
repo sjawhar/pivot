@@ -49,6 +49,7 @@ def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactR
         name=name,
         deps={},
         outs=outs,
+        incremental_inputs={},
         params=None,
         mutex=[],
         variant=None,

@@ -35,6 +35,7 @@ def _helper_make_stage_info(
         name=name,
         deps=deps or {},
         outs=outs,
+        incremental_inputs={},
         params=None,
         mutex=[],
         variant=None,

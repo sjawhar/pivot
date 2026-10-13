@@ -4,18 +4,26 @@ A stage's dependencies are its function parameters. Pivot loads each one before
 the stage runs, passes the loaded value in, and uses the dependency to build the
 [DAG](artifacts-and-dag.md) and to decide when the stage must re-run.
 
-A parameter can receive three kinds of value at the call site:
+A parameter can receive one of four values at the call site:
 
 | Call-site value | The function receives | Creates a DAG edge |
 |-----------------|-----------------------|--------------------|
 | A handle (from `pipeline.input()` or another stage call) | The loaded artifact | Yes |
 | A `list` or `tuple` of handles | A `list` or `tuple` of loaded artifacts | One per handle |
 | A `StageParams` instance (at most one) | That instance, with `params.yaml` overrides applied | No (see [Parameters](parameters.md)) |
+| `pipeline.previous()` or `pipeline.previous("key")` | The stage's prior tagged incremental output | No |
 
 Anything else (an `int`, a string, a path) is rejected when the pipeline is
 built: `parameter 'factor' has unsupported type 'int'. Use ArtifactHandle
 (dependency), StageParams (config), or list/tuple of ArtifactHandle.` Put such
 values in the stage's `StageParams`.
+
+## Previous incremental outputs
+
+`pipeline.previous()` is valid only as an argument to the stage call whose
+return type has one output tagged `incremental`. For a `TypedDict` result, use
+`pipeline.previous("key")` to select the tagged field. Each marker can bind one
+parameter only; it is not a handle and does not add a self-edge to the DAG.
 
 ## Inputs: `pipeline.input()`
 

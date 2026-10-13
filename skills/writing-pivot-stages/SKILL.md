@@ -87,7 +87,8 @@ Outputs: `data/scores/clean/rows.jsonl`, `metrics/scores/clean/summary.yaml`, `d
 - Every parameter receives one of:
   - an **artifact handle** (from `pipeline.input()` or another stage call); the function receives the loaded value,
   - a **list or tuple of handles**; the function receives a list or tuple of loaded values (`tables: list[pd.DataFrame]`),
-  - a **`StageParams` instance**, at most one per stage; never `Optional[...]` or a union.
+  - a **`StageParams` instance**, at most one per stage; never `Optional[...]` or a union,
+  - a **previous-output marker** from `pipeline.previous()` or `pipeline.previous("key")`; the function receives its own prior output tagged `incremental`.
 - Plain values (`factor=3`, a string, a path) are rejected: `parameter 'factor' has unsupported type 'int'`. Put them in `StageParams`.
 - Define stages, their `StageParams`, their return `TypedDict`s and custom loaders at module level. Workers receive the function by pickling. With postponed/string annotations (for example, `from __future__ import annotations`), return annotations are resolved in the module namespace, so a `TypedDict` defined inside a function fails with `name 'Result' is not defined`.
 - Outside a `with Pipeline` block a stage is an ordinary function, so test it directly: `clean(df, CleanParams(min_score=0.9))`.
@@ -116,16 +117,18 @@ The return type decides the format. Annotate only the **return type**; parameter
 | `Annotated[T, loaders.CSV()]` (any loader instance) | that loader | its extension |
 | `Annotated[dict, metric]` | YAML, under `metrics/` | `.yaml` |
 | `Annotated[Figure, plot]` (matplotlib) | PNG, under `plots/` | `.png` |
+| `Annotated[T, incremental]` | the type's `Loader`, restored before the stage runs | its extension |
 | a `TypedDict` | one output per field, each field typed as above | one file per field |
 
 Any other type fails with `Cannot infer serialization format for type int`; wrap it (`-> dict`) or annotate a loader (`Annotated[int, loaders.JSON()]`).
 
-- Import tags from `pivot`: `from pivot import metric, plot`.
+- Import tags from `pivot`: `from pivot import incremental, metric, plot`.
 - Paths are chosen by Pivot: `data/<pipeline>/<stage>.<ext>`, or `data/<pipeline>/<stage>/<field>.<ext>` for `TypedDict` fields; `metrics/` and `plots/` replace `data/` for tagged outputs. Do not write directly to those managed paths.
+- An incremental output receives the loader's `empty()` value on the first run and a writable copy of its previous cached value on later runs. Bind it with `pipeline.previous()` for a single output or `pipeline.previous("key")` for a tagged `TypedDict` field. The marker creates no DAG edge, can bind one parameter only, and requires a full `Loader` with `load()`, `save()`, and `empty()`.
 - For a `pathlib.Path` return, create a file or directory outside the project (for example in a temporary directory) and return that path. Pivot moves it to the managed output path; returning a path already inside the project is rejected because Pivot does not take ownership of user files.
 - A multi-output handle must be narrowed before use: `cleaned.rows` or `cleaned["rows"]`. Passing `cleaned` itself fails with `received handle from multi-output stage ... without selecting an output`.
 - Convert numpy scalars to Python types (`float(x)`, `int(x)`) before putting them in a `dict` or `list` output; YAML cannot read them back.
-- Loaders: `pivot.loaders.CSV`, `JSON`, `YAML`, `Text`, `JSONL`, `DataFrameJSONL`, `Pickle`, `MatplotlibFigure` (`pip install "pivot[matplotlib]"`). A custom loader is a module-level `@dataclasses.dataclass(frozen=True)` subclass of `loaders.Writer[T]` (`save`) or `loaders.Loader[T]` (`load` and `save`).
+- Loaders: `pivot.loaders.CSV`, `JSON`, `YAML`, `Text`, `JSONL`, `DataFrameJSONL`, `Pickle`, `MatplotlibFigure` (`pip install "pivot[matplotlib]"`). A custom loader is a module-level `@dataclasses.dataclass(frozen=True)` subclass of `loaders.Writer[T]` (`save`) or `loaders.Loader[T]` (`load`, `save`, and `empty`).
 
 ## Configuration: one `StageParams` per stage
 

@@ -23,6 +23,7 @@ def _stage_info(name: str, state_dir: pathlib.Path | None) -> RegistryStageInfo:
         name=name,
         deps={},
         outs=[],
+        incremental_inputs={},
         params=None,
         mutex=[],
         variant=None,

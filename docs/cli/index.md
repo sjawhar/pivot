@@ -80,7 +80,7 @@ pivot repro [STAGES...] [OPTIONS]
 | `--fail-fast` | Stop on first failure (default) |
 | `--keep-going` / `-k` | Continue running stages after failures; skip only downstream dependents |
 | `--serve` | Start RPC server for agent control (requires --watch) |
-| `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
+| `--allow-uncached-incremental` | Allow running stages with incremental output files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
 | `--allow-missing` | Allow missing dep files if tracked (only affects --dry-run) |
 | `--all` | Run across all pipelines in the project |
@@ -130,7 +130,7 @@ pivot run STAGES... [OPTIONS]
 | `--no-commit` | Run stages without writing locks, cache, or StateDB |
 | `--fail-fast` | Stop on first failure |
 | `--keep-going` / `-k` | Continue running stages after failures |
-| `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
+| `--allow-uncached-incremental` | Allow running stages with incremental output files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
 | `--all` | Run across all pipelines in the project |
 

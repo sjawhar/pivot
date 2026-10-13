@@ -93,6 +93,7 @@ def _helper_info(
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        incremental_inputs={},
     )
 
 

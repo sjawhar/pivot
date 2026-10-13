@@ -40,6 +40,7 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         name=name,
         deps={},
         outs=outs,
+        incremental_inputs={},
         params=None,
         mutex=[],
         variant=None,

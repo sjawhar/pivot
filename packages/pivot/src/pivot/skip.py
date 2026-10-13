@@ -30,6 +30,7 @@ def check_stage(
     *,
     explain: bool = False,
     force: bool = False,
+    run_cache_allowed: bool = True,
 ) -> ChangeDecision:
     """Single source of truth for Tier 2 skip detection.
 
@@ -41,22 +42,36 @@ def check_stage(
     - Tier 3 (run cache) after this returns changed=True
     """
     if force and not explain:
-        return ChangeDecision(changed=True, reason="forced")
+        return ChangeDecision(changed=True, reason="forced", run_cache_allowed=run_cache_allowed)
 
     if lock_data is None:
-        return ChangeDecision(changed=True, reason="No previous run")
+        return ChangeDecision(
+            changed=True, reason="No previous run", run_cache_allowed=run_cache_allowed
+        )
 
     # Fast path: cheap dict equality, no detailed diffs or path conversion.
     if not explain:
         if lock_data["code_manifest"] != fingerprint:
-            return ChangeDecision(changed=True, reason="Code changed")
+            return ChangeDecision(
+                changed=True, reason="Code changed", run_cache_allowed=run_cache_allowed
+            )
         if lock_data["params"] != params:
-            return ChangeDecision(changed=True, reason="Params changed")
+            return ChangeDecision(
+                changed=True, reason="Params changed", run_cache_allowed=run_cache_allowed
+            )
         if not _dep_hashes_match(lock_data["dep_hashes"], dep_hashes):
-            return ChangeDecision(changed=True, reason="Input dependencies changed")
+            return ChangeDecision(
+                changed=True,
+                reason="Input dependencies changed",
+                run_cache_allowed=run_cache_allowed,
+            )
         if sorted(lock_data["output_hashes"].keys()) != sorted(out_paths):
-            return ChangeDecision(changed=True, reason="Output paths changed")
-        return ChangeDecision(changed=False, reason="")
+            return ChangeDecision(
+                changed=True,
+                reason="Output paths changed",
+                run_cache_allowed=run_cache_allowed,
+            )
+        return ChangeDecision(changed=False, reason="", run_cache_allowed=run_cache_allowed)
 
     # Explain path: full diffs for all categories.
     code_changes = diff_code_manifests(lock_data["code_manifest"], fingerprint)
@@ -75,6 +90,7 @@ def check_stage(
         code_changes=code_changes,
         param_changes=param_changes,
         dep_changes=dep_changes,
+        run_cache_allowed=run_cache_allowed,
     )
 
 

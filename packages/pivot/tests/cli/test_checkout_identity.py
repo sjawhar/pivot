@@ -45,6 +45,7 @@ def _helper_stage_info(
         name=name,
         deps={},
         outs=outs,
+        incremental_inputs={},
         params=None,
         mutex=[],
         variant=None,
@@ -277,6 +278,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
             tag=types.ArtifactTag.DATA,
         )
     ],
+    incremental_inputs={},
     params=None,
     mutex=[],
     variant=None,
@@ -320,6 +322,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
             tag=types.ArtifactTag.DATA,
         )
     ],
+    incremental_inputs={},
     params=None,
     mutex=[],
     variant=None,

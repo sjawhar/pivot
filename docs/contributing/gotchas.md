@@ -127,9 +127,11 @@ if not func_node.body:
 
 ## Storage
 
-### IncrementalOut Uses COPY Mode
+### Incremental Outputs Use COPY Mode
 
-`IncrementalOut` (`outputs.py`, checked by `executor/core.py`) always copies from cache rather than hardlinking/symlinking. This is intentional - the stage modifies the file in-place, so hardlinks would corrupt the cache. The compositional API cannot declare incremental outputs yet; keep this invariant if that design is added.
+An `Annotated[T, incremental]` output restores its previous cached artifact as a
+writable copy before the stage receives the value bound by `pipeline.previous()`.
+Copy mode prevents in-place changes from corrupting the cached version.
 
 ### Path Strategies in StateDB
 

@@ -13,10 +13,8 @@ import subprocess
 import threading
 from typing import TYPE_CHECKING, cast
 
-from pivot import project
 from pivot.executor import worker
-from pivot.storage import cache
-from pivot.types import FileHash, OutputMessage
+from pivot.types import OutputMessage
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -163,30 +161,6 @@ def test_hash_dependencies_directory_has_manifest(tmp_path: pathlib.Path) -> Non
     hash_info = hashes[str(directory)]
     assert "manifest" in hash_info
     assert {entry["relpath"] for entry in hash_info["manifest"]} == {"a.txt", "b.txt"}
-
-
-def test_file_needs_restore_detects_missing_and_corruption(tmp_path: pathlib.Path) -> None:
-    """File restore check detects missing and changed workspace data."""
-    path = tmp_path / "output.txt"
-    path.write_text("good")
-    file_hash, _ = cache.hash_file(path)
-    expected = FileHash(hash=file_hash)
-    assert not worker._file_needs_restore(path, expected)
-
-    path.write_text("bad")
-    assert worker._file_needs_restore(path, expected)
-    path.unlink()
-    assert worker._file_needs_restore(path, expected)
-
-
-def test_canonicalize_out_normalizes_relative_path(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Worker output canonicalization normalizes relative path components."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "get_project_root", lambda: tmp_path)
-
-    assert worker._canonicalize_out("data/./result.txt") == str(tmp_path / "data/result.txt")
 
 
 def _double(value: int) -> int:

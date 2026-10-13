@@ -62,11 +62,12 @@ class Loader[W, R = W](Writer[W], Reader[R], abc.ABC):
     def empty(self) -> R:
         """Return an empty instance of the loaded type.
 
-        Used for IncrementalOut on first run when no previous output exists.
-        Override in loaders that support IncrementalOut (JSON, CSV, YAML).
+        Used by an incremental output on its first run.
+        Override in loaders that support an empty value (JSON, CSV, YAML).
         """
         raise NotImplementedError(
-            f"{type(self).__name__} cannot provide an empty instance. For IncrementalOut, use a loader with a known empty value (JSON, CSV, YAML)."
+            f"{type(self).__name__} cannot provide an empty instance. "
+            + "Use an incremental output loader with a known empty value (JSON, CSV, YAML)."
         )
 
 
@@ -111,7 +112,7 @@ class JSON[T](Loader[T, T]):
 
     Args:
         indent: JSON indentation (default 2, None for compact).
-        empty_factory: Callable returning empty value for IncrementalOut first run.
+        empty_factory: Callable returning the first-run value for an incremental output.
             Defaults to dict. Use list for list types: JSON(empty_factory=list).
     """
 
@@ -140,7 +141,7 @@ class YAML[T](Loader[T, T]):
     Generic type parameter indicates the expected type for type checking.
 
     Args:
-        empty_factory: Callable returning empty value for IncrementalOut first run.
+        empty_factory: Callable returning the first-run value for an incremental output.
             Defaults to dict. Use list for list types: YAML(empty_factory=list).
     """
 

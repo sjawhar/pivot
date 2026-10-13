@@ -152,6 +152,7 @@ def test_stage_returning_external_path_dependency_does_not_move_user_file(
         project_root=tmp_path,
         state_dir=state_dir,
         collection_params={},
+        incremental_inputs={},
     )
 
     result = worker.execute_stage("pathret/passthrough", stage_info, worker_env, output_queue)

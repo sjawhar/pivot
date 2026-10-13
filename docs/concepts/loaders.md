@@ -30,13 +30,14 @@ All three are frozen dataclasses with abstract methods. They are:
 | Base class | Methods | Used for |
 |------------|---------|----------|
 | `Reader[R]` | `load(path) -> R` | `pipeline.input(..., format=...)` |
-| `Writer[W]` | `save(data, path)` | Stage outputs (return types) |
-| `Loader[W, R]` | `load() + save() + empty()` | Outputs that downstream stages read back |
+| `Writer[W]` | `save(data, path)` | Stage outputs that are not read back |
+| `Loader[W, R]` | `load() + save() + empty()` | Dependencies and incremental outputs |
 
 An output consumed by another stage needs a `Loader`: Pivot writes it with
-`save()` and reads it back with `load()` for the consumer. A `Writer` alone is
-enough for leaf outputs such as plots. `Loader[T]` (one type parameter) means
-`Loader[T, T]`.
+`save()` and reads it back with `load()` for the consumer. An incremental output
+also needs `empty()` for its first run, then uses `load()` after restoring its
+previous cached value. A `Writer` alone is enough for leaf outputs such as
+plots. `Loader[T]` (one type parameter) means `Loader[T, T]`.
 
 ## Built-in loaders
 

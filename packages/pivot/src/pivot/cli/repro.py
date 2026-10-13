@@ -792,7 +792,7 @@ def _run_oneshot_mode(
 @click.option(
     "--allow-uncached-incremental",
     is_flag=True,
-    help="Allow running stages with IncrementalOut files that exist but aren't in cache.",
+    help="Allow running stages with incremental output files that exist but aren't in cache.",
 )
 @click.option(
     "--checkout-missing",

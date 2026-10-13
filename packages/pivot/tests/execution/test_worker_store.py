@@ -73,6 +73,7 @@ def _make_worker_stage_info(
         project_root=tmp_path,
         state_dir=state_dir,
         collection_params={},
+        incremental_inputs={},
     )
 
 
