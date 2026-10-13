@@ -223,3 +223,93 @@ parent.close()
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_fork_waits_for_active_read_before_reopening_state_db(tmp_path: pathlib.Path) -> None:
+    """A child reopens StateDB after a parent reader has safely drained."""
+    script = """
+import os
+import pathlib
+import sys
+import threading
+
+from pivot.storage import state
+
+state_dir = pathlib.Path(sys.argv[1])
+parent = state.StateDB(state_dir)
+parent.put_raw(b'parent', b'written-before-fork')
+ready = threading.Event()
+release = threading.Event()
+
+def read() -> None:
+    with parent._read_transaction() as txn:
+        assert txn.get(b'parent') == b'written-before-fork'
+        ready.set()
+        release.wait()
+
+reader = threading.Thread(target=read)
+reader.start()
+assert ready.wait(5)
+timer = threading.Timer(0.1, release.set)
+timer.start()
+
+pid = os.fork()
+if pid == 0:
+    try:
+        with state.StateDB(state_dir) as child:
+            assert child.get_raw(b'parent') == b'written-before-fork'
+            child.put_raw(b'child', b'written-by-child')
+    except BaseException as error:
+        print(repr(error), file=sys.stderr)
+        os._exit(1)
+    os._exit(0)
+
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+timer.join()
+reader.join()
+assert parent.get_raw(b'child') == b'written-by-child'
+parent.close()
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_fork_from_active_read_has_no_atfork_callback_failure(tmp_path: pathlib.Path) -> None:
+    """An active same-thread read does not make fork callbacks raise."""
+    script = """
+import os
+import pathlib
+import sys
+
+from pivot.storage import state
+
+db = state.StateDB(pathlib.Path(sys.argv[1]))
+db.put_raw(b'key', b'value')
+transaction = db._read_transaction()
+transaction.__enter__()
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+transaction.__exit__(None, None, None)
+db.close()
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Exception ignored in" not in result.stderr

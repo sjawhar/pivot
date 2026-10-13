@@ -55,6 +55,9 @@ class _SharedEnv(typing.TypedDict):
     users: int
 
 
+_FORK_DRAIN_TIMEOUT = 1.0
+
+
 @typing.final
 class _ForkGate:
     """Allow concurrent transactions while draining them before fork."""
@@ -63,7 +66,6 @@ class _ForkGate:
         self._condition = threading.Condition()
         self._transactions = 0
         self._forking = False
-        self._local = threading.local()
 
     @contextlib.contextmanager
     def transaction(self) -> Generator[None]:
@@ -71,23 +73,28 @@ class _ForkGate:
             while self._forking:
                 self._condition.wait()
             self._transactions += 1
-        self._local.depth = getattr(self._local, "depth", 0) + 1
         try:
             yield
         finally:
-            self._local.depth -= 1
             with self._condition:
                 self._transactions -= 1
                 if self._transactions == 0:
                     self._condition.notify_all()
 
-    def before_fork(self) -> None:
-        if getattr(self._local, "depth", 0):
-            raise RuntimeError("Cannot fork while a StateDB transaction is active")
+    def before_fork(self) -> bool:
+        """Block new transactions and return whether existing ones drained."""
         self._condition.acquire()
         self._forking = True
+        deadline = time.monotonic() + _FORK_DRAIN_TIMEOUT
         while self._transactions:
-            self._condition.wait()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._forking = False
+                self._condition.notify_all()
+                self._condition.release()
+                return False
+            self._condition.wait(remaining)
+        return True
 
     def after_fork_parent(self) -> None:
         self._forking = False
@@ -110,6 +117,7 @@ class _ForkGate:
 _shared_envs = dict[pathlib.Path, _SharedEnv]()
 _shared_envs_lock = threading.RLock()
 _fork_gate = _ForkGate()
+_fork_drained = False
 
 
 def _open_env(lmdb_path: pathlib.Path) -> lmdb.Environment:
@@ -161,8 +169,12 @@ def _release_shared_env(lmdb_path: pathlib.Path, shared: _SharedEnv) -> None:
 
 
 def _before_fork() -> None:
-    """Close environments only after current StateDB operations finish."""
-    _fork_gate.before_fork()
+    """Drain StateDB transactions, then close environments before a fork."""
+    global _fork_drained
+
+    _fork_drained = _fork_gate.before_fork()
+    if not _fork_drained:
+        return
     try:
         with _shared_envs_lock:
             for shared in _shared_envs.values():
@@ -172,19 +184,27 @@ def _before_fork() -> None:
                     shared["env"] = None
     except BaseException:
         _fork_gate.abort_fork()
+        _fork_drained = False
         raise
 
 
 def _after_fork_parent() -> None:
-    _fork_gate.after_fork_parent()
+    global _fork_drained
+
+    if _fork_drained:
+        _fork_gate.after_fork_parent()
+    _fork_drained = False
 
 
 def _after_fork_child() -> None:
-    global _shared_envs, _shared_envs_lock
+    global _fork_drained, _fork_gate, _shared_envs, _shared_envs_lock
 
+    if _fork_drained:
+        _fork_gate.after_fork_child()
+    _fork_drained = False
+    _fork_gate = _ForkGate()
     _shared_envs = dict[pathlib.Path, _SharedEnv]()
     _shared_envs_lock = threading.RLock()
-    _fork_gate.after_fork_child()
 
 
 os.register_at_fork(
