@@ -59,6 +59,23 @@ Defaults Pivot chooses without an annotation: `DataFrame` → `DataFrameJSONL()`
 `dict`/`list` → `YAML()`, `str` → `Text()`, `plot` tag → `MatplotlibFigure()`,
 `metric` tag → `YAML()`.
 
+### DataFrameJSONL metadata header
+
+A `DataFrameJSONL()` output starts with one metadata record, then ordinary row
+records:
+
+```json
+{"__pivot_dataframe_metadata__": {"version": 1, "temporal_columns": {...}}}
+{"name":"alice","created_at":"2026-10-13T12:00:00.000Z"}
+```
+
+Pivot uses the header to restore only the columns it marked as temporal, retain
+the original timezone names, and preserve all-null `datetime` and `timedelta`
+dtypes. It never guesses that an ISO-shaped string column is temporal.
+
+Non-Pivot JSONL readers see the explicit first record and must skip it before
+reading data rows. Treat `__pivot_dataframe_metadata__` as reserved.
+
 ### Pickle is a trusted-code boundary
 
 Loading a pickle can execute arbitrary code. Only load Pickle artifacts written
