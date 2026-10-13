@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import loky
 
-from pivot import config, discovery, exceptions, outputs, parameters, registry
+from pivot import config, discovery, exceptions, parameters, project, registry, types
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
@@ -175,7 +175,7 @@ def run(
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
         on_error: Error handling mode - "fail" or "keep_going".
-        allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
+        allow_uncached_incremental: If True, skip the uncached incremental-output safety check.
         force: If True, bypass cache and force all stages to re-execute.
         no_commit: If True, skip writing lock files (faster iteration).
         checkout_missing: If True, restore missing tracked files from cache before running.
@@ -332,6 +332,7 @@ def prepare_worker_info(
         "deps": stage_info["deps"],
         "outs": stage_info["outs"],
         "store_spec": store_spec,
+        "incremental_inputs": stage_info["incremental_inputs"],
         "signature": stage_info["signature"],
         "params": stage_info["params"],
         "variant": stage_info["variant"],
@@ -446,30 +447,23 @@ def check_uncached_incremental_outputs(
     execution_order: list[str],
     all_stages: dict[str, RegistryStageInfo],
 ) -> list[tuple[str, str]]:
-    """Check for IncrementalOut files that exist but aren't cached.
-
-    Returns list of (stage_name, output_path) tuples for uncached files.
-    """
+    """Check for incremental artifacts that exist without a recorded cache hash."""
     uncached = list[tuple[str, str]]()
     default_state_dir = config.get_state_dir()
+    workspace = store_mod.WorkspaceStore(project.get_project_root(), "", {})
 
     for stage_name in execution_order:
         stage_info = all_stages[stage_name]
         stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-        stage_outs = stage_info["outs"]
-
-        # Read lock file from stage's state_dir
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
         output_hashes = lock_data["output_hashes"] if lock_data else {}
 
-        for out in stage_outs:
-            if isinstance(out, outputs.IncrementalOut):
-                # Registry always stores single-file outputs (multi-file are expanded)
-                out_path = str(out.path)
-                path = pathlib.Path(out_path)
-                # File exists on disk but has no cache entry
-                if path.exists() and out_path not in output_hashes:
-                    uncached.append((stage_name, out_path))
+        for out in stage_info["outs"]:
+            if out.tag is not types.ArtifactTag.INCREMENTAL:
+                continue
+            out_path = workspace.resolve_display_path(out)
+            if out_path.exists() and out.identity not in output_hashes:
+                uncached.append((stage_name, str(out_path)))
 
     return uncached

@@ -27,6 +27,7 @@ class RegistryStageInfo(TypedDict):
         name: Unique stage identifier (function name or custom name).
         deps: Named input dependencies (param name -> ArtifactRef).
         outs: Output specs as artifact references.
+        incremental_inputs: Previous-output parameters (param name -> own output identity).
         params: Pydantic model instance with parameter values.
         mutex: Mutex groups for exclusive execution.
         variant: Variant name for matrix stages (None for regular stages).
@@ -42,6 +43,7 @@ class RegistryStageInfo(TypedDict):
     name: str
     deps: dict[str, types.ArtifactRef]
     outs: list[types.ArtifactRef]
+    incremental_inputs: dict[str, types.ArtifactIdentity]
     params: stage_def.StageParams | None
     mutex: list[str]
     variant: str | None

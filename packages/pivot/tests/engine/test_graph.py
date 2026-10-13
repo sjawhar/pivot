@@ -36,6 +36,7 @@ def _create_stage(
         name=name,
         deps={f"_{i}": _artifact_ref(dep) for i, dep in enumerate(deps)},
         outs=[_artifact_ref(out) for out in outs],
+        incremental_inputs={},
         params=None,
         mutex=list[str](),
         variant=None,

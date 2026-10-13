@@ -356,7 +356,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
 @click.option(
     "--allow-uncached-incremental",
     is_flag=True,
-    help="Allow running stages with IncrementalOut files that exist but aren't in cache.",
+    help="Allow running stages with incremental output files that exist but aren't in cache.",
 )
 @click.option(
     "--checkout-missing",

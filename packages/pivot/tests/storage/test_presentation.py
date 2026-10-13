@@ -31,6 +31,7 @@ def _make_stage(
                 tag=tag,
             )
         ],
+        incremental_inputs={},
         params=None,
         mutex=list[str](),
         variant=None,

@@ -289,6 +289,7 @@ class ArtifactTag(enum.StrEnum):
     METRIC = "metric"
     PLOT = "plot"
     DIRECTORY = "directory"
+    INCREMENTAL = "incremental"
 
 
 @dataclasses.dataclass(eq=False)
@@ -463,6 +464,7 @@ class ChangeDecision(TypedDict, total=False):
     changed: Required[bool]
     reason: Required[str]
     code_changes: list[CodeChange]
+    run_cache_allowed: Required[bool]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
 

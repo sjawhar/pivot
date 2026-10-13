@@ -907,7 +907,7 @@ class Engine:
         if not execution_order:
             return {}
 
-        # Check for uncached IncrementalOut files that would be lost
+        # Check for uncached incremental output files that would be lost.
         if not allow_uncached_incremental:
             uncached = executor_core.check_uncached_incremental_outputs(
                 execution_order, self._get_all_stages()
@@ -915,9 +915,11 @@ class Engine:
             if uncached:
                 files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
                 raise pivot_exceptions.UncachedIncrementalOutputError(
-                    f"The following IncrementalOut files exist but are not in cache:\n{files_list}\n\n"
+                    "The following incremental output files exist but are not in cache:\n"
+                    + f"{files_list}\n\n"
                     + "Running the pipeline will DELETE these files and they cannot be restored.\n"
-                    + "To proceed anyway, use allow_uncached_incremental=True or back up these files first."
+                    + "To proceed anyway, use --allow-uncached-incremental or back up these "
+                    + "files first."
                 )
 
         # Compute max workers

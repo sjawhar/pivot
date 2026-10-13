@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast, override, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, runtime_checkable
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders_module
@@ -102,30 +102,6 @@ class Plot[W](Out[W]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
 
 
 @dataclasses.dataclass(frozen=True)
-class IncrementalOut[W, R = W]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
-    """Incremental output - restored from cache before stage runs.
-
-    W is the write type (what the stage returns).
-    R is the read type (what gets loaded). Defaults to W for symmetric loaders.
-
-    Use for outputs that are incrementally updated across runs:
-
-        class CacheOutputs(TypedDict):
-            cache: Annotated[dict, IncrementalOut("cache.json", JSON())]
-
-    Before stage execution, previous output is restored from cache as a writable
-    copy. Stage can read, modify, and write back. Changes are re-cached after run.
-
-    Requires a full Loader (not just Reader or Writer) since it needs both
-    load() for restoring and save() for persisting.
-    """
-
-    path: PathType
-    loader: loaders_module.Loader[W, R]
-    cache: bool = True
-
-
-@dataclasses.dataclass(frozen=True)
 class DirectoryOut[T]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syntax yet
     """Directory output - dynamic set of files determined at runtime.
 
@@ -161,14 +137,7 @@ class DirectoryOut[T]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
 
 @runtime_checkable
 class BaseOut(Protocol):
-    """Protocol for common output spec attributes.
-
-    All output specs (Out, DirectoryOut, IncrementalOut) implement this protocol,
-    providing access to the common `path`, `cache`, and `loader` attributes.
-
-    This is a Protocol rather than a base class because dataclass inheritance
-    has field ordering constraints that prevent a clean hierarchy.
-    """
+    """Protocol for the legacy path-bearing output specifications."""
 
     @property
     def path(self) -> PathType:
@@ -182,68 +151,10 @@ class BaseOut(Protocol):
 
     @property
     def loader(self) -> loaders_module.Writer[Any] | loaders_module.Loader[Any, Any]:
-        """Writer or Loader for this output.
-
-        Out and DirectoryOut use Writer (save only).
-        IncrementalOut uses Loader (save and load for restore).
-        """
-        ...
-
-
-class ExpandedOut(BaseOut, Protocol):
-    """Protocol for output specs after registry expansion.
-
-    After the registry's expansion step, every output spec has ``path: str``
-    (multi-path variants have been expanded into individual single-path specs).
-    ``RegistryStageInfo["outs"]`` and ``WorkerStageInfo["outs"]`` use this
-    narrower type so downstream code can use ``out.path`` as ``str`` directly.
-
-    At runtime the objects are still the original dataclass instances (Out,
-    DirectoryOut, IncrementalOut), so ``isinstance`` checks continue to work.
-    """
-
-    @property
-    @override
-    def path(self) -> str:
-        """Single path string (post-expansion)."""
+        """Writer or Loader for this output."""
         ...
 
 
 def is_directory_out(spec: BaseOut) -> TypeGuard[DirectoryOut[Any]]:
     """Type guard to narrow output spec to DirectoryOut."""
     return isinstance(spec, DirectoryOut)
-
-
-def is_incremental_out(spec: BaseOut) -> TypeGuard[IncrementalOut[Any, Any]]:
-    """Type guard to narrow output spec to IncrementalOut."""
-    return isinstance(spec, IncrementalOut)
-
-
-def require_expanded(out: BaseOut) -> ExpandedOut:
-    """Verify output has a str path (post-expansion) and return as ExpandedOut.
-
-    Use at boundaries where BaseOut instances are known to have str paths
-    (e.g., after registry expansion) but the type system can't prove it.
-    """
-    if not isinstance(out.path, str):
-        raise TypeError(f"Expected expanded output path (str), got {type(out.path)}: {out.path}")
-    return cast("ExpandedOut", out)
-
-
-# Type alias for any output spec
-AnyOut = Out[Any] | DirectoryOut[Any] | IncrementalOut[Any, Any]
-
-# Output spec can be string (converted to Out with default loader) or any Out subclass
-OutSpec = str | AnyOut
-
-
-def normalize_out(out: OutSpec) -> AnyOut:
-    """Convert string or Out subclass to Out object.
-
-    String paths are converted to Out with PathOnly loader.
-    """
-    if isinstance(out, str):
-        from pivot import loaders
-
-        return Out(path=out, loader=loaders.PathOnly())
-    return out

@@ -212,7 +212,7 @@ class CacheRestoreError(CacheError):
 
 
 class UncachedIncrementalOutputError(CacheError):
-    """Raised when an IncrementalOut file exists but is not in cache."""
+    """Raised when an incremental output exists without a cache entry."""
 
 
 class ParamsError(PivotError):

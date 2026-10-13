@@ -1256,6 +1256,7 @@ def _make_stage_info(
         name=name,
         deps=deps or {},
         outs=outs or [],
+        incremental_inputs={},
         params=None,
         mutex=[],
         variant=None,
@@ -1625,7 +1626,7 @@ def test_no_fingerprint_outside_stage_decorator(set_project_root: pathlib.Path) 
 
     @no_fingerprint()
     @stage
-    def my_stage() -> Annotated[str, outputs.Out("out.txt", loaders.Text())]:
+    def my_stage() -> Annotated[str, loaders.Text()]:
         return "hello"
 
     p = Pipeline("test", root=set_project_root)

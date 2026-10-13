@@ -47,25 +47,6 @@ def test_all_outputs_frozen() -> None:
         plot.x = "step"  # pyright: ignore[reportAttributeAccessIssue]
 
 
-def test_normalize_out_string() -> None:
-    """String should become Out object."""
-    result = outputs.normalize_out("file.txt")
-    assert isinstance(result, outputs.Out)
-    assert result.path == "file.txt"
-    assert result.cache is True
-
-
-def test_normalize_out_passthrough() -> None:
-    """Out subclasses should pass through unchanged."""
-    out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), cache=False)
-    metric = outputs.Metric(path="metrics.json")
-    plot = outputs.Plot(path="loss.csv", loader=loaders.PathOnly(), x="epoch")
-
-    assert outputs.normalize_out(out) is out
-    assert outputs.normalize_out(metric) is metric
-    assert outputs.normalize_out(plot) is plot
-
-
 def test_out_with_explicit_cache_false() -> None:
     """Out can explicitly set cache=False."""
     out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), cache=False)
@@ -87,11 +68,9 @@ def test_plot_with_no_options() -> None:
 
 
 def test_out_subclass_hierarchy() -> None:
-    """Metric, Plot should inherit from Out."""
+    """Metric and Plot should inherit from Out."""
     assert issubclass(outputs.Metric, outputs.Out)
     assert issubclass(outputs.Plot, outputs.Out)
-    # Note: IncrementalOut and DirectoryOut are standalone classes (not Out subclasses)
-    # to avoid dataclass field ordering issues. They implement the BaseOut protocol.
 
 
 def test_out_instances_are_out() -> None:
@@ -103,38 +82,6 @@ def test_out_instances_are_out() -> None:
     assert isinstance(out, outputs.Out)
     assert isinstance(metric, outputs.Out)
     assert isinstance(plot, outputs.Out)
-
-
-# IncrementalOut tests
-
-
-def test_incremental_out_cache_default_true() -> None:
-    """IncrementalOut should have cache=True by default."""
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    assert inc.cache is True
-
-
-def test_incremental_out_frozen() -> None:
-    """IncrementalOut should be immutable (frozen dataclass)."""
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    with pytest.raises(AttributeError):
-        inc.path = "other.csv"  # pyright: ignore[reportAttributeAccessIssue]
-
-
-def test_incremental_out_implements_base_out_protocol() -> None:
-    """IncrementalOut should implement BaseOut protocol (not inherit from Out)."""
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    # IncrementalOut is a standalone class that implements BaseOut protocol
-    assert isinstance(inc, outputs.BaseOut)
-    assert hasattr(inc, "path")
-    assert hasattr(inc, "cache")
-    assert hasattr(inc, "loader")
-
-
-def test_normalize_out_incremental_passthrough() -> None:
-    """IncrementalOut should pass through normalize_out unchanged."""
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    assert outputs.normalize_out(inc) is inc
 
 
 # DirectoryOut tests
@@ -186,12 +133,6 @@ def test_directory_out_cache_default_true() -> None:
     assert dir_out.cache is True
 
 
-def test_normalize_out_directory_passthrough() -> None:
-    """DirectoryOut should pass through normalize_out unchanged."""
-    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
-    assert outputs.normalize_out(dir_out) is dir_out
-
-
 # TypeGuard tests
 
 
@@ -201,23 +142,7 @@ def test_is_directory_out_true_for_directory_out() -> None:
     assert outputs.is_directory_out(dir_out) is True
 
 
-def test_is_directory_out_false_for_other_types() -> None:
-    """is_directory_out should return False for Out and IncrementalOut."""
+def test_is_directory_out_false_for_out() -> None:
+    """is_directory_out should return False for a regular output."""
     out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
-    inc = outputs.IncrementalOut(path="cache.json", loader=loaders.JSON[dict[str, int]]())
     assert outputs.is_directory_out(out) is False
-    assert outputs.is_directory_out(inc) is False
-
-
-def test_is_incremental_out_true_for_incremental_out() -> None:
-    """is_incremental_out should return True for IncrementalOut."""
-    inc = outputs.IncrementalOut(path="cache.json", loader=loaders.JSON[dict[str, int]]())
-    assert outputs.is_incremental_out(inc) is True
-
-
-def test_is_incremental_out_false_for_other_types() -> None:
-    """is_incremental_out should return False for Out and DirectoryOut."""
-    out = outputs.Out(path="file.txt", loader=loaders.PathOnly())
-    dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
-    assert outputs.is_incremental_out(out) is False
-    assert outputs.is_incremental_out(dir_out) is False

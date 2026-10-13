@@ -43,6 +43,7 @@ def _register_metric_stage(test_pipeline: PipelineLike, name: str) -> Path:
                 tag=ArtifactTag.METRIC,
             )
         ],
+        incremental_inputs={},
         params=None,
         mutex=[],
         variant=None,

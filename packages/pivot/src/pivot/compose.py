@@ -45,8 +45,13 @@ class _PlotTag:
     pass
 
 
+class _IncrementalTag:
+    pass
+
+
 metric = _MetricTag()
 plot = _PlotTag()
+incremental = _IncrementalTag()
 
 SINGLE_OUTPUT_KEY = stage_def.SINGLE_OUTPUT_KEY
 
@@ -58,8 +63,9 @@ class CollectionKind(enum.StrEnum):
 
 __all__ = [
     "ArtifactHandle",
-    "CollectionKind",
-    "SINGLE_OUTPUT_KEY",
+    "incremental",
+    "metric",
+    "plot",
     "_InputNode",
     "_OutputSpec",
     "_StageNode",
@@ -112,6 +118,8 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         dep_tag = types.ArtifactTag.METRIC
     elif isinstance(output_spec.tag, _PlotTag):
         dep_tag = types.ArtifactTag.PLOT
+    elif isinstance(output_spec.tag, _IncrementalTag):
+        dep_tag = types.ArtifactTag.INCREMENTAL
     else:
         dep_tag = types.ArtifactTag.DATA
 
@@ -172,6 +180,8 @@ def _emit_stage_info(
             out_tag = types.ArtifactTag.METRIC
         elif isinstance(output_spec.tag, _PlotTag):
             out_tag = types.ArtifactTag.PLOT
+        elif isinstance(output_spec.tag, _IncrementalTag):
+            out_tag = types.ArtifactTag.INCREMENTAL
         else:
             out_tag = types.ArtifactTag.DATA
 
@@ -214,11 +224,20 @@ def _emit_stage_info(
                 )
             break
 
+    output_identities = {
+        spec.key: out.identity for spec, out in zip(node.output_specs, outs, strict=True)
+    }
+    incremental_inputs = {
+        param_name: output_identities[output_key]
+        for param_name, output_key in node.incremental_inputs.items()
+    }
+
     return registry.RegistryStageInfo(
         func=func,
         name=qualified_name,
         deps=deps,
         outs=outs,
+        incremental_inputs=incremental_inputs,
         params=node.params,
         mutex=[],
         variant=node.variant,
@@ -240,9 +259,9 @@ class Pipeline:
     _call_counts: dict[tuple[str, tuple[str, ...]], int]
     _validation_errors: list[str]
     _token: contextvars.Token[Pipeline | None] | None
-    _variant_stack: list[str]
     _registry: registry.StageRegistry
     _included_stages: dict[str, registry.RegistryStageInfo]
+    _previous_markers: list[_PreviousOutputMarker]
     _constructing: bool
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
@@ -257,6 +276,7 @@ class Pipeline:
         self._token = None
         self._variant_stack = []
         self._registry = registry.StageRegistry()
+        self._previous_markers = list[_PreviousOutputMarker]()
         self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
 
@@ -542,9 +562,64 @@ class Pipeline:
         input_handles = dict[str, ArtifactHandle]()
         list_input_handles = dict[str, list[ArtifactHandle]]()
         collection_params = dict[str, CollectionKind]()
+        incremental_inputs = dict[str, str]()
         params: stage_def.StageParams | None = None
         for param_name, value in bound.arguments.items():
-            if isinstance(value, ArtifactHandle):
+            if isinstance(value, _PreviousOutputMarker):
+                if value.pipeline is not self:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' received p.previous() from "
+                        + f"Pipeline '{value.pipeline.name}', not this stage call."
+                    )
+                    continue
+                if value.consumed_by is not None:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' reuses p.previous() already "
+                        + f"bound to {value.consumed_by}."
+                    )
+                    continue
+                value.consumed_by = stage_name
+                if value.key is None:
+                    if len(output_specs) != 1:
+                        self._validation_errors.append(
+                            f"{stage_name}: parameter '{param_name}' uses p.previous() but "
+                            + "the stage has multiple outputs; name an incremental output key."
+                        )
+                        continue
+                    output_spec = output_specs[0]
+                else:
+                    output_spec = next(
+                        (spec for spec in output_specs if spec.key == value.key), None
+                    )
+                    if output_spec is None:
+                        self._validation_errors.append(
+                            f"{stage_name}: parameter '{param_name}' uses p.previous({value.key!r}) "
+                            + f"but '{value.key}' is not an output key."
+                        )
+                        continue
+                if not isinstance(output_spec.tag, _IncrementalTag):
+                    self._validation_errors.append(
+                        f"{stage_name}: parameter '{param_name}' uses p.previous("
+                        + (f"{value.key!r}" if value.key is not None else "")
+                        + f") but output '{output_spec.key}' is not tagged incremental."
+                    )
+                    continue
+                existing_param = next(
+                    (
+                        existing
+                        for existing, output_key in incremental_inputs.items()
+                        if output_key == output_spec.key
+                    ),
+                    None,
+                )
+                if existing_param is not None:
+                    self._validation_errors.append(
+                        f"{stage_name}: parameters '{existing_param}' and '{param_name}' both "
+                        + f"bind p.previous() to incremental output '{output_spec.key}'."
+                    )
+                    continue
+                incremental_inputs[param_name] = output_spec.key
+            elif isinstance(value, ArtifactHandle):
                 input_handles[param_name] = value
             elif isinstance(value, (list, tuple)):
                 items = list[Any](value)
@@ -584,6 +659,7 @@ class Pipeline:
             variant=variant_str,
             list_input_handles=list_input_handles,
             collection_params=collection_params,
+            incremental_inputs=incremental_inputs,
         )
         self._stages.append(node)
 
@@ -601,7 +677,20 @@ class Pipeline:
             python_type=dict,
         )
 
+    def previous(self, key: str | None = None) -> Any:
+        """Mark a parameter as this stage call's prior incremental output."""
+        if not self._constructing:
+            raise ValueError("p.previous() may only be used inside a Pipeline stage call.")
+        marker = _PreviousOutputMarker(pipeline=self, key=key)
+        self._previous_markers.append(marker)
+        return marker
+
     def _validate(self) -> None:
+        for marker in self._previous_markers:
+            if marker.consumed_by is None:
+                self._validation_errors.append(
+                    "p.previous() must be passed as an argument to a stage call."
+                )
         if self._validation_errors:
             msg = (
                 f'Pipeline "{self._name}" has {len(self._validation_errors)} '
@@ -780,8 +869,8 @@ def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
 # --- Return type analysis ---
 
 
-def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
-    """Parse a type hint into OutputSpec(s)."""
+def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec]:
+    """Parse a stage return type into output specifications."""
     origin = get_origin(hint)
     if origin is typing.Required or origin is typing.NotRequired:
         hint = get_args(hint)[0]
@@ -795,34 +884,55 @@ def _parse_output_type(hint: Any, key: str) -> list[_OutputSpec]:
                     f"TypedDict field name {SINGLE_OUTPUT_KEY!r} is reserved by Pivot. "
                     + f"Rename the field in {hint.__name__}."
                 )
-            specs.extend(_parse_output_type(field_hint, field_name))
+            specs.extend(_parse_output_type(field_hint, field_name, stage_name))
         return specs
 
-    # Check for Annotated
-    if get_origin(hint) is Annotated:
-        args = get_args(hint)
-        base_type = args[0]
-        tag: _MetricTag | _PlotTag | None = None
-        fmt: loaders_mod.Writer[object] | None = None
-        loaders = _get_loaders()
-        for arg in args[1:]:
-            if isinstance(arg, (_MetricTag, _PlotTag)):
-                tag = arg
-            elif isinstance(arg, loaders.Writer):
-                fmt = typing.cast("loaders_mod.Writer[object]", arg)
+    if get_origin(hint) is not Annotated:
+        return [_OutputSpec(key=key, python_type=hint, format=_infer_format(hint))]
 
-        if fmt is None:
-            if isinstance(tag, _PlotTag):
-                fmt = typing.cast("loaders_mod.Writer[object]", loaders.MatplotlibFigure())
-            elif isinstance(tag, _MetricTag):
-                fmt = typing.cast("loaders_mod.Writer[object]", loaders.YAML())
-            else:
-                fmt = _infer_format(base_type)
-        return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
+    args = get_args(hint)
+    base_type = args[0]
+    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
+    fmt: loaders_mod.Writer[object] | None = None
+    loaders = _get_loaders()
+    for metadata in args[1:]:
+        if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
+            if tag is not None:
+                raise exceptions.StageDefinitionError(
+                    f"Stage '{stage_name}' output '{key}' cannot combine "
+                    + f"{type(tag).__name__.removeprefix('_').removesuffix('Tag').lower()} "
+                    + f"with {type(metadata).__name__.removeprefix('_').removesuffix('Tag').lower()}."
+                )
+            tag = metadata
+        elif isinstance(metadata, loaders.Writer):
+            if fmt is not None:
+                raise exceptions.StageDefinitionError(
+                    f"Stage '{stage_name}' output '{key}' has more than one loader."
+                )
+            fmt = typing.cast("loaders_mod.Writer[object]", metadata)
+        else:
+            metadata_name = (
+                metadata.__name__ if isinstance(metadata, type) else type(metadata).__name__
+            )
+            raise exceptions.StageDefinitionError(
+                f"Stage '{stage_name}' output '{key}' has unsupported Annotated metadata "
+                + f"'{metadata_name}'."
+            )
 
-    # Plain type
-    fmt = _infer_format(hint)
-    return [_OutputSpec(key=key, python_type=hint, format=fmt)]
+    if fmt is None:
+        if isinstance(tag, _PlotTag):
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders.MatplotlibFigure())
+        elif isinstance(tag, _MetricTag):
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders.YAML())
+        else:
+            fmt = _infer_format(base_type)
+
+    if isinstance(tag, _IncrementalTag) and not isinstance(fmt, loaders.Loader):
+        raise exceptions.StageDefinitionError(
+            f"Stage '{stage_name}' output '{key}' is incremental but loader "
+            + f"'{type(fmt).__name__}' is not a Loader."
+        )
+    return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
 
 
 def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
@@ -831,10 +941,10 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
     return_hint = hints.get("return")
     if return_hint is None:
         msg = f"Stage function {func.__name__} must have a return type annotation"
-        raise ValueError(msg)
+        raise exceptions.StageDefinitionError(msg)
     if return_hint is type(None):
         return []
-    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY)
+    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY, func.__name__)
 
 
 # --- @stage decorator ---
@@ -877,7 +987,7 @@ class _OutputSpec:
     key: str
     python_type: type
     format: loaders_mod.Writer[object]
-    tag: _MetricTag | _PlotTag | None = None
+    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
 
 
 @dataclasses.dataclass
@@ -893,6 +1003,14 @@ class _StageNode:
     collection_params: dict[str, CollectionKind] = dataclasses.field(default_factory=dict)
     no_fingerprint: bool = False
     code_deps: list[str] = dataclasses.field(default_factory=list)
+    incremental_inputs: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class _PreviousOutputMarker:
+    pipeline: Pipeline
+    key: str | None
+    consumed_by: str | None = None
 
 
 @dataclasses.dataclass
