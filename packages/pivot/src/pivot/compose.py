@@ -239,6 +239,9 @@ class Pipeline:
     _constructing: bool
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
+        reason = lock.stage_name_error(name)
+        if reason is not None:
+            raise ValueError(f"Invalid pipeline name {name!r}: {reason}")
         self._name = name
         self._stages = []
         self._inputs = {}

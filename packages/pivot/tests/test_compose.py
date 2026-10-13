@@ -737,25 +737,36 @@ def test_pipeline_variant_rejects_name_lock_files_cannot_hold(
     assert repr(variant_name) in str(exc_info.value), "Error should name the bad variant"
 
 
-@pytest.mark.parametrize(
-    ("pipeline_name", "variant_name", "bad_stage"),
-    [
-        pytest.param("my pipeline", "ok", "my pipeline/_helper_produce@ok", id="pipeline_space"),
-        pytest.param(
-            "p", "v" * 190, f"p/_helper_produce@{'v' * 190}", id="qualified_name_too_long"
-        ),
-    ],
-)
-def test_pipeline_rejects_stage_name_lock_files_cannot_hold(
-    tmp_path: pathlib.Path, pipeline_name: str, variant_name: str, bad_stage: str
-) -> None:
+def test_pipeline_rejects_stage_name_lock_files_cannot_hold(tmp_path: pathlib.Path) -> None:
     """A qualified stage name the lock would reject fails at definition, not at repro."""
-    pipeline = Pipeline(pipeline_name, root=tmp_path)
+    bad_stage = f"p/_helper_produce@{'v' * 190}"
+    pipeline = Pipeline("p", root=tmp_path)
     with pytest.raises(ValueError, match="stage name") as exc_info, pipeline:  # noqa: SIM117
-        with pipeline.variant(variant_name):
+        with pipeline.variant("v" * 190):
             _helper_produce(params=stage_def.StageParams())
 
     assert repr(bad_stage) in str(exc_info.value), "Error should name the bad stage"
+
+
+@pytest.mark.parametrize(
+    "pipeline_name",
+    [
+        pytest.param("my pipeline", id="space"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="spaces"),
+        pytest.param("/etc", id="absolute"),
+        pytest.param("a//b", id="empty_segment"),
+        pytest.param(".", id="dot"),
+    ],
+)
+def test_pipeline_rejects_name_lock_files_cannot_hold(
+    tmp_path: pathlib.Path, pipeline_name: str
+) -> None:
+    """A pipeline name that would place lock files outside .pivot/stages fails on construction."""
+    with pytest.raises(ValueError, match="pipeline name") as exc_info:
+        Pipeline(pipeline_name, root=tmp_path)
+
+    assert repr(pipeline_name) in str(exc_info.value), "Error should name the bad pipeline"
 
 
 def test_pipeline_variant_accepts_lock_compatible_names(tmp_path: pathlib.Path) -> None:
