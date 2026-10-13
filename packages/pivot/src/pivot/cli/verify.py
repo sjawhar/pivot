@@ -97,7 +97,22 @@ def _get_stage_lock_hashes(
                 resolved_path = identity_key
             cached_output_hashes[resolved_path] = hash_info
 
-    dep_hashes = {types.identity_key(k): v for k, v in lock_data["dep_hashes"].items()}
+    # Key deps by workspace path: upstream stage outputs at their output path,
+    # raw inputs at their input binding (data/raw/<name> by default).
+    stage_names = set(cli_helpers.list_stages())
+    dep_refs = {ref.identity: ref for ref in stage_info["deps"].values()}
+    dep_hashes = dict[str, HashInfo]()
+    for identity, hash_info in lock_data["dep_hashes"].items():
+        ref = dep_refs.get(identity)
+        if workspace_store is None or ref is None:
+            dep_hashes[types.identity_key(identity)] = hash_info
+            continue
+        dep_path = (
+            workspace_store.resolve_display_path(ref)
+            if identity.producer in stage_names
+            else workspace_store.checkout(ref)
+        )
+        dep_hashes[project.to_relative_path(dep_path)] = hash_info
 
     return (
         _extract_file_hashes(cached_output_hashes),

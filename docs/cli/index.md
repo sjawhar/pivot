@@ -485,7 +485,7 @@ pivot plots show [TARGETS...] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--output` / `-o PATH` | Output HTML path (default: `pivot_plots/index.html`) |
+| `--output` / `-o PATH` | Output HTML path (default: `.pivot/plots/index.html`, ignored by git). Image paths are relative to the HTML file. |
 | `--open` | Open browser after rendering |
 
 ---
