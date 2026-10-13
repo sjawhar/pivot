@@ -81,7 +81,7 @@ import sys
 
 from pivot import explain, fingerprint, project
 from pivot.config import io
-from pivot.storage import lock
+from pivot.storage import lock, store
 from pivot.types import LockData
 
 root = pathlib.Path(sys.argv[1])
@@ -103,11 +103,17 @@ assert fingerprint._get_state_db() is not None
 explanation = explain.get_stage_explanation(
     stage_name='stage',
     fingerprint={'self:stage': 'fingerprint'},
-    deps=[],
-    outs_paths=[],
+    deps={},
+    outs=[],
     params_instance=None,
     overrides=None,
     state_dir=state_dir,
+    store=store.WorkspaceStore(
+        project_root=root,
+        pipeline_name='test',
+        input_bindings={},
+        cache_dir=state_dir / 'cache',
+    ),
 )
 assert explanation['will_run'] is False
 """
