@@ -89,10 +89,12 @@ Coordinates deterministic scheduling (sync, no IO):
 
 - Maintains per-stage execution state
 - Tracks upstream/downstream completion
-- Enforces mutex groups (including exclusive `*`)
+- Holds per-stage resource permits until completion
 - Decides which stages are eligible to start
 
-Implemented in `packages/pivot/src/pivot/engine/scheduler.py` and owned by the Engine.
+Each stage holds one CPU unit by default. A decorator can request additional resources with
+`@stage(resources={"gpu": 1})`; non-CPU resources default to capacity 1 and can be configured
+per run. Implemented in `packages/pivot/src/pivot/engine/scheduler.py` and owned by the Engine.
 
 ### WatchCoordinator
 

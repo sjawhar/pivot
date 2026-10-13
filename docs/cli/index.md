@@ -77,6 +77,7 @@ pivot repro [STAGES...] [OPTIONS]
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure (default) |
 | `--keep-going` / `-k` | Continue running stages after failures; skip only downstream dependents |
 | `--serve` | Start RPC server for agent control (requires --watch) |
@@ -102,6 +103,9 @@ pivot repro --watch
 
 # Continue after failures
 pivot repro --keep-going
+
+# Allow two stages that request gpu to run together
+pivot repro --resources gpu=2
 ```
 
 ---
@@ -128,6 +132,7 @@ pivot run STAGES... [OPTIONS]
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure |
 | `--keep-going` / `-k` | Continue running stages after failures |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
@@ -868,14 +873,14 @@ pivot config unset default_remote
 | `core.max_workers` | Parallel workers (-1 = all CPUs) | `-2` |
 | `core.run_history_retention` | Keep last N runs | `100` |
 | `core.state_dir` | State directory | `.pivot` |
+| `resources` | Scheduler resource capacities | `{}` |
 | `remote.jobs` | Parallel transfer jobs | `20` |
 | `remote.retries` | Transfer retry count | `10` |
 | `remote.connect_timeout` | Connection timeout (seconds) | `30` |
 | `watch.debounce` | Watch debounce (milliseconds) | `300` |
 | `display.precision` | Float display precision | `5` |
-| `diff.max_rows` | Max rows for data diff | `10000` |
+| `diff.max_rows` | Max rows for diff | `10000` |
 | `default_remote` | Default remote name | (none) |
-| `remotes.<name>` | Remote URL (S3) | (none) |
 
 ---
 

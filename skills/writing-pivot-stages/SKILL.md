@@ -92,6 +92,31 @@ Outputs: `data/scores/clean/rows.jsonl`, `metrics/scores/clean/summary.yaml`, `d
 - Define stages, their `StageParams`, their return `TypedDict`s and custom loaders at module level. Workers receive the function by pickling. With postponed/string annotations (for example, `from __future__ import annotations`), return annotations are resolved in the module namespace, so a `TypedDict` defined inside a function fails with `name 'Result' is not defined`.
 - Outside a `with Pipeline` block a stage is an ordinary function, so test it directly: `clean(df, CleanParams(min_score=0.9))`.
 
+## Resources and concurrency
+
+Use `resources=` on `@stage` when a stage needs a constrained scheduler resource:
+
+```python
+@stage(resources={"gpu": 1})
+def train(rows: pd.DataFrame, params: TrainParams) -> dict:
+    return {"rows": len(rows)}
+```
+
+Every scheduled stage holds one CPU unit. `@stage(resources={"cpu": "all"})` reserves all effective worker capacity and therefore runs alone. Other resource names default to capacity 1. Set capacities in `.pivot/config.yaml`:
+
+```yaml
+resources:
+  gpu: 2
+```
+
+or for one run:
+
+```bash
+pivot repro --resources gpu=2
+```
+
+Resource names are case-insensitive. Resources control admission only: a waiting stage does not consume a worker, and changing a resource declaration does not invalidate cached outputs.
+
 ## Pipelines and inputs
 
 - `pipeline.py` must bind the pipeline to a module variable named `pipeline`. Pivot finds `pipeline.py` in the current directory or the project root (the top-most directory containing `.pivot/`).
