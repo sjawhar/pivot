@@ -898,10 +898,7 @@ def _reject_path_inside_project(
     lexical_source = source.absolute()
     resolved_root = project_root.resolve()
     resolved_source = source.resolve()
-    if (
-        lexical_source.is_relative_to(lexical_root)
-        or resolved_source.is_relative_to(resolved_root)
-    ):
+    if lexical_source.is_relative_to(lexical_root) or resolved_source.is_relative_to(resolved_root):
         raise exceptions.StageDefinitionError(
             f"Stage '{ref.identity.producer}' returned {value}, which is inside the project "
             + f"({project_root}). Pivot moves a returned path to the stage's output path, so it "
