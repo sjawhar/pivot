@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import exceptions, path_policy, project, registry, stage_def, types
+from . import exceptions, outputs, path_policy, project, registry, stage_def, types
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -917,11 +917,13 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
     tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
     fmt: loaders_mod.Writer[object] | None = None
     loaders = _get_loaders()
+    # Users never see SINGLE_OUTPUT_KEY: a single output is the stage's return value.
+    label = "the return value" if key == SINGLE_OUTPUT_KEY else f"output '{key}'"
     for metadata in args[1:]:
         if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
             if tag is not None:
                 raise exceptions.StageDefinitionError(
-                    f"Stage '{stage_name}' output '{key}' cannot combine "
+                    f"Stage '{stage_name}': {label} cannot combine "
                     + f"{type(tag).__name__.removeprefix('_').removesuffix('Tag').lower()} "
                     + f"with {type(metadata).__name__.removeprefix('_').removesuffix('Tag').lower()}."
                 )
@@ -929,17 +931,23 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
         elif isinstance(metadata, loaders.Writer):
             if fmt is not None:
                 raise exceptions.StageDefinitionError(
-                    f"Stage '{stage_name}' output '{key}' has more than one loader."
+                    f"Stage '{stage_name}': {label} has more than one loader."
                 )
             fmt = typing.cast("loaders_mod.Writer[object]", metadata)
         else:
             metadata_name = (
                 metadata.__name__ if isinstance(metadata, type) else type(metadata).__name__
             )
-            raise exceptions.StageDefinitionError(
-                f"Stage '{stage_name}' output '{key}' has unsupported Annotated metadata "
+            message = (
+                f"Stage '{stage_name}': {label} has unsupported Annotated metadata "
                 + f"'{metadata_name}'."
             )
+            if isinstance(metadata, outputs.DirectoryOut):
+                message += (
+                    " For a directory output, create the directory outside the project and "
+                    + "return a pathlib.Path to it."
+                )
+            raise exceptions.StageDefinitionError(message)
 
     if fmt is None:
         if isinstance(tag, _PlotTag):
@@ -953,7 +961,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
         not isinstance(fmt, loaders.Loader) or type(fmt).empty is loaders.Loader.empty
     ):
         raise exceptions.StageDefinitionError(
-            f"Stage '{stage_name}' output '{key}' is incremental but loader "
+            f"Stage '{stage_name}': {label} is incremental but loader "
             + f"'{type(fmt).__name__}' does not implement empty()."
         )
     return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
