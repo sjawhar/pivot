@@ -64,9 +64,10 @@ def test_previous_requires_an_incremental_output(tmp_path: pathlib.Path) -> None
     def update(previous: dict[str, int]) -> dict[str, int]:
         return previous
 
-    with pytest.raises(
-        ValueError, match="update.*previous.*incremental"
-    ), compose.Pipeline("updates", root=tmp_path) as pipeline:
+    with (
+        pytest.raises(ValueError, match="update.*previous.*incremental"),
+        compose.Pipeline("updates", root=tmp_path) as pipeline,
+    ):
         update(previous=pipeline.previous())
 
 
@@ -78,9 +79,10 @@ def test_previous_rejects_unknown_output_key(tmp_path: pathlib.Path) -> None:
     def update(previous: dict[str, int]) -> Annotated[dict[str, int], tag]:
         return previous
 
-    with pytest.raises(
-        ValueError, match="update.*previous.*missing"
-    ), compose.Pipeline("updates", root=tmp_path) as pipeline:
+    with (
+        pytest.raises(ValueError, match="update.*previous.*missing"),
+        compose.Pipeline("updates", root=tmp_path) as pipeline,
+    ):
         update(previous=pipeline.previous("missing"))
 
 
@@ -92,9 +94,10 @@ def test_previous_rejects_two_parameters_for_one_output(tmp_path: pathlib.Path) 
     def update(first: dict[str, int], second: dict[str, int]) -> Annotated[dict[str, int], tag]:
         return {**first, **second}
 
-    with pytest.raises(
-        ValueError, match="update.*first.*second"
-    ), compose.Pipeline("updates", root=tmp_path) as pipeline:
+    with (
+        pytest.raises(ValueError, match="update.*first.*second"),
+        compose.Pipeline("updates", root=tmp_path) as pipeline,
+    ):
         update(first=pipeline.previous(), second=pipeline.previous())
 
 
@@ -102,9 +105,10 @@ def test_previous_marker_must_be_consumed_by_one_stage_call(tmp_path: pathlib.Pa
     """A marker outside a stage call is a definition error rather than inert state."""
     _ = _incremental_tag()
 
-    with pytest.raises(
-        ValueError, match="previous.*stage call"
-    ), compose.Pipeline("updates", root=tmp_path) as pipeline:
+    with (
+        pytest.raises(ValueError, match="previous.*stage call"),
+        compose.Pipeline("updates", root=tmp_path) as pipeline,
+    ):
         pipeline.previous()
 
 
@@ -116,9 +120,10 @@ def test_previous_marker_cannot_be_reused_by_another_stage_call(tmp_path: pathli
     def update(previous: dict[str, int]) -> Annotated[dict[str, int], tag]:
         return previous
 
-    with pytest.raises(
-        ValueError, match="previous.*already.*update"
-    ), compose.Pipeline("updates", root=tmp_path) as pipeline:
+    with (
+        pytest.raises(ValueError, match="previous.*already.*update"),
+        compose.Pipeline("updates", root=tmp_path) as pipeline,
+    ):
         previous = pipeline.previous()
         update(previous=previous)
         update(previous=previous)

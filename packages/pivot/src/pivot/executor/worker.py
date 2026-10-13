@@ -467,8 +467,6 @@ def execute_stage(
             )
 
 
-
-
 def _to_identity_hashes(hashes: dict[str, HashInfo]) -> dict[types.ArtifactIdentity, HashInfo]:
     return {types.identity_from_key(key): info for key, info in hashes.items()}
 
@@ -612,7 +610,6 @@ def _check_skip_or_run(
     if decision["changed"]:
         return None, decision["reason"], input_hash, decision["run_cache_allowed"]
     return "unchanged", "", input_hash, decision["run_cache_allowed"]
-
 
 
 def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:

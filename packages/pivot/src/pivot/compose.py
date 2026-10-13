@@ -259,6 +259,7 @@ class Pipeline:
     _call_counts: dict[tuple[str, tuple[str, ...]], int]
     _validation_errors: list[str]
     _token: contextvars.Token[Pipeline | None] | None
+    _variant_stack: list[str]
     _registry: registry.StageRegistry
     _included_stages: dict[str, registry.RegistryStageInfo]
     _previous_markers: list[_PreviousOutputMarker]
@@ -274,7 +275,7 @@ class Pipeline:
         self._call_counts = {}
         self._validation_errors = []
         self._token = None
-        self._variant_stack = []
+        self._variant_stack = list[str]()
         self._registry = registry.StageRegistry()
         self._previous_markers = list[_PreviousOutputMarker]()
         self._included_stages = dict[str, registry.RegistryStageInfo]()
