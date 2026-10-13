@@ -37,7 +37,10 @@ def _mutate_previous_file(previous: pathlib.Path) -> pathlib.Path:
 def _mutate_previous_directory(previous: pathlib.Path) -> pathlib.Path:
     assert previous.is_dir()
     assert not previous.is_symlink()
-    (previous / "nested").mkdir(exist_ok=True)
+    assert (previous / "seed.txt").read_text() == "seed"
+    assert (previous / "nested" / "existing.txt").read_text() == "nested seed"
+    (previous / "seed.txt").write_text("seed updated")
+    (previous / "nested" / "existing.txt").write_text("nested seed updated")
     (previous / "nested" / "next.txt").write_text("next")
     result_dir = pathlib.Path(tempfile.mkdtemp()) / "result"
     shutil.copytree(previous, result_dir)
@@ -234,6 +237,8 @@ def test_incremental_directory_restores_a_writable_copy_without_mutating_the_cac
     output_path = _output_path(tmp_path, "directory", "dat")
     output_path.mkdir(parents=True)
     (output_path / "seed.txt").write_text("seed")
+    (output_path / "nested").mkdir()
+    (output_path / "nested" / "existing.txt").write_text("nested seed")
     output_hash = cache.save_to_cache(output_path, worker_env)
     cache.remove_output(output_path)
     stage_lock = lock.StageLock("incremental/directory", lock.get_stages_dir(tmp_path / ".pivot"))
@@ -254,6 +259,13 @@ def test_incremental_directory_restores_a_writable_copy_without_mutating_the_cac
     )
 
     assert result["status"] is types.StageStatus.RAN
-    assert (output_path / "nested" / "next.txt").read_text() == "next"
-    cache_path = cache.get_cache_path(worker_env, output_hash["hash"])
-    assert not (cache_path / "nested" / "next.txt").exists()
+    assert output_path.joinpath("seed.txt").read_text() == "seed updated"
+    assert output_path.joinpath("nested", "existing.txt").read_text() == "nested seed updated"
+    assert output_path.joinpath("nested", "next.txt").read_text() == "next"
+    cache_files = {
+        entry["relpath"]: cache.get_cache_path(worker_env, entry["hash"])
+        for entry in output_hash["manifest"]
+    }
+    assert cache_files["seed.txt"].read_text() == "seed"
+    assert cache_files["nested/existing.txt"].read_text() == "nested seed"
+    assert "nested/next.txt" not in cache_files
