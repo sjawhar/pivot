@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import contextvars
 import dataclasses
 import enum
@@ -241,6 +242,7 @@ class Pipeline:
     _token: contextvars.Token[Pipeline | None] | None
     _variant_stack: list[str]
     _registry: registry.StageRegistry
+    _included_stages: dict[str, registry.RegistryStageInfo]
     _constructing: bool
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
@@ -255,6 +257,7 @@ class Pipeline:
         self._token = None
         self._variant_stack = []
         self._registry = registry.StageRegistry()
+        self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
 
         if root is not None:
@@ -314,20 +317,23 @@ class Pipeline:
         self._registry.restore(snapshot)
 
     def include(self, other: registry.PipelineLike) -> None:
-        import copy
-
         if other is self:
             from pivot.exceptions import PipelineConfigError
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        existing_stages = set(self._registry.list_stages())
+        existing_stages = (
+            set(self._included_stages) if self._constructing else set(self._registry.list_stages())
+        )
         for stage_name in other.list_stages():
             if stage_name in existing_stages:
                 logger.debug("include: skipping duplicate stage '%s'", stage_name)
                 continue
             stage_info = copy.deepcopy(other.get_stage(stage_name))
-            self._registry.add_existing(stage_info)
+            self._included_stages[stage_name] = stage_info
+            existing_stages.add(stage_name)
+            if not self._constructing:
+                self._registry.add_existing(copy.deepcopy(stage_info))
 
         for name, path in other.input_bindings.items():
             if name in self._inputs:
@@ -381,6 +387,14 @@ class Pipeline:
             qualified_name = f"{self._name}/{node.name}"
             stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
             new_registry.add_existing(stage_info)
+
+        materialized_stages = set(new_registry.list_stages())
+        for stage_name, stage_info in self._included_stages.items():
+            if stage_name in materialized_stages:
+                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+                continue
+            new_registry.add_existing(copy.deepcopy(stage_info))
+            materialized_stages.add(stage_name)
 
         # Atomic swap — if any step above raises, self._registry is unchanged
         self._registry = new_registry

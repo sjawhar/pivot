@@ -1613,6 +1613,33 @@ def test_cross_pipeline_input_binding_conflict_raises(tmp_path: pathlib.Path) ->
             _helper_consume_dict(result)
 
 
+def test_include_inside_construction_survives_materialization(tmp_path: pathlib.Path) -> None:
+    """include() inside a Pipeline block keeps the child's snapshot after the registry rebuild."""
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        _helper_produce(params=stage_def.StageParams())
+
+    with Pipeline("parent", root=tmp_path) as parent:
+        parent.include(child)
+        _helper_repeat(params=stage_def.StageParams())
+
+    assert set(parent.list_stages()) == {"child/_helper_produce", "parent/_helper_repeat"}
+
+
+def test_include_after_construction_survives_later_materialization(tmp_path: pathlib.Path) -> None:
+    """include() after a block has the same snapshot behavior if the pipeline is re-entered."""
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        _helper_produce(params=stage_def.StageParams())
+
+    parent = Pipeline("parent", root=tmp_path)
+    parent.include(child)
+    with parent:
+        _helper_repeat(params=stage_def.StageParams())
+
+    assert set(parent.list_stages()) == {"child/_helper_produce", "parent/_helper_repeat"}
+
+
 # --- Edge-case tests for cross-pipeline composition ---
 
 
