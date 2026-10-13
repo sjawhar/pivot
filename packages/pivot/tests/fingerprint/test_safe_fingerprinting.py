@@ -1,5 +1,6 @@
 import dataclasses
 import enum
+import json
 import logging
 from collections.abc import Callable
 from typing import ClassVar
@@ -217,6 +218,27 @@ def test_unsafe_env_allows_non_scalar_capture(
     assert any("non-scalar variable" in record.message for record in caplog.records), (
         "Should warn when unsafe fingerprinting is enabled"
     )
+
+
+def test_unsafe_capture_does_not_populate_manifest_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cached = dict[str, dict[str, str]]()
+
+    class ManifestWrites(list[tuple[bytes, bytes]]):
+        def append(self, entry: tuple[bytes, bytes]) -> None:
+            cached["unsafe-cache"] = json.loads(entry[1])["m"]
+
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", ManifestWrites())
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda stage_name: cached.get(stage_name))
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_tuple)
+
+    assert "unsafe-cache" not in cached
+
+    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING")
+    with pytest.raises(exceptions.StageDefinitionError):
+        fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_tuple)
 
 
 NESTED_MUTABLE_TUPLE = (1, [2, 3])

@@ -30,8 +30,9 @@ _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Bump when the hashing scheme changes. Version 3 strips absolute source paths from
-# marshalled code objects. Version 4 qualifies manifest keys by definition module.
-_CACHE_SCHEMA_VERSION = 4
+# marshalled code objects. Version 4 qualifies manifest keys by definition module. Version 5
+# invalidates manifests that might have been persisted after unsafe capture warnings.
+_CACHE_SCHEMA_VERSION = 5
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -117,6 +118,12 @@ _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar
 # Unsafe capture errors collected while recursively walking one stage's dependencies.
 _capture_errors: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
     "_capture_errors", default=None
+)
+
+# Unsafe captures are allowed only with an explicit warning and must never populate the
+# persistent manifest cache.
+_unsafe_capture_warning: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_unsafe_capture_warning", default=False
 )
 
 
@@ -450,28 +457,31 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
         return cached
 
     metrics.count("fingerprint.manifest_cache.miss")
-
-    # Compute with source tracking
-    token = _current_stage_name.set(stage_name)
+    unsafe_token = _unsafe_capture_warning.set(False)
     try:
-        with _collecting_sources() as source_map:
-            manifest = get_stage_fingerprint(func)
+        # Compute with source tracking
+        token = _current_stage_name.set(stage_name)
+        try:
+            with _collecting_sources() as source_map:
+                manifest = get_stage_fingerprint(func)
+        finally:
+            _current_stage_name.reset(token)
+
+        if not _unsafe_capture_warning.get():
+            key = _make_manifest_cache_key(stage_name)
+            value = json.dumps(
+                {
+                    "m": manifest,
+                    "s": {rel_path: list(stats) for rel_path, stats in source_map.items()},
+                },
+                separators=(",", ":"),
+            ).encode()
+            _pending_manifest_writes.append((key, value))
+
+        return manifest
     finally:
-        _current_stage_name.reset(token)
-
-    # Queue for flush
-    key = _make_manifest_cache_key(stage_name)
-    value = json.dumps(
-        {
-            "m": manifest,
-            "s": {rel_path: list(stats) for rel_path, stats in source_map.items()},
-        },
-        separators=(",", ":"),
-    ).encode()
-    _pending_manifest_writes.append((key, value))
-
-    metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
-    return manifest
+        _unsafe_capture_warning.reset(unsafe_token)
+        metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
 
 
 def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
@@ -786,6 +796,7 @@ def _check_non_scalar_capture(var_name: str, value: Any, stage_name: str) -> Non
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
     if _is_unsafe_fingerprinting_enabled():
+        _unsafe_capture_warning.set(True)
         _logger.warning(message)
         return
     errors = _capture_errors.get()
