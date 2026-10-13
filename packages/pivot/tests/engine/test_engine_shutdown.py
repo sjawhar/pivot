@@ -11,11 +11,11 @@ from typing import TYPE_CHECKING, Any, cast
 import anyio
 import pytest
 
-from conftest import AsyncEventCaptureSink
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks, sources
 from pivot.types import LogMessage, OutputMessage, OutputMessageKind, StageStatus
 from tests import helpers
+from tests.conftest import AsyncEventCaptureSink
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
