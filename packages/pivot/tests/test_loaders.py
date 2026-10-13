@@ -1112,9 +1112,9 @@ def test_dataframe_jsonl_refuses_timezone_that_cannot_roundtrip(
     assert timezone is not None
     frame = pandas.DataFrame(
         {
-            "timestamp": pandas.Series(
-                pandas.to_datetime(["2024-03-04 12:00", None]).tz_localize(timezone)
-            )
+            "timestamp": pandas.to_datetime(
+                pandas.Series(["2024-03-04 12:00", None])
+            ).dt.tz_localize(timezone)
         }
     )
 

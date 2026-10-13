@@ -501,7 +501,7 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
         for name, dtype in float_columns.items():
             if name not in frame.columns:
                 frame[name] = pandas.Series(math.nan, index=frame.index)
-            frame[name] = frame[name].astype(dtype)
+            frame[name] = frame[name].astype(pandas.api.types.pandas_dtype(dtype))
         return frame
 
     @override

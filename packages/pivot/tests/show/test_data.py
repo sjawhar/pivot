@@ -89,12 +89,11 @@ def test_load_dataframe_jsonl(tmp_path: Path) -> None:
     assert df.iloc[0]["name"] == "alice"
 
 
-
 def test_dataframe_jsonl_metadata_is_excluded_from_data_readers(tmp_path: Path) -> None:
     jsonl_file = tmp_path / "pivot.jsonl"
     frame = pandas.DataFrame(
         {
-            "timestamp": pandas.to_datetime(["2024-03-04 12:34:56.123456789", None]),
+            "timestamp": pandas.to_datetime(pandas.Series(["2024-03-04 12:34:56.123456789", None])),
             "value": [1, 2],
         }
     )
@@ -108,6 +107,7 @@ def test_dataframe_jsonl_metadata_is_excluded_from_data_readers(tmp_path: Path) 
         "value": "int64",
     }
     assert data.get_row_count(jsonl_file) == 2
+
 
 def test_load_dataframe_unsupported(tmp_path: Path) -> None:
     """Unsupported format raises DataError."""
