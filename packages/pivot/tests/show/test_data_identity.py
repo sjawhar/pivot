@@ -167,8 +167,8 @@ outs:
     tag: data
 """
 
-    def mock_read_files(paths: Sequence[str]) -> dict[str, str]:
-        return {".pivot/stages/train.lock": lock_content}
+    def mock_read_files(paths: Sequence[str]) -> dict[str, bytes]:
+        return {".pivot/stages/train.lock": lock_content.encode()}
 
     monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
 

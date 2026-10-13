@@ -32,6 +32,9 @@ from pivot.decorators import no_fingerprint
 from pivot.executor.worker import _reconstruct_list_kwargs
 from pivot.registry import RegistryStageInfo, _compute_fingerprint
 
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
+
 
 def test_infer_format_dataframe() -> None:
     fmt = _infer_format(pd.DataFrame)
@@ -76,7 +79,6 @@ def test_artifact_handle_suboutput() -> None:
         _OutputSpec(key="raw_runs", python_type=dict, format=loaders.JSON()),
     ]
     stage_node = _StageNode(
-        func=stage_func,
         original_func=stage_func,
         name="train",
         params=None,
@@ -109,7 +111,6 @@ def test_artifact_handle_missing_output_raises() -> None:
         ),
     ]
     stage_node = _StageNode(
-        func=stage_func,
         original_func=stage_func,
         name="train",
         params=None,
@@ -713,6 +714,55 @@ def test_pipeline_variant_counts_still_increment_within_same_variant(
     assert pipeline._stages[0].name == "_helper_repeat@v1"
     assert pipeline._stages[1].name == "_helper_repeat@1@v1"
     assert pipeline._stages[2].name == "_helper_repeat@v2"
+
+
+@pytest.mark.parametrize(
+    "variant_name",
+    [
+        pytest.param("big one", id="space"),
+        pytest.param("a/../b", id="traversal"),
+        pytest.param("", id="empty"),
+        pytest.param("x" * 201, id="too_long"),
+    ],
+)
+def test_pipeline_variant_rejects_name_lock_files_cannot_hold(
+    tmp_path: pathlib.Path, variant_name: str
+) -> None:
+    """A variant name that cannot be part of a lock file name fails where it is declared."""
+    pipeline = Pipeline("v", root=tmp_path)
+    with pytest.raises(ValueError, match="variant name") as exc_info, pipeline:  # noqa: SIM117
+        with pipeline.variant(variant_name):
+            _helper_produce(params=stage_def.StageParams())
+
+    assert repr(variant_name) in str(exc_info.value), "Error should name the bad variant"
+
+
+@pytest.mark.parametrize(
+    ("pipeline_name", "variant_name", "bad_stage"),
+    [
+        pytest.param("my pipeline", "ok", "my pipeline/_helper_produce@ok", id="pipeline_space"),
+        pytest.param(
+            "p", "v" * 190, f"p/_helper_produce@{'v' * 190}", id="qualified_name_too_long"
+        ),
+    ],
+)
+def test_pipeline_rejects_stage_name_lock_files_cannot_hold(
+    tmp_path: pathlib.Path, pipeline_name: str, variant_name: str, bad_stage: str
+) -> None:
+    """A qualified stage name the lock would reject fails at definition, not at repro."""
+    pipeline = Pipeline(pipeline_name, root=tmp_path)
+    with pytest.raises(ValueError, match="stage name") as exc_info, pipeline:  # noqa: SIM117
+        with pipeline.variant(variant_name):
+            _helper_produce(params=stage_def.StageParams())
+
+    assert repr(bad_stage) in str(exc_info.value), "Error should name the bad stage"
+
+
+def test_pipeline_variant_accepts_lock_compatible_names(tmp_path: pathlib.Path) -> None:
+    with Pipeline("v", root=tmp_path) as pipeline, pipeline.variant("0.5-swe_bench"):
+        _helper_produce(params=stage_def.StageParams())
+
+    assert pipeline.list_stages() == ["v/_helper_produce@0.5-swe_bench"]
 
 
 # --- Bug 2: Optional[StageParams] params detection ---
@@ -1345,6 +1395,44 @@ def test_cross_pipeline_input_identity_not_qualified(tmp_path: pathlib.Path) -> 
 
 
 # --- @no_fingerprint decorator stacking ---
+
+
+@no_fingerprint(code_deps=["helper.py"])
+@stage
+def _helper_code_deps_above_stage() -> str:
+    return "output"
+
+
+@stage
+@no_fingerprint(code_deps=["helper.py"])
+def _helper_code_deps_below_stage() -> str:
+    return "output"
+
+
+@pytest.mark.parametrize(
+    "stage_func",
+    [
+        pytest.param(_helper_code_deps_above_stage, id="no_fingerprint-above-stage"),
+        pytest.param(_helper_code_deps_below_stage, id="no_fingerprint-below-stage"),
+    ],
+)
+def test_no_fingerprint_code_deps_survive_decorator_order(
+    stage_func: Callable[[], str], set_project_root: pathlib.Path
+) -> None:
+    """code_deps must be fingerprinted whichever side of @stage @no_fingerprint sits on."""
+    helper = set_project_root / "helper.py"
+    helper.write_text("value = 1\n")
+    with Pipeline("test", root=set_project_root) as before:
+        stage_func()
+    fp_before = before.ensure_fingerprint(f"test/{stage_func.__name__}")
+
+    helper.write_text("value = 2\n")
+    with Pipeline("test", root=set_project_root) as after:
+        stage_func()
+    fp_after = after.ensure_fingerprint(f"test/{stage_func.__name__}")
+
+    assert "file:helper.py" in fp_before, f"code_deps file must be fingerprinted, got: {fp_before}"
+    assert fp_before != fp_after, "Editing a code_deps file must change the stage fingerprint"
 
 
 def test_no_fingerprint_outside_stage_decorator(set_project_root: pathlib.Path) -> None:

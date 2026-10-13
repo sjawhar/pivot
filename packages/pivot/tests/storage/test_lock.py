@@ -353,6 +353,7 @@ def test_lock_directory_created(tmp_path: Path) -> None:
         pytest.param("../etc/passwd", id="path_traversal"),
         pytest.param("stage with spaces", id="spaces"),
         pytest.param("stage\nwith\nnewlines", id="newlines"),
+        pytest.param("stage\n", id="trailing_newline"),
         pytest.param("../../traversal", id="double_traversal"),
     ],
 )

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 from typing_extensions import is_typeddict
 
 from . import project, registry, stage_def, types
+from .storage import lock
 
 logger = logging.getLogger(__name__)
 
@@ -152,9 +153,7 @@ def _emit_stage_info(
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     assert not hasattr(func, "_is_stage")
-    no_fp = getattr(node.func, "__pivot_no_fingerprint__", False)
-    if not no_fp:
-        no_fp = getattr(func, "__pivot_no_fingerprint__", False)
+    no_fp = getattr(func, "__pivot_no_fingerprint__", False)
 
     deps = dict[str, types.ArtifactRef]()
 
@@ -432,6 +431,9 @@ class Pipeline:
         All stages registered within the block get @{name} appended to their stage name.
         Nesting is supported: variant("a") inside variant("b") → @b@a suffix.
         """
+        reason = lock.stage_name_error(name)
+        if reason is not None:
+            raise ValueError(f"Invalid variant name {name!r}: {reason}")
         self._variant_stack.append(name)
         try:
             yield
@@ -441,7 +443,6 @@ class Pipeline:
     def _record_stage(
         self,
         original_func: Callable[..., object],
-        wrapper: Callable[..., object],
         output_specs: list[_OutputSpec],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -457,6 +458,11 @@ class Pipeline:
         if self._variant_stack:
             for variant in self._variant_stack:
                 stage_name = f"{stage_name}@{variant}"
+
+        qualified_name = f"{self._name}/{stage_name}"
+        reason = lock.stage_name_error(qualified_name)
+        if reason is not None:
+            raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
 
         sig = inspect.signature(original_func)
         try:
@@ -505,7 +511,6 @@ class Pipeline:
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
         node = _StageNode(
-            func=wrapper,
             original_func=original_func,
             name=stage_name,
             params=params,
@@ -792,7 +797,7 @@ def stage[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
+        return pipeline._record_stage(func, _get_output_specs(), args, kwargs)
 
     wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
     wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
@@ -809,7 +814,6 @@ class _OutputSpec:
 
 @dataclasses.dataclass
 class _StageNode:
-    func: Callable[..., object]
     original_func: Callable[..., object]
     name: str
     params: stage_def.StageParams | None

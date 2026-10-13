@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _VALID_STAGE_NAME = re.compile(
-    r"^[a-zA-Z0-9_@./-]+$"
+    r"[a-zA-Z0-9_@./-]+"
 )  # Allow / for pipeline-prefixed names, . for DVC matrix keys
 _PATH_TRAVERSAL = re.compile(r"(^|/)\.\.(/|$)")  # Reject ../ path traversal
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
@@ -54,6 +54,18 @@ def get_stages_dir(state_dir: Path) -> Path:
     .pivot/cache/stages/ so they can be versioned for reproducibility.
     """
     return state_dir / "stages"
+
+
+def stage_name_error(name: str) -> str | None:
+    """Return why ``name`` cannot name a lock file, or None if it can.
+
+    This is the single rule for stage names and the variant segments inside them.
+    """
+    if not name or not _VALID_STAGE_NAME.fullmatch(name) or _PATH_TRAVERSAL.search(name):
+        return "use only letters, digits and the characters _ @ . / - (no '..' segments)"
+    if len(name) > _MAX_STAGE_NAME_LEN:
+        return f"too long ({len(name)} > {_MAX_STAGE_NAME_LEN} characters)"
+    return None
 
 
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
@@ -212,14 +224,9 @@ class StageLock:
 
     def __init__(self, stage_name: str, stages_dir: Path) -> None:
         """Initialize a stage lock for the given stage in stages_dir."""
-        if (
-            not stage_name
-            or not _VALID_STAGE_NAME.match(stage_name)
-            or _PATH_TRAVERSAL.search(stage_name)
-        ):
-            raise ValueError(f"Invalid stage name: {stage_name!r}")
-        if len(stage_name) > _MAX_STAGE_NAME_LEN:
-            raise ValueError(f"Stage name too long ({len(stage_name)} > {_MAX_STAGE_NAME_LEN})")
+        reason = stage_name_error(stage_name)
+        if reason is not None:
+            raise ValueError(f"Invalid stage name {stage_name!r}: {reason}")
         self.stage_name = stage_name
         self.path = stages_dir / f"{stage_name}.lock"
 
