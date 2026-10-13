@@ -588,7 +588,7 @@ def test_status_json_includes_suggestions(
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     assert "suggestions" in data
-    assert any("pivot run" in s for s in data["suggestions"])
+    assert any("pivot repro" in s for s in data["suggestions"])
 
 
 # =============================================================================
@@ -606,7 +606,7 @@ def test_status_shows_suggestions(
 
     assert result.exit_code == 0, result.output
     assert "Suggestions" in result.output
-    assert "pivot run" in result.output
+    assert "pivot repro" in result.output
 
 
 # =============================================================================

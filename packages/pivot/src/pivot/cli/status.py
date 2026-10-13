@@ -7,11 +7,13 @@ import click
 import tqdm
 
 from pivot import config, exceptions, project
+from pivot import explain as explain_mod
 from pivot import status as status_mod
 from pivot.cli import completion, console
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
+from pivot.remote import config as remote_config
 from pivot.types import (
     ExplainOutput,
     ExplainStageJson,
@@ -141,13 +143,24 @@ def status(
     # Compute counts once for suggestions and output
     if explain and pipeline_explanations:
         stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
+        stage_reasons = [e["reason"] for e in pipeline_explanations]
     else:
         stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
+        stage_reasons = [s["reason"] for s in pipeline_status]
+    missing_outputs_count = sum(
+        1 for reason in stage_reasons if reason == explain_mod.OUTPUTS_MISSING_REASON
+    )
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
     suggestions = status_mod.get_suggestions(
-        stale_count, modified_count, push_count, pull_count, len(orphaned_locks)
+        stale_count,
+        modified_count,
+        push_count,
+        pull_count,
+        len(orphaned_locks),
+        missing_outputs_count=missing_outputs_count,
+        remote_configured=missing_outputs_count > 0 and bool(remote_config.list_remotes()),
     )
 
     # Quiet mode: no output, exit 1 if there are issues needing attention

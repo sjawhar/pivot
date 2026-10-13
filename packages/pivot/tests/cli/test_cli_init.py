@@ -225,6 +225,19 @@ def test_init_output_contains_expected_elements(
         assert "pipeline.py" in result.output
 
 
+def test_init_next_steps_suggest_repro(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The suggested run command must work without arguments (`pivot run` needs stage names)."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0
+        assert "'pivot repro'" in result.output
+        assert "'pivot run'" not in result.output
+
+
 # --- safety checks: symlink and file-not-dir ---
 
 

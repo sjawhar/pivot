@@ -96,3 +96,43 @@ def test_verify_allow_missing_passes_when_everything_is_local(tmp_path: pathlib.
 
     assert proc.returncode == 0, out
     assert "Missing files" not in out, out
+
+
+_CLONE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def double(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * 2
+
+
+with Pipeline("c") as pipeline:
+    double(pipeline.input("t.csv"))
+"""
+
+
+def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: pathlib.Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(src, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(src, "repro"))
+    _ok(_pivot(src, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    _ok(_pivot(src, "config", "set", "default_remote", "origin"))
+    (src / ".gitignore").write_text("data/c/\n")
+    subprocess.run(["git", "add", "-A"], cwd=src, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=src,
+        check=True,
+    )
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+
+    out = _ok(_pivot(clone, "status"))
+
+    assert "Run `pivot pull` to restore outputs of 1 stage from the remote" in out
+    assert "Run `pivot repro` to execute 1 stale stage" in out
+    assert out.index("pivot pull") < out.index("pivot repro"), out

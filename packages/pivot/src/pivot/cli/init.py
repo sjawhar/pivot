@@ -77,5 +77,5 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo()
         click.echo("Next steps:")
         click.echo("  1. Create pipeline.py to define your pipeline stages")
-        click.echo("  2. Run 'pivot run' to execute the pipeline")
+        click.echo("  2. Run 'pivot repro' to execute the pipeline")
         click.echo("  3. See 'pivot --help' for more commands")
