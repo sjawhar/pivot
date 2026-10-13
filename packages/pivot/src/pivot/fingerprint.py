@@ -112,6 +112,11 @@ _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar
     "_current_stage_name", default=None
 )
 
+# Unsafe capture errors collected while recursively walking one stage's dependencies.
+_capture_errors: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "_capture_errors", default=None
+)
+
 
 def _close_state_db() -> None:
     """Close the readonly StateDB on process exit."""
@@ -408,14 +413,23 @@ def get_stage_fingerprint(
     """
     if visited is None:
         visited = set()
-        # TODO (future): If parallel fingerprinting is needed, use threading.Lock
-        # to protect visited set from race conditions. Current single-threaded
-        # usage is safe.
+
+    errors = _capture_errors.get()
+    token: contextvars.Token[list[str] | None] | None = None
+    if errors is None:
+        errors = list[str]()
+        token = _capture_errors.set(errors)
 
     _t = metrics.start()
-    result = _get_stage_fingerprint_impl(func, visited)
-    metrics.end("fingerprint.get_stage_fingerprint", _t)
-    return result
+    try:
+        result = _get_stage_fingerprint_impl(func, visited)
+        if errors:
+            raise exceptions.StageDefinitionError("\n\n".join(errors))
+        return result
+    finally:
+        metrics.end("fingerprint.get_stage_fingerprint", _t)
+        if token is not None:
+            _capture_errors.reset(token)
 
 
 def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
@@ -772,7 +786,10 @@ def _check_non_scalar_capture(var_name: str, value: Any, stage_name: str) -> Non
     if _is_unsafe_fingerprinting_enabled():
         _logger.warning(message)
         return
-    raise exceptions.StageDefinitionError(message)
+    errors = _capture_errors.get()
+    if errors is None:
+        raise exceptions.StageDefinitionError(message)
+    errors.append(message)
 
 
 def _check_data_class_methods(cls: type) -> None:

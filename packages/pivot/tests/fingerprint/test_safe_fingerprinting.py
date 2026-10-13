@@ -100,6 +100,10 @@ def _stage_uses_enum_member() -> str:
     return ENUM_MEMBER.value
 
 
+def _stage_uses_three_non_scalar_values() -> int:
+    return len(IMMUTABLE_TUPLE) + len(IMMUTABLE_FROZENSET) + FROZEN_DATACLASS.value
+
+
 @pytest.mark.parametrize(
     ("func", "var_name", "type_name"),
     [
@@ -164,6 +168,15 @@ def test_non_scalar_closure_capture_raises(
     assert f"type: {type_name}" in message, "Should include captured variable type"
     assert "Fix: pass this data via StageParams" in message, "Should include suggestion"
     assert "PIVOT_UNSAFE_FINGERPRINTING=1" in message, "Should include suppression hint"
+
+
+def test_non_scalar_capture_errors_are_aggregated() -> None:
+    with pytest.raises(exceptions.StageDefinitionError) as exc:
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_three_non_scalar_values)
+
+    message = str(exc.value)
+    for variable in ("IMMUTABLE_TUPLE", "IMMUTABLE_FROZENSET", "FROZEN_DATACLASS"):
+        assert variable in message
 
 
 @pytest.mark.parametrize(
