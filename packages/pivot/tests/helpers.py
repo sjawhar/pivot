@@ -42,11 +42,13 @@ async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> No
             try:
                 mode = socket_path.stat().st_mode
                 if stat.S_ISSOCK(mode):
+                    connection = await anyio.connect_unix(str(socket_path))
+                    await connection.aclose()
                     return
-            except OSError:
+            except (OSError, anyio.BrokenResourceError, anyio.ClosedResourceError):
                 pass
         await anyio.sleep(0.05)
-    msg = f"Socket {socket_path} not created within {timeout}s"
+    msg = f"Socket {socket_path} not created and connectable within {timeout}s"
     raise TimeoutError(msg)
 
 

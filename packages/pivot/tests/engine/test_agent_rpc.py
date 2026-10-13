@@ -105,6 +105,66 @@ async def test_agent_rpc_source_accepts_connections(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_source_client_eof_is_not_an_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Readiness probes may connect and close without creating an ERROR traceback."""
+    socket_path = tmp_path / "agent.sock"
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+
+        with caplog.at_level("ERROR"):
+            connection = await anyio.connect_unix(str(socket_path))
+            await connection.aclose()
+            await anyio.sleep(0.05)
+
+        tg.cancel_scope.cancel()
+
+    assert not any(
+        record.name == "pivot.engine.agent_rpc" and record.levelname == "ERROR"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_closed_engine_send_still_logs_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A closed engine event stream is an internal error, not a client disconnect."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](1)
+    await recv.aclose()
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+
+        with caplog.at_level("ERROR"):
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                request = {"jsonrpc": "2.0", "method": "run", "id": 1}
+                await conn.send(json.dumps(request).encode() + b"\n")
+                with contextlib.suppress(
+                    anyio.EndOfStream,
+                    anyio.ClosedResourceError,
+                    anyio.BrokenResourceError,
+                ):
+                    await conn.receive(4096)
+            await anyio.sleep(0.05)
+
+        tg.cancel_scope.cancel()
+
+    assert any(
+        record.name == "pivot.engine.agent_rpc" and record.levelname == "ERROR"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_cancel_command(tmp_path: Path) -> None:
     """AgentRpcSource emits CancelRequested for cancel method."""
     socket_path = tmp_path / "agent.sock"
