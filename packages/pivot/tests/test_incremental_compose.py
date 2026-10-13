@@ -172,7 +172,7 @@ def test_incremental_output_requires_a_full_loader() -> None:
     "loader",
     [
         pytest.param(loaders.PathOnly(), id="path-only"),
-        pytest.param(loaders.Pickle(), id="pickle"),
+        pytest.param(loaders.Pickle[object](), id="pickle"),
     ],
 )
 def test_incremental_output_requires_a_loader_with_an_empty_value(loader: object) -> None:

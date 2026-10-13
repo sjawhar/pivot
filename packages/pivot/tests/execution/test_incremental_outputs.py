@@ -303,6 +303,7 @@ def test_incremental_directory_restores_a_writable_copy_without_mutating_the_cac
     assert output_path.joinpath("seed.txt").read_text() == "seed updated"
     assert output_path.joinpath("nested", "existing.txt").read_text() == "nested seed updated"
     assert output_path.joinpath("nested", "next.txt").read_text() == "next"
+    assert types.is_dir_hash(output_hash)
     cache_files = {
         entry["relpath"]: cache.get_cache_path(worker_env, entry["hash"])
         for entry in output_hash["manifest"]
