@@ -607,6 +607,38 @@ def test_clear_forgets_output_paths() -> None:
     reg.add_existing(_helper_info("demo/x", outs=[_helper_out("demo/x", None)]))
 
 
+@pytest.mark.parametrize(
+    ("input_path", "relation"),
+    [
+        pytest.param("data/demo/x.jsonl", "which 'demo/x' writes", id="same-file"),
+        pytest.param("data/demo", "which contains data/demo/x.jsonl", id="input-contains-output"),
+        pytest.param(
+            "data/demo/x.jsonl/part", "inside data/demo/x.jsonl", id="input-inside-output"
+        ),
+    ],
+)
+def test_check_input_path_rejects_overlap_with_an_output(input_path: str, relation: str) -> None:
+    """An input may not read an output file, a directory holding one, or a path inside one."""
+    reg = StageRegistry()
+    reg.add_existing(_helper_info("demo/x", outs=[_helper_out("demo/x", None)]))
+
+    with pytest.raises(exceptions.OutputPathConflictError) as exc_info:
+        reg.check_input_path("raw_in", pathlib.PurePosixPath(input_path).parts)
+
+    message = str(exc_info.value)
+    assert f"input 'raw_in' reads {input_path}" in message, message
+    assert relation in message, message
+
+
+def test_check_input_path_accepts_a_sibling_of_an_output() -> None:
+    """A path sharing characters but no component with an output is a separate file."""
+    reg = StageRegistry()
+    reg.add_existing(_helper_info("demo/x", outs=[_helper_out("demo/x", None)]))
+
+    reg.check_input_path("raw_in", ("data", "demo", "x.jsonl.bak"))
+    reg.check_input_path("raw_in", ("data", "raw", "x.jsonl"))
+
+
 def test_registry_add_existing_invalidates_dag_cache(tmp_path: pathlib.Path) -> None:
     """add_existing() should invalidate the cached DAG."""
     reg = StageRegistry()

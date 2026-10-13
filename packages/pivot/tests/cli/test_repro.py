@@ -11,6 +11,8 @@ import sys
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 from conftest import isolated_pivot_dir, send_rpc
 from pivot import cli, compose, executor
 from pivot.storage import cache, track
@@ -334,6 +336,77 @@ def test_list_refuses_two_input_names_bound_to_one_path(
         in result.output
     ), result.output
     assert "ExceptionGroup" not in result.output, result.output
+
+
+# Pipeline "raw": stage "s" writes data/raw/s.jsonl, which is also the default binding of
+# pipeline.input("s.jsonl"); an explicit path to another stage's output collides the same way.
+_INPUT_ON_OUTPUT_PIPELINE = """
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def s(seed: pd.DataFrame) -> pd.DataFrame:
+    return seed
+
+
+@stage
+def t(data: pd.DataFrame) -> pd.DataFrame:
+    return data
+
+
+with Pipeline("raw") as pipeline:
+    s(pipeline.input("seed.csv"))
+    t(INPUT)
+"""
+
+
+@pytest.mark.parametrize(
+    ("input_call", "input_name", "path", "output"),
+    [
+        pytest.param(
+            'pipeline.input("s.jsonl")', "s.jsonl", "data/raw/s.jsonl", "raw/s", id="default-path"
+        ),
+        pytest.param(
+            'pipeline.input("copy", path="data/raw/s.jsonl")',
+            "copy",
+            "data/raw/s.jsonl",
+            "raw/s",
+            id="explicit-path",
+        ),
+        pytest.param(
+            'pipeline.input("dir", path="data/raw")',
+            "dir",
+            "data/raw",
+            "raw/s",
+            id="input-contains-output",
+        ),
+    ],
+)
+def test_list_refuses_an_input_bound_to_an_output_path(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    input_call: str,
+    input_name: str,
+    path: str,
+    output: str,
+) -> None:
+    """An input on, inside, or around another stage's output fails at load, naming both."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "seed.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(
+            _INPUT_ON_OUTPUT_PIPELINE.replace("INPUT", input_call)
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    assert "Output path conflict" in result.output, result.output
+    assert f"input '{input_name}'" in result.output, result.output
+    assert f"'{output}'" in result.output, result.output
+    assert path in result.output, result.output
 
 
 # =============================================================================

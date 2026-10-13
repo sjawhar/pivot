@@ -11,6 +11,7 @@ import importlib
 import inspect
 import logging
 import os
+import pathlib
 import types as _stdlib_types
 import typing
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import collections.abc
-    import pathlib
     from collections.abc import Callable
 
     from networkx import DiGraph
@@ -375,6 +375,8 @@ class Pipeline:
                         inherited=True,
                     )
                 )
+        if not self._constructing:
+            self._check_inputs_against_outputs(self._registry)
         self._registry.invalidate_dag_cache()
 
     def __enter__(self) -> Pipeline:
@@ -422,8 +424,22 @@ class Pipeline:
             new_registry.add_existing(copy.deepcopy(stage_info))
             materialized_stages.add(stage_name)
 
+        self._check_inputs_against_outputs(new_registry)
+
         # Atomic swap — if any step above raises, self._registry is unchanged
         self._registry = new_registry
+
+    def _check_inputs_against_outputs(self, reg: registry.StageRegistry) -> None:
+        """Refuse an input whose path equals, contains, or lies inside a registered output.
+
+        Runs once the registry holds every output: at materialization and after an include()
+        outside a construction block (how --all combines pipelines).
+        """
+        for node in self._inputs.values():
+            normalized = pathlib.Path(os.path.normpath(self._root / node.path))
+            if not normalized.is_relative_to(self._root):
+                continue  # path_policy keeps inputs in the project; outputs always are
+            reg.check_input_path(node.name, normalized.relative_to(self._root).parts)
 
     @typing.overload
     def input(
@@ -857,10 +873,8 @@ def _format_extension(
 
 
 def _infer_input_format_from_type(t: type) -> loaders_mod.Reader[object] | None:
-    import pathlib as _pathlib
-
     loaders = _get_loaders()
-    if t is _pathlib.Path:
+    if t is pathlib.Path:
         return loaders.PathOnly()  # type: ignore[return-value]
     if t is str:
         return loaders.Text()  # type: ignore[return-value]

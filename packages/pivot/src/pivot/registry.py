@@ -104,6 +104,37 @@ class StageRegistry:
         self._stages[name] = stage_info
         self._cached_dag = None
 
+    def check_input_path(self, name: str, parts: tuple[str, ...]) -> None:
+        """Raise if input ``name``'s project-relative path overlaps a registered output.
+
+        An input that reads a stage's output file, a directory holding one, or a file inside
+        an output directory would read bytes a stage rewrites with no DAG edge between them.
+
+        Raises:
+            OutputPathConflictError: Naming the input, the output and both paths.
+        """
+        path = "/".join(parts) or "."
+        if parts in self._output_paths:
+            output = types.identity_key(self._output_paths[parts])
+            raise exceptions.OutputPathConflictError(
+                f"Output path conflict: input '{name}' reads {path}, which '{output}' writes."
+            )
+        if self._output_paths.has_subtrie(parts):
+            inner_parts = next(iter(self._output_paths.keys(prefix=parts)))
+            output = types.identity_key(self._output_paths[inner_parts])
+            raise exceptions.OutputPathConflictError(
+                f"Output path conflict: input '{name}' reads {path}, which contains "
+                + f"{'/'.join(inner_parts)} that '{output}' writes."
+            )
+        enclosing = self._output_paths.shortest_prefix(parts)
+        if enclosing is not None and enclosing.is_set:
+            outer = enclosing.value
+            assert outer is not None  # is_set guarantees a stored value
+            raise exceptions.OutputPathConflictError(
+                f"Output path conflict: input '{name}' reads {path}, inside "
+                + f"{'/'.join(enclosing.key)} that '{types.identity_key(outer)}' writes."
+            )
+
     def get(self, name: str) -> RegistryStageInfo:
         """Get stage info by name (raises KeyError if not found)."""
         return self._stages[name]
