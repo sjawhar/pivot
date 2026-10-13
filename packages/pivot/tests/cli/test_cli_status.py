@@ -4,6 +4,9 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
+import pytest
+import yaml
+
 from conftest import isolated_pivot_dir
 from pivot import cli, compose
 from pivot import status as status_mod
@@ -432,6 +435,64 @@ def test_status_verbose_shows_all_stages(
         assert result.exit_code == 0
         assert "test/stage_a" in result.output
         assert "test/stage_b" in result.output
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param("producer", id="list-producer"),
+        pytest.param("params", id="list-params"),
+        pytest.param("delete", id="deleted-lock-control"),
+    ],
+)
+def test_status_and_repro_treat_a_wrongly_shaped_lock_as_missing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, corrupt: str
+) -> None:
+    """A hand-edited lock that fails validation behaves exactly like a deleted one.
+
+    status reports the stage stale; repro does not skip it on the bad lock but processes it as
+    a stage with no lock (unchanged inputs restore from the run cache) and writes a valid lock,
+    after which status agrees the stage is cached.
+    """
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        _write_upstream_pipeline("a")
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, first.output
+
+        lock_path = cwd / ".pivot" / "stages" / "test" / "stage_b.lock"
+        document = yaml.safe_load(lock_path.read_text())
+        if corrupt == "delete":
+            lock_path.unlink()
+        else:
+            if corrupt == "producer":
+                assert document["deps"][0]["producer"] == "test/stage_a"
+                document["deps"][0]["producer"] = ["test/stage_a"]
+            else:
+                document["params"] = []
+            lock_path.write_text(yaml.safe_dump(document))
+
+        status = runner.invoke(cli.cli, ["status"])
+        repro = runner.invoke(cli.cli, ["repro", "--json"])
+        repaired = yaml.safe_load(lock_path.read_text())
+        status_after = runner.invoke(cli.cli, ["status"])
+
+    assert status.exit_code == 0, status.output
+    assert "1 cached, 1 stale" in status.output, status.output
+    assert "test/stage_b" in status.output, status.output
+    assert "No previous run" in status.output, status.output
+
+    assert repro.exit_code == 0, repro.output
+    events = [json.loads(line) for line in repro.output.splitlines() if line.startswith("{")]
+    stage_b = next(
+        e for e in events if e["type"] == "stage_complete" and e["stage"] == "test/stage_b"
+    )
+    assert stage_b["reason"] == "unchanged (run cache)", stage_b
+
+    assert repaired["deps"][0]["producer"] == "test/stage_a"
+    assert repaired["params"] == {}
+    assert status_after.exit_code == 0, status_after.output
+    assert "2 cached, 0 stale" in status_after.output, status_after.output
 
 
 def test_status_specific_stages(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:

@@ -85,42 +85,107 @@ def variant_name_error(name: str) -> str | None:
 
 
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
-    """Validate that parsed YAML has valid storage format structure.
+    """Validate that parsed YAML has the storage format's shape, field by field.
 
-    Rejects lock files with null/empty hashes in deps or outs entries,
-    which can occur when stages were never executed locally (e.g., pulled
-    from remote with incomplete state). Callers already handle None returns
-    gracefully (treated as "no lock = needs re-run").
+    A lock that fails is treated as missing by every caller ("no lock = needs re-run"), so a
+    hand-edited or partially written lock makes the stage stale instead of crashing a reader
+    or letting status and repro disagree. The first failing field is logged at debug.
+    """
+    error = _lock_shape_error(data)
+    if error is not None:
+        logger.debug("Lock data rejected: field %s has the wrong type or is missing", error)
+        return False
+    return True
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _is_str_mapping(value: object, *, str_values: bool) -> bool:
+    if not isinstance(value, dict):
+        return False
+    mapping = cast("dict[object, object]", value)
+    if not all(isinstance(key, str) for key in mapping):
+        return False
+    return not str_values or all(isinstance(item, str) for item in mapping.values())
+
+
+def _manifest_error(value: object, field: str) -> str | None:
+    if not isinstance(value, list):
+        return field
+    for index, raw in enumerate(cast("list[object]", value)):
+        entry_field = f"{field}[{index}]"
+        if not isinstance(raw, dict):
+            return entry_field
+        entry = cast("dict[str, object]", raw)
+        for name in ("relpath", "hash"):
+            if not _is_nonempty_str(entry.get(name)):
+                return f"{entry_field}.{name}"
+        if not _is_int(entry.get("size")):
+            return f"{entry_field}.size"
+        if not isinstance(entry.get("isexec"), bool):
+            return f"{entry_field}.isexec"
+    return None
+
+
+def _entry_error(raw: object, field: str, list_key: str) -> str | None:
+    """Check one ``deps`` or ``outs`` entry against DepEntry / OutEntry."""
+    if not isinstance(raw, dict):
+        return field
+    entry = cast("dict[str, object]", raw)
+    # Null and empty hashes come from stages never executed locally (e.g. pulled with
+    # incomplete state); they violate FileHash/DirHash's `hash: str` as much as a list does.
+    if not _is_nonempty_str(entry.get("hash")):
+        return f"{field}.hash"
+    if list_key == "deps" and not _is_nonempty_str(entry.get("producer")):
+        return f"{field}.producer"
+    if "key" not in entry or not (entry["key"] is None or isinstance(entry["key"], str)):
+        return f"{field}.key"
+    if list_key == "outs" and not isinstance(entry.get("tag"), str):
+        return f"{field}.tag"
+    if "display" in entry and not isinstance(entry["display"], str):
+        return f"{field}.display"
+    if "size" in entry and not _is_int(entry["size"]):
+        return f"{field}.size"
+    if "manifest" in entry:
+        return _manifest_error(entry["manifest"], f"{field}.manifest")
+    return None
+
+
+def _lock_shape_error(data: object) -> str | None:
+    """Return the first field of ``data`` that breaks StorageLockData, or None if none does.
+
+    Extra top-level keys are allowed for forward compatibility.
     """
     if not isinstance(data, dict):
-        return False
-    # Cast to dict[str, object] for type-safe key access
-    typed_data = cast("dict[str, object]", data)
-    # Require all required keys (allow extra keys for forward compatibility)
-    if not _REQUIRED_LOCK_KEYS.issubset(typed_data.keys()):
-        return False
-    # Reject null values for required keys (corrupted data)
-    if not all(typed_data[key] is not None for key in _REQUIRED_LOCK_KEYS):
-        return False
-    # Validate that deps and outs entries have non-null hash values.
-    # YAML `hash: null` deserializes to None, violating the `hash: str` contract
-    # on FileHash/DirHash. Reject at the boundary so consumers never see it.
+        return "<document>"
+    document = cast("dict[object, object]", data)
+    for key in sorted(_REQUIRED_LOCK_KEYS):
+        if key not in document:
+            return key
+    if not _is_str_mapping(document["code_manifest"], str_values=True):
+        return "code_manifest"
+    if not _is_str_mapping(document["params"], str_values=False):
+        return "params"
     for list_key in ("deps", "outs"):
-        entries = typed_data[list_key]
+        entries = document[list_key]
         if not isinstance(entries, list):
-            return False
-        entry_list = cast("list[object]", entries)
-        for raw_entry in entry_list:
-            if not isinstance(raw_entry, dict):
-                return False
-            typed_entry = cast("dict[str, object]", raw_entry)
-            if not typed_entry.get("hash"):
-                return False
-            if list_key == "deps" and ("producer" not in typed_entry or "key" not in typed_entry):
-                return False
-            if list_key == "outs" and ("key" not in typed_entry or "tag" not in typed_entry):
-                return False
-    return True
+            return list_key
+        for index, raw in enumerate(cast("list[object]", entries)):
+            error = _entry_error(raw, f"{list_key}[{index}]", list_key)
+            if error is not None:
+                return error
+    if "schema_version" in document and not _is_int(document["schema_version"]):
+        return "schema_version"
+    merkle_id = document.get("merkle_id")
+    if merkle_id is not None and not isinstance(merkle_id, str):
+        return "merkle_id"
+    return None
 
 
 def _get_output_tag(hash_info: HashInfo) -> str:
@@ -227,16 +292,8 @@ class StageLock:
             with open(self.path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not is_lock_data(data):
-                if isinstance(data, dict):
-                    # Cast to get typed keys for debug logging
-                    actual_keys = set(cast("dict[str, object]", data).keys())
-                    logger.debug(
-                        "Lock file validation failed for %s: keys=%s, expected=%s",
-                        self.path,
-                        actual_keys,
-                        _REQUIRED_LOCK_KEYS,
-                    )
-                return None  # Treat corrupted/invalid file as missing
+                logger.debug("Lock file %s failed validation; treating it as missing", self.path)
+                return None
             return _convert_from_storage_format(data, stage_name=self.stage_name)
         except FileNotFoundError:
             return None  # Normal case - lock doesn't exist yet

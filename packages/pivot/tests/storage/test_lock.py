@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import threading
 from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 
 from pivot.storage import lock
 from pivot.types import ArtifactIdentity, DirHash, LockData, StorageLockData
@@ -366,6 +368,139 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     assert result is not None
     assert result["code_manifest"] == {}
     assert result["params"] == {}
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [{"producer": ["p/a"], "key": None, "hash": "x"}],
+                "outs": [],
+            },
+            id="list-producer",
+        ),
+        pytest.param(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": {"k": 1}, "hash": "x", "tag": "data"}],
+            },
+            id="mapping-key",
+        ),
+    ],
+)
+def test_lock_read_treats_wrongly_typed_identity_fields_as_missing(
+    document: dict[str, object], tmp_path: Path
+) -> None:
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    stage_lock.path.write_text(yaml.safe_dump(document))
+    assert stage_lock.read() is None
+
+
+@pytest.mark.parametrize(
+    ("code_manifest", "params"),
+    [
+        pytest.param({}, [], id="params-list"),
+        pytest.param({}, 3, id="params-int"),
+        pytest.param(["self:x"], {}, id="code-manifest-list"),
+    ],
+)
+def test_lock_read_treats_non_mapping_manifest_or_params_as_missing(
+    code_manifest: object, params: object, tmp_path: Path
+) -> None:
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    document = {"code_manifest": code_manifest, "params": params, "deps": [], "outs": []}
+    stage_lock.path.write_text(yaml.safe_dump(document))
+    assert stage_lock.read() is None
+
+
+_DEP: dict[str, object] = {"producer": "p/a", "key": None, "hash": "aa"}
+_OUT: dict[str, object] = {"key": "o", "hash": "bb", "tag": "data"}
+_MANIFEST_ENTRY: dict[str, object] = {"relpath": "f.txt", "hash": "cc", "size": 1, "isexec": False}
+
+
+@pytest.mark.parametrize(
+    ("field", "document"),
+    [
+        pytest.param("code_manifest", {"code_manifest": {"self:x": 1}}, id="manifest-int-value"),
+        pytest.param("code_manifest", {"code_manifest": {1: "h"}}, id="manifest-int-key"),
+        pytest.param("params", {"params": {1: "v"}}, id="params-int-key"),
+        pytest.param("deps", {"deps": {"producer": "p/a"}}, id="deps-mapping"),
+        pytest.param("outs", {"outs": "o"}, id="outs-string"),
+        pytest.param(
+            "deps[0].producer", {"deps": [{**_DEP, "producer": None}]}, id="null-producer"
+        ),
+        pytest.param("deps[0].producer", {"deps": [{**_DEP, "producer": ""}]}, id="empty-producer"),
+        pytest.param("deps[0].key", {"deps": [{**_DEP, "key": 3}]}, id="int-dep-key"),
+        pytest.param("deps[0].hash", {"deps": [{**_DEP, "hash": ["aa"]}]}, id="list-dep-hash"),
+        pytest.param("outs[0].hash", {"outs": [{**_OUT, "hash": 7}]}, id="int-out-hash"),
+        pytest.param("outs[0].tag", {"outs": [{**_OUT, "tag": ["data"]}]}, id="list-tag"),
+        pytest.param(
+            "outs[0].manifest",
+            {"outs": [{**_OUT, "manifest": dict[str, object]()}]},
+            id="mapping-manifest",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].size",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "size": "1"}]}]},
+            id="string-manifest-size",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": None}]}]},
+            id="null-manifest-relpath",
+        ),
+        pytest.param("merkle_id", {"merkle_id": ["m"]}, id="list-merkle-id"),
+        pytest.param("schema_version", {"schema_version": "2"}, id="string-schema-version"),
+    ],
+)
+def test_lock_read_treats_wrongly_typed_fields_as_missing_and_names_them(
+    field: str,
+    document: dict[str, object],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every field is type-checked once; the debug log names the field that failed."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    base: dict[str, object] = {"code_manifest": {}, "params": {}, "deps": [], "outs": []}
+    stage_lock.path.write_text(yaml.safe_dump({**base, **document}))
+
+    with caplog.at_level(logging.DEBUG, logger="pivot.storage.lock"):
+        assert stage_lock.read() is None
+
+    assert any(field in record.getMessage() for record in caplog.records), caplog.text
+
+
+def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
+    """The validator accepts each optional field the writer and older locks produce."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    document = {
+        "schema_version": 2,
+        "code_manifest": {"self:stage": "h"},
+        "params": {"lr": 0.1, "nested": {"a": [1, 2]}},
+        "deps": [{**_DEP, "display": "data/raw/a.csv", "size": 3}],
+        "outs": [
+            {**_OUT, "key": None, "manifest": [_MANIFEST_ENTRY]},
+            {**_OUT, "key": "m", "tag": "metric", "size": 4},
+        ],
+        "merkle_id": "abc",
+    }
+    stage_lock.path.write_text(yaml.safe_dump(document))
+
+    result = stage_lock.read()
+
+    assert result is not None
+    assert result["params"] == {"lr": 0.1, "nested": {"a": [1, 2]}}
+    assert "merkle_id" in result
+    assert result["merkle_id"] == "abc"
 
 
 # ==============================================================================
