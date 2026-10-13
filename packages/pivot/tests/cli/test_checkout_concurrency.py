@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import multiprocessing
+import os
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -79,6 +80,65 @@ def _helper_checkout_all_at_barrier(
         elif future.result()[0] == "missing":
             failures.append(f"missing: {future.result()[1]}")
     return failures
+
+
+def _helper_checkout_crash_after_backup_rename(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+) -> None:
+    """Simulate a killed checkout immediately after its directory backup rename."""
+    original_rename = pathlib.Path.rename
+
+    def _rename_and_crash(source: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        result = original_rename(source, target)
+        if source == path and target.name.startswith(cache._BACKUP_TEMP_PREFIX):
+            os._exit(73)
+        return result
+
+    pathlib.Path.rename = _rename_and_crash  # pyright: ignore[reportAttributeAccessIssue]
+    _ = checkout_mod._restore_path_sync(
+        path,
+        output_hash,
+        cache_dir,
+        [cache.CheckoutMode.COPY],
+        checkout_mod.CheckoutBehavior.SKIP_EXISTING,
+        state_dir,
+    )
+
+
+def test_checkout_recovers_fresh_crash_orphans_under_outer_lock(tmp_path: pathlib.Path) -> None:
+    """A retry of checkout removes a killed checkout's fresh target-tagged artifacts (#228)."""
+    target = tmp_path / "data" / "out"
+    target.mkdir(parents=True)
+    (target / "result.txt").write_text("cached content")
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    (target / "result.txt").write_text("old workspace content")
+
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(
+        target=_helper_checkout_crash_after_backup_rename,
+        args=(target, output_hash, cache_dir, state_dir),
+    )
+    process.start()
+    process.join(timeout=60)
+
+    assert process.exitcode == 73
+    assert not target.exists()
+
+    assert checkout_mod._restore_path_sync(
+        target,
+        output_hash,
+        cache_dir,
+        [cache.CheckoutMode.COPY],
+        checkout_mod.CheckoutBehavior.SKIP_EXISTING,
+        state_dir,
+    ) == ("restored", "out")
+    assert (target / "result.txt").read_text() == "cached content"
+    assert not [p.name for p in target.parent.iterdir() if p.name.startswith(".pivot_")]
 
 
 @pytest.mark.parametrize(

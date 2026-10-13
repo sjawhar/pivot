@@ -101,7 +101,9 @@ def _restore_path_sync(
             instead of raising.
     """
     with cache.restore_lock(path, state_dir):
-        return _restore_path_locked(path, output_hash, cache_dir, checkout_modes, behavior)
+        return _restore_path_locked(
+            path, output_hash, cache_dir, checkout_modes, behavior, state_dir
+        )
 
 
 def _restore_path_locked(
@@ -110,6 +112,7 @@ def _restore_path_locked(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
+    state_dir: pathlib.Path | None,
 ) -> tuple[RestoreResult, str]:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
     if path.exists():
@@ -133,13 +136,13 @@ def _restore_path_locked(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
-    # state_dir=None: the restore lock for path is already held (it is not reentrant).
     success = cache.restore_from_cache(
         path,
         output_hash,
         cache_dir,
         checkout_modes=checkout_modes,
-        state_dir=None,
+        state_dir=state_dir,
+        lock_held=True,
     )
     if not success:
         return ("missing", path.name)

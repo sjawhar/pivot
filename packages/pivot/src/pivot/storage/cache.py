@@ -591,6 +591,8 @@ def restore_from_cache(
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
     state_dir: pathlib.Path | None = None,
+    *,
+    lock_held: bool = False,
 ) -> bool:
     """Restore file or directory from cache. Returns True if successful.
 
@@ -600,14 +602,17 @@ def restore_from_cache(
         cache_dir: Cache directory
         checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
         checkout_modes: Ordered list of link modes to try with fallback on failure.
-        state_dir: State directory for lock files (e.g. per-stage .pivot/ dir).
-            Required for directory restores to prevent concurrent restore races.
+        state_dir: State directory for directory restore locks and crash cleanup.
+        lock_held: Caller already holds restore_lock(path, state_dir). state_dir remains
+            required so fresh crash artifacts can be cleaned without re-acquiring it.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
 
     if is_dir_hash(output_hash):
+        if lock_held and state_dir is None:
+            raise ValueError("state_dir is required when lock_held is True")
         return _restore_directory_from_cache(
-            path, output_hash, cache_dir, effective_modes, state_dir
+            path, output_hash, cache_dir, effective_modes, state_dir, lock_held=lock_held
         )
     return _restore_file_from_cache(path, output_hash, cache_dir, effective_modes)
 
@@ -634,6 +639,8 @@ def _restore_directory_from_cache(
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
     state_dir: pathlib.Path | None = None,
+    *,
+    lock_held: bool = False,
 ) -> bool:
     """Restore directory from cache atomically with file locking."""
     cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
@@ -652,7 +659,8 @@ def _restore_directory_from_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
     _cleanup_stale_restore_temps(path.parent)
 
-    with restore_lock(path, state_dir):
+    lock_context = contextlib.nullcontext() if lock_held else restore_lock(path, state_dir)
+    with lock_context:
         target_token = _restore_target_token(path)
         if state_dir is not None:
             _cleanup_fresh_restore_orphans(path)
