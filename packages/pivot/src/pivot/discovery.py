@@ -98,6 +98,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         preexisting_root_modules,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
     )
+    _displace_root_module_collisions(_import_session)
     importlib.invalidate_caches()
     return _import_session
 
@@ -141,6 +142,27 @@ def _module_name_matches_root_path(
         }
     module_paths = getattr(module, "__path__", ())
     return any(pathlib.Path(path).resolve() == root.joinpath(*parts) for path in module_paths)
+
+
+def _displace_root_module_collisions(session: _ImportSession) -> None:
+    if not session.root.is_dir():
+        return
+    for candidate in session.root.iterdir():
+        if candidate.name.startswith("."):
+            continue
+        if candidate.suffix == ".py":
+            module_name = candidate.stem
+        elif candidate.is_dir() and (candidate / "__init__.py").is_file():
+            module_name = candidate.name
+        else:
+            continue
+        if module_name == "pivot":
+            continue
+        module = sys.modules.get(module_name)
+        if isinstance(module, _stdlib_types.ModuleType) and not _module_name_matches_root_path(
+            module_name, module, session.root
+        ):
+            _displace_module(module_name, session)
 
 
 def _track_root_modules(session: _ImportSession) -> None:
