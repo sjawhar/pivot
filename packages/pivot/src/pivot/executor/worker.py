@@ -882,8 +882,18 @@ def _reject_path_inside_project(
 ) -> None:
     """A PathOnly output is moved to the output path; never move a file pivot does not own."""
     if not isinstance(value, pathlib.Path):
-        return
-    if not (project_root / value).resolve().is_relative_to(project_root.resolve()):
+        raise TypeError(
+            f"Stage '{ref.identity.producer}' returned {type(value).__name__}; "
+            + "a PathOnly output must return pathlib.Path"
+        )
+    source = value if value.is_absolute() else project_root / value
+    lexical_root = project_root.absolute()
+    lexical_source = source.absolute()
+    resolved_root = project_root.resolve()
+    resolved_source = source.resolve()
+    if not (
+        lexical_source.is_relative_to(lexical_root) or resolved_source.is_relative_to(resolved_root)
+    ):
         return
     raise exceptions.StageDefinitionError(
         f"Stage '{ref.identity.producer}' returned {value}, which is inside the project "
@@ -896,7 +906,7 @@ def _reject_path_inside_project(
 def _write_output_with_store(
     ref: types.ArtifactRef, value: Any, store: store_mod.Store, project_root: pathlib.Path
 ) -> pathlib.Path:
-    if isinstance(ref.format, loaders.PathOnly):
+    if isinstance(ref.format, loaders.PathOnly) and ref.tag is not types.ArtifactTag.DIRECTORY:
         _reject_path_inside_project(ref, value, project_root)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
@@ -917,6 +927,8 @@ def _write_output_with_store(
             normalized = stage_def.validate_directory_out_key(key, ref.identity.producer)
             full_path = output_path / normalized
             full_path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(ref.format, loaders.PathOnly):
+                _reject_path_inside_project(ref, cast("object", item_value), project_root)
             writer.save(item_value, full_path)
         return output_path
 
