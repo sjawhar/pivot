@@ -13,6 +13,7 @@ import pickle
 import re
 import shutil
 import tempfile
+import warnings
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 
 if TYPE_CHECKING:
@@ -470,14 +471,21 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
 class Pickle[T](Loader[T, T]):
     """Pickle file loader for arbitrary Python objects.
 
-    WARNING: Loading pickle files from untrusted sources is a security risk.
-    Pickle can execute arbitrary code during deserialization.
+    Warning:
+        Pickle executes code during deserialization. Treat every Pickle artifact
+        from a cache or remote as trusted code: anyone who can write that
+        storage can execute code on a machine that loads it.
     """
 
     protocol: int = pickle.HIGHEST_PROTOCOL
 
     @override
     def load(self, path: pathlib.Path) -> T:
+        warnings.warn(
+            "Loading a Pickle artifact can execute arbitrary code. Treat any cache or remote that supplied it as trusted code.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         with open(path, "rb") as f:
             return pickle.load(f)  # type: ignore[return-value] - pickle returns Any, user specifies T
 

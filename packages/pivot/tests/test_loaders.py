@@ -226,6 +226,14 @@ def test_yaml_loader_refuses_dataclass_with_type_name(tmp_path: pathlib.Path) ->
         loaders.YAML[object]().save(_UnserializableMetric(0.5), tmp_path / "metric.yaml")
 
 
+def test_pickle_loader_warns_about_cache_and_remote_trust(tmp_path: pathlib.Path) -> None:
+    pickle_file = tmp_path / "artifact.pkl"
+    pickle_file.write_bytes(pickle.dumps({"value": 1}))
+
+    with pytest.warns(RuntimeWarning, match="cache or remote"):
+        assert loaders.Pickle[dict[str, int]]().load(pickle_file) == {"value": 1}
+
+
 # ==============================================================================
 # Text loader tests
 # ==============================================================================
