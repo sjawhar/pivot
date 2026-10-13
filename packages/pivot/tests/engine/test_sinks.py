@@ -14,6 +14,8 @@ from pivot.engine import engine as engine_mod
 from pivot.engine import sinks
 from pivot.engine.types import (
     EngineDiagnostic,
+    EngineState,
+    EngineStateChanged,
     LogLine,
     OutputEvent,
     SinkState,
@@ -37,6 +39,31 @@ def _helper_render_renderable(renderable: object) -> str:
     console = Console(file=output, force_terminal=False, no_color=True)
     console.print(renderable)
     return output.getvalue()
+
+
+def _helper_engine_state(state: EngineState) -> EngineStateChanged:
+    return EngineStateChanged(type="engine_state_changed", seq=0, state=state)
+
+
+def _helper_started(stage: str, *, index: int, total: int, run_id: str) -> StageStarted:
+    return StageStarted(
+        type="stage_started", seq=0, stage=stage, index=index, total=total, run_id=run_id
+    )
+
+
+def _helper_completed(stage: str, *, index: int, total: int, run_id: str) -> StageCompleted:
+    return StageCompleted(
+        type="stage_completed",
+        seq=index,
+        stage=stage,
+        status=StageStatus.RAN,
+        reason="",
+        duration_ms=100.0,
+        index=index,
+        total=total,
+        run_id=run_id,
+        input_hash=None,
+    )
 
 
 # =============================================================================
@@ -645,6 +672,26 @@ async def test_static_sink_prints_engine_diagnostics() -> None:
     assert "Loop blocked" in result, "Should include diagnostic detail"
 
 
+async def test_static_sink_reports_each_watch_run_separately() -> None:
+    """Piped watch output prints each run's report when that run ends, not all at exit."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+    reports = list[str]()
+
+    for run_id in ("run-1", "run-2"):
+        await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+        await sink.handle(_helper_started("demo/a", index=1, total=1, run_id=run_id))
+        await sink.handle(_helper_completed("demo/a", index=1, total=1, run_id=run_id))
+        await sink.handle(_helper_engine_state(EngineState.IDLE))
+        reports.append(output.getvalue())
+    await sink.close()
+
+    assert reports[0].count("demo/a") == 1, "first run's report prints when it ends"
+    assert reports[1].count("demo/a") == 2, "second run prints its own report"
+    assert output.getvalue() == reports[1], "close prints nothing already reported"
+
+
 # =============================================================================
 # LiveConsoleSink Tests
 # =============================================================================
@@ -917,6 +964,34 @@ async def test_live_sink_live_renderable_shows_progress() -> None:
     await sink.close()
 
     assert "1/3" in rendered, "Live renderable should include progress counts"
+
+
+async def test_live_sink_reports_each_watch_run_separately() -> None:
+    """Each watch run shows its own progress and prints its own report when it ends."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+    reports = list[str]()
+    rendered = ""
+
+    for run_id in ("run-1", "run-2"):
+        await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+        for index, stage in enumerate(("demo/a", "demo/b"), start=1):
+            await sink.handle(_helper_started(stage, index=index, total=2, run_id=run_id))
+            await sink.handle(_helper_completed(stage, index=index, total=2, run_id=run_id))
+        rendered = _helper_render_renderable(
+            sink._build_live_group()  # type: ignore[reportPrivateUsage] - testing live renderable
+        )
+        await sink.handle(_helper_engine_state(EngineState.IDLE))
+        reports.append(output.getvalue())
+    await sink.close()
+
+    assert "2/2 (100%)" in rendered, "second run's progress counts only that run"
+    assert "2 ran" in rendered, "second run's summary counts only that run"
+    assert rendered.count("demo/a") == 1, "second run lists each stage once"
+    assert reports[0].count("demo/a") == 1, "first run's report prints when it ends"
+    assert reports[1].count("demo/a") == 2, "second run prints its own report"
+    assert output.getvalue() == reports[1], "close prints nothing already reported"
 
 
 # =============================================================================
