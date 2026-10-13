@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import anyio
 
-from pivot.types import ArtifactIdentity
+from pivot.types import ArtifactIdentity, ChangeType, DepChange, StageExplanation
 from pivot_tui.client import (
     CommitResult,
     EngineStatus,
@@ -31,9 +31,9 @@ if TYPE_CHECKING:
 
     from anyio.abc import SocketStream
 
-    from pivot.types import StageExplanation
+    from pivot.types import CodeChange, ParamChange
 
-__all__ = ["RpcError", "RpcProtocolError", "RpcPivotClient"]
+__all__ = ["RpcError", "RpcProtocolError", "RpcPivotClient", "decode_stage_explanation"]
 
 _logger = logging.getLogger(__name__)
 
@@ -136,40 +136,7 @@ class RpcPivotClient:
         )
 
     async def explain(self, stage: str) -> StageExplanation:
-        from pivot.types import CodeChange, DepChange, ParamChange, StageExplanation
-
-        r = _as_dict(await self._call("explain", {"stage": stage}))
-        stage_name = r["stage_name"]
-        will_run = r["will_run"]
-        is_forced = r["is_forced"]
-        reason = r["reason"]
-        code_changes = r["code_changes"]
-        param_changes = r["param_changes"]
-        dep_changes = r["dep_changes"]
-        if not isinstance(stage_name, str):
-            raise RpcProtocolError("str", type(stage_name).__name__)
-        if not isinstance(will_run, bool):
-            raise RpcProtocolError("bool", type(will_run).__name__)
-        if not isinstance(is_forced, bool):
-            raise RpcProtocolError("bool", type(is_forced).__name__)
-        if not isinstance(reason, str):
-            raise RpcProtocolError("str", type(reason).__name__)
-        if not isinstance(code_changes, list):
-            raise RpcProtocolError("list", type(code_changes).__name__)
-        if not isinstance(param_changes, list):
-            raise RpcProtocolError("list", type(param_changes).__name__)
-        if not isinstance(dep_changes, list):
-            raise RpcProtocolError("list", type(dep_changes).__name__)
-        return StageExplanation(
-            stage_name=stage_name,
-            will_run=will_run,
-            is_forced=is_forced,
-            reason=reason,
-            code_changes=cast("list[CodeChange]", code_changes),
-            param_changes=cast("list[ParamChange]", param_changes),
-            dep_changes=cast("list[DepChange]", dep_changes),
-            upstream_stale=_as_str_list(r["upstream_stale"]),
-        )
+        return decode_stage_explanation(await self._call("explain", {"stage": stage}))
 
     async def events_since(self, version: int) -> EventBatch:
         r = _as_dict(await self._call("events_since", {"version": version}))
@@ -312,3 +279,78 @@ def _as_identity_list(value: object) -> list[ArtifactIdentity]:
             raise RpcProtocolError("str | None (key)", type(key).__name__)
         items.append(ArtifactIdentity(producer, key))
     return items
+
+
+def _as_wire_identity(value: object) -> ArtifactIdentity:
+    """Rebuild an ArtifactIdentity from its JSON form.
+
+    ArtifactIdentity is a NamedTuple, so ``json.dumps`` writes it as ``[producer, key]``.
+    """
+    if not isinstance(value, list) or len(value) != 2:
+        raise RpcProtocolError("[producer, key] identity", type(value).__name__)
+    producer, key = value
+    if not isinstance(producer, str):
+        raise RpcProtocolError("str (producer)", type(producer).__name__)
+    if key is not None and not isinstance(key, str):
+        raise RpcProtocolError("str | None (key)", type(key).__name__)
+    return ArtifactIdentity(producer, key)
+
+
+def _as_optional_str(value: object, field: str) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise RpcProtocolError(f"str | None ({field})", type(value).__name__)
+    return value
+
+
+def _as_dep_changes(value: list[object]) -> list[DepChange]:
+    changes = list[DepChange]()
+    for item in value:
+        d = _as_dict(item)
+        change_type = d["change_type"]
+        if not isinstance(change_type, str):
+            raise RpcProtocolError("str (change_type)", type(change_type).__name__)
+        changes.append(
+            DepChange(
+                identity=_as_wire_identity(d["identity"]),
+                old_hash=_as_optional_str(d["old_hash"], "old_hash"),
+                new_hash=_as_optional_str(d["new_hash"], "new_hash"),
+                change_type=ChangeType(change_type),
+            )
+        )
+    return changes
+
+
+def decode_stage_explanation(value: object) -> StageExplanation:
+    """Decode a StageExplanation received over JSON-RPC, rebuilding artifact identities."""
+    r = _as_dict(value)
+    stage_name = r["stage_name"]
+    will_run = r["will_run"]
+    is_forced = r["is_forced"]
+    reason = r["reason"]
+    code_changes = r["code_changes"]
+    param_changes = r["param_changes"]
+    dep_changes = r["dep_changes"]
+    if not isinstance(stage_name, str):
+        raise RpcProtocolError("str", type(stage_name).__name__)
+    if not isinstance(will_run, bool):
+        raise RpcProtocolError("bool", type(will_run).__name__)
+    if not isinstance(is_forced, bool):
+        raise RpcProtocolError("bool", type(is_forced).__name__)
+    if not isinstance(reason, str):
+        raise RpcProtocolError("str", type(reason).__name__)
+    if not isinstance(code_changes, list):
+        raise RpcProtocolError("list", type(code_changes).__name__)
+    if not isinstance(param_changes, list):
+        raise RpcProtocolError("list", type(param_changes).__name__)
+    if not isinstance(dep_changes, list):
+        raise RpcProtocolError("list", type(dep_changes).__name__)
+    return StageExplanation(
+        stage_name=stage_name,
+        will_run=will_run,
+        is_forced=is_forced,
+        reason=reason,
+        code_changes=cast("list[CodeChange]", code_changes),
+        param_changes=cast("list[ParamChange]", param_changes),
+        dep_changes=_as_dep_changes(dep_changes),
+        upstream_stale=_as_str_list(r["upstream_stale"]),
+    )

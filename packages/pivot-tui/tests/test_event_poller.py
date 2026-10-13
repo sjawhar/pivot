@@ -1376,3 +1376,47 @@ async def test_oneshot_disconnect_stops_cleanly(tmp_path: Path) -> None:
         assert poller._stop_event.is_set(), "Poller should have stopped after disconnect"
     finally:
         await server.stop()
+
+
+# F13: an explanation with a dependency change, sent over the RPC wire the way the engine sends it,
+# must reach the TUI with ArtifactIdentity values (diff_panels.py:559 calls identity_key on them).
+def test_f13_started_event_dep_change_identity_survives_rpc_wire() -> None:
+    import json
+
+    from pivot import types
+    from pivot.engine import agent_rpc
+    from pivot_tui import event_poller
+
+    explanation = types.StageExplanation(
+        stage_name="demo/featurize@p1",
+        will_run=True,
+        is_forced=False,
+        reason="Input dependencies changed",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[
+            types.DepChange(
+                identity=types.ArtifactIdentity("demo/clean", None),
+                old_hash="036db852cd264fe0",
+                new_hash="0030de75fd10b9ca",
+                change_type=types.ChangeType.MODIFIED,
+            )
+        ],
+        upstream_stale=[],
+    )
+    event = {
+        "type": "stage_started",
+        "stage": "demo/featurize@p1",
+        "index": 2,
+        "total": 6,
+        "run_id": "run",
+        "explanation": explanation,
+    }
+    wire = json.loads(json.dumps(event, default=agent_rpc._json_default))
+
+    msg = event_poller._make_started_message(wire)
+
+    assert msg is not None
+    assert "explanation" in msg
+    dep = msg["explanation"]["dep_changes"][0]
+    assert types.identity_key(dep["identity"]) == "demo/clean"

@@ -21,7 +21,6 @@ import anyio
 from anyio import to_thread
 
 from pivot.types import (
-    StageExplanation,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -30,7 +29,7 @@ from pivot.types import (
     TuiWatchMessage,
     WatchStatus,
 )
-from pivot_tui.rpc_client_impl import RpcProtocolError
+from pivot_tui.rpc_client_impl import RpcProtocolError, decode_stage_explanation
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -194,7 +193,10 @@ def _make_started_message(event: dict[str, object]) -> TuiStatusMessage | None:
     )
     explanation: object = event.get("explanation")
     if isinstance(explanation, dict) and explanation.keys() >= _EXPLANATION_REQUIRED_KEYS:
-        msg["explanation"] = cast("StageExplanation", explanation)  # pyright: ignore[reportInvalidCast] - validated shape
+        try:
+            msg["explanation"] = decode_stage_explanation(explanation)
+        except (RpcProtocolError, KeyError, ValueError) as exc:
+            _logger.warning("Invalid explanation payload, skipping: %s", exc)
     elif explanation is not None:
         _logger.warning("Invalid explanation payload, skipping: %s", type(explanation).__name__)
     return msg

@@ -414,6 +414,64 @@ async def test_run_app_navigation_stays_at_bounds(
 
 
 @pytest.mark.asyncio
+async def test_run_app_selecting_stage_with_dep_change_from_wire_shows_input_panel(
+    simple_run_app: run_tui.PivotApp,
+) -> None:
+    """Selecting a stage whose live explanation carries a dependency change renders it.
+
+    The explanation travels the engine's real JSON-RPC encoding and the TUI's event
+    conversion, so the identity arrives exactly as `pivot repro --tui --watch` delivers it.
+    """
+    import json
+
+    from pivot import types
+    from pivot.engine import agent_rpc
+    from pivot_tui import diff_panels, event_poller
+
+    explanation = types.StageExplanation(
+        stage_name="stage2",
+        will_run=True,
+        is_forced=False,
+        reason="Input dependencies changed",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[
+            types.DepChange(
+                identity=types.ArtifactIdentity("stage1", "features"),
+                old_hash="036db852cd264fe0",
+                new_hash="0030de75fd10b9ca",
+                change_type=types.ChangeType.MODIFIED,
+            )
+        ],
+        upstream_stale=[],
+    )
+    event = {
+        "type": "stage_started",
+        "stage": "stage2",
+        "index": 2,
+        "total": 3,
+        "run_id": "run-dep",
+        "explanation": explanation,
+    }
+    wire = json.loads(json.dumps(event, default=agent_rpc._json_default))
+    msg = event_poller._make_started_message(wire)
+    assert msg is not None
+
+    async with simple_run_app.run_test() as pilot:
+        await pilot.pause()
+        simple_run_app.post_message(run_tui.TuiUpdate(msg))
+        await pilot.pause()
+
+        simple_run_app.action_nav_down()
+        await pilot.pause()
+
+        assert simple_run_app.selected_stage_name == "stage2"
+        input_panel = simple_run_app.query_one("#input-panel", diff_panels.InputDiffPanel)
+        assert input_panel._dep_by_path.keys() == {"stage1:features"}
+        assert simple_run_app.return_code is None, "TUI must not crash on navigation"
+
+
+@pytest.mark.asyncio
 async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
     """action_quit exits the app."""
     async with simple_run_app.run_test() as pilot:
