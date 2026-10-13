@@ -39,18 +39,14 @@ _CSV_REL = "data/test/make_csv.csv"
 
 _GET_STAGE_RED = pytest.mark.xfail(
     strict=True,
-    reason=(
-        "red test for cli-fixes (Task 9): get resolves only slash-free stage names "
-        "and restores to identity keys, not workspace paths (storage/restore.py:154-164)"
-    ),
+    reason="red test for copilot-fixes (Task 3, #446): get does not resolve qualified stage targets",
 )
 
 _DIFF_HEAD_RED = pytest.mark.xfail(
     strict=True,
     reason=(
-        "red test for cli-fixes (Task 9): diff cannot read HEAD hashes of single-output "
-        "stages; v2 lock outs have key=None and extract_output_hashes_from_lock maps them "
-        "to 'unknown' (show/common.py:72-91)"
+        "red test for copilot-fixes (Task 3): show/common.py keys single-output HEAD hashes "
+        "as 'unknown'"
     ),
 )
 
