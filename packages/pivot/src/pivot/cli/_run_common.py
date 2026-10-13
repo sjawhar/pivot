@@ -32,6 +32,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_POLLER_CONNECT_ATTEMPTS = 30
+_POLLER_CONNECT_RETRY_S = 1.0
+_POLLER_STOP_CHECK_S = 0.05
+POLLER_THREAD_NAME = "pivot-tui-event-poller"
+
 
 @contextlib.contextmanager
 def suppress_stderr_logging() -> Generator[None]:
@@ -350,6 +355,8 @@ def run_tui_with_engine(
     from pivot_tui.rpc_client_impl import RpcPivotClient
 
     socket_ready = threading.Event()
+    # Set when the engine finishes or the TUI exits; the poller thread stops on it.
+    poller_stop = threading.Event()
 
     def engine_thread_target() -> None:
         """Run the async Engine in a background thread with its own event loop."""
@@ -362,6 +369,7 @@ def run_tui_with_engine(
                 result_future.set_exception(e)
         finally:
             socket_ready.set()  # Unblock main thread even on failure
+            poller_stop.set()
             # Signal TUI to exit when engine completes (success or failure)
             with contextlib.suppress(Exception):
                 app.post_message(tui_run.TuiShutdown())
@@ -372,17 +380,32 @@ def run_tui_with_engine(
     if not socket_ready.wait(timeout=10.0):
         logger.warning("Engine socket not ready after 10s, poller will retry connect")
 
+    async def wait_for_poller_stop(timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for the stop signal; True once it is set."""
+        with anyio.move_on_after(timeout):
+            while not poller_stop.is_set():
+                await anyio.sleep(_POLLER_STOP_CHECK_S)
+        return poller_stop.is_set()
+
+    async def stop_poller_on_signal(poller: EventPoller) -> None:
+        while not poller_stop.is_set():
+            await anyio.sleep(_POLLER_STOP_CHECK_S)
+        poller.stop()
+
     def poller_thread_target() -> None:
         async def poller_main() -> None:
             poller_client = RpcPivotClient()
-            for _attempt in range(30):
+            for _attempt in range(_POLLER_CONNECT_ATTEMPTS):
                 try:
                     await poller_client.connect(socket_path)
                     break
                 except OSError:
-                    await anyio.sleep(1.0)
+                    if await wait_for_poller_stop(_POLLER_CONNECT_RETRY_S):
+                        # A one-shot engine can finish and remove its socket first.
+                        logger.debug("Engine finished before the event poller connected")
+                        return
             else:
-                logger.error("Poller failed to connect after 30 attempts")
+                logger.error("Poller failed to connect after %d attempts", _POLLER_CONNECT_ATTEMPTS)
                 return
             poller = EventPoller(
                 poller_client,
@@ -391,7 +414,10 @@ def run_tui_with_engine(
             )
             app.set_event_poller(poller)
             try:
-                await poller.run()
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(stop_poller_on_signal, poller)
+                    await poller.run()
+                    tg.cancel_scope.cancel()
             finally:
                 with contextlib.suppress(Exception):
                     await poller_client.disconnect()
@@ -401,19 +427,23 @@ def run_tui_with_engine(
         except Exception:
             logger.debug("Event poller stopped", exc_info=True)
 
-    poller_thread = threading.Thread(target=poller_thread_target, daemon=True)
+    poller_thread = threading.Thread(
+        target=poller_thread_target, name=POLLER_THREAD_NAME, daemon=True
+    )
     poller_thread.start()
 
     # Run TUI in main thread (required for signal handlers)
-    if suppress_keyboard_interrupt:
-        with contextlib.suppress(KeyboardInterrupt), suppress_stderr_logging():
-            app.run()
-    else:
-        with suppress_stderr_logging():
-            app.run()
+    try:
+        if suppress_keyboard_interrupt:
+            with contextlib.suppress(KeyboardInterrupt), suppress_stderr_logging():
+                app.run()
+        else:
+            with suppress_stderr_logging():
+                app.run()
+    finally:
+        poller_stop.set()
 
-    # For oneshot mode, wait for engine thread to finish
-    poller_thread.join(timeout=2.0)
+    poller_thread.join()
     if result_future is not None:
         engine_thread.join(timeout=5.0)
 

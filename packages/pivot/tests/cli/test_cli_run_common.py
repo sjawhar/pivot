@@ -90,6 +90,9 @@ class _FakeEventPoller:
     async def run(self) -> None:
         self.ran = True
 
+    def stop(self) -> None:
+        return None
+
 
 class _DoneFuture(concurrent.futures.Future[str]):
     set_result_called: bool
@@ -720,14 +723,28 @@ def test_run_tui_with_engine_retries_poller_connect(
     _FakeRpcPivotClient.instances = []
     _FakeRpcPivotClient.failures_before_success = 2
 
+    # The poller stops retrying once the engine finishes or the TUI exits, so keep both
+    # running until the poller has connected.
     async def _engine_fn(socket_ready: threading.Event) -> str:
+        import anyio
+
         socket_ready.set()
+        with anyio.fail_after(10):
+            while app.event_poller is None:
+                await anyio.sleep(0.01)
         return "ok"
 
-    async def _fake_sleep(_duration: float) -> None:
-        return None
+    def _run_until_connected() -> None:
+        import time
 
-    mocker.patch("pivot.cli._run_common.anyio.sleep", new=_fake_sleep)
+        app.ran = True
+        deadline = time.monotonic() + 10
+        while app.event_poller is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        app.return_code = 0
+
+    app.run = _run_until_connected
+    mocker.patch.object(_run_common, "_POLLER_CONNECT_RETRY_S", 0.01)
     mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
     mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
 
@@ -803,3 +820,51 @@ def test_run_tui_with_engine_exits_nonzero_when_app_crashes(
         )
 
     assert exc_info.value.code == 1
+
+
+def test_run_tui_with_engine_stops_poller_when_engine_finishes_before_connect(
+    mocker: MockerFixture, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A one-shot engine that finishes before the poller connects ends the poller thread.
+
+    The engine removes its socket on exit, so a poller still retrying connect must stop
+    when the engine (and TUI) finish, not keep retrying after the command returns.
+    """
+    import threading
+    import time
+
+    app = _FakeApp()
+    result_future: concurrent.futures.Future[str] = concurrent.futures.Future()
+
+    async def _engine_fn(socket_ready: threading.Event) -> str:
+        socket_ready.set()
+        return "ok"
+
+    class _SlowFirstConnectClient:
+        connect_calls: int = 0
+
+        async def connect(self, _socket_path: pathlib.Path) -> None:
+            type(self).connect_calls += 1
+            if type(self).connect_calls == 1:
+                time.sleep(3.0)
+            raise OSError("socket removed: engine already finished")
+
+        async def disconnect(self) -> None:
+            return None
+
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _SlowFirstConnectClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+    threads_before = set(threading.enumerate())
+
+    with caplog.at_level(logging.DEBUG, logger="pivot.cli._run_common"):
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            result_future=result_future,
+        )
+
+    new_threads = [t for t in threading.enumerate() if t not in threads_before and t.is_alive()]
+    assert new_threads == [], f"poller thread still alive after return: {new_threads}"
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert result_future.result(timeout=1) == "ok"
