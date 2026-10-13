@@ -74,14 +74,16 @@ def test_list_no_stages_json(
 # =============================================================================
 
 
-def test_list_with_stages_json(
+def test_list_renders_registry_mutex_fixture(
     mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
 ) -> None:
-    """JSON output includes name, deps, outs, mutex, variant for all stages."""
+    """Render a non-empty registry mutex list.
+
+    This is a test-only rendering fixture: @stage has no mutex/resources API yet.
+    """
+    # Task 19 replaces with @stage(resources=...).
     with mock_discovery:
         stage_b(stage_a(mock_discovery.input("input.txt", t=str)))
-    # @stage has no mutex argument; set it on the registry entry so the
-    # rendering of a non-empty mutex list is still exercised.
     mock_discovery.get_stage("test/stage_a")["mutex"] = ["gpu"]
 
     result = runner.invoke(cli.cli, ["list", "--json"])

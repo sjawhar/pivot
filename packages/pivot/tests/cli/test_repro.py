@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import signal
+import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING
 
-from conftest import isolated_pivot_dir
+from conftest import isolated_pivot_dir, send_rpc
 from pivot import cli, compose, executor
-from pivot.cli import repro as repro_cli
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
     import click.testing
-    from pytest_mock import MockerFixture
 
 # =============================================================================
 # Module-level stage functions (required for pickling)
@@ -280,25 +282,72 @@ def test_repro_serve_requires_watch(
     assert "--watch" in result.output
 
 
-def test_repro_serve_with_watch_uses_headless_mode(
-    mock_discovery: compose.Pipeline,
-    runner: click.testing.CliRunner,
-    mocker: MockerFixture,
-) -> None:
-    """repro --serve --watch without --tui runs headless daemon mode.
+def test_repro_serve_with_watch_uses_headless_mode(tmp_path: pathlib.Path) -> None:
+    """repro --serve --watch starts an RPC-accessible headless daemon."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".pivot").mkdir()
+    raw_dir = tmp_path / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "input.txt").write_text("data")
+    (tmp_path / "pipeline.py").write_text("""\
+from __future__ import annotations
 
-    The daemon itself never exits, so the long-running serve loop is stubbed;
-    the test checks that the flag combination passes validation and is routed
-    to headless serve mode.
-    """
-    _register_a(mock_discovery)
-    serve = mocker.patch.object(repro_cli, "_run_serve_mode", autospec=True)
+import pathlib
 
-    result = runner.invoke(cli.cli, ["repro", "--serve", "--watch"])
+from pivot.compose import Pipeline, stage
 
-    assert "--serve requires --watch" not in result.output
-    assert result.exit_code == 0, result.output
-    serve.assert_called_once()
+
+@stage
+def process(input_file: str) -> str:
+    return input_file
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    process(pipeline.input("input.txt"))
+""")
+
+    socket_path = tmp_path / ".pivot" / "agent.sock"
+    stdout_path = tmp_path / "serve.stdout"
+    stderr_path = tmp_path / "serve.stderr"
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    # The child logs every RPC disconnect. Files avoid a PIPE filling and blocking it.
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+            cwd=tmp_path,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+
+    try:
+        response: dict[str, object] | None = None
+        for _ in range(100):
+            if socket_path.exists():
+                try:
+                    candidate = send_rpc(socket_path, "status")
+                    if "result" in candidate:
+                        response = candidate
+                        break
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass
+            time.sleep(0.1)
+
+        assert response is not None, (
+            "Agent socket did not become RPC-ready within 10s.\n"
+            + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+            + f"stderr: {stderr_path.read_text(errors='replace')}"
+        )
+        assert "result" in response
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def test_repro_debounce_requires_watch(

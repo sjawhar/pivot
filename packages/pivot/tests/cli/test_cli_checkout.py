@@ -901,6 +901,7 @@ def test_checkout_rejects_entire_lock_when_any_hash_invalid(
         assert result.exit_code != 0, (
             "Valid output should also fail — lock file is rejected entirely"
         )
+        assert "pivot repro test/two_stage" in result.output
         assert not (out_dir / "output1.txt").exists()
         assert not (out_dir / "output2.txt").exists()
 

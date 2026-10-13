@@ -197,6 +197,7 @@ def test_diff_json_output(
     assert data[0]["old_rows"] == 1, "HEAD version (1 row) must be restored from cache"
 
 
+@_DIFF_HEAD_RED
 def test_diff_key_columns(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
@@ -213,8 +214,13 @@ def test_diff_key_columns(
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 2 -> 3 (+1)" in result.output
+    assert "+1 added" in result.output
+    assert "~1 modified" in result.output
 
 
+@_DIFF_HEAD_RED
 def test_diff_positional(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
@@ -231,6 +237,9 @@ def test_diff_positional(
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "REORDER ONLY" in result.output
+    assert "Same content, different row order" in result.output
 
 
 @_DIFF_HEAD_RED
@@ -433,6 +442,7 @@ size: 8
 # =============================================================================
 
 
+@_DIFF_HEAD_RED
 def test_diff_summary_flag(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
@@ -448,10 +458,12 @@ def test_diff_summary_flag(
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert _CSV_REL in result.output
-    # Summary should show counts but not detailed row-by-row changes
-    assert "Rows:" in result.output or "Schema" in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 2 -> 3 (+1)" in result.output
+    assert "Columns: 2 -> 3 (+1 added, -0 removed)" in result.output
 
 
+@_DIFF_HEAD_RED
 def test_diff_markdown_output(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
@@ -466,11 +478,13 @@ def test_diff_markdown_output(
     result = runner.invoke(cli.cli, ["diff", "--md", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    # --md produces summary output (same format as plain for now)
     assert _CSV_REL in result.output
-    assert "Rows:" in result.output or "Row changes:" in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 1 -> 1 (0)" in result.output
+    assert "~1 modified" in result.output
 
 
+@_DIFF_HEAD_RED
 def test_diff_max_rows_parameter(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
@@ -487,11 +501,15 @@ def test_diff_max_rows_parameter(
 
     result = runner.invoke(cli.cli, ["diff", "--no-tui", "--max-rows", "10", _CSV_REL])
 
-    # Should succeed without error even with max-rows limit
+    # The comparison must use the HEAD file, not render the workspace file as newly added.
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 100 -> 100 (0)" in result.output
+    assert "~1 modified" in result.output
 
 
+@_DIFF_HEAD_RED
 def test_diff_empty_csv_file(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
@@ -505,9 +523,12 @@ def test_diff_empty_csv_file(
 
     result = runner.invoke(cli.cli, ["diff", "--no-tui", _CSV_REL])
 
-    # Should handle empty file without crashing
+    # The header-only HEAD file must be compared with the workspace file, not treated as absent.
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 0 -> 1 (+1)" in result.output
+    assert "+1 added" in result.output
 
 
 # =============================================================================

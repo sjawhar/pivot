@@ -170,5 +170,5 @@ def test_check_ignore_no_targets_shows_help(
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["check-ignore"])
 
-        # Should indicate how to use the command
-        assert result.exit_code in (0, 1, 2)  # Could be error or help
+        assert result.exit_code == 2
+        assert "No targets specified" in result.output
