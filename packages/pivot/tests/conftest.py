@@ -530,3 +530,26 @@ def minimal_pipeline(
     (tmp_path / ".git").mkdir(exist_ok=True)
 
     return test_pipeline
+
+
+# =============================================================================
+# tests.helpers default pipeline
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def bind_test_pipeline_helper(request: pytest.FixtureRequest) -> Generator[None]:
+    """Point tests.helpers' default pipeline at the test_pipeline fixture.
+
+    Active only for tests that request test_pipeline (directly or through
+    mock_discovery, minimal_pipeline, test_engine, ...), so register_test_stage()
+    registers into that pipeline without an explicit pipeline argument.
+    """
+    if "test_pipeline" not in request.fixturenames:
+        yield
+        return
+    from tests import helpers
+
+    helpers.set_test_pipeline(request.getfixturevalue("test_pipeline"))
+    yield
+    helpers.set_test_pipeline(None)
