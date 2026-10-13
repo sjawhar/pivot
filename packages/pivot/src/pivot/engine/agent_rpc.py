@@ -395,10 +395,18 @@ class AgentRpcSource:
 
     _socket_path: Path
     _handler: AgentRpcHandler | None
+    _resource_capacity: dict[str, int]
 
-    def __init__(self, *, socket_path: Path, handler: AgentRpcHandler | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        socket_path: Path,
+        handler: AgentRpcHandler | None = None,
+        resource_capacity: dict[str, int] | None = None,
+    ) -> None:
         self._socket_path = socket_path
         self._handler = handler
+        self._resource_capacity = dict(resource_capacity or {})
 
     async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
         """Listen for agent connections and process requests."""
@@ -542,7 +550,7 @@ class AgentRpcSource:
                 single_stage=False,
                 parallel=True,
                 max_workers=None,
-                resource_capacity={},
+                resource_capacity=dict(self._resource_capacity),
                 no_commit=False,
                 on_error=on_error,
                 cache_dir=None,

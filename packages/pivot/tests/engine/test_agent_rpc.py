@@ -174,6 +174,30 @@ async def test_agent_rpc_source_run_with_params(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_source_carries_configured_resource_capacity(tmp_path: Path) -> None:
+    """An RPC-triggered run keeps the capacity supplied by serve mode."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path, resource_capacity={"gpu": 2})
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {"jsonrpc": "2.0", "method": "run", "id": 4}
+            await conn.send(json.dumps(request).encode() + b"\n")
+            response = json.loads((await conn.receive(4096)).decode())
+            assert response.get("result") == "accepted"
+
+        event = await recv.receive()
+        tg.cancel_scope.cancel()
+
+    assert event["type"] == "run_requested"
+    assert event["resource_capacity"] == {"gpu": 2}
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_unknown_method(tmp_path: Path) -> None:
     """AgentRpcSource returns error for unknown methods."""
     socket_path = tmp_path / "agent.sock"

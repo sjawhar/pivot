@@ -538,7 +538,13 @@ def _run_serve_mode(
 
             # Add agent RPC source with handler for status/stages queries
             rpc_handler = AgentRpcHandler(engine=eng, event_buffer=eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
-            eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+            eng.add_source(
+                AgentRpcSource(
+                    socket_path=socket_path,
+                    handler=rpc_handler,
+                    resource_capacity=resource_capacity,
+                )
+            )
 
             # Add sinks
             if not quiet:
