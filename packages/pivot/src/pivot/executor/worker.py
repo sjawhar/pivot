@@ -816,14 +816,13 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
         return func(**kwargs)
 
 
-def _load_dep_from_store(ref: types.ArtifactRef, store: store_mod.Store) -> Any:
-    path = store.checkout(ref)
+def _load_dep_from_path(ref: types.ArtifactRef, path: pathlib.Path) -> Any:
+    """Load an artifact after the caller has resolved its workspace/cache path."""
     loader = cast("Any", ref.format)
     if ref.tag is types.ArtifactTag.DIRECTORY:
-        dir_path = pathlib.Path(path)
         values = dict[str, Any]()
-        for file_path in sorted(p for p in dir_path.rglob("*") if p.is_file()):
-            rel_key = file_path.relative_to(dir_path).as_posix()
+        for file_path in sorted(p for p in path.rglob("*") if p.is_file()):
+            rel_key = file_path.relative_to(path).as_posix()
             values[rel_key] = loader.load(file_path)
         return values
     return loader.load(path)
@@ -877,8 +876,16 @@ def _resolve_output_values(
     return value_map
 
 
+def _paths_overlap(first: pathlib.Path, second: pathlib.Path) -> bool:
+    """Return whether either path contains the other."""
+    return first.is_relative_to(second) or second.is_relative_to(first)
+
+
 def _reject_path_inside_project(
-    ref: types.ArtifactRef, value: object, project_root: pathlib.Path
+    ref: types.ArtifactRef,
+    value: object,
+    project_root: pathlib.Path,
+    dependency_paths: collections_abc.Collection[pathlib.Path] = (),
 ) -> None:
     """A PathOnly output is moved to the output path; never move a file pivot does not own."""
     if not isinstance(value, pathlib.Path):
@@ -891,23 +898,39 @@ def _reject_path_inside_project(
     lexical_source = source.absolute()
     resolved_root = project_root.resolve()
     resolved_source = source.resolve()
-    if not (
-        lexical_source.is_relative_to(lexical_root) or resolved_source.is_relative_to(resolved_root)
+    if (
+        lexical_source.is_relative_to(lexical_root)
+        or resolved_source.is_relative_to(resolved_root)
     ):
-        return
-    raise exceptions.StageDefinitionError(
-        f"Stage '{ref.identity.producer}' returned {value}, which is inside the project "
-        + f"({project_root}). Pivot moves a returned path to the stage's output path, so it "
-        + "must be a file or directory the stage created outside the project, e.g. under "
-        + "tempfile.mkdtemp()."
-    )
+        raise exceptions.StageDefinitionError(
+            f"Stage '{ref.identity.producer}' returned {value}, which is inside the project "
+            + f"({project_root}). Pivot moves a returned path to the stage's output path, so it "
+            + "must be a file or directory the stage created outside the project, e.g. under "
+            + "tempfile.mkdtemp()."
+        )
+    for dependency_path in dependency_paths:
+        lexical_dependency = dependency_path.absolute()
+        resolved_dependency = dependency_path.resolve()
+        if any(
+            _paths_overlap(source_path, dependency_variant)
+            for source_path in (lexical_source, resolved_source)
+            for dependency_variant in (lexical_dependency, resolved_dependency)
+        ):
+            raise exceptions.StageDefinitionError(
+                f"Stage '{ref.identity.producer}' returned {value}, which overlaps dependency "
+                + f"{dependency_path}. Pivot cannot move a path the stage received as input."
+            )
 
 
 def _write_output_with_store(
-    ref: types.ArtifactRef, value: Any, store: store_mod.Store, project_root: pathlib.Path
+    ref: types.ArtifactRef,
+    value: Any,
+    store: store_mod.Store,
+    project_root: pathlib.Path,
+    dependency_paths: collections_abc.Collection[pathlib.Path] = (),
 ) -> pathlib.Path:
     if isinstance(ref.format, loaders.PathOnly) and ref.tag is not types.ArtifactTag.DIRECTORY:
-        _reject_path_inside_project(ref, value, project_root)
+        _reject_path_inside_project(ref, value, project_root, dependency_paths)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
     if ref.tag is types.ArtifactTag.DIRECTORY:
@@ -919,16 +942,23 @@ def _write_output_with_store(
             raise ValueError(f"Directory output '{ref.identity.producer}': dict must be non-empty")
         # Cast needed: isinstance narrows Any to dict[Unknown, Unknown]; keys are checked below
         value_dict = cast("dict[object, Any]", value)
+        members = list[tuple[pathlib.Path, Any]]()
         for key, item_value in value_dict.items():
             if not isinstance(key, str):
                 raise ValueError(
-                    f"Directory output '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
+                    f"Directory output for '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
                 )
             normalized = stage_def.validate_directory_out_key(key, ref.identity.producer)
-            full_path = output_path / normalized
-            full_path.parent.mkdir(parents=True, exist_ok=True)
             if isinstance(ref.format, loaders.PathOnly):
-                _reject_path_inside_project(ref, cast("object", item_value), project_root)
+                _reject_path_inside_project(
+                    ref,
+                    cast("object", item_value),
+                    project_root,
+                    dependency_paths,
+                )
+            members.append((output_path / normalized, item_value))
+        for full_path, item_value in members:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
             writer.save(item_value, full_path)
         return output_path
 
@@ -989,8 +1019,11 @@ def _run_stage_function_with_store(
                 )
             kwargs[params_arg_name] = params
 
+        dependency_paths = list[pathlib.Path]()
         for name, ref in deps.items():
-            kwargs[name] = _load_dep_from_store(ref, store)
+            dependency_path = store.checkout(ref)
+            dependency_paths.append(dependency_path)
+            kwargs[name] = _load_dep_from_path(ref, dependency_path)
 
         kwargs = _reconstruct_list_kwargs(kwargs, collection_params)
 
@@ -1001,7 +1034,13 @@ def _run_stage_function_with_store(
         output_values = _resolve_output_values(result, outs, stage_name)
         output_paths = dict[types.ArtifactRef, pathlib.Path]()
         for ref, value in output_values.items():
-            output_paths[ref] = _write_output_with_store(ref, value, store, project_root)
+            output_paths[ref] = _write_output_with_store(
+                ref,
+                value,
+                store,
+                project_root,
+                dependency_paths,
+            )
 
         return output_paths
 
