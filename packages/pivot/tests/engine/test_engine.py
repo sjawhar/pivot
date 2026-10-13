@@ -11,7 +11,7 @@ import anyio
 import networkx as nx
 import pytest
 
-from pivot import parameters, project
+from pivot import loaders, parameters, project, types
 from pivot.compose import Pipeline, stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import graph as engine_graph
@@ -395,6 +395,76 @@ async def test_engine_ignores_its_completed_output_write(
         )
 
     assert executed == []
+
+
+@pytest.mark.anyio
+async def test_engine_distinguishes_own_and_external_directory_output_writes(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Directory-output child writes are suppressed only when pivot wrote them."""
+    from pivot.engine.sources import FilesystemSource
+    from pivot.storage import store as store_mod
+
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    scale_stage = "watch/_helper_watch_scale"
+    total_stage = "watch/_helper_watch_total"
+    scale_info = pipeline.get_stage(scale_stage)
+    total_info = pipeline.get_stage(total_stage)
+    directory_ref = types.ArtifactRef(
+        identity=scale_info["outs"][0].identity,
+        format=loaders.Text(),
+        python_type=str,
+        tag=types.ArtifactTag.DIRECTORY,
+    )
+    scale_info["outs"] = [directory_ref]
+    total_info["deps"]["scaled"] = directory_ref
+    output_dir = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    ).resolve_display_path(directory_ref)
+    child_path = output_dir / "results" / "child.txt"
+    child_path.parent.mkdir(parents=True)
+    child_path.write_text("pivot write")
+    executed = list[list[str]]()
+
+    async def _capture_execution(stages: list[str]) -> None:
+        executed.append(stages)
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine.add_source(FilesystemSource(watch_paths=[tmp_path]))
+        engine._graph = engine_graph.build_graph(
+            {
+                scale_stage: scale_info,
+                total_stage: total_info,
+            }
+        )
+        await engine._initialize_orchestration([scale_stage, total_stage], max_workers=1)
+        await engine._set_stage_state(scale_stage, StageExecutionState.RUNNING)
+        await engine._handle_stage_completion(
+            scale_stage,
+            {
+                "status": StageStatus.RAN,
+                "reason": "ran",
+                "input_hash": "input",
+                "output_lines": [],
+            },
+            time.perf_counter(),
+            tmp_path / ".pivot",
+        )
+        engine._execute_affected_stages = _capture_execution
+        await engine._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(child_path)])
+        )
+        assert executed == []
+
+        child_path.write_text("external write with a new size")
+        await engine._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(child_path)])
+        )
+
+    assert executed == [[total_stage]]
 
 
 @pytest.mark.anyio

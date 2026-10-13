@@ -2078,27 +2078,39 @@ class Engine:
         coordinator = self._get_watch_coordinator()
         if coordinator is None:
             return
-        for path, identity in coordinator.artifact_paths.items():
-            if engine_graph.get_producer(coordinator.graph, identity) != stage_name:
-                continue
+
+        def _record(path: pathlib.Path) -> None:
             try:
                 stat = path.stat()
             except FileNotFoundError:
                 self._watch_output_stats[path] = None
-                continue
+                return
             self._watch_output_stats[path] = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
+        for path, identity in coordinator.artifact_paths.items():
+            if engine_graph.get_producer(coordinator.graph, identity) != stage_name:
+                continue
+            _record(path)
+            if path.is_dir():
+                for child in path.rglob("*"):
+                    if child.is_file():
+                        _record(child)
 
     def _is_own_watch_output_write(self, path: pathlib.Path) -> bool:
         """Return whether a changed output still matches the engine's own write."""
-        normalized = project.normalize_path(path)
-        if normalized not in self._watch_output_stats:
-            return False
-        expected = self._watch_output_stats[normalized]
-        try:
-            stat = normalized.stat()
-        except FileNotFoundError:
-            return expected is None
-        return expected == (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        current = project.normalize_path(path)
+        while True:
+            if current in self._watch_output_stats:
+                expected = self._watch_output_stats[current]
+                try:
+                    stat = current.stat()
+                except FileNotFoundError:
+                    return expected is None
+                return expected == (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            parent = current.parent
+            if parent == current:
+                return False
+            current = parent
 
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
