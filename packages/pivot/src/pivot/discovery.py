@@ -322,6 +322,8 @@ def _load_pipeline_from_module(
             return pipeline_obj
 
         for name, value in module_dict.items():
+            if isinstance(value, type):
+                continue
             if isinstance(value, PipelineLike):
                 raise DiscoveryError(
                     f"{path} does not define a 'pipeline' variable. Found Pipeline instance named '{name}' - rename it to 'pipeline'."

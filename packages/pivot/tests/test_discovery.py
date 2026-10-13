@@ -429,3 +429,18 @@ def test_discovery_keeps_project_module_preimported_by_caller(
     assert sys.modules["stages"] is stages
     assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
     assert sys.modules["stages"] is stages
+
+
+def test_discover_pipeline_missing_pipeline_variable_names_instance(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A Pipeline assigned to the wrong module variable names that variable in the error."""
+    (tmp_path / "pipeline.py").write_text(
+        "import pathlib\nfrom pivot.compose import Pipeline\n"
+        + "wrong_name = Pipeline('wrong', root=pathlib.Path('.'))\n"
+    )
+
+    with pytest.raises(
+        discovery.DiscoveryError, match="Found Pipeline instance named 'wrong_name'"
+    ):
+        discovery.discover_pipeline(project_root=tmp_path)
