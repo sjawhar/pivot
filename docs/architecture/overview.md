@@ -69,19 +69,9 @@ preprocess (produces data/clean.csv)
   train (consumes data/clean.csv)
 ```
 
-#### Path Resolution
+#### Dependency Resolution
 
-The graph builder uses two strategies to match dependencies to outputs:
-
-1. **Exact match (O(1)):** Dictionary lookup via `_build_outputs_map()`
-   - Maps each output path to its producing stage
-   - Handles the common case of explicit path dependencies
-
-2. **Directory overlap (O(log n)):** pygtrie prefix tree for parent/child relationships
-   - `has_subtrie()`: Dependency is parent of outputs (`data/` depends on `data/file.csv`)
-   - `shortest_prefix()`: Dependency is child of output (`data/file.csv` depends on `data/`)
-
-This handles cases where a stage declares a directory output and another stage depends on a file within that directory (or vice versa).
+The graph builder matches each dependency to its producer by artifact identity: `_build_outputs_map()` maps every output's `ArtifactIdentity` (producing stage plus output key) to that stage, and a dependency handle carries the identity of the output it was created from. A dependency with no producer is a pipeline input, resolved to its bound workspace path by the store. Paths play no part in matching, so two stages can never be linked by an accidental path prefix.
 
 ### Scheduler
 

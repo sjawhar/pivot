@@ -1,7 +1,7 @@
 ---
 tags: [python, paths, data-structures, trie]
 category: implementation
-module: trie
+module: status
 symptoms: ["false positive path overlaps", "directory vs file path confusion", "incorrect dependency detection"]
 ---
 
@@ -74,4 +74,4 @@ The pygtrie library provides efficient O(k) operations where k is the number of 
 - `shortest_prefix(key)` - find if any stored path is a prefix of key
 - Standard dict operations for exact matches
 
-This is used in Pivot's `src/pivot/trie.py` to validate that stage outputs don't overlap (preventing one stage from clobbering another's outputs).
+Pivot uses this for tracked-file (`.pvt`) ancestor lookups: `status.py` builds a `pygtrie.Trie` of tracked paths and `explain.py` finds the tracked directory that contains a dependency.

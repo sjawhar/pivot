@@ -42,14 +42,6 @@ class SecurityValidationError(PivotError):
     """
 
 
-class OutputDuplicationError(ValidationError):
-    """Raised when two stages produce the same output."""
-
-
-class OverlappingOutputPathsError(ValidationError):
-    """Raised when output paths overlap (one is parent/child of another)."""
-
-
 class InvalidPathError(ValidationError):
     """Raised when a path is invalid (e.g., resolves outside project root)."""
 
