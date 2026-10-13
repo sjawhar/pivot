@@ -7,8 +7,10 @@ parallelism, and the value plumbing between the store and the stage function.
 
 from __future__ import annotations
 
+import array
 import contextlib
 import dataclasses
+import fcntl
 import io
 import logging
 import os
@@ -19,6 +21,7 @@ import re
 import signal
 import subprocess
 import sys
+import termios
 import textwrap
 import threading
 import time
@@ -391,6 +394,20 @@ def test_forced_run_of_unchanged_stage_reports_forced(
     assert (forced["status"], forced["reason"]) == (StageStatus.RAN, "forced")
 
 
+def test_lock_comparison_skip_reports_unchanged(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """Without recorded generations the worker compares the lock; history records "unchanged"."""
+    info = _stage_info(_upper, project, worker_env, no_commit=False)
+    first = _run_and_apply(info, worker_env, output_queue)
+
+    second = worker.execute_stage(_STAGE, info, worker_env, output_queue)
+
+    assert first["status"] == StageStatus.RAN, first["reason"]
+    assert (second["status"], second["reason"]) == (StageStatus.CACHED, "unchanged")
+    assert second["input_hash"] == first["input_hash"]
+
+
 def test_run_cache_restores_an_earlier_input_version(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
@@ -692,6 +709,19 @@ def test_nested_parallelism_backend_follows_the_environment(
     assert worker._execute_with_joblib_protection(_active_backend, {}) == backend
 
 
+def _add(a: int, b: int) -> int:
+    return a + b
+
+
+def test_stage_runs_unprotected_when_joblib_is_not_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """joblib is a dev dependency only (packages/pivot/pyproject.toml), so users may lack it."""
+    monkeypatch.setitem(sys.modules, "joblib", None)
+
+    assert worker._execute_with_joblib_protection(_add, {"a": 2, "b": 3}) == 5
+
+
 # =============================================================================
 # Values between the store and the stage
 # =============================================================================
@@ -955,6 +985,38 @@ def test_queue_writer_reads_subprocess_bytes_until_end_of_file(
 
     assert ring.snapshot() == [("ok", False), ("\ufffd", False)]
     assert elapsed < 4.0, "the reader thread must stop at end of file"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="red test: _QueueWriter._pipe_reader (worker.py:1057-1066) decodes each pipe read "
+    + "on its own, so a UTF-8 character split across two reads becomes U+FFFD",
+)
+def test_queue_writer_keeps_a_character_split_across_pipe_reads(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
+    """A subprocess's non-ASCII output must reach the log intact, wherever the pipe splits it."""
+    euro = "€".encode()
+    ring = worker._OutputRingBuffer()
+    writer = worker._QueueWriter(_STAGE, output_queue, is_stderr=False, ring_buffer=ring)
+    writer.__enter__()
+    try:
+        write_fd = writer.fileno()
+        _ = os.write(write_fd, b"abc" + euro[:1])
+        # Second write only after the reader has taken the first one, so the split is a real
+        # read boundary rather than whatever the scheduler happens to produce.
+        unread = array.array("i", [1])
+        deadline = time.monotonic() + 10
+        while unread[0]:
+            assert time.monotonic() < deadline, "the reader thread never read the first bytes"
+            time.sleep(0.01)
+            _ = fcntl.ioctl(write_fd, termios.FIONREAD, unread)
+        _ = os.write(write_fd, euro[1:] + b"\n")
+    finally:
+        writer.__exit__(None, None, None)
+
+    assert _log_lines(_drain(output_queue)) == [(_STAGE, "abc€", False)]
+    assert ring.snapshot() == [("abc€", False)]
 
 
 _LEAKED_CHILD_SCRIPT = textwrap.dedent(
