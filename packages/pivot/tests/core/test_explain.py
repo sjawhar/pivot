@@ -12,7 +12,15 @@ import pytest
 from pivot import StageParams, compose, executor, explain, loaders, project, skip, status
 from pivot.storage import lock
 from pivot.storage import store as store_mod
-from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, HashInfo, LockData, StageExplanation
+from pivot.storage.track import PvtData
+from pivot.types import (
+    ArtifactIdentity,
+    ArtifactRef,
+    ArtifactTag,
+    HashInfo,
+    LockData,
+    StageExplanation,
+)
 
 
 class _UpstreamParams(StageParams):
@@ -678,11 +686,17 @@ def test_get_pipeline_explanations_upstream_propagation(
     )
 
     stage_b_exp = next(
-        (explanation for explanation in explanations if explanation["stage_name"] == "test/_upstream_stage_b"),
+        (
+            explanation
+            for explanation in explanations
+            if explanation["stage_name"] == "test/_upstream_stage_b"
+        ),
         None,
     )
     assert stage_b_exp is not None, "test/_upstream_stage_b should be in explanations"
-    assert stage_b_exp["will_run"] is True, "test/_upstream_stage_b should run due to upstream staleness"
+    assert stage_b_exp["will_run"] is True, (
+        "test/_upstream_stage_b should run due to upstream staleness"
+    )
     assert "upstream_stale" in stage_b_exp, "test/_upstream_stage_b should have upstream_stale"
     assert "test/_upstream_stage_a" in stage_b_exp["upstream_stale"], (
         "test/_upstream_stage_b should list test/_upstream_stage_a as stale upstream"
