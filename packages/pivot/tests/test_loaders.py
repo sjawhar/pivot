@@ -856,7 +856,11 @@ def test_dataframe_jsonl_loader_save(tmp_path: pathlib.Path) -> None:
     lines = jsonl_file.read_text().strip().split("\n")
     assert len(lines) == 3
     assert json.loads(lines[0]) == {
-        "__pivot_dataframe_metadata__": {"version": 1, "temporal_columns": {}}
+        "__pivot_dataframe_metadata__": {
+            "version": 1,
+            "temporal_columns": {},
+            "float_columns": {},
+        }
     }
 
 
