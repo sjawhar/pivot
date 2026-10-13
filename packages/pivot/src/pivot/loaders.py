@@ -85,6 +85,9 @@ class CSV[T](Loader[T, T]):
 
     @override
     def load(self, path: pathlib.Path) -> T:
+        # pandas writes a zero-column frame as a bare line break, which read_csv rejects.
+        if path.stat().st_size <= 2 and not path.read_bytes().strip():
+            return self.empty()
         result = pandas.read_csv(  # pyright: ignore[reportUnknownMemberType] - pandas read_csv has complex overloads
             path,
             index_col=self.index_col,
