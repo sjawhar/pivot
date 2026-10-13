@@ -348,8 +348,8 @@ def _iso_datetime_texts(series: pandas.Series[Any], suffix: str = "") -> list[st
 
 def _encode_jsonl_column(
     series: pandas.Series[Any], encoder: json.JSONEncoder
-) -> tuple[list[str], dict[str, object] | None]:
-    """Encode one DataFrame column as JSON value texts and return temporal metadata."""
+) -> tuple[list[str], str, dict[str, object] | None]:
+    """Encode one column: its JSON value texts, the dtype as written, and temporal metadata."""
     dtype = series.dtype
     if pandas.api.types.is_float_dtype(dtype):
         if isinstance(dtype, numpy.dtype) and dtype.itemsize > numpy.dtype("float64").itemsize:
@@ -357,11 +357,11 @@ def _encode_jsonl_column(
         # repr() is the shortest text that parses back to the identical float;
         # pandas.to_json rounds to at most 15 significant digits.
         floats: list[float] = series.to_numpy(dtype="float64", na_value=math.nan).tolist()
-        return [repr(v) if math.isfinite(v) else "null" for v in floats], None
+        return [repr(v) if math.isfinite(v) else "null" for v in floats], str(dtype), None
     if isinstance(dtype, numpy.dtype) and dtype.kind in "iu":
-        return series.astype(str).tolist(), None
+        return series.astype(str).tolist(), str(dtype), None
     if isinstance(dtype, numpy.dtype) and dtype.kind == "b":
-        return numpy.where(series.to_numpy(), "true", "false").tolist(), None
+        return numpy.where(series.to_numpy(), "true", "false").tolist(), str(dtype), None
     if pandas.api.types.is_object_dtype(dtype) and pandas.api.types.infer_dtype(
         series, skipna=True
     ) in ("date", "datetime"):
@@ -384,14 +384,16 @@ def _encode_jsonl_column(
         metadata: dict[str, object] = {"kind": "datetime", "timezone": timezone}
         return (
             _iso_datetime_texts(series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z"),
+            str(dtype),
             metadata,
         )
     if pandas.api.types.is_datetime64_dtype(dtype):
-        return _iso_datetime_texts(series), {"kind": "datetime", "timezone": None}
+        return _iso_datetime_texts(series), str(dtype), {"kind": "datetime", "timezone": None}
     if pandas.api.types.is_timedelta64_dtype(dtype):
         deltas = cast("list[pandas.Timedelta]", series.tolist())
         return (
             ["null" if delta is pandas.NaT else f'"{delta.isoformat()}"' for delta in deltas],
+            str(dtype),
             {"kind": "timedelta"},
         )
     missing: list[bool] = series.isna().tolist()
@@ -405,7 +407,7 @@ def _encode_jsonl_column(
             encoded.append(encoder.encode(cell))
         except ValueError:
             encoded.append(encoder.encode(_replace_nonfinite(cell)))
-    return encoded, None
+    return encoded, str(dtype), None
 
 
 def _restore_temporal_jsonl_column(
@@ -431,10 +433,12 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
 
     One JSON object per row; the index is not written. The first line is a
-    reserved ``{"__pivot_dataframe_metadata__": ...}`` JSON object describing
-    Pivot-written temporal columns. A non-Pivot JSONL reader sees that explicit
-    metadata record followed by normal row records; it can skip the first line
-    to read the data rows unchanged.
+    reserved ``{"__pivot_dataframe_metadata__": ...}`` JSON object recording every
+    column's name and dtype, in order, plus how temporal columns were written. A
+    non-Pivot JSONL reader sees that explicit metadata record followed by normal
+    row records; it can skip the first line to read the data rows unchanged.
+
+    - a zero-row frame keeps its columns and dtypes.
 
     - floats: written as the shortest exact text, read back bit-identical
       (NaN and +/-inf are written as ``null`` and read back as NaN).
@@ -454,8 +458,9 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     def load(self, path: pathlib.Path, *, max_rows: int | None = None) -> pandas.DataFrame:
         """Load all rows, or at most ``max_rows`` data records after the metadata header."""
         records = list[object]()
+        has_metadata = False
+        columns = list[tuple[str, str]]()
         temporal_columns = dict[str, collections_abc.Mapping[str, object]]()
-        float_columns = dict[str, str]()
         with path.open() as f:
             for line_num, line in enumerate(f, 1):
                 if not line.strip():
@@ -477,6 +482,22 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                             raise ValueError(
                                 f"Unsupported DataFrameJSONL metadata version at {path}"
                             )
+                        raw_columns = typed_metadata.get("columns")
+                        if not isinstance(raw_columns, list):
+                            raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
+                        for raw_column in cast("list[object]", raw_columns):
+                            column = (
+                                cast("dict[object, object]", raw_column)
+                                if isinstance(raw_column, dict)
+                                else {}
+                            )
+                            name = column.get("name")
+                            dtype = column.get("dtype")
+                            if not isinstance(name, str) or not isinstance(dtype, str):
+                                raise ValueError(
+                                    f"Invalid DataFrameJSONL column metadata at {path}"
+                                )
+                            columns.append((name, dtype))
                         raw_temporal = typed_metadata.get("temporal_columns", {})
                         if not isinstance(raw_temporal, dict):
                             raise ValueError(f"Invalid DataFrameJSONL temporal metadata at {path}")
@@ -489,29 +510,34 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                             temporal_columns[name] = cast(
                                 "collections_abc.Mapping[str, object]", metadata
                             )
-                        raw_float = typed_metadata.get("float_columns", {})
-                        if not isinstance(raw_float, dict):
-                            raise ValueError(f"Invalid DataFrameJSONL float metadata at {path}")
-                        float_mapping = cast("dict[object, object]", raw_float)
-                        for name, dtype in float_mapping.items():
-                            if not isinstance(name, str) or not isinstance(dtype, str):
-                                raise ValueError(
-                                    f"Invalid DataFrameJSONL float column metadata at {path}"
-                                )
-                            float_columns[name] = dtype
+                        has_metadata = True
                         continue
                 records.append(cast("object", record))
                 if max_rows is not None and len(records) >= max_rows:
                     break
+        if has_metadata and not records:
+            # No row records carry the keys, so the header alone gives the schema.
+            return pandas.DataFrame(
+                {
+                    name: pandas.Series([], dtype=pandas.api.types.pandas_dtype(dtype))
+                    for name, dtype in columns
+                }
+            )
         frame = pandas.DataFrame(records)
+        if has_metadata:
+            names = [name for name, _ in columns]
+            if list(frame.columns) != names:
+                raise ValueError(
+                    f"DataFrameJSONL rows at {path} have columns {list(frame.columns)}, "
+                    + f"but the metadata header declares {names}"
+                )
         for name, metadata in temporal_columns.items():
-            if name not in frame.columns:
-                frame[name] = pandas.Series(pandas.NaT, index=frame.index)
             frame[name] = _restore_temporal_jsonl_column(frame[name], metadata)
-        for name, dtype in float_columns.items():
-            if name not in frame.columns:
-                frame[name] = pandas.Series(math.nan, index=frame.index)
-            frame[name] = frame[name].astype(pandas.api.types.pandas_dtype(dtype))
+        for name, dtype in columns:
+            # An all-null float column has only nulls in its rows; restore its dtype.
+            float_dtype = pandas.api.types.pandas_dtype(dtype)
+            if pandas.api.types.is_float_dtype(float_dtype):
+                frame[name] = frame[name].astype(float_dtype)
         return frame
 
     def row_count(self, path: pathlib.Path) -> int:
@@ -552,13 +578,12 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
         encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"), default=_json_default)
         keys = list[str]()
         columns = list[list[str]]()
+        column_schema = list[dict[str, str]]()
         temporal_columns = dict[str, dict[str, object]]()
-        float_columns = dict[str, str]()
         for name in data.columns:
             string_name = str(name)
-            dtype = data[name].dtype
             try:
-                column, temporal_metadata = _encode_jsonl_column(data[name], encoder)
+                column, written_dtype, temporal_metadata = _encode_jsonl_column(data[name], encoder)
             except TypeError as e:
                 raise TypeError(
                     f"DataFrameJSONL cannot write column {string_name!r}: {e}. Convert it to "
@@ -567,16 +592,15 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                 ) from e
             columns.append(column)
             keys.append(encoder.encode(string_name) + ":")
+            column_schema.append({"name": string_name, "dtype": written_dtype})
             if temporal_metadata is not None:
                 temporal_columns[string_name] = temporal_metadata
-            if pandas.api.types.is_float_dtype(dtype):
-                float_columns[string_name] = str(dtype)
 
         metadata = {
             _DATAFRAME_METADATA_KEY: {
                 "version": _DATAFRAME_METADATA_VERSION,
+                "columns": column_schema,
                 "temporal_columns": temporal_columns,
-                "float_columns": float_columns,
             }
         }
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -878,8 +878,8 @@ def test_dataframe_jsonl_loader_save(tmp_path: pathlib.Path) -> None:
     assert json.loads(lines[0]) == {
         "__pivot_dataframe_metadata__": {
             "version": 1,
+            "columns": [{"name": "x", "dtype": "int64"}, {"name": "y", "dtype": "int64"}],
             "temporal_columns": {},
-            "float_columns": {},
         }
     }
 
@@ -1018,13 +1018,18 @@ def test_dataframe_jsonl_roundtrips_date_and_time_columns(tmp_path: pathlib.Path
     assert jsonl_records[0] == {
         "__pivot_dataframe_metadata__": {
             "version": 1,
+            "columns": [
+                {"name": "date", "dtype": "datetime64[ns]"},
+                {"name": "ns", "dtype": "datetime64[ns]"},
+                {"name": "tz", "dtype": "datetime64[ns, America/New_York]"},
+                {"name": "delta", "dtype": "timedelta64[ns]"},
+            ],
             "temporal_columns": {
                 "date": {"kind": "datetime", "timezone": None},
                 "ns": {"kind": "datetime", "timezone": None},
                 "tz": {"kind": "datetime", "timezone": "America/New_York"},
                 "delta": {"kind": "timedelta"},
             },
-            "float_columns": {},
         }
     }
     assert jsonl_records[1]["date"] == "2024-03-04T00:00:00.000000000"
@@ -1085,6 +1090,36 @@ def test_dataframe_jsonl_keeps_iso_shaped_strings_as_strings(tmp_path: pathlib.P
     loaded = loaders.DataFrameJSONL().load(jsonl_file)
 
     pandas.testing.assert_frame_equal(loaded, df)
+
+
+def test_dataframe_jsonl_keeps_columns_of_zero_row_frame(tmp_path: pathlib.Path) -> None:
+    frame = pandas.DataFrame(
+        {"count": pandas.Series([], dtype="int64"), "label": pandas.Series([], dtype=object)}
+    )
+    loaders.DataFrameJSONL().save(frame, tmp_path / "out.jsonl")
+    loaded = loaders.DataFrameJSONL().load(tmp_path / "out.jsonl")
+    assert isinstance(loaded, pandas.DataFrame)
+    assert list(loaded.columns) == ["count", "label"], "a filtered-to-empty frame keeps its schema"
+
+
+def test_dataframe_jsonl_roundtrips_zero_row_frame_dtypes(tmp_path: pathlib.Path) -> None:
+    jsonl_file = tmp_path / "empty.jsonl"
+    frame = pandas.DataFrame(
+        {
+            "label": pandas.Series([], dtype=object),
+            "count": pandas.Series([], dtype="int64"),
+            "score": pandas.Series([], dtype="float32"),
+            "flag": pandas.Series([], dtype="bool"),
+            "when": pandas.Series([], dtype="datetime64[ns]"),
+            "local": pandas.Series([], dtype=pandas.DatetimeTZDtype(tz="America/New_York")),
+            "elapsed": pandas.Series([], dtype="timedelta64[ns]"),
+        }
+    )
+
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, frame)
 
 
 def test_dataframe_jsonl_roundtrips_all_null_temporal_dtypes(tmp_path: pathlib.Path) -> None:
