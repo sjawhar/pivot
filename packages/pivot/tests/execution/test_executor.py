@@ -561,18 +561,24 @@ def test_multiple_mutex_groups_per_stage(
 # mutex=["gpu"] -> resources={"gpu": 1}
 @pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
 def test_mutex_with_dependencies(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Resource scheduling preserves both handle dependency and resource order."""
+    """Resource scheduling preserves a handle edge and serializes independent GPU work."""
     root = _resource_root(tmp_path, monkeypatch)
     stage_a = _resource_stage({"gpu": 1}, _resource_a)
     stage_c = _resource_stage({"gpu": 1}, _resource_c)
+    independent = _resource_stage({"gpu": 1}, _resource_b)
     pipeline = compose.Pipeline("resources", root=root)
     with pipeline:
         a = stage_a()
         stage_c(a)
+        independent()
 
-    results = executor.run(pipeline=pipeline, max_workers=2)
+    results = executor.run(pipeline=pipeline, max_workers=3)
     assert results["resources/_resource_a"]["status"] == "ran"
     assert results["resources/_resource_c"]["status"] == "ran"
+    assert results["resources/_resource_b"]["status"] == "ran"
+    _assert_serial(root, "a", "c")
+    _assert_serial(root, "a", "b")
+    _assert_serial(root, "b", "c")
 
 
 def test_no_mutex_stages_unaffected(
