@@ -219,6 +219,46 @@ def _collecting_sources() -> Iterator[dict[str, tuple[int, int, int]]]:
         _active_source_map = previous
 
 
+# (loaded modules, project root, project module files) from the last sys.modules scan.
+_project_modules_snapshot: (
+    tuple[list[object], pathlib.Path, list[tuple[str, pathlib.Path]]] | None
+) = None
+
+
+def _project_module_files(project_root: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
+    """Return (relative path, path) for every loaded project module.
+
+    Classifying the ~2,000 loaded modules is reused until a module is imported, removed or
+    replaced, so a fingerprint pass scans sys.modules once rather than once per stage.
+    """
+    global _project_modules_snapshot
+    loaded = list[object](sys.modules.values())
+    snapshot = _project_modules_snapshot
+    if (
+        snapshot is not None
+        and snapshot[1] == project_root
+        and len(snapshot[0]) == len(loaded)
+        and all(previous is current for previous, current in zip(snapshot[0], loaded, strict=True))
+    ):
+        return snapshot[2]
+    files = list[tuple[str, pathlib.Path]]()
+    for module in loaded:
+        # Some libraries install non-module objects in sys.modules.
+        if not isinstance(module, types.ModuleType):
+            continue
+        file = module.__dict__.get("__file__")
+        if not isinstance(file, str) or not is_user_code(module):
+            continue
+        try:
+            path = pathlib.Path(file).resolve()
+            rel_path = str(path.relative_to(project_root))
+        except (OSError, ValueError):
+            continue
+        files.append((rel_path, path))
+    _project_modules_snapshot = (loaded, project_root, files)
+    return files
+
+
 def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None:
     """Add the file of every loaded project module to a manifest's source map.
 
@@ -229,19 +269,10 @@ def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None
     """
     from pivot import project
 
-    project_root = project.get_project_root()
-    for module in list(sys.modules.values()):
-        # Some libraries install non-module objects in sys.modules.
-        if not isinstance(cast("object", module), types.ModuleType):
-            continue
-        file = module.__dict__.get("__file__")
-        if not isinstance(file, str) or not is_user_code(module):
-            continue
+    for rel_path, path in _project_module_files(project.get_project_root()):
         try:
-            path = pathlib.Path(file).resolve()
-            rel_path = str(path.relative_to(project_root))
             stat = path.stat()
-        except (OSError, ValueError):
+        except OSError:
             continue
         source_map.setdefault(rel_path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
 

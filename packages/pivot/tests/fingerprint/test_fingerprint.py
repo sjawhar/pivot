@@ -2257,6 +2257,50 @@ def test_cached_manifest_source_map_includes_module_attribute_source(
     assert "f8_settings.py" in json.loads(raw)["s"]
 
 
+def test_project_module_scan_is_reused_until_loaded_modules_change(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cache misses reuse one scan of sys.modules; importing or reloading a module redoes it."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "scan_first.py").write_text("VALUE = 1\n")
+    (tmp_path / "scan_second.py").write_text("VALUE = 2\n")
+    classified = list[object]()
+    real_is_user_code = fingerprint.is_user_code
+
+    def counting_is_user_code(obj: object) -> bool:
+        classified.append(obj)
+        return real_is_user_code(obj)
+
+    try:
+        importlib.import_module("scan_first")
+        first = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(first)
+        assert "scan_first.py" in first
+
+        monkeypatch.setattr(fingerprint, "is_user_code", counting_is_user_code)
+        repeat = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(repeat)
+        assert repeat == first
+        assert classified == [], "an unchanged sys.modules must not be rescanned"
+
+        importlib.import_module("scan_second")
+        after_import = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(after_import)
+        assert "scan_second.py" in after_import
+
+        (tmp_path / "scan_first.py").write_text("VALUE = 100\n")
+        del sys.modules["scan_first"]
+        importlib.import_module("scan_first")
+        after_reload = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(after_reload)
+        stat = (tmp_path / "scan_first.py").stat()
+        assert after_reload["scan_first.py"] == (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    finally:
+        sys.modules.pop("scan_first", None)
+        sys.modules.pop("scan_second", None)
+
+
 # ==============================================================================
 # Stage manifest cache tests
 # ==============================================================================
