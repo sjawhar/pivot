@@ -142,14 +142,20 @@ def test_discover_pipeline_py_no_pipeline_variable(tmp_path: pathlib.Path) -> No
     assert discovery.discover_pipeline(project_root=tmp_path) is None
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="red test for Task 18: wrong-variable discovery reports imported Pipeline class instead of wrong_name",
+)
 def test_discover_pipeline_missing_pipeline_variable(tmp_path: pathlib.Path) -> None:
     """A Pipeline assigned to the wrong module variable produces a useful error."""
     (tmp_path / "pipeline.py").write_text(
         "import pathlib\nfrom pivot.compose import Pipeline\n"
-        + "other = Pipeline('wrong', root=pathlib.Path('.'))\n"
+        + "wrong_name = Pipeline('wrong', root=pathlib.Path('.'))\n"
     )
 
-    with pytest.raises(discovery.DiscoveryError, match="does not define a 'pipeline' variable"):
+    with pytest.raises(
+        discovery.DiscoveryError, match="Found Pipeline instance named 'wrong_name'"
+    ):
         discovery.discover_pipeline(project_root=tmp_path)
 
 
@@ -247,6 +253,19 @@ def test_load_pipeline_from_path_logs_errors(
     assert "Pipeline discovery issue" in caplog.text
 
 
+def test_load_pipeline_from_path_skips_runtime_error(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Runtime errors are debug-logged and skipped by best-effort path loading."""
+    path = tmp_path / "pipeline.py"
+    path.write_text("raise RuntimeError('boom')\n")
+
+    with caplog.at_level(logging.DEBUG):
+        assert discovery.load_pipeline_from_path(path) is None
+
+    assert "Failed to load pipeline from" in caplog.text
+
+
 def test_load_pipeline_from_path_unknown_file_type(tmp_path: pathlib.Path) -> None:
     """Returns None for a non-pipeline.py file."""
     path = tmp_path / "other.py"
@@ -267,7 +286,19 @@ def test_glob_all_pipelines_finds_pipeline_py(tmp_path: pathlib.Path) -> None:
     assert discovery.glob_all_pipelines(tmp_path) == [expected]
 
 
-@pytest.mark.parametrize("excluded", [".pivot", ".git", ".venv", "__pycache__", "node_modules"])
+@pytest.mark.parametrize(
+    "excluded",
+    [
+        ".pivot",
+        ".git",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "site-packages",
+        "dist-packages",
+        ".eggs",
+    ],
+)
 def test_glob_all_pipelines_skips_excluded_dirs(tmp_path: pathlib.Path, excluded: str) -> None:
     """Does not scan generated, VCS, dependency or pivot state directories."""
     _helper_write_pipeline(tmp_path / excluded / "nested")

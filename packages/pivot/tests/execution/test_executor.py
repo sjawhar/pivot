@@ -366,15 +366,16 @@ def test_directory_dependency_hashed_and_runs(
 def test_parallel_false_runs_sequentially(
     test_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """parallel=False serializes independent stages."""
-    _prepare(test_pipeline, monkeypatch)
-    helpers.register_test_stage(_sleep_a, name="a")
-    helpers.register_test_stage(_sleep_b, name="b")
+    """parallel=False has non-overlapping stage timing, not merely a long wall clock."""
+    root = _prepare(test_pipeline, monkeypatch)
+    helpers.register_test_stage(_resource_a, name="a")
+    helpers.register_test_stage(_resource_b, name="b")
 
-    start = time.monotonic()
     executor.run(pipeline=test_pipeline, parallel=False)
 
-    assert time.monotonic() - start >= 0.7
+    intervals = _timing_intervals(root)
+    assert not _overlap(intervals["a"], intervals["b"]), intervals
+    assert intervals["a"][1] <= intervals["b"][0] or intervals["b"][1] <= intervals["a"][0]
 
 
 def test_executor_saves_outputs_to_cache_and_lock(
@@ -418,6 +419,40 @@ def test_force_runs_unchanged_stage(
     executor.run(pipeline=test_pipeline)
 
     assert executor.run(pipeline=test_pipeline, force=True)["test/stage"]["status"] == "ran"
+
+
+def test_force_with_specific_stage(
+    test_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forcing a target includes its handle dependencies but excludes unrelated stages."""
+    root = _prepare(test_pipeline, monkeypatch)
+    (root / "input.txt").write_text("data")
+    step1 = helpers.register_test_stage(_upper, name="step1", deps={"data": "input.txt"})
+    helpers.register_test_stage(_downstream, name="step2", deps={"value": step1})
+    helpers.register_test_stage(_independent_a, name="other")
+
+    executor.run(pipeline=test_pipeline)
+    results = executor.run(stages=["test/step2"], force=True, pipeline=test_pipeline)
+
+    assert results["test/step1"]["status"] == "ran"
+    assert results["test/step2"]["status"] == "ran"
+    assert "test/other" not in results
+
+
+def test_force_with_single_stage(test_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch) -> None:
+    """single_stage force executes only the selected stage with existing upstream output."""
+    root = _prepare(test_pipeline, monkeypatch)
+    (root / "input.txt").write_text("data")
+    step1 = helpers.register_test_stage(_upper, name="step1", deps={"data": "input.txt"})
+    helpers.register_test_stage(_downstream, name="step2", deps={"value": step1})
+
+    executor.run(pipeline=test_pipeline)
+    results = executor.run(
+        stages=["test/step2"], single_stage=True, force=True, pipeline=test_pipeline
+    )
+
+    assert "test/step1" not in results
+    assert results["test/step2"]["status"] == "ran"
 
 
 def test_ensure_cleanup_registered_registers_atexit(mocker: MockerFixture) -> None:
