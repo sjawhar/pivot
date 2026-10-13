@@ -161,10 +161,6 @@ class StageRegistry:
         self._stages = dict(snapshot)
         self._cached_dag = None
 
-    def get_all_output_paths(self) -> set[str]:
-        """Get all registered output paths (for watch mode filtering)."""
-        return set[str]()
-
 
 @runtime_checkable
 class PipelineLike(Protocol):
