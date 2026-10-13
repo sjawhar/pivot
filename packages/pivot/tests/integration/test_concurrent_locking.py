@@ -35,15 +35,24 @@ import time
 from pivot.compose import Pipeline, stage
 
 
+def record(label: str) -> None:
+    with pathlib.Path("timing.log").open("a") as timing:
+        timing.write(f"{label} {time.monotonic()}\\n")
+
+
 @stage
 def stage_a() -> str:
+    record("a_start")
     time.sleep(float(os.environ.get("STAGE_A_SLEEP", "2")))
+    record("a_end")
     return "hello from a"
 
 
 @stage
 def stage_b() -> str:
+    record("b_start")
     time.sleep(float(os.environ.get("STAGE_B_SLEEP", "2")))
+    record("b_end")
     return "hello from b"
 
 
@@ -130,11 +139,14 @@ def _helper_run_pivot(
     tmp_path: pathlib.Path,
     stage: str,
     env: Mapping[str, str] | None = None,
+    *,
+    resolve_deps: bool = False,
 ) -> subprocess.Popen[bytes]:
-    """Start ``pivot run`` for a stage identity as a background process."""
+    """Start an isolated `run` or dependency-resolving `repro` stage command."""
     qualified_stage = stage if "/" in stage else f"test/{stage}"
+    command = "repro" if resolve_deps else "run"
     return subprocess.Popen(
-        [_PIVOT_BIN, "run", qualified_stage, "--force"],
+        [_PIVOT_BIN, command, qualified_stage, "--force"],
         cwd=tmp_path,
         env=env or os.environ.copy(),
         stdout=subprocess.PIPE,
@@ -157,7 +169,6 @@ def test_disjoint_runs_proceed_in_parallel(tmp_path: pathlib.Path) -> None:
     _helper_setup_project(tmp_path, _PIPELINE_DISJOINT)
     env = _helper_make_env(STAGE_A_SLEEP=str(sleep_seconds), STAGE_B_SLEEP=str(sleep_seconds))
 
-    start = time.monotonic()
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
     proc_b = _helper_run_pivot(tmp_path, "stage_b", env=env)
     try:
@@ -168,7 +179,6 @@ def test_disjoint_runs_proceed_in_parallel(tmp_path: pathlib.Path) -> None:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-    elapsed = time.monotonic() - start
 
     assert proc_a.returncode == 0, (
         f"stage_a failed:\nstdout={stdout_a.decode()}\nstderr={stderr_a.decode()}"
@@ -179,10 +189,13 @@ def test_disjoint_runs_proceed_in_parallel(tmp_path: pathlib.Path) -> None:
     assert _helper_output(tmp_path, "stage_a").read_text() == "hello from a"
     assert _helper_output(tmp_path, "stage_b").read_text() == "hello from b"
 
-    max_serial_time = sleep_seconds * 2 + 2
-    assert elapsed < max_serial_time, (
-        f"Wall time {elapsed:.1f}s >= {max_serial_time}s — stages may not have run in parallel"
-    )
+    events = {
+        label: float(timestamp)
+        for label, timestamp in (
+            line.split() for line in (tmp_path / "timing.log").read_text().splitlines()
+        )
+    }
+    assert events["a_start"] < events["b_end"] and events["b_start"] < events["a_end"], events
 
 
 def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
@@ -192,7 +205,7 @@ def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
     time.sleep(0.5)
-    proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env)
+    proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env, resolve_deps=True)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)
         stdout_c, stderr_c = proc_c.communicate(timeout=30)
