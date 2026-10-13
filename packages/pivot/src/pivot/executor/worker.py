@@ -265,7 +265,7 @@ def execute_stage(
                             current_params=current_params,
                             lock_data=lock_data,
                             state_db=state_db,
-                            verify_files=True,
+                            store=store,
                         ):
                             out_specs = _get_output_specs(stage_info)
                             deps_list = _deps_list_for_input_hash(
@@ -274,11 +274,12 @@ def execute_stage(
                             input_hash = run_history.compute_input_hash(
                                 current_fingerprint, current_params, deps_list, out_specs
                             )
-                            restored = _outputs_exist_with_store(
+                            restored = restore_outputs_to_hashes(
                                 store,
                                 stage_outs,
-                                lock_data,
-                                stage_info["state_dir"],
+                                lock_data["output_hashes"],
+                                state_db,
+                                state_dir=stage_info["state_dir"],
                             )
                             if restored:
                                 return _make_result(
@@ -325,11 +326,12 @@ def execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
-                        restored = _outputs_exist_with_store(
+                        restored = restore_outputs_to_hashes(
                             store,
                             stage_outs,
-                            lock_data,
-                            stage_info["state_dir"],
+                            lock_data["output_hashes"],
+                            state_db,
+                            state_dir=stage_info["state_dir"],
                         )
                         if restored:
                             return _make_result(
@@ -348,6 +350,7 @@ def execute_stage(
                             stage_outs,
                             store,
                             state_db,
+                            state_dir=stage_info["state_dir"],
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -477,24 +480,33 @@ def _to_identity_keyed_hashes(
     return {types.identity_key(identity): info for identity, info in hashes.items()}
 
 
-def _outputs_exist_with_store(
+def restore_outputs_to_hashes(
     store: store_mod.Store,
     outs: list[types.ArtifactRef],
-    lock_data: LockData | None = None,
+    output_hashes: dict[types.ArtifactIdentity, HashInfo],
+    state_db: state.StateDB | None,
+    *,
     state_dir: pathlib.Path | None = None,
+    restore: bool = True,
 ) -> bool:
+    """Verify outputs match recorded hashes and restore cacheable mismatches."""
     if not isinstance(store, store_mod.WorkspaceStore):
         return all(store.exists(ref) for ref in outs)
 
     for ref in outs:
-        if store.exists(ref):
+        expected_hash = output_hashes.get(ref.identity)
+        if expected_hash is None:
+            return False
+        output_path = store.resolve_display_path(ref)
+        try:
+            actual_hash = hash_output(output_path, state_db)
+        except OSError:
+            actual_hash = None
+        if actual_hash == expected_hash:
             continue
-        if lock_data is None:
+        if not store.cache_contains(ref, expected_hash):
             return False
-        hash_info = lock_data["output_hashes"].get(ref.identity)
-        if hash_info is None:
-            return False
-        if not store.restore_from_cache(ref, hash_info, state_dir=state_dir):
+        if restore and not store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
             return False
     return True
 
@@ -919,17 +931,7 @@ def _run_stage_function_with_store(
         for ref, value in output_values.items():
             output_paths[ref] = _write_output_with_store(ref, value, store)
 
-        for name, value in kwargs.items():
-            if isinstance(value, TrackedDict):
-                accessed[name] = set(value.accessed_keys)
-            elif isinstance(value, (list, tuple)):
-                # Cast needed: isinstance narrows Any to list[Unknown] | tuple[Unknown, ...]
-                items = cast("list[object] | tuple[object, ...]", value)
-                for item in items:
-                    if isinstance(item, TrackedDict):
-                        accessed.setdefault(name, set()).update(item.accessed_keys)
-
-        return output_paths, accessed
+        return output_paths
 
 
 def _hash_output_paths(
@@ -1123,12 +1125,7 @@ def hash_dependencies(
     store: store_mod.Store | None = None,
     state_db: state.StateDB | None = None,
 ) -> tuple[dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]]:
-    """Hash all dependency files and directories.
-
-    Returns (hashes, missing_files, unreadable_files).
-    For directories, includes full manifest with file hashes/sizes for provenance.
-    Paths are normalized (symlinks preserved) for portability in lock files.
-    """
+    """Hash all dependencies and collect file-hash cache write-backs."""
     _t = metrics.start()
     hashes = dict[str, HashInfo]()
     missing = list[str]()
@@ -1140,17 +1137,17 @@ def hash_dependencies(
         for ref in deps.values():
             key = types.identity_key(ref.identity)
             try:
-                hash_info = store.hash_artifact(ref)
+                hash_info = store.hash_artifact(ref, state_db)
                 hashes[key] = hash_info
                 if not is_dir_hash(hash_info) and isinstance(store, store_mod.WorkspaceStore):
                     path = store.checkout(ref)
-                    stat = path.stat()
+                    fs_stat = path.stat()
                     file_hash_entries.append(
                         (
                             str(path),
-                            stat.st_mtime_ns,
-                            stat.st_size,
-                            stat.st_ino,
+                            fs_stat.st_mtime_ns,
+                            fs_stat.st_size,
+                            fs_stat.st_ino,
                             hash_info["hash"],
                         )
                     )
@@ -1167,14 +1164,14 @@ def hash_dependencies(
                     tree_hash, manifest = cache.hash_directory(path, state_db)
                     hashes[dep] = DirHash(hash=tree_hash, manifest=manifest)
                 else:
-                    file_hash, file_stat = cache.hash_file(path, state_db)
+                    file_hash, fs_stat = cache.hash_file(path, state_db)
                     hashes[dep] = FileHash(hash=file_hash)
                     file_hash_entries.append(
                         (
                             str(normalized_path),
-                            file_stat.st_mtime_ns,
-                            file_stat.st_size,
-                            file_stat.st_ino,
+                            fs_stat.st_mtime_ns,
+                            fs_stat.st_size,
+                            fs_stat.st_ino,
                             file_hash,
                         )
                     )
