@@ -193,7 +193,7 @@ with Pipeline("report") as pipeline:
     count(kept)
 ```
 
-From `report/`, `pivot repro` runs `prep/drop_low` then `report/count`. From the project root, `pivot repro --all` runs every `pipeline.py` under it. To make one root pipeline, call `include()` after the `with` blocks have closed (inside a `with` block it is discarded):
+From `report/`, `pivot repro` runs `prep/drop_low` then `report/count`. From the project root, `pivot repro --all` runs every `pipeline.py` under it. To make one root pipeline, `include()` the others (inside the `with` block or after it):
 
 ```python
 # pipeline.py
@@ -242,7 +242,6 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock fil
 | `must have a return type annotation` | Annotate the return; `-> None` stages have no outputs |
 | `Invalid stage name: '...@big one'` | Variant names: letters, digits, `_ . -` |
 | `could not determine a constructor for the tag` | Convert numpy scalars with `float()`/`int()` before returning |
-| `No stages registered.` after `include()` | Call `include()` outside any `with` block |
 
 ## Checklist
 

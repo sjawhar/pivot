@@ -7,17 +7,17 @@ Complete reference for all Pivot command-line commands.
 | Task | Command |
 |------|---------|
 | Run pipeline | `pivot repro` |
-| Run specific stages + deps | `pivot repro stage1 stage2` |
-| Run single stage (no deps) | `pivot run stage` |
+| Run specific stages + deps | `pivot repro pipeline/stage1 pipeline/stage2` |
+| Run single stage (no deps) | `pivot run pipeline/stage` |
 | Run with live output | `pivot repro --show-output` |
 | See what would run | `pivot repro -n` |
 | Understand why stage runs | `pivot status --explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
 | Visualize DAG | `pivot dag` |
-| Compare data files | `pivot diff output.csv` |
+| Compare data files | `pivot diff data/demo/clean.jsonl` |
 | Verify reproducibility | `pivot verify` |
-| Import from remote repo | `pivot import REPO_URL PATH` |
+| Import from remote repo | `pivot import REPO_URL ARTIFACT --out PATH` |
 | Update imported artifacts | `pivot update` |
 | Push outputs to remote | `pivot push` |
 | Fetch to local cache | `pivot fetch` |
@@ -61,7 +61,7 @@ pivot repro [STAGES...] [OPTIONS]
 
 **Arguments:**
 
-- `STAGES` - Stage names to run (optional, runs all if not specified)
+- `STAGES` - Stage names (`pipeline/stage`) or output identities to run (optional, runs all if not specified)
 
 **Options:**
 
@@ -83,7 +83,7 @@ pivot repro [STAGES...] [OPTIONS]
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
 | `--allow-missing` | Allow missing dep files if tracked (only affects --dry-run) |
-| `--all` | Run all stages (ignore target filtering) |
+| `--all` | Run across all pipelines in the project |
 
 **Examples:**
 
@@ -92,7 +92,7 @@ pivot repro [STAGES...] [OPTIONS]
 pivot repro
 
 # Run specific stages and their dependencies
-pivot repro train evaluate
+pivot repro demo/train demo/evaluate
 
 # See what would run
 pivot repro --dry-run
@@ -116,7 +116,7 @@ pivot run STAGES... [OPTIONS]
 
 **Arguments:**
 
-- `STAGES` - Stage names to run (required, at least one)
+- `STAGES` - Stage names to run (required, at least one), qualified by pipeline (`demo/train`)
 
 **Options:**
 
@@ -132,18 +132,19 @@ pivot run STAGES... [OPTIONS]
 | `--keep-going` / `-k` | Continue running stages after failures |
 | `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
+| `--all` | Run across all pipelines in the project |
 
 **Examples:**
 
 ```bash
 # Run a single stage (no dependencies)
-pivot run train
+pivot run demo/train
 
 # Run multiple stages in order
-pivot run preprocess train
+pivot run demo/preprocess demo/train
 
 # Stop immediately on failure
-pivot run preprocess train --fail-fast
+pivot run demo/preprocess demo/train --fail-fast
 ```
 
 ---
@@ -164,7 +165,7 @@ pivot list [OPTIONS]
 |--------|-------------|
 | `--json` | Output as JSON |
 | `--deps` | Show stage dependencies |
-| `--all` | List all stages (ignore target filtering) |
+| `--all` | List stages across all pipelines in the project |
 
 ---
 
@@ -192,7 +193,7 @@ pivot status [STAGES...] [OPTIONS]
 | `--remote-only` | Show only remote status |
 | `--remote` / `-r` | Include remote sync status |
 | `--check-imports` | Check for import updates (requires network) |
-| `--all` | Show all stages (ignore target filtering) |
+| `--all` | Show status across all pipelines in the project |
 
 ---
 
@@ -210,7 +211,7 @@ Without arguments, commits all stale stages. With stage names, unconditionally c
 
 | Option | Description |
 |--------|-------------|
-| `--all` | Commit all stages |
+| `--all` | Commit across all pipelines in the project |
 
 ---
 
@@ -251,22 +252,6 @@ pivot show [RUN_ID] [OPTIONS]
 
 ---
 
-### `pivot export`
-
-Export pipeline to DVC YAML format.
-
-```bash
-pivot export [STAGES...] [OPTIONS]
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--output` / `-o PATH` | Output path (default: `dvc.yaml`) |
-
----
-
 ### `pivot dag`
 
 Visualize the pipeline DAG.
@@ -289,7 +274,7 @@ Shows the dependency graph of artifacts (default) or stages. Without targets, sh
 | `--mermaid` | Output Mermaid format |
 | `--md` | Output Mermaid wrapped in markdown |
 | `--stages` | Show stages as nodes (default: artifacts) |
-| `--all` | Show all stages (ignore target filtering) |
+| `--all` | Show the DAG across all pipelines in the project |
 
 **Examples:**
 
@@ -298,7 +283,7 @@ Shows the dependency graph of artifacts (default) or stages. Without targets, sh
 pivot dag
 
 # Show DAG for specific stage and its dependencies
-pivot dag train
+pivot dag demo/train
 
 # Output as Mermaid diagram
 pivot dag --mermaid
@@ -346,7 +331,7 @@ Checks that all stages are cached (code, params, deps match lock files) and outp
 pivot verify
 
 # Verify specific stages
-pivot verify train evaluate
+pivot verify demo/train demo/evaluate
 
 # CI gate: allow missing local files if on remote
 pivot verify --allow-missing
@@ -429,13 +414,13 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 
 ```bash
 # Get file from specific commit
-pivot get model.pkl --rev abc123
+pivot get data/demo/train.jsonl --rev abc123
 
 # Get stage output from branch
-pivot get train --rev feature-branch
+pivot get demo/train --rev feature-branch
 
 # Get with custom output path
-pivot get model.pkl --rev v1.0 --output old_model.pkl
+pivot get data/demo/train.jsonl --rev v1.0 --output old_train.jsonl
 ```
 
 ---
@@ -586,13 +571,13 @@ pivot diff TARGETS... [OPTIONS]
 
 ```bash
 # Interactive TUI mode
-pivot diff output.csv
+pivot diff data/demo/clean.jsonl
 
 # Key-based row matching
-pivot diff output.csv --key id,timestamp
+pivot diff data/demo/clean.jsonl --key id,timestamp
 
 # JSON output for scripting
-pivot diff output.csv --json
+pivot diff data/demo/clean.jsonl --json
 ```
 
 ---
@@ -912,29 +897,6 @@ pivot init [OPTIONS]
 
 ---
 
-### `pivot import-dvc`
-
-Import DVC pipeline and convert to Pivot format.
-
-```bash
-pivot import-dvc [OPTIONS]
-```
-
-Reads `dvc.yaml` (and optionally `dvc.lock`, `params.yaml`) and generates `pivot.yaml` with migration notes for manual review.
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--input` / `-i PATH` | Path to dvc.yaml (default: auto-detect) |
-| `--output` / `-o PATH` | Output path for pivot.yaml (default: pivot.yaml) |
-| `--params` / `-p PATH` | Path to params.yaml (default: auto-detect) |
-| `--notes` / `-n PATH` | Path for migration notes (default: .pivot/migration-notes.md) |
-| `--force` / `-f` | Overwrite existing files |
-| `--dry-run` | Show what would be generated without writing files |
-
----
-
 ## Utilities
 
 ### `pivot doctor`
@@ -978,22 +940,6 @@ eval "$(pivot completion zsh)"
 # Fish (~/.config/fish/config.fish)
 pivot completion fish | source
 ```
-
----
-
-### `pivot schema`
-
-Output JSON Schema for pivot.yaml configuration.
-
-```bash
-pivot schema [OPTIONS]
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--indent N` | JSON indentation (0 for compact) |
 
 ---
 

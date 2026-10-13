@@ -21,18 +21,18 @@ For pushing/pulling cached outputs to S3:
 uv add "pivot[s3]"
 ```
 
-### DVC Integration
+### Matplotlib Plots
 
-For `pivot export` to generate DVC-compatible YAML:
+For stages that return figures tagged `plot`:
 
 ```bash
-uv add "pivot[dvc]"
+uv add "pivot[matplotlib]"
 ```
 
 ### All Optional Dependencies
 
 ```bash
-uv add "pivot[s3,dvc]"
+uv add "pivot[s3,matplotlib]"
 ```
 
 ## Development Installation

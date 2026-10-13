@@ -18,7 +18,7 @@ How Pivot compares to other pipeline and workflow tools.
 | Per-stage locks | Parallel-safe writes | Single dvc.lock | N/A | N/A |
 | Remote storage | S3 | S3, GCS, Azure, SSH | Cloud-native | Cloud-native |
 | **Configuration** | | | | |
-| Pure Python | YAML + typed classes | YAML + scripts | Decorators | Decorators |
+| Pure Python | `@stage` functions + `Pipeline` | YAML + scripts | Decorators | Decorators |
 | Type-safe parameters | Pydantic models | No | Pydantic | Yes |
 | **Ecosystem** | | | | |
 | Web UI | Planned | DVC Studio | Built-in | Built-in |
@@ -29,7 +29,7 @@ How Pivot compares to other pipeline and workflow tools.
 ### Use Pivot When
 
 - You need fast local iteration with automatic code change detection
-- Your pipeline is Python-native and you want type-annotation-based configuration
+- Your pipeline is Python-native and you want stages to be plain typed functions
 - You're frustrated by DVC's lock file performance or manual dependency declarations
 - You want watch mode (`pivot repro --watch`) for rapid development cycles
 
@@ -57,11 +57,13 @@ Most tools hash command strings or explicit inputs. Pivot parses your Python fun
 def helper(x):
     return x * 2  # Change this...
 
-def process():
-    return helper(load())  # ...Pivot detects it!
+
+@stage
+def process(raw: pd.DataFrame) -> pd.DataFrame:
+    return helper(raw)  # ...Pivot re-runs process
 ```
 
-DVC would require manually updating `dvc.yaml` to track this change.
+DVC would require listing the helper's source file under `deps:` in `dvc.yaml`.
 
 ### Per-Stage Lock Files
 
@@ -72,7 +74,7 @@ DVC writes a single `dvc.lock` file for all stages. With many stages, this creat
 dvc.lock
 
 # Pivot: Each stage writes its own file
-.pivot/stages/
+.pivot/stages/<pipeline>/
 ├── preprocess.lock
 ├── train.lock
 └── evaluate.lock
@@ -96,14 +98,4 @@ Edit code, save, see results immediately.
 
 ## Migration from DVC
 
-Pivot can export to DVC format for gradual adoption:
-
-```bash
-# Generate dvc.yaml from Pivot stages
-pivot export > dvc.yaml
-
-# Team members without Pivot can still use DVC
-dvc repro
-```
-
-See [Migrating from DVC](migrating-from-dvc.md) for details.
+Pivot does not read or write `dvc.yaml`. Porting a DVC pipeline means rewriting each stage as a `@stage` function; see [Migrating from DVC](migrating-from-dvc.md).

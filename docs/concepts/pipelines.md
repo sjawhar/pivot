@@ -116,8 +116,8 @@ example.
 ### `include()`
 
 `include()` copies every stage of another pipeline into this one, which is how
-you make one root pipeline from several. Call it after the other pipelines'
-`with` blocks have closed; calls inside a `with` block are discarded:
+you make one root pipeline from several. It can be called inside the `with`
+block or after it:
 
 ```python
 # pipeline.py
