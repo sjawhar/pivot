@@ -101,9 +101,7 @@ def test_lock_read_treats_arbitrary_bytes_as_missing_or_valid(content: bytes) ->
 @pytest.mark.xfail(
     strict=True,
     raises=TypeError,
-    reason="red test for coordinator routing (lock schema v2, #452): "
-    + "StageLock.read raises TypeError on a non-string producer/key instead of treating "
-    + "the lock as missing",
+    reason="red test for Task 27: lock read must treat malformed identity fields as missing",
 )
 @pytest.mark.parametrize(
     "document",
@@ -133,6 +131,29 @@ def test_lock_read_treats_wrongly_typed_identity_fields_as_missing(
 ) -> None:
     stage_lock = lock.StageLock("p/stage", tmp_path)
     stage_lock.path.parent.mkdir(parents=True)
+    stage_lock.path.write_text(yaml.safe_dump(document))
+    assert stage_lock.read() is None
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="red test for Task 27: is_lock_data must reject non-mapping params/code_manifest "
+    + "so status and repro agree the stage is stale",
+)
+@pytest.mark.parametrize(
+    ("code_manifest", "params"),
+    [
+        pytest.param({}, [], id="params-list"),
+        pytest.param({}, 3, id="params-int"),
+        pytest.param(["self:x"], {}, id="code-manifest-list"),
+    ],
+)
+def test_lock_read_treats_non_mapping_manifest_or_params_as_missing(
+    code_manifest: object, params: object, tmp_path: pathlib.Path
+) -> None:
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    document = {"code_manifest": code_manifest, "params": params, "deps": [], "outs": []}
     stage_lock.path.write_text(yaml.safe_dump(document))
     assert stage_lock.read() is None
 
