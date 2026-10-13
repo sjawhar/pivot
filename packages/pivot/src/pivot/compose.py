@@ -10,6 +10,7 @@ import functools
 import importlib
 import inspect
 import logging
+import os
 import types as _stdlib_types
 import typing
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
@@ -257,6 +258,7 @@ class Pipeline:
     _root: pathlib.Path
     _stages: list[_StageNode]
     _inputs: dict[str, _InputNode]
+    _input_names_by_path: dict[str, str]
     _call_counts: dict[tuple[str, tuple[str, ...]], int]
     _validation_errors: list[str]
     _token: contextvars.Token[Pipeline | None] | None
@@ -273,6 +275,7 @@ class Pipeline:
         self._name = name
         self._stages = []
         self._inputs = {}
+        self._input_names_by_path = dict[str, str]()
         self._call_counts = {}
         self._validation_errors = []
         self._token = None
@@ -363,12 +366,14 @@ class Pipeline:
                         + f"'{existing_path}' and '{path}' in different pipelines."
                     )
             else:
-                self._inputs[name] = _InputNode(
-                    name=name,
-                    python_type=None,
-                    path=path,
-                    format=_get_loaders().PathOnly(),
-                    inherited=True,
+                self._add_input(
+                    _InputNode(
+                        name=name,
+                        python_type=None,
+                        path=path,
+                        format=_get_loaders().PathOnly(),
+                        inherited=True,
+                    )
                 )
         self._registry.invalidate_dag_cache()
 
@@ -492,13 +497,31 @@ class Pipeline:
                 python_type=existing.python_type or object,
             )
         node = _InputNode(name=name, python_type=t, path=path, format=format)
-        self._inputs[name] = node
+        self._add_input(node)
         return ArtifactHandle(
             pipeline=self,
             source=node,
             output_key=None,
             python_type=t or object,
         )
+
+    def _add_input(self, node: _InputNode) -> None:
+        """Bind a new input name, refusing a second name for a file another input reads.
+
+        The workspace store maps each input identity to its path, so two names on one
+        file would collide there mid-run; this rejects them while the pipeline is defined.
+        """
+        path_key = os.path.normpath(self._root / node.path)
+        other = self._input_names_by_path.get(path_key)
+        if other is not None:
+            other_path = self._inputs[other].path
+            spelled = "" if other_path == node.path else f" (as '{node.path}')"
+            raise exceptions.PipelineConfigError(
+                f"Input binding conflict: inputs '{other}' and '{node.name}' are both bound to "
+                + f"'{other_path}'{spelled}. Use one input name per file."
+            )
+        self._inputs[node.name] = node
+        self._input_names_by_path[path_key] = node.name
 
     @contextlib.contextmanager
     def variant(self, name: str) -> collections.abc.Generator[None]:
@@ -751,12 +774,14 @@ class Pipeline:
                     + f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
                 )
             if name not in self._inputs:
-                self._inputs[name] = _InputNode(
-                    name=name,
-                    python_type=None,
-                    path=path,
-                    format=_get_loaders().PathOnly(),
-                    inherited=True,
+                self._add_input(
+                    _InputNode(
+                        name=name,
+                        python_type=None,
+                        path=path,
+                        format=_get_loaders().PathOnly(),
+                        inherited=True,
+                    )
                 )
 
 

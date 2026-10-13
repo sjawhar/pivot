@@ -301,6 +301,41 @@ def test_repro_refuses_two_outputs_that_map_to_one_path(
     assert not shared_file_written, "Neither stage may run once their paths collide"
 
 
+_ALIASED_INPUT_PIPELINE = """
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def join(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    return pd.concat([left, right])
+
+
+with Pipeline("demo") as pipeline:
+    join(pipeline.input("t.csv"), pipeline.input("alias", path="data/raw/t.csv"))
+"""
+
+
+def test_list_refuses_two_input_names_bound_to_one_path(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Two input names on one file fail at load with a binding conflict, not mid-repro."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "t.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(_ALIASED_INPUT_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    assert (
+        "Input binding conflict: inputs 't.csv' and 'alias' are both bound to 'data/raw/t.csv'"
+        in result.output
+    ), result.output
+    assert "ExceptionGroup" not in result.output, result.output
+
+
 # =============================================================================
 # Explain Mode Tests
 # =============================================================================
