@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import click
 
-from pivot import config, outputs, project
+from pivot import config, project
 from pivot.cli import _run_common
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
 from pivot.show import metrics as metrics_mod
-from pivot.types import OutputFormat
+from pivot.types import ArtifactTag, OutputFormat
 
 
 @click.group()
@@ -51,7 +51,7 @@ def metrics_show(
     proj_root = project.get_project_root()
     _run_common.ensure_stages_registered(all_pipelines=all_pipelines)
 
-    paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
+    paths = cli_targets.resolve_and_validate(targets, proj_root, ArtifactTag.METRIC)
     if paths is not None:
         all_metrics = metrics_mod.collect_metrics_from_files(list(paths), recursive)
     else:
@@ -99,7 +99,7 @@ def metrics_diff(
     proj_root = project.get_project_root()
     _run_common.ensure_stages_registered(all_pipelines=all_pipelines)
 
-    paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Metric)
+    paths = cli_targets.resolve_and_validate(targets, proj_root, ArtifactTag.METRIC)
     if paths is not None:
         head_info = metrics_mod.get_metric_info_from_head()
         head_info = {k: v for k, v in head_info.items() if k in paths}

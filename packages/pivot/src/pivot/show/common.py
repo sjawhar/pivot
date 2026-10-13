@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import tabulate
 import yaml
 
-from pivot import git, yaml_config
+from pivot import git, project, types, yaml_config
 from pivot.storage import lock
 from pivot.types import ChangeType, OutputFormat, StorageLockData
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+    from pivot.storage.store import WorkspaceStore
 
 logger = logging.getLogger(__name__)
 
@@ -57,37 +59,34 @@ def read_lock_files_from_head(
     return _parse_lock_contents(stage_names, lock_contents)
 
 
-def read_lock_files_from_revision(
-    stage_names: Sequence[str],
-    rev: str,
-) -> dict[str, StorageLockData | None]:
-    """Batch read and parse lock files from a specific git revision."""
-    if not stage_names:
-        return {}
-    lock_paths = [f"{lock.STAGES_REL_PATH}/{name}.lock" for name in stage_names]
-    lock_contents = git.read_files_from_revision(lock_paths, rev)
-    return _parse_lock_contents(stage_names, lock_contents)
-
-
 def extract_output_hashes_from_lock(
     lock_data: StorageLockData,
+    stage_name: str,
+) -> dict[str, str]:
+    """Map each output recorded in a stage's lock data to its hash, keyed by identity key."""
+    return {
+        types.identity_key(types.ArtifactIdentity(stage_name, out["key"])): out["hash"]
+        for out in lock_data["outs"]
+    }
+
+
+def output_hashes_from_head(
+    outs_by_stage: Mapping[str, Sequence[types.ArtifactRef]],
+    store: WorkspaceStore,
 ) -> dict[str, str | None]:
-    """Extract path -> hash mapping from lock data 'outs' field."""
+    """Map each output's workspace path (relative to the project root) to its hash at git HEAD.
+
+    An output maps to None when its stage has no lock file at HEAD or the lock does not record it.
+    """
+    proj_root = project.get_project_root()
+    lock_data_map = read_lock_files_from_head(list(outs_by_stage))
     result = dict[str, str | None]()
-    for out in lock_data["outs"]:
-        key = out["key"]
-        if isinstance(key, str):
-            result[key] = out["hash"]
-            continue
-        raw = cast("dict[str, object]", cast("object", out))
-        path_value = raw.get("path")
-        if isinstance(path_value, str):
-            result[path_value] = out["hash"]
-            continue
-        display = out["display"] if "display" in out else None
-        if display is None:
-            display = "unknown"
-        result[display] = out["hash"]
+    for stage_name, outs in outs_by_stage.items():
+        lock_data = lock_data_map[stage_name]
+        hashes = {} if lock_data is None else extract_output_hashes_from_lock(lock_data, stage_name)
+        for out in outs:
+            rel_path = project.to_relative_path(store.resolve_display_path(out), proj_root)
+            result[rel_path] = hashes.get(types.identity_key(out.identity))
     return result
 
 
