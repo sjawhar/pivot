@@ -10,6 +10,8 @@ Three-tier algorithm for deciding whether to skip stage execution:
 2. **O(n) lock file comparison** - Compare fingerprint + params + dependency hashes
 3. **Run cache lookup** - Check if input hash matches a cached run
 
+For status and explain, a stage is stale when repro will rewrite its lock by running it or restoring it from the run cache; it is cached when its lock already matches the pipeline and repro can at most restore outputs.
+
 ## dep_generations: StateDB Only
 
 Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not in lock files. Workers compute them via `compute_dep_generation_map()` and return them in `DeferredWrites`. The coordinator applies them via `apply_deferred_writes()`. Old lock files that may have contained `dep_generations` are handled gracefully (field ignored on read).
