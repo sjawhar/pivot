@@ -35,6 +35,11 @@ class CapturedMode(enum.Enum):
     DEFAULT = "default"
 
 
+class CallableConfig:
+    def __call__(self) -> int:
+        return 7
+
+
 MUTABLE_DICT = {"a": 1}
 MUTABLE_LIST = [1, 2]
 MUTABLE_SET = {1, 2}
@@ -46,6 +51,7 @@ IMMUTABLE_TUPLE = (1, 2)
 IMMUTABLE_FROZENSET = frozenset({1, 2})
 PRIMITIVE_INT = 42
 ENUM_MEMBER = CapturedMode.DEFAULT
+CALLABLE_INSTANCE = CallableConfig()
 
 
 def _callable_helper() -> int:
@@ -100,6 +106,10 @@ def _stage_uses_enum_member() -> str:
     return ENUM_MEMBER.value
 
 
+def _stage_uses_callable_instance() -> int:
+    return CALLABLE_INSTANCE()
+
+
 def _stage_uses_three_non_scalar_values() -> int:
     return len(IMMUTABLE_TUPLE) + len(IMMUTABLE_FROZENSET) + FROZEN_DATACLASS.value
 
@@ -152,6 +162,12 @@ def _stage_uses_three_non_scalar_values() -> int:
         pytest.param(_stage_uses_tuple, "IMMUTABLE_TUPLE", "tuple", id="tuple"),
         pytest.param(_stage_uses_frozenset, "IMMUTABLE_FROZENSET", "frozenset", id="frozenset"),
         pytest.param(_stage_uses_enum_member, "ENUM_MEMBER", "CapturedMode", id="enum-member"),
+        pytest.param(
+            _stage_uses_callable_instance,
+            "CALLABLE_INSTANCE",
+            "CallableConfig",
+            id="callable-instance",
+        ),
     ],
 )
 def test_non_scalar_closure_capture_raises(

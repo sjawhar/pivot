@@ -104,6 +104,14 @@ def process():
 
 Uses `inspect.getclosurevars()` + AST extraction with recursive fingerprinting for transitive dependencies.
 
+#### Module-level values
+
+Pivot tracks module-level `bool`, `int`, `float`, `str`, `bytes`, and `None` values used by
+a stage. Any other module-level value—such as a tuple, collection, enum member, frozen model,
+or instance—raises `StageDefinitionError`; put configuration in `StageParams` instead. Set
+`core.unsafe_fingerprinting=true` or `PIVOT_UNSAFE_FINGERPRINTING=1` only to downgrade that
+error to a warning.
+
 ### Explain Mode
 
 See *why* a stage would run:

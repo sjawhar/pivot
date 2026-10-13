@@ -28,7 +28,8 @@ Pivot's fingerprinting system:
 | Class definitions | Yes | Full class AST hashed |
 | StageParams subclasses | Yes | Type hint analysis + full class AST + Pydantic field defaults + `default_factory` functions |
 | Custom loaders | Yes | Loader class AST hashed via type hint analysis |
-| Global constants | Yes (value) | `getclosurevars()` + `repr()` |
+| Module-level primitive values | Yes (value) | `getclosurevars()` + `repr()` |
+| Other module-level values | No — error | Use `StageParams` instead |
 | Closure variables | Yes (structure) | `getclosurevars()` captures binding |
 | Default arguments | Yes | Captured in function signature |
 | `functools.partial` | Yes | Bound args + underlying function |
@@ -139,47 +140,26 @@ result = eval("process(data)")     # String execution
 
 **Workaround:** Not supported; restructure code.
 
-### Runtime-Computed Values
+### Module-Level Values
 
-Global constants (primitives like `int`, `float`, `str`, `bool`, `bytes`, `None`) ARE tracked via `repr()`. However, values computed at runtime or by complex expressions are not:
+Pivot tracks only module-level `bool`, `int`, `float`, `str`, `bytes`, and `None` values. Editing
+one of those values changes the stage fingerprint. Reading any other module-level value—including
+a tuple, frozenset, list, dict, set, enum member, frozen dataclass, frozen Pydantic model, or
+class instance—raises `StageDefinitionError`, because stages must be pure functions.
 
-```python
-# TRACKED - primitive constants captured via repr()
-THRESHOLD = 0.5  # Changing this value IS detected
-DEBUG = True     # Changing this IS detected
-
-# NOT TRACKED - runtime-computed values
-THRESHOLD = float(os.environ.get("THRESHOLD", "0.5"))  # Dynamic
-CONFIG = load_config()  # Function call result
-PATHS = [p for p in Path(".").glob("*.csv")]  # Computed at import
-```
-
-The fingerprinting system uses `getclosurevars()` to capture referenced globals, then stores `repr(value)` for primitives. This works for literal constants but cannot track values that change based on environment or runtime state.
-
-**Workaround:** Use stage parameters for configurable values:
+Put configuration in `StageParams`:
 
 ```python
-# stages.py
-from pivot.stage_def import StageParams
-
-
 class ProcessParams(StageParams):
     threshold: float = 0.5
 
 
 def process(params: ProcessParams):
-    if value > params.threshold:  # Changes tracked!
-        pass
+    return params.threshold
 ```
 
-```yaml
-# pivot.yaml
-stages:
-  process:
-    python: stages.process
-    params:
-      threshold: 0.5
-```
+For an explicitly unsafe migration path, `core.unsafe_fingerprinting=true` or
+`PIVOT_UNSAFE_FINGERPRINTING=1` downgrades the error to a warning.
 
 ## Why AST + getclosurevars?
 
@@ -218,14 +198,14 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 
 | Prefix | Purpose | Example |
 |--------|---------|---------|
-| `self:` | The stage function itself | `self:` |
-| `func:` | Helper functions (user code callables) | `func:process_data` |
-| `class:` | Class definitions | `class:MyModel` |
-| `const:` | Global constants (primitives via `repr()`) | `const:THRESHOLD` |
-| `mod:` | Module attribute access patterns | `mod:utils.helper` |
-| `partial:` | `functools.partial` bound arguments | `partial:0`, `partial:kwarg_name` |
-| `loader:` | Loader class methods and config | `loader:load`, `loader:save`, `loader:config` |
-| `schema:` | Pydantic model JSON schema | `schema:ModelName` |
+| `self:` | The stage function itself | `self:train` |
+| `func:` | Helper functions (user code callables) | `func:myproject.helpers.process_data` |
+| `class:` | Class definitions | `class:myproject.params.TrainParams` |
+| `const:` | Module-level primitive values | `const:myproject.settings.THRESHOLD` |
+| `mod:` | Module attribute access patterns | `mod:myproject.helpers.process_data` |
+| `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
+| `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
+| `schema:` | Pydantic model JSON schema | `schema:myproject.params.TrainParams` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |
 
 ## Comparison with Other Tools

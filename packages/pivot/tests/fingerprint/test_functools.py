@@ -2,8 +2,18 @@
 """Tests for fingerprinting functools.partial and functools.wraps."""
 
 import functools
+import inspect
 
 from pivot import fingerprint
+
+
+def _definition_key(prefix: str, value: object) -> str:
+    return f"{prefix}:{value.__module__}.{value.__qualname__}"  # type: ignore[attr-defined] - test types
+
+
+def _partial_key(name: str, member: str) -> str:
+    return f"partial:{__name__}.{name}.{member}"
+
 
 # --- Test helpers for functools.partial ---
 
@@ -65,11 +75,13 @@ def test_partial_is_detected():
 
     fp = fingerprint.get_stage_fingerprint(stage_with_partial)
 
-    # Should have partial:bound.args and partial:bound.kwargs
-    assert "partial:bound.args" in fp, f"partial args not tracked. Got: {list(fp.keys())}"
-    assert "partial:bound.kwargs" in fp, f"partial kwargs not tracked. Got: {list(fp.keys())}"
-    # Should also track the underlying function
-    assert "func:bound.func" in fp, f"partial underlying func not tracked. Got: {list(fp.keys())}"
+    assert _partial_key("bound", "args") in fp, f"partial args not tracked. Got: {list(fp.keys())}"
+    assert _partial_key("bound", "kwargs") in fp, (
+        f"partial kwargs not tracked. Got: {list(fp.keys())}"
+    )
+    assert _definition_key("func", _helper_func) in fp, (
+        f"partial underlying func not tracked. Got: {list(fp.keys())}"
+    )
 
 
 def test_partial_args_change_triggers_fingerprint_change():
@@ -86,7 +98,7 @@ def test_partial_args_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    assert fp1["partial:bound_v1.args"] != fp2["partial:bound_v2.args"], (
+    assert fp1[_partial_key("bound_v1", "args")] != fp2[_partial_key("bound_v2", "args")], (
         "Different bound args should produce different hashes"
     )
 
@@ -105,7 +117,7 @@ def test_partial_kwargs_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    assert fp1["partial:bound_v1.kwargs"] != fp2["partial:bound_v2.kwargs"], (
+    assert fp1[_partial_key("bound_v1", "kwargs")] != fp2[_partial_key("bound_v2", "kwargs")], (
         "Different bound kwargs should produce different hashes"
     )
 
@@ -124,9 +136,9 @@ def test_partial_underlying_func_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    assert fp1["func:bound_v1.func"] != fp2["func:bound_v2.func"], (
-        "Different underlying functions should produce different hashes"
-    )
+    assert (
+        fp1[_definition_key("func", _helper_func)] != fp2[_definition_key("func", _helper_func_v2)]
+    ), "Different underlying functions should produce different hashes"
 
 
 def test_partial_in_closure():
@@ -144,7 +156,7 @@ def test_partial_in_closure():
     fp = fingerprint.get_stage_fingerprint(stage)
 
     # Should track partial from nonlocals
-    assert "partial:bound.args" in fp, (
+    assert _partial_key("bound", "args") in fp, (
         f"partial args from closure not tracked. Got: {list(fp.keys())}"
     )
 
@@ -164,8 +176,9 @@ def test_wrapped_function_detected():
     # The function should be tracked
     assert "self:my_stage" in fp, f"wrapped function not tracked. Got: {list(fp.keys())}"
 
-    # The original function should also be tracked via closure
-    assert "func:func" in fp, f"original function not tracked via closure. Got: {list(fp.keys())}"
+    assert _definition_key("func", inspect.unwrap(my_stage)) in fp, (
+        f"original function not tracked via closure. Got: {list(fp.keys())}"
+    )
 
 
 def test_decorator_change_triggers_fingerprint_change():
@@ -202,11 +215,10 @@ def test_original_function_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    # The original function is tracked via closure as 'func'
-    # The hashes should be different because the original functions differ
-    assert fp1["func:func"] != fp2["func:func"], (
-        "Different original functions should produce different hashes"
-    )
+    assert (
+        fp1[_definition_key("func", inspect.unwrap(stage_v1))]
+        != fp2[_definition_key("func", inspect.unwrap(stage_v2))]
+    ), "Different original functions should produce different hashes"
 
 
 def test_wrapped_uses_bytecode_not_source():
@@ -267,5 +279,6 @@ def test_nested_wraps():
     # Should have the outer wrapper (decorator_a's wrapper)
     assert "self:my_stage" in fp, f"outer wrapper not tracked. Got: {list(fp.keys())}"
 
-    # The closure should include decorator_b's wrapper as 'func'
-    assert "func:func" in fp, f"inner wrapper not tracked via closure. Got: {list(fp.keys())}"
+    assert _definition_key("func", inspect.unwrap(my_stage)) in fp, (
+        f"inner wrapper not tracked via closure. Got: {list(fp.keys())}"
+    )

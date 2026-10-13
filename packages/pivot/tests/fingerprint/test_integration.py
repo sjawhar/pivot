@@ -61,7 +61,7 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify helper is captured with a hash (not "callable")
-    helper_key = "mod:helpers.process"
+    helper_key = "mod:test_mod_helpers_v1.process"
     assert helper_key in fp1, f"Should capture helper.process, got: {fp1.keys()}"
     hash1 = fp1[helper_key]
     assert len(hash1) == 16, f"Should be 16-char hash, got: {hash1}"
@@ -139,7 +139,9 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify transitive dep is captured
-    assert "mod:leaf.leaf_func" in fp1, f"Should capture transitive dep, got: {fp1.keys()}"
+    assert "mod:test_mod_leaf_v3.leaf_func" in fp1, (
+        f"Should capture transitive dep, got: {fp1.keys()}"
+    )
 
     # Modify leaf function
     leaf_py.write_text("""
@@ -155,7 +157,7 @@ def leaf_func(x):
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
 
     # Transitive fingerprint must change
-    assert fp1["mod:leaf.leaf_func"] != fp2["mod:leaf.leaf_func"], (
+    assert fp1["mod:test_mod_leaf_v3.leaf_func"] != fp2["mod:test_mod_leaf_v3.leaf_func"], (
         "Transitive dep fingerprint must change"
     )
 
@@ -201,8 +203,10 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify helper is captured
-    assert "func:helper_func" in fp1, f"Should capture helper_func, got: {fp1.keys()}"
-    hash1 = fp1["func:helper_func"]
+    assert "func:test_mod_helpers_v5.helper_func" in fp1, (
+        f"Should capture helper_func, got: {fp1.keys()}"
+    )
+    hash1 = fp1["func:test_mod_helpers_v5.helper_func"]
 
     # Modify helper
     helpers_py.write_text("""
@@ -216,7 +220,7 @@ def helper_func(x):
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
 
     # Fingerprint must change
-    hash2 = fp2["func:helper_func"]
+    hash2 = fp2["func:test_mod_helpers_v5.helper_func"]
     assert hash1 != hash2, f"Direct import fingerprint must change: {hash1} vs {hash2}"
 
 
@@ -242,10 +246,9 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Constant should be captured with repr value
-    assert "mod:helpers.THRESHOLD" in fp, f"Should capture constant, got: {fp.keys()}"
-    assert fp["mod:helpers.THRESHOLD"] == "0.5", (
-        f"Constant value should be repr, got: {fp['mod:helpers.THRESHOLD']}"
-    )
+    key = "mod:test_mod_helpers_v6.THRESHOLD"
+    assert key in fp, f"Should capture constant, got: {fp.keys()}"
+    assert fp[key] == "0.5", f"Constant value should be repr, got: {fp[key]}"
 
 
 def test_both_import_styles_in_same_stage(module_dir: pathlib.Path) -> None:
@@ -272,12 +275,11 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Both should be captured
-    assert "func:func_a" in fp, "Should capture direct import"
-    assert "mod:helpers.func_b" in fp, "Should capture module attr"
+    assert "func:test_mod_helpers_v7.func_a" in fp, "Should capture direct import"
+    assert "mod:test_mod_helpers_v7.func_b" in fp, "Should capture module attr"
 
-    # Both should be hashes (not "callable")
-    assert len(fp["func:func_a"]) == 16, "Direct import should be hashed"
-    assert len(fp["mod:helpers.func_b"]) == 16, "Module attr should be hashed"
+    assert len(fp["func:test_mod_helpers_v7.func_a"]) == 16, "Direct import should be hashed"
+    assert len(fp["mod:test_mod_helpers_v7.func_b"]) == 16, "Module attr should be hashed"
 
 
 @pytest.mark.parametrize(
@@ -295,13 +297,13 @@ def run_stage():
         ),
         pytest.param(
             "import dataclasses\n\n@dataclasses.dataclass(frozen=True)\nclass Config:\n"
-            "    value: int\n\nVALUE = Config(1)",
+            + "    value: int\n\nVALUE = Config(1)",
             "Config",
             id="frozen-dataclass",
         ),
         pytest.param(
             "import pydantic\n\nclass Config(pydantic.BaseModel):\n"
-            "    model_config = pydantic.ConfigDict(frozen=True)\n    value: int\n\nVALUE = Config(value=1)",
+            + "    model_config = pydantic.ConfigDict(frozen=True)\n    value: int\n\nVALUE = Config(value=1)",
             "Config",
             id="frozen-pydantic",
         ),
@@ -309,6 +311,11 @@ def run_stage():
             "class Config:\n    pass\n\nVALUE = Config()",
             "Config",
             id="class-instance",
+        ),
+        pytest.param(
+            "class CallableConfig:\n    def __call__(self):\n        return 1\n\nVALUE = CallableConfig()",
+            "CallableConfig",
+            id="callable-instance",
         ),
     ],
 )
@@ -354,3 +361,61 @@ def test_unsafe_fingerprinting_warns_for_non_scalar_module_attribute(
     assert any(f"{helper_name}.VALUE" in record.message for record in caplog.records), (
         "Unsafe fingerprinting should warn with the module attribute name"
     )
+
+
+def _collision_module_source(value: int, default: int) -> str:
+    return f"""\
+from pydantic import BaseModel
+
+VALUE = {value}
+
+
+def helper() -> int:
+    return VALUE
+
+
+class Config(BaseModel):
+    value: int = {default}
+
+
+def run(config: Config = Config()) -> int:
+    return helper() + config.value
+"""
+
+
+def test_colliding_module_definitions_keep_separate_manifest_entries(
+    module_dir: pathlib.Path,
+) -> None:
+    first_name = "test_mod_collision_first"
+    second_name = "test_mod_collision_second"
+    stage_name = "test_mod_collision_stage"
+    first_path = module_dir / f"{first_name}.py"
+    second_path = module_dir / f"{second_name}.py"
+    first_path.write_text(_collision_module_source(1, 1))
+    second_path.write_text(_collision_module_source(2, 2))
+    (module_dir / f"{stage_name}.py").write_text(
+        f"import {first_name} as first\n"
+        + f"import {second_name} as second\n\n"
+        + "def run_stage() -> int:\n"
+        + "    return first.run() + second.run()\n"
+    )
+
+    first_fingerprint = fingerprint.get_stage_fingerprint(_import_module(stage_name).run_stage)
+
+    first_path.write_text(_collision_module_source(10, 10))
+    _reimport_module(first_name)
+    updated_stage = _reimport_module(stage_name)
+    second_fingerprint = fingerprint.get_stage_fingerprint(updated_stage.run_stage)
+
+    assert first_fingerprint != second_fingerprint
+    expected_keys = {
+        f"const:{first_name}.VALUE",
+        f"func:{first_name}.helper",
+        f"class:{first_name}.Config",
+        f"schema:{first_name}.Config",
+        f"const:{second_name}.VALUE",
+        f"func:{second_name}.helper",
+        f"class:{second_name}.Config",
+        f"schema:{second_name}.Config",
+    }
+    assert expected_keys <= second_fingerprint.keys()

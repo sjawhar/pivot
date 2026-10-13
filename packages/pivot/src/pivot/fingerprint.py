@@ -29,7 +29,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
-_CACHE_SCHEMA_VERSION = 2
+# Bump when the hashing scheme changes. Version 3 strips absolute source paths from
+# marshalled code objects. Version 4 qualifies manifest keys by definition module.
+_CACHE_SCHEMA_VERSION = 4
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -406,10 +408,10 @@ def get_stage_fingerprint(
 
     Returns dict with keys:
     - 'self:<name>': Function itself (hash)
-    - 'func:<name>': Referenced helper functions (hash, transitive)
-    - 'class:<name>': Referenced class definitions (hash, transitive)
+    - 'func:<module>.<qualname>': Referenced helper functions (hash, transitive)
+    - 'class:<module>.<qualname>': Referenced class definitions (hash, transitive)
     - 'mod:<module>.<attr>': User-code module attributes (hash for callables, repr for primitives)
-    - 'const:<name>': Global constants (repr value)
+    - 'const:<module>.<name>': Global primitive constants (repr value)
     """
     if visited is None:
         visited = set()
@@ -636,7 +638,7 @@ def _process_class_body_dependencies(
             continue
         value = ns[name]
         if isinstance(value, type) and is_user_code(value):
-            key = f"class:{name}"
+            key = f"class:{_definition_ref(value)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, value, manifest, visited)
             if hasattr(value, "model_fields"):
@@ -648,7 +650,7 @@ def _process_class_body_dependencies(
         resolved = _resolve_dotted_path(parts, ns)
         if resolved is None or not isinstance(resolved, type) or not is_user_code(resolved):
             continue
-        key = f"class:{parts[-1]}"
+        key = f"class:{_definition_ref(resolved)}"
         if key not in manifest:
             _add_callable_to_manifest(key, resolved, manifest, visited)
         if hasattr(resolved, "model_fields"):
@@ -711,13 +713,13 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
 
     Handles Reader, Writer, and Loader (which inherits from both) instances.
     Only fingerprints methods that exist on the handler type:
-    - Reader: 'loader:<classname>:load' + empty() if overridden
-    - Writer: 'loader:<classname>:save'
+    - Reader: 'loader:<module>.<qualname>:load' + empty() if overridden
+    - Writer: 'loader:<module>.<qualname>:save'
     - Loader: All of the above
-    - Always: 'loader:<classname>:config' for dataclass field values
+    - Always: 'loader:<module>.<qualname>:config' for dataclass field values
     """
     manifest = dict[str, str]()
-    class_name = type(loader).__name__
+    class_name = _definition_ref(type(loader))
 
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
@@ -809,6 +811,11 @@ def _check_data_class_methods(cls: type) -> None:
         raise exceptions.StageDefinitionError(message)
 
 
+def _is_user_class_instance(value: Any) -> bool:
+    """Return whether `value` is an instance of a user-defined class."""
+    return not isinstance(value, type) and is_user_code(type(value))
+
+
 def _process_closure_values(
     values: Mapping[str, Any],
     func: Callable[..., Any],
@@ -824,14 +831,17 @@ def _process_closure_values(
         if skip_dunders and name.startswith("__"):
             continue
 
+        binding_ref = _binding_ref(func, name)
         # functools.partial fails is_user_code() (module is functools/stdlib)
-        # Must check before general callable check
-        if isinstance(value, functools.partial):
+        # Must check before general callable check.
+        if _is_user_class_instance(value):
+            _check_non_scalar_capture(name, value, stage_name)
+        elif isinstance(value, functools.partial):
             _process_partial_dependency(
-                name, cast("functools.partial[Any]", value), manifest, visited
+                binding_ref, cast("functools.partial[Any]", value), manifest, visited
             )
         elif callable(value) and is_user_code(value):
-            _process_callable_dependency(name, value, manifest, visited)
+            _process_callable_dependency(binding_ref, value, manifest, visited)
         elif callable(value):
             # Non-user-code callables (stdlib/third-party functions like typing.cast,
             # json.dumps) are tracked via module dependency when accessed as module.func.
@@ -842,37 +852,37 @@ def _process_closure_values(
         elif isinstance(value, logging.Logger):
             continue
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{name}"] = repr(value)
+            manifest[f"const:{binding_ref}"] = repr(value)
         else:
             _check_non_scalar_capture(name, value, stage_name)
 
 
 def _process_callable_dependency(
-    name: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+    binding_ref: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Process a callable dependency and add to manifest."""
-    # Use 'class:' prefix for type objects, 'func:' for functions
     prefix = "class" if isinstance(func, type) else "func"
-    _add_callable_to_manifest(f"{prefix}:{name}", func, manifest, visited)
+    _add_callable_to_manifest(
+        f"{prefix}:{_callable_ref(func, binding_ref)}", func, manifest, visited
+    )
 
 
 def _process_partial_dependency(
-    name: str,
+    binding_ref: str,
     partial_obj: functools.partial[Any],
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
     """Process functools.partial: hash underlying func and bound arguments."""
-    # Hash bound args and kwargs (changes to these should invalidate cache)
     args_str = _serialize_value_for_hash(partial_obj.args)
     kwargs_str = _serialize_value_for_hash(partial_obj.keywords)
-    manifest[f"partial:{name}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
-    manifest[f"partial:{name}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
+    manifest[f"partial:{binding_ref}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
+    manifest[f"partial:{binding_ref}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
 
-    # Recursively fingerprint the underlying function if it's user code
     underlying = partial_obj.func
     if callable(underlying) and is_user_code(underlying):
-        _add_callable_to_manifest(f"func:{name}.func", underlying, manifest, visited)
+        callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
+        _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
@@ -936,7 +946,7 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
         # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
         if isinstance(origin, type) and is_user_code(origin):
             origin_type = cast("type[Any]", origin)
-            key = f"class:{origin_type.__name__}"
+            key = f"class:{_definition_ref(origin_type)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, origin_type, manifest, visited)
             if hasattr(origin_type, "model_fields"):
@@ -957,7 +967,7 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
     if dataclasses.is_dataclass(hint_type):
         _check_data_class_methods(hint_type)
 
-    key = f"class:{hint_type.__name__}"
+    key = f"class:{_definition_ref(hint_type)}"
     if key not in manifest:
         _add_callable_to_manifest(key, hint_type, manifest, visited)
 
@@ -1011,7 +1021,7 @@ def _hash_pydantic_schema(
     visited: set[int],
 ) -> None:
     schema_model = model
-    schema_key = f"schema:{schema_model.__name__}"
+    schema_key = f"schema:{_definition_ref(schema_model)}"
     if schema_key in manifest:
         return
     # Insert placeholder to prevent infinite recursion on self-referential models
@@ -1051,7 +1061,7 @@ def _discover_pydantic_field_types(
         return
     if isinstance(annotation, type) and is_user_code(annotation):
         annotation_type = cast("type[Any]", annotation)
-        key = f"class:{annotation_type.__name__}"
+        key = f"class:{_definition_ref(annotation_type)}"
         if key not in manifest:
             _add_callable_to_manifest(key, annotation_type, manifest, visited)
         if hasattr(annotation_type, "model_fields"):
@@ -1121,7 +1131,7 @@ def _process_module_dependency(
     for mod_name, attr_name in attrs:
         if mod_name not in (name, module_name):
             continue
-        key = f"mod:{mod_name}.{attr_name}"
+        key = f"mod:{module_name}.{attr_name}"
         if key in manifest:
             continue
         try:
@@ -1129,7 +1139,13 @@ def _process_module_dependency(
         except AttributeError:
             manifest[key] = "unknown"
             continue
-        if callable(attr_value) and is_user_code(attr_value):
+        if _is_user_class_instance(attr_value):
+            _check_non_scalar_capture(
+                f"{module_name}.{attr_name}",
+                attr_value,
+                _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
+            )
+        elif callable(attr_value) and is_user_code(attr_value):
             _add_callable_to_manifest(key, attr_value, manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
@@ -1167,6 +1183,26 @@ def _get_qualname_for_cache(func: Callable[..., Any]) -> str:
                 break
 
     return f"{qualname}:{lineno}:{col}"
+
+
+def _definition_ref(obj: Any) -> str:
+    """Return an object's module-qualified definition name for a manifest key."""
+    module = getattr(obj, "__module__", None) or "<unknown>"
+    return f"{module}.{_get_qualname_for_cache(obj)}"
+
+
+def _binding_ref(func: Callable[..., Any], name: str) -> str:
+    """Return a module-qualified reference for a value reached through `func`."""
+    module = getattr(func, "__module__", None) or "<unknown>"
+    return f"{module}.{name}"
+
+
+def _callable_ref(func: Callable[..., Any], binding_ref: str) -> str:
+    """Use callable's definition, retaining the binding path for anonymous lambdas."""
+    qualname = getattr(func, "__qualname__", "") or ""
+    if "<lambda>" in qualname:
+        return binding_ref
+    return _definition_ref(func)
 
 
 def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
@@ -1270,6 +1306,23 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.hash_function_ast", _t)
 
 
+_PORTABLE_CO_FILENAME = "<pivot>"
+
+
+def _hash_code_object(code: types.CodeType) -> str:
+    """Hash code while excluding absolute source paths."""
+    return xxhash.xxh64(marshal.dumps(_replace_code_filenames(code))).hexdigest()
+
+
+def _replace_code_filenames(code: types.CodeType) -> types.CodeType:
+    """Replace the source filename in `code` and nested code constants."""
+    constants = tuple(
+        _replace_code_filenames(value) if isinstance(value, types.CodeType) else value
+        for value in code.co_consts
+    )
+    return code.replace(co_filename=_PORTABLE_CO_FILENAME, co_consts=constants)
+
+
 def _compute_function_hash(func: Callable[..., Any]) -> str:
     """Compute hash for a function (uncached implementation)."""
     _t = metrics.start()
@@ -1281,9 +1334,9 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
 
         # For wrapped functions (via functools.wraps), inspect.getsource() follows
         # __wrapped__ and returns the ORIGINAL function's source, making decorator
-        # logic invisible. Use __code__ bytecode to capture the actual wrapper.
+        # logic invisible. Use bytecode to capture the actual wrapper.
         if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
-            return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+            return _hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
 
         _t_source = metrics.start()
         try:
@@ -1291,9 +1344,9 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         except (OSError, TypeError):
             metrics.end("fingerprint.inspect_getsource", _t_source)
             if hasattr(func, "__code__"):
-                # marshal.dumps captures full code object including co_consts
-                # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
-                return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+                # Marshal captures constants as well as bytecode, so `x + 1` and `x + 999`
+                # differ. Remove embedded source paths before hashing to keep it portable.
+                return _hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
             # KNOWN ISSUE: Using id(func) is non-deterministic across runs
             # This affects lambdas without source code, causing unnecessary re-runs
             if is_user_code(func):

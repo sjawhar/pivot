@@ -13,12 +13,12 @@ logical keys to hashes:
 | Manifest key | What it represents |
 |--------------|--------------------|
 | `self:<name>` | The stage function's own AST |
-| `func:<name>` | Helper functions called by the stage |
-| `class:<name>` | User-defined classes referenced by the stage |
+| `func:<module>.<qualname>` | Helper functions called by the stage |
+| `class:<module>.<qualname>` | User-defined classes referenced by the stage |
 | `mod:<module>.<attr>` | Attributes accessed on imported user modules |
-| `const:<name>` | Global constants (primitives, frozen collections) |
-| `schema:<name>` | Pydantic model JSON schemas |
-| `loader:<class>:<method>` | Reader/Writer method ASTs and config |
+| `const:<module>.<name>` | Module-level primitive values |
+| `schema:<module>.<qualname>` | Pydantic model JSON schemas |
+| `loader:<module>.<class>:<method>` | Reader/Writer method ASTs and config |
 
 ### How It Works
 
@@ -47,10 +47,11 @@ If `train()` calls `normalize()` which calls `clip_outliers()`, all three
 functions appear in the manifest. Changing `clip_outliers` triggers a
 re-run of `train` even though `train` itself didn't change.
 
-Module-level attributes are tracked too. If your stage does
-`from myproject import config` and then accesses `config.THRESHOLD`, the
-value of `THRESHOLD` is captured (via `repr()` for primitives, or AST hash
-for callables).
+Module-level primitive values are tracked too. If your stage does
+`from myproject import config` and then accesses `config.THRESHOLD`, Pivot captures the primitive
+value or the called function. A stage reading any other module-level value—such as a tuple,
+collection, enum member, frozen model, or instance—raises `StageDefinitionError`; use
+[StageParams](parameters.md) instead.
 
 ## What Triggers a Re-Run
 
@@ -84,26 +85,23 @@ def clean(data):
 pipeline.register(clean)
 ```
 
-### Mutable Captured Variables
+### Non-Scalar Captured Values
 
-Pivot cannot track mutations to mutable objects captured from an enclosing
-scope. If your stage closes over a list, dict, or mutable instance, Pivot
-raises `StageDefinitionError` at registration time:
+Pivot tracks only module-level `bool`, `int`, `float`, `str`, `bytes`, and `None` values. A stage
+that reads any other module-level value—including a tuple, frozenset, list, dict, set, enum member,
+frozen dataclass, frozen Pydantic model, or class instance—raises `StageDefinitionError`.
 
 ```python
-config = {"threshold": 0.5}  # Mutable dict
+columns = ("score", "label")
+
 
 def process(data):
-    return data[data["score"] > config["threshold"]]  # Error!
+    return data[list(columns)]  # Error: use StageParams instead
 ```
 
-Fix: pass the value via [StageParams](parameters.md) or declare it as a
-`Dep` input. For truly static config, use a frozen dataclass or
-`frozenset`.
-
-To suppress the check (at your own risk), set
-`core.unsafe_fingerprinting = true` in your Pivot config or
-`PIVOT_UNSAFE_FINGERPRINTING=1` in the environment.
+Move the value into [StageParams](parameters.md). To deliberately accept unsafe fingerprinting,
+set `core.unsafe_fingerprinting = true` or `PIVOT_UNSAFE_FINGERPRINTING=1`; Pivot then emits a
+warning instead.
 
 ### Dynamic Name Access
 
