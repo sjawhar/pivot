@@ -57,17 +57,22 @@ pipeline = _cp
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
     sock_path = tmp_path / ".pivot" / "agent.sock"
+    stdout_path = tmp_path / "serve.stdout"
+    stderr_path = tmp_path / "serve.stderr"
 
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
 
-    proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # Server output goes to files, not pipes: nothing reads a pipe until teardown, and
+    # the server logs on every RPC connection close, so a pipe fills and blocks it.
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
+            cwd=tmp_path,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
 
     try:
         # Wait for socket
@@ -76,10 +81,10 @@ pipeline = _cp
                 break
             time.sleep(0.1)
         else:
-            stdout, stderr = proc.communicate(timeout=1)
             pytest.fail(
                 "Socket not created within 10s.\n"
-                + f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+                + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+                + f"stderr: {stderr_path.read_text(errors='replace')}"
             )
 
         # Poll until status query succeeds (server is ready)
@@ -174,16 +179,19 @@ def test_force_rerun_triggers_events(serve_pipeline: pathlib.Path) -> None:
     run_response = send_rpc(serve_pipeline, "run", {"stages": ["test/my_stage"], "force": True})
     assert run_response.get("result") == "accepted"
 
-    # Wait a bit for the engine to process
-    time.sleep(0.5)
-
-    # Check for new events
-    events_response = send_rpc(serve_pipeline, "events_since", {"version": initial_version})
-    assert "result" in events_response, f"Expected events result, got: {events_response}"
-    events_result = events_response["result"]
-    assert isinstance(events_result, dict), f"Expected dict result, got: {type(events_result)}"
-    assert "version" in events_result, "Expected version field"
+    # Poll until the engine has processed the command and the event version advances
+    deadline = time.monotonic() + 10.0
+    new_version = initial_version
+    while time.monotonic() < deadline:
+        events_response = send_rpc(serve_pipeline, "events_since", {"version": initial_version})
+        assert "result" in events_response, f"Expected events result, got: {events_response}"
+        events_result = events_response["result"]
+        assert isinstance(events_result, dict), f"Expected dict result, got: {type(events_result)}"
+        assert "version" in events_result, "Expected version field"
+        new_version = events_result["version"]
+        if new_version > initial_version:
+            break
+        time.sleep(0.05)
 
     # The version should have advanced (indicating new events were generated)
-    new_version = events_result["version"]
-    assert new_version > initial_version, "Events should have been generated"
+    assert new_version > initial_version, "Events should have been generated within 10s"
