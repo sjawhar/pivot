@@ -7,7 +7,7 @@ is handled by callers after this function when changed=True.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from pivot.types import (
     ArtifactIdentity,
@@ -184,7 +184,7 @@ def diff_dep_hashes(
                 )
             )
         else:
-            if _dep_hash_changed(old[key], new[key]):
+            if old[key] != new[key]:
                 changes.append(
                     DepChange(
                         identity=key,
@@ -199,26 +199,4 @@ def diff_dep_hashes(
 def _dep_hashes_match(
     old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
 ) -> bool:
-    if old.keys() != new.keys():
-        return False
-    return not any(_dep_hash_changed(old[key], new[key]) for key in old)
-
-
-def _dep_hash_changed(old: HashInfo, new: HashInfo) -> bool:
-    old_accessed = _get_accessed_hashes(old)
-    if old_accessed is None:
-        return old != new
-
-    new_accessed = _get_accessed_hashes(new)
-    if new_accessed is None:
-        return True
-    return any(new_accessed.get(dep_key) != dep_hash for dep_key, dep_hash in old_accessed.items())
-
-
-def _get_accessed_hashes(info: HashInfo) -> dict[str, str] | None:
-    raw: dict[str, object] = cast("dict[str, object]", cast("object", info))
-    if "accessed_hashes" in raw:
-        return cast("dict[str, str]", raw["accessed_hashes"])
-    if "manifest" in info:
-        return {entry["relpath"]: entry["hash"] for entry in info["manifest"]}
-    return None
+    return old == new

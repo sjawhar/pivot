@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Any, TypeGuard, cast
+from typing import TYPE_CHECKING, TypeGuard, cast
 
 import yaml
 
@@ -125,11 +125,6 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
         entry = DepEntry(producer=identity.producer, key=identity.key, hash=hash_info["hash"])
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
-        raw_info = dict(hash_info)  # shallow copy to check extra keys
-        if "accessed_keys" in raw_info:
-            entry["accessed_keys"] = cast("list[str]", raw_info["accessed_keys"])
-        if "accessed_hashes" in raw_info:
-            entry["accessed_hashes"] = cast("dict[str, str]", raw_info["accessed_hashes"])
         deps_list.append(entry)
     deps_list.sort(key=lambda e: (e["producer"], e["key"] or ""))
 
@@ -166,17 +161,7 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
             hash_info: HashInfo = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
             hash_info = FileHash(hash=entry["hash"])
-        if "accessed_keys" in entry or "accessed_hashes" in entry:
-            raw = dict[str, object](hash=hash_info["hash"])  # type: ignore[call-overload] - building mutable copy
-            if is_dir_hash(hash_info):
-                raw["manifest"] = hash_info["manifest"]
-            if "accessed_keys" in entry:
-                raw["accessed_keys"] = entry["accessed_keys"]
-            if "accessed_hashes" in entry:
-                raw["accessed_hashes"] = entry["accessed_hashes"]
-            dep_hashes[identity] = cast("HashInfo", cast("object", raw))
-        else:
-            dep_hashes[identity] = hash_info
+        dep_hashes[identity] = hash_info
 
     output_hashes = dict[ArtifactIdentity, HashInfo]()
     for entry in data["outs"]:
@@ -204,16 +189,6 @@ def _ensure_identity_keys(
     if isinstance(first_key, ArtifactIdentity):
         return cast("dict[ArtifactIdentity, HashInfo]", hashes)
     return {identity_from_key(k): v for k, v in cast("dict[str, HashInfo]", hashes).items()}
-
-
-def _ensure_identity_list(
-    paths: list[ArtifactIdentity] | list[str],
-) -> list[ArtifactIdentity]:
-    if not paths:
-        return []
-    if isinstance(paths[0], ArtifactIdentity):
-        return cast("list[ArtifactIdentity]", paths)
-    return [identity_from_key(p) for p in cast("list[str]", paths)]
 
 
 class StageLock:
@@ -262,44 +237,6 @@ class StageLock:
                 yaml.dump(storage_data, f, Dumper=yaml_config.Dumper, sort_keys=False)
 
         cache.atomic_write_file(self.path, write_yaml)
-
-    def is_changed(
-        self,
-        current_fingerprint: dict[str, str],
-        current_params: dict[str, Any],
-        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
-        out_paths: list[ArtifactIdentity] | list[str] | None = None,
-    ) -> tuple[bool, str]:
-        lock_data = self.read()
-        return self.is_changed_with_lock_data(
-            lock_data, current_fingerprint, current_params, dep_hashes, out_paths
-        )
-
-    def is_changed_with_lock_data(
-        self,
-        lock_data: LockData | None,
-        current_fingerprint: dict[str, str],
-        current_params: dict[str, Any],
-        dep_hashes: dict[ArtifactIdentity, HashInfo] | dict[str, HashInfo],
-        out_paths: list[ArtifactIdentity] | list[str] | None = None,
-    ) -> tuple[bool, str]:
-        if lock_data is None:
-            return True, "No previous run"
-
-        if lock_data["code_manifest"] != current_fingerprint:
-            return True, "Code changed"
-        if lock_data["params"] != current_params:
-            return True, "Params changed"
-        normalized_deps = _ensure_identity_keys(dep_hashes)
-        if lock_data["dep_hashes"] != normalized_deps:
-            return True, "Input dependencies changed"
-        if out_paths is not None:
-            locked_out_paths = sorted(lock_data["output_hashes"].keys())
-            normalized_outs = _ensure_identity_list(out_paths)
-            if sorted(normalized_outs) != locked_out_paths:
-                return True, "Output paths changed"
-
-        return False, ""
 
 
 def find_orphaned_locks(

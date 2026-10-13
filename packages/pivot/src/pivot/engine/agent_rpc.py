@@ -14,10 +14,11 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from pydantic import BaseModel, ValidationError, field_validator
 
 from pivot import explain as explain_mod
-from pivot import parameters, types
+from pivot import parameters, project, types
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
+from pivot.storage import store as store_mod
 from pivot.types import DataDiffResult, OnError, StageExplanation
 
 if TYPE_CHECKING:
@@ -296,19 +297,31 @@ class AgentRpcHandler:
                         overrides = parameters.load_params_yaml()
                     except Exception as e:
                         raise ValueError(f"Failed to load params.yaml: {e}") from e
+                    all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
+                    producer_hashes = explain_mod.producer_output_hashes(
+                        list(all_stages),
+                        all_stages,
+                        config_io.get_state_dir(),
+                    )
+                    store = store_mod.WorkspaceStore(
+                        project_root=project.get_project_root(),
+                        pipeline_name=pipeline.name,
+                        input_bindings=pipeline.input_bindings,
+                        cache_dir=config_io.get_cache_dir() / "files",
+                    )
                     return explain_mod.get_stage_explanation(
                         stage_name=stage,
                         fingerprint=fingerprint,
-                        deps=[
-                            types.identity_key(dep.identity) for dep in reg_info["deps"].values()
-                        ],
-                        outs_paths=[types.identity_key(out.identity) for out in reg_info["outs"]],
+                        deps=reg_info["deps"],
+                        outs=list(reg_info["outs"]),
                         params_instance=reg_info["params"],
                         overrides=overrides,
                         state_dir=registry_mod.get_stage_state_dir(
                             reg_info, config_io.get_state_dir()
                         ),
+                        store=store,
                         allow_missing=True,
+                        producer_hashes=producer_hashes,
                     )
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
