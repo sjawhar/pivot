@@ -51,7 +51,6 @@ def test_load_pipeline_from_module_requires_protocol_methods(tmp_path: pathlib.P
         "build_dag",
         "ensure_fingerprint",
         "snapshot",
-        "restore",
     ]:
         assert attr in message
 
@@ -79,9 +78,6 @@ class FakePipeline:
 
     def snapshot(self):
         return {}
-
-    def restore(self, snapshot):
-        return None
 
 
 pipeline = FakePipeline()

@@ -333,11 +333,6 @@ class Pipeline:
         self._require_materialized()
         return self._registry.snapshot()
 
-    def restore(self, snapshot: dict[str, registry.RegistryStageInfo]) -> None:
-        self._require_materialized()
-        self._registry.invalidate_dag_cache()
-        self._registry.restore(snapshot)
-
     def include(self, other: registry.PipelineLike) -> None:
         if other is self:
             from pivot.exceptions import PipelineConfigError
