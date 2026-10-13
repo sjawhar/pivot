@@ -68,7 +68,7 @@ pivot repro  # runs clean, then summarize
 pivot repro  # nothing changed: both stages are cached
 ```
 
-Outputs land in `data/demo/clean.jsonl` and `data/demo/summarize.yaml`. Edit the body of `summarize` and only `summarize` re-runs; change `min_value` or `clean` and both re-run.
+Pivot writes outputs to `data/demo/clean.jsonl` and `data/demo/summarize.yaml`. Edit the body of `summarize` and only `summarize` re-runs. A change to `min_value` or `clean` re-runs `clean`; downstream stages run only when `clean` produces different output bytes.
 
 The [Quick Start guide](https://sjawhar.github.io/pivot/getting-started/quickstart/) walks through this pipeline step by step.
 

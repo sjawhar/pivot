@@ -44,13 +44,13 @@ pivot repro  # Runs both stages
 pivot repro  # Instant - nothing changed
 ```
 
-Edit `normalize` and both stages re-run, because `preprocess` calls it and `summarize` consumes `preprocess`'s output. Edit `summarize` and only `summarize` re-runs.
+Edit `normalize` and `preprocess` re-runs. `summarize` runs only when `preprocess` produces different output bytes. Edit `summarize` and only `summarize` re-runs.
 
 ## What Makes Pivot Different
 
 ### Automatic Code Change Detection
 
-Pivot fingerprints each stage function and every helper it calls, so a change to `normalize` above re-runs `preprocess` without any declaration. No YAML to update, no list of source files to maintain.
+Pivot fingerprints each stage function and every helper it calls, so a change to `normalize` above re-runs `preprocess` without any declaration. No YAML to update, no list of source files to maintain. Downstream execution remains content-addressed: when `preprocess` writes the same bytes, its consumers stay cached.
 
 ### No Paths in Pipeline Code
 

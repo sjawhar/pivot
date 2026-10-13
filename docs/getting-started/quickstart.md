@@ -55,13 +55,14 @@ from pivot import Pipeline, StageParams, stage
 
 
 class CleanParams(StageParams):
-    drop_missing: bool = True
+    min_value: float = 0.0
 
 
 @stage
 def clean(records: pd.DataFrame, params: CleanParams) -> pd.DataFrame:
-    """Remove rows with missing values."""
-    return records.dropna() if params.drop_missing else records
+    """Remove rows with missing values and values below the threshold."""
+    cleaned = records.dropna()
+    return cleaned[cleaned["value"] >= params.min_value]
 
 
 @stage
@@ -78,7 +79,7 @@ def summarize(rows: pd.DataFrame) -> dict:
 
 with Pipeline("quickstart") as pipeline:
     records = pipeline.input("records.csv")
-    cleaned = clean(records, params=CleanParams())
+    cleaned = clean(records, params=CleanParams(min_value=0.0))
     summarize(cleaned)
 ```
 
@@ -147,12 +148,12 @@ Parameters can be overridden per stage in `params.yaml` without touching code:
 ```bash
 cat > params.yaml << 'EOF'
 quickstart/clean:
-  drop_missing: false
+  min_value: 150
 EOF
 pivot status --explain
 ```
 
-The explanation shows the parameter change for `quickstart/clean` and marks `summarize` as stale because its input will change. Run `pivot repro` to apply it, or delete `params.yaml` to return to the values in code.
+The explanation shows the parameter change for `quickstart/clean` and marks `summarize` as stale because `clean` will produce different output bytes. Run `pivot repro` to apply it, or delete `params.yaml` to return to the values in code.
 
 ## Next Steps
 

@@ -94,9 +94,9 @@ def make_stage(threshold):
 
 ## Types
 
-### Return-Type TypedDicts Must Be Module-Level
+### Return-Type TypedDicts Should Be Module-Level
 
-Pivot resolves a stage's return annotation with `get_type_hints()`, which looks names up in the function's module namespace. A `TypedDict` defined inside a function is not there, and the pipeline fails to load with `name 'ProcessOutputs' is not defined`.
+With postponed/string annotations (for example, `from __future__ import annotations`), Pivot resolves a stage's return annotation with `get_type_hints()`, which looks names up in the function's module namespace. A `TypedDict` defined inside a function is not there, and the pipeline fails to load with `name 'ProcessOutputs' is not defined`. Without postponed annotations Python 3.13 can preserve a function-local `TypedDict`, but module-level definitions work in both cases and are the project convention.
 
 ```python
 # Good - module level
@@ -109,7 +109,7 @@ class ProcessOutputs(TypedDict):
 def process(data: pd.DataFrame) -> ProcessOutputs: ...
 
 
-# Bad - inline
+# Bad with postponed annotations - inline
 def create_stage():
     class ProcessOutputs(TypedDict):  # Can't resolve type hints!
         ...
@@ -129,7 +129,7 @@ if not func_node.body:
 
 ### IncrementalOut Uses COPY Mode
 
-`IncrementalOut` (`outputs.py`, checked by `executor/core.py`) always copies from cache rather than hardlinking/symlinking. This is intentional - the stage modifies the file in-place, so hardlinks would corrupt the cache. The compositional API cannot declare incremental outputs yet; keep this invariant if that design lands.
+`IncrementalOut` (`outputs.py`, checked by `executor/core.py`) always copies from cache rather than hardlinking/symlinking. This is intentional - the stage modifies the file in-place, so hardlinks would corrupt the cache. The compositional API cannot declare incremental outputs yet; keep this invariant if that design is added.
 
 ### Path Strategies in StateDB
 

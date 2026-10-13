@@ -89,7 +89,7 @@ Outputs: `data/scores/clean/rows.jsonl`, `metrics/scores/clean/summary.yaml`, `d
   - a **list or tuple of handles**; the function receives a list or tuple of loaded values (`tables: list[pd.DataFrame]`),
   - a **`StageParams` instance**, at most one per stage; never `Optional[...]` or a union.
 - Plain values (`factor=3`, a string, a path) are rejected: `parameter 'factor' has unsupported type 'int'`. Put them in `StageParams`.
-- Define stages, their `StageParams`, their return `TypedDict`s and custom loaders at module level. Workers receive the function by pickling, and return annotations are resolved in the module namespace (a `TypedDict` defined inside a function fails with `name 'Result' is not defined`).
+- Define stages, their `StageParams`, their return `TypedDict`s and custom loaders at module level. Workers receive the function by pickling. With postponed/string annotations (for example, `from __future__ import annotations`), return annotations are resolved in the module namespace, so a `TypedDict` defined inside a function fails with `name 'Result' is not defined`.
 - Outside a `with Pipeline` block a stage is an ordinary function, so test it directly: `clean(df, CleanParams(min_score=0.9))`.
 
 ## Pipelines and inputs
@@ -112,6 +112,7 @@ The return type decides the format. Annotate only the **return type**; parameter
 | `pd.DataFrame` | JSON Lines | `.jsonl` |
 | `dict`, `list` | YAML | `.yaml` |
 | `str` | text | `.txt` |
+| `pathlib.Path` | a file or directory created outside the project, moved by `PathOnly()` | `.dat` (or a directory) |
 | `Annotated[T, loaders.CSV()]` (any loader instance) | that loader | its extension |
 | `Annotated[dict, metric]` | YAML, under `metrics/` | `.yaml` |
 | `Annotated[Figure, plot]` (matplotlib) | PNG, under `plots/` | `.png` |
@@ -120,7 +121,8 @@ The return type decides the format. Annotate only the **return type**; parameter
 Any other type fails with `Cannot infer serialization format for type int`; wrap it (`-> dict`) or annotate a loader (`Annotated[int, loaders.JSON()]`).
 
 - Import tags from `pivot`: `from pivot import metric, plot`.
-- Paths are chosen by Pivot: `data/<pipeline>/<stage>.<ext>`, or `data/<pipeline>/<stage>/<field>.<ext>` for `TypedDict` fields; `metrics/` and `plots/` replace `data/` for tagged outputs. Never write files yourself, and never return a `pathlib.Path`.
+- Paths are chosen by Pivot: `data/<pipeline>/<stage>.<ext>`, or `data/<pipeline>/<stage>/<field>.<ext>` for `TypedDict` fields; `metrics/` and `plots/` replace `data/` for tagged outputs. Do not write directly to those managed paths.
+- For a `pathlib.Path` return, create a file or directory outside the project (for example in a temporary directory) and return that path. Pivot moves it to the managed output path; returning a path already inside the project is rejected because Pivot does not take ownership of user files.
 - A multi-output handle must be narrowed before use: `cleaned.rows` or `cleaned["rows"]`. Passing `cleaned` itself fails with `received handle from multi-output stage ... without selecting an output`.
 - Convert numpy scalars to Python types (`float(x)`, `int(x)`) before putting them in a `dict` or `list` output; YAML cannot read them back.
 - Loaders: `pivot.loaders.CSV`, `JSON`, `YAML`, `Text`, `JSONL`, `DataFrameJSONL`, `Pickle`, `MatplotlibFigure` (`pip install "pivot[matplotlib]"`). A custom loader is a module-level `@dataclasses.dataclass(frozen=True)` subclass of `loaders.Writer[T]` (`save`) or `loaders.Loader[T]` (`load` and `save`).

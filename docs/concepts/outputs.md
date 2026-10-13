@@ -14,6 +14,7 @@ Pivot picks a writer from it:
 | `pandas.DataFrame` | JSON Lines (`DataFrameJSONL()`) | `.jsonl` |
 | `dict`, `list` (including `dict[str, int]` etc.) | YAML (`YAML()`) | `.yaml` |
 | `str` | text (`Text()`) | `.txt` |
+| `pathlib.Path` | a file or directory created outside the project, moved by `PathOnly()` | `.dat` (or a directory) |
 | `Annotated[T, <loader>]` | that loader | the loader's extension |
 | `Annotated[dict, metric]` | YAML, stored under `metrics/` | `.yaml` |
 | `Annotated[Figure, plot]` | PNG via `MatplotlibFigure()`, stored under `plots/` | `.png` |
@@ -39,6 +40,11 @@ the producing stage or from `pipeline.input()`.
 Extensions come from the writer: `jsonl`, `csv`, `yaml`, `json`, `txt`, `pkl`,
 `png`, and `dat` for custom writers. Variant stages keep their `@` suffix in the
 file name (`data/p/scale@x2.csv`).
+
+For a `pathlib.Path` return, the stage must create a file or directory outside
+the project and return its path. Pivot moves it to the managed output path. A
+returned path inside the project is rejected because Pivot must not take
+ownership of a file it did not create.
 
 ## Example
 
@@ -114,8 +120,8 @@ Define the `TypedDict` at module level. The field name `_single` is reserved.
 
 The compositional API has no way to declare a directory output (a variable set
 of files decided at run time) or an incremental output (a stage that reads its
-own previous result). Both designs are open; until they land, return a `dict`
-or `TypedDict` instead.
+own previous result). Both designs are open; until both designs are available,
+return a `dict` or `TypedDict` instead.
 
 ## Metrics and plots
 

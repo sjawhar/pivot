@@ -11,9 +11,12 @@ symptoms: ["name 'X' is not defined when loading pipeline.py", "TypedDict return
 
 Two things go wrong when stage functions or their return `TypedDict`s are defined inside other functions.
 
-**1. Type hint resolution fails for nested TypedDicts:**
+**1. Type hint resolution can fail for nested TypedDicts with postponed annotations:**
 
 ```python
+from __future__ import annotations
+
+
 def create_pipeline():
     class TrainResult(TypedDict):
         model: Annotated[dict, loaders.Pickle()]
@@ -24,11 +27,13 @@ def create_pipeline():
         ...
 ```
 
-Pivot reads a stage's outputs from its return annotation with `get_type_hints()` (`compose._analyze_return_type`). `get_type_hints()` resolves forward references in `func.__module__`'s namespace; for a nested definition, `TrainResult` exists only in the enclosing function's local scope. Loading `pipeline.py` fails with:
+Pivot reads a stage's outputs from its return annotation with `get_type_hints()` (`compose._analyze_return_type`). With postponed/string annotations, `get_type_hints()` resolves forward references in `func.__module__`'s namespace; for a nested definition, `TrainResult` exists only in the enclosing function's local scope. Loading `pipeline.py` then fails with:
 
 ```
 Error: Failed to load …/pipeline.py: name 'TrainResult' is not defined
 ```
+
+Without postponed annotations Python 3.13 can preserve a function-local `TypedDict`, but module-level definitions work in both modes and are the project convention.
 
 **2. Configuration hidden in a closure:**
 
@@ -76,7 +81,7 @@ For test files, the same rule applies: put test stages and their `TypedDict`s at
 
 ## Key Insight
 
-Python's `get_type_hints()` does name resolution at call time, not definition time, and looks names up in the function's `__module__` namespace. Nested class definitions are not there.
+Python's `get_type_hints()` does name resolution at call time, not definition time, and with postponed annotations looks names up in the function's `__module__` namespace. Nested class definitions are not there.
 
 The rule: **if Pivot needs to introspect it, define it at module level; if it is configuration, put it in `StageParams`**. This covers:
 

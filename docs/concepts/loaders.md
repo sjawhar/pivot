@@ -51,17 +51,18 @@ All built-in loaders live in `pivot.loaders`:
 | `JSONL()` | `Loader` | `list[dict]` | — | `.dat` (no fixed extension) |
 | `DataFrameJSONL()` | `Loader` | `DataFrame` | — | `.jsonl` |
 | `Pickle()` | `Loader` | any picklable object | `protocol` | `.pkl` |
-| `PathOnly()` | `Loader` | `pathlib.Path` | — | — |
+| `PathOnly()` | `Loader` | `pathlib.Path` | — | `.dat` (or a directory) |
 | `MatplotlibFigure()` | `Writer` only | `Figure` | `dpi`, `bbox_inches`, `transparent` | `.png` |
 
 Defaults Pivot chooses without an annotation: `DataFrame` → `DataFrameJSONL()`,
 `dict`/`list` → `YAML()`, `str` → `Text()`, `plot` tag → `MatplotlibFigure()`,
 `metric` tag → `YAML()`.
 
-`PathOnly()` is for inputs only: with `pipeline.input("blob.bin", t=pathlib.Path)`
-the stage receives the file's path and reads it however it likes. Stage
-outputs cannot use it, because a stage does not know the path Pivot will store
-its output at; return the data instead.
+`PathOnly()` hands a stage an input path without loading content. For an output,
+it takes ownership of a file or directory created outside the project and moves
+it to Pivot's managed path; a path already inside the project is rejected. Use
+it for a binary format or directory artifact that a stage creates itself, not
+for a file under `data/<pipeline>/`.
 
 ## Overriding the format
 
