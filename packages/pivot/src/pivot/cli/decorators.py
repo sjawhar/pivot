@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 
 from pivot import discovery, exceptions, metrics
+from pivot.cli import errors
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +25,15 @@ PIPELINE_CONTEXT_KEY = "_pivot_pipeline"
 ALL_PIPELINES_CONTEXT_KEY = "_pivot_all_pipelines"
 
 
-def _handle_pivot_error(e: exceptions.PivotError) -> click.ClickException:
-    """Convert PivotError to user-friendly ClickException."""
-    message = e.format_user_message()
-    if suggestion := e.get_suggestion():
-        message = f"{message}\n\nTip: {suggestion}"
-    return click.ClickException(message)
+def _pivot_errors(group: BaseExceptionGroup[BaseException]) -> list[exceptions.PivotError]:
+    """Flatten PivotErrors nested in async TaskGroup exception groups."""
+    result = list[exceptions.PivotError]()
+    for error in group.exceptions:
+        if isinstance(error, exceptions.PivotError):
+            result.append(error)
+        elif isinstance(error, BaseExceptionGroup):
+            result.extend(_pivot_errors(cast("BaseExceptionGroup[BaseException]", error)))
+    return result
 
 
 def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
@@ -50,14 +54,13 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         except click.ClickException:
             raise
         except exceptions.PivotError as e:
-            raise _handle_pivot_error(e) from e
+            raise errors.handle_pivot_error(e) from e
         except BaseExceptionGroup as eg:
             # Async TaskGroups wrap exceptions in ExceptionGroup.
-            # Unwrap to find PivotErrors for user-friendly formatting.
-            pivot_errors = eg.subgroup(exceptions.PivotError)
-            if pivot_errors is not None:
-                messages = [str(e) for e in pivot_errors.exceptions]
-                raise click.ClickException("\n".join(messages)) from eg
+            pivot_errors = _pivot_errors(eg)
+            if pivot_errors:
+                message = "\n".join(errors.format_pivot_error(error) for error in pivot_errors)
+                raise click.ClickException(message) from eg
             logger.debug("Unhandled ExceptionGroup in CLI command", exc_info=True)
             raise click.ClickException(repr(eg)) from eg
         except Exception as e:

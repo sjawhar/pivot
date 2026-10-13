@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import networkx as nx
 
+from pivot import project
 from pivot import types as pivot_types
 from pivot.engine.types import NodeType
 
@@ -182,11 +183,16 @@ def validate_dependency_sources(
                 continue
             if store.exists(dep):
                 continue
+            try:
+                input_path = project.to_relative_path(store.checkout(dep))
+            except FileNotFoundError:
+                input_path = None
             errors.append(
                 exceptions.DependencyNotFoundError(
                     stage=stage_name,
                     dep=pivot_types.identity_key(dep_identity),
                     available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+                    input_path=input_path,
                 )
             )
 
