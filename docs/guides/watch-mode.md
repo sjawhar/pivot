@@ -59,7 +59,7 @@ Watch mode reacts to **external** file changes — files you edit in your editor
 
 Changes that trigger re-runs:
 
-- Editing a source file that a stage depends on (via `Dep`)
+- Editing an input file declared with `pipeline.input()`
 - Editing a stage's Python source code (detected by [fingerprinting](../concepts/fingerprinting.md))
 - Editing parameter files
 
@@ -74,11 +74,11 @@ Changes that do **not** trigger re-runs:
 By default, watch mode runs the entire pipeline. Target specific stages to narrow the scope:
 
 ```bash
-# Watch and re-run only train and its dependencies
-pivot repro train --watch
+# Watch and re-run only demo/train and its dependencies
+pivot repro demo/train --watch
 
 # Watch multiple stages
-pivot repro train evaluate --watch
+pivot repro demo/train demo/evaluate --watch
 ```
 
 Only the targeted stages (and their upstream [dependencies](../concepts/dependencies.md)) are monitored and re-run.

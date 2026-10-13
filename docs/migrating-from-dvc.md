@@ -19,7 +19,7 @@ and the change detection of neither.
 | `params.yaml` + `params:` + `dvc.api.params_show()` | One `StageParams` subclass per stage, passed at the call site |
 | `metrics:` | `Annotated[dict, metric]` on the return type |
 | `plots:` | `Annotated[Figure, plot]` on the return type |
-| `foreach:` / `matrix:` | A Python loop in the `with Pipeline` block, optionally inside `pipeline.variant(name)` |
+| `foreach` / `matrix` stages | A Python loop in the `with Pipeline` block, optionally inside `pipeline.variant(name)` |
 | `vars:` and `${...}` interpolation | Python values in `pipeline.py` and `StageParams` fields |
 | Several `dvc.yaml` files | Several `pipeline.py` files; one imports another's handles |
 | `dvc.lock` | Per-stage lock files in `.pivot/stages/` |

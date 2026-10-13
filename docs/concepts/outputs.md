@@ -110,6 +110,13 @@ field is a separate artifact with its own hash, so a change that only affects
 
 Define the `TypedDict` at module level. The field name `_single` is reserved.
 
+## Not yet available
+
+The compositional API has no way to declare a directory output (a variable set
+of files decided at run time) or an incremental output (a stage that reads its
+own previous result). Both designs are open; until they land, return a `dict`
+or `TypedDict` instead.
+
 ## Metrics and plots
 
 `metric` and `plot` (imported from `pivot`) are tags, not paths:

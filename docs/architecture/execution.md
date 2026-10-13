@@ -116,35 +116,9 @@ Workers stay alive between stages, so expensive imports (numpy, pandas) only hap
 
 ## Mutex Handling
 
-Mutex groups prevent concurrent execution:
+The scheduler supports mutex groups: stages sharing a group never run at the same time, and the special group `*` runs a stage with nothing else executing. Groups are read from each stage's `RegistryStageInfo["mutex"]`.
 
-```yaml
-# pivot.yaml
-stages:
-  train_model_a:
-    python: stages.train_model_a
-    mutex:
-      - gpu
-
-  train_model_b:
-    python: stages.train_model_b
-    mutex:
-      - gpu  # Won't run while train_model_a is running
-```
-
-### Exclusive Mutex
-
-Use `mutex: ["*"]` to run a stage with no other stages executing concurrently:
-
-```yaml
-stages:
-  database_migration:
-    python: stages.migrate_db
-    mutex:
-      - "*"  # Runs exclusively - no other stages run at the same time
-```
-
-This is useful for stages that require exclusive access to shared resources like databases or file locks.
+Mutex groups cannot be declared in the compositional API yet: `@stage` and `Pipeline` always record an empty list (`compose.py` `_emit_stage_info`). How a stage declares its groups is an open design question.
 
 ### Implementation
 

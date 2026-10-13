@@ -7,7 +7,7 @@ Pivot's fingerprinting is Abstract Syntax Tree (AST) based — it captures the
 
 ## What Gets Tracked
 
-When you register a stage, Pivot builds a **manifest** — a dict mapping
+When Pivot builds a stage, it computes a **manifest**: a dict mapping
 logical keys to hashes:
 
 | Manifest key | What it represents |
@@ -16,9 +16,9 @@ logical keys to hashes:
 | `func:<name>` | Helper functions called by the stage |
 | `class:<name>` | User-defined classes referenced by the stage |
 | `mod:<module>.<attr>` | Attributes accessed on imported user modules |
-| `const:<name>` | Global constants (primitives, frozen collections) |
+| `const:<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`) |
 | `schema:<name>` | Pydantic model JSON schemas |
-| `loader:<class>:<method>` | Reader/Writer method ASTs and config |
+| `dep:…:loader:…`, `out:…:loader:…` | Reader/Writer method ASTs and config for each input and output |
 
 ### How It Works
 
@@ -49,8 +49,8 @@ re-run of `train` even though `train` itself didn't change.
 
 Module-level attributes are tracked too. If your stage does
 `from myproject import config` and then accesses `config.THRESHOLD`, the
-value of `THRESHOLD` is captured (via `repr()` for primitives, or AST hash
-for callables).
+value of `THRESHOLD` is captured if it is a scalar, and its AST hash if it is
+a function.
 
 ## What Triggers a Re-Run
 
@@ -70,36 +70,38 @@ for callables).
 
 ### Lambdas
 
-Lambda functions have no stable source location across Python runs. Pivot
-falls back to `id(func)`, which is **non-deterministic** — your stage
-will re-run every time. Always use named functions:
+Lambdas created dynamically (via `eval`, `exec`, or an interactive session)
+have no source to hash, so their fingerprint changes every run. Use named,
+module-level functions for stages and the helpers they call:
 
 ```python
-# Bad — re-runs every time
-pipeline.register(lambda data: data.dropna(), name="clean")
+# Bad - no stable source
+normalize = eval("lambda df: df / df.max()")
 
-# Good — stable fingerprint
-def clean(data):
-    return data.dropna()
-pipeline.register(clean)
+
+# Good - stable fingerprint
+def normalize(df):
+    return df / df.max()
 ```
 
-### Mutable Captured Variables
+### Module-Level Values
 
-Pivot cannot track mutations to mutable objects captured from an enclosing
-scope. If your stage closes over a list, dict, or mutable instance, Pivot
-raises `StageDefinitionError` at registration time:
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or
+`None`; editing it re-runs the stage. Reading any other module-level value
+(tuple, list, dict, set, frozenset, enum member, class instance), directly or
+as `module.NAME`, is a `StageDefinitionError` that names the variable:
 
 ```python
-config = {"threshold": 0.5}  # Mutable dict
+COLUMNS = {"score": float}  # Module-level dict
 
-def process(data):
-    return data[data["score"] > config["threshold"]]  # Error!
+
+@stage
+def process(data: pd.DataFrame) -> pd.DataFrame:
+    return data.astype(COLUMNS)  # Error!
 ```
 
-Fix: pass the value via [StageParams](parameters.md) or declare it as a
-`Dep` input. For truly static config, use a frozen dataclass or
-`frozenset`.
+Fix: move the value into the stage's [StageParams](parameters.md). Configuration
+in module-level collections is not supported.
 
 To suppress the check (at your own risk), set
 `core.unsafe_fingerprinting = true` in your Pivot config or
@@ -119,25 +121,27 @@ track. Use direct attribute access and static imports instead.
 ## @pivot.no_fingerprint()
 
 For stages where AST fingerprinting doesn't work (C extensions, generated
-code, complex metaprogramming), opt out with the `@pivot.no_fingerprint()`
-decorator:
+code, complex metaprogramming), opt out with `@no_fingerprint()`, applied
+directly to the function, under `@stage`:
 
 ```python
-import pivot
+from pivot import no_fingerprint, stage
 
-@pivot.no_fingerprint()
-def external_model_stage(data):
-    ...
 
-@pivot.no_fingerprint(code_deps=["scripts/train.sh", "configs/model.yaml"])
-def shell_stage(data):
-    ...
+@stage
+@no_fingerprint()
+def external_model_stage(data: pd.DataFrame) -> pd.DataFrame: ...
+
+
+@stage
+@no_fingerprint(code_deps=["scripts/train.sh", "configs/model.yaml"])
+def shell_stage(data: pd.DataFrame) -> dict: ...
 ```
 
-With `@pivot.no_fingerprint()`, Pivot falls back to **file-level hashing** —
-it hashes the entire source file containing the function. The optional
-`code_deps` argument lets you list additional files that should be
-considered part of the stage's code.
+With `@no_fingerprint()`, Pivot falls back to **file-level hashing**: it
+hashes the entire source file containing the function. The optional
+`code_deps` argument lists additional files (relative to the project root)
+that are part of the stage's code; editing one marks the stage "Code changed".
 
 **Use sparingly.** File-level hashing is less precise: any change anywhere
 in the file triggers a re-run.

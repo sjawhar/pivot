@@ -139,46 +139,27 @@ result = eval("process(data)")     # String execution
 
 **Workaround:** Not supported; restructure code.
 
-### Runtime-Computed Values
+### Module-Level Values
 
-Global constants (primitives like `int`, `float`, `str`, `bool`, `bytes`, `None`) ARE tracked via `repr()`. However, values computed at runtime or by complex expressions are not:
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; its current value is recorded with `repr()`, so editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance), directly or as `module.NAME`, is a `StageDefinitionError` that names the variable and points to `StageParams`:
 
 ```python
-# TRACKED - primitive constants captured via repr()
-THRESHOLD = 0.5  # Changing this value IS detected
-DEBUG = True     # Changing this IS detected
-
-# NOT TRACKED - runtime-computed values
-THRESHOLD = float(os.environ.get("THRESHOLD", "0.5"))  # Dynamic
-CONFIG = load_config()  # Function call result
-PATHS = [p for p in Path(".").glob("*.csv")]  # Computed at import
+THRESHOLD = 0.5            # allowed: tracked by value
+COLUMNS = ("a", "b")       # error when a stage reads it
+CONFIG = load_config()     # error when a stage reads it (a dict)
 ```
 
-The fingerprinting system uses `getclosurevars()` to capture referenced globals, then stores `repr(value)` for primitives. This works for literal constants but cannot track values that change based on environment or runtime state.
-
-**Workaround:** Use stage parameters for configurable values:
+Configuration belongs in the stage's `StageParams`:
 
 ```python
-# stages.py
-from pivot.stage_def import StageParams
-
-
 class ProcessParams(StageParams):
     threshold: float = 0.5
+    columns: list[str] = ["a", "b"]
 
 
-def process(params: ProcessParams):
-    if value > params.threshold:  # Changes tracked!
-        pass
-```
-
-```yaml
-# pivot.yaml
-stages:
-  process:
-    python: stages.process
-    params:
-      threshold: 0.5
+@stage
+def process(data: pd.DataFrame, params: ProcessParams) -> pd.DataFrame:
+    return data.loc[data["value"] > params.threshold, params.columns]
 ```
 
 ## Why AST + getclosurevars?
@@ -244,17 +225,16 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 Use explain mode to see what changed:
 
 ```bash
-$ pivot status --explain train
+$ pivot status --explain
 
-Stage: train
+Stage: demo/train
   Status: WILL RUN
-  Reason: Code dependency changed
+  Reason: Code changed
 
-  Code changes:
+  Code Changes:
     func:helper_a
       Old: 5995c853
       New: a1b2c3d4
-      File: src/utils.py:15
 ```
 
 ## Manual Invalidation
@@ -263,7 +243,7 @@ If automatic detection fails, manually invalidate:
 
 ```bash
 # Force re-run of specific stage
-pivot repro train --force
+pivot repro demo/train --force
 ```
 
 ## Further Reading
