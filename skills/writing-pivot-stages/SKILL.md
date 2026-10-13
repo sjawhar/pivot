@@ -1,6 +1,6 @@
 ---
 name: writing-pivot-stages
-description: Use when writing, editing, reviewing, or debugging a Pivot pipeline (pipeline.py, @stage functions, Pipeline, pipeline.input, StageParams, params.yaml overrides), porting a DVC pipeline (dvc.yaml, dvc.api.params_show) to Pivot, or seeing Pivot errors such as "module 'pivot' has no attribute", "received handle from multi-output stage", "has unsupported type", "Cannot infer serialization format", "closure captures mutable variable", "does not define a 'pipeline' variable", or "No module named" when loading pipeline.py
+description: Use when writing, editing, reviewing, or debugging a Pivot pipeline (pipeline.py, @stage functions, Pipeline, pipeline.input, StageParams, params.yaml overrides), porting a DVC pipeline (dvc.yaml, dvc.api.params_show) to Pivot, or seeing Pivot errors such as "module 'pivot' has no attribute", "received handle from multi-output stage", "has unsupported type", "Cannot infer serialization format", "captures non-scalar variable", "does not define a 'pipeline' variable", or "No module named" when loading pipeline.py
 ---
 
 # Writing Pivot Stages
@@ -261,16 +261,19 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock fil
 
 | Error | Fix |
 |---|---|
-| `module 'pivot' has no attribute 'Out'` (or `Dep`, `Metric`) | Those markers do not exist; use the return type and `metric`/`plot` tags |
+| `cannot import name 'Out' from 'pivot'` or `module 'pivot' has no attribute 'Out'` (or `Dep`, `Metric`) | Those markers do not exist; use the return type and `metric`/`plot` tags |
 | `does not define a 'pipeline' variable` | `with Pipeline("name") as pipeline:` |
 | `No module named '<yours>'` | Import from the project root: `from report.helpers import x`, not `from helpers import x`, in `report/pipeline.py` |
 | `parameter 'x' has unsupported type` | Pass handles or `StageParams`; move plain values into `StageParams` |
 | `received handle from multi-output stage` | Select a field: `handle.field` |
 | `Cannot infer serialization format` | Return a supported type or `Annotated[T, loaders.X()]` |
-| `closure captures mutable variable 'X'` | Move `X` into `StageParams` |
-| `depends on '<name>' which is not produced by any stage and does not exist on disk` | Put the file at `data/raw/<name>` or pass `path=` |
+| `captures non-scalar variable 'X'` | Move `X` into `StageParams` |
+| `depends on input '<name>' (path data/raw/<name>), which does not exist` | Put the file at `data/raw/<name>` or pass `path=` |
 | `must have a return type annotation` | Annotate the return; `-> None` stages have no outputs |
-| `Invalid stage name: '...@big one'` | Variant names: letters, digits, `_ . -` |
+| `Invalid variant name 'big one': use only letters, digits and the characters _ . -` | Rename the variant; `/`, `@` and spaces are not allowed |
+| `has unsupported Annotated metadata 'DirectoryOut'` | Create the directory outside the project and return a `pathlib.Path` to it |
+| `Input binding conflict: inputs 'a' and 'b' are both bound to '<path>'` | Use one `pipeline.input()` name per file |
+| `Output path conflict: 'p/x/y' and 'p/x:y' both write data/p/x/y.jsonl` | Rename a stage, pipeline or `TypedDict` field so each output has its own path |
 | `could not determine a constructor for the tag` | Convert numpy scalars with `float()`/`int()` before returning |
 
 ## Checklist
