@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import logging
 from collections.abc import Callable
 from typing import ClassVar
@@ -30,6 +31,10 @@ class FrozenModel(pydantic.BaseModel):
     value: int
 
 
+class CapturedMode(enum.Enum):
+    DEFAULT = "default"
+
+
 MUTABLE_DICT = {"a": 1}
 MUTABLE_LIST = [1, 2]
 MUTABLE_SET = {1, 2}
@@ -40,6 +45,7 @@ FROZEN_PYDANTIC = FrozenModel(value=1)
 IMMUTABLE_TUPLE = (1, 2)
 IMMUTABLE_FROZENSET = frozenset({1, 2})
 PRIMITIVE_INT = 42
+ENUM_MEMBER = CapturedMode.DEFAULT
 
 
 def _callable_helper() -> int:
@@ -90,6 +96,10 @@ def _stage_uses_callable() -> int:
     return _callable_helper()
 
 
+def _stage_uses_enum_member() -> str:
+    return ENUM_MEMBER.value
+
+
 @pytest.mark.parametrize(
     ("func", "var_name", "type_name"),
     [
@@ -123,9 +133,24 @@ def _stage_uses_callable() -> int:
             "MutableModel",
             id="mutable-pydantic",
         ),
+        pytest.param(
+            _stage_uses_frozen_dataclass,
+            "FROZEN_DATACLASS",
+            "FrozenConfig",
+            id="frozen-dataclass",
+        ),
+        pytest.param(
+            _stage_uses_frozen_pydantic,
+            "FROZEN_PYDANTIC",
+            "FrozenModel",
+            id="frozen-pydantic",
+        ),
+        pytest.param(_stage_uses_tuple, "IMMUTABLE_TUPLE", "tuple", id="tuple"),
+        pytest.param(_stage_uses_frozenset, "IMMUTABLE_FROZENSET", "frozenset", id="frozenset"),
+        pytest.param(_stage_uses_enum_member, "ENUM_MEMBER", "CapturedMode", id="enum-member"),
     ],
 )
-def test_mutable_closure_capture_raises(
+def test_non_scalar_closure_capture_raises(
     func: Callable[[], int],
     var_name: str,
     type_name: str,
@@ -144,29 +169,25 @@ def test_mutable_closure_capture_raises(
 @pytest.mark.parametrize(
     "func",
     [
-        pytest.param(_stage_uses_frozen_dataclass, id="frozen-dataclass"),
-        pytest.param(_stage_uses_frozen_pydantic, id="frozen-pydantic"),
-        pytest.param(_stage_uses_tuple, id="tuple"),
-        pytest.param(_stage_uses_frozenset, id="frozenset"),
         pytest.param(_stage_uses_primitive, id="primitive"),
         pytest.param(_stage_uses_callable, id="callable"),
     ],
 )
-def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], int]) -> None:
+def test_scalar_and_callable_closure_capture_allows_fingerprint(func: Callable[[], object]) -> None:
     fingerprint.get_stage_fingerprint_cached("train", func)
 
 
-def test_unsafe_env_allows_mutable_capture(
+def test_unsafe_env_allows_non_scalar_capture(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     with caplog.at_level(logging.WARNING):
-        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_mutable_dict)
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_tuple)
 
-    assert any(
-        "closure captures mutable variable" in record.message for record in caplog.records
-    ), "Should warn when unsafe fingerprinting is enabled"
+    assert any("non-scalar variable" in record.message for record in caplog.records), (
+        "Should warn when unsafe fingerprinting is enabled"
+    )
 
 
 NESTED_MUTABLE_TUPLE = (1, [2, 3])
@@ -180,7 +201,7 @@ def _stage_uses_mutable_dict_for_config_test() -> int:
     return MUTABLE_DICT["a"]
 
 
-def test_unsafe_config_allows_mutable_capture(
+def test_unsafe_config_allows_non_scalar_capture(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Config-based unsafe_fingerprinting=true downgrades errors to warnings."""
@@ -191,13 +212,13 @@ def test_unsafe_config_allows_mutable_capture(
         mock.patch("pivot.config.io.get_merged_config", autospec=True, return_value=unsafe_config),
         caplog.at_level(logging.WARNING),
     ):
-        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_mutable_dict_for_config_test)
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_frozenset)
 
-    assert any(
-        "closure captures mutable variable" in record.message for record in caplog.records
-    ), "Should warn when unsafe fingerprinting via config is enabled"
+    assert any("non-scalar variable" in record.message for record in caplog.records), (
+        "Should warn when unsafe fingerprinting via config is enabled"
+    )
 
 
-def test_nested_mutable_in_tuple_allows_fingerprint() -> None:
-    """Tuple containing mutable list is allowed — tuples are immutable at top level."""
-    fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+def test_nested_mutable_in_tuple_raises() -> None:
+    with pytest.raises(exceptions.StageDefinitionError, match="NESTED_MUTABLE_TUPLE"):
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)

@@ -759,11 +759,12 @@ def _is_unsafe_fingerprinting_enabled() -> bool:
         return False
 
 
-def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
+def _check_non_scalar_capture(var_name: str, value: Any, stage_name: str) -> None:
     message = (
-        f"Stage '{stage_name}': closure captures mutable variable '{var_name}' "
+        f"Stage '{stage_name}': captures non-scalar variable '{var_name}' "
         + f"(type: {type(value).__name__}).\n"
-        + "Pivot cannot track changes to mutable runtime state, which may cause silent wrong "
+        + "Pivot tracks only module-level bool, int, float, str, bytes, and None values. "
+        + "Other values may change without a reliable fingerprint, which can cause silent wrong "
         + "outputs.\n"
         + "Fix: pass this data via StageParams or as a function parameter.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
@@ -789,42 +790,6 @@ def _check_data_class_methods(cls: type) -> None:
             + "Move these to standalone functions for reliable change detection."
         )
         raise exceptions.StageDefinitionError(message)
-
-
-def _is_frozen_dataclass(value: Any) -> bool:
-    if not dataclasses.is_dataclass(value):
-        return False
-    cls = cast("type[Any]", type(value))
-    params = getattr(cls, "__dataclass_params__", None)
-    return bool(params and getattr(params, "frozen", False))
-
-
-def _is_frozen_pydantic(value: Any) -> bool:
-    cls = cast("type[Any]", type(value))
-    model_config = getattr(cls, "model_config", None)
-    if model_config is None:
-        return False
-    try:
-        return bool(model_config.get("frozen", False))
-    except AttributeError:
-        return False
-
-
-def _hash_unrecognized_closure_value(
-    name: str, value: Any, manifest: dict[str, str], stage_name: str
-) -> None:
-    try:
-        value_repr = repr(value)
-    except Exception:
-        _check_mutable_capture(name, value, stage_name)
-        return
-    if "0x" in value_repr:
-        _check_mutable_capture(name, value, stage_name)
-        return
-    if len(value_repr) > _REPR_SIZE_LIMIT:
-        _check_mutable_capture(name, value, stage_name)
-        return
-    manifest[f"const:{name}"] = xxhash.xxh64(value_repr.encode()).hexdigest()
 
 
 def _process_closure_values(
@@ -853,8 +818,7 @@ def _process_closure_values(
         elif callable(value):
             # Non-user-code callables (stdlib/third-party functions like typing.cast,
             # json.dumps) are tracked via module dependency when accessed as module.func.
-            # Skip them here — their repr contains memory addresses (0x...) which would
-            # trigger _check_mutable_capture falsely.
+            # Skip them here because their repr can contain memory addresses.
             continue
         elif include_modules and isinstance(value, types.ModuleType):
             _process_module_dependency(name, value, func, manifest, visited)
@@ -862,26 +826,8 @@ def _process_closure_values(
             continue
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
-        elif isinstance(value, (dict, list, tuple, set, frozenset)):
-            if isinstance(value, (dict, list, set)):
-                _check_mutable_capture(name, value, stage_name)
-            _process_collection_dependency(
-                name,
-                cast(
-                    "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
-                    value,
-                ),
-                manifest,
-                visited,
-            )
-        elif _is_user_class_instance(value):
-            if _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
-                _process_instance_dependency(name, value, manifest, visited)
-            else:
-                _check_mutable_capture(name, value, stage_name)
-                _process_instance_dependency(name, value, manifest, visited)
         else:
-            _hash_unrecognized_closure_value(name, value, manifest, stage_name)
+            _check_non_scalar_capture(name, value, stage_name)
 
 
 def _process_callable_dependency(
@@ -910,23 +856,6 @@ def _process_partial_dependency(
     underlying = partial_obj.func
     if callable(underlying) and is_user_code(underlying):
         _add_callable_to_manifest(f"func:{name}.func", underlying, manifest, visited)
-
-
-def _is_user_class_instance(value: Any) -> bool:
-    """Check if value is an instance of a user-defined class."""
-    cls = cast("type[Any]", type(value))
-    # Skip built-in types and common stdlib types
-    if cls.__module__ == "builtins":
-        return False
-    return is_user_code(cls)
-
-
-def _process_instance_dependency(
-    name: str, instance: Any, manifest: dict[str, str], visited: set[int]
-) -> None:
-    """Track the class definition of a user-defined instance."""
-    cls = cast("type[Any]", type(instance))
-    _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
