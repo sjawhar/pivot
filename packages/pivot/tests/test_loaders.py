@@ -12,6 +12,7 @@ import pickle
 import typing
 from typing import Any
 
+import numpy
 import pandas
 import pytest
 
@@ -187,6 +188,42 @@ def test_yaml_loader_save(tmp_path: pathlib.Path) -> None:
     assert yaml_file.exists()
     content = yaml_file.read_text()
     assert "setting:" in content
+
+
+def test_yaml_loader_roundtrips_numpy_values_as_plain_data(tmp_path: pathlib.Path) -> None:
+    yaml_file = tmp_path / "metric.yaml"
+    data: dict[str, object] = {
+        "mean": numpy.float64(0.5),
+        "count": numpy.int64(3),
+        "valid": numpy.bool_(True),
+        "samples": numpy.array([0.25, 0.75]),
+    }
+
+    loaders.YAML[dict[str, object]]().save(data, yaml_file)
+    loaded = loaders.YAML[dict[str, object]]().load(yaml_file)
+
+    assert loaded == {"mean": 0.5, "count": 3, "valid": True, "samples": [0.25, 0.75]}
+    assert "python/" not in yaml_file.read_text()
+
+
+def test_yaml_loader_refuses_non_plain_data_before_writing(tmp_path: pathlib.Path) -> None:
+    yaml_file = tmp_path / "metric.yaml"
+    yaml_file.write_text("old: value\n")
+
+    with pytest.raises(TypeError, match="DataFrame"):
+        loaders.YAML[object]().save(pandas.DataFrame({"value": [1.0]}), yaml_file)
+
+    assert yaml_file.read_text() == "old: value\n"
+
+
+@dataclasses.dataclass
+class _UnserializableMetric:
+    value: float
+
+
+def test_yaml_loader_refuses_dataclass_with_type_name(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(TypeError, match="_UnserializableMetric"):
+        loaders.YAML[object]().save(_UnserializableMetric(0.5), tmp_path / "metric.yaml")
 
 
 # ==============================================================================

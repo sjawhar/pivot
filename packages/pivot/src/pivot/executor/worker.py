@@ -790,6 +790,17 @@ def _write_output_with_store(
         _reject_path_inside_project(ref, value, project_root, dependency_paths)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
+
+    def save_output(output_value: Any, destination: pathlib.Path) -> None:
+        try:
+            writer.save(output_value, destination)
+        except TypeError as e:
+            if isinstance(writer, loaders.YAML):
+                raise TypeError(
+                    f"Stage '{ref.identity.producer}' cannot write YAML output {ref.identity.key!r}: {e}"
+                ) from e
+            raise
+
     if ref.tag is types.ArtifactTag.DIRECTORY:
         if not isinstance(value, dict):
             raise RuntimeError(
@@ -816,11 +827,11 @@ def _write_output_with_store(
             members.append((output_path / normalized, item_value))
         for full_path, item_value in members:
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            writer.save(item_value, full_path)
+            save_output(item_value, full_path)
         return output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer.save(value, output_path)
+    save_output(value, output_path)
     return output_path
 
 

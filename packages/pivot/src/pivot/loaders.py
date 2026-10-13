@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import collections.abc as collections_abc
 import dataclasses
 import datetime
 import json
@@ -144,9 +145,11 @@ class JSON[T](Loader[T, T]):
 
 @dataclasses.dataclass(frozen=True)
 class YAML[T](Loader[T, T]):
-    """YAML file loader.
+    """YAML file loader that writes only values safe_load can read.
 
-    Generic type parameter indicates the expected type for type checking.
+    Numpy scalars and arrays are converted to equivalent Python values. Other
+    arbitrary Python objects raise ``TypeError`` instead of being written as
+    unsafe ``!!python/*`` tags.
 
     Args:
         empty_factory: Callable returning the first-run value for an incremental output.
@@ -162,8 +165,42 @@ class YAML[T](Loader[T, T]):
 
     @override
     def save(self, data: T, path: pathlib.Path) -> None:
-        with open(path, "w") as f:
-            yaml.dump(data, f, default_flow_style=False)
+        def plain(value: object, location: str) -> object:
+            if value is pandas.NaT or value is pandas.NA:
+                return None
+            if isinstance(value, numpy.ndarray):
+                return plain(value.tolist(), location)
+            if isinstance(value, numpy.generic):
+                return plain(value.item(), location)
+            if type(value) in (
+                type(None),
+                bool,
+                int,
+                float,
+                str,
+                bytes,
+                datetime.date,
+                datetime.datetime,
+            ):
+                return value
+            if isinstance(value, collections_abc.Mapping):
+                mapping = cast("collections_abc.Mapping[object, object]", value)
+                plain_mapping = dict[object, object]()
+                for key, item in mapping.items():
+                    plain_key = plain(key, f"{location} key")
+                    plain_mapping[plain_key] = plain(item, f"{location}[{key!r}]")
+                return plain_mapping
+            if isinstance(value, (list, tuple)):
+                items = cast("list[object] | tuple[object, ...]", value)
+                return [plain(item, f"{location}[{index}]") for index, item in enumerate(items)]
+            raise TypeError(
+                f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
+                + "Convert DataFrames with .to_dict() and dataclasses with dataclasses.asdict()."
+            )
+
+        content = yaml.safe_dump(plain(data, "root"), default_flow_style=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
 
     @override
     def empty(self) -> T:

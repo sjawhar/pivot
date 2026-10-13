@@ -7,6 +7,7 @@ import tempfile
 import typing
 from typing import TYPE_CHECKING, Annotated, NotRequired, Required, TypedDict
 
+import numpy
 import pandas as pd
 import pytest
 
@@ -2051,3 +2052,59 @@ def test_stage_returning_path_inside_workspace_is_rejected(
     assert (tmp_path / "data" / "raw" / "handwritten.bin").read_bytes() == b"inside workspace", (
         "Rejected workspace file must be left untouched"
     )
+
+
+# --- YAML metrics must be safe-readable by downstream stages ---
+
+
+@stage
+def _helper_metric_numpy_scalar(params: stage_def.StageParams) -> Annotated[dict, metric]:
+    return {"mean": numpy.float64(0.5)}
+
+
+@stage
+def _helper_consume_metric_scalar(stats: dict) -> dict:
+    return {"mean": stats["mean"]}
+
+
+def test_metric_numpy_scalar_is_safe_for_downstream_stage(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        stats = _helper_metric_numpy_scalar(params=stage_def.StageParams())
+        _helper_consume_metric_scalar(stats=stats)
+
+    producer_result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_numpy_scalar", tmp_path, output_queue
+    )
+    assert producer_result["status"] == types.StageStatus.RAN, producer_result["reason"]
+
+    consumer_result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_consume_metric_scalar", tmp_path, output_queue
+    )
+    assert consumer_result["status"] == types.StageStatus.RAN, consumer_result["reason"]
+
+    metric_data = loaders.YAML[dict[str, float]]().load(
+        tmp_path / "metrics" / "metricsafe" / "_helper_metric_numpy_scalar.yaml"
+    )
+    assert metric_data == {"mean": 0.5}
+
+
+@stage
+def _helper_metric_dataframe(params: stage_def.StageParams) -> Annotated[pd.DataFrame, metric]:
+    return pd.DataFrame({"value": [1.0]})
+
+
+def test_metric_dataframe_fails_at_write_with_stage_and_type(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        _helper_metric_dataframe(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_dataframe", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.FAILED
+    assert "metricsafe/_helper_metric_dataframe" in result["reason"]
+    assert "DataFrame" in result["reason"]
