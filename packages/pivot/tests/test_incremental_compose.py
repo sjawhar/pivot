@@ -34,6 +34,7 @@ def test_incremental_output_registers_its_previous_input_without_a_dag_edge(
     assert info["incremental_inputs"] == {"previous": output.identity}
     assert list(pipeline.build_dag().edges()) == []
 
+
 def test_uncached_incremental_output_is_detected_from_artifact_refs(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
