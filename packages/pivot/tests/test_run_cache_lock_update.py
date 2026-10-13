@@ -489,92 +489,106 @@ def test_regular_execution_still_works(
     assert "unchanged" in result2["reason"]
 
 
-def test_run_cache_skip_does_not_increment_output_generations(
+def test_run_cache_restore_bumps_output_generation_and_invalidates_downstream(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
-    """Run cache skip should NOT increment output generations.
-
-    This is the critical integration test for the increment_outputs flag:
-    1. First run: outputs get generation 1
-    2. Modify dep, second run: outputs get generation 2
-    3. Revert dep, third run: skips via run cache, outputs stay at generation 2
-
-    If output generations were wrongly incremented on run cache skip, downstream
-    stages would see a generation bump and think they need to re-run even though
-    the outputs are identical to what they already processed.
-    """
+    """A restored producer invalidates consumers that last saw different output bytes."""
     input_file = tmp_path / "input.txt"
     input_file.write_text("state_A")
 
-    def stage_func(_0: str) -> str:
-        content = (tmp_path / "input.txt").read_text()
-        output = f"processed: {content}"
-        (tmp_path / "output.txt").write_text(output)
-        return output
+    def producer_func(_0: str) -> str:
+        return f"processed: {_0}"
 
-    stage_info = _make_stage_info(
-        stage_func,
+    def consumer_func(_0: str) -> str:
+        return f"consumed: {_0}"
+
+    producer_out = _output_ref("producer")
+    consumer_out = _output_ref("consumer")
+    producer_info = _make_stage_info(
+        producer_func,
         tmp_path,
-        fingerprint={"self:stage_func": "fp123"},
+        fingerprint={"self:producer": "fp-producer"},
         deps={"_0": _input_ref("input.txt")},
-        outs=[_output_ref("test_stage")],
-        run_id="run_1",
+        outs=[producer_out],
+        run_id="producer_A",
     )
-
+    consumer_info = _make_stage_info(
+        consumer_func,
+        tmp_path,
+        fingerprint={"self:consumer": "fp-consumer"},
+        deps={"_0": producer_out},
+        outs=[consumer_out],
+        run_id="consumer_A",
+    )
     state_db_path = tmp_path / ".pivot"
+    workspace = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="test",
+        input_bindings={},
+    )
 
-    # Step 1: First run - creates lock file with state A
-    result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
-    assert result1["status"] == "ran"
-    _apply_deferred_writes("test_stage", stage_info, result1, state_db_path)
+    producer_a = executor.execute_stage("producer", producer_info, worker_env, output_queue)
+    assert producer_a["status"] == "ran"
+    _apply_deferred_writes("producer", producer_info, producer_a, state_db_path)
+    producer_lock = lock.StageLock("producer", lock.get_stages_dir(state_db_path))
+    producer_lock_a = producer_lock.read()
+    assert producer_lock_a is not None
 
-    with state.StateDB(state_db_path) as db:
-        gen_after_run1 = db.get_generation(_identity_key(_output_ref("test_stage")))
-    assert gen_after_run1 == 1, f"Expected generation 1 after first run, got {gen_after_run1}"
+    consumer_a = executor.execute_stage("consumer", consumer_info, worker_env, output_queue)
+    assert consumer_a["status"] == "ran"
+    _apply_deferred_writes("consumer", consumer_info, consumer_a, state_db_path)
 
-    # Step 2: Modify input to state B
     input_file.write_text("state_B")
-
-    # Step 3: Run again - output gen -> 2
-    stage_info_run2 = _make_stage_info(
-        stage_func,
+    producer_b_info = _make_stage_info(
+        producer_func,
         tmp_path,
-        fingerprint={"self:stage_func": "fp123"},
+        fingerprint={"self:producer": "fp-producer"},
         deps={"_0": _input_ref("input.txt")},
-        outs=[_output_ref("test_stage")],
-        run_id="run_2",
+        outs=[producer_out],
+        run_id="producer_B",
     )
-    result2 = executor.execute_stage("test_stage", stage_info_run2, worker_env, output_queue)
-    assert result2["status"] == "ran"
-    _apply_deferred_writes("test_stage", stage_info_run2, result2, state_db_path)
+    producer_b = executor.execute_stage("producer", producer_b_info, worker_env, output_queue)
+    assert producer_b["status"] == "ran"
+    _apply_deferred_writes("producer", producer_b_info, producer_b, state_db_path)
 
-    with state.StateDB(state_db_path) as db:
-        gen_after_run2 = db.get_generation(_identity_key(_output_ref("test_stage")))
-    assert gen_after_run2 == 2, f"Expected generation 2 after second run, got {gen_after_run2}"
+    consumer_b_info = _make_stage_info(
+        consumer_func,
+        tmp_path,
+        fingerprint={"self:consumer": "fp-consumer"},
+        deps={"_0": producer_out},
+        outs=[consumer_out],
+        run_id="consumer_B",
+    )
+    consumer_b = executor.execute_stage("consumer", consumer_b_info, worker_env, output_queue)
+    assert consumer_b["status"] == "ran"
+    _apply_deferred_writes("consumer", consumer_b_info, consumer_b, state_db_path)
 
-    # Step 4: Revert input to state A
     input_file.write_text("state_A")
-
-    # Step 5: Run again - should skip via run cache
-    stage_info_run3 = _make_stage_info(
-        stage_func,
+    producer_restore_info = _make_stage_info(
+        producer_func,
         tmp_path,
-        fingerprint={"self:stage_func": "fp123"},
+        fingerprint={"self:producer": "fp-producer"},
         deps={"_0": _input_ref("input.txt")},
-        outs=[_output_ref("test_stage")],
-        run_id="run_3",
+        outs=[producer_out],
+        run_id="producer_A_restored",
     )
-    result3 = executor.execute_stage("test_stage", stage_info_run3, worker_env, output_queue)
-    assert result3["status"] == "cached"
-    assert "run cache" in result3["reason"], f"Expected run cache skip, got: {result3['reason']}"
+    restored = executor.execute_stage(
+        "producer", producer_restore_info, worker_env, output_queue
+    )
+    assert restored["status"] == "cached"
+    assert "run cache" in restored["reason"]
+    _apply_deferred_writes("producer", producer_restore_info, restored, state_db_path)
 
-    # Apply deferred writes from the SKIPPED result
-    _apply_deferred_writes("test_stage", stage_info_run3, result3, state_db_path)
+    producer_lock_after = producer_lock.read()
+    assert producer_lock_after is not None
+    assert producer_lock_after["dep_hashes"] == producer_lock_a["dep_hashes"]
+    assert producer_lock_after["output_hashes"] == producer_lock_a["output_hashes"]
+    assert workspace.resolve_display_path(producer_out).read_text() == "processed: state_A"
 
-    # CRITICAL: Output generation should NOT have been incremented
     with state.StateDB(state_db_path) as db:
-        gen_after_skip = db.get_generation(_identity_key(_output_ref("test_stage")))
-    assert gen_after_skip == 2, (
-        f"Output generation should remain at 2 after run cache skip, got {gen_after_skip}. "
-        "Run cache skip should not increment output generations since outputs are restored, not rewritten."
-    )
+        producer_generation = db.get_generation(_identity_key(producer_out))
+    assert producer_generation == 3
+
+    downstream = executor.execute_stage("consumer", consumer_b_info, worker_env, output_queue)
+    assert downstream["reason"] != "unchanged (generation)"
+    assert workspace.resolve_display_path(consumer_out).read_text() == "consumed: processed: state_A"

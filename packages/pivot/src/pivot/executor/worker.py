@@ -376,7 +376,7 @@ def execute_stage(
                                 production_lock,
                                 state_db,
                                 file_hash_entries=file_hash_entries,
-                                increment_outputs=False,
+                                increment_outputs=True,
                             )
                             return StageResult(
                                 status=StageStatus.CACHED,
