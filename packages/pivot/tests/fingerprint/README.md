@@ -358,7 +358,7 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_fingerprint.py::test_invalidate_manifests_for_paths_selective`, `test_fingerprint.py::test_invalidate_manifests_for_paths_recomputes_affected_stage`, `test_fingerprint.py::test_invalidate_manifests_for_paths_cold_start`
 
-17. **Pivot framework excluded from `is_user_code`**: Modules in the `pivot` package are treated as framework code, not user code. This prevents framework internals (e.g., `StageParams`, `Out`, `Dep`) from appearing in manifests when using editable installs where pivot isn't in `site-packages`.
+17. **Pivot framework excluded from `is_user_code`**: Modules in the `pivot` package are treated as framework code, not user code. This prevents framework internals (e.g., `StageParams`, `stage`, `Pipeline`) from appearing in manifests when using editable installs where pivot isn't in `site-packages`.
 
     Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`
 
