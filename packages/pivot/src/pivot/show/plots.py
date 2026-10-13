@@ -4,13 +4,12 @@ from __future__ import annotations
 import html
 import json
 import logging
-import os
 import pathlib
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict
 
-from pivot import config, git, outputs, project, types
+from pivot import project, types
 from pivot.show import common
-from pivot.storage import cache, lock
+from pivot.storage import cache
 from pivot.types import ChangeType, OutputFormat
 
 if TYPE_CHECKING:
@@ -20,13 +19,10 @@ logger = logging.getLogger(__name__)
 
 
 class PlotInfo(TypedDict):
-    """Info about a registered Plot output."""
+    """A plot to render: its workspace path and the stage that produces it."""
 
     path: str
     stage_name: str
-    x: str | None
-    y: str | None
-    template: str | None
 
 
 class PlotDiffEntry(TypedDict):
@@ -38,181 +34,44 @@ class PlotDiffEntry(TypedDict):
     change_type: ChangeType
 
 
-def _plot_display_path(
-    out: types.ArtifactRef | outputs.BaseOut,
-    project_root: pathlib.Path,
-) -> str | None:
-    if isinstance(out, types.ArtifactRef):
-        if out.tag is not types.ArtifactTag.PLOT:
-            return None
-        return types.identity_key(out.identity)
-    if isinstance(out, outputs.Plot):
-        expanded = outputs.require_expanded(cast("outputs.BaseOut", out))
-        abs_path = str(project.normalize_path(expanded.path))
-        return project.to_relative_path(abs_path, project_root)
-    return None
+def _plot_outs_by_stage() -> dict[str, list[types.ArtifactRef]]:
+    from pivot.cli import helpers as cli_helpers
 
-
-def _plot_lock_keys(
-    out: types.ArtifactRef | outputs.BaseOut,
-    stage_name: str,
-    project_root: pathlib.Path,
-) -> list[types.ArtifactIdentity]:
-    if isinstance(out, types.ArtifactRef):
-        if out.tag is not types.ArtifactTag.PLOT:
-            return []
-        return [out.identity]
-    if isinstance(out, outputs.Plot):
-        expanded = outputs.require_expanded(cast("outputs.BaseOut", out))
-        abs_path = str(project.normalize_path(expanded.path))
-        rel_path = project.to_relative_path(abs_path, project_root)
-        keys = [abs_path, rel_path]
-        if rel_path:
-            keys.append(f"{stage_name}:{rel_path}")
-        else:
-            keys.append(stage_name)
-        return [types.identity_from_key(key) for key in list(dict.fromkeys(keys)) if key]
-    return []
+    outs_by_stage = dict[str, list[types.ArtifactRef]]()
+    for stage_name in cli_helpers.list_stages():
+        plot_outs = [
+            out
+            for out in cli_helpers.get_stage(stage_name)["outs"]
+            if out.tag is types.ArtifactTag.PLOT
+        ]
+        if plot_outs:
+            outs_by_stage[stage_name] = plot_outs
+    return outs_by_stage
 
 
 def collect_plots_from_stages() -> list[PlotInfo]:
-    """Discover Plot outputs from Pipeline in context."""
+    """List the plot outputs of the Pipeline in context at their workspace paths."""
     from pivot.cli import helpers as cli_helpers
 
-    result = list[PlotInfo]()
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        outs = cast("list[types.ArtifactRef | outputs.BaseOut]", info["outs"])
-        for out in outs:
-            if isinstance(out, types.ArtifactRef):
-                if out.tag is not types.ArtifactTag.PLOT:
-                    continue
-                result.append(
-                    PlotInfo(
-                        path=types.identity_key(out.identity),
-                        stage_name=stage_name,
-                        x=None,
-                        y=None,
-                        template=None,
-                    )
-                )
-            elif isinstance(out, outputs.Plot):
-                # Registry always stores single-file outputs (multi-file are expanded)
-                expanded = outputs.require_expanded(cast("outputs.BaseOut", out))
-                abs_path = str(project.normalize_path(expanded.path))
-                rel_path = project.to_relative_path(abs_path, project.get_project_root())
-                result.append(
-                    PlotInfo(
-                        path=rel_path,
-                        stage_name=stage_name,
-                        x=None,
-                        y=None,
-                        template=None,
-                    )
-                )
-    return result
-
-
-def get_plot_hashes_from_lock(
-    state_dir: pathlib.Path | None = None,
-) -> dict[str, str | None]:
-    """Read output_hashes for plots from lock files.
-
-    Returns paths relative to project root for consistent comparison with user input.
-    """
-    from pivot.cli import helpers as cli_helpers
-
-    if state_dir is None:
-        state_dir = config.get_state_dir()
-
+    store = cli_helpers.require_workspace_store()
     proj_root = project.get_project_root()
-    result = dict[str, str | None]()
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-
-        outs = cast("list[types.ArtifactRef | outputs.BaseOut]", info["outs"])
-        for out in outs:
-            rel_path = _plot_display_path(out, proj_root)
-            if rel_path is None:
-                continue
-            hash_value: str | None = None
-            if lock_data:
-                for identity in _plot_lock_keys(out, stage_name, proj_root):
-                    if identity in lock_data["output_hashes"]:
-                        hash_value = lock_data["output_hashes"][identity]["hash"]
-                        break
-            result[rel_path] = hash_value
-    return result
+    return [
+        PlotInfo(
+            path=project.to_relative_path(store.resolve_display_path(out), proj_root),
+            stage_name=stage_name,
+        )
+        for stage_name, plot_outs in _plot_outs_by_stage().items()
+        for out in plot_outs
+    ]
 
 
 def get_plot_hashes_from_head() -> dict[str, str | None]:
-    """Read output_hashes for plots from lock files at Git HEAD.
-
-    Returns paths relative to project root for consistent comparison with workspace.
-    Returns empty dict if not in a git repo or no HEAD commit exists.
-    """
+    """Map each plot output's workspace path to its hash in the lock files at git HEAD."""
     from pivot.cli import helpers as cli_helpers
 
-    result = dict[str, str | None]()
-    proj_root = project.get_project_root()
-
-    # Collect lock file paths we need to read
-    stage_plot_paths = dict[str, list[str]]()  # stage_name -> [rel_plot_paths]
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        outs = cast("list[types.ArtifactRef | outputs.BaseOut]", info["outs"])
-        for out in outs:
-            rel_path = _plot_display_path(out, proj_root)
-            if rel_path is None:
-                continue
-            stage_plot_paths.setdefault(stage_name, []).append(rel_path)
-            result[rel_path] = None  # Default to None
-
-    # Read all lock files from HEAD in one batch
-    lock_data_map = common.read_lock_files_from_head(list(stage_plot_paths.keys()))
-
-    # Parse lock files and extract plot hashes
-    for stage_name, plot_paths in stage_plot_paths.items():
-        lock_data = lock_data_map.get(stage_name)
-        if lock_data is None:
-            continue
-
-        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
-
-        # Match our plot paths against storage paths
-        for plot_rel_path in plot_paths:
-            if plot_rel_path in path_to_hash:
-                result[plot_rel_path] = path_to_hash[plot_rel_path]
-
-    return result
-
-
-def get_output_hashes_from_revision(rev: str) -> dict[str, str | None]:
-    """Read output hashes from lock files at a git revision; empty dict on error."""
-    result = dict[str, str | None]()
-
-    lock_files = git.list_files_at_revision(lock.STAGES_REL_PATH, rev, "*.lock")
-    if not lock_files:
-        return result
-
-    stage_names = [pathlib.Path(f).stem for f in lock_files]
-    lock_data_map = common.read_lock_files_from_revision(stage_names, rev)
-
-    for lock_data in lock_data_map.values():
-        if lock_data is None:
-            continue
-
-        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
-        for path, hash_val in path_to_hash.items():
-            normalized = os.path.normpath(path)
-            if normalized in result and result[normalized] != hash_val:
-                msg = f"Conflicting hashes for output path '{normalized}' at revision {rev}: {result[normalized]} vs {hash_val}"
-                raise ValueError(msg)
-            result[normalized] = hash_val
-
-    return result
+    return common.output_hashes_from_head(
+        _plot_outs_by_stage(), cli_helpers.require_workspace_store()
+    )
 
 
 def get_plot_hashes_from_workspace(

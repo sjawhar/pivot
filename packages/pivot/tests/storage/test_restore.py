@@ -110,7 +110,7 @@ path: data.csv
 
 
 def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Resolves target as stage name when lock file exists."""
+    """A stage target resolves to its outputs' workspace paths and the hashes its lock records."""
     repo_path, commit = git_repo
 
     # Create lock file for stage
@@ -119,20 +119,47 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [{"key": None, "hash": "def456", "tag": "data", "display": "model.pkl"}],
+        "outs": [{"key": None, "hash": "def456", "tag": "data"}],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
     sha = commit("add lock file")[:7]
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
-    state_dir = repo_path / ".pivot"
+    stage_targets = {
+        "train": restore.StageTarget(
+            stage_name="train",
+            state_dir=repo_path / ".pivot",
+            paths_by_key={None: "data/train.pkl"},
+        )
+    }
 
-    targets = restore.resolve_targets(["train"], sha, state_dir)
+    targets = restore.resolve_targets(["train"], sha, stage_targets)
 
     assert len(targets) == 1
     assert targets[0]["target_type"] == "stage"
     assert targets[0]["original_target"] == "train"
-    assert "train" in targets[0]["paths"]
+    assert targets[0]["paths"] == ["data/train.pkl"]
+    assert targets[0]["hashes"] == {"data/train.pkl": {"hash": "def456"}}
+
+
+def test_resolve_targets_stage_without_lock_at_revision(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registered stage that had not run at the revision is reported, not treated as a file."""
+    repo_path, commit = git_repo
+    (repo_path / "dummy.txt").write_text("dummy")
+    sha = commit("initial commit")[:7]
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    stage_targets = {
+        "train": restore.StageTarget(
+            stage_name="train",
+            state_dir=repo_path / ".pivot",
+            paths_by_key={None: "data/train.pkl"},
+        )
+    }
+
+    with pytest.raises(exceptions.TargetNotFoundError, match="Stage 'train' has no lock file"):
+        restore.resolve_targets(["train"], sha, stage_targets)
 
 
 def test_resolve_targets_as_pvt_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,8 +173,7 @@ def test_resolve_targets_as_pvt_file(git_repo: GitRepo, monkeypatch: pytest.Monk
     sha = commit("add pvt file")[:7]
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    state_dir = repo_path / ".pivot"
-    targets = restore.resolve_targets(["data.csv"], sha, state_dir)
+    targets = restore.resolve_targets(["data.csv"], sha, {})
 
     assert len(targets) == 1
     assert targets[0]["target_type"] == "file"
@@ -165,8 +191,7 @@ def test_resolve_targets_as_git_file(git_repo: GitRepo, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    state_dir = repo_path / ".pivot"
-    targets = restore.resolve_targets(["readme.txt"], sha, state_dir)
+    targets = restore.resolve_targets(["readme.txt"], sha, {})
 
     assert len(targets) == 1
     assert targets[0]["target_type"] == "file"
@@ -182,10 +207,8 @@ def test_resolve_targets_not_found(git_repo: GitRepo, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    state_dir = repo_path / ".pivot"
-
     with pytest.raises(exceptions.TargetNotFoundError, match="nonexistent"):
-        restore.resolve_targets(["nonexistent"], sha, state_dir)
+        restore.resolve_targets(["nonexistent"], sha, {})
 
 
 def test_resolve_targets_path_traversal(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -197,10 +220,8 @@ def test_resolve_targets_path_traversal(git_repo: GitRepo, monkeypatch: pytest.M
 
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
-    state_dir = repo_path / ".pivot"
-
     with pytest.raises(exceptions.TargetNotFoundError, match="Path traversal"):
-        restore.resolve_targets(["../../../etc/passwd"], sha, state_dir)
+        restore.resolve_targets(["../../../etc/passwd"], sha, {})
 
 
 # =============================================================================
@@ -219,7 +240,6 @@ def test_restore_targets_from_revision_invalid_rev(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
 
     with pytest.raises(exceptions.RevisionNotFoundError, match="invalid-rev"):
         restore.restore_targets_from_revision(
@@ -227,7 +247,7 @@ def test_restore_targets_from_revision_invalid_rev(
             rev="invalid-rev",
             output=None,
             cache_dir=cache_dir,
-            state_dir=state_dir,
+            stage_targets={},
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
         )
@@ -245,7 +265,6 @@ def test_restore_targets_from_revision_output_with_multiple_targets(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
 
     with pytest.raises(exceptions.GetError, match="single target"):
         restore.restore_targets_from_revision(
@@ -253,7 +272,7 @@ def test_restore_targets_from_revision_output_with_multiple_targets(
             rev=sha[:7],
             output=repo_path / "output.txt",
             cache_dir=cache_dir,
-            state_dir=state_dir,
+            stage_targets={},
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
         )
@@ -273,7 +292,6 @@ def test_restore_targets_from_revision_git_file(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
     output_path = repo_path / "restored.txt"
 
     messages, _ = restore.restore_targets_from_revision(
@@ -281,7 +299,7 @@ def test_restore_targets_from_revision_git_file(
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -306,14 +324,13 @@ def test_restore_targets_from_revision_skip_existing(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
 
     messages, _ = restore.restore_targets_from_revision(
         targets=["file.txt"],
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -338,14 +355,13 @@ def test_restore_targets_from_revision_force_overwrite(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
 
     messages, _ = restore.restore_targets_from_revision(
         targets=["file.txt"],
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
     )
@@ -383,7 +399,11 @@ def test_restore_targets_from_revision_output_with_stage(
             rev=sha[:7],
             output=repo_path / "output.txt",
             cache_dir=cache_dir,
-            state_dir=state_dir,
+            stage_targets={
+                "train": restore.StageTarget(
+                    stage_name="train", state_dir=state_dir, paths_by_key={None: "model.pkl"}
+                )
+            },
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
         )
@@ -435,14 +455,13 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
 
     messages, _ = restore.restore_targets_from_revision(
         targets=["data.csv"],
         rev=sha[:7],
         output=None,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -460,7 +479,6 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
 
     # Set up cache directory
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
     # Create a fake cached file
@@ -483,7 +501,7 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -524,7 +542,6 @@ def test_restore_directory_from_cache_with_manifest(
 
     # Set up cache directory
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
     # Create cached files (individual file hashes, NOT the tree hash)
@@ -556,7 +573,7 @@ def test_restore_directory_from_cache_with_manifest(
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -578,7 +595,6 @@ def test_restore_file_from_remote_caches_with_readonly_permissions(
 
     # Set up directories
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
     # Create content that will "come from remote"
@@ -606,7 +622,7 @@ def test_restore_file_from_remote_caches_with_readonly_permissions(
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -633,7 +649,6 @@ def test_restore_file_from_remote_hash_mismatch(
 
     # Set up directories
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
     # Create content but calculate hash for DIFFERENT content
@@ -662,7 +677,7 @@ def test_restore_file_from_remote_hash_mismatch(
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )
@@ -689,7 +704,6 @@ def test_restore_file_from_remote_success(
 
     # Set up directories
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
     content = b"content from remote"
@@ -717,7 +731,7 @@ def test_restore_file_from_remote_success(
         rev=sha[:7],
         output=output_path,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
     )

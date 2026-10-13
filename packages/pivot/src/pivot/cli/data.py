@@ -5,7 +5,7 @@ import pathlib
 
 import click
 
-from pivot import config, project, types
+from pivot import config, project, registry, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -69,41 +69,22 @@ def diff(
         click.echo("No data files found in registered stages.")
         return
 
-    # Filter to targets
+    # Filter to targets: stage identities resolve through the Store, anything else is a path
     proj_root = project.get_project_root()
-    store = cli_helpers.get_workspace_store()
+    store = cli_helpers.require_workspace_store()
     all_stages = cli_helpers.get_all_stages()
-    resolved_targets = set[str]()
+    target_set = set[str]()
 
     for target in targets:
-        try:
-            resolved = cli_targets.resolve_cli_target(target, all_stages, lambda _: False)
-        except cli_targets.TargetValidationError as exc:
-            identity = types.identity_from_key(target)
-            if identity.producer in all_stages:
-                raise click.ClickException(str(exc)) from exc
-            resolved_targets.add(
-                project.to_relative_path(project.normalize_path(target), proj_root)
-            )
+        resolved = cli_targets.resolve_cli_target(target, all_stages)
+        if resolved is None:
+            target_set.add(project.to_relative_path(project.normalize_path(target), proj_root))
             continue
-
-        if resolved["kind"] == "identity":
-            if store is None:
-                resolved_targets.add(types.identity_key(resolved["identity"]))
+        for ref in resolved["refs"]:
+            if ref.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
                 continue
-            for ref in resolved["refs"]:
-                if ref.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
-                    continue
-                abs_path = store.resolve_display_path(ref)
-                rel_path = project.to_relative_path(str(abs_path), proj_root)
-                resolved_targets.add(rel_path)
-            continue
+            target_set.add(project.to_relative_path(store.resolve_display_path(ref), proj_root))
 
-        resolved_targets.add(
-            project.to_relative_path(project.normalize_path(resolved["path"]), proj_root)
-        )
-
-    target_set = resolved_targets
     filtered_head_hashes = {k: v for k, v in head_hashes.items() if k in target_set}
 
     # Get workspace hashes
@@ -199,7 +180,7 @@ def diff(
                     temp_file.unlink(missing_ok=True)
 
 
-@cli_decorators.pivot_command(auto_discover=False)
+@cli_decorators.pivot_command()
 @click.argument("targets", nargs=-1, required=True)
 @click.option(
     "--rev",
@@ -230,7 +211,7 @@ def get(
 ) -> None:
     """Retrieve files or stage outputs from a specific git revision.
 
-    TARGETS can be file paths or stage names.
+    TARGETS can be file paths or stage outputs (``stage`` or ``stage:key``).
 
     \b
     Examples:
@@ -239,18 +220,39 @@ def get(
       pivot get --rev abc123 train                # Get all outputs from stage
     """
     cache_dir = config.get_cache_dir()
-    state_dir = config.get_state_dir()
 
     checkout_modes = (
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
     )
+
+    pipeline = cli_decorators.get_pipeline_from_context()
+    all_stages = {} if pipeline is None else cli_helpers.get_all_stages()
+    proj_root = project.get_project_root()
+    default_state_dir = config.get_state_dir()
+    stage_targets = dict[str, restore.StageTarget]()
+    for target in targets:
+        resolved = cli_targets.resolve_cli_target(target, all_stages)
+        if resolved is None:
+            continue
+        store = cli_helpers.require_workspace_store()
+        stage_name = resolved["stage_name"]
+        stage_targets[target] = restore.StageTarget(
+            stage_name=stage_name,
+            state_dir=registry.get_stage_state_dir(all_stages[stage_name], default_state_dir),
+            paths_by_key={
+                ref.identity.key: project.to_relative_path(
+                    store.resolve_display_path(ref), proj_root
+                )
+                for ref in resolved["refs"]
+            },
+        )
 
     messages, success = restore.restore_targets_from_revision(
         targets=list(targets),
         rev=rev,
         output=output,
         cache_dir=cache_dir,
-        state_dir=state_dir,
+        stage_targets=stage_targets,
         checkout_modes=checkout_modes,
         force=force,
     )

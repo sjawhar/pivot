@@ -7,10 +7,11 @@ import os
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import config, exceptions, metrics, project, registry, types
+from pivot import config, exceptions, metrics, names, project, registry, types
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.storage import cache, lock, track
+from pivot.storage import store as store_mod
 from pivot.types import DirHash, FileHash, HashInfo, RemoteStatus, TransferSummary, is_dir_hash
 
 if TYPE_CHECKING:
@@ -190,51 +191,56 @@ def get_target_hashes(
     _t = metrics.start()
     proj_root = project.get_project_root()
     hashes = set[str]()
+    output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
 
     for target in targets:
-        is_known_stage = all_stages is not None and target in all_stages
-        if is_known_stage:
-            assert all_stages is not None
-            stage_info = all_stages[target]
-            target_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
-            non_cached_paths = {
-                types.identity_key(out.identity)
-                for out in stage_info["outs"]
-                if out.tag is types.ArtifactTag.METRIC
-            }
+        original_target = target
+        target_identity = types.identity_from_key(target)
+        stage_name: str | None = None
+        if all_stages is not None:
+            resolved_name = names.resolve_stage_name(target_identity.producer, all_stages)
+            if resolved_name in all_stages:
+                stage_name = resolved_name
 
-            try:
-                stage_lock = lock.StageLock(target, lock.get_stages_dir(target_state_dir))
-            except ValueError:
-                stage_lock = None
+        if stage_name is not None and all_stages is not None:
+            if target_identity.key is None:
+                stage_info = all_stages[stage_name]
+                target_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+                non_cached_paths = {
+                    types.identity_key(out.identity)
+                    for out in stage_info["outs"]
+                    if out.tag is types.ArtifactTag.METRIC
+                }
 
-            if stage_lock is not None:
-                lock_data = stage_lock.read()
-                if lock_data is not None:
-                    for out_path, out_hash in lock_data["output_hashes"].items():
-                        if types.identity_key(out_path) not in non_cached_paths:
-                            hashes |= _extract_file_hashes_from_hash_info(out_hash)
-                    if include_deps:
-                        for dep_hash in lock_data["dep_hashes"].values():
-                            hashes |= _extract_file_hashes_from_hash_info(dep_hash)
+                try:
+                    stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(target_state_dir))
+                except ValueError:
+                    stage_lock = None
+
+                if stage_lock is not None:
+                    lock_data = stage_lock.read()
+                    if lock_data is not None:
+                        for out_path, out_hash in lock_data["output_hashes"].items():
+                            if types.identity_key(out_path) not in non_cached_paths:
+                                hashes |= _extract_file_hashes_from_hash_info(out_hash)
+                        if include_deps:
+                            for dep_hash in lock_data["dep_hashes"].values():
+                                hashes |= _extract_file_hashes_from_hash_info(dep_hash)
+                        continue
+            else:
+                resolved_identity = types.ArtifactIdentity(stage_name, target_identity.key)
+                out_hash = _get_file_hash_from_stages(
+                    types.identity_key(resolved_identity),
+                    state_dir,
+                    all_stages,
+                )
+                if out_hash is not None:
+                    hashes |= _extract_file_hashes_from_hash_info(out_hash)
                     continue
 
-        target_identity = types.identity_from_key(target)
-        is_identity_target = (
-            all_stages is not None
-            and target_identity.producer in all_stages
-            and target not in all_stages
-        )
-        if is_identity_target:
-            out_hash = _get_file_hash_from_stages(
-                types.identity_key(target_identity),
-                state_dir,
-                all_stages,
-            )
-            if out_hash is not None:
-                hashes |= _extract_file_hashes_from_hash_info(out_hash)
-                continue
+            unresolved.append(original_target)
+            continue
 
         # Strip .pvt suffix if present (CLI normalizes these, but be defensive)
         target_p = pathlib.Path(target)
@@ -244,6 +250,16 @@ def get_target_hashes(
 
         abs_path = str(project.normalize_path(target))
         rel_path = project.to_relative_path(abs_path, proj_root)
+
+        # A workspace path of a stage output stands for that output's identity.
+        if all_stages is not None:
+            if output_identities is None:
+                # Display paths depend only on qualified stage names, not the pipeline name.
+                workspace = store_mod.WorkspaceStore(proj_root, "", {})
+                output_identities = workspace.output_identities_by_path(
+                    out for stage_info in all_stages.values() for out in stage_info["outs"]
+                )
+            target_identity = output_identities.get(rel_path, target_identity)
 
         out_hash = _get_file_hash_from_stages(
             types.identity_key(target_identity), state_dir, all_stages

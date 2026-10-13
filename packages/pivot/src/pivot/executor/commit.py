@@ -64,18 +64,13 @@ def commit_stages(
         targets = all_stage_names
 
     default_state_dir = config.get_state_dir()
-    cache_dir = config.get_cache_dir()
-    files_cache_dir = cache_dir / "files"
-    config.get_checkout_mode_order()
     project_root = project.get_project_root()
-    store_spec = store_mod.StoreSpec(
-        kind="workspace",
-        cache_dir=str(files_cache_dir),
-        project_root=str(project_root),
+    store = store_mod.WorkspaceStore(
+        project_root=project_root,
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
+        cache_dir=config.get_cache_dir() / "files",
     )
-    store = store_mod.store_from_spec(store_spec)
 
     committed = list[str]()
     failed = list[str]()
@@ -165,6 +160,7 @@ def commit_stages(
                 identity = types.identity_from_key(identity_key)
                 try:
                     hash_info = store.hash_artifact(out)
+                    store.backup_to_cache(out, store.resolve_display_path(out))
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[identity] = hash_info
                 except FileNotFoundError:

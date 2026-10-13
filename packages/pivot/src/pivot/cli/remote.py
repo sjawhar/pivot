@@ -6,7 +6,7 @@ import pathlib
 
 import click
 
-from pivot import config, project, types
+from pivot import config, names, project, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -57,12 +57,12 @@ def _normalize_cli_targets(
 
     for target in targets:
         if known_stages is not None:
-            if target in known_stages:
-                normalized.append(target)
-                continue
             identity = types.identity_from_key(target)
-            if ":" in target and identity.producer in known_stages:
-                normalized.append(target)
+            stage_name = names.resolve_stage_name(identity.producer, dict.fromkeys(known_stages))
+            if stage_name in known_stages:
+                normalized.append(
+                    types.identity_key(types.ArtifactIdentity(stage_name, identity.key))
+                )
                 continue
 
         original = target

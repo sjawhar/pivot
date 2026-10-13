@@ -5,9 +5,10 @@ from typing import TypedDict
 
 import click
 
-from pivot import types
+from pivot import project, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.cli import targets as cli_targets
 
 
 class StageJsonOutput(TypedDict):
@@ -80,10 +81,12 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
     output_sources = _get_output_sources(stage_list) if show_deps else {}
 
     click.echo(f"Registered stages ({len(stage_list)}):")
+    store = cli_helpers.require_workspace_store()
+    project_root = project.get_project_root()
     for name in stage_list:
         info = cli_helpers.get_stage(name)
         deps = [types.identity_key(dep.identity) for dep in info["deps"].values()]
-        outs = [types.identity_key(out.identity) for out in info["outs"]]
+        outs = info["outs"]
         click.echo(f"  {name}")
 
         if show_deps or verbose:
@@ -98,4 +101,9 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
             if outs:
                 click.echo("    outs:")
                 for out in outs:
-                    click.echo(f"      {out}")
+                    output_path = project.to_relative_path(
+                        store.resolve_display_path(out), project_root
+                    )
+                    click.echo(
+                        f"      {cli_targets.format_identity_display(out.identity, output_path)}"
+                    )

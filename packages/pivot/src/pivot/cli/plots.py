@@ -4,12 +4,12 @@ import pathlib
 
 import click
 
-from pivot import outputs, path_policy, project
+from pivot import path_policy, project
 from pivot.cli import _run_common
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
 from pivot.show import plots as plots_mod
-from pivot.types import OutputFormat
+from pivot.types import ArtifactTag, OutputFormat
 
 
 @click.group()
@@ -88,7 +88,7 @@ def plots_diff(targets: tuple[str, ...], json_output: bool, md: bool, no_path: b
     proj_root = project.get_project_root()
     _run_common.ensure_stages_registered()
 
-    paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Plot)
+    paths = cli_targets.resolve_and_validate(targets, proj_root, ArtifactTag.PLOT)
     if paths is not None:
         # Filter lock file hashes to only requested paths
         all_old_hashes = plots_mod.get_plot_hashes_from_head()

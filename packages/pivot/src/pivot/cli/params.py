@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import click
 
-from pivot import config, exceptions
+from pivot import config
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -46,14 +46,10 @@ def params_show(
     """
     ensure_stages_registered(all_pipelines=all_pipelines)
     precision = precision if precision is not None else config.get_display_precision()
-    stages_list = list(stages) if stages else None
-    result = params_mod.collect_params_from_stages(stages_list)
+    stages_list = cli_helpers.resolve_stage_names(list(stages) if stages else None)
+    workspace_params = params_mod.collect_params_from_stages(stages_list)
 
-    if result["unknown_stages"]:
-        available = cli_helpers.list_stages()
-        raise exceptions.StageNotFoundError(result["unknown_stages"], available_stages=available)
-
-    output = params_mod.format_params_table(result["params"], output_format, precision)
+    output = params_mod.format_params_table(workspace_params, output_format, precision)
     click.echo(output)
 
 
@@ -87,22 +83,15 @@ def params_diff(
     """
     ensure_stages_registered(all_pipelines=all_pipelines)
     precision = precision if precision is not None else config.get_display_precision()
-    stages_list = list(stages) if stages else None
+    stages_list = cli_helpers.resolve_stage_names(list(stages) if stages else None)
 
     head_result = params_mod.get_params_from_head(stages_list)
-    workspace_result = params_mod.collect_params_from_stages(stages_list)
-
-    if workspace_result["unknown_stages"]:
-        available = cli_helpers.list_stages()
-        raise exceptions.StageNotFoundError(
-            workspace_result["unknown_stages"], available_stages=available
-        )
+    workspace_params = params_mod.collect_params_from_stages(stages_list)
 
     if not head_result["git_available"]:
         click.echo("Warning: Not in a git repository or no commits yet.", err=True)
 
     head_params = head_result["params"]
-    workspace_params = workspace_result["params"]
 
     if not head_params and not workspace_params:
         click.echo("No parameters found in registered stages.")

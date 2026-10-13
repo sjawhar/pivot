@@ -208,8 +208,8 @@ def test_checkout_unknown_identity_target_raises(
     result = runner.invoke(cli.cli, ["checkout", "train:nope"])
 
     assert result.exit_code != 0
-    assert "has no cached outputs" in result.output
-    assert "pivot repro train" in result.output
+    assert "Stage 'train' has no output key 'nope'" in result.output
+    assert "train:model" in result.output
 
 
 def test_checkout_directory_output_restores_contents(

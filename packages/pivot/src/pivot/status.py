@@ -411,14 +411,18 @@ def _pluralize(count: int, singular: str) -> str:
     return singular if count == 1 else f"{singular}s"
 
 
-def find_orphaned_lock_files(
-    registered_stages: set[str],
-    state_dir: pathlib.Path | None = None,
-) -> list[str]:
-    if state_dir is None:
-        state_dir = project.get_project_root() / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    return lock.find_orphaned_locks(stages_dir, registered_stages)
+def find_orphaned_lock_files(all_stages: dict[str, RegistryStageInfo]) -> list[str]:
+    """Find lock files in the registered stages' state dirs that belong to no registered stage."""
+    default_state_dir = config.get_state_dir()
+    state_dirs = {default_state_dir} | {
+        registry.get_stage_state_dir(stage_info, default_state_dir)
+        for stage_info in all_stages.values()
+    }
+    registered = set(all_stages)
+    orphaned = set[str]()
+    for state_dir in state_dirs:
+        orphaned.update(lock.find_orphaned_locks(lock.get_stages_dir(state_dir), registered))
+    return sorted(orphaned)
 
 
 def get_suggestions(
@@ -457,28 +461,6 @@ def get_suggestions(
         )
 
     return suggestions
-
-
-def what_if_changed(
-    paths: list[pathlib.Path],
-    all_stages: dict[str, RegistryStageInfo],
-    graph: nx.DiGraph[str] | None = None,
-) -> list[str]:
-    """Determine which stages would run if these paths changed.
-
-    Args:
-        paths: Paths that hypothetically changed (relative or absolute).
-        all_stages: Dict mapping stage names to RegistryStageInfo.
-        graph: Optional bipartite graph from Engine.
-
-    Returns:
-        List of stage names that would be affected.
-    """
-    if graph is None:
-        graph = engine_graph.build_graph(all_stages)
-
-    _ = graph, paths
-    return sorted(all_stages.keys())
 
 
 class ImportCheckStatus(enum.Enum):
