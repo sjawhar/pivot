@@ -4,6 +4,8 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
+import boto3
+
 from conftest import isolated_pivot_dir
 from pivot import cli, compose
 from pivot import status as status_mod
@@ -510,6 +512,81 @@ def test_status_shows_modified_tracked_files(
 
         assert result.exit_code == 0
         assert "modified" in result.output
+
+
+def test_status_counts_missing_tracked_file_and_explain_lists_it(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A tracked file deleted from the workspace is reported missing in text and explain modes."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
+        _write_tracked_file("tracked")
+        pathlib.Path("data.txt").unlink()
+
+        plain = runner.invoke(cli.cli, ["status", "--tracked-only"])
+        explained = runner.invoke(cli.cli, ["status", "--explain"])
+
+        assert plain.exit_code == 0, plain.output
+        assert "1 files: 0 clean, 0 modified, 1 missing" in plain.output
+        assert "data.txt" in plain.output
+        assert explained.exit_code == 0, explained.output
+        assert "No stages to run" in explained.output
+        assert "1 missing" in explained.output
+
+
+def test_status_remote_counts_files_absent_from_a_real_remote(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    moto_patch_session: None,
+) -> None:
+    """--remote compares the local cache with the configured S3 remote and suggests a push."""
+    bucket = f"pivot-status-{tmp_path.name[-8:].lower().replace('_', '-')}"
+    boto3.Session(region_name="us-east-1").client("s3").create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
+        pathlib.Path(".pivot", "config.yaml").write_text(f"remotes:\n  origin: s3://{bucket}/c\n")
+        pathlib.Path("data.txt").write_text("to push")
+        assert runner.invoke(cli.cli, ["track", "data.txt"]).exit_code == 0
+
+        text = runner.invoke(cli.cli, ["status", "--remote"])
+        explained = runner.invoke(cli.cli, ["--quiet", "status", "--remote", "--explain", "--json"])
+        assert runner.invoke(cli.cli, ["push"]).exit_code == 0
+        after_push = runner.invoke(cli.cli, ["--quiet", "status", "--remote-only", "--json"])
+
+    assert text.exit_code == 0, text.output
+    assert f"Remote Status (origin \u2192 s3://{bucket}/c)" in text.output
+    assert "\u2191 1 to push" in text.output
+    assert "Run `pivot push` to upload 1 file" in text.output
+    assert explained.exit_code == 0, explained.output
+    assert json.loads(explained.output)["remote"]["push_count"] == 1
+    assert after_push.exit_code == 0, after_push.output
+    assert json.loads(after_push.output)["remote"]["push_count"] == 0
+
+
+def test_status_remote_with_unusable_remote_url_fails(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path(".pivot", "config.yaml").write_text("remotes:\n  origin: https://x/c\n")
+
+        result = runner.invoke(cli.cli, ["status", "--remote"])
+
+    assert result.exit_code != 0
+    assert "Remote 'origin' must be a valid S3 URL" in result.output
+
+
+def test_status_remote_without_remotes_still_shows_local_sections(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--remote (unlike --remote-only) notes the missing remote and keeps going."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["status", "--remote"])
+
+    assert result.exit_code == 0, result.output
+    assert "No remotes configured" in result.output
+    assert "Tracked Files" in result.output
 
 
 # =============================================================================
