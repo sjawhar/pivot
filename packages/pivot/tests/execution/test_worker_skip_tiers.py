@@ -252,7 +252,9 @@ def test_restore_reports_matching_outputs_available_without_writing(
 
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
-    assert result == worker.OutputRestoreResult(available=True, outputs_restored=False)
+    assert result == worker.OutputRestoreResult(
+        available=True, outputs_restored=False, unavailable=[]
+    )
 
 
 def test_restore_verifies_directory_output(project: pathlib.Path, state_db: state.StateDB) -> None:
@@ -266,7 +268,9 @@ def test_restore_verifies_directory_output(project: pathlib.Path, state_db: stat
         store, [ref], {ref.identity: DirHash(hash=tree_hash, manifest=manifest)}, state_db
     )
 
-    assert result == worker.OutputRestoreResult(available=True, outputs_restored=False)
+    assert result == worker.OutputRestoreResult(
+        available=True, outputs_restored=False, unavailable=[]
+    )
 
 
 def test_restore_brings_back_deleted_output_from_cache(
@@ -279,7 +283,9 @@ def test_restore_brings_back_deleted_output_from_cache(
 
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
-    assert result == worker.OutputRestoreResult(available=True, outputs_restored=True)
+    assert result == worker.OutputRestoreResult(
+        available=True, outputs_restored=True, unavailable=[]
+    )
     assert path.read_text() == "cached out"
 
 
@@ -293,7 +299,9 @@ def test_restore_reports_output_without_recorded_hash_unavailable(
 
     result = _restore(store, [unrecorded, recorded], {recorded.identity: file_hash}, state_db)
 
-    assert result == worker.OutputRestoreResult(available=False, outputs_restored=False)
+    assert result == worker.OutputRestoreResult(
+        available=False, outputs_restored=False, unavailable=[unrecorded]
+    )
 
 
 def test_restore_reports_output_missing_from_cache_unavailable(
@@ -308,7 +316,9 @@ def test_restore_reports_output_missing_from_cache_unavailable(
 
     result = _restore(store, [ref], {ref.identity: FileHash(hash=file_hash)}, state_db)
 
-    assert result == worker.OutputRestoreResult(available=False, outputs_restored=False)
+    assert result == worker.OutputRestoreResult(
+        available=False, outputs_restored=False, unavailable=[ref]
+    )
     assert not path.exists()
 
 
@@ -327,7 +337,9 @@ def test_restore_reports_failed_restore_unavailable(
 
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
-    assert result == worker.OutputRestoreResult(available=False, outputs_restored=False)
+    assert result == worker.OutputRestoreResult(
+        available=False, outputs_restored=False, unavailable=[ref]
+    )
 
 
 def test_restore_on_cache_store_reports_whether_every_output_is_stored(

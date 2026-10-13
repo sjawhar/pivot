@@ -98,11 +98,6 @@ def test_lock_read_treats_arbitrary_bytes_as_missing_or_valid(content: bytes) ->
         assert result is None or isinstance(result["code_manifest"], dict)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="red test for Task 27: lock read must treat malformed identity fields as missing",
-)
 @pytest.mark.parametrize(
     "document",
     [
@@ -135,11 +130,6 @@ def test_lock_read_treats_wrongly_typed_identity_fields_as_missing(
     assert stage_lock.read() is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 27: is_lock_data must reject non-mapping params/code_manifest "
-    + "so status and repro agree the stage is stale",
-)
 @pytest.mark.parametrize(
     ("code_manifest", "params"),
     [
