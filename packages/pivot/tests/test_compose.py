@@ -419,6 +419,44 @@ def test_input_no_t_uses_extension_inference() -> None:
     assert isinstance(node.format, loaders.CSV)
 
 
+def test_input_redeclaration_with_different_path_raises(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*first.csv.*second.csv"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("data", path="data/first.csv", t=str)
+        pipeline.input("data", path="data/second.csv", t=str)
+
+
+def test_input_redeclaration_with_different_format_raises(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*format"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("data", path="data/input.csv", format=loaders.CSV())
+        pipeline.input("data", path="data/input.csv", format=loaders.Text())
+
+
+def test_identical_input_redeclaration_returns_existing_node(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        original = pipeline.input("data", path="data/input.csv", format=loaders.CSV())
+        repeated = pipeline.input("data", path="data/input.csv", format=loaders.CSV())
+
+    assert original._source is repeated._source
+
+
+def test_input_redeclaration_after_reentering_pipeline_raises(tmp_path: pathlib.Path) -> None:
+    pipeline = Pipeline("test", root=tmp_path)
+    with pipeline:
+        pipeline.input("data", path="data/first.csv", t=str)
+
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*first.csv.*second.csv"),
+        pipeline,
+    ):
+        pipeline.input("data", path="data/second.csv", t=str)
+
+
 def test_pipeline_context_basic() -> None:
     with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
         data = _helper_produce(params=stage_def.StageParams())

@@ -442,6 +442,24 @@ class Pipeline:
                 format = _infer_input_format_from_type(t)
             if format is None:
                 format = _infer_format_from_extension(path)
+        existing = self._inputs.get(name)
+        if existing is not None:
+            if existing.path != path:
+                raise exceptions.PipelineConfigError(
+                    f"Input binding conflict: input '{name}' is bound to '{existing.path}' "
+                    + f"and '{path}' in the same pipeline."
+                )
+            if existing.format != format:
+                raise exceptions.PipelineConfigError(
+                    f"Input binding conflict: input '{name}' at '{path}' changes format from "
+                    + f"{type(existing.format).__name__} to {type(format).__name__}."
+                )
+            return ArtifactHandle(
+                pipeline=self,
+                source=existing,
+                output_key=None,
+                python_type=existing.python_type or object,
+            )
         node = _InputNode(name=name, python_type=t, path=path, format=format)
         self._inputs[name] = node
         return ArtifactHandle(
