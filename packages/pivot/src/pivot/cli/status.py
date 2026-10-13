@@ -149,22 +149,15 @@ def status(
     else:
         stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
         stage_reasons = [(s["name"], s["reason"], s["upstream_stale"]) for s in pipeline_status]
-    # A stage downstream of a stale one is recomputed by repro, so pulling it is wasted.
-    outputs_missing = [
-        name
-        for name, reason, upstream_stale in stage_reasons
-        if reason == explain_mod.OUTPUTS_MISSING_REASON and not upstream_stale
-    ]
-    # Pull can restore only cacheable outputs; a metric-only mismatch is not pullable.
-    missing_outputs_count = (
-        len(
-            status_mod.stages_missing_cacheable_outputs(
-                outputs_missing, cli_helpers.get_all_stages(), cli_helpers.get_pipeline()
-            )
+    # Pull restores missing outputs without recomputing; skip the count when nothing would
+    # print it (quiet) or there is no remote to pull from.
+    missing_outputs_count = 0
+    if not quiet and remote_config.list_remotes():
+        missing_outputs_count = sum(
+            1
+            for _, reason, upstream_stale in stage_reasons
+            if reason == explain_mod.OUTPUTS_MISSING_REASON and not upstream_stale
         )
-        if outputs_missing
-        else 0
-    )
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
@@ -175,7 +168,7 @@ def status(
         pull_count,
         len(orphaned_locks),
         missing_outputs_count=missing_outputs_count,
-        remote_configured=missing_outputs_count > 0 and bool(remote_config.list_remotes()),
+        remote_configured=missing_outputs_count > 0,
     )
 
     # Quiet mode: no output, exit 1 if there are issues needing attention

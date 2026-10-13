@@ -45,7 +45,6 @@ Example::
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import enum
 import logging
 import pathlib
@@ -65,14 +64,12 @@ from pivot import (
     registry,
 )
 from pivot.engine import graph as engine_graph
-from pivot.executor import worker
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
-    ArtifactTag,
     CodeChange,
     DepChange,
     ParamChange,
@@ -434,47 +431,6 @@ def find_orphaned_lock_files(all_stages: dict[str, RegistryStageInfo]) -> list[s
     for state_dir in state_dirs:
         orphaned.update(lock.find_orphaned_locks(lock.get_stages_dir(state_dir), registered))
     return sorted(orphaned)
-
-
-def stages_missing_cacheable_outputs(
-    stage_names: list[str],
-    all_stages: dict[str, RegistryStageInfo],
-    pipeline: registry.PipelineLike,
-) -> list[str]:
-    """Return the stages whose locked cacheable outputs are missing or differ on disk.
-
-    Metric outputs are git-tracked and never in the cache or remote, so a stage whose
-    only mismatched output is a metric is excluded: `pivot pull` cannot restore it.
-    """
-    store = _make_workspace_store(pipeline)
-    default_state_dir = config.get_state_dir()
-    result = list[str]()
-    for stage_name in stage_names:
-        stage_info = all_stages[stage_name]
-        state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-        lock_data = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
-        if lock_data is None:
-            continue
-        state_context: contextlib.AbstractContextManager[state_mod.StateDB | None]
-        if (state_dir / "state.lmdb").exists():
-            state_context = state_mod.StateDB(state_dir, readonly=True)
-        else:
-            state_context = contextlib.nullcontext(None)
-        with state_context as state_db:
-            for out in stage_info["outs"]:
-                if out.tag is ArtifactTag.METRIC:
-                    continue
-                expected = lock_data["output_hashes"].get(out.identity)
-                if expected is None:
-                    continue
-                try:
-                    actual = worker.hash_output(store.resolve_display_path(out), state_db)
-                except OSError:
-                    actual = None
-                if actual != expected:
-                    result.append(stage_name)
-                    break
-    return result
 
 
 def get_suggestions(
