@@ -810,12 +810,30 @@ def _is_user_class_instance(value: Any) -> bool:
 
 
 def _is_callable_instance(value: Any) -> bool:
-    """Return whether `value` is a callable object rather than a function or class."""
-    return (
-        callable(value)
-        and not isinstance(value, (functools.partial, type))
-        and not inspect.isroutine(value)
-    )
+    """Return whether `value` is a callable object rather than a function or class.
+
+    A non-user module's own public callable (`numpy.log` is a `ufunc` instance) is a library
+    function, not module-level state, so it is not a callable instance here.
+    """
+    if (
+        not callable(value)
+        or isinstance(value, (functools.partial, type))
+        or inspect.isroutine(value)
+    ):
+        return False
+    return not _is_library_export(value)
+
+
+def _is_library_export(value: Any) -> bool:
+    """Return whether `value` is bound under its own name in its own non-user module."""
+    module_name = getattr(value, "__module__", None)
+    name = getattr(value, "__name__", None)
+    if not isinstance(module_name, str) or not isinstance(name, str):
+        return False
+    module = sys.modules.get(module_name)
+    if module is None or is_user_code(module):
+        return False
+    return vars(module).get(name) is value
 
 
 def _process_closure_values(

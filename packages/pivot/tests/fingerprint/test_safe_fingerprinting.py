@@ -70,6 +70,7 @@ class _ExternalCallable:
 
 EXTERNAL_CALLABLE = _ExternalCallable()
 COMPILED_PATTERN = re.compile("x")
+NUMPY_LOG = np.log  # What `from numpy import log` binds: a ufunc, a callable instance.
 
 
 def _callable_helper() -> int:
@@ -168,6 +169,7 @@ def _stage_uses_common_callables() -> int:
         + len(json.dumps({"value": 1}))
         + int(math.sqrt(4))
         + typing.cast("int", 1)
+        + int(NUMPY_LOG(1))
         + _decorated_user_function()
     )
 
