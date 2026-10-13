@@ -1,14 +1,16 @@
 """SKILL.md's "Common errors" table quotes the messages users actually see.
 
-Each case builds the mistake a row describes, runs the CLI, and checks two things: the row's
-quoted text is in SKILL.md, and the command prints the concrete message that text stands for.
-A final test checks that every row of the table has a case.
+Each case builds the mistake a row describes, runs the CLI, and checks three things: the row's
+quoted text is in SKILL.md, that quote matches the concrete message the case expects (with
+`<placeholder>` and quoted one-letter names such as `'x'` as wildcards), and the command prints
+that message. A final test checks that every row of the table has a case.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import pathlib
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -189,6 +191,28 @@ _CASES = {
 }
 
 
+_PLACEHOLDER = re.compile(r"<(?P<angle>[a-z]+)>|'(?P<letter>[A-Za-z])'")
+
+
+def _quote_pattern(doc: str) -> re.Pattern[str]:
+    """Compile a row's quote into a pattern; one placeholder name matches one value throughout."""
+    text = doc.strip("`")
+    parts = list[str]()
+    seen = set[str]()
+    position = 0
+    for match in _PLACEHOLDER.finditer(text):
+        parts.append(re.escape(text[position : match.start()]))
+        if match["angle"] is not None:
+            group, body, quote = f"angle_{match['angle']}", ".+?", ""
+        else:
+            group, body, quote = f"letter_{match['letter']}", "[^']+", "'"
+        parts.append(quote + (f"(?P={group})" if group in seen else f"(?P<{group}>{body})") + quote)
+        seen.add(group)
+        position = match.end()
+    parts.append(re.escape(text[position:]))
+    return re.compile("".join(parts))
+
+
 def _common_error_rows() -> list[str]:
     text = _SKILL.read_text()
     section = text.split("## Common errors", 1)[1].split("\n## ", 1)[0]
@@ -203,6 +227,7 @@ def test_common_error_is_quoted_as_the_cli_prints_it(
     case: _Case,
 ) -> None:
     assert any(case.doc in row for row in _common_error_rows()), case.doc
+    assert _quote_pattern(case.doc).search(case.observed), (case.doc, case.observed)
 
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         (cwd / "data" / "raw").mkdir(parents=True)
@@ -216,6 +241,36 @@ def test_common_error_is_quoted_as_the_cli_prints_it(
 
     assert result.exit_code != 0, result.output
     assert case.observed in result.output, result.output
+
+
+@pytest.mark.parametrize(
+    ("doc", "observed"),
+    [
+        pytest.param(
+            "`closure captures mutable variable 'X'`",
+            "captures non-scalar variable 'COLS' (type: list)",
+            id="stale-wording",
+        ),
+        pytest.param(
+            "`depends on input '<name>' (path data/raw/<name>), which does not exist`",
+            "depends on input 'a.csv' (path data/raw/b.csv), which does not exist",
+            id="one-placeholder-two-values",
+        ),
+        pytest.param(
+            "`Invalid variant name 'big one'`",
+            "Invalid stage name 'big one'",
+            id="literal-mismatch",
+        ),
+        pytest.param(
+            "`parameter 'x' has unsupported type`",
+            "parameter factor has unsupported type 'int'",
+            id="quotes-are-literal",
+        ),
+    ],
+)
+def test_quote_pattern_rejects_a_misquote(doc: str, observed: str) -> None:
+    """A quote that a row and its case agree on still fails when the CLI says something else."""
+    assert _quote_pattern(doc).search(observed) is None
 
 
 def test_every_common_error_row_has_a_case() -> None:
