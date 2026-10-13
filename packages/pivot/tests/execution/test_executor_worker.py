@@ -184,5 +184,6 @@ def test_execute_with_joblib_processes_override(
     assert worker._execute_with_joblib_protection(_identity, {"value": 7}) == 7
 
 
-# DirectoryOut, IncrementalOut, and old annotation injection tests are exercised
-# by the dedicated red suites and store-based worker coverage listed above.
+# Directory outputs (ArtifactTag.DIRECTORY refs) are exercised in test_worker_store.py,
+# test_execution_modes.py and test_path_output_ownership.py; incremental outputs in
+# test_incremental_outputs.py.
