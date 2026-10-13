@@ -125,9 +125,10 @@ def list_directory_from_remote_repo(
 ) -> list[str] | None:
     """List files in a directory from a remote repo via ``git archive``.
 
-    Returns a list of file paths (relative to repo root), or ``None``
-    on failure (path not found, repo inaccessible, timeout).
+    Returns file paths relative to ``path`` (including files in subdirectories),
+    or ``None`` on failure (path not found, repo inaccessible, timeout).
     """
+    prefix = path.rstrip("/") + "/"
     try:
         result = subprocess.run(
             ["git", "archive", f"--remote={repo_url}", rev, "--", path],
@@ -136,7 +137,7 @@ def list_directory_from_remote_repo(
             check=True,
         )
         with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
-            return [m.name.rsplit("/", 1)[-1] for m in tar.getmembers() if m.isfile()]
+            return [m.name.removeprefix(prefix) for m in tar.getmembers() if m.isfile()]
     except subprocess.CalledProcessError as e:
         logger.debug("git archive failed: %s", e.stderr)
         return None
