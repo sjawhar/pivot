@@ -463,28 +463,6 @@ def get_suggestions(
     return suggestions
 
 
-def what_if_changed(
-    paths: list[pathlib.Path],
-    all_stages: dict[str, RegistryStageInfo],
-    graph: nx.DiGraph[str] | None = None,
-) -> list[str]:
-    """Determine which stages would run if these paths changed.
-
-    Args:
-        paths: Paths that hypothetically changed (relative or absolute).
-        all_stages: Dict mapping stage names to RegistryStageInfo.
-        graph: Optional bipartite graph from Engine.
-
-    Returns:
-        List of stage names that would be affected.
-    """
-    if graph is None:
-        graph = engine_graph.build_graph(all_stages)
-
-    _ = graph, paths
-    return sorted(all_stages.keys())
-
-
 class ImportCheckStatus(enum.Enum):
     UP_TO_DATE = "up to date"
     UPDATE_AVAILABLE = "update available"
