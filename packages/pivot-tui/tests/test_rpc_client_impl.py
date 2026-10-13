@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
+from helpers import wait_for_socket as _wait_for_socket
 from pivot_tui.rpc_client_impl import RpcError, RpcPivotClient, RpcProtocolError
 from pivot_tui.testing import FakeRpcServer
 
@@ -23,13 +24,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from anyio.abc import SocketListener
-
-
-async def _wait_for_socket(socket_path: Path, timeout: float = 1.0) -> None:
-    with anyio.move_on_after(timeout):
-        while not socket_path.exists():
-            await anyio.sleep(0.01)
-    assert socket_path.exists()
 
 
 @contextlib.asynccontextmanager

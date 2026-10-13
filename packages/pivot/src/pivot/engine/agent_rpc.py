@@ -441,6 +441,8 @@ class AgentRpcSource:
                     }
                     with anyio.move_on_after(1.0):  # Brief timeout for error send
                         await conn.send(json.dumps(error_response).encode() + b"\n")
+            except (anyio.EndOfStream, anyio.BrokenResourceError):
+                _logger.debug("Agent client disconnected")
             except Exception:
                 _logger.exception("Error handling agent connection")
 
