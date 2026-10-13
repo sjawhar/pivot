@@ -62,6 +62,7 @@ def _configure_watch_sources(
     *,
     force: bool,
     stages: list[str] | None,
+    resource_capacity: dict[str, int],
     no_commit: bool,
     on_error: OnError,
 ) -> None:
@@ -73,6 +74,7 @@ def _configure_watch_sources(
                 stages=stages,
                 force=True,
                 reason="watch:initial:forced",
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
             )
@@ -94,6 +96,7 @@ def _configure_oneshot_source(
     stages: list[str] | None,
     *,
     force: bool,
+    resource_capacity: dict[str, int],
     no_commit: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
@@ -106,6 +109,7 @@ def _configure_oneshot_source(
             force=force,
             reason="cli",
             single_stage=False,  # Always resolve deps for repro
+            resource_capacity=resource_capacity,
             no_commit=no_commit,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
@@ -217,6 +221,7 @@ def _run_pipeline(
     no_commit: bool,
     on_error: OnError,
     serve: bool,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> dict[str, ExecutionSummary] | None:
@@ -294,6 +299,7 @@ def _run_pipeline(
             console=console,
             jsonl_callback=jsonl_callback,
             no_commit=no_commit,
+            resource_capacity=resource_capacity,
         )
 
     return _run_oneshot_mode(
@@ -308,6 +314,7 @@ def _run_pipeline(
         force=force,
         no_commit=no_commit,
         on_error=on_error,
+        resource_capacity=resource_capacity,
         allow_uncached_incremental=allow_uncached_incremental,
         checkout_missing=checkout_missing,
         run_id=run_id,
@@ -335,6 +342,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     console: tui_console.Console | None,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
     no_commit: bool,
+    resource_capacity: dict[str, int],
 ) -> None:
     """Run watch mode with unified event-driven execution."""
 
@@ -350,6 +358,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             debounce=debounce,
             on_error=on_error,
             no_commit=no_commit,
+            resource_capacity=resource_capacity,
         )
 
     # Build bipartite graph for watch paths
@@ -415,6 +424,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     debounce,
                     force=force,
                     stages=stages_list,
+                    resource_capacity=resource_capacity,
                     no_commit=no_commit,
                     on_error=on_error,
                 )
@@ -450,6 +460,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     debounce,
                     force=force,
                     stages=stages_list,
+                    resource_capacity=resource_capacity,
                     no_commit=no_commit,
                     on_error=on_error,
                 )
@@ -469,6 +480,7 @@ def _run_serve_mode(
     debounce: int,
     on_error: OnError,
     no_commit: bool,
+    resource_capacity: dict[str, int],
 ) -> None:
     """Run serve mode with Engine and agent RPC.
 
@@ -515,6 +527,7 @@ def _run_serve_mode(
                         stages=stages_list,
                         force=True,
                         reason="serve:initial",
+                        resource_capacity=resource_capacity,
                         no_commit=no_commit,
                         on_error=on_error,
                     )
@@ -562,6 +575,7 @@ def _run_oneshot_mode(
     force: bool,
     no_commit: bool,
     on_error: OnError,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
     run_id: str | None,
@@ -630,6 +644,7 @@ def _run_oneshot_mode(
                     eng,
                     stages_list,
                     force=force,
+                    resource_capacity=resource_capacity,
                     no_commit=no_commit,
                     on_error=on_error,
                     allow_uncached_incremental=allow_uncached_incremental,
@@ -669,6 +684,7 @@ def _run_oneshot_mode(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -769,6 +785,14 @@ def _run_oneshot_mode(
     help="Write TUI messages to JSONL file for monitoring",
 )
 @click.option(
+    "--resources",
+    "resource_capacity",
+    multiple=True,
+    callback=cli_helpers.parse_resource_capacities,
+    metavar="NAME=CAPACITY",
+    help="Set a scheduler resource capacity. May be repeated.",
+)
+@click.option(
     "--no-commit",
     is_flag=True,
     help="Skip writing lock files. Run 'pivot commit' to finalize.",
@@ -821,6 +845,7 @@ def repro(
     fail_fast: bool,
     keep_going: bool,
     serve: bool,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
     allow_missing: bool,
@@ -952,6 +977,7 @@ def repro(
             no_commit=no_commit,
             on_error=on_error,
             serve=serve,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )

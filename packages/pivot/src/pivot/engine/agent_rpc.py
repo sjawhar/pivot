@@ -542,6 +542,7 @@ class AgentRpcSource:
                 single_stage=False,
                 parallel=True,
                 max_workers=None,
+                resource_capacity={},
                 no_commit=False,
                 on_error=on_error,
                 cache_dir=None,

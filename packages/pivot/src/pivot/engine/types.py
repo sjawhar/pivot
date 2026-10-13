@@ -101,6 +101,7 @@ class RunRequested(TypedDict):
     single_stage: bool
     parallel: bool
     max_workers: int | None
+    resource_capacity: dict[str, int]
     no_commit: bool
     on_error: OnError
     cache_dir: pathlib.Path | None

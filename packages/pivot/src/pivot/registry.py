@@ -28,7 +28,7 @@ class RegistryStageInfo(TypedDict):
         deps: Named input dependencies (param name -> ArtifactRef).
         outs: Output specs as artifact references.
         params: Pydantic model instance with parameter values.
-        mutex: Mutex groups for exclusive execution.
+        resources: Scheduler resource requests declared on the stage.
         variant: Variant name for matrix stages (None for regular stages).
         signature: Function signature for parameter injection.
         fingerprint: Code fingerprint mapping (key -> hash), or None if not computed yet.
@@ -43,7 +43,7 @@ class RegistryStageInfo(TypedDict):
     deps: dict[str, types.ArtifactRef]
     outs: list[types.ArtifactRef]
     params: stage_def.StageParams | None
-    mutex: list[str]
+    resources: dict[str, int | str]
     variant: str | None
     signature: Signature | None
     fingerprint: dict[str, str] | None

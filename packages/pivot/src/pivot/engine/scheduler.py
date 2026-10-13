@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import StageExecutionState
-from pivot.executor import core as executor_core
 
 if TYPE_CHECKING:
     import networkx as nx
@@ -18,32 +17,34 @@ __all__ = ["Scheduler"]
 class Scheduler:
     """Synchronous, deterministic scheduler for stage execution.
 
-    Owns all scheduling state (stage states, upstream/downstream maps, mutex
-    counts) and produces deterministic decisions without async or IO.
+    Owns all scheduling state (stage states, upstream/downstream maps, and
+    scheduler-held resource permits) and produces deterministic decisions without
+    async or IO.
 
-    Determinism guarantee: when multiple stages are eligible to start,
-    the tie-breaker is ``_stage_states`` iteration order, which preserves
-    the ``execution_order`` passed to ``initialize()``.  This order is
-    seeded from the topological sort of the DAG.
+    Determinism guarantee: when multiple stages are eligible to start, the
+    tie-breaker is ``_stage_states`` iteration order, which preserves the
+    ``execution_order`` passed to ``initialize()``. This order is seeded from
+    the topological sort of the DAG.
 
-    The Engine delegates all scheduling decisions to this class while
-    retaining responsibility for async IO, event emission, and worker
-    submission.
+    The Engine delegates all scheduling decisions to this class while retaining
+    responsibility for async IO, event emission, and worker submission.
     """
 
     _stage_states: dict[str, StageExecutionState]
     _upstream_unfinished: dict[str, set[str]]
     _downstream: dict[str, list[str]]
-    _stage_mutex: dict[str, list[str]]
-    _mutex_counts: collections.defaultdict[str, int]
+    _stage_resources: dict[str, dict[str, int]]
+    _resource_capacity: dict[str, int]
+    _resource_counts: collections.defaultdict[str, int]
     _stop_starting_new: bool
 
     def __init__(self) -> None:
         self._stage_states = dict[str, StageExecutionState]()
         self._upstream_unfinished = dict[str, set[str]]()
         self._downstream = dict[str, list[str]]()
-        self._stage_mutex = dict[str, list[str]]()
-        self._mutex_counts = collections.defaultdict(int)
+        self._stage_resources = dict[str, dict[str, int]]()
+        self._resource_capacity = dict[str, int]()
+        self._resource_counts = collections.defaultdict(int)
         self._stop_starting_new = False
 
     @property
@@ -59,8 +60,8 @@ class Scheduler:
         self._stop_starting_new = value
 
     @property
-    def stage_mutex(self) -> dict[str, list[str]]:
-        return self._stage_mutex
+    def stage_resources(self) -> dict[str, dict[str, int]]:
+        return self._stage_resources
 
     @property
     def downstream(self) -> dict[str, list[str]]:
@@ -71,43 +72,34 @@ class Scheduler:
         execution_order: list[str],
         graph: nx.DiGraph[str] | None,
         *,
-        stage_mutex: dict[str, list[str]],
+        stage_resources: dict[str, dict[str, int]],
+        resource_capacity: dict[str, int],
     ) -> None:
-        """Reset and configure scheduler for a new execution.
-
-        Args:
-            execution_order: Stage names in topological order. This order
-                determines the determinism tie-breaker: when multiple stages
-                are eligible to start simultaneously, they are considered in
-                ``execution_order`` sequence (i.e., dict insertion order of
-                ``_stage_states``).
-            graph: Bipartite artifact-stage graph for deriving upstream/downstream
-                relationships. Pass None for single-stage or no-dependency runs.
-            stage_mutex: Mapping of stage name to mutex group names. Must contain
-                exactly the same keys as ``execution_order``.
-
-        Raises:
-            ValueError: If ``stage_mutex`` keys don't match ``execution_order``.
-        """
-        self._mutex_counts.clear()
+        """Reset and configure scheduler state for a new execution."""
+        self._resource_counts.clear()
         self._upstream_unfinished.clear()
         self._downstream.clear()
-        self._stage_mutex.clear()
+        self._stage_resources.clear()
+        self._resource_capacity = dict(resource_capacity)
         self._stage_states.clear()
         self._stop_starting_new = False
 
         stages_set = set(execution_order)
-        mutex_keys = set(stage_mutex.keys())
-        missing = stages_set - mutex_keys
-        extra = mutex_keys - stages_set
+        resource_keys = set(stage_resources)
+        missing = stages_set - resource_keys
+        extra = resource_keys - stages_set
         if missing or extra:
             parts = list[str]()
             if missing:
                 parts.append(f"missing: {sorted(missing)}")
             if extra:
                 parts.append(f"unknown: {sorted(extra)}")
-            msg = f"stage_mutex inconsistency — {', '.join(parts)}"
+            msg = f"stage resource inconsistency — {', '.join(parts)}"
             raise ValueError(msg)
+
+        for resource, capacity in self._resource_capacity.items():
+            if capacity <= 0:
+                raise ValueError(f"Resource {resource!r} has non-positive capacity {capacity}")
 
         for stage_name in execution_order:
             if graph is not None:
@@ -116,21 +108,17 @@ class Scheduler:
                     for upstream_name in engine_graph.get_upstream_stages(graph, stage_name)
                     if upstream_name in stages_set
                 ]
-            else:
-                upstream = []
-            self._upstream_unfinished[stage_name] = set(upstream)
-
-            if graph is not None:
                 downstream = [
                     downstream_name
                     for downstream_name in engine_graph.get_downstream_stages(graph, stage_name)
                     if downstream_name in stages_set
                 ]
             else:
+                upstream = []
                 downstream = []
+            self._upstream_unfinished[stage_name] = set(upstream)
             self._downstream[stage_name] = downstream
-
-            self._stage_mutex[stage_name] = stage_mutex[stage_name]
+            self._stage_resources[stage_name] = dict(stage_resources[stage_name])
 
             initial_state = (
                 StageExecutionState.READY if not upstream else StageExecutionState.PENDING
@@ -150,35 +138,29 @@ class Scheduler:
         self._stage_states[stage] = new_state
         return old_state, True
 
-    def can_start(self, stage: str, *, running_count: int) -> bool:
+    def can_start(self, stage: str) -> bool:
+        """Return whether all scheduler-held resources are available for a ready stage."""
         if self.get_state(stage) != StageExecutionState.READY:
             return False
-
         if self._upstream_unfinished.get(stage):
             return False
-
-        stage_mutexes = self._stage_mutex.get(stage, [])
-        is_exclusive = executor_core.EXCLUSIVE_MUTEX in stage_mutexes
-
-        for mutex in stage_mutexes:
-            if mutex == executor_core.EXCLUSIVE_MUTEX:
-                if self._mutex_counts[mutex] > 0 or running_count > 0:
-                    return False
-            elif self._mutex_counts[mutex] > 0:
+        for resource, request in self._stage_resources[stage].items():
+            if self._resource_counts[resource] + request > self._resource_capacity[resource]:
                 return False
+        return True
 
-        return is_exclusive or self._mutex_counts[executor_core.EXCLUSIVE_MUTEX] == 0
+    def acquire_resources(self, stage: str) -> None:
+        """Reserve a stage's resources immediately before it is admitted."""
+        for resource, request in self._stage_resources[stage].items():
+            self._resource_counts[resource] += request
 
-    def acquire_mutexes(self, stage: str) -> None:
-        for mutex in self._stage_mutex.get(stage, []):
-            self._mutex_counts[mutex] += 1
-
-    def release_mutexes(self, stage: str) -> None:
-        for mutex in self._stage_mutex.get(stage, []):
-            if self._mutex_counts[mutex] <= 0:
-                msg = f"Mutex '{mutex}' released when not held (stage '{stage}')"
+    def release_resources(self, stage: str) -> None:
+        """Release all resources held for a completed stage."""
+        for resource, request in self._stage_resources[stage].items():
+            if self._resource_counts[resource] < request:
+                msg = f"Resource {resource!r} released when not held (stage {stage!r})"
                 raise ValueError(msg)
-            self._mutex_counts[mutex] -= 1
+            self._resource_counts[resource] -= request
 
     def on_stage_completed(
         self, stage: str, failed: bool

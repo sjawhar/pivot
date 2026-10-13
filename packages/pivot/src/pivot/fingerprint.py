@@ -1388,6 +1388,27 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.hash_function_ast", _t)
 
 
+def _strip_resource_stage_decorators(tree: ast.AST) -> None:
+    """Exclude scheduler-only @stage(resources=...) declarations from code hashes."""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        node.decorator_list = [
+            decorator
+            for decorator in node.decorator_list
+            if not (
+                isinstance(decorator, ast.Call)
+                and (
+                    isinstance(decorator.func, ast.Name)
+                    and decorator.func.id == "stage"
+                    or isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "stage"
+                )
+                and any(keyword.arg == "resources" for keyword in decorator.keywords)
+            )
+        ]
+
+
 def _compute_function_hash(func: Callable[..., Any]) -> str:
     """Compute hash for a function (uncached implementation)."""
     _t = metrics.start()
@@ -1435,6 +1456,8 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.ast_parse", _t_parse)
 
         _t_norm = metrics.start()
+        if hasattr(func, "__pivot_resources__"):
+            _strip_resource_stage_decorators(tree)
         tree = _normalize_ast(tree)
         ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
         metrics.end("fingerprint.normalize_and_dump", _t_norm)
