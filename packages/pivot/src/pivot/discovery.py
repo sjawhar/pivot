@@ -1,10 +1,11 @@
 # pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
+import importlib
 import logging
 import pathlib
-import runpy
-from typing import Final, cast
+import sys
+from typing import Final
 
 from pivot import fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
@@ -16,6 +17,60 @@ PIPELINE_PY_NAME: Final = "pipeline.py"
 
 class DiscoveryError(Exception):
     """Error during pipeline discovery."""
+
+
+_PIPELINE_MODULE_NAMES = set[str]()
+_PIPELINE_IMPORT_ROOTS = set[str]()
+
+
+def _remove_imported_pipeline_modules() -> None:
+    """Clear project modules and import roots retained from the previous discovery."""
+    for module_name in _PIPELINE_MODULE_NAMES:
+        sys.modules.pop(module_name, None)
+    _PIPELINE_MODULE_NAMES.clear()
+    for root in _PIPELINE_IMPORT_ROOTS:
+        while root in sys.path:
+            sys.path.remove(root)
+    _PIPELINE_IMPORT_ROOTS.clear()
+
+
+def _activate_import_root(root: pathlib.Path) -> None:
+    """Put the project root first on sys.path for project-local imports."""
+    root_str = str(root)
+    while root_str in sys.path:
+        sys.path.remove(root_str)
+    sys.path.insert(0, root_str)
+    _PIPELINE_IMPORT_ROOTS.add(root_str)
+    importlib.invalidate_caches()
+
+
+def _module_name_for_path(path: pathlib.Path, root: pathlib.Path) -> str:
+    """Return the stable dotted module name for a pipeline.py path below root."""
+    try:
+        relative_path = path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise DiscoveryError(f"Pipeline {path} is outside import root {root}") from exc
+    return ".".join(relative_path.with_suffix("").parts)
+
+
+def _remember_project_modules(root: pathlib.Path, pipeline_module_name: str) -> None:
+    """Remember project modules so the next discovery starts without stale imports."""
+    _PIPELINE_MODULE_NAMES.add(pipeline_module_name)
+    _PIPELINE_MODULE_NAMES.update(
+        ".".join(pipeline_module_name.split(".")[:index])
+        for index in range(1, len(pipeline_module_name.split(".")))
+    )
+    for module_name, module in list(sys.modules.items()):
+        if module_name == "pivot" or module_name.startswith("pivot."):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        try:
+            if pathlib.Path(module_file).resolve().is_relative_to(root):
+                _PIPELINE_MODULE_NAMES.add(module_name)
+        except (OSError, ValueError):
+            continue
 
 
 def find_config_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
@@ -61,13 +116,15 @@ def discover_pipeline(
     """
     _t = metrics.start()
     try:
-        root = project_root or project.get_project_root()
+        root = (project_root or project.get_project_root()).resolve()
+        _remove_imported_pipeline_modules()
+        _activate_import_root(root)
 
         if all_pipelines:
             return _discover_all_pipelines(root)
         try:
             cwd = pathlib.Path.cwd().resolve()
-            root_resolved = root.resolve()
+            root_resolved = root
         except OSError as e:
             raise DiscoveryError(f"Failed to resolve paths: {e}") from e
 
@@ -88,7 +145,7 @@ def discover_pipeline(
         # pipeline.py
         _t_module = metrics.start()
         try:
-            return _load_pipeline_from_module(config_path)
+            return _load_pipeline_from_module(config_path, root)
         except SystemExit as e:
             raise DiscoveryError(f"Pipeline {config_path} called sys.exit({e.code})") from e
         except DiscoveryError:
@@ -104,15 +161,26 @@ def discover_pipeline(
         metrics.end("discovery.total", _t)
 
 
-def _load_pipeline_from_module(path: pathlib.Path) -> PipelineLike | None:
-    """Load Pipeline instance from a pipeline.py file.
-
-    Returns None if the file doesn't define a 'pipeline' variable.
-    Raises DiscoveryError if:
-    - 'pipeline' variable exists but isn't a Pipeline instance
-    - A Pipeline instance exists under a different variable name (likely typo)
-    """
-    module_dict = cast("dict[str, object]", runpy.run_path(str(path), run_name="_pivot_pipeline"))
+def _load_pipeline_from_module(
+    path: pathlib.Path, import_root: pathlib.Path | None = None
+) -> PipelineLike | None:
+    """Load Pipeline from pipeline.py as its stable root-relative Python module."""
+    inferred_import_root = import_root is None
+    import_root = (import_root or path.parent).resolve()
+    if inferred_import_root:
+        _activate_import_root(import_root)
+    resolved_path = path.resolve()
+    module_name = _module_name_for_path(resolved_path, import_root)
+    module = sys.modules.get(module_name)
+    if module is not None:
+        module_file = getattr(module, "__file__", None)
+        if module_file is None or pathlib.Path(module_file).resolve() != resolved_path:
+            sys.modules.pop(module_name, None)
+            module = None
+    if module is None:
+        module = importlib.import_module(module_name)
+    _remember_project_modules(import_root, module_name)
+    module_dict = vars(module)
 
     # Look for 'pipeline' variable
     pipeline_obj = module_dict.get("pipeline")
@@ -157,7 +225,11 @@ def _discover_all_pipelines(root: pathlib.Path) -> PipelineLike | None:
 
     pipelines = list[PipelineLike]()
     for path in config_paths:
-        pipeline = load_pipeline_from_path(path)
+        try:
+            pipeline = _load_pipeline_from_module(path, root)
+        except DiscoveryError as e:
+            logger.warning(f"--all: failed to load pipeline from {path}, skipping ({e})")
+            continue
         if pipeline is not None:
             pipelines.append(pipeline)
             logger.info(f"  {pipeline.name}: {path} ({len(pipeline.list_stages())} stages)")
@@ -250,20 +322,24 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
 def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:
     """Load a Pipeline from a pipeline.py file.
 
-    Args:
-        path: pathlib.Path to pipeline.py file.
-
-    Returns:
-        Pipeline instance, or None if file doesn't define one.
-        Returns None (with debug log) on load errors.
+    Paths below the active project use project-relative module names. A standalone path uses
+    its parent as an import root so its sibling modules remain importable.
     """
-
     if path.name != PIPELINE_PY_NAME:
         logger.debug(f"Unknown pipeline file type: {path}")
         return None
 
+    resolved_path = path.resolve()
     try:
-        return _load_pipeline_from_module(path)
+        project_root = project.get_project_root().resolve()
+    except Exception:
+        project_root = resolved_path.parent
+    import_root = (
+        project_root if resolved_path.is_relative_to(project_root) else resolved_path.parent
+    )
+    _activate_import_root(import_root)
+    try:
+        return _load_pipeline_from_module(resolved_path, import_root)
     except DiscoveryError as e:
         # Log at warning level - user likely made a typo (e.g., wrong variable name)
         logger.warning(f"Pipeline discovery issue in {path}: {e}")

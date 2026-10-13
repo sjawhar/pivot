@@ -1,14 +1,12 @@
 # pyright: reportMissingImports=false
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pathlib
+import sys
 
 import pytest
 
 from pivot import discovery
-
-if TYPE_CHECKING:
-    import pathlib
 
 
 def test_find_config_in_dir_ignores_pivot_yaml(tmp_path: pathlib.Path) -> None:
@@ -90,3 +88,194 @@ pipeline = FakePipeline()
 
     message = str(excinfo.value)
     assert "missing required methods" in message
+
+
+def test_discover_pipeline_fingerprints_helper_defined_in_pipeline(
+    tmp_path: pathlib.Path,
+) -> None:
+    (tmp_path / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+def normalize(value: str) -> str:
+    return value.strip()
+
+
+@stage
+def preprocess(value: str) -> str:
+    return normalize(value)
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    preprocess(pipeline.input("value.txt", t=str))
+"""
+    )
+
+    pipeline = discovery.discover_pipeline(project_root=tmp_path)
+
+    assert pipeline is not None
+    assert "func:normalize" in pipeline.ensure_fingerprint("test/preprocess")
+
+
+def test_discover_root_pipeline_imports_sibling_stages_module(tmp_path: pathlib.Path) -> None:
+    (tmp_path / "stages.py").write_text(
+        """
+from pivot.compose import stage
+
+
+@stage
+def clean(value: str) -> str:
+    return value.strip()
+"""
+    )
+    (tmp_path / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline
+from stages import clean
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    clean(pipeline.input("value.txt", t=str))
+"""
+    )
+
+    pipeline = discovery.discover_pipeline(project_root=tmp_path)
+
+    assert pipeline is not None
+    assert pipeline.list_stages() == ["test/clean"]
+
+
+def test_discover_subdirectory_pipeline_imports_package_helper(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "helpers.py").write_text(
+        """
+def clean(value: str) -> str:
+    return value.strip()
+"""
+    )
+    (report / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline, stage
+from report.helpers import clean
+
+
+@stage
+def preprocess(value: str) -> str:
+    return clean(value)
+
+
+with Pipeline("report", root=pathlib.Path(__file__).parent) as pipeline:
+    preprocess(pipeline.input("value.txt", t=str))
+"""
+    )
+    monkeypatch.chdir(report)
+
+    pipeline = discovery.discover_pipeline(project_root=tmp_path)
+
+    assert pipeline is not None
+    assert pipeline.list_stages() == ["report/preprocess"]
+    assert "func:clean" in pipeline.ensure_fingerprint("report/preprocess")
+
+
+def test_discover_all_reuses_pipeline_imported_by_another_pipeline(
+    tmp_path: pathlib.Path,
+) -> None:
+    prep = tmp_path / "prep"
+    prep.mkdir()
+    (prep / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+with (pathlib.Path(__file__).with_name("loads.txt")).open("a") as loads:
+    loads.write("prep\\n")
+
+
+@stage
+def kept(value: str) -> str:
+    return value
+
+
+with Pipeline("prep", root=pathlib.Path(__file__).parent) as pipeline:
+    kept_handle = kept(pipeline.input("value.txt", t=str))
+"""
+    )
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline, stage
+from prep.pipeline import kept_handle
+
+
+@stage
+def consume(value: str) -> str:
+    return value
+
+
+with Pipeline("report", root=pathlib.Path(__file__).parent) as pipeline:
+    consume(kept_handle)
+"""
+    )
+
+    pipeline = discovery.discover_pipeline(project_root=tmp_path, all_pipelines=True)
+
+    assert pipeline is not None
+    assert set(pipeline.list_stages()) == {"prep/kept", "report/consume"}
+    assert (prep / "loads.txt").read_text().splitlines() == ["prep"]
+
+
+def test_discover_pipeline_replaces_modules_and_import_root_between_projects(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A later discovery does not reuse a same-named module from an earlier project."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for root, value in ((first, "first"), (second, "second")):
+        root.mkdir()
+        (root / "stages.py").write_text(
+            f"""
+from pivot.compose import stage
+
+
+@stage
+def clean(value: str) -> str:
+    return "{value}"
+"""
+        )
+        (root / "pipeline.py").write_text(
+            """
+import pathlib
+
+from pivot.compose import Pipeline
+from stages import clean
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    clean(pipeline.input("value.txt", t=str))
+"""
+        )
+
+    first_pipeline = discovery.discover_pipeline(project_root=first)
+    second_pipeline = discovery.discover_pipeline(project_root=second)
+
+    assert first_pipeline is not None
+    assert second_pipeline is not None
+    module_file = getattr(sys.modules["stages"], "__file__", None)
+    assert isinstance(module_file, str)
+    assert pathlib.Path(module_file).resolve() == (second / "stages.py")
+    assert str(first) not in sys.path
+    assert str(second) == sys.path[0]
