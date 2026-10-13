@@ -137,14 +137,6 @@ def parse_stage_name(name: str) -> tuple[str, str]:
     return (name, "")
 
 
-class StageDisplayStatus(enum.StrEnum):
-    """Display status for stage progress output."""
-
-    FINGERPRINTING = "fingerprinting"
-    RUNNING = "running"
-    WAITING = "waiting"
-
-
 class OnError(enum.StrEnum):
     """Error handling mode."""
 
