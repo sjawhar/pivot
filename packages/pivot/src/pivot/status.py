@@ -92,6 +92,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
+"""Reason prefix for a stage that is current on its own but has a stale upstream."""
+
 
 def _discover_tracked_files(
     allow_missing: bool,
@@ -248,7 +251,11 @@ def _compute_explanations_with_upstream(
         reason = (
             exp["reason"]
             if exp["will_run"]
-            else (f"Upstream stale ({', '.join(upstream_stale)})" if upstream_stale else "")
+            else (
+                f"{UPSTREAM_STALE_REASON_PREFIX} ({', '.join(upstream_stale)})"
+                if upstream_stale
+                else ""
+            )
         )
 
         # Create new explanation with upstream_stale populated

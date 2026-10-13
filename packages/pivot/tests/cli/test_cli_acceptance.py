@@ -6,6 +6,7 @@ the way a user does, so it covers discovery, config and the real command wiring.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import subprocess
@@ -289,6 +290,67 @@ def test_status_does_not_suggest_pull_for_stage_whose_upstream_is_stale(
 def test_status_in_plain_clone_counts_every_stage_pull_restores(tmp_path: pathlib.Path) -> None:
     """A downstream stage stale only because its upstream's outputs are also missing is pullable."""
     clone = _chain_clone(tmp_path)
+
+    out = _ok(_pivot(clone, "status"))
+
+    assert "Run `pivot pull` to restore outputs of 2 stages from the remote" in out, out
+
+
+def test_status_quiet_json_keeps_pull_suggestion(tmp_path: pathlib.Path) -> None:
+    """`-q` drops chatter, but `--json` still prints suggestions, including the pull line."""
+    clone = _chain_clone(tmp_path)
+
+    out = _ok(_pivot(clone, "-q", "status", "--json"))
+
+    suggestions = json.loads(out)["suggestions"]
+    assert "Run `pivot pull` to restore outputs of 2 stages from the remote" in suggestions, out
+
+
+_METRIC_MIDDLE_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, metric, stage
+
+
+@stage
+def clean(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * 2
+
+
+@stage
+def summarize(cleaned: pd.DataFrame) -> Annotated[dict, metric]:
+    return {"rows": int(len(cleaned))}
+
+
+@stage
+def report(stats: dict) -> dict:
+    return {"seen": stats["rows"]}
+
+
+with Pipeline("r") as pipeline:
+    report(summarize(clean(pipeline.input("t.csv"))))
+"""
+
+
+def test_status_pull_count_passes_through_committed_metric_stage(tmp_path: pathlib.Path) -> None:
+    """A committed metric between two data stages must not hide the downstream data stage."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(src, {"pipeline.py": _METRIC_MIDDLE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(src, "repro"))
+    _ok(_pivot(src, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    (src / ".gitignore").write_text("data/r/\n")
+    subprocess.run(["git", "add", "-A"], cwd=src, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=src,
+        check=True,
+    )
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    assert (clone / "metrics" / "r" / "summarize.yaml").is_file()
 
     out = _ok(_pivot(clone, "status"))
 
