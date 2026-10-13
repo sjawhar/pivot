@@ -79,6 +79,7 @@ class _DependencyStore:
     ) -> HashInfo:
         raise AssertionError(f"not used by dependency validation: {ref} {state_db}")
 
+
 # --- Basic DAG construction tests ---
 
 
