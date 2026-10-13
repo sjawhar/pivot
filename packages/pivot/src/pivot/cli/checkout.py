@@ -111,9 +111,14 @@ def _restore_path_sync(
                 # inner files; never overwrite or swap out files already on disk.
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return ("skipped", path.name)
-                restored, unavailable = cache.restore_missing_in_directory(
+                restored, unavailable, divergent = cache.restore_missing_in_directory(
                     path, output_hash, cache_dir, checkout_modes
                 )
+                if divergent:
+                    raise click.ClickException(
+                        f"'{path.name}' has files that differ from the target: "
+                        + f"{', '.join(divergent)}. Use --force to overwrite."
+                    )
                 if unavailable:
                     return ("missing", path.name)
                 return ("restored" if restored else "skipped", path.name)

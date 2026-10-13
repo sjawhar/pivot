@@ -760,37 +760,84 @@ def restore_missing_in_directory(
     output_hash: DirHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
-) -> tuple[int, int]:
-    """Restore only the manifest files missing from an existing directory.
+) -> tuple[int, int, list[str]]:
+    """Restore a directory's missing target files only when retained content matches.
 
-    Additive: files already on disk (edited or not) and files outside the manifest
-    are left untouched.
+    Existing files that differ from the target manifest (including files removed
+    from the new manifest) are reported as divergent. No files are restored when
+    divergence exists, so ``--only-missing`` never leaves a silently hybrid tree.
 
     Returns:
-        (restored_count, unavailable_count), where unavailable counts missing files
-        whose blob is absent from the cache.
+        (restored_count, unavailable_count, divergent_relpaths).
     """
+    lexical_base = pathlib.Path(os.path.abspath(path))
     resolved_base = path.resolve()
-    restored = 0
-    unavailable = 0
+    expected_paths = set[str]()
+    missing = list[tuple[DirManifestEntry, pathlib.Path, pathlib.Path]]()
+    divergent = set[str]()
+
     for entry in output_hash["manifest"]:
-        file_path = path / entry["relpath"]
-        if not file_path.resolve().is_relative_to(resolved_base):
+        relpath = entry["relpath"]
+        expected_paths.add(relpath)
+        file_path = path / relpath
+        lexical_path = pathlib.Path(os.path.abspath(file_path))
+        if not lexical_path.is_relative_to(lexical_base):
             raise exceptions.SecurityValidationError(
-                f"Manifest contains path traversal: {entry['relpath']!r}"
+                f"Manifest contains path traversal: {relpath!r}"
             )
-        if file_path.exists() or file_path.is_symlink():
-            continue
+
         file_cache_path = get_cache_path(cache_dir, entry["hash"])
-        if not file_cache_path.exists():
-            unavailable += 1
+        if file_path.is_symlink():
+            if not file_path.parent.resolve().is_relative_to(resolved_base):
+                raise exceptions.SecurityValidationError(
+                    f"Manifest contains path traversal: {relpath!r}"
+                )
+            if file_path.resolve() == file_cache_path.resolve():
+                if not file_cache_path.exists():
+                    missing.append((entry, file_path, file_cache_path))
+            else:
+                divergent.add(relpath)
             continue
+        if file_path.exists():
+            if not file_path.is_file():
+                divergent.add(relpath)
+                continue
+            file_hash, _ = hash_file(file_path)
+            if file_hash != entry["hash"]:
+                divergent.add(relpath)
+            continue
+        if not file_path.parent.resolve().is_relative_to(resolved_base):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {relpath!r}"
+            )
+        missing.append((entry, file_path, file_cache_path))
+
+    def _extra_relpaths(directory: pathlib.Path) -> Generator[str]:
+        """Yield non-ignored file or symlink paths without following symlink directories."""
+        with os.scandir(directory) as entries:
+            for existing_entry in entries:
+                if _should_skip_entry(existing_entry):
+                    continue
+                existing_path = pathlib.Path(existing_entry.path)
+                if existing_entry.is_symlink() or existing_entry.is_file():
+                    yield str(existing_path.relative_to(path))
+                elif existing_entry.is_dir():
+                    yield from _extra_relpaths(existing_path)
+
+    for relpath in _extra_relpaths(path):
+        if relpath not in expected_paths:
+            divergent.add(relpath)
+    unavailable = sum(1 for _, _, file_cache_path in missing if not file_cache_path.exists())
+    if divergent or unavailable:
+        return (0, unavailable, sorted(divergent))
+
+    for entry, file_path, file_cache_path in missing:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         _checkout_with_fallback(
             file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
         )
-        restored += 1
-    return (restored, unavailable)
+
+    return (len(missing), 0, [])
 
 
 def protect(path: pathlib.Path) -> None:

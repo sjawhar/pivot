@@ -4,15 +4,41 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pivot import cli, config, project
+from pivot import cli, config, project, types
+from pivot.remote import storage as remote_storage
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
     import pathlib
 
     import click.testing
+    from pytest_mock import MockerFixture
 
     from pivot.registry import PipelineLike
+
+
+def test_pull_only_missing_accepts_existing_cache_file_symlinks(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    data_dir = _helper_track_directory(project.get_project_root())
+    cache.remove_output(data_dir)
+    restored = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "symlink", "data/ext"])
+    assert restored.exit_code == 0, restored.output
+
+    mocker.patch(
+        "pivot.remote.sync.create_remote_from_name",
+        return_value=(mocker.Mock(spec=remote_storage.S3Remote), "origin"),
+    )
+    mocker.patch(
+        "pivot.remote.sync.pull",
+        return_value=types.TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+    )
+
+    result = runner.invoke(cli.cli, ["pull", "--checkout-mode", "symlink", "data/ext"])
+
+    assert result.exit_code == 0, result.output
+    assert (data_dir / "a.txt").is_symlink()
+    assert (data_dir / "b.txt").is_symlink()
 
 
 def _helper_track_directory(root: pathlib.Path) -> pathlib.Path:
@@ -38,7 +64,98 @@ def _helper_track_directory(root: pathlib.Path) -> pathlib.Path:
     return data_dir
 
 
-def test_checkout_only_missing_keeps_edited_file_in_directory(
+def _helper_cache_directory(path: pathlib.Path, contents: dict[str, str]) -> track.PvtData:
+    path.mkdir(parents=True)
+    for relpath, content in contents.items():
+        file_path = path / relpath
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content)
+    output_hash = cache.save_to_cache(
+        path, config.get_cache_dir() / "files", checkout_mode=config.CheckoutMode.COPY
+    )
+    assert "manifest" in output_hash
+    return track.PvtData(
+        path="ext",
+        hash=output_hash["hash"],
+        size=sum(len(content) for content in contents.values()),
+        num_files=len(contents),
+        manifest=output_hash["manifest"],
+    )
+
+
+def test_checkout_only_missing_accepts_existing_cache_file_symlinks(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    data_dir = _helper_track_directory(project.get_project_root())
+    cache.remove_output(data_dir)
+
+    restored = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "symlink", "data/ext"])
+    assert restored.exit_code == 0, restored.output
+    assert (data_dir / "a.txt").is_symlink()
+
+    checked = runner.invoke(
+        cli.cli, ["checkout", "--only-missing", "--checkout-mode", "symlink", "data/ext"]
+    )
+
+    assert checked.exit_code == 0, checked.output
+    assert (data_dir / "a.txt").is_symlink()
+    assert (data_dir / "b.txt").is_symlink()
+
+
+def test_pull_reports_directory_that_would_be_hybrid(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    root = project.get_project_root()
+    data_dir = _helper_track_directory(root)
+    new_pvt_data = _helper_cache_directory(
+        root / "new-ext",
+        {"a.txt": "one updated\n", "c.txt": "three\n"},
+    )
+    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+
+    mocker.patch(
+        "pivot.remote.sync.create_remote_from_name",
+        return_value=(mocker.Mock(spec=remote_storage.S3Remote), "origin"),
+    )
+    mocker.patch(
+        "pivot.remote.sync.pull",
+        return_value=types.TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+    )
+
+    result = runner.invoke(cli.cli, ["pull", "data/ext"])
+
+    assert result.exit_code != 0
+    assert "a.txt" in result.output
+    assert "b.txt" in result.output
+    assert "--force" in result.output
+    assert not (data_dir / "c.txt").exists(), "A refused pull must not partially restore files"
+
+
+def test_checkout_only_missing_refuses_directory_that_would_be_hybrid(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    root = project.get_project_root()
+    data_dir = _helper_track_directory(root)
+    new_pvt_data = _helper_cache_directory(
+        root / "new-ext",
+        {"a.txt": "one updated\n", "c.txt": "three\n"},
+    )
+    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+
+    result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
+
+    assert result.exit_code != 0
+    assert "a.txt" in result.output
+    assert "b.txt" in result.output
+    assert "--force" in result.output
+    assert (data_dir / "a.txt").read_text() == "one\n"
+    assert (data_dir / "b.txt").read_text() == "two\n"
+    assert not (data_dir / "c.txt").exists(), (
+        "A failed checkout must not partially restore new files"
+    )
+
+
+def test_checkout_only_missing_reports_edited_file_in_directory(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
     data_dir = _helper_track_directory(project.get_project_root())
@@ -47,12 +164,14 @@ def test_checkout_only_missing_keeps_edited_file_in_directory(
 
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code != 0
+    assert "a.txt" in result.output
+    assert "--force" in result.output
     assert (data_dir / "a.txt").read_text() == "one EDITED\n", "Edited file must not be replaced"
-    assert (data_dir / "b.txt").read_text() == "two\n", "Missing file should be restored"
+    assert not (data_dir / "b.txt").exists(), "A refused checkout must not partially restore files"
 
 
-def test_checkout_only_missing_keeps_untracked_file_in_directory(
+def test_checkout_only_missing_reports_untracked_file_in_directory(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
     data_dir = _helper_track_directory(project.get_project_root())
@@ -60,7 +179,9 @@ def test_checkout_only_missing_keeps_untracked_file_in_directory(
 
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code != 0
+    assert "notes.txt" in result.output
+    assert "--force" in result.output
     assert (data_dir / "notes.txt").read_text() == "mine\n", "Extra file must survive"
 
 
@@ -80,3 +201,60 @@ def test_checkout_default_refuses_edited_directory_and_force_overwrites(
 
     assert forced.exit_code == 0, forced.output
     assert (data_dir / "a.txt").read_text() == "one\n"
+
+
+def test_checkout_only_missing_reports_extra_symlink_in_directory(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    root = project.get_project_root()
+    data_dir = _helper_track_directory(root)
+    (root / "external.txt").write_text("outside\n")
+    (data_dir / "notes-link").symlink_to(root / "external.txt")
+
+    result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
+
+    assert result.exit_code != 0
+    assert "notes-link" in result.output
+    assert "--force" in result.output
+    assert (data_dir / "notes-link").is_symlink()
+
+
+def test_checkout_only_missing_rejects_symlink_parent_inside_ignored_directory(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    root = project.get_project_root()
+    data_dir = _helper_track_directory(root)
+    (data_dir / "a.txt").unlink()
+    (data_dir / "b.txt").unlink()
+    outside = root / "outside"
+    outside.mkdir()
+    ignored_dir = data_dir / ".pivot"
+    ignored_dir.mkdir()
+    (ignored_dir / "escape").symlink_to(outside, target_is_directory=True)
+
+    source = root / "new.txt"
+    source.write_text("new")
+    file_hash, _ = cache.hash_file(source)
+    cache.copy_to_cache(source, cache.get_cache_path(config.get_cache_dir() / "files", file_hash))
+    manifest_entry = types.DirManifestEntry(
+        relpath=".pivot/escape/new.txt",
+        hash=file_hash,
+        size=3,
+        isexec=False,
+    )
+    track.write_pvt_file(
+        track.get_pvt_path(data_dir),
+        track.PvtData(
+            path="ext",
+            hash="aaaaaaaaaaaaaaaa",
+            size=3,
+            num_files=1,
+            manifest=[manifest_entry],
+        ),
+    )
+
+    result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
+
+    assert result.exit_code != 0
+    assert "Manifest contains path traversal" in result.output
+    assert not (outside / "new.txt").exists()
