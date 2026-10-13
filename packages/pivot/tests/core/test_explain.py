@@ -40,7 +40,10 @@ def _upstream_stage_b(a_output: str) -> str:
 def _build_upstream_pipeline(root: pathlib.Path, value: int) -> compose.Pipeline:
     with compose.Pipeline("test", root=root) as pipeline:
         input_file = pipeline.input("input.txt")
-        a_output = _upstream_stage_a(input_file, params=_UpstreamParams(value=value))
+        a_output = _upstream_stage_a(
+            input_file,  # pyright: ignore[reportArgumentType] - pipeline construction passes an ArtifactHandle
+            params=_UpstreamParams(value=value),
+        )
         _upstream_stage_b(a_output)
     return pipeline
 

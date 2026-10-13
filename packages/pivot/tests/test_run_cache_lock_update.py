@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pydantic
-
-from pivot import executor, loaders
+from pivot import executor, loaders, stage_def
 from pivot.storage import cache, lock, state
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
@@ -605,7 +603,7 @@ def test_run_cache_hit_with_matching_outputs_preserves_generation_skip(
 ) -> None:
     """A cache hit that writes no bytes preserves the downstream generation fast path."""
 
-    class ConstantOutputParams(pydantic.BaseModel):
+    class ConstantOutputParams(stage_def.StageParams):
         factor: int
 
     input_file = tmp_path / "input.txt"
