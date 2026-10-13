@@ -191,6 +191,29 @@ def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
     return remote
 
 
+def _status_from_explanations(
+    explanations: list[types.StageExplanation],
+) -> list[PipelineStatusInfo]:
+    """Convert rich explanations to verification status, retaining changed dep identities."""
+    statuses = list[PipelineStatusInfo]()
+    for explanation in explanations:
+        reason = explanation["reason"]
+        if reason == "Input dependencies changed" and explanation["dep_changes"]:
+            changed = ", ".join(
+                types.identity_key(change["identity"]) for change in explanation["dep_changes"]
+            )
+            reason = f"{reason}: {changed}"
+        statuses.append(
+            PipelineStatusInfo(
+                name=explanation["stage_name"],
+                status=(PipelineStatus.STALE if explanation["will_run"] else PipelineStatus.CACHED),
+                reason=reason,
+                upstream_stale=explanation["upstream_stale"],
+            )
+        )
+    return statuses
+
+
 def _verify_stages(
     pipeline_status: list[PipelineStatusInfo],
     cache_dir: pathlib.Path,
@@ -346,14 +369,16 @@ def verify(
 
     cache_dir = config.get_cache_dir()
 
-    # Get pipeline status (uses default state directory internally)
-    pipeline_status, _ = status_mod.get_pipeline_status(
+    # Get rich explanations so lock-only dependency mismatches identify the
+    # producer artifact in verification output.
+    explanations = status_mod.get_pipeline_explanations(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
         pipeline=cli_helpers.get_pipeline(),
         allow_missing=allow_missing,
     )
+    pipeline_status = _status_from_explanations(explanations)
 
     if not pipeline_status:
         raise click.ClickException("No stages to verify.")
