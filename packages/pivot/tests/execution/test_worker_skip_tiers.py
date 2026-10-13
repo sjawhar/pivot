@@ -342,6 +342,41 @@ def test_restore_reports_failed_restore_unavailable(
     )
 
 
+def test_check_lists_every_unavailable_output_and_writes_nothing(
+    project: pathlib.Path, state_db: state.StateDB
+) -> None:
+    """``pivot status`` (explain.py) checks with restore=False and names every unavailable output.
+
+    A cached output counts as available without being restored; a restore stops at the first
+    unavailable output instead.
+    """
+    store = _workspace(project, {})
+    restorable = _ref(_STAGE, "restorable")
+    unrecorded = _ref(_STAGE, "unrecorded")
+    uncached = _ref(_STAGE, "uncached")
+    restorable_path, restorable_hash = _cached_output(project, store, restorable, "cached")
+    restorable_path.unlink()
+    uncached_path = store.prepare_output(uncached)
+    uncached_path.write_text("never cached")
+    uncached_hash = FileHash(hash=cache.hash_file(uncached_path, None)[0])
+    uncached_path.unlink()
+    outs = [unrecorded, restorable, uncached]
+    hashes = {restorable.identity: restorable_hash, uncached.identity: uncached_hash}
+
+    checked = worker.restore_outputs_to_hashes(
+        store, outs, hashes, state_db, restore=False, report_changes=True
+    )
+    restored = _restore(store, outs, hashes, state_db)
+
+    assert checked == worker.OutputRestoreResult(
+        available=False, outputs_restored=False, unavailable=[unrecorded, uncached]
+    )
+    assert restored == worker.OutputRestoreResult(
+        available=False, outputs_restored=False, unavailable=[unrecorded]
+    )
+    assert not restorable_path.exists()
+
+
 def test_restore_on_cache_store_reports_whether_every_output_is_stored(
     project: pathlib.Path, state_db: state.StateDB
 ) -> None:
