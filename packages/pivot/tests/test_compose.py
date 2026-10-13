@@ -716,6 +716,55 @@ def test_pipeline_variant_counts_still_increment_within_same_variant(
     assert pipeline._stages[2].name == "_helper_repeat@v2"
 
 
+@pytest.mark.parametrize(
+    "variant_name",
+    [
+        pytest.param("big one", id="space"),
+        pytest.param("a/../b", id="traversal"),
+        pytest.param("", id="empty"),
+        pytest.param("x" * 201, id="too_long"),
+    ],
+)
+def test_pipeline_variant_rejects_name_lock_files_cannot_hold(
+    tmp_path: pathlib.Path, variant_name: str
+) -> None:
+    """A variant name that cannot be part of a lock file name fails where it is declared."""
+    pipeline = Pipeline("v", root=tmp_path)
+    with pytest.raises(ValueError, match="variant name") as exc_info, pipeline:  # noqa: SIM117
+        with pipeline.variant(variant_name):
+            _helper_produce(params=stage_def.StageParams())
+
+    assert repr(variant_name) in str(exc_info.value), "Error should name the bad variant"
+
+
+@pytest.mark.parametrize(
+    ("pipeline_name", "variant_name", "bad_stage"),
+    [
+        pytest.param("my pipeline", "ok", "my pipeline/_helper_produce@ok", id="pipeline_space"),
+        pytest.param(
+            "p", "v" * 190, f"p/_helper_produce@{'v' * 190}", id="qualified_name_too_long"
+        ),
+    ],
+)
+def test_pipeline_rejects_stage_name_lock_files_cannot_hold(
+    tmp_path: pathlib.Path, pipeline_name: str, variant_name: str, bad_stage: str
+) -> None:
+    """A qualified stage name the lock would reject fails at definition, not at repro."""
+    pipeline = Pipeline(pipeline_name, root=tmp_path)
+    with pytest.raises(ValueError, match="stage name") as exc_info, pipeline:  # noqa: SIM117
+        with pipeline.variant(variant_name):
+            _helper_produce(params=stage_def.StageParams())
+
+    assert repr(bad_stage) in str(exc_info.value), "Error should name the bad stage"
+
+
+def test_pipeline_variant_accepts_lock_compatible_names(tmp_path: pathlib.Path) -> None:
+    with Pipeline("v", root=tmp_path) as pipeline, pipeline.variant("0.5-swe_bench"):
+        _helper_produce(params=stage_def.StageParams())
+
+    assert pipeline.list_stages() == ["v/_helper_produce@0.5-swe_bench"]
+
+
 # --- Bug 2: Optional[StageParams] params detection ---
 
 

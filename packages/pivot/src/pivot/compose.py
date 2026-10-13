@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 from typing_extensions import is_typeddict
 
 from . import project, registry, stage_def, types
+from .storage import lock
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +431,9 @@ class Pipeline:
         All stages registered within the block get @{name} appended to their stage name.
         Nesting is supported: variant("a") inside variant("b") → @b@a suffix.
         """
+        reason = lock.stage_name_error(name)
+        if reason is not None:
+            raise ValueError(f"Invalid variant name {name!r}: {reason}")
         self._variant_stack.append(name)
         try:
             yield
@@ -454,6 +458,11 @@ class Pipeline:
         if self._variant_stack:
             for variant in self._variant_stack:
                 stage_name = f"{stage_name}@{variant}"
+
+        qualified_name = f"{self._name}/{stage_name}"
+        reason = lock.stage_name_error(qualified_name)
+        if reason is not None:
+            raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
 
         sig = inspect.signature(original_func)
         try:
