@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import inspect
-import pathlib
+from typing import TYPE_CHECKING
 
-from pivot import config, status
+from pivot import status
 from pivot.registry import RegistryStageInfo
+
+if TYPE_CHECKING:
+    import pathlib
 
 
 def _stage_info(name: str, state_dir: pathlib.Path | None) -> RegistryStageInfo:
@@ -36,7 +39,9 @@ def _touch_lock(state_dir: pathlib.Path, stage_name: str) -> None:
     lock_path.write_text("")
 
 
-def test_find_orphaned_lock_files_scans_each_stage_state_dir(set_project_root: pathlib.Path) -> None:
+def test_find_orphaned_lock_files_scans_each_stage_state_dir(
+    set_project_root: pathlib.Path,
+) -> None:
     sub_state_dir = set_project_root / "sub" / ".pivot"
     all_stages = {
         "main/train": _stage_info("main/train", set_project_root / ".pivot"),
