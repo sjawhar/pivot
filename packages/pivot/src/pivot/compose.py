@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import project, registry, stage_def, types
+from . import exceptions, project, registry, stage_def, types
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -206,6 +206,11 @@ def _emit_stage_info(
                     )
         if isinstance(base_hint, type) and issubclass(base_hint, stage_def.StageParams):
             params_arg_name = name
+            if node.params is not None and not isinstance(node.params, base_hint):
+                raise exceptions.ParamsError(
+                    f"Stage '{qualified_name}': params type {type(node.params).__name__} "
+                    + f"does not match parameter '{name}: {base_hint.__name__}'"
+                )
             break
 
     return registry.RegistryStageInfo(

@@ -9,7 +9,7 @@ from typing import Annotated, NotRequired, Required, TypedDict
 import pandas as pd
 import pytest
 
-from pivot import fingerprint, loaders, outputs, stage_def, types
+from pivot import exceptions, fingerprint, loaders, outputs, stage_def, types
 from pivot.compose import (
     SINGLE_OUTPUT_KEY,
     ArtifactHandle,
@@ -791,6 +791,41 @@ def test_build_rejects_stage_params_in_typing_optional(tmp_path: pathlib.Path) -
         with Pipeline("test", root=tmp_path) as pipeline:
             raw = pipeline.input("raw", path="data/raw.csv", t=pd.DataFrame)
             _helper_typing_optional_params_stage(data=raw, params=_HelperOptionalParams(x=3))
+
+
+class _HelperParamsA(stage_def.StageParams):
+    value_a: int = 1
+
+
+class _HelperParamsB(stage_def.StageParams):
+    value_b: str = "x"
+
+
+class _HelperParamsBChild(_HelperParamsB):
+    extra: int = 2
+
+
+@stage
+def _helper_wants_params_b(params: _HelperParamsB) -> dict:
+    return {"b": params.value_b}
+
+
+def test_record_stage_rejects_params_of_wrong_type(tmp_path: pathlib.Path) -> None:
+    """A StageParams instance unrelated to the stage's params annotation fails at definition."""
+    with (
+        pytest.raises(exceptions.ParamsError, match="_HelperParamsA.*_HelperParamsB"),
+        Pipeline("test", root=tmp_path),
+    ):
+        _helper_wants_params_b(params=_HelperParamsA())  # pyright: ignore[reportArgumentType] - the error under test
+
+
+def test_record_stage_accepts_params_subclass(tmp_path: pathlib.Path) -> None:
+    with Pipeline("test", root=tmp_path) as pipeline:
+        _helper_wants_params_b(params=_HelperParamsBChild())
+
+    assert isinstance(
+        pipeline.get_stage("test/_helper_wants_params_b")["params"], _HelperParamsBChild
+    )
 
 
 # --- Bug 3: list[ArtifactHandle] support ---
