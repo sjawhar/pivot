@@ -51,6 +51,8 @@ import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
 
+import pygtrie
+
 from pivot import (
     config,
     exceptions,
@@ -84,7 +86,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     import networkx as nx
-    import pygtrie
     from networkx import DiGraph
 
     from pivot.registry import RegistryStageInfo
@@ -101,22 +102,30 @@ def _discover_tracked_files(
         return None, None
 
     tracked_files = track.discover_pvt_files(project.get_project_root())
-    return tracked_files, None
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+    for path in tracked_files:
+        tracked_trie[pathlib.Path(path).parts] = path
+    return tracked_files, tracked_trie
 
 
 def _get_explanations_in_parallel(
     execution_order: list[str],
     overrides: parameters.ParamsOverrides | None,
     all_stages: dict[str, RegistryStageInfo],
+    store: store_mod.WorkspaceStore,
     force: bool = False,
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
-    store: store_mod.Store | None = None,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
+    producer_hashes = explain.producer_output_hashes(
+        execution_order,
+        all_stages,
+        default_state_dir,
+    )
     explanations_by_name = dict[str, StageExplanation]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -129,18 +138,17 @@ def _get_explanations_in_parallel(
                 explain.get_stage_explanation,
                 stage_name,
                 fingerprint,
-                [types.identity_key(dep.identity) for dep in stage_info["deps"].values()],
-                [types.identity_key(out.identity) for out in stage_info["outs"]],
+                stage_info["deps"],
+                list(stage_info["outs"]),
                 stage_info["params"],
                 overrides,
                 stage_state_dir,
+                store,
                 force=force,
                 allow_missing=allow_missing,
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
-                deps_refs=stage_info["deps"],
-                store=store,
-                outs_refs=list(stage_info["outs"]),
+                producer_hashes=producer_hashes,
             )
             futures[future] = stage_name
 
@@ -169,6 +177,7 @@ def _make_workspace_store(pipeline: registry.PipelineLike) -> store_mod.Workspac
         project_root=project.get_project_root(),
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
+        cache_dir=config.get_cache_dir() / "files",
     )
 
 

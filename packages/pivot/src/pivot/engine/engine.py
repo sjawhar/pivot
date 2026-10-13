@@ -1614,14 +1614,14 @@ class Engine:
 
         deps = stage_info["deps"]
 
-        def _outputs_exist() -> bool:
-            if not isinstance(store, store_mod.WorkspaceStore):
-                return False
-            for out_ref in stage_info["outs"]:
-                out_path = store._resolve_output_path(out_ref)  # pyright: ignore[reportPrivateUsage]
-                if not out_path.exists():
-                    return False
-            return True
+        def _restore_outputs_to_lock(state_db: state_mod.StateDB) -> bool:
+            return worker.restore_outputs_to_hashes(
+                store,
+                stage_info["outs"],
+                lock_data["output_hashes"],
+                state_db,
+                state_dir=stage_state_dir,
+            )
 
         def _get_skip_state_db() -> state_mod.StateDB:
             if skip_state_dbs is not None:
@@ -1643,7 +1643,7 @@ class Engine:
                     current_params=current_params,
                     lock_data=lock_data,
                     state_db=state_db,
-                    verify_files=True,
+                    store=store,
                 )
                 if not can_skip:
                     return False, None
@@ -1658,7 +1658,7 @@ class Engine:
                 input_hash = run_history.compute_input_hash(
                     current_fingerprint, current_params, deps_list, out_specs
                 )
-                if not _outputs_exist():
+                if not _restore_outputs_to_lock(state_db):
                     return False, None
                 return True, input_hash
             finally:
@@ -1727,20 +1727,15 @@ class Engine:
             out_specs,
         )
 
-        def _restore_outputs() -> bool:
-            if _outputs_exist():
-                return True
-            if not isinstance(store, store_mod.WorkspaceStore):
-                return False
-            for out_ref in stage_info["outs"]:
-                hash_info = lock_data["output_hashes"].get(out_ref.identity)
-                if hash_info is None:
-                    return False
-                if not store.restore_from_cache(out_ref, hash_info, state_dir=stage_state_dir):
-                    return False
-            return True
+        def _restore_lock_outputs() -> bool:
+            state_db = _get_skip_state_db()
+            try:
+                return _restore_outputs_to_lock(state_db)
+            finally:
+                if skip_state_dbs is None:
+                    state_db.close()
 
-        restored = await anyio.to_thread.run_sync(_restore_outputs)
+        restored = await anyio.to_thread.run_sync(_restore_lock_outputs)
         if not restored:
             return False
 
@@ -1822,14 +1817,22 @@ class Engine:
         from pivot import explain as explain_mod
 
         def _compute() -> StageExplanation:
+            pipeline = self._require_pipeline()
+            store = store_mod.WorkspaceStore(
+                project_root=worker_info["project_root"],
+                pipeline_name=pipeline.name,
+                input_bindings=pipeline.input_bindings,
+                cache_dir=pathlib.Path(worker_info["store_spec"]["cache_dir"]),
+            )
             return explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
-                deps=[types.identity_key(ref.identity) for ref in stage_info["deps"].values()],
-                outs_paths=[types.identity_key(ref.identity) for ref in stage_info["outs"]],
+                deps=stage_info["deps"],
+                outs=list(stage_info["outs"]),
                 params_instance=worker_info["params"],
                 overrides=overrides,
                 state_dir=worker_info["state_dir"],
+                store=store,
                 force=force,
                 allow_missing=True,
             )

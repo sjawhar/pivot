@@ -912,13 +912,8 @@ def _run_stage_function_with_store(
                 )
             kwargs[params_arg_name] = params
 
-        accessed = dict[str, set[str]]()
         for name, ref in deps.items():
-            loaded = _load_dep_from_store(ref, store)
-            if isinstance(loaded, TrackedDict):
-                kwargs[name] = loaded
-            else:
-                kwargs[name] = loaded
+            kwargs[name] = _load_dep_from_store(ref, store)
 
         kwargs = _reconstruct_list_kwargs(kwargs, collection_params)
 
@@ -1191,66 +1186,60 @@ def hash_dependencies(
 def can_skip_via_generation(
     stage_name: str,
     fingerprint: dict[str, str],
-    deps: dict[str, types.ArtifactRef] | list[str],
+    deps: dict[str, types.ArtifactRef],
     outs_paths: list[str],
     current_params: dict[str, Any],
     lock_data: LockData,
     state_db: state.StateDB,
-    verify_files: bool = True,
+    store: store_mod.Store,
 ) -> bool:
-    """Check if stage can skip using O(1) generation tracking.
-
-    Generation tracking avoids hashing files by tracking monotonic generation counters.
-    Set verify_files=False for status prediction.
-    """
+    """Check generation counters and cached dependency hashes without rehashing."""
     if lock_data["code_manifest"] != fingerprint:
         return False
     if lock_data["params"] != current_params:
         return False
 
-    # Compare output identities (outs_paths is already normalized by _get_normalized_out_paths)
     normalized_outs = sorted(outs_paths)
-    locked_out_paths = sorted(
-        types.identity_key(k) if isinstance(k, types.ArtifactIdentity) else k
-        for k in lock_data["output_hashes"]
-    )
+    locked_out_paths = sorted(types.identity_key(identity) for identity in lock_data["output_hashes"])
     if normalized_outs != locked_out_paths:
         return False
-
     if not deps:
         return True
 
     recorded_gens = state_db.get_dep_generations(stage_name)
     if not recorded_gens:
         return False
-
-    dep_keys = (
-        [types.identity_key(ref.identity) for ref in deps.values()]
-        if isinstance(deps, dict)
-        else list(deps)
-    )
+    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
     current_gens = state_db.get_many_generations(dep_keys)
-
-    for dep_key in dep_keys:
+    stats = list[tuple[pathlib.Path, os.stat_result]]()
+    paths_by_key = dict[str, pathlib.Path]()
+    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
+        expected_hash = lock_data["dep_hashes"].get(ref.identity)
+        if expected_hash is None or is_dir_hash(expected_hash):
+            return False
         current_gen = current_gens.get(dep_key)
-        if current_gen is None:
+        if current_gen is None or current_gen != recorded_gens.get(dep_key):
             return False
-        if current_gen != recorded_gens.get(dep_key):
+        try:
+            path = store.checkout(ref)
+            stats.append((path, path.stat()))
+            paths_by_key[dep_key] = path
+        except OSError:
             return False
-
+    cached_hashes = state_db.get_many(stats)
+    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
+        cached_hash = cached_hashes[paths_by_key[dep_key]]
+        if cached_hash != lock_data["dep_hashes"][ref.identity]["hash"]:
+            return False
     return True
 
 
 def compute_dep_generation_map(
-    deps: dict[str, types.ArtifactRef] | list[str],
+    deps: dict[str, types.ArtifactRef],
     state_db: state.StateDB,
 ) -> dict[str, int]:
     """Compute dependency identity -> generation map for recording."""
-    dep_keys = (
-        [types.identity_key(ref.identity) for ref in deps.values()]
-        if isinstance(deps, dict)
-        else list(deps)
-    )
+    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
     current_gens = state_db.get_many_generations(dep_keys)
 
     gen_record = dict[str, int]()
@@ -1258,7 +1247,6 @@ def compute_dep_generation_map(
         gen = current_gens.get(dep_key)
         if gen is not None:
             gen_record[dep_key] = gen
-
     return gen_record
 
 
@@ -1355,26 +1343,32 @@ def _try_skip_via_run_cache_with_store(
     stage_outs: list[types.ArtifactRef],
     store: store_mod.Store,
     state_db: state.StateDB,
+    *,
+    state_dir: pathlib.Path,
 ) -> RunCacheSkipResult | None:
-    """Try to skip using run cache for store-based outputs.
-
-    For store-based stages, outputs are already in the store, so we just need to
-    check if they exist and get their hashes.
-    """
+    """Restore all cached outputs from a matching run-cache entry."""
+    if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
+        return None
     entry = state_db.lookup_run_cache(stage_name, input_hash)
     if entry is None:
         return None
-
-    output_hashes: dict[str, HashInfo] = {}
-    for ref in stage_outs:
-        if not store.exists(ref):
-            return None
-        identity_key = types.identity_key(ref.identity)
-        output_hashes[identity_key] = store.hash_artifact(ref)
-
-    return RunCacheSkipResult(
-        output_hashes=output_hashes,
-    )
+    output_hashes = {
+        output["path"]: run_history.entry_to_output_hash(output)
+        for output in entry["output_hashes"]
+    }
+    expected_keys = {types.identity_key(ref.identity) for ref in stage_outs}
+    if output_hashes.keys() != expected_keys:
+        return None
+    identity_hashes = _to_identity_hashes(output_hashes)
+    if not restore_outputs_to_hashes(
+        store,
+        stage_outs,
+        identity_hashes,
+        state_db,
+        state_dir=state_dir,
+    ):
+        return None
+    return RunCacheSkipResult(output_hashes=output_hashes)
 
 
 def write_run_cache_entry(

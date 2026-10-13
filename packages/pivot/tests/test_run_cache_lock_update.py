@@ -276,11 +276,17 @@ def test_explain_shows_cached_after_run_cache_skip(
     explanation = explain.get_stage_explanation(
         stage_name="test_stage",
         fingerprint=stage_info["fingerprint"],
-        deps=["input.txt"],
-        outs_paths=[_identity_key(_output_ref("test_stage"))],
+        deps=stage_info["deps"],
+        outs=stage_info["outs"],
         params_instance=None,
         overrides=None,
         state_dir=tmp_path / ".pivot",
+        store=store_mod.WorkspaceStore(
+            project_root=tmp_path,
+            pipeline_name="test",
+            input_bindings={"input.txt": "input.txt"},
+            cache_dir=worker_env,
+        ),
         force=False,
     )
 
@@ -338,14 +344,18 @@ def test_explain_uses_generation_tracking_when_state_db_exists(
     assert producer_path.exists()
     producer_path.unlink()
 
+    producer_lock = lock.StageLock("producer", lock.get_stages_dir(state_dir)).read()
+    assert producer_lock is not None
     explanation = explain.get_stage_explanation(
         stage_name="consumer",
         fingerprint=consumer_info["fingerprint"],
-        deps=[_identity_key(producer_out)],
-        outs_paths=[_identity_key(_output_ref("consumer"))],
+        deps=consumer_info["deps"],
+        outs=consumer_info["outs"],
         params_instance=None,
         overrides=None,
         state_dir=state_dir,
+        store=workspace,
+        producer_hashes=producer_lock["output_hashes"],
     )
 
     assert not explanation["will_run"], explanation["reason"]
@@ -369,11 +379,17 @@ def test_explain_does_not_create_state_db(tmp_path: pathlib.Path) -> None:
     explanation = explain.get_stage_explanation(
         stage_name="test_stage",
         fingerprint={"self:test_stage": "abc123"},
-        deps=[],
-        outs_paths=[],
+        deps={},
+        outs=[],
         params_instance=None,
         overrides=None,
         state_dir=state_dir,
+        store=store_mod.WorkspaceStore(
+            project_root=tmp_path,
+            pipeline_name="test",
+            input_bindings={},
+            cache_dir=state_dir / "cache",
+        ),
     )
 
     assert explanation["will_run"] is False
