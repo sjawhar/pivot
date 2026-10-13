@@ -15,6 +15,7 @@ from typing import Any
 import numpy
 import pandas
 import pytest
+from dateutil import tz as dateutil_tz
 
 from pivot import loaders
 
@@ -1079,6 +1080,28 @@ def test_dataframe_jsonl_refuses_extended_precision_float(tmp_path: pathlib.Path
         loaders.DataFrameJSONL().save(df, tmp_path / "float128.jsonl")
 
 
+@pytest.mark.parametrize(
+    "timezone",
+    [
+        pytest.param(dateutil_tz.tzoffset(None, 5 * 3600), id="dateutil-offset"),
+        pytest.param(dateutil_tz.tzutc(), id="dateutil-utc"),
+        pytest.param(dateutil_tz.gettz("Europe/London"), id="dateutil-tzfile"),
+    ],
+)
+def test_dataframe_jsonl_refuses_timezone_that_cannot_roundtrip(
+    tmp_path: pathlib.Path, timezone: datetime.tzinfo | None
+) -> None:
+    assert timezone is not None
+    frame = pandas.DataFrame(
+        {
+            "timestamp": pandas.Series(
+                pandas.to_datetime(["2024-03-04 12:00", None]).tz_localize(timezone)
+            )
+        }
+    )
+
+    with pytest.raises(TypeError, match="timestamp.*timezone"):
+        loaders.DataFrameJSONL().save(frame, tmp_path / "dateutil.jsonl")
 
 
 @pytest.mark.parametrize(
