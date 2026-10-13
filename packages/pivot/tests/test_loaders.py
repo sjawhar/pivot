@@ -968,13 +968,26 @@ def test_dataframe_jsonl_roundtrips_date_and_time_columns(tmp_path: pathlib.Path
     )
 
     loaders.DataFrameJSONL().save(df, jsonl_file)
+    jsonl_records = [json.loads(line) for line in jsonl_file.read_text().splitlines()]
+    assert jsonl_records[0] == {
+        "__pivot_dataframe_metadata__": {
+            "version": 1,
+            "temporal_columns": {
+                "date": {"kind": "datetime", "timezone": None},
+                "ns": {"kind": "datetime", "timezone": None},
+                "tz": {"kind": "datetime", "timezone": "America/New_York"},
+                "delta": {"kind": "timedelta"},
+            },
+        }
+    }
+    assert jsonl_records[1]["date"] == "2024-03-04T00:00:00.000000000"
     loaded = loaders.DataFrameJSONL().load(jsonl_file)
 
     expected = pandas.DataFrame(
         {
             "date": pandas.to_datetime(pandas.Series(["2024-03-04", "2024-03-05", None])),
             "ns": df["ns"],
-            "tz": df["tz"].dt.tz_convert("UTC"),
+            "tz": df["tz"],
             "delta": df["delta"],
         }
     )
@@ -1008,6 +1021,48 @@ def test_dataframe_jsonl_keeps_numeric_looking_strings_as_strings(tmp_path: path
     loaded = loaders.DataFrameJSONL().load(jsonl_file)
 
     pandas.testing.assert_frame_equal(loaded, df)
+
+
+def test_dataframe_jsonl_keeps_iso_shaped_strings_as_strings(tmp_path: pathlib.Path) -> None:
+    jsonl_file = tmp_path / "iso-strings.jsonl"
+    df = pandas.DataFrame(
+        {
+            "timestamp_text": [
+                "2024-03-04T12:34:56.123456789",
+                "2024-03-05T00:00:00.000000000",
+            ]
+        }
+    )
+
+    loaders.DataFrameJSONL().save(df, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, df)
+
+
+def test_dataframe_jsonl_roundtrips_all_null_temporal_dtypes(tmp_path: pathlib.Path) -> None:
+    jsonl_file = tmp_path / "all-null-temporal.jsonl"
+    df = pandas.DataFrame(
+        {
+            "naive": pandas.Series([pandas.NaT, pandas.NaT], dtype="datetime64[ns]"),
+            "tz": pandas.Series(
+                [pandas.NaT, pandas.NaT], dtype=pandas.DatetimeTZDtype(tz="America/New_York")
+            ),
+            "delta": pandas.Series([pandas.NaT, pandas.NaT], dtype="timedelta64[ns]"),
+        }
+    )
+
+    loaders.DataFrameJSONL().save(df, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, df)
+
+
+def test_dataframe_jsonl_refuses_extended_precision_float(tmp_path: pathlib.Path) -> None:
+    df = pandas.DataFrame({"x": numpy.array([numpy.longdouble("1.0000000000000000009")])})
+
+    with pytest.raises(TypeError, match="float128"):
+        loaders.DataFrameJSONL().save(df, tmp_path / "float128.jsonl")
 
 
 @pytest.mark.parametrize(

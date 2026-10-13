@@ -10,7 +10,6 @@ import operator
 import os
 import pathlib
 import pickle
-import re
 import shutil
 import tempfile
 import warnings
@@ -285,8 +284,8 @@ class JSONL(Loader[list[dict[str, Any]], list[dict[str, Any]]]):
         return []
 
 
-_ISO_DATETIME_NS = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}"
-_ISO_DURATION = r"P-?\d+DT\d+H\d+M\d+(?:\.\d+)?S"
+_DATAFRAME_METADATA_KEY = "__pivot_dataframe_metadata__"
+_DATAFRAME_METADATA_VERSION = 1
 
 
 def _json_default(value: object) -> object:
@@ -329,31 +328,41 @@ def _iso_datetime_texts(series: pandas.Series[Any], suffix: str = "") -> list[st
     return ["null" if text == "NaT" else f'"{text}{suffix}"' for text in texts]
 
 
-def _encode_jsonl_column(series: pandas.Series[Any], encoder: json.JSONEncoder) -> list[str]:
-    """Encode one DataFrame column as JSON value texts, one per row."""
+def _encode_jsonl_column(
+    series: pandas.Series[Any], encoder: json.JSONEncoder
+) -> tuple[list[str], dict[str, object] | None]:
+    """Encode one DataFrame column as JSON value texts and return temporal metadata."""
     dtype = series.dtype
     if pandas.api.types.is_float_dtype(dtype):
+        if isinstance(dtype, numpy.dtype) and dtype.itemsize > numpy.dtype("float64").itemsize:
+            raise TypeError(f"unsupported extended-precision floating dtype {dtype}")
         # repr() is the shortest text that parses back to the identical float;
         # pandas.to_json rounds to at most 15 significant digits.
         floats: list[float] = series.to_numpy(dtype="float64", na_value=math.nan).tolist()
-        return [repr(v) if math.isfinite(v) else "null" for v in floats]
+        return [repr(v) if math.isfinite(v) else "null" for v in floats], None
     if isinstance(dtype, numpy.dtype) and dtype.kind in "iu":
-        return series.astype(str).tolist()
+        return series.astype(str).tolist(), None
     if isinstance(dtype, numpy.dtype) and dtype.kind == "b":
-        return numpy.where(series.to_numpy(), "true", "false").tolist()
+        return numpy.where(series.to_numpy(), "true", "false").tolist(), None
     if pandas.api.types.is_object_dtype(dtype) and pandas.api.types.infer_dtype(
         series, skipna=True
     ) in ("date", "datetime"):
         series = pandas.Series(pandas.to_datetime(series))
         dtype = series.dtype
     if isinstance(dtype, pandas.DatetimeTZDtype):
-        # tz-aware: written in UTC with a "Z" suffix, read back as datetime64[ns, UTC]
-        return _iso_datetime_texts(series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z")
+        # Values are ISO UTC text; metadata records the original zone for exact restoration.
+        metadata: dict[str, object] = {"kind": "datetime", "timezone": str(dtype.tz)}
+        return _iso_datetime_texts(
+            series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z"
+        ), metadata
     if pandas.api.types.is_datetime64_dtype(dtype):
-        return _iso_datetime_texts(series)
+        return _iso_datetime_texts(series), {"kind": "datetime", "timezone": None}
     if pandas.api.types.is_timedelta64_dtype(dtype):
         deltas = cast("list[pandas.Timedelta]", series.tolist())
-        return ["null" if delta is pandas.NaT else f'"{delta.isoformat()}"' for delta in deltas]
+        return (
+            ["null" if delta is pandas.NaT else f'"{delta.isoformat()}"' for delta in deltas],
+            {"kind": "timedelta"},
+        )
     missing: list[bool] = series.isna().tolist()
     cells = [
         None if is_missing else cell
@@ -365,63 +374,95 @@ def _encode_jsonl_column(series: pandas.Series[Any], encoder: json.JSONEncoder) 
             encoded.append(encoder.encode(cell))
         except ValueError:
             encoded.append(encoder.encode(_replace_nonfinite(cell)))
-    return encoded
+    return encoded, None
 
 
-def _restore_jsonl_column(series: pandas.Series[Any]) -> pandas.Series[Any]:
-    """Turn a column of the ISO texts save() writes back into datetime/timedelta."""
-    if not pandas.api.types.is_object_dtype(series.dtype):
-        return series
-    kind = pandas.api.types.infer_dtype(series, skipna=True)
-    if kind == "empty":
-        return series.astype("float64")
-    if kind != "string":
-        return series
-    texts = series.dropna().astype(str)
-    first = texts.iloc[0]
-    for pattern, convert in (
-        (_ISO_DATETIME_NS, lambda: pandas.to_datetime(series, format="ISO8601")),
-        (_ISO_DATETIME_NS + "Z", lambda: pandas.to_datetime(series, format="ISO8601", utc=True)),
-        (_ISO_DURATION, lambda: pandas.to_timedelta(series)),
-    ):
-        if re.fullmatch(pattern, first) and texts.str.fullmatch(pattern).all():
-            return pandas.Series(convert())
-    return series
+def _restore_temporal_jsonl_column(
+    series: pandas.Series[Any], metadata: collections_abc.Mapping[str, object]
+) -> pandas.Series[Any]:
+    """Restore a writer-marked temporal column; never infer temporal dtypes from strings."""
+    kind = metadata["kind"]
+    if kind == "timedelta":
+        return pandas.Series(pandas.to_timedelta(series))
+    if kind != "datetime":
+        raise ValueError(f"Unsupported DataFrameJSONL temporal metadata kind: {kind!r}")
+    timezone = metadata["timezone"]
+    if timezone is None:
+        return pandas.Series(pandas.to_datetime(series, format="ISO8601"))
+    if not isinstance(timezone, str):
+        raise ValueError(f"Invalid DataFrameJSONL timezone metadata: {timezone!r}")
+    parsed = pandas.to_datetime(series, format="ISO8601", utc=True)
+    return pandas.Series(parsed.dt.tz_convert(timezone))
 
 
 @dataclasses.dataclass(frozen=True)
 class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
 
-    One JSON object per row; the index is not written. Values round-trip as follows:
+    One JSON object per row; the index is not written. The first line is a
+    reserved ``{"__pivot_dataframe_metadata__": ...}`` JSON object describing
+    Pivot-written temporal columns. A non-Pivot JSONL reader sees that explicit
+    metadata record followed by normal row records; it can skip the first line
+    to read the data rows unchanged.
 
     - floats: written as the shortest exact text, read back bit-identical
       (NaN and +/-inf are written as ``null`` and read back as NaN).
     - ``datetime.date``/``datetime`` objects and ``datetime64`` columns: written as
-      ISO 8601 with nanoseconds and read back as ``datetime64[ns]``; tz-aware
-      columns are written in UTC (``...Z``) and read back as ``datetime64[ns, UTC]``.
-    - ``timedelta64`` columns: written as ISO 8601 durations, read back as ``timedelta64[ns]``.
-    - strings stay strings, even when they look like numbers.
+      ISO 8601 with nanoseconds and restored only when the metadata marks the
+      column temporal. Original tz-aware dtype zones are retained.
+    - ``timedelta64`` columns: written as ISO 8601 durations and restored from
+      metadata, including all-null columns.
+    - strings remain strings, including ISO-shaped strings.
 
-    A string column whose every value is exactly one of those ISO shapes is read
-    back as datetimes/timedeltas. Cells that JSON cannot hold (``Decimal``,
-    ``set``, ``bytes``, arbitrary objects) raise ``TypeError`` naming the column.
-    Saves atomically via temp file + rename.
+    Cells that JSON cannot hold (``Decimal``, ``set``, ``bytes``, arbitrary
+    objects) raise ``TypeError`` naming the column. Saves atomically via temp
+    file + rename.
     """
 
     @override
     def load(self, path: pathlib.Path) -> pandas.DataFrame:
         records = list[object]()
+        temporal_columns = dict[str, collections_abc.Mapping[str, object]]()
         with path.open() as f:
             for line_num, line in enumerate(f, 1):
-                if line.strip():
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError as e:
-                        raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
+                if not line.strip():
+                    continue
+                try:
+                    record = cast("object", json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
+                if line_num == 1 and isinstance(record, dict):
+                    metadata_record = cast("dict[object, object]", record)
+                    if set(metadata_record) == {_DATAFRAME_METADATA_KEY}:
+                        raw_metadata = metadata_record[_DATAFRAME_METADATA_KEY]
+                        if not isinstance(raw_metadata, dict):
+                            raise ValueError(
+                                f"Invalid DataFrameJSONL metadata at {path}: expected object"
+                            )
+                        typed_metadata = cast("dict[object, object]", raw_metadata)
+                        if typed_metadata.get("version") != _DATAFRAME_METADATA_VERSION:
+                            raise ValueError(
+                                f"Unsupported DataFrameJSONL metadata version at {path}"
+                            )
+                        raw_temporal = typed_metadata.get("temporal_columns", {})
+                        if not isinstance(raw_temporal, dict):
+                            raise ValueError(f"Invalid DataFrameJSONL temporal metadata at {path}")
+                        temporal_mapping = cast("dict[object, object]", raw_temporal)
+                        for name, metadata in temporal_mapping.items():
+                            if not isinstance(name, str) or not isinstance(metadata, dict):
+                                raise ValueError(
+                                    f"Invalid DataFrameJSONL temporal column metadata at {path}"
+                                )
+                            temporal_columns[name] = cast(
+                                "collections_abc.Mapping[str, object]", metadata
+                            )
+                        continue
+                records.append(cast("object", record))
         frame = pandas.DataFrame(records)
-        for column in frame.columns:
-            frame[column] = _restore_jsonl_column(frame[column])
+        for name, metadata in temporal_columns.items():
+            if name not in frame.columns:
+                frame[name] = pandas.Series(pandas.NaT, index=frame.index)
+            frame[name] = _restore_temporal_jsonl_column(frame[name], metadata)
         return frame
 
     @override
@@ -433,26 +474,42 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             raise ValueError(
                 f"DataFrameJSONL requires unique column names, duplicated: {duplicated}"
             )
+        if _DATAFRAME_METADATA_KEY in {str(name) for name in data.columns}:
+            raise ValueError(
+                f"DataFrameJSONL reserves column name {_DATAFRAME_METADATA_KEY!r} for metadata"
+            )
 
         encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"), default=_json_default)
         keys = list[str]()
         columns = list[list[str]]()
+        temporal_columns = dict[str, dict[str, object]]()
         for name in data.columns:
+            string_name = str(name)
             try:
-                columns.append(_encode_jsonl_column(data[name], encoder))
+                column, temporal_metadata = _encode_jsonl_column(data[name], encoder)
             except TypeError as e:
                 raise TypeError(
-                    f"DataFrameJSONL cannot write column {str(name)!r}: {e}. Convert it to "
+                    f"DataFrameJSONL cannot write column {string_name!r}: {e}. Convert it to "
                     + "str/int/float/bool/list/dict values, or pick another format for this "
                     + "output, e.g. Annotated[pd.DataFrame, Pickle()]."
                 ) from e
-            keys.append(encoder.encode(str(name)) + ":")
+            columns.append(column)
+            keys.append(encoder.encode(string_name) + ":")
+            if temporal_metadata is not None:
+                temporal_columns[string_name] = temporal_metadata
 
+        metadata = {
+            _DATAFRAME_METADATA_KEY: {
+                "version": _DATAFRAME_METADATA_VERSION,
+                "temporal_columns": temporal_columns,
+            }
+        }
         path.parent.mkdir(parents=True, exist_ok=True)
 
         fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
         try:
             with os.fdopen(fd, "w") as f:
+                f.write(encoder.encode(metadata) + "\n")
                 for cells in zip(*columns, strict=True):
                     f.write("{" + ",".join(map(operator.add, keys, cells)) + "}\n")
             os.rename(tmp_path_str, path)
