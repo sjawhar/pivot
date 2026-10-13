@@ -1,8 +1,10 @@
 # pyright: reportMissingImports=false
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
+import types as _stdlib_types
 
 import pytest
 
@@ -279,3 +281,135 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     assert pathlib.Path(module_file).resolve() == (second / "stages.py")
     assert str(first) not in sys.path
     assert str(second) == sys.path[0]
+
+
+def _write_sibling_stage_project(
+    root: pathlib.Path, value: str, *, broken: bool = False
+) -> pathlib.Path:
+    root.mkdir()
+    (root / "stages.py").write_text(f'VALUE = "{value}"\n')
+    pipeline_path = root / "pipeline.py"
+    pipeline_path.write_text(
+        f"""
+import pathlib
+
+from pivot.compose import Pipeline, stage
+from stages import VALUE
+
+
+@stage
+def build() -> str:
+    return VALUE
+
+
+with Pipeline("{root.name}") as pipeline:
+    build()
+"""
+        + ("\nraise RuntimeError('broken pipeline')\n" if broken else "")
+    )
+    return pipeline_path
+
+
+def test_failed_pipeline_import_rolls_back_sibling_modules(tmp_path: pathlib.Path) -> None:
+    failed = _write_sibling_stage_project(tmp_path / "failed", "a", broken=True)
+    with pytest.raises(discovery.DiscoveryError, match="broken pipeline"):
+        discovery.discover_pipeline(project_root=failed.parent)
+
+    valid = _write_sibling_stage_project(tmp_path / "valid", "b")
+    pipeline = discovery.discover_pipeline(project_root=valid.parent)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("valid/build")["func"]() == "b"
+    module_file = getattr(sys.modules["stages"], "__file__", None)
+    assert pathlib.Path(str(module_file)).resolve() == valid.parent / "stages.py"
+
+
+def test_direct_pipeline_load_starts_fresh_import_session(tmp_path: pathlib.Path) -> None:
+    first = _write_sibling_stage_project(tmp_path / "first", "a")
+    second = _write_sibling_stage_project(tmp_path / "second", "b")
+
+    first_pipeline = discovery.load_pipeline_from_path(first)
+    second_pipeline = discovery.load_pipeline_from_path(second)
+
+    assert first_pipeline is not None
+    assert second_pipeline is not None
+    assert second_pipeline.get_stage("second/build")["func"]() == "b"
+
+
+def test_discover_all_skips_ordinary_broken_sibling(tmp_path: pathlib.Path) -> None:
+    valid = tmp_path / "valid"
+    valid.mkdir()
+    (valid / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def build() -> str:
+    return "ok"
+
+
+with Pipeline("valid", root=pathlib.Path(__file__).parent) as pipeline:
+    build()
+"""
+    )
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "pipeline.py").write_text("raise RuntimeError('broken sibling')\n")
+
+    pipeline = discovery.discover_pipeline(project_root=tmp_path, all_pipelines=True)
+
+    assert pipeline is not None
+    assert pipeline.list_stages() == ["valid/build"]
+
+
+def test_subdirectory_pipeline_displaces_and_restores_stdlib_parent(
+    tmp_path: pathlib.Path,
+) -> None:
+    root = tmp_path / "project"
+    collision = root / "json"
+    collision.mkdir(parents=True)
+    (collision / "pipeline.py").write_text(
+        """
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def build() -> str:
+    return "project"
+
+
+with Pipeline("project", root=pathlib.Path(__file__).parents[1]) as pipeline:
+    build()
+"""
+    )
+
+    pipeline = discovery.discover_pipeline(project_root=root, all_pipelines=True)
+
+    assert pipeline is not None
+    assert pipeline.list_stages() == ["project/build"]
+    assert sys.modules["json"] is not json
+
+    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
+    assert sys.modules["json"] is json
+
+
+def test_discovery_restores_displaced_pipeline_module_and_caller_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    foreign = _stdlib_types.ModuleType("pipeline")
+    monkeypatch.setitem(sys.modules, "pipeline", foreign)
+    root = _write_sibling_stage_project(tmp_path / "project", "project").parent
+    monkeypatch.syspath_prepend(str(root))
+
+    pipeline = discovery.discover_pipeline(project_root=root)
+
+    assert pipeline is not None
+    assert sys.modules["pipeline"] is not foreign
+    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
+    assert sys.modules["pipeline"] is foreign
+    assert sys.path.count(str(root)) == 1
