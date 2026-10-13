@@ -10,11 +10,10 @@ from collections.abc import Callable
 from typing import ClassVar
 from unittest import mock
 
-import pydantic
-import pytest
-
 import numpy as np
 import pandas as pd
+import pydantic
+import pytest
 
 from pivot import exceptions, fingerprint
 from pivot.config import models
@@ -133,7 +132,7 @@ def _stage_uses_three_non_scalar_values() -> int:
     return len(IMMUTABLE_TUPLE) + len(IMMUTABLE_FROZENSET) + FROZEN_DATACLASS.value
 
 
-CHILD_BAD = []
+CHILD_BAD: list[int] = []
 
 
 def _child_with_non_scalar_capture() -> int:
@@ -168,7 +167,7 @@ def _stage_uses_common_callables() -> int:
         int(np.mean(frame["value"]))
         + len(json.dumps({"value": 1}))
         + int(math.sqrt(4))
-        + typing.cast(int, 1)
+        + typing.cast("int", 1)
         + _decorated_user_function()
     )
 
@@ -338,11 +337,15 @@ def test_unsafe_capture_does_not_populate_manifest_cache(
     cached = dict[str, dict[str, str]]()
 
     class ManifestWrites(list[tuple[bytes, bytes]]):
+        @typing.override
         def append(self, entry: tuple[bytes, bytes]) -> None:
             cached["unsafe-cache"] = json.loads(entry[1])["m"]
 
+    def cache_hit(stage_name: str) -> dict[str, str] | None:
+        return cached.get(stage_name)
+
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", ManifestWrites())
-    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda stage_name: cached.get(stage_name))
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", cache_hit)
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_tuple)
 
