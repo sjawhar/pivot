@@ -212,6 +212,37 @@ def test_repro_dry_run_allow_missing_uses_pvt_hash(
     assert "would skip" in result.output.lower(), f"Got: {result.output}"
 
 
+def test_repro_reports_paths_for_multiple_missing_pipeline_inputs(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Plain repro formats every missing input path from its error group."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(
+            """
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def combine(left: str, extra: str) -> str:
+    return left + extra
+
+
+with Pipeline("demo") as pipeline:
+    left = pipeline.input("left.csv", path="missing/left.csv", t=str)
+    extra = pipeline.input("extra.csv", path="missing/extra.csv", t=str)
+    combine(left, extra)
+"""
+        )
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code != 0
+    assert "2 missing dependency error(s):" in result.output
+    assert "input 'left.csv' (path missing/left.csv)" in result.output
+    assert "input 'extra.csv' (path missing/extra.csv)" in result.output
+    assert "Tip: Ensure all dependency files exist or are produced by other stages" in result.output
+
+
 # =============================================================================
 # Explain Mode Tests
 # =============================================================================
