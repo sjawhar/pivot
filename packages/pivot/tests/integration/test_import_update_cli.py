@@ -401,7 +401,7 @@ def test_import_rejects_remote_content_that_does_not_match_its_hash(
     result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/total", "--out", "t.txt"])
 
     assert result.exit_code != 0
-    assert "Downloaded file hash mismatch" in result.output
+    assert "Hash mismatch" in result.output
     assert not (consumer / "t.txt").exists(), "corrupt content must not stay in the workspace"
     assert not (consumer / "t.txt.pvt").exists()
 
@@ -534,11 +534,6 @@ def test_update_skips_unreadable_and_non_import_targets(
     assert "No imports found to update." in result.output
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 9 (cli-fixes Slice 2 PR): failed pivot update deletes the last "
-    + "good import",
-)
 def test_update_with_corrupt_remote_keeps_last_good_file(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:

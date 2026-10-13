@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
+import os
+import pathlib
+import tempfile
 from typing import TYPE_CHECKING, TypedDict, cast
 
 import aiohttp
@@ -16,7 +20,6 @@ from pivot.storage import cache, track
 from pivot.storage import lock as storage_lock
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Callable
 
     from pivot.types import DirManifestEntry, OutEntry, StorageLockData
@@ -37,6 +40,31 @@ class ImportResult(TypedDict):
     pvt_path: str
     data_path: str
     downloaded: bool
+
+
+async def _download_verified(remote_url: str, file_hash: str, data_path: pathlib.Path) -> int:
+    """Download ``file_hash`` to ``data_path`` only if its content matches; return its size.
+
+    The file is downloaded to a temp file in the destination directory and moved over
+    ``data_path`` after its hash is checked, so a corrupt remote copy leaves any existing
+    file (the last good import) untouched.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=data_path.parent, prefix=f".{data_path.name}.", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp_path = pathlib.Path(tmp_name)
+    try:
+        await remote_storage.S3Remote(remote_url).download_file(file_hash, tmp_path)
+        actual_hash, _ = cache.hash_file(tmp_path)
+        if actual_hash != file_hash:
+            raise exceptions.RemoteError(f"Hash mismatch: expected {file_hash}, got {actual_hash}")
+        size = tmp_path.stat().st_size
+        os.replace(tmp_path, data_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+    return size
 
 
 def _maybe_token(repo_url: str, token: str | None) -> str | None:
@@ -366,16 +394,8 @@ async def import_artifact(
     downloaded = False
     file_size = resolved["size"]
     if not no_download:
-        remote = remote_storage.S3Remote(resolved["remote_url"])
-        await remote.download_file(resolved["hash"], data_path)
+        file_size = await _download_verified(resolved["remote_url"], resolved["hash"], data_path)
         downloaded = True
-        actual_hash, _ = cache.hash_file(data_path)
-        if actual_hash != resolved["hash"]:
-            data_path.unlink(missing_ok=True)
-            raise exceptions.RemoteError(
-                f"Downloaded file hash mismatch: expected {resolved['hash']}, got {actual_hash}"
-            )
-        file_size = data_path.stat().st_size
 
     source = track.ImportSource(
         repo=repo_url,
@@ -452,16 +472,8 @@ async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -
 
     file_size = resolved["size"]
     if need_download:
-        remote = remote_storage.S3Remote(resolved["remote_url"])
-        await remote.download_file(resolved["hash"], data_path)
-        actual_hash, _ = cache.hash_file(data_path)
-        if actual_hash != resolved["hash"]:
-            data_path.unlink(missing_ok=True)
-            raise exceptions.RemoteError(
-                f"Hash mismatch: expected {resolved['hash']}, got {actual_hash}"
-            )
+        file_size = await _download_verified(resolved["remote_url"], resolved["hash"], data_path)
         downloaded = True
-        file_size = data_path.stat().st_size
     elif data_path.exists():
         file_size = data_path.stat().st_size
 
