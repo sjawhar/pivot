@@ -204,6 +204,61 @@ def test_run_cache_skip_updates_lock_file(
     )
 
 
+def test_run_cache_skip_restores_cached_output(
+    worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
+) -> None:
+    """A run-cache hit restores the earlier output instead of locking stale bytes."""
+    input_file = tmp_path / "input.txt"
+    input_file.write_text("state_A")
+
+    def stage_func(_0: str) -> str:
+        return f"processed: {(tmp_path / 'input.txt').read_text()}"
+
+    stage_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
+        run_id="run_1",
+    )
+    first = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
+    assert first["status"] == "ran"
+    _apply_deferred_writes("test_stage", stage_info, first, tmp_path / ".pivot")
+
+    input_file.write_text("state_B")
+    second_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
+        run_id="run_2",
+    )
+    second = executor.execute_stage("test_stage", second_info, worker_env, output_queue)
+    assert second["status"] == "ran"
+    _apply_deferred_writes("test_stage", second_info, second, tmp_path / ".pivot")
+
+    input_file.write_text("state_A")
+    restored_info = _make_stage_info(
+        stage_func,
+        tmp_path,
+        fingerprint={"self:stage_func": "fp123"},
+        deps={"_0": _input_ref("input.txt")},
+        outs=[_output_ref("test_stage")],
+        run_id="run_3",
+    )
+    restored = executor.execute_stage("test_stage", restored_info, worker_env, output_queue)
+
+    assert restored["status"] == "cached"
+    assert "run cache" in restored["reason"]
+    workspace = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="test",
+        input_bindings={},
+    )
+    output_path = workspace.resolve_display_path(_output_ref("test_stage"))
+    assert output_path.read_text() == "processed: state_A"
 def test_explain_shows_cached_after_run_cache_skip(
     worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage], tmp_path: pathlib.Path
 ) -> None:
