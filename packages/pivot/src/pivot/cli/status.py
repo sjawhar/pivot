@@ -143,12 +143,17 @@ def status(
     # Compute counts once for suggestions and output
     if explain and pipeline_explanations:
         stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
-        stage_reasons = [(e["stage_name"], e["reason"]) for e in pipeline_explanations]
+        stage_reasons = [
+            (e["stage_name"], e["reason"], e["upstream_stale"]) for e in pipeline_explanations
+        ]
     else:
         stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
-        stage_reasons = [(s["name"], s["reason"]) for s in pipeline_status]
+        stage_reasons = [(s["name"], s["reason"], s["upstream_stale"]) for s in pipeline_status]
+    # A stage downstream of a stale one is recomputed by repro, so pulling it is wasted.
     outputs_missing = [
-        name for name, reason in stage_reasons if reason == explain_mod.OUTPUTS_MISSING_REASON
+        name
+        for name, reason, upstream_stale in stage_reasons
+        if reason == explain_mod.OUTPUTS_MISSING_REASON and not upstream_stale
     ]
     # Pull can restore only cacheable outputs; a metric-only mismatch is not pullable.
     missing_outputs_count = (

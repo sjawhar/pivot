@@ -224,3 +224,51 @@ def test_status_does_not_suggest_pull_for_an_edited_metric(tmp_path: pathlib.Pat
     out = _ok(_pivot(root, "status"))
 
     assert "pivot pull" not in out, out
+
+
+_CHAIN_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def scale(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * 2
+
+
+@stage
+def total(scaled: pd.DataFrame) -> dict:
+    return {"sum": int(scaled["a"].sum())}
+
+
+with Pipeline("k") as pipeline:
+    total(scale(pipeline.input("t.csv")))
+"""
+
+
+def test_status_does_not_suggest_pull_for_stage_whose_upstream_is_stale(
+    tmp_path: pathlib.Path,
+) -> None:
+    """repro recomputes a stage downstream of a stale one, so pulling its outputs is wasted."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(src, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(src, "repro"))
+    _ok(_pivot(src, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    (src / ".gitignore").write_text("data/k/\n")
+    subprocess.run(["git", "add", "-A"], cwd=src, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=src,
+        check=True,
+    )
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    pipeline_py = clone / "pipeline.py"
+    pipeline_py.write_text(pipeline_py.read_text().replace("raw * 2", "raw * 3"))
+
+    out = _ok(_pivot(clone, "status"))
+
+    assert "Run `pivot repro` to execute 2 stale stages" in out, out
+    assert "pivot pull" not in out, out
