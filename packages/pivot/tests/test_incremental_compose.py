@@ -4,7 +4,7 @@ from typing import Annotated, TypedDict
 import pytest
 
 import pivot
-from pivot import compose, exceptions, loaders, outputs, types
+from pivot import compose, exceptions, loaders, outputs, project, types
 
 
 def _incremental_tag() -> object:
@@ -33,6 +33,31 @@ def test_incremental_output_registers_its_previous_input_without_a_dag_edge(
     assert output.tag is types.ArtifactTag.INCREMENTAL
     assert info["incremental_inputs"] == {"previous": output.identity}
     assert list(pipeline.build_dag().edges()) == []
+
+def test_uncached_incremental_output_is_detected_from_artifact_refs(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing incremental workspace artifact without a lock hash is guarded."""
+    tag = _incremental_tag()
+
+    @compose.stage
+    def update(previous: dict[str, int]) -> Annotated[dict[str, int], tag]:
+        return previous
+
+    with compose.Pipeline("updates", root=tmp_path) as pipeline:
+        update(previous=pipeline.previous())
+
+    stage_name = "updates/update"
+    output_path = tmp_path / "data" / "updates" / "update.yaml"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("count: 1\n")
+    monkeypatch.setattr(project, "get_project_root", lambda: tmp_path)
+
+    from pivot.executor import core
+
+    assert core.check_uncached_incremental_outputs(
+        [stage_name], {stage_name: pipeline.get_stage(stage_name)}
+    ) == [(stage_name, str(output_path))]
 
 
 def test_previous_key_selects_an_incremental_typed_dict_output(tmp_path: pathlib.Path) -> None:
