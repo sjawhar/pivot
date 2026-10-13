@@ -227,6 +227,24 @@ def test_yaml_loader_refuses_dataclass_with_type_name(tmp_path: pathlib.Path) ->
         loaders.YAML[object]().save(_UnserializableMetric(0.5), tmp_path / "metric.yaml")
 
 
+@pytest.mark.parametrize(
+    ("value", "type_name"),
+    [
+        pytest.param(numpy.datetime64("2024-01-01T00:00:00.000000001"), "datetime64"),
+        pytest.param(numpy.timedelta64(5, "ns"), "timedelta64"),
+        pytest.param(
+            numpy.array(["2024-01-01T00:00:00.000000001"], dtype="datetime64[ns]"),
+            "datetime64",
+        ),
+    ],
+)
+def test_yaml_loader_refuses_numpy_temporal_values(
+    tmp_path: pathlib.Path, value: object, type_name: str
+) -> None:
+    with pytest.raises(TypeError, match=type_name):
+        loaders.YAML[object]().save({"value": value}, tmp_path / "metric.yaml")
+
+
 def test_pickle_loader_warns_about_cache_and_remote_trust(tmp_path: pathlib.Path) -> None:
     pickle_file = tmp_path / "artifact.pkl"
     pickle_file.write_bytes(pickle.dumps({"value": 1}))

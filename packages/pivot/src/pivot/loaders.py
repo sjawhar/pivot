@@ -168,7 +168,17 @@ class YAML[T](Loader[T, T]):
         def plain(value: object, location: str) -> object:
             if value is pandas.NaT or value is pandas.NA:
                 return None
+            if isinstance(value, (numpy.datetime64, numpy.timedelta64)):
+                raise TypeError(
+                    f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
+                    + "Convert NumPy temporal values explicitly."
+                )
             if isinstance(value, numpy.ndarray):
+                if value.dtype.kind in "mM":
+                    raise TypeError(
+                        f"YAML output must contain plain data; got {value.dtype} array at {location}. "
+                        + "Convert NumPy temporal values explicitly."
+                    )
                 return plain(value.tolist(), location)
             if isinstance(value, numpy.generic):
                 unwrapped = value.item()
