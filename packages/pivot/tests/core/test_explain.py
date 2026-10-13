@@ -9,11 +9,32 @@ import pydantic
 import pygtrie
 import pytest
 
-from pivot import explain, loaders, project, skip
+from pivot import StageParams, compose, executor, explain, loaders, project, skip, status
 from pivot.storage import lock
 from pivot.storage import store as store_mod
-from pivot.storage.track import PvtData
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, HashInfo, LockData
+
+
+class _UpstreamParams(StageParams):
+    value: int = 1
+
+
+@compose.stage
+def _upstream_stage_a(input_file: str, params: _UpstreamParams) -> str:
+    return f"{params.value}:{input_file}"
+
+
+@compose.stage
+def _upstream_stage_b(a_output: str) -> str:
+    return a_output
+
+
+def _build_upstream_pipeline(root: pathlib.Path, value: int) -> compose.Pipeline:
+    with compose.Pipeline("test", root=root) as pipeline:
+        input_file = pipeline.input("input.txt")
+        a_output = _upstream_stage_a(input_file, params=_UpstreamParams(value=value))
+        _upstream_stage_b(a_output)
+    return pipeline
 
 
 def _input_ref(name: str) -> ArtifactRef:
@@ -572,7 +593,7 @@ def test_get_stage_explanation_force_without_changes(
 
     assert result["will_run"] is True
     assert result["is_forced"] is True
-    assert result["reason"] == ("forced" if create_lock else "forced")
+    assert result["reason"] == "forced"
 
 
 def test_get_stage_explanation_force_with_code_changes(tmp_path: pathlib.Path) -> None:
@@ -620,6 +641,37 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: pathlib.Path) -
     assert result["will_run"] is True
     assert result["is_forced"] is True
     assert "missing" in result["reason"].lower()
+
+
+def test_get_pipeline_explanations_upstream_propagation(
+    mock_discovery: compose.Pipeline,
+) -> None:
+    """get_pipeline_explanations propagates staleness to downstream stages."""
+    input_path = mock_discovery.root / "data" / "raw" / "input.txt"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_text("data")
+
+    initial_pipeline = _build_upstream_pipeline(mock_discovery.root, value=1)
+    executor.run(pipeline=initial_pipeline)
+
+    pipeline = _build_upstream_pipeline(mock_discovery.root, value=2)
+    explanations = status.get_pipeline_explanations(
+        stages=None,
+        single_stage=False,
+        all_stages=pipeline.snapshot(),
+        pipeline=pipeline,
+    )
+
+    stage_b_exp = next(
+        (explanation for explanation in explanations if explanation["stage_name"] == "test/_upstream_stage_b"),
+        None,
+    )
+    assert stage_b_exp is not None, "test/_upstream_stage_b should be in explanations"
+    assert stage_b_exp["will_run"] is True, "test/_upstream_stage_b should run due to upstream staleness"
+    assert "upstream_stale" in stage_b_exp, "test/_upstream_stage_b should have upstream_stale"
+    assert "test/_upstream_stage_a" in stage_b_exp["upstream_stale"], (
+        "test/_upstream_stage_b should list test/_upstream_stage_a as stale upstream"
+    )
 
 
 # Removed: annotation-style pipeline re-registration is not part of the compositional API.
