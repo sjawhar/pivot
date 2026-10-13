@@ -150,7 +150,7 @@ Variants are Python loops. Calling the same stage again in one pipeline creates 
 
 ## Several modules and pipelines
 
-`pipeline.py`, modules next to it, and packages at the project root import normally, so stage code can live in its own modules and one pipeline can import from another. Larger projects keep one module per stage, each holding its own `StageParams` (`stages/clean.py` with `CleanParams` and `clean`), and `pipeline.py` only imports and wires them.
+Imports resolve from the project root (the directory holding `.pivot/`): a root `pipeline.py` imports sibling modules directly (`from stages import clean`); a pipeline in a subdirectory imports with the full path (`from report.helpers import x`, `from prep.pipeline import kept`). Larger projects keep one module per stage, each holding its own `StageParams` (`stages/clean.py` with `CleanParams` and `clean`), and `pipeline.py` only imports and wires them.
 
 A handle is an ordinary Python object, so a downstream pipeline imports it and Pivot runs the upstream stages first:
 
@@ -233,7 +233,7 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock fil
 |---|---|
 | `module 'pivot' has no attribute 'Out'` (or `Dep`, `Metric`) | Those markers do not exist; use the return type and `metric`/`plot` tags |
 | `does not define a 'pipeline' variable` | `with Pipeline("name") as pipeline:` |
-| `No module named '<yours>'` | The module must sit next to `pipeline.py`, in a package at the project root, or be installed |
+| `No module named '<yours>'` | Import from the project root: `from report.helpers import x`, not `from helpers import x`, in `report/pipeline.py` |
 | `parameter 'x' has unsupported type` | Pass handles or `StageParams`; move plain values into `StageParams` |
 | `received handle from multi-output stage` | Select a field: `handle.field` |
 | `Cannot infer serialization format` | Return a supported type or `Annotated[T, loaders.X()]` |
