@@ -127,6 +127,9 @@ def _resource_a() -> str:
 def _resource_b() -> str:
     return _timed("b")
 
+def _resource_cpu() -> str:
+    return _timed("cpu")
+
 
 def _resource_c(value: str) -> str:
     _ = value
@@ -628,3 +631,78 @@ def test_exclusive_mutex_runs_alone(
 
     executor.run(pipeline=pipeline, max_workers=2)
     _assert_serial(root, "a", "b")
+
+
+@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
+def test_resource_waiting_does_not_consume_worker(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage waiting for GPU leaves a worker available for CPU-only work."""
+    root = _resource_root(tmp_path, monkeypatch)
+    pipeline = _resource_pipeline(
+        root,
+        [
+            ({"gpu": 1}, _resource_a, ()),
+            ({"gpu": 1}, _resource_b, ()),
+            (None, _resource_cpu, ()),
+        ],
+    )
+
+    executor.run(pipeline=pipeline, max_workers=2)
+
+    intervals = _timing_intervals(root)
+    assert _overlap(intervals["a"], intervals["cpu"]), intervals
+    assert not _overlap(intervals["a"], intervals["b"]), intervals
+
+
+@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
+def test_cpu_all_excludes_bare_stage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full CPU reservation excludes a concurrently ready bare stage."""
+    root = _resource_root(tmp_path, monkeypatch)
+    pipeline = _resource_pipeline(
+        root,
+        [
+            ({"cpu": "all"}, _resource_a, ()),
+            (None, _resource_b, ()),
+        ],
+    )
+
+    executor.run(pipeline=pipeline, max_workers=2)
+
+    _assert_serial(root, "a", "b")
+
+
+@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
+def test_resource_changes_leave_stage_cached(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing a resource declaration does not change a stage fingerprint."""
+    root = _resource_root(tmp_path, monkeypatch)
+    pipeline = _resource_pipeline(root, [({"gpu": 1}, _resource_a, ())])
+
+    assert executor.run(pipeline=pipeline)["resources/_resource_a"]["status"] == "ran"
+    pipeline.get_stage("resources/_resource_a")["resources"] = {"gpu": 2}
+
+    assert executor.run(pipeline=pipeline)["resources/_resource_a"]["status"] == "cached"
+
+
+@pytest.mark.xfail(strict=True, reason="red test for Task 19: stage resources replace mutex")
+def test_resource_request_above_capacity_fails_before_submission(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """An impossible request errors before the worker pool receives a stage."""
+    from pivot.engine import worker_pool
+
+    root = _resource_root(tmp_path, monkeypatch)
+    pipeline = _resource_pipeline(root, [({"gpu": 3}, _resource_a, ())])
+    submit = mocker.patch.object(worker_pool.WorkerPool, "submit")
+
+    with pytest.raises(
+        ValueError,
+        match=r"resources/_resource_a.*gpu.*3.*1",
+    ):
+        executor.run(pipeline=pipeline)
+
+    submit.assert_not_called()
