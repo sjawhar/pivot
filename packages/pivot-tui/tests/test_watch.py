@@ -42,21 +42,26 @@ pipeline = _cp
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
     sock_path = tmp_path / ".pivot" / "agent.sock"
+    stdout_path = tmp_path / "tui.stdout"
+    stderr_path = tmp_path / "tui.stderr"
 
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
     # TERM needed for TUI mode
     env["TERM"] = "xterm-256color"
 
-    # Start TUI watch mode WITHOUT --serve - the socket should still be created
-    proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--tui", "--force"],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.PIPE,  # TUI needs stdin
-    )
+    # Start TUI watch mode WITHOUT --serve - the socket should still be created.
+    # Output goes to files, not pipes: nothing reads a pipe until teardown, so the
+    # TUI's screen output and the server's per-connection logs would fill it and block.
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            ["uv", "run", "pivot", "repro", "--watch", "--tui", "--force"],
+            cwd=tmp_path,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            stdin=subprocess.PIPE,  # TUI needs stdin
+        )
 
     try:
         # Wait for socket to be created
@@ -65,10 +70,10 @@ pipeline = _cp
                 break
             time.sleep(0.1)
         else:
-            stdout, stderr = proc.communicate(timeout=1)
             pytest.fail(
                 "Socket not created within 10s.\n"
-                + f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+                + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+                + f"stderr: {stderr_path.read_text(errors='replace')}"
             )
 
         # Poll until status query succeeds (server is ready)
