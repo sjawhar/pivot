@@ -377,7 +377,7 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
             {
                 "code_manifest": {},
                 "params": {},
-                "deps": [{"producer": ["p/a"], "key": None, "hash": "x"}],
+                "deps": [{"producer": ["p/a"], "key": None, "hash": "0123456789abcdef"}],
                 "outs": [],
             },
             id="list-producer",
@@ -387,7 +387,7 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
                 "code_manifest": {},
                 "params": {},
                 "deps": [],
-                "outs": [{"key": {"k": 1}, "hash": "x", "tag": "data"}],
+                "outs": [{"key": {"k": 1}, "hash": "fedcba9876543210", "tag": "data"}],
             },
             id="mapping-key",
         ),
