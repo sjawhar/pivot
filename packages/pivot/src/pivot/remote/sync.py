@@ -203,7 +203,7 @@ def get_target_hashes(
             if resolved_name in all_stages:
                 stage_name = resolved_name
 
-        if stage_name is not None:
+        if stage_name is not None and all_stages is not None:
             if target_identity.key is None:
                 stage_info = all_stages[stage_name]
                 target_state_dir = registry.get_stage_state_dir(stage_info, state_dir)

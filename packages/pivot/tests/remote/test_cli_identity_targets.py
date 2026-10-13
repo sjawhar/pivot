@@ -8,13 +8,14 @@ import boto3
 
 from pivot import cli, compose, config, executor
 from pivot.cli import helpers as cli_helpers
-from pivot.cli import remote as cli_remote
 from pivot.remote import storage as remote_storage
+from pivot.remote import sync
 from pivot.storage import cache, lock
 from pivot.types import ArtifactIdentity
 
 if TYPE_CHECKING:
     import click.testing
+    import pytest
 
 
 class _RemoteOutput(TypedDict):
@@ -28,8 +29,8 @@ def _remote_train() -> _RemoteOutput:
 
 def test_push_fetch_pull_resolve_bare_and_qualified_stage_keys(
     mock_discovery: compose.Pipeline,
-    monkeypatch,
-    moto_patch_session,
+    monkeypatch: pytest.MonkeyPatch,
+    moto_patch_session: None,
     runner: click.testing.CliRunner,
 ) -> None:
     # The remote test package's autouse fixture supplies empty outs by default;
@@ -50,13 +51,15 @@ def test_push_fetch_pull_resolve_bare_and_qualified_stage_keys(
     assert cache_path.exists()
 
     bucket = "pivot-identity-targets"
-    boto3.Session(region_name="us-east-1").client("s3").create_bucket(Bucket=bucket)
-    remote = remote_storage.S3Remote(f"s3://{bucket}/cache/")
-    monkeypatch.setattr(
-        cli_remote.transfer,
-        "create_remote_from_name",
-        lambda name: (remote, "origin"),
+    boto3.Session(region_name="us-east-1").client("s3").create_bucket(  # pyright: ignore[reportAttributeAccessIssue]
+        Bucket=bucket
     )
+    remote = remote_storage.S3Remote(f"s3://{bucket}/cache/")
+
+    def _create_remote(name: str | None) -> tuple[remote_storage.S3Remote, str]:
+        return remote, "origin"
+
+    monkeypatch.setattr(sync, "create_remote_from_name", _create_remote)
 
     push = runner.invoke(cli.cli, ["push", "_remote_train:model"])
     assert push.exit_code == 0, push.output
