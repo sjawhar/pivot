@@ -199,8 +199,7 @@ async def test_pipeline_edit_reloads_and_reruns_changed_stages_with_new_code(
 @pytest.mark.anyio
 @pytest.mark.xfail(
     strict=True,
-    reason="red test for watch-fixes (Task 26): reload fingerprints the old pipeline lazily, "
-    + "after the edit, so an edited stage never fingerprinted before is not reported modified",
+    reason="red test for Task 26: reload compares old fingerprint computed after the edit",
 )
 async def test_pipeline_edit_before_any_run_reports_edited_stage_as_modified(
     watch_project: pathlib.Path,
