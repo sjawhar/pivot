@@ -167,6 +167,26 @@ def test_incremental_output_requires_a_full_loader() -> None:
     ):
         compose._analyze_return_type(non_loader)
 
+@pytest.mark.parametrize(
+    "loader",
+    [
+        pytest.param(loaders.PathOnly(), id="path-only"),
+        pytest.param(loaders.Pickle(), id="pickle"),
+    ],
+)
+def test_incremental_output_requires_a_loader_with_an_empty_value(loader: object) -> None:
+    """A Loader that inherits the raising default cannot initialize an incremental output."""
+    tag = _incremental_tag()
+
+    def unsupported_empty_loader() -> Annotated[pathlib.Path, tag, loader]:
+        raise AssertionError("annotations are analyzed without calling the stage")
+
+    with pytest.raises(
+        exceptions.StageDefinitionError,
+        match=rf"unsupported_empty_loader.*_single.*{type(loader).__name__}",
+    ):
+        compose._analyze_return_type(unsupported_empty_loader)
+
 
 def test_incremental_output_rejects_metric_combination() -> None:
     """An output has one storage policy: incremental data cannot also be a metric."""
