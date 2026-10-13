@@ -150,9 +150,11 @@ with Pipeline("state") as pipeline:
     update_cache(previous=pipeline.previous())
 ```
 
-An incremental output requires a full `Loader` with `load()`, `save()`, and
-`empty()`; a writer-only format such as `MatplotlibFigure()` is rejected. An
-existing incremental output without a lock-file cache entry is refused unless
+An incremental output requires a full `Loader` with `load()`, `save()`, and a
+concrete `empty()` implementation; a writer-only format such as
+`MatplotlibFigure()` and loaders that inherit the default raising `empty()`
+(including `PathOnly()` and `Pickle()`) are rejected. An existing incremental
+output without a lock-file cache entry is refused unless
 `pivot repro --allow-uncached-incremental` is explicit.
 
 ## Metrics and plots
