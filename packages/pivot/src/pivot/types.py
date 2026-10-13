@@ -926,41 +926,6 @@ class AgentStagesResult(TypedDict):
     stages: list[AgentStageInfo]
 
 
-# =============================================================================
-# Stage Function Types
-# =============================================================================
-#
-# Stage functions are the core unit of pipeline definition. Their return type
-# determines how outputs are tracked and persisted.
-#
-# Valid return types (validated at registration time):
-#
-#   1. None
-#      No tracked outputs. Stage executes for side effects or writes directly.
-#
-#   2. TypedDict with Out-annotated fields
-#      Multiple named outputs. Each field must have Annotated[T, Out(...)] type.
-#      Example:
-#          class TrainOutputs(TypedDict):
-#              model: Annotated[bytes, Out("model.pkl", Pickle())]
-#              metrics: Annotated[dict, Out("metrics.json", JSON())]
-#
-#   3. Annotated[T, Out(...)]
-#      Single tracked output. Return value is written directly.
-#      Example:
-#          def transform(...) -> Annotated[DataFrame, Out("out.csv", CSV())]:
-#              return df.dropna()
-#
-#   4. Any other type
-#      No tracked outputs. Return value is ignored by the framework.
-#
-
-#
-
-# Return type for stage functions. The actual constraint is validated at
-# registration time - see valid return types documentation above.
-type StageReturn = Any
-
-# Callable type for stage functions. Parameters are injected based on
-# Annotated[T, Dep(...)] type hints at runtime.
-type StageFunc = Callable[..., StageReturn]
+# A stage function; compose derives its deps from handle arguments and its outputs
+# from the return annotation.
+type StageFunc = Callable[..., Any]

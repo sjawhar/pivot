@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import collections
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,7 +10,6 @@ import textual.widgets
 
 import pivot_tui.rpc_client_impl
 from helpers import wait_for_socket
-from pivot import loaders, outputs
 from pivot.types import (
     ArtifactIdentity,
     StageStatus,
@@ -35,82 +33,11 @@ from pivot_tui.widgets import (
 from pivot_tui.widgets import status as tui_status
 
 if TYPE_CHECKING:
+    import pathlib
+
     from pytest_mock import MockerFixture
 
     from pivot.registry import PipelineLike
-
-# =============================================================================
-# Output TypedDicts for annotation-based stages
-# =============================================================================
-
-
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-
-class _Step1Outputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step1.txt", loaders.PathOnly())]
-
-
-class _Step2Outputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step2.txt", loaders.PathOnly())]
-
-
-class _Step3Outputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("step3.txt", loaders.PathOnly())]
-
-
-# =============================================================================
-# Module-level helper functions for stages
-# =============================================================================
-
-
-def _helper_process(
-    input_file: pathlib.Path,
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
-
-
-def _helper_process_print(
-    input_file: pathlib.Path,
-) -> _OutputTxtOutputs:
-    _ = input_file
-    print("Processing data")
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
-
-
-def _helper_failing_stage(
-    input_file: pathlib.Path,
-) -> _OutputTxtOutputs:
-    _ = input_file
-    raise RuntimeError("Stage failed!")
-
-
-def _helper_step1(
-    input_file: pathlib.Path,
-) -> _Step1Outputs:
-    _ = input_file
-    pathlib.Path("step1.txt").write_text("step1")
-    return {"output": pathlib.Path("step1.txt")}
-
-
-def _helper_step2(
-    step1_file: pathlib.Path,
-) -> _Step2Outputs:
-    _ = step1_file
-    pathlib.Path("step2.txt").write_text("step2")
-    return {"output": pathlib.Path("step2.txt")}
-
-
-def _helper_step3(
-    step2_file: pathlib.Path,
-) -> _Step3Outputs:
-    _ = step2_file
-    pathlib.Path("step3.txt").write_text("step3")
-    return {"output": pathlib.Path("step3.txt")}
 
 
 class _FailingRpcClient:

@@ -369,7 +369,7 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
 
 
 # ==============================================================================
-# DirectoryOut trailing slash preservation
+# Directory outputs: lock display fields
 # ==============================================================================
 
 
