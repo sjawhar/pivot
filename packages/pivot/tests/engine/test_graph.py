@@ -215,24 +215,6 @@ def test_get_producer_returns_none_for_input_artifact(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures("clean_registry")
-def test_get_watch_paths_returns_all_artifacts(tmp_path: Path) -> None:
-    """get_watch_paths returns empty list with identity-based artifacts."""
-    input_identity = ArtifactIdentity("source", "input.csv")
-    intermediate = ArtifactIdentity("stage_a", "intermediate.csv")
-    output_identity = ArtifactIdentity("stage_b", "output.csv")
-
-    stages = {
-        "stage_a": _create_stage("stage_a", [input_identity], [intermediate]),
-        "stage_b": _create_stage("stage_b", [intermediate], [output_identity]),
-    }
-
-    g = graph.build_graph(stages)
-    paths = graph.get_watch_paths(g)
-
-    assert paths == []
-
-
-@pytest.mark.usefixtures("clean_registry")
 def test_get_downstream_stages(tmp_path: Path) -> None:
     """get_downstream_stages returns all transitively downstream stages."""
     input_identity = ArtifactIdentity("source", "input.csv")

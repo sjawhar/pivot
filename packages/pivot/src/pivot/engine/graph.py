@@ -24,7 +24,6 @@ __all__ = [
     "validate_dependency_sources",
     "get_consumers",
     "get_producer",
-    "get_watch_paths",
     "get_downstream_stages",
     "get_upstream_stages",
     "get_stage_dag",
@@ -268,17 +267,6 @@ def get_producer(g: nx.DiGraph[str], identity: pivot_types.ArtifactIdentity) -> 
         if g.nodes[pred]["type"] == NodeType.STAGE:
             return parse_node(pred)[1]
     return None
-
-
-def get_watch_paths(g: nx.DiGraph[str]) -> list[str]:
-    """Return watch paths (STUB — watch mode broken for data artifacts).
-
-    Watch mode for data artifact changes is not functional in this release.
-    Code/config file watching still works via inotify on source files.
-    TODO: Resolve ArtifactIdentity to filesystem paths via Store.
-    """
-    _ = g
-    return []
 
 
 def get_downstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:

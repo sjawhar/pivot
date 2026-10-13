@@ -6,6 +6,8 @@ import pathlib
 
 import networkx as nx
 
+from pivot import project
+from pivot import types as pivot_types
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import NodeType, StageExecutionState
 from pivot.engine.watch import WatchCoordinator
@@ -13,25 +15,32 @@ from pivot.engine.watch import WatchCoordinator
 
 def _helper_build_graph(
     stages: dict[str, dict[str, list[str]]],
-) -> nx.DiGraph[str]:
-    """Build a minimal bipartite graph for testing.
+) -> tuple[nx.DiGraph[str], dict[pathlib.Path, pivot_types.ArtifactIdentity]]:
+    """Build a minimal identity graph and its filesystem path index."""
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    identities = dict[pathlib.Path, pivot_types.ArtifactIdentity]()
 
-    Args:
-        stages: Mapping of stage_name -> {"deps": [paths], "outs": [paths]}
-    """
-    g: nx.DiGraph[str] = nx.DiGraph()
+    def _identity(path_str: str, producer: str | None = None) -> pivot_types.ArtifactIdentity:
+        path = project.normalize_path(path_str)
+        if path not in identities:
+            identities[path] = pivot_types.ArtifactIdentity(
+                producer or f"input/{path.name}",
+                None,
+            )
+        return identities[path]
+
     for name, info in stages.items():
         stage = engine_graph.stage_node(name)
-        g.add_node(stage, type=NodeType.STAGE)
+        graph.add_node(stage, type=NodeType.STAGE)
         for dep in info.get("deps", []):
-            art = engine_graph.artifact_node(pathlib.Path(dep))
-            g.add_node(art, type=NodeType.ARTIFACT)
-            g.add_edge(art, stage)
+            artifact = engine_graph.artifact_node(_identity(dep))
+            graph.add_node(artifact, type=NodeType.ARTIFACT)
+            graph.add_edge(artifact, stage)
         for out in info.get("outs", []):
-            art = engine_graph.artifact_node(pathlib.Path(out))
-            g.add_node(art, type=NodeType.ARTIFACT)
-            g.add_edge(stage, art)
-    return g
+            artifact = engine_graph.artifact_node(_identity(out, producer=name))
+            graph.add_node(artifact, type=NodeType.ARTIFACT)
+            graph.add_edge(stage, artifact)
+    return graph, identities
 
 
 def _helper_state_map(
@@ -53,14 +62,14 @@ def _helper_state_map(
 
 def test_affected_stages_returns_consumers_and_downstream() -> None:
     """Changed input affects its consumer and all transitive downstream stages."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "extract": {"deps": ["/data/raw.csv"], "outs": ["/data/clean.csv"]},
             "train": {"deps": ["/data/clean.csv"], "outs": ["/models/model.pkl"]},
             "evaluate": {"deps": ["/models/model.pkl"], "outs": ["/results/metrics.json"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     affected = coord.get_affected_stages([pathlib.Path("/data/raw.csv")])
     assert set(affected) == {"extract", "train", "evaluate"}, (
@@ -70,24 +79,24 @@ def test_affected_stages_returns_consumers_and_downstream() -> None:
 
 def test_affected_stages_unknown_path_returns_empty() -> None:
     """Path not in graph returns no affected stages."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     assert coord.get_affected_stages([pathlib.Path("/unknown.csv")]) == []
 
 
 def test_affected_stages_deduplicates() -> None:
     """Multiple paths affecting the same stage are deduplicated."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input1.csv", "/input2.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     affected = coord.get_affected_stages(
         [
@@ -105,12 +114,12 @@ def test_affected_stages_deduplicates() -> None:
 
 def test_should_filter_path_true_for_preparing_and_running_producer() -> None:
     """Paths produced by a PREPARING, WAITING_ON_LOCK, or RUNNING stage are filtered."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
     output = pathlib.Path("/output.csv")
 
     for state in (
@@ -126,12 +135,12 @@ def test_should_filter_path_true_for_preparing_and_running_producer() -> None:
 
 def test_should_filter_path_false_for_non_executing_producer() -> None:
     """Paths produced by PENDING, BLOCKED, READY, or COMPLETED stages are NOT filtered."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
     output = pathlib.Path("/output.csv")
 
     for state in (
@@ -148,12 +157,12 @@ def test_should_filter_path_false_for_non_executing_producer() -> None:
 
 def test_should_filter_path_false_for_input_artifact() -> None:
     """Input artifacts (no producer) should never be filtered."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     state_map = _helper_state_map(StageExecutionState.RUNNING)
     assert (
@@ -169,11 +178,11 @@ def test_should_filter_path_false_for_input_artifact() -> None:
 
 def test_should_restart_workers_true_when_parallel() -> None:
     """Worker restart recommended when parallel mode is enabled."""
-    coord = WatchCoordinator(graph=nx.DiGraph())
+    coord = WatchCoordinator(nx.DiGraph(), {})
     assert coord.should_restart_workers(parallel=True) is True
 
 
 def test_should_restart_workers_false_when_not_parallel() -> None:
     """Worker restart not recommended in sequential mode."""
-    coord = WatchCoordinator(graph=nx.DiGraph())
+    coord = WatchCoordinator(nx.DiGraph(), {})
     assert coord.should_restart_workers(parallel=False) is False
