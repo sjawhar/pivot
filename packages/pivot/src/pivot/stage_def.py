@@ -7,7 +7,6 @@ from typing import ClassVar
 
 import pydantic
 
-
 # Key used in out_specs for single-output stages (non-TypedDict returns)
 SINGLE_OUTPUT_KEY = "_single"
 
@@ -73,5 +72,3 @@ def validate_directory_out_key(key: str, output_name: str) -> str:
         )
 
     return normalized
-
-

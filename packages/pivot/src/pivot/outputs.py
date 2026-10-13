@@ -133,5 +133,3 @@ class DirectoryOut[T]:  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
     def __post_init__(self) -> None:
         if not self.path.endswith("/"):
             raise ValueError(f"DirectoryOut path must end with '/': {self.path!r}")
-
-

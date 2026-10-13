@@ -1,7 +1,7 @@
-import stat
 import collections.abc
 import pathlib
 import shutil
+import stat
 import tempfile
 from typing import Any
 
@@ -18,6 +18,7 @@ def _incremental_tag() -> types.ArtifactTag:
 
 def _increment(previous: dict[str, int]) -> dict[str, int]:
     return {"count": previous.get("count", 0) + 1}
+
 
 _incremental_invocations = list[int]()
 
@@ -53,6 +54,7 @@ def _mutate_previous_directory(previous: pathlib.Path) -> pathlib.Path:
     result_dir = pathlib.Path(tempfile.mkdtemp()) / "result"
     shutil.copytree(previous, result_dir)
     return result_dir
+
 
 def _copy_previous_directory(previous: pathlib.Path) -> pathlib.Path:
     assert previous.is_dir()
@@ -134,6 +136,7 @@ def test_incremental_first_run_injects_loader_empty_and_forced_run_restores_prev
 
     assert second["status"] is types.StageStatus.RAN
     assert loaders.JSON[dict[str, int]]().load(_output_path(tmp_path, "cache")) == {"count": 2}
+
 
 def test_unchanged_incremental_stage_is_cached_and_restores_missing_workspace_output(
     worker_env: pathlib.Path,
@@ -307,6 +310,7 @@ def test_incremental_directory_restores_a_writable_copy_without_mutating_the_cac
     assert cache_files["seed.txt"].read_text() == "seed"
     assert cache_files["nested/existing.txt"].read_text() == "nested seed"
     assert "nested/next.txt" not in cache_files
+
 
 def test_incremental_directory_copy_restore_preserves_executable_mode(
     worker_env: pathlib.Path,

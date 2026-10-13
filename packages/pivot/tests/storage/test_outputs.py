@@ -83,6 +83,7 @@ def test_out_instances_are_out() -> None:
     assert isinstance(metric, outputs.Out)
     assert isinstance(plot, outputs.Out)
 
+
 def test_legacy_path_output_plumbing_is_not_exposed() -> None:
     """Compositional outputs do not retain the removed path-bearing helpers."""
     assert not hasattr(outputs, "BaseOut")
@@ -116,8 +117,6 @@ def test_directory_out_non_string_path_raises_error() -> None:
         )
 
 
-
-
 def test_directory_out_frozen() -> None:
     """DirectoryOut should be immutable (frozen dataclass)."""
     dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
@@ -129,5 +128,3 @@ def test_directory_out_cache_default_true() -> None:
     """DirectoryOut should have cache=True by default."""
     dir_out = outputs.DirectoryOut(path="output/", loader=loaders.JSON[dict[str, int]]())
     assert dir_out.cache is True
-
-

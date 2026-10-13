@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from click.testing import CliRunner
 
 
-_PIPELINE = '''\
+_PIPELINE = """\
 from typing import Annotated
 
 from pivot import Pipeline, incremental, stage
@@ -25,7 +25,7 @@ def update(row: str, previous: dict[str, int]) -> Annotated[dict[str, int], incr
 
 with Pipeline("incremental") as pipeline:
     update(pipeline.input("row.txt"), previous=pipeline.previous())
-'''
+"""
 
 
 def _write_pipeline_and_input() -> None:

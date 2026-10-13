@@ -167,6 +167,7 @@ def test_incremental_output_requires_a_full_loader() -> None:
     ):
         compose._analyze_return_type(non_loader)
 
+
 @pytest.mark.parametrize(
     "loader",
     [
