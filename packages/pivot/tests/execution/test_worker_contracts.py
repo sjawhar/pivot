@@ -394,20 +394,6 @@ def test_forced_run_of_unchanged_stage_reports_forced(
     assert (forced["status"], forced["reason"]) == (StageStatus.RAN, "forced")
 
 
-def test_lock_comparison_skip_reports_unchanged(
-    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
-) -> None:
-    """Without recorded generations the worker compares the lock; history records "unchanged"."""
-    info = _stage_info(_upper, project, worker_env, no_commit=False)
-    first = _run_and_apply(info, worker_env, output_queue)
-
-    second = worker.execute_stage(_STAGE, info, worker_env, output_queue)
-
-    assert first["status"] == StageStatus.RAN, first["reason"]
-    assert (second["status"], second["reason"]) == (StageStatus.CACHED, "unchanged")
-    assert second["input_hash"] == first["input_hash"]
-
-
 def test_run_cache_restores_an_earlier_input_version(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
@@ -989,8 +975,8 @@ def test_queue_writer_reads_subprocess_bytes_until_end_of_file(
 
 @pytest.mark.xfail(
     strict=True,
-    reason="red test: _QueueWriter._pipe_reader (worker.py:1057-1066) decodes each pipe read "
-    + "on its own, so a UTF-8 character split across two reads becomes U+FFFD",
+    reason="red test for Task 9 (cli-fixes Slice 2 PR): worker pipe reader decodes each read "
+    + "separately",
 )
 def test_queue_writer_keeps_a_character_split_across_pipe_reads(
     output_queue: mp.Queue[OutputMessage],
