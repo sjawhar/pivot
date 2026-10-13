@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import decimal
 import json
+import math
 import pathlib
 import pickle
 import typing
@@ -898,3 +901,81 @@ def test_csv_loader_rejects_files_other_than_the_empty_frame_encoding(
 
     with pytest.raises(error):
         loaders.CSV().load(path)
+def test_dataframe_jsonl_roundtrips_date_and_time_columns(tmp_path: pathlib.Path) -> None:
+    """Date, datetime, tz-aware, NaT and timedelta values come back as datetimes, not ints."""
+    jsonl_file = tmp_path / "dates.jsonl"
+    df = pandas.DataFrame(
+        {
+            "date": [datetime.date(2024, 3, 4), datetime.date(2024, 3, 5), None],
+            "ns": pandas.to_datetime(
+                pandas.Series(
+                    ["2024-03-04 12:34:56.123456789", "2024-03-05 00:00:00.000000001", None]
+                )
+            ),
+            "tz": pandas.to_datetime(
+                pandas.Series(["2024-03-04 12:00", "2024-03-05 08:00", None])
+            ).dt.tz_localize("America/New_York"),
+            "delta": pandas.to_timedelta(
+                pandas.Series(["-1 days +00:00:01", "2 days 00:00:00.000000001", None])
+            ),
+        }
+    )
+
+    loaders.DataFrameJSONL().save(df, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    expected = pandas.DataFrame(
+        {
+            "date": pandas.to_datetime(pandas.Series(["2024-03-04", "2024-03-05", None])),
+            "ns": df["ns"],
+            "tz": df["tz"].dt.tz_convert("UTC"),
+            "delta": df["delta"],
+        }
+    )
+    pandas.testing.assert_frame_equal(loaded, expected)
+
+
+def test_dataframe_jsonl_roundtrips_floats_exactly(tmp_path: pathlib.Path) -> None:
+    """Float values come back bit-identical, including inside list cells."""
+    jsonl_file = tmp_path / "floats.jsonl"
+    values = [0.3, 0.35, 0.7, 0.1 + 0.2, 1 / 3, 1e-12, 2.0**-30, 123456789.123456789, math.nan]
+    df = pandas.DataFrame(
+        {
+            "x": values,
+            "whole": [float(i) for i in range(len(values))],
+            "nested": [[v] for v in values[:-1]] + [None],
+        }
+    )
+
+    loaders.DataFrameJSONL().save(df, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, df, check_exact=True)
+    assert [f"run_{v}" for v in loaded["x"].tolist()[:3]] == ["run_0.3", "run_0.35", "run_0.7"]
+
+
+def test_dataframe_jsonl_keeps_numeric_looking_strings_as_strings(tmp_path: pathlib.Path) -> None:
+    jsonl_file = tmp_path / "strings.jsonl"
+    df = pandas.DataFrame({"zip": ["02134", "10001", "00501"], "code": ["1", "2", "3"]})
+
+    loaders.DataFrameJSONL().save(df, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, df)
+
+
+@pytest.mark.parametrize(
+    ("cell", "type_name"),
+    [
+        pytest.param(decimal.Decimal("0.1"), "Decimal", id="decimal"),
+        pytest.param({1, 2}, "set", id="set"),
+        pytest.param(b"raw", "bytes", id="bytes"),
+    ],
+)
+def test_dataframe_jsonl_refuses_cells_json_cannot_hold(
+    tmp_path: pathlib.Path, cell: object, type_name: str
+) -> None:
+    df = pandas.DataFrame({"col": [cell, None]})
+
+    with pytest.raises(TypeError, match=rf"column 'col'.*{type_name}"):
+        loaders.DataFrameJSONL().save(df, tmp_path / "bad.jsonl")

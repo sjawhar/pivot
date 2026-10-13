@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import datetime
 import json
+import math
+import operator
 import os
 import pathlib
 import pickle
+import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, Any, Literal, override
+from typing import TYPE_CHECKING, Any, Literal, cast, override
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from matplotlib.figure import Figure
 
+import numpy
 import pandas
 import yaml
 
@@ -242,29 +247,176 @@ class JSONL(Loader[list[dict[str, Any]], list[dict[str, Any]]]):
         return []
 
 
+_ISO_DATETIME_NS = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}"
+_ISO_DURATION = r"P-?\d+DT\d+H\d+M\d+(?:\.\d+)?S"
+
+
+def _json_default(value: object) -> object:
+    """Convert the non-JSON scalars pandas hands back from object columns."""
+    if value is pandas.NaT:
+        return None
+    if isinstance(value, numpy.ndarray):
+        return value.tolist()
+    if isinstance(value, numpy.generic):
+        return value.item()
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, datetime.timedelta):
+        return pandas.Timedelta(value).isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _replace_nonfinite(value: object) -> object:
+    """Map NaN/inf anywhere inside a nested value to None (JSON has no NaN)."""
+    if isinstance(value, (numpy.ndarray, numpy.generic)):
+        value = cast("object", value.tolist())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        items = cast("list[object] | tuple[object, ...]", value)
+        return [_replace_nonfinite(item) for item in items]
+    if isinstance(value, dict):
+        mapping = cast("dict[object, object]", value)
+        return {key: _replace_nonfinite(item) for key, item in mapping.items()}
+    return value
+
+
+def _iso_datetime_texts(series: pandas.Series[Any], suffix: str = "") -> list[str]:
+    """JSON texts for a naive datetime64 column: quoted ISO 8601 with nanoseconds, NaT as null.
+
+    ISO texts contain only digits, "-", ":", "T", "." and the suffix, so they need no escaping.
+    """
+    values = series.to_numpy(dtype="datetime64[ns]")
+    texts: list[str] = numpy.datetime_as_string(values, unit="ns").tolist()
+    return ["null" if text == "NaT" else f'"{text}{suffix}"' for text in texts]
+
+
+def _encode_jsonl_column(series: pandas.Series[Any], encoder: json.JSONEncoder) -> list[str]:
+    """Encode one DataFrame column as JSON value texts, one per row."""
+    dtype = series.dtype
+    if pandas.api.types.is_float_dtype(dtype):
+        # repr() is the shortest text that parses back to the identical float;
+        # pandas.to_json rounds to at most 15 significant digits.
+        floats: list[float] = series.to_numpy(dtype="float64", na_value=math.nan).tolist()
+        return [repr(v) if math.isfinite(v) else "null" for v in floats]
+    if isinstance(dtype, numpy.dtype) and dtype.kind in "iu":
+        return series.astype(str).tolist()
+    if isinstance(dtype, numpy.dtype) and dtype.kind == "b":
+        return numpy.where(series.to_numpy(), "true", "false").tolist()
+    if pandas.api.types.is_object_dtype(dtype) and pandas.api.types.infer_dtype(
+        series, skipna=True
+    ) in ("date", "datetime"):
+        series = pandas.Series(pandas.to_datetime(series))
+        dtype = series.dtype
+    if isinstance(dtype, pandas.DatetimeTZDtype):
+        # tz-aware: written in UTC with a "Z" suffix, read back as datetime64[ns, UTC]
+        return _iso_datetime_texts(series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z")
+    if pandas.api.types.is_datetime64_dtype(dtype):
+        return _iso_datetime_texts(series)
+    if pandas.api.types.is_timedelta64_dtype(dtype):
+        deltas = cast("list[pandas.Timedelta]", series.tolist())
+        return ["null" if delta is pandas.NaT else f'"{delta.isoformat()}"' for delta in deltas]
+    missing: list[bool] = series.isna().tolist()
+    cells = [
+        None if is_missing else cell
+        for cell, is_missing in zip(cast("list[object]", series.tolist()), missing, strict=True)
+    ]
+    encoded = list[str]()
+    for cell in cells:
+        try:
+            encoded.append(encoder.encode(cell))
+        except ValueError:
+            encoded.append(encoder.encode(_replace_nonfinite(cell)))
+    return encoded
+
+
+def _restore_jsonl_column(series: pandas.Series[Any]) -> pandas.Series[Any]:
+    """Turn a column of the ISO texts save() writes back into datetime/timedelta."""
+    if not pandas.api.types.is_object_dtype(series.dtype):
+        return series
+    kind = pandas.api.types.infer_dtype(series, skipna=True)
+    if kind == "empty":
+        return series.astype("float64")
+    if kind != "string":
+        return series
+    texts = series.dropna().astype(str)
+    first = texts.iloc[0]
+    for pattern, convert in (
+        (_ISO_DATETIME_NS, lambda: pandas.to_datetime(series, format="ISO8601")),
+        (_ISO_DATETIME_NS + "Z", lambda: pandas.to_datetime(series, format="ISO8601", utc=True)),
+        (_ISO_DURATION, lambda: pandas.to_timedelta(series)),
+    ):
+        if re.fullmatch(pattern, first) and texts.str.fullmatch(pattern).all():
+            return pandas.Series(convert())
+    return series
+
+
 @dataclasses.dataclass(frozen=True)
 class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
 
-    Uses pandas.read_json with lines=True for efficient loading.
+    One JSON object per row; the index is not written. Values round-trip as follows:
+
+    - floats: written as the shortest exact text, read back bit-identical
+      (NaN and +/-inf are written as ``null`` and read back as NaN).
+    - ``datetime.date``/``datetime`` objects and ``datetime64`` columns: written as
+      ISO 8601 with nanoseconds and read back as ``datetime64[ns]``; tz-aware
+      columns are written in UTC (``...Z``) and read back as ``datetime64[ns, UTC]``.
+    - ``timedelta64`` columns: written as ISO 8601 durations, read back as ``timedelta64[ns]``.
+    - strings stay strings, even when they look like numbers.
+
+    A string column whose every value is exactly one of those ISO shapes is read
+    back as datetimes/timedeltas. Cells that JSON cannot hold (``Decimal``,
+    ``set``, ``bytes``, arbitrary objects) raise ``TypeError`` naming the column.
     Saves atomically via temp file + rename.
     """
 
     @override
     def load(self, path: pathlib.Path) -> pandas.DataFrame:
-        return pandas.read_json(path, lines=True, orient="records", convert_dates=False)
+        records = list[object]()
+        with path.open() as f:
+            for line_num, line in enumerate(f, 1):
+                if line.strip():
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
+        frame = pandas.DataFrame(records)
+        for column in frame.columns:
+            frame[column] = _restore_jsonl_column(frame[column])
+        return frame
 
     @override
     def save(self, data: pandas.DataFrame, path: pathlib.Path) -> None:
         if not isinstance(data, pandas.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
             raise TypeError(f"DataFrameJSONL save expects DataFrame, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
+        if not data.columns.is_unique:
+            duplicated = sorted({str(c) for c in data.columns[data.columns.duplicated()]})
+            raise ValueError(
+                f"DataFrameJSONL requires unique column names, duplicated: {duplicated}"
+            )
+
+        encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"), default=_json_default)
+        keys = list[str]()
+        columns = list[list[str]]()
+        for name in data.columns:
+            try:
+                columns.append(_encode_jsonl_column(data[name], encoder))
+            except TypeError as e:
+                raise TypeError(
+                    f"DataFrameJSONL cannot write column {str(name)!r}: {e}. Convert it to "
+                    + "str/int/float/bool/list/dict values, or pick another format for this "
+                    + "output, e.g. Annotated[pd.DataFrame, Pickle()]."
+                ) from e
+            keys.append(encoder.encode(str(name)) + ":")
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
         fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
         try:
             with os.fdopen(fd, "w") as f:
-                data.to_json(f, lines=True, orient="records")
+                for cells in zip(*columns, strict=True):
+                    f.write("{" + ",".join(map(operator.add, keys, cells)) + "}\n")
             os.rename(tmp_path_str, path)
         except Exception:
             tmp_path = pathlib.Path(tmp_path_str)
