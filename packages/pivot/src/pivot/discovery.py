@@ -219,27 +219,25 @@ def discover_pipeline(
     session: _ImportSession | None = None
     loaded = False
     try:
-        root = (project_root or project.get_project_root()).resolve()
+        try:
+            root = (project_root or project.get_project_root()).resolve()
+            cwd = pathlib.Path.cwd().resolve()
+        except OSError as e:
+            raise DiscoveryError(f"Failed to resolve paths: {e}") from e
         session = _start_import_session(root)
 
         if all_pipelines:
             result = _discover_all_pipelines(root, session)
             loaded = result is not None
             return result
-        try:
-            cwd = pathlib.Path.cwd().resolve()
-            root_resolved = root
-        except OSError as e:
-            raise DiscoveryError(f"Failed to resolve paths: {e}") from e
-
         # Check cwd first if it's within project root but not the root itself
         config_path: pathlib.Path | None = None
-        if cwd != root_resolved and cwd.is_relative_to(root_resolved):
+        if cwd != root and cwd.is_relative_to(root):
             config_path = find_config_in_dir(cwd)
 
-        # Fall back to project root (use resolved path for consistency)
+        # Fall back to project root
         if config_path is None:
-            config_path = find_config_in_dir(root_resolved)
+            config_path = find_config_in_dir(root)
 
         if config_path is None:
             return None
