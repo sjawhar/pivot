@@ -928,9 +928,8 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
         else:
             fmt = _infer_format(base_type)
 
-    if (
-        isinstance(tag, _IncrementalTag)
-        and (not isinstance(fmt, loaders.Loader) or type(fmt).empty is loaders.Loader.empty)
+    if isinstance(tag, _IncrementalTag) and (
+        not isinstance(fmt, loaders.Loader) or type(fmt).empty is loaders.Loader.empty
     ):
         raise exceptions.StageDefinitionError(
             f"Stage '{stage_name}' output '{key}' is incremental but loader "
