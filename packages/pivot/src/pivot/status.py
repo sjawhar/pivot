@@ -411,14 +411,18 @@ def _pluralize(count: int, singular: str) -> str:
     return singular if count == 1 else f"{singular}s"
 
 
-def find_orphaned_lock_files(
-    registered_stages: set[str],
-    state_dir: pathlib.Path | None = None,
-) -> list[str]:
-    if state_dir is None:
-        state_dir = project.get_project_root() / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    return lock.find_orphaned_locks(stages_dir, registered_stages)
+def find_orphaned_lock_files(all_stages: dict[str, RegistryStageInfo]) -> list[str]:
+    """Find lock files in the registered stages' state dirs that belong to no registered stage."""
+    default_state_dir = config.get_state_dir()
+    state_dirs = {
+        registry.get_stage_state_dir(stage_info, default_state_dir)
+        for stage_info in all_stages.values()
+    }
+    registered = set(all_stages)
+    orphaned = set[str]()
+    for state_dir in state_dirs:
+        orphaned.update(lock.find_orphaned_locks(lock.get_stages_dir(state_dir), registered))
+    return sorted(orphaned)
 
 
 def get_suggestions(

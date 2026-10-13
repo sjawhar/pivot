@@ -78,7 +78,7 @@ def status(
     if show_stages and pipeline is not None:
         all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)
-        orphaned_locks = status_mod.find_orphaned_lock_files(set(all_stages.keys()))
+        orphaned_locks = status_mod.find_orphaned_lock_files(all_stages)
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
