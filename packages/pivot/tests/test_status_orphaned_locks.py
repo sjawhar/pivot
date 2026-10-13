@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from typing import TYPE_CHECKING
 
-from pivot import status
+from pivot import config, status
 from pivot.registry import RegistryStageInfo
 
 if TYPE_CHECKING:
@@ -52,3 +52,30 @@ def test_find_orphaned_lock_files_scans_each_stage_state_dir(
     _touch_lock(sub_state_dir, "sub/renamed_away")
 
     assert status.find_orphaned_lock_files(all_stages) == ["sub/renamed_away"]
+
+
+def test_find_orphaned_lock_files_includes_default_dir_with_only_custom_stages(
+    set_project_root: pathlib.Path,
+    monkeypatch,
+) -> None:
+    """A custom stage dir does not suppress cleanup of stale locks in the configured default."""
+    default_state_dir = set_project_root / ".pivot"
+    custom_state_dir = set_project_root / "custom" / ".pivot"
+    monkeypatch.setattr(config, "get_state_dir", lambda: default_state_dir)
+    all_stages = {"custom/train": _stage_info("custom/train", custom_state_dir)}
+    _touch_lock(custom_state_dir, "custom/train")
+    _touch_lock(default_state_dir, "deleted/train")
+
+    assert status.find_orphaned_lock_files(all_stages) == ["deleted/train"]
+
+
+def test_find_orphaned_lock_files_scans_default_dir_without_stages(
+    set_project_root: pathlib.Path,
+    monkeypatch,
+) -> None:
+    """Deleting every stage does not hide stale locks in the configured default directory."""
+    default_state_dir = set_project_root / ".pivot"
+    monkeypatch.setattr(config, "get_state_dir", lambda: default_state_dir)
+    _touch_lock(default_state_dir, "deleted/train")
+
+    assert status.find_orphaned_lock_files({}) == ["deleted/train"]

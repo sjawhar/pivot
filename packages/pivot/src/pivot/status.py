@@ -414,7 +414,7 @@ def _pluralize(count: int, singular: str) -> str:
 def find_orphaned_lock_files(all_stages: dict[str, RegistryStageInfo]) -> list[str]:
     """Find lock files in the registered stages' state dirs that belong to no registered stage."""
     default_state_dir = config.get_state_dir()
-    state_dirs = {
+    state_dirs = {default_state_dir} | {
         registry.get_stage_state_dir(stage_info, default_state_dir)
         for stage_info in all_stages.values()
     }
