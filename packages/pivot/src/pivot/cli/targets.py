@@ -11,7 +11,7 @@ from pivot import discovery, names, outputs, project, types
 from pivot.cli import helpers as cli_helpers
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Mapping
 
     import networkx as nx
 
@@ -43,13 +43,6 @@ class IdentityTarget(TypedDict):
     refs: list[types.ArtifactRef]
 
 
-class PvtTarget(TypedDict):
-    """CLI target resolved to a .pvt-tracked file."""
-
-    kind: Literal["pvt"]
-    path: str
-
-
 def parse_identity_target(target: str) -> types.ArtifactIdentity:
     """Parse a CLI target string into an ArtifactIdentity.
 
@@ -61,67 +54,32 @@ def parse_identity_target(target: str) -> types.ArtifactIdentity:
 def resolve_cli_target(
     target: str,
     all_stages: Mapping[str, RegistryStageInfo],
-    pvt_exists: Callable[[str], bool],
-) -> IdentityTarget | PvtTarget:
-    """Resolve a CLI target to an identity or pvt target.
+) -> IdentityTarget | None:
+    """Resolve a CLI target naming a stage output: ``stage`` or ``stage:key``.
 
-    Resolution order:
-    1. Parse as identity (``"stage"`` or ``"stage:key"``)
-    2. If producer is a registered stage, return IdentityTarget
-    3. If target has a ``.pvt`` sidecar, return PvtTarget
-    4. Otherwise raise TargetValidationError
-
-    Args:
-        target: CLI target string.
-        all_stages: All registered stages by name.
-        pvt_exists: Callable that checks if a path has a .pvt sidecar.
-
-    Returns:
-        IdentityTarget or PvtTarget.
+    The stage may be bare or pipeline-qualified. Returns None when the target names no
+    registered stage, so the caller can treat it as a file path.
 
     Raises:
-        TargetValidationError: If target cannot be resolved.
+        TargetValidationError: If the stage exists but has no output with the given key.
     """
     identity = parse_identity_target(target)
-
-    # Resolve bare name to prefixed form (single-pipeline convenience)
-    resolved_producer = names.resolve_stage_name(identity.producer, all_stages)
-    if resolved_producer != identity.producer:
-        identity = types.ArtifactIdentity(producer=resolved_producer, key=identity.key)
-
-    if identity.producer in all_stages:
-        stage_info = all_stages[identity.producer]
-        stage_outs: list[types.ArtifactRef] = stage_info["outs"]
-
-        if identity.key is not None:
-            # Filter to matching key
-            matching = [out for out in stage_outs if out.identity.key == identity.key]
-            if not matching:
-                available_keys = [types.identity_key(out.identity) for out in stage_outs]
-                available = ", ".join(available_keys) or "(none)"
-                message = (
-                    f"Stage '{identity.producer}' has no output key '{identity.key}'. "
-                    + f"Available: {available}"
-                )
-                raise TargetValidationError(message)
-            refs = matching
-        else:
-            refs = stage_outs
-
-        return IdentityTarget(
-            kind="identity",
-            identity=identity,
-            stage_name=identity.producer,
-            refs=refs,
-        )
-
-    # Not a stage — check if .pvt tracked
-    if pvt_exists(target):
-        return PvtTarget(kind="pvt", path=target)
-
-    raise TargetValidationError(
-        f"Target '{target}' is neither a registered stage nor a .pvt-tracked file"
-    )
+    producer = names.resolve_stage_name(identity.producer, all_stages)
+    if producer not in all_stages:
+        return None
+    identity = types.ArtifactIdentity(producer=producer, key=identity.key)
+    stage_outs = all_stages[producer]["outs"]
+    if identity.key is None:
+        refs = stage_outs
+    else:
+        refs = [out for out in stage_outs if out.identity.key == identity.key]
+        if not refs:
+            available = ", ".join(types.identity_key(out.identity) for out in stage_outs)
+            raise TargetValidationError(
+                f"Stage '{producer}' has no output key '{identity.key}'. "
+                + f"Available: {available or '(none)'}"
+            )
+    return IdentityTarget(kind="identity", identity=identity, stage_name=producer, refs=refs)
 
 
 def validate_targets(targets: tuple[str, ...]) -> list[str]:
@@ -188,48 +146,29 @@ def resolve_targets_to_stages(
     Returns:
         Tuple of (resolved stage names, unresolved targets).
     """
-    registered_stages = set(cli_helpers.list_stages())
+    all_stages = cli_helpers.get_all_stages()
     result = set[str]()
     unresolved = list[str]()
-
-    # Build file path → stage name reverse map (lazy, only if needed)
-    _file_to_stage: dict[str, str] | None = None
-
-    def _get_file_to_stage() -> dict[str, str]:
-        nonlocal _file_to_stage
-        if _file_to_stage is not None:
-            return _file_to_stage
-        store = cli_helpers.get_workspace_store()
-        proj_root = project.get_project_root()
-        _file_to_stage = {}
-        for stage_name in registered_stages:
-            info = cli_helpers.get_stage(stage_name)
-            for out in info["outs"]:
-                if store is not None:
-                    display_path = store.resolve_display_path(out)
-                    rel = project.to_relative_path(str(display_path), proj_root)
-                    _file_to_stage[rel] = stage_name
-        return _file_to_stage
+    # Workspace path -> producing stage, built only when a target is not a stage
+    stage_by_output_path: dict[str, str] | None = None
 
     for target in targets:
-        resolved = names.resolve_stage_name(target, dict.fromkeys(registered_stages))
-        if resolved in registered_stages:
-            result.add(resolved)
-        else:
-            identity = types.identity_from_key(target)
-            resolved_producer = names.resolve_stage_name(
-                identity.producer, dict.fromkeys(registered_stages)
+        resolved = resolve_cli_target(target, all_stages)
+        if resolved is not None:
+            result.add(resolved["stage_name"])
+            continue
+        if stage_by_output_path is None:
+            identities = cli_helpers.require_workspace_store().output_identities_by_path(
+                out for info in all_stages.values() for out in info["outs"]
             )
-            if resolved_producer in registered_stages:
-                result.add(resolved_producer)
-                continue
-            # Try resolving as a workspace file path
-            proj_root = project.get_project_root()
-            norm_path = project.to_relative_path(project.normalize_path(target), proj_root)
-            file_to_stage = _get_file_to_stage()
-            if norm_path in file_to_stage:
-                result.add(file_to_stage[norm_path])
-                continue
+            stage_by_output_path = {
+                path: identity.producer for path, identity in identities.items()
+            }
+        proj_root = project.get_project_root()
+        norm_path = project.to_relative_path(project.normalize_path(target), proj_root)
+        if norm_path in stage_by_output_path:
+            result.add(stage_by_output_path[norm_path])
+        else:
             unresolved.append(target)
 
     return result, unresolved

@@ -69,41 +69,22 @@ def diff(
         click.echo("No data files found in registered stages.")
         return
 
-    # Filter to targets
+    # Filter to targets: stage identities resolve through the Store, anything else is a path
     proj_root = project.get_project_root()
-    store = cli_helpers.get_workspace_store()
+    store = cli_helpers.require_workspace_store()
     all_stages = cli_helpers.get_all_stages()
-    resolved_targets = set[str]()
+    target_set = set[str]()
 
     for target in targets:
-        try:
-            resolved = cli_targets.resolve_cli_target(target, all_stages, lambda _: False)
-        except cli_targets.TargetValidationError as exc:
-            identity = types.identity_from_key(target)
-            if identity.producer in all_stages:
-                raise click.ClickException(str(exc)) from exc
-            resolved_targets.add(
-                project.to_relative_path(project.normalize_path(target), proj_root)
-            )
+        resolved = cli_targets.resolve_cli_target(target, all_stages)
+        if resolved is None:
+            target_set.add(project.to_relative_path(project.normalize_path(target), proj_root))
             continue
-
-        if resolved["kind"] == "identity":
-            if store is None:
-                resolved_targets.add(types.identity_key(resolved["identity"]))
+        for ref in resolved["refs"]:
+            if ref.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
                 continue
-            for ref in resolved["refs"]:
-                if ref.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
-                    continue
-                abs_path = store.resolve_display_path(ref)
-                rel_path = project.to_relative_path(str(abs_path), proj_root)
-                resolved_targets.add(rel_path)
-            continue
+            target_set.add(project.to_relative_path(store.resolve_display_path(ref), proj_root))
 
-        resolved_targets.add(
-            project.to_relative_path(project.normalize_path(resolved["path"]), proj_root)
-        )
-
-    target_set = resolved_targets
     filtered_head_hashes = {k: v for k, v in head_hashes.items() if k in target_set}
 
     # Get workspace hashes

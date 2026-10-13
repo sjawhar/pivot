@@ -57,7 +57,7 @@ def status(
     stages_list = cli_helpers.stages_to_list(stages)
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is not None:
-        cli_helpers.validate_stages_exist(stages_list)
+        stages_list = cli_helpers.resolve_stage_names(stages_list)
 
     project_root = project.get_project_root()
     resolved_cache_dir = config.get_cache_dir()

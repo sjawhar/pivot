@@ -389,11 +389,10 @@ def run(
     quiet = cli_ctx["quiet"]
     show_human_output = not as_json and not quiet
 
-    # Convert tuple to list and validate at least one stage provided
-    stages_list = _validate_stages_required(cli_helpers.stages_to_list(stages))
-
-    # Validate stages exist in registry
-    cli_helpers.validate_stages_exist(stages_list)
+    # Require at least one stage, then resolve bare names to registered stages
+    stages_list = _validate_stages_required(
+        cli_helpers.resolve_stage_names(cli_helpers.stages_to_list(stages))
+    )
 
     # Validate mutual exclusions
     _run_common.validate_display_mode(tui_flag, as_json)
