@@ -95,9 +95,8 @@ def _restore_directory(
 
 @pytest.mark.xfail(
     strict=True,
-    reason="red test for Task 8 (#461): restore lock file is unlinked after release "
-    + "(cache.py:738-739), so two restores hold 'the' lock on different inodes and the "
-    + "directory swap fails with Errno 39",
+    reason="red test for Task 8 (storage-fixes Slice 2 PR): "
+    + "directory restore lock is unlinked while a waiter holds it",
 )
 def test_concurrent_directory_restores_leave_one_complete_tree_and_no_temps(
     tmp_path: pathlib.Path,
