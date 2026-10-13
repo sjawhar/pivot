@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import tempfile
 import typing
-from typing import Annotated, NotRequired, Required, TypedDict
+from typing import TYPE_CHECKING, Annotated, NotRequired, Required, TypedDict
 
 import pandas as pd
 import pytest
@@ -29,8 +30,17 @@ from pivot.compose import (
     stage,
 )
 from pivot.decorators import no_fingerprint
+from pivot.executor import core as executor_core
+from pivot.executor import worker
 from pivot.executor.worker import _reconstruct_list_kwargs
 from pivot.registry import RegistryStageInfo, _compute_fingerprint
+from pivot.storage import cache, lock
+from pivot.storage import store as store_mod
+
+if TYPE_CHECKING:
+    import multiprocessing as mp
+
+    from pivot.types import OutputMessage
 
 if typing.TYPE_CHECKING:
     from collections.abc import Callable
@@ -1830,3 +1840,150 @@ def test_cross_pipeline_all_discovery_deduplicates(tmp_path: pathlib.Path) -> No
     assert "difficulty/_helper_produce" in combined.list_stages()
     assert "base/_helper_consume" in combined.list_stages()
     assert len([s for s in combined.list_stages() if s == "difficulty/_helper_produce"]) == 1
+
+
+# --- Stages returning pathlib.Path (PathOnly outputs) ---
+
+
+@stage
+def _helper_path_write_file(params: stage_def.StageParams) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "report.bin"
+    out.write_bytes(b"report-bytes")
+    return out
+
+
+@stage
+def _helper_path_write_dir(params: stage_def.StageParams) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "bundle"
+    (out / "sub").mkdir(parents=True)
+    (out / "a.txt").write_text("alpha")
+    (out / "sub" / "b.txt").write_text("beta")
+    return out
+
+
+@stage
+def _helper_path_read_back(report: pathlib.Path, bundle: pathlib.Path) -> dict:
+    return {
+        "report": report.read_bytes().decode(),
+        "bundle": sorted(
+            p.relative_to(bundle).as_posix() for p in bundle.rglob("*") if p.is_file()
+        ),
+    }
+
+
+@stage
+def _helper_path_return_missing(params: stage_def.StageParams) -> pathlib.Path:
+    return pathlib.Path(tempfile.mkdtemp()) / "never_written.bin"
+
+
+@stage
+def _helper_path_return_workspace_file(params: stage_def.StageParams) -> pathlib.Path:
+    out = pathlib.Path("data") / "raw" / "handwritten.bin"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"inside workspace")
+    return out
+
+
+def _helper_execute_compose_stage(
+    pipeline: Pipeline,
+    stage_name: str,
+    tmp_path: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+) -> types.StageResult:
+    cache_dir = tmp_path / ".pivot" / "cache"
+    store_spec = store_mod.StoreSpec(
+        kind="workspace",
+        cache_dir=str(cache_dir / "files"),
+        project_root=str(tmp_path),
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    )
+    stage_info = executor_core.prepare_worker_info(
+        pipeline.get_stage(stage_name),
+        pipeline,
+        overrides={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        run_id="test_run",
+        force=False,
+        no_commit=False,
+        project_root=tmp_path,
+        default_state_dir=tmp_path / ".pivot",
+        store_spec=store_spec,
+    )
+    return worker.execute_stage(stage_name, stage_info, cache_dir, output_queue)
+
+
+def test_stage_returning_path_takes_ownership_of_file_and_directory(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """A stage annotated -> pathlib.Path hands pivot a file or directory it wrote elsewhere."""
+    with Pipeline("pathret", root=tmp_path) as pipeline:
+        report = _helper_path_write_file(params=stage_def.StageParams())
+        bundle = _helper_path_write_dir(params=stage_def.StageParams())
+        _helper_path_read_back(report=report, bundle=bundle)
+
+    file_result = _helper_execute_compose_stage(
+        pipeline, "pathret/_helper_path_write_file", tmp_path, output_queue
+    )
+    assert file_result["status"] == types.StageStatus.RAN, file_result["reason"]
+    report_path = tmp_path / "data" / "pathret" / "_helper_path_write_file.dat"
+    assert report_path.read_bytes() == b"report-bytes", "Returned file should land at engine path"
+
+    dir_result = _helper_execute_compose_stage(
+        pipeline, "pathret/_helper_path_write_dir", tmp_path, output_queue
+    )
+    assert dir_result["status"] == types.StageStatus.RAN, dir_result["reason"]
+    bundle_path = tmp_path / "data" / "pathret" / "_helper_path_write_dir.dat"
+    assert bundle_path.is_dir(), "Returned directory should land at engine path"
+    assert (bundle_path / "a.txt").read_text() == "alpha"
+    assert (bundle_path / "sub" / "b.txt").read_text() == "beta"
+
+    dir_lock = lock.StageLock(
+        "pathret/_helper_path_write_dir", lock.get_stages_dir(tmp_path / ".pivot")
+    ).read()
+    assert dir_lock is not None, "Directory-returning stage should write a lock file"
+    dir_hash = next(iter(dir_lock["output_hashes"].values()))
+    assert types.is_dir_hash(dir_hash), "Directory output should be recorded with a manifest"
+    assert sorted(e["relpath"] for e in dir_hash["manifest"]) == ["a.txt", "sub/b.txt"]
+
+    read_result = _helper_execute_compose_stage(
+        pipeline, "pathret/_helper_path_read_back", tmp_path, output_queue
+    )
+    assert read_result["status"] == types.StageStatus.RAN, read_result["reason"]
+    read_back = loaders.YAML[dict]().load(
+        tmp_path / "data" / "pathret" / "_helper_path_read_back.yaml"
+    )
+    assert read_back == {"report": "report-bytes", "bundle": ["a.txt", "sub/b.txt"]}
+
+
+def test_stage_returning_missing_path_fails_with_clear_error(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("pathret", root=tmp_path) as pipeline:
+        _helper_path_return_missing(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "pathret/_helper_path_return_missing", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.FAILED
+    assert "never_written.bin" in result["reason"], "Error should name the returned path"
+    assert "does not exist" in result["reason"]
+
+
+def test_stage_returning_path_inside_workspace_is_rejected(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """Moving a workspace file would delete a file pivot does not own (e.g. a raw input)."""
+    with Pipeline("pathret", root=tmp_path) as pipeline:
+        _helper_path_return_workspace_file(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "pathret/_helper_path_return_workspace_file", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.FAILED
+    assert "inside the project" in result["reason"], result["reason"]
+    assert (tmp_path / "data" / "raw" / "handwritten.bin").read_bytes() == b"inside workspace", (
+        "Rejected workspace file must be left untouched"
+    )

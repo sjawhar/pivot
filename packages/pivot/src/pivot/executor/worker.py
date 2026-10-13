@@ -24,6 +24,7 @@ import pydantic
 
 from pivot import (
     exceptions,
+    loaders,
     metrics,
     outputs,
     parameters,
@@ -396,6 +397,7 @@ def execute_stage(
                     store,
                     stage_info["params_arg_name"],
                     stage_info["collection_params"],
+                    project_root,
                 )
                 if no_commit:
                     output_hashes = _hash_output_paths(output_paths)
@@ -875,9 +877,27 @@ def _resolve_output_values(
     return value_map
 
 
+def _reject_path_inside_project(
+    ref: types.ArtifactRef, value: object, project_root: pathlib.Path
+) -> None:
+    """A PathOnly output is moved to the output path; never move a file pivot does not own."""
+    if not isinstance(value, pathlib.Path):
+        return
+    if not (project_root / value).resolve().is_relative_to(project_root.resolve()):
+        return
+    raise exceptions.StageDefinitionError(
+        f"Stage '{ref.identity.producer}' returned {value}, which is inside the project "
+        + f"({project_root}). Pivot moves a returned path to the stage's output path, so it "
+        + "must be a file or directory the stage created outside the project, e.g. under "
+        + "tempfile.mkdtemp()."
+    )
+
+
 def _write_output_with_store(
-    ref: types.ArtifactRef, value: Any, store: store_mod.Store
+    ref: types.ArtifactRef, value: Any, store: store_mod.Store, project_root: pathlib.Path
 ) -> pathlib.Path:
+    if isinstance(ref.format, loaders.PathOnly):
+        _reject_path_inside_project(ref, value, project_root)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
     if ref.tag is types.ArtifactTag.DIRECTORY:
@@ -942,6 +962,7 @@ def _run_stage_function_with_store(
     store: store_mod.Store,
     params_arg_name: str | None,
     collection_params: dict[str, str],
+    project_root: pathlib.Path,
 ) -> dict[types.ArtifactRef, pathlib.Path]:
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
@@ -968,7 +989,7 @@ def _run_stage_function_with_store(
         output_values = _resolve_output_values(result, outs, stage_name)
         output_paths = dict[types.ArtifactRef, pathlib.Path]()
         for ref, value in output_values.items():
-            output_paths[ref] = _write_output_with_store(ref, value, store)
+            output_paths[ref] = _write_output_with_store(ref, value, store, project_root)
 
         return output_paths
 

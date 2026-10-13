@@ -294,22 +294,66 @@ def test_pathonly_loader_load_returns_path(tmp_path: pathlib.Path) -> None:
     assert isinstance(result, pathlib.Path)
 
 
-def test_pathonly_loader_save_validates_exists(tmp_path: pathlib.Path) -> None:
-    """PathOnly save validates file exists (user must create it)."""
+def test_pathonly_loader_save_same_path_is_noop(tmp_path: pathlib.Path) -> None:
+    """PathOnly save accepts a file already at the output path."""
     file = tmp_path / "output.bin"
     file.write_bytes(b"data")
 
     loader = loaders.PathOnly()
-    loader.save(file, file)  # No error - file exists
+    loader.save(file, file)
+
+    assert file.read_bytes() == b"data"
 
 
 def test_pathonly_loader_save_raises_if_missing(tmp_path: pathlib.Path) -> None:
-    """PathOnly save raises if file doesn't exist."""
-    file = tmp_path / "missing.bin"
+    """PathOnly save raises if the returned path doesn't exist, naming it."""
+    missing = tmp_path / "missing.bin"
 
     loader = loaders.PathOnly()
-    with pytest.raises(FileNotFoundError):
-        loader.save(file, file)
+    with pytest.raises(FileNotFoundError, match="missing.bin"):
+        loader.save(missing, tmp_path / "stage.dat")
+
+
+def test_pathonly_loader_save_moves_returned_file(tmp_path: pathlib.Path) -> None:
+    """PathOnly save moves the file the stage returned to the output path."""
+    returned = tmp_path / "scratch" / "report.bin"
+    returned.parent.mkdir()
+    returned.write_bytes(b"report")
+    output = tmp_path / "data" / "stage.dat"
+
+    loaders.PathOnly().save(returned, output)
+
+    assert output.read_bytes() == b"report"
+    assert not returned.exists(), "Returned file should be moved, not copied"
+
+
+def test_pathonly_loader_save_moves_returned_directory(tmp_path: pathlib.Path) -> None:
+    """PathOnly save moves a returned directory tree to the output path."""
+    returned = tmp_path / "scratch" / "bundle"
+    (returned / "sub").mkdir(parents=True)
+    (returned / "a.txt").write_text("alpha")
+    (returned / "sub" / "b.txt").write_text("beta")
+    output = tmp_path / "data" / "stage.dat"
+
+    loaders.PathOnly().save(returned, output)
+
+    assert (output / "a.txt").read_text() == "alpha"
+    assert (output / "sub" / "b.txt").read_text() == "beta"
+    assert not returned.exists(), "Returned directory should be moved, not copied"
+
+
+def test_pathonly_loader_save_refuses_existing_output(tmp_path: pathlib.Path) -> None:
+    """PathOnly save never moves a path on top of an existing output."""
+    returned = tmp_path / "report.bin"
+    returned.write_bytes(b"new")
+    output = tmp_path / "stage.dat"
+    output.write_bytes(b"old")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        loaders.PathOnly().save(returned, output)
+
+    assert output.read_bytes() == b"old"
+    assert returned.read_bytes() == b"new"
 
 
 # ==============================================================================
