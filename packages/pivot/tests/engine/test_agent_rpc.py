@@ -178,6 +178,7 @@ async def test_agent_rpc_source_carries_configured_resource_capacity(tmp_path: P
     """An RPC-triggered run keeps the capacity supplied by serve mode."""
     socket_path = tmp_path / "agent.sock"
     send, recv = anyio.create_memory_object_stream[InputEvent](10)
+    event: InputEvent | None = None
 
     async with anyio.create_task_group() as tg:
         source = AgentRpcSource(socket_path=socket_path, resource_capacity={"gpu": 2})
@@ -193,8 +194,10 @@ async def test_agent_rpc_source_carries_configured_resource_capacity(tmp_path: P
         event = await recv.receive()
         tg.cancel_scope.cancel()
 
+    assert event is not None
     assert event["type"] == "run_requested"
-    assert event["resource_capacity"] == {"gpu": 2}
+    if event["type"] == "run_requested":
+        assert event["resource_capacity"] == {"gpu": 2}
 
 
 @pytest.mark.anyio
