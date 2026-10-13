@@ -74,4 +74,4 @@ The pygtrie library provides efficient O(k) operations where k is the number of 
 - `shortest_prefix(key)` - find if any stored path is a prefix of key
 - Standard dict operations for exact matches
 
-Pivot uses this for tracked-file (`.pvt`) ancestor lookups: `status.py` builds a `pygtrie.Trie` of tracked paths and `explain.py` finds the tracked directory that contains a dependency.
+Pivot uses this in two places. `StageRegistry.add_existing` (`registry.py`) keeps a `pygtrie.Trie` of every registered output's workspace path and raises `OutputPathConflictError` when a new output equals, contains, or lies inside another's; each worker resolves paths in its own `WorkspaceStore`, so the registry is the only place that sees all outputs. Once every output is registered, `Pipeline._check_inputs_against_outputs` runs each input binding through `StageRegistry.check_input_path` against the same trie, so an input cannot read an output file, or a directory that holds one, without a DAG edge. `status.py` builds a trie of tracked (`.pvt`) paths and `explain.py` finds the tracked directory that contains a dependency.

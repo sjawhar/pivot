@@ -11,6 +11,8 @@ import sys
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 from conftest import isolated_pivot_dir, send_rpc
 from pivot import cli, compose, executor
 from pivot.storage import cache, track
@@ -241,6 +243,223 @@ with Pipeline("demo") as pipeline:
     assert "input 'left.csv' (path missing/left.csv)" in result.output
     assert "input 'extra.csv' (path missing/extra.csv)" in result.output
     assert "Tip: Ensure all dependency files exist or are produced by other stages" in result.output
+
+
+# Pipeline "demo" stage "x" field "y" and pipeline "demo/x" stage "y" both map to
+# data/demo/x/y.jsonl.
+_COLLIDING_OUTPUTS_PIPELINE = """
+from typing import TypedDict
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class XResult(TypedDict):
+    y: pd.DataFrame
+
+
+@stage
+def x(raw: pd.DataFrame) -> XResult:
+    out = raw.copy()
+    out["who"] = "x field y"
+    return {"y": out}
+
+
+@stage
+def y(raw: pd.DataFrame) -> pd.DataFrame:
+    out = raw.copy()
+    out["who"] = "stage y"
+    return out
+
+
+with Pipeline("demo/x") as inner:
+    y(inner.input("t.csv"))
+
+with Pipeline("demo") as pipeline:
+    x(pipeline.input("t.csv"))
+
+pipeline.include(inner)
+"""
+
+
+def test_repro_refuses_two_outputs_that_map_to_one_path(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Two artifacts resolving to one workspace file fail at load, naming both, before any write."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "t.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(_COLLIDING_OUTPUTS_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["repro"])
+        shared_file_written = (cwd / "data" / "demo" / "x" / "y.jsonl").exists()
+
+    assert result.exit_code != 0, result.output
+    assert "Output path conflict" in result.output, result.output
+    assert "'demo/x:y'" in result.output, result.output
+    assert "'demo/x/y'" in result.output, result.output
+    assert "data/demo/x/y.jsonl" in result.output, result.output
+    assert not shared_file_written, "Neither stage may run once their paths collide"
+
+
+_ALIASED_INPUT_PIPELINE = """
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def join(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    return pd.concat([left, right])
+
+
+with Pipeline("demo") as pipeline:
+    join(pipeline.input("t.csv"), pipeline.input("alias", path="data/raw/t.csv"))
+"""
+
+
+def test_list_refuses_two_input_names_bound_to_one_path(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Two input names on one file fail at load with a binding conflict, not mid-repro."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "t.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(_ALIASED_INPUT_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    assert (
+        "Input binding conflict: inputs 't.csv' and 'alias' are both bound to 'data/raw/t.csv'"
+        in result.output
+    ), result.output
+    assert "ExceptionGroup" not in result.output, result.output
+
+
+# Pipeline "raw": stage "s" writes data/raw/s.jsonl, which is also the default binding of
+# pipeline.input("s.jsonl"); an explicit path to another stage's output collides the same way.
+_INPUT_ON_OUTPUT_PIPELINE = """
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def s(seed: pd.DataFrame) -> pd.DataFrame:
+    return seed
+
+
+@stage
+def t(data: pd.DataFrame) -> pd.DataFrame:
+    return data
+
+
+with Pipeline("raw") as pipeline:
+    s(pipeline.input("seed.csv"))
+    t(INPUT)
+"""
+
+
+@pytest.mark.parametrize(
+    ("input_call", "input_name", "path", "output"),
+    [
+        pytest.param(
+            'pipeline.input("s.jsonl")', "s.jsonl", "data/raw/s.jsonl", "raw/s", id="default-path"
+        ),
+        pytest.param(
+            'pipeline.input("copy", path="data/raw/s.jsonl")',
+            "copy",
+            "data/raw/s.jsonl",
+            "raw/s",
+            id="explicit-path",
+        ),
+        pytest.param(
+            'pipeline.input("dir", path="data/raw")',
+            "dir",
+            "data/raw",
+            "raw/s",
+            id="input-contains-output",
+        ),
+    ],
+)
+def test_list_refuses_an_input_bound_to_an_output_path(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    input_call: str,
+    input_name: str,
+    path: str,
+    output: str,
+) -> None:
+    """An input on, inside, or around another stage's output fails at load, naming both."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "seed.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(
+            _INPUT_ON_OUTPUT_PIPELINE.replace("INPUT", input_call)
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    assert "Output path conflict" in result.output, result.output
+    assert f"input '{input_name}'" in result.output, result.output
+    assert f"'{output}'" in result.output, result.output
+    assert path in result.output, result.output
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param(
+            "@stage\ndef s(previous: dict) -> dict:\n    return previous\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n    s(previous=pipeline.previous())\n',
+            "uses p.previous() but the return value is not tagged incremental",
+            id="previous-on-untagged-return",
+        ),
+        pytest.param(
+            "from typing import Annotated\n\nfrom pivot import incremental\n\n\n"
+            + "@stage\ndef s(a: dict, b: dict) -> Annotated[dict, incremental]:\n"
+            + "    return a\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n'
+            + "    s(a=pipeline.previous(), b=pipeline.previous())\n",
+            "parameters 'a' and 'b' both bind p.previous() to the return value",
+            id="previous-bound-twice",
+        ),
+        pytest.param(
+            "@stage\ndef s(raw: pd.DataFrame) -> pd.DataFrame:\n    return raw\n\n\n"
+            + "@stage\ndef t(rows: pd.DataFrame) -> pd.DataFrame:\n    return rows\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n    t(s(pipeline.input("t.csv")).rows)\n',
+            "Stage 's' has no output 'rows': it has a single output, the return value",
+            id="attribute-on-single-output",
+        ),
+        pytest.param(
+            "@stage\ndef s(raw: pd.DataFrame) -> pd.DataFrame:\n    return raw\n\n\n"
+            + "@stage\ndef t(rows: pd.DataFrame) -> pd.DataFrame:\n    return rows\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n    t(s(pipeline.input("t.csv"))["rows"])\n',
+            "Stage 's' has no output 'rows': it has a single output, the return value",
+            id="item-on-single-output",
+        ),
+    ],
+)
+def test_list_names_a_single_output_as_the_return_value(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, body: str, expected: str
+) -> None:
+    """Errors about a stage's single output never show the internal key '_single'."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "t.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(
+            "import pandas as pd\n\nfrom pivot import Pipeline, stage\n\n\n" + body
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    # Quoted: the temp directory name ("test_list_names_a_single_output...") contains the bare word.
+    assert repr(compose.SINGLE_OUTPUT_KEY) not in result.output, result.output
+    assert expected in result.output, result.output
 
 
 # =============================================================================

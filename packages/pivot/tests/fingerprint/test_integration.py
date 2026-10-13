@@ -1,4 +1,5 @@
 import importlib
+import logging
 import pathlib
 import sys
 import types
@@ -6,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import fingerprint
+from pivot import exceptions, fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -60,7 +61,7 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify helper is captured with a hash (not "callable")
-    helper_key = "mod:helpers.process"
+    helper_key = "mod:test_mod_helpers_v1.process"
     assert helper_key in fp1, f"Should capture helper.process, got: {fp1.keys()}"
     hash1 = fp1[helper_key]
     assert len(hash1) == 16, f"Should be 16-char hash, got: {hash1}"
@@ -138,7 +139,9 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify transitive dep is captured
-    assert "mod:leaf.leaf_func" in fp1, f"Should capture transitive dep, got: {fp1.keys()}"
+    assert "mod:test_mod_leaf_v3.leaf_func" in fp1, (
+        f"Should capture transitive dep, got: {fp1.keys()}"
+    )
 
     # Modify leaf function
     leaf_py.write_text("""
@@ -154,7 +157,7 @@ def leaf_func(x):
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
 
     # Transitive fingerprint must change
-    assert fp1["mod:leaf.leaf_func"] != fp2["mod:leaf.leaf_func"], (
+    assert fp1["mod:test_mod_leaf_v3.leaf_func"] != fp2["mod:test_mod_leaf_v3.leaf_func"], (
         "Transitive dep fingerprint must change"
     )
 
@@ -200,8 +203,10 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify helper is captured
-    assert "func:helper_func" in fp1, f"Should capture helper_func, got: {fp1.keys()}"
-    hash1 = fp1["func:helper_func"]
+    assert "func:test_mod_helpers_v5.helper_func" in fp1, (
+        f"Should capture helper_func, got: {fp1.keys()}"
+    )
+    hash1 = fp1["func:test_mod_helpers_v5.helper_func"]
 
     # Modify helper
     helpers_py.write_text("""
@@ -215,7 +220,7 @@ def helper_func(x):
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
 
     # Fingerprint must change
-    hash2 = fp2["func:helper_func"]
+    hash2 = fp2["func:test_mod_helpers_v5.helper_func"]
     assert hash1 != hash2, f"Direct import fingerprint must change: {hash1} vs {hash2}"
 
 
@@ -241,10 +246,9 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Constant should be captured with repr value
-    assert "mod:helpers.THRESHOLD" in fp, f"Should capture constant, got: {fp.keys()}"
-    assert fp["mod:helpers.THRESHOLD"] == "0.5", (
-        f"Constant value should be repr, got: {fp['mod:helpers.THRESHOLD']}"
-    )
+    key = "mod:test_mod_helpers_v6.THRESHOLD"
+    assert key in fp, f"Should capture constant, got: {fp.keys()}"
+    assert fp[key] == "0.5", f"Constant value should be repr, got: {fp[key]}"
 
 
 def test_both_import_styles_in_same_stage(module_dir: pathlib.Path) -> None:
@@ -271,329 +275,147 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Both should be captured
-    assert "func:func_a" in fp, "Should capture direct import"
-    assert "mod:helpers.func_b" in fp, "Should capture module attr"
+    assert "func:test_mod_helpers_v7.func_a" in fp, "Should capture direct import"
+    assert "mod:test_mod_helpers_v7.func_b" in fp, "Should capture module attr"
 
-    # Both should be hashes (not "callable")
-    assert len(fp["func:func_a"]) == 16, "Direct import should be hashed"
-    assert len(fp["mod:helpers.func_b"]) == 16, "Module attr should be hashed"
+    assert len(fp["func:test_mod_helpers_v7.func_a"]) == 16, "Direct import should be hashed"
+    assert len(fp["mod:test_mod_helpers_v7.func_b"]) == 16, "Module attr should be hashed"
 
 
-def test_unsupported_module_attr_type_raises_error(
-    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("module_source", "type_name"),
+    [
+        pytest.param("VALUE = (1, 2)", "tuple", id="tuple"),
+        pytest.param("VALUE = frozenset({1, 2})", "frozenset", id="frozenset"),
+        pytest.param("VALUE = [1, 2]", "list", id="list"),
+        pytest.param("VALUE = {1, 2}", "set", id="set"),
+        pytest.param("VALUE = {'one': 1}", "dict", id="dict"),
+        pytest.param(
+            "import enum\n\nclass Mode(enum.Enum):\n    DEFAULT = 'default'\n\nVALUE = Mode.DEFAULT",
+            "Mode",
+            id="enum-member",
+        ),
+        pytest.param(
+            "import dataclasses\n\n@dataclasses.dataclass(frozen=True)\nclass Config:\n"
+            + "    value: int\n\nVALUE = Config(1)",
+            "Config",
+            id="frozen-dataclass",
+        ),
+        pytest.param(
+            "import pydantic\n\nclass Config(pydantic.BaseModel):\n"
+            + "    model_config = pydantic.ConfigDict(frozen=True)\n    value: int\n\nVALUE = Config(value=1)",
+            "Config",
+            id="frozen-pydantic",
+        ),
+        pytest.param(
+            "class Config:\n    pass\n\nVALUE = Config()",
+            "Config",
+            id="class-instance",
+        ),
+        pytest.param(
+            "class CallableConfig:\n    def __call__(self):\n        return 1\n\nVALUE = CallableConfig()",
+            "CallableConfig",
+            id="callable-instance",
+        ),
+    ],
+)
+def test_non_scalar_module_attribute_raises(
+    module_dir: pathlib.Path,
+    module_source: str,
+    type_name: str,
 ) -> None:
-    """Unsupported types (custom objects, non-primitive collections) in module attrs raise TypeError."""
+    helper_name = f"test_mod_d2_helpers_{type_name.lower()}"
+    stage_name = f"test_mod_d2_stage_{type_name.lower()}"
+    (module_dir / f"{helper_name}.py").write_text(f"{module_source}\n")
+    (module_dir / f"{stage_name}.py").write_text(
+        f"import {helper_name} as helpers\n\ndef run_stage():\n    return helpers.VALUE\n"
+    )
+
+    stage_module = _import_module(stage_name)
+
+    with pytest.raises(exceptions.StageDefinitionError) as exc:
+        fingerprint.get_stage_fingerprint_cached("train", stage_module.run_stage)
+
+    message = str(exc.value)
+    assert f"{helper_name}.VALUE" in message
+    assert f"type: {type_name}" in message
+    assert "Fix: pass this data via StageParams" in message
+
+
+def test_unsafe_fingerprinting_warns_for_non_scalar_module_attribute(
+    module_dir: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    helper_name = "test_mod_d2_unsafe_helpers"
+    stage_name = "test_mod_d2_unsafe_stage"
+    (module_dir / f"{helper_name}.py").write_text("VALUE = (1, 2)\n")
+    (module_dir / f"{stage_name}.py").write_text(
+        f"import {helper_name} as helpers\n\ndef run_stage():\n    return helpers.VALUE\n"
+    )
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    helpers_py = module_dir / "test_mod_helpers_v8.py"
-    helpers_py.write_text("""
-# This is an unsupported type - a list containing a custom object
-class Config:
-    def __init__(self, value: int) -> None:
-        self.value = value
 
-MY_CONFIGS = [Config(1), Config(2)]
+    with caplog.at_level(logging.WARNING):
+        fingerprint.get_stage_fingerprint_cached("train", _import_module(stage_name).run_stage)
 
-def process(x: int) -> bool:
-    return any(c.value == x for c in MY_CONFIGS)
-""")
-
-    stage_py = module_dir / "test_mod_stage_v8.py"
-    stage_py.write_text("""
-import test_mod_helpers_v8 as helpers
-
-def run_stage():
-    # Uses the list via module attribute access
-    return helpers.process(1) and len(helpers.MY_CONFIGS) > 0
-""")
-
-    stage_mod = _import_module("test_mod_stage_v8")
-
-    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
-        fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-
-
-def test_primitive_collection_module_attr_fingerprinting(module_dir: pathlib.Path) -> None:
-    """Primitive collections (dict/list/tuple/set of primitives) are supported."""
-    helpers_py = module_dir / "test_mod_helpers_v9.py"
-    helpers_py.write_text("""
-# Primitive collections - should be fingerprinted
-AGENTS = {"agent1": "config1", "agent2": "config2"}
-NUMBERS = [1, 2, 3, 4, 5]
-NESTED = {"key": [1, 2, {"inner": "value"}]}
-""")
-
-    stage_py = module_dir / "test_mod_stage_v9.py"
-    stage_py.write_text("""
-import test_mod_helpers_v9 as helpers
-
-def run_stage():
-    # Access all primitive collection attrs
-    return list(helpers.AGENTS.keys()) + helpers.NUMBERS + list(helpers.NESTED.keys())
-""")
-
-    stage_mod = _import_module("test_mod_stage_v9")
-    manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-
-    # Should have entries for the primitive collections
-    assert "mod:helpers.AGENTS" in manifest
-    assert "mod:helpers.NUMBERS" in manifest
-    assert "mod:helpers.NESTED" in manifest
-
-    # Values should be hashes (not repr strings)
-    for key in ["mod:helpers.AGENTS", "mod:helpers.NUMBERS", "mod:helpers.NESTED"]:
-        assert len(manifest[key]) == 16  # xxhash64 hex digest length
-
-
-def test_primitive_collection_change_detected(module_dir: pathlib.Path) -> None:
-    """Changing a primitive collection module attribute changes fingerprint."""
-    helpers_py = module_dir / "test_mod_helpers_v10.py"
-    helpers_py.write_text("""
-AGENTS = {"agent1": "config1", "agent2": "config2"}
-""")
-
-    stage_py = module_dir / "test_mod_stage_v10.py"
-    stage_py.write_text("""
-import test_mod_helpers_v10 as helpers
-
-def run_stage():
-    return list(helpers.AGENTS.keys())
-""")
-
-    stage_mod = _import_module("test_mod_stage_v10")
-    fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-    hash1 = fp1["mod:helpers.AGENTS"]
-
-    # Modify the collection
-    helpers_py.write_text("""
-AGENTS = {"agent1": "config1", "agent3": "config3"}  # CHANGED!
-""")
-
-    # Force re-import
-    _reimport_module("test_mod_helpers_v10")
-    stage_mod_v2 = _reimport_module("test_mod_stage_v10")
-    fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
-    hash2 = fp2["mod:helpers.AGENTS"]
-
-    # Fingerprint MUST be different
-    assert hash1 != hash2, f"Fingerprint must change when collection changes: {hash1} vs {hash2}"
-
-
-def test_primitive_collection_fingerprint_deterministic(module_dir: pathlib.Path) -> None:
-    """Same primitive collection produces same fingerprint (stability check)."""
-    helpers_py = module_dir / "test_mod_helpers_v11.py"
-    helpers_py.write_text("""
-# Test determinism with various collection types
-DICT_DATA = {"z": 1, "a": 2, "m": 3}  # Dict with unsorted keys
-SET_DATA = {5, 1, 3, 2, 4}  # Set (unordered)
-FROZENSET_DATA = frozenset([3, 1, 4, 1, 5])  # Frozenset (unordered, with duplicate)
-""")
-
-    stage_py = module_dir / "test_mod_stage_v11.py"
-    stage_py.write_text("""
-import test_mod_helpers_v11 as helpers
-
-def run_stage():
-    return helpers.DICT_DATA and helpers.SET_DATA and helpers.FROZENSET_DATA
-""")
-
-    stage_mod = _import_module("test_mod_stage_v11")
-    fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-
-    # Get fingerprint again without changes
-    fp2 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-
-    # Hashes must be identical (deterministic)
-    assert fp1["mod:helpers.DICT_DATA"] == fp2["mod:helpers.DICT_DATA"]
-    assert fp1["mod:helpers.SET_DATA"] == fp2["mod:helpers.SET_DATA"]
-    assert fp1["mod:helpers.FROZENSET_DATA"] == fp2["mod:helpers.FROZENSET_DATA"]
-
-
-def test_primitive_collection_edge_cases(module_dir: pathlib.Path) -> None:
-    """Empty and deeply nested primitive collections are supported."""
-    helpers_py = module_dir / "test_mod_helpers_v12.py"
-    helpers_py.write_text("""
-# Edge cases
-EMPTY_LIST = []
-EMPTY_DICT = {}
-EMPTY_SET = set()
-EMPTY_TUPLE = ()
-DEEPLY_NESTED = {"a": {"b": {"c": {"d": [1, 2, {"e": "value"}]}}}}
-LARGE_LIST = list(range(200))  # 200 elements
-""")
-
-    stage_py = module_dir / "test_mod_stage_v12.py"
-    stage_py.write_text("""
-import test_mod_helpers_v12 as helpers
-
-def run_stage():
-    return (
-        helpers.EMPTY_LIST
-        or helpers.EMPTY_DICT
-        or helpers.EMPTY_SET
-        or helpers.EMPTY_TUPLE
-        or helpers.DEEPLY_NESTED
-        or helpers.LARGE_LIST
+    assert any(f"{helper_name}.VALUE" in record.message for record in caplog.records), (
+        "Unsafe fingerprinting should warn with the module attribute name"
     )
-""")
-
-    stage_mod = _import_module("test_mod_stage_v12")
-    manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-
-    # All edge cases should be fingerprinted successfully
-    assert "mod:helpers.EMPTY_LIST" in manifest
-    assert "mod:helpers.EMPTY_DICT" in manifest
-    assert "mod:helpers.EMPTY_SET" in manifest
-    assert "mod:helpers.EMPTY_TUPLE" in manifest
-    assert "mod:helpers.DEEPLY_NESTED" in manifest
-    assert "mod:helpers.LARGE_LIST" in manifest
-
-    # All should be hashes
-    for key in [
-        "mod:helpers.EMPTY_LIST",
-        "mod:helpers.EMPTY_DICT",
-        "mod:helpers.EMPTY_SET",
-        "mod:helpers.EMPTY_TUPLE",
-        "mod:helpers.DEEPLY_NESTED",
-        "mod:helpers.LARGE_LIST",
-    ]:
-        assert len(manifest[key]) == 16
 
 
-def test_all_primitive_types_supported(module_dir: pathlib.Path) -> None:
-    """All primitive types (bool/int/float/str/bytes/None) in all collection types are supported."""
-    helpers_py = module_dir / "test_mod_helpers_v13.py"
-    helpers_py.write_text("""
-# All primitive types in various collections
-LIST_ALL_TYPES = [True, 42, 3.14, "text", b"bytes", None]
-TUPLE_ALL_TYPES = (False, -1, -2.5, "tuple", b"data", None)
-SET_PRIMITIVES = {1, 2, 3, "a", "b"}  # Set can't contain mutable types
-FROZENSET_PRIMITIVES = frozenset([True, False, 0, 1])
-DICT_ALL_TYPES = {
-    "bool": True,
-    "int": 123,
-    "float": 45.67,
-    "str": "value",
-    "bytes": b"raw",
-    "none": None,
-}
-""")
+def _collision_module_source(value: int, default: int) -> str:
+    return f"""\
+from pydantic import BaseModel
 
-    stage_py = module_dir / "test_mod_stage_v13.py"
-    stage_py.write_text("""
-import test_mod_helpers_v13 as helpers
+VALUE = {value}
 
-def run_stage():
-    return (
-        helpers.LIST_ALL_TYPES
-        or helpers.TUPLE_ALL_TYPES
-        or helpers.SET_PRIMITIVES
-        or helpers.FROZENSET_PRIMITIVES
-        or helpers.DICT_ALL_TYPES
+
+def helper() -> int:
+    return VALUE
+
+
+class Config(BaseModel):
+    value: int = {default}
+
+
+def run(config: Config = Config()) -> int:
+    return helper() + config.value
+"""
+
+
+def test_colliding_module_definitions_keep_separate_manifest_entries(
+    module_dir: pathlib.Path,
+) -> None:
+    first_name = "test_mod_collision_first"
+    second_name = "test_mod_collision_second"
+    stage_name = "test_mod_collision_stage"
+    first_path = module_dir / f"{first_name}.py"
+    second_path = module_dir / f"{second_name}.py"
+    first_path.write_text(_collision_module_source(1, 1))
+    second_path.write_text(_collision_module_source(2, 2))
+    (module_dir / f"{stage_name}.py").write_text(
+        f"import {first_name} as first\n"
+        + f"import {second_name} as second\n\n"
+        + "def run_stage() -> int:\n"
+        + "    return first.run() + second.run()\n"
     )
-""")
 
-    stage_mod = _import_module("test_mod_stage_v13")
-    manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+    first_fingerprint = fingerprint.get_stage_fingerprint(_import_module(stage_name).run_stage)
 
-    # All should be fingerprinted
-    assert "mod:helpers.LIST_ALL_TYPES" in manifest
-    assert "mod:helpers.TUPLE_ALL_TYPES" in manifest
-    assert "mod:helpers.SET_PRIMITIVES" in manifest
-    assert "mod:helpers.FROZENSET_PRIMITIVES" in manifest
-    assert "mod:helpers.DICT_ALL_TYPES" in manifest
+    first_path.write_text(_collision_module_source(10, 10))
+    _reimport_module(first_name)
+    updated_stage = _reimport_module(stage_name)
+    second_fingerprint = fingerprint.get_stage_fingerprint(updated_stage.run_stage)
 
-    # All should be hashes
-    for key in [
-        "mod:helpers.LIST_ALL_TYPES",
-        "mod:helpers.TUPLE_ALL_TYPES",
-        "mod:helpers.SET_PRIMITIVES",
-        "mod:helpers.FROZENSET_PRIMITIVES",
-        "mod:helpers.DICT_ALL_TYPES",
-    ]:
-        assert len(manifest[key]) == 16
-
-
-def test_unsupported_types_comprehensive_errors(module_dir: pathlib.Path) -> None:
-    """Various unsupported types in collections raise clear TypeErrors."""
-    # Test 1: Mixed collection with custom object
-    helpers_py = module_dir / "test_mod_helpers_v14.py"
-    helpers_py.write_text("""
-class Config:
-    pass
-
-MIXED = [1, 2, Config()]  # Primitive + custom object
-""")
-
-    stage_py = module_dir / "test_mod_stage_v14.py"
-    stage_py.write_text("""
-import test_mod_helpers_v14 as helpers
-
-def run_stage():
-    return len(helpers.MIXED) > 0
-""")
-
-    stage_mod = _import_module("test_mod_stage_v14")
-    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
-        fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-
-    # Test 2: Dict containing callable (module attributes don't support callable extraction)
-    helpers_py.write_text("""
-def callback():
-    return None
-
-CALLBACKS = {"func": callback}
-""")
-    stage_py.write_text("""
-import test_mod_helpers_v14 as helpers
-
-def run_stage():
-    return helpers.CALLBACKS
-""")
-    _reimport_module("test_mod_helpers_v14")
-    stage_mod_v2 = _reimport_module("test_mod_stage_v14")
-
-    # Module attribute collections with callables are not supported
-    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
-        fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
-
-    # Test 3: Deeply nested unsupported type
-    helpers_py.write_text("""
-class DeepConfig:
-    pass
-
-NESTED_BAD = {"level1": {"level2": [1, 2, DeepConfig()]}}
-""")
-    stage_py.write_text("""
-import test_mod_helpers_v14 as helpers
-
-def run_stage():
-    return helpers.NESTED_BAD
-""")
-    _reimport_module("test_mod_helpers_v14")
-    stage_mod_v3 = _reimport_module("test_mod_stage_v14")
-
-    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
-        fingerprint.get_stage_fingerprint(stage_mod_v3.run_stage)
-
-
-def test_circular_reference_in_collection_raises_error(module_dir: pathlib.Path) -> None:
-    """Circular references in module-level collections should raise TypeError."""
-    helpers_py = module_dir / "test_mod_helpers_circular.py"
-    helpers_py.write_text("""
-CIRCULAR = [1, 2, 3]
-CIRCULAR.append(CIRCULAR)
-""")
-
-    stage_py = module_dir / "test_mod_stage_circular.py"
-    stage_py.write_text("""
-import test_mod_helpers_circular as helpers
-
-def run_stage():
-    return helpers.CIRCULAR[0]
-""")
-
-    stage_mod = _import_module("test_mod_stage_circular")
-
-    # Circular reference fails _is_primitive_collection check, so raises TypeError
-    with pytest.raises(TypeError, match="Cannot fingerprint module attribute"):
-        fingerprint.get_stage_fingerprint(stage_mod.run_stage)
+    assert first_fingerprint != second_fingerprint
+    expected_keys = {
+        f"const:{first_name}.VALUE",
+        f"func:{first_name}.helper",
+        f"class:{first_name}.Config",
+        f"schema:{first_name}.Config",
+        f"const:{second_name}.VALUE",
+        f"func:{second_name}.helper",
+        f"class:{second_name}.Config",
+        f"schema:{second_name}.Config",
+    }
+    assert expected_keys <= second_fingerprint.keys()

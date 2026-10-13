@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
@@ -170,11 +171,9 @@ def render_plots_html(
         if not path.exists():
             continue
 
-        # Use relative path from output HTML to plot file
-        try:
-            rel_path = path.resolve().relative_to(output_path.parent.resolve())
-        except ValueError:
-            rel_path = path.resolve()
+        # Reference the plot relative to the HTML file so the gallery stays valid when the
+        # project directory is moved or opened from another machine.
+        rel_path = pathlib.Path(os.path.relpath(path.resolve(), output_path.parent.resolve()))
 
         # Escape user-provided content to prevent XSS
         safe_path = html.escape(plot["path"])

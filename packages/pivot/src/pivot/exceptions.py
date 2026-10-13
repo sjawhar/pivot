@@ -46,6 +46,14 @@ class InvalidPathError(ValidationError):
     """Raised when a path is invalid (e.g., resolves outside project root)."""
 
 
+class OutputPathConflictError(ValidationError):
+    """Raised when two outputs resolve to the same workspace path, or one lies inside another."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Rename a stage, pipeline or output so each output has its own path"
+
+
 class DAGError(PivotError):
     """Base class for DAG-related errors."""
 

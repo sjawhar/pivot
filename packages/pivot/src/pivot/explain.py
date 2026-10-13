@@ -30,6 +30,32 @@ if TYPE_CHECKING:
 
     from pivot.storage.track import PvtData
 
+OUTPUTS_MISSING_REASON = "Outputs missing from cache"
+"""Reason for a stage whose lock is current but whose cacheable outputs are absent locally.
+
+``pivot status`` counts stages with this reason as restorable by ``pivot pull``, so it is
+never used when the only unavailable outputs are metrics, which are not cached.
+"""
+
+
+def _unavailable_outputs_reason(
+    store: store_mod.WorkspaceStore, unavailable: list[types.ArtifactRef]
+) -> str:
+    """Say why a stage whose lock is current must still run to regenerate ``unavailable``."""
+    if any(ref.tag is not types.ArtifactTag.METRIC for ref in unavailable):
+        return OUTPUTS_MISSING_REASON
+    changed = list[str]()
+    missing = list[str]()
+    for ref in unavailable:
+        key = types.identity_key(ref.identity)
+        (changed if store.resolve_display_path(ref).exists() else missing).append(key)
+    reasons = list[str]()
+    if changed:
+        reasons.append(f"Metric output changed: {', '.join(changed)}")
+    if missing:
+        reasons.append(f"Metric output missing: {', '.join(missing)}")
+    return "; ".join(reasons)
+
 
 def producer_output_hashes(
     stage_names: list[str],
@@ -227,20 +253,23 @@ def get_stage_explanation(
             explain=True,
             force=force,
         )
-        outputs_ready = allow_missing or worker.restore_outputs_to_hashes(
-            store,
-            outs,
-            lock_data["output_hashes"],
-            state_db,
-            state_dir=state_dir,
-            restore=False,
-        )
-        if not decision["changed"] and not outputs_ready:
+        unavailable = list[types.ArtifactRef]()
+        if not allow_missing:
+            unavailable = worker.restore_outputs_to_hashes(
+                store,
+                outs,
+                lock_data["output_hashes"],
+                state_db,
+                state_dir=state_dir,
+                restore=False,
+                report_changes=True,
+            ).unavailable
+        if not decision["changed"] and unavailable:
             return StageExplanation(
                 stage_name=stage_name,
                 will_run=True,
                 is_forced=force,
-                reason="Outputs missing from cache",
+                reason=_unavailable_outputs_reason(store, unavailable),
                 code_changes=[],
                 param_changes=[],
                 dep_changes=[],

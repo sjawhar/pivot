@@ -28,7 +28,6 @@ _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 # ---------------------------------------------------------------------------
 
 _PIPELINE_DISJOINT = """\
-import os
 import pathlib
 import time
 
@@ -40,10 +39,22 @@ def record(label: str) -> None:
         timing.write(f"{label} {time.monotonic()}\\n")
 
 
+def wait_for(label: str) -> None:
+    # Both runs must be inside their stages at once; a run serialised behind the other
+    # never sees its partner start and fails here instead of passing on timing luck.
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        lines = pathlib.Path("timing.log").read_text().splitlines()
+        if any(line.startswith(label + " ") for line in lines):
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"partner {label} never started")
+
+
 @stage
 def stage_a() -> str:
     record("a_start")
-    time.sleep(float(os.environ.get("STAGE_A_SLEEP", "2")))
+    wait_for("b_start")
     record("a_end")
     return "hello from a"
 
@@ -51,7 +62,7 @@ def stage_a() -> str:
 @stage
 def stage_b() -> str:
     record("b_start")
-    time.sleep(float(os.environ.get("STAGE_B_SLEEP", "2")))
+    wait_for("a_start")
     record("b_end")
     return "hello from b"
 
@@ -165,15 +176,13 @@ def _helper_output(project: pathlib.Path, stage: str) -> pathlib.Path:
 
 def test_disjoint_runs_proceed_in_parallel(tmp_path: pathlib.Path) -> None:
     """Two independent artifact writers run concurrently without blocking."""
-    sleep_seconds = 3
     _helper_setup_project(tmp_path, _PIPELINE_DISJOINT)
-    env = _helper_make_env(STAGE_A_SLEEP=str(sleep_seconds), STAGE_B_SLEEP=str(sleep_seconds))
 
-    proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    proc_b = _helper_run_pivot(tmp_path, "stage_b", env=env)
+    proc_a = _helper_run_pivot(tmp_path, "stage_a")
+    proc_b = _helper_run_pivot(tmp_path, "stage_b")
     try:
-        stdout_a, stderr_a = proc_a.communicate(timeout=30)
-        stdout_b, stderr_b = proc_b.communicate(timeout=30)
+        stdout_a, stderr_a = proc_a.communicate(timeout=90)
+        stdout_b, stderr_b = proc_b.communicate(timeout=90)
     finally:
         for process in (proc_a, proc_b):
             if process.poll() is None:

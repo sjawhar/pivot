@@ -16,12 +16,12 @@ def test_google_style_captures_module_attrs() -> None:
     assert "self:stage_google_style" in manifest, "Should capture stage function"
 
     # Should capture module attribute usage via AST analysis
-    assert "mod:user_utils.helper_b" in manifest, "Should capture user_utils.helper_b"
-    assert "mod:user_utils.CONSTANT_A" in manifest, "Should capture user_utils.CONSTANT_A"
+    helper_key = "mod:tests.user_utils.helper_b"
+    assert helper_key in manifest, "Should capture user_utils.helper_b"
+    assert "mod:tests.user_utils.CONSTANT_A" in manifest, "Should capture user_utils.CONSTANT_A"
 
     # Verify helper_b is hashed (user code gets hash, not "callable" marker)
-    helper_b_hash = manifest["mod:user_utils.helper_b"]
-    assert isinstance(helper_b_hash, str), "helper_b should have a hash"
+    helper_b_hash = manifest[helper_key]
     assert len(helper_b_hash) == 16, "helper_b hash should be 16 chars"
 
 

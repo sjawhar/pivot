@@ -136,14 +136,12 @@ def test_get_plot_hashes_from_head_returns_committed_hash(
     """Returns hash from lock file committed to HEAD."""
     repo_path, commit = git_repo
     _register_plot_stage(mock_discovery, "test_stage")
-    _write_lock(
-        repo_path, "test_stage", [{"key": None, "hash": "committed_hash_123", "tag": "plot"}]
-    )
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "c0aa17ed12300000", "tag": "plot"}])
     commit("initial")
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result == {"plots/test_stage.png": "committed_hash_123"}
+    assert result == {"plots/test_stage.png": "c0aa17ed12300000"}
 
 
 def test_get_plot_hashes_from_head_matches_keyed_output(
@@ -161,15 +159,15 @@ def test_get_plot_hashes_from_head_matches_keyed_output(
         repo_path,
         "test_stage",
         [
-            {"key": "chart", "hash": "chart_hash", "tag": "plot"},
-            {"key": "table", "hash": "table_hash", "tag": "data"},
+            {"key": "chart", "hash": "c4a47000000000aa", "tag": "plot"},
+            {"key": "table", "hash": "7ab1e000000000bb", "tag": "data"},
         ],
     )
     commit("initial")
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result == {"plots/test_stage/chart.png": "chart_hash"}
+    assert result == {"plots/test_stage/chart.png": "c4a47000000000aa"}
 
 
 def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
@@ -179,13 +177,13 @@ def test_get_plot_hashes_from_head_ignores_uncommitted_changes(
     """Returns committed hash, not uncommitted changes."""
     repo_path, commit = git_repo
     _register_plot_stage(mock_discovery, "test_stage")
-    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "original_hash", "tag": "plot"}])
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "0a191a1000000000", "tag": "plot"}])
     commit("initial")
-    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "modified_hash", "tag": "plot"}])
+    _write_lock(repo_path, "test_stage", [{"key": None, "hash": "3d1f1ed000000000", "tag": "plot"}])
 
     result = plots.get_plot_hashes_from_head()
 
-    assert result == {"plots/test_stage.png": "original_hash"}, (
+    assert result == {"plots/test_stage.png": "0a191a1000000000"}, (
         "Should return committed hash, not modified"
     )
 
@@ -479,3 +477,19 @@ def test_render_plots_html_escapes_xss(tmp_path: Path) -> None:
     content = result.read_text()
     assert "<script>" not in content, "Script tags should be escaped"
     assert "&lt;script&gt;" in content, "HTML entities should be used"
+
+
+def test_render_plots_html_img_src_is_relative_to_html_file(tmp_path: Path) -> None:
+    """A plot outside the HTML file's directory is referenced by a relative path, never absolute."""
+    plot_file = tmp_path / "plots" / "p" / "chart.png"
+    plot_file.parent.mkdir(parents=True)
+    plot_file.write_bytes(b"data")
+    output_path = tmp_path / ".pivot" / "plots" / "index.html"
+
+    plots.render_plots_html(
+        [plots.PlotInfo(path=str(plot_file), stage_name="p/chart")], output_path
+    )
+
+    content = output_path.read_text()
+    assert '<img src="../../plots/p/chart.png"' in content, content
+    assert f'src="{tmp_path}' not in content, "img src must not be absolute"

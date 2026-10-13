@@ -656,26 +656,18 @@ def test_matplotlib_figure_loader_closes_on_error(tmp_path: pathlib.Path) -> Non
     assert fig.number not in plt.get_fignums()  # pyright: ignore[reportAttributeAccessIssue]
 
 
-def test_matplotlib_figure_loader_with_out(tmp_path: pathlib.Path) -> None:
-    """MatplotlibFigure works with Out for plot outputs."""
+def test_matplotlib_figure_loader_saves_and_closes_figure(tmp_path: pathlib.Path) -> None:
+    """MatplotlibFigure keeps its configured dpi, writes the figure, and closes it."""
     import matplotlib.pyplot as plt
 
-    from pivot import outputs
+    loader = loaders.MatplotlibFigure(dpi=100)
+    assert loader.dpi == 100
 
-    # Create an Out with MatplotlibFigure loader (like Plot but with auto-save)
-    out = outputs.Out("plot.png", loaders.MatplotlibFigure(dpi=100))
-
-    # Verify the loader is correctly stored
-    assert isinstance(out.loader, loaders.MatplotlibFigure)
-    assert out.loader.dpi == 100
-    assert isinstance(out.path, str)
-
-    # Create and save a figure using the loader
     fig, ax = plt.subplots()
     ax.plot([1, 2, 3], [4, 5, 6])
 
-    plot_file = tmp_path / out.path
-    out.loader.save(fig, plot_file)
+    plot_file = tmp_path / "plot.png"
+    loader.save(fig, plot_file)
 
     assert plot_file.exists()
     assert fig.number not in plt.get_fignums()  # pyright: ignore[reportAttributeAccessIssue]
