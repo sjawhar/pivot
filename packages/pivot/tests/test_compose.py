@@ -1440,24 +1440,43 @@ def _helper_shared_impl() -> str:
     return "output"
 
 
+def _helper_shared_impl_late() -> str:
+    return "output"
+
+
 _helper_plain_alias = stage(_helper_shared_impl)
 _helper_special_alias = no_fingerprint(code_deps=["helper.py"])(stage(_helper_shared_impl))
+# Plain alias created AFTER the marked one: functools.wraps copies whatever the function holds.
+_helper_special_alias_late = no_fingerprint(code_deps=["helper.py"])(
+    stage(_helper_shared_impl_late)
+)
+_helper_plain_alias_late = stage(_helper_shared_impl_late)
 
 
+@pytest.mark.parametrize(
+    ("plain_alias", "special_alias"),
+    [
+        pytest.param(_helper_plain_alias, _helper_special_alias, id="plain-created-first"),
+        pytest.param(_helper_plain_alias_late, _helper_special_alias_late, id="plain-created-last"),
+    ],
+)
 def test_no_fingerprint_does_not_leak_to_other_stage_of_same_function(
     set_project_root: pathlib.Path,
+    plain_alias: Callable[[], str],
+    special_alias: Callable[[], str],
 ) -> None:
     """Marking one @stage wrapper no_fingerprint leaves other wrappers of the function alone."""
     (set_project_root / "helper.py").write_text("value = 1\n")
     with Pipeline("test", root=set_project_root) as plain:
-        _helper_plain_alias()
+        plain_alias()
     with Pipeline("test", root=set_project_root) as special:
-        _helper_special_alias()
+        special_alias()
+    stage_name = f"test/{plain_alias.__name__}"
 
-    plain_fp = plain.ensure_fingerprint("test/_helper_shared_impl")
-    special_fp = special.ensure_fingerprint("test/_helper_shared_impl")
+    plain_fp = plain.ensure_fingerprint(stage_name)
+    special_fp = special.ensure_fingerprint(stage_name)
 
-    assert plain.get_stage("test/_helper_shared_impl")["no_fingerprint"] is False, (
+    assert plain.get_stage(stage_name)["no_fingerprint"] is False, (
         "The plain alias must keep AST fingerprinting"
     )
     assert not any(k.startswith("file:") for k in plain_fp), f"Unexpected file hashing: {plain_fp}"
