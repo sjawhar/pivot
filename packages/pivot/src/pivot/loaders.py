@@ -444,7 +444,8 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """
 
     @override
-    def load(self, path: pathlib.Path) -> pandas.DataFrame:
+    def load(self, path: pathlib.Path, *, max_rows: int | None = None) -> pandas.DataFrame:
+        """Load all rows, or at most ``max_rows`` data records after the metadata header."""
         records = list[object]()
         temporal_columns = dict[str, collections_abc.Mapping[str, object]]()
         float_columns = dict[str, str]()
@@ -493,6 +494,8 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                             float_columns[name] = dtype
                         continue
                 records.append(cast("object", record))
+                if max_rows is not None and len(records) >= max_rows:
+                    break
         frame = pandas.DataFrame(records)
         for name, metadata in temporal_columns.items():
             if name not in frame.columns:
@@ -503,6 +506,27 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                 frame[name] = pandas.Series(math.nan, index=frame.index)
             frame[name] = frame[name].astype(pandas.api.types.pandas_dtype(dtype))
         return frame
+
+    def row_count(self, path: pathlib.Path) -> int:
+        """Count data records while skipping the optional Pivot metadata header."""
+        count = 0
+        first_record = True
+        with path.open() as f:
+            for line_num, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                if first_record:
+                    first_record = False
+                    try:
+                        record = cast("object", json.loads(line))
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
+                    if isinstance(record, dict) and set(cast("dict[object, object]", record)) == {
+                        _DATAFRAME_METADATA_KEY
+                    }:
+                        continue
+                count += 1
+        return count
 
     @override
     def save(self, data: pandas.DataFrame, path: pathlib.Path) -> None:

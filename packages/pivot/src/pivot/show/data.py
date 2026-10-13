@@ -145,7 +145,7 @@ def get_schema(path: pathlib.Path) -> dict[str, str]:
         case DataFileFormat.JSON:
             df = pandas.read_json(path)
         case DataFileFormat.JSONL:
-            df = loaders.DataFrameJSONL().load(path).head(100)
+            df = loaders.DataFrameJSONL().load(path, max_rows=100)
         case _:
             raise DataError(f"Unsupported data format: {path.suffix}")
     return {str(col): str(dtype) for col, dtype in df.dtypes.items()}
@@ -162,7 +162,7 @@ def get_row_count(path: pathlib.Path) -> int:
             # Subtract header row, but don't go negative for empty files
             return max(0, count - 1)
         case DataFileFormat.JSONL:
-            return len(loaders.DataFrameJSONL().load(path))
+            return loaders.DataFrameJSONL().row_count(path)
         case _:
             # For JSON, we need to load it
             df = load_dataframe(path)
