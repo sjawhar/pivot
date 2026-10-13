@@ -954,7 +954,7 @@ Manage function fingerprinting cache.
 
 #### `pivot fingerprint reset`
 
-Reset cached function fingerprints. Use after encountering stale cache issues or when troubleshooting unexpected stage re-runs.
+Reset cached function fingerprints and cached stage manifests. Use after encountering stale cache issues or when troubleshooting unexpected stage re-runs.
 
 ```bash
 pivot fingerprint reset

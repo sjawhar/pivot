@@ -13,7 +13,7 @@ def fingerprint() -> None:
 @fingerprint.command("reset")
 @cli_decorators.with_error_handling
 def reset() -> None:
-    """Reset cached function fingerprints.
+    """Reset cached function fingerprints and stage manifests.
 
     Use after encountering stale cache issues or when troubleshooting
     unexpected stage re-runs.
@@ -22,6 +22,6 @@ def reset() -> None:
     from pivot.storage import state
 
     with state.StateDB(io.get_state_dir(), readonly=False) as db:
-        count = db.clear_ast_hashes()
+        count = db.clear_fingerprint_caches()
 
     click.echo(f"Cleared {count} cached fingerprint entries.")
