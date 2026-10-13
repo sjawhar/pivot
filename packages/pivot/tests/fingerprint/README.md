@@ -13,6 +13,7 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
 - **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (data class methods, dynamic name access)
 - **`test_no_fingerprint.py`** - Worker skip/re-run behavior for `@no_fingerprint()` stages (file-level hashing)
+- **`test_fingerprint_properties.py`** - Hypothesis properties over generated stage bodies: fresh-process determinism, formatting insensitivity, one-token sensitivity, and `params.yaml` overrides vs. the run-cache key
 
 Loader fingerprint collision tests live in `tests/test_compose.py`.
 
@@ -205,6 +206,11 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Multiple runs stable                    | ✅        | `test_change_detection.py::test_multiple_runs_stable`           |
 | Same logic, different names → same hash | ✅        | `test_fingerprint.py::test_identical_functions_same_hash`       |
 | Dict key order doesn't affect hash      | ✅        | `test_change_detection.py::test_fingerprint_ordering_stability` |
+| Same source → same manifest in fresh processes (any hash seed) | ✅ | `test_fingerprint_properties.py::test_same_source_gives_same_manifest_in_fresh_processes` |
+| Formatting that keeps the syntax tree → same manifest | ✅ | `test_fingerprint_properties.py::test_formatting_that_keeps_the_syntax_tree_keeps_the_manifest` |
+| Any one-token body change → changed manifest | ✅ | `test_fingerprint_properties.py::test_changing_one_token_of_the_body_changes_the_manifest` |
+| Param override changes run-cache key iff effective params change | ✅ | `test_fingerprint_properties.py::test_override_changes_run_cache_key_exactly_when_effective_params_change` |
+| Override for one stage leaves other stages' keys | ✅ | `test_fingerprint_properties.py::test_override_for_one_stage_leaves_other_stages_run_cache_keys` |
 
 ---
 
