@@ -389,3 +389,48 @@ def test_check_stage_identity_keyed_dep_change_detected() -> None:
     dep_changes = result.get("dep_changes", [])
     assert len(dep_changes) == 1
     assert dep_changes[0]["identity"] == _id("input")
+
+
+def test_explain_reports_output_paths_change_as_stale() -> None:
+    """Status must call a stage stale when only its declared outputs changed, as repro does."""
+    lock_data = _helper_make_lock_data(output_hashes={_id("stage", "old"): FileHash(hash="h")})
+    result = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "new")],
+        explain=True,
+    )
+    assert result["changed"] is True
+    assert result["reason"] == "Output paths changed"
+
+
+def test_explain_reports_added_and_removed_params() -> None:
+    """A param that appears or disappears is a change, not only a param whose value moved."""
+    lock_data = _helper_make_lock_data(params={"lr": 0.01, "old_only": 1})
+    result = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01, "new_only": 2},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "output")],
+        explain=True,
+    )
+    assert result["changed"] is True
+    changes = {c["key"]: c["change_type"] for c in result["param_changes"]}
+    assert changes == {"new_only": "added", "old_only": "removed"}
+
+
+def test_explain_unchanged_stage_has_empty_reason() -> None:
+    """Callers print their own 'unchanged' label only when the reason is empty."""
+    result = skip.check_stage(
+        lock_data=_helper_make_lock_data(),
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "output")],
+        explain=True,
+    )
+    assert result["changed"] is False
+    assert result["reason"] == ""
