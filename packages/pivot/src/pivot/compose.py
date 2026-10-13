@@ -637,7 +637,7 @@ class Pipeline:
                     self._validation_errors.append(
                         f"{stage_name}: parameter '{param_name}' uses p.previous("
                         + (f"{value.key!r}" if value.key is not None else "")
-                        + f") but output '{output_spec.key}' is not tagged incremental."
+                        + f") but {_output_label(output_spec.key)} is not tagged incremental."
                     )
                     continue
                 existing_param = next(
@@ -649,9 +649,10 @@ class Pipeline:
                     None,
                 )
                 if existing_param is not None:
+                    label = _output_label(output_spec.key)
                     self._validation_errors.append(
                         f"{stage_name}: parameters '{existing_param}' and '{param_name}' both "
-                        + f"bind p.previous() to incremental output '{output_spec.key}'."
+                        + f"bind p.previous() to {label}, an incremental output."
                     )
                     continue
                 incremental_inputs[param_name] = output_spec.key
@@ -905,6 +906,14 @@ def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
 # --- Return type analysis ---
 
 
+def _output_label(key: str) -> str:
+    """Name an output in a user-facing message.
+
+    Users never see SINGLE_OUTPUT_KEY: a single output is the stage's return value.
+    """
+    return "the return value" if key == SINGLE_OUTPUT_KEY else f"output '{key}'"
+
+
 def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec]:
     """Parse a stage return type into output specifications."""
     origin = get_origin(hint)
@@ -931,8 +940,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
     tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
     fmt: loaders_mod.Writer[object] | None = None
     loaders = _get_loaders()
-    # Users never see SINGLE_OUTPUT_KEY: a single output is the stage's return value.
-    label = "the return value" if key == SINGLE_OUTPUT_KEY else f"output '{key}'"
+    label = _output_label(key)
     for metadata in args[1:]:
         if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
             if tag is not None:
@@ -1150,10 +1158,7 @@ class ArtifactHandle:
                     output_key=name,
                     python_type=spec.python_type,
                 )
-        available = [spec.key for spec in self._source.output_specs]
-        raise AttributeError(
-            f"Stage '{self._source.name}' has no output '{name}'. Available: {available}"
-        )
+        raise AttributeError(_no_such_output_message(self._source, name))
 
     def __getitem__(self, key: str) -> ArtifactHandle:
         if not isinstance(self._source, _StageNode):
@@ -1166,5 +1171,14 @@ class ArtifactHandle:
                     output_key=key,
                     python_type=spec.python_type,
                 )
-        available = [spec.key for spec in self._source.output_specs]
-        raise KeyError(f"Stage '{self._source.name}' has no output '{key}'. Available: {available}")
+        raise KeyError(_no_such_output_message(self._source, key))
+
+
+def _no_such_output_message(source: _StageNode, key: str) -> str:
+    if [spec.key for spec in source.output_specs] == [SINGLE_OUTPUT_KEY]:
+        return (
+            f"Stage '{source.name}' has no output '{key}': it has a single output, the return "
+            + "value. Pass the handle itself."
+        )
+    available = [spec.key for spec in source.output_specs]
+    return f"Stage '{source.name}' has no output '{key}'. Available: {available}"

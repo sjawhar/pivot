@@ -409,6 +409,59 @@ def test_list_refuses_an_input_bound_to_an_output_path(
     assert path in result.output, result.output
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param(
+            "@stage\ndef s(previous: dict) -> dict:\n    return previous\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n    s(previous=pipeline.previous())\n',
+            "uses p.previous() but the return value is not tagged incremental",
+            id="previous-on-untagged-return",
+        ),
+        pytest.param(
+            "from typing import Annotated\n\nfrom pivot import incremental\n\n\n"
+            + "@stage\ndef s(a: dict, b: dict) -> Annotated[dict, incremental]:\n"
+            + "    return a\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n'
+            + "    s(a=pipeline.previous(), b=pipeline.previous())\n",
+            "parameters 'a' and 'b' both bind p.previous() to the return value",
+            id="previous-bound-twice",
+        ),
+        pytest.param(
+            "@stage\ndef s(raw: pd.DataFrame) -> pd.DataFrame:\n    return raw\n\n\n"
+            + "@stage\ndef t(rows: pd.DataFrame) -> pd.DataFrame:\n    return rows\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n    t(s(pipeline.input("t.csv")).rows)\n',
+            "Stage 's' has no output 'rows': it has a single output, the return value",
+            id="attribute-on-single-output",
+        ),
+        pytest.param(
+            "@stage\ndef s(raw: pd.DataFrame) -> pd.DataFrame:\n    return raw\n\n\n"
+            + "@stage\ndef t(rows: pd.DataFrame) -> pd.DataFrame:\n    return rows\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n    t(s(pipeline.input("t.csv"))["rows"])\n',
+            "Stage 's' has no output 'rows': it has a single output, the return value",
+            id="item-on-single-output",
+        ),
+    ],
+)
+def test_list_names_a_single_output_as_the_return_value(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, body: str, expected: str
+) -> None:
+    """Errors about a stage's single output never show the internal key '_single'."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "t.csv").write_text("a\n1\n")
+        pathlib.Path("pipeline.py").write_text(
+            "import pandas as pd\n\nfrom pivot import Pipeline, stage\n\n\n" + body
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    # Quoted: the temp directory name ("test_list_names_a_single_output...") contains the bare word.
+    assert repr(compose.SINGLE_OUTPUT_KEY) not in result.output, result.output
+    assert expected in result.output, result.output
+
+
 # =============================================================================
 # Explain Mode Tests
 # =============================================================================
