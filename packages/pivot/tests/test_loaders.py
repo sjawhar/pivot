@@ -307,7 +307,8 @@ def test_pickle_loader_load(tmp_path: pathlib.Path) -> None:
     pkl_file.write_bytes(pickle.dumps(obj))
 
     loader = loaders.Pickle[dict[str, Any]]()
-    loaded = loader.load(pkl_file)
+    with pytest.warns(RuntimeWarning, match="cache or remote"):
+        loaded = loader.load(pkl_file)
 
     assert loaded == obj
 
