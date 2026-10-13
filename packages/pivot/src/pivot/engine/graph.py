@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import networkx as nx
 
@@ -184,9 +184,15 @@ def validate_dependency_sources(
             if store.exists(dep):
                 continue
             try:
-                input_path = project.to_relative_path(store.checkout(dep))
+                resolved_input_path = cast("object", store.checkout(dep))
             except FileNotFoundError:
                 input_path = None
+            else:
+                input_path = (
+                    project.to_relative_path(resolved_input_path)
+                    if isinstance(resolved_input_path, pathlib.Path)
+                    else None
+                )
             errors.append(
                 exceptions.DependencyNotFoundError(
                     stage=stage_name,
