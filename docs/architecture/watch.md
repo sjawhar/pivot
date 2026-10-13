@@ -55,7 +55,7 @@ The same Engine code handles both batch and watch mode:
 | Mode | Entry Point | Event Source |
 |------|-------------|--------------|
 | Batch (`pivot repro`) | `engine.run(exit_on_completion=True)` | OneShotSource |
-| Watch (`pivot repro --watch`) | `engine.run(exit_on_completion=False)` | FilesystemSource |
+| Watch (`pivot repro --watch`) | `engine.run(exit_on_completion=False)` | OneShotSource (startup run) + FilesystemSource |
 
 This unified architecture eliminates divergent code paths between batch and watch modes. Both modes use identical sink configuration, ensuring flags like `--quiet` work consistently.
 

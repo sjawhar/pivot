@@ -66,19 +66,22 @@ def _configure_watch_sources(
     no_commit: bool,
     on_error: OnError,
 ) -> None:
-    """Configure sources for watch mode."""
+    """Configure sources for watch mode: one startup run, then filesystem changes.
+
+    The startup run uses normal skip detection, so only stale stages execute unless
+    ``force`` is set.
+    """
     eng.add_source(engine_sources.FilesystemSource(watch_paths=watch_paths, debounce_ms=debounce))
-    if force:
-        eng.add_source(
-            engine_sources.OneShotSource(
-                stages=stages,
-                force=True,
-                reason="watch:initial:forced",
-                resource_capacity=resource_capacity,
-                no_commit=no_commit,
-                on_error=on_error,
-            )
+    eng.add_source(
+        engine_sources.OneShotSource(
+            stages=stages,
+            force=force,
+            reason="watch:initial:forced" if force else "watch:initial",
+            resource_capacity=resource_capacity,
+            no_commit=no_commit,
+            on_error=on_error,
         )
+    )
 
 
 def _watch_paths_from_registry(
@@ -512,26 +515,16 @@ def _run_serve_mode(
         watch_paths = _watch_paths_from_registry(all_stages)
 
         async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
-            # Add filesystem watch source
-            eng.add_source(
-                engine_sources.FilesystemSource(
-                    watch_paths=watch_paths,
-                    debounce_ms=debounce,
-                )
+            _configure_watch_sources(
+                eng,
+                watch_paths,
+                debounce,
+                force=force,
+                stages=stages_list,
+                resource_capacity=resource_capacity,
+                no_commit=no_commit,
+                on_error=on_error,
             )
-
-            # Add initial run source if force specified
-            if force:
-                eng.add_source(
-                    engine_sources.OneShotSource(
-                        stages=stages_list,
-                        force=True,
-                        reason="serve:initial",
-                        resource_capacity=resource_capacity,
-                        no_commit=no_commit,
-                        on_error=on_error,
-                    )
-                )
 
             # Add event buffer as sink so it captures events
             eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]

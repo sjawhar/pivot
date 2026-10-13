@@ -8,7 +8,7 @@ Watch mode monitors your project for file changes and automatically re-runs affe
 pivot repro --watch
 ```
 
-Pivot runs the full pipeline once, then watches for changes. When you save a file, it re-runs only the stages affected by that change — the stage whose [dependency](../concepts/dependencies.md) changed, plus all downstream stages.
+Pivot first runs the pipeline once with normal [skip detection](../concepts/caching.md), so stale stages run and cached ones are skipped (`--force` re-runs every stage on this first run). It then watches for changes. When you save a file, it re-runs only the stages affected by that change — the stage whose [dependency](../concepts/dependencies.md) changed, plus all downstream stages.
 
 ### With the Interactive TUI
 
