@@ -457,6 +457,49 @@ def test_input_redeclaration_after_reentering_pipeline_raises(tmp_path: pathlib.
         pipeline.input("data", path="data/second.csv", t=str)
 
 
+@stage
+def _helper_consume_text(data: str) -> str:
+    return data
+
+
+def test_include_binding_allows_same_path_explicit_format_takeover(tmp_path: pathlib.Path) -> None:
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        child.input("data", path="data/input.txt", t=str)
+
+    with Pipeline("parent", root=tmp_path) as parent:
+        parent.include(child)
+        data = parent.input("data", path="data/input.txt", t=str)
+        _helper_consume_text(data)
+
+    assert isinstance(parent._inputs["data"].format, loaders.Text)
+    assert isinstance(
+        parent.get_stage("parent/_helper_consume_text")["deps"]["data"].format, loaders.Text
+    )
+
+
+def test_include_binding_rejects_explicit_different_path(tmp_path: pathlib.Path) -> None:
+    child = Pipeline("child", root=tmp_path)
+    with child:
+        child.input("data", path="data/child.txt", t=str)
+
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*child.txt.*parent.txt"),
+        Pipeline("parent", root=tmp_path) as parent,
+    ):
+        parent.include(child)
+        parent.input("data", path="data/parent.txt", t=str)
+
+
+def test_explicit_pathonly_then_text_redeclaration_still_raises(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(exceptions.PipelineConfigError, match="data.*format"),
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        pipeline.input("data", path="data/input.txt", format=loaders.PathOnly())
+        pipeline.input("data", path="data/input.txt", format=loaders.Text())
+
+
 def test_pipeline_context_basic() -> None:
     with Pipeline("test", root=pathlib.Path("/tmp")) as pipeline:
         data = _helper_produce(params=stage_def.StageParams())

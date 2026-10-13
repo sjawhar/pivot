@@ -347,7 +347,11 @@ class Pipeline:
                     )
             else:
                 self._inputs[name] = _InputNode(
-                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                    name=name,
+                    python_type=None,
+                    path=path,
+                    format=_get_loaders().PathOnly(),
+                    inherited=True,
                 )
         self._registry.invalidate_dag_cache()
 
@@ -448,6 +452,16 @@ class Pipeline:
                 raise exceptions.PipelineConfigError(
                     f"Input binding conflict: input '{name}' is bound to '{existing.path}' "
                     + f"and '{path}' in the same pipeline."
+                )
+            if existing.inherited:
+                existing.python_type = t
+                existing.format = format
+                existing.inherited = False
+                return ArtifactHandle(
+                    pipeline=self,
+                    source=existing,
+                    output_key=None,
+                    python_type=t or object,
                 )
             if existing.format != format:
                 raise exceptions.PipelineConfigError(
@@ -652,7 +666,11 @@ class Pipeline:
                 )
             if name not in self._inputs:
                 self._inputs[name] = _InputNode(
-                    name=name, python_type=None, path=path, format=_get_loaders().PathOnly()
+                    name=name,
+                    python_type=None,
+                    path=path,
+                    format=_get_loaders().PathOnly(),
+                    inherited=True,
                 )
 
 
@@ -883,6 +901,7 @@ class _InputNode:
     python_type: type | None
     path: str
     format: loaders_mod.Reader[object] | loaders_mod.Loader[object, object]
+    inherited: bool = False
 
 
 class ArtifactHandle:
