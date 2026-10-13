@@ -11,6 +11,8 @@ from pivot.registry import RegistryStageInfo
 if TYPE_CHECKING:
     import pathlib
 
+    import pytest
+
 
 def _stage_info(name: str, state_dir: pathlib.Path | None) -> RegistryStageInfo:
     def _stage_func() -> None:
@@ -56,7 +58,7 @@ def test_find_orphaned_lock_files_scans_each_stage_state_dir(
 
 def test_find_orphaned_lock_files_includes_default_dir_with_only_custom_stages(
     set_project_root: pathlib.Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A custom stage dir does not suppress cleanup of stale locks in the configured default."""
     default_state_dir = set_project_root / ".pivot"
@@ -71,7 +73,7 @@ def test_find_orphaned_lock_files_includes_default_dir_with_only_custom_stages(
 
 def test_find_orphaned_lock_files_scans_default_dir_without_stages(
     set_project_root: pathlib.Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Deleting every stage does not hide stale locks in the configured default directory."""
     default_state_dir = set_project_root / ".pivot"
