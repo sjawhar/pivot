@@ -1,3 +1,4 @@
+import stat
 import collections.abc
 import pathlib
 import shutil
@@ -42,6 +43,13 @@ def _mutate_previous_directory(previous: pathlib.Path) -> pathlib.Path:
     (previous / "seed.txt").write_text("seed updated")
     (previous / "nested" / "existing.txt").write_text("nested seed updated")
     (previous / "nested" / "next.txt").write_text("next")
+    result_dir = pathlib.Path(tempfile.mkdtemp()) / "result"
+    shutil.copytree(previous, result_dir)
+    return result_dir
+
+def _copy_previous_directory(previous: pathlib.Path) -> pathlib.Path:
+    assert previous.is_dir()
+    assert (previous / "script.sh").stat().st_mode & stat.S_IXUSR
     result_dir = pathlib.Path(tempfile.mkdtemp()) / "result"
     shutil.copytree(previous, result_dir)
     return result_dir
@@ -269,3 +277,36 @@ def test_incremental_directory_restores_a_writable_copy_without_mutating_the_cac
     assert cache_files["seed.txt"].read_text() == "seed"
     assert cache_files["nested/existing.txt"].read_text() == "nested seed"
     assert "nested/next.txt" not in cache_files
+
+def test_incremental_directory_copy_restore_preserves_executable_mode(
+    worker_env: pathlib.Path,
+    tmp_path: pathlib.Path,
+    output_queue: Any,
+) -> None:
+    """COPY restoration preserves executable files before an incremental stage runs."""
+    output = _output_ref("executable", loaders.PathOnly())
+    output_path = _output_path(tmp_path, "executable", "dat")
+    output_path.mkdir(parents=True)
+    script = output_path / "script.sh"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
+    output_hash = cache.save_to_cache(output_path, worker_env)
+    cache.remove_output(output_path)
+    lock.StageLock("incremental/executable", lock.get_stages_dir(tmp_path / ".pivot")).write(
+        types.LockData(
+            code_manifest={"self:test": "abc123"},
+            params={},
+            dep_hashes={},
+            output_hashes={output.identity: output_hash},
+        )
+    )
+
+    result = worker.execute_stage(
+        "incremental/executable",
+        _worker_info(_copy_previous_directory, tmp_path, output, force=True),
+        worker_env,
+        output_queue,
+    )
+
+    assert result["status"] is types.StageStatus.RAN
+    assert output_path.joinpath("script.sh").stat().st_mode & stat.S_IXUSR
