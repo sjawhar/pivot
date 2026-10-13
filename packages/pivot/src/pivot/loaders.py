@@ -366,14 +366,19 @@ def _encode_jsonl_column(
         series = pandas.Series(pandas.to_datetime(series))
         dtype = series.dtype
     if isinstance(dtype, pandas.DatetimeTZDtype):
-        # Values are ISO UTC text; metadata must rebuild the original zone exactly.
+        # Values are ISO UTC text; metadata must rebuild the original zone semantics.
         timezone = str(dtype.tz)
         try:
             reconstructed_dtype = pandas.DatetimeTZDtype(tz=timezone)
         except (KeyError, TypeError, ValueError) as e:
             raise TypeError(f"cannot round-trip timezone {timezone!r}") from e
-        if reconstructed_dtype != dtype:
+        if str(reconstructed_dtype.tz) != timezone:
             raise TypeError(f"cannot round-trip timezone {timezone!r}")
+        for timestamp in series.dropna():
+            original_offset = timestamp.utcoffset()
+            reconstructed_offset = timestamp.tz_convert(reconstructed_dtype.tz).utcoffset()
+            if original_offset != reconstructed_offset:
+                raise TypeError(f"cannot round-trip timezone {timezone!r}")
         metadata: dict[str, object] = {"kind": "datetime", "timezone": timezone}
         return (
             _iso_datetime_texts(series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z"),

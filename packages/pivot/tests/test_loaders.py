@@ -11,10 +11,12 @@ import pathlib
 import pickle
 import typing
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy
 import pandas
 import pytest
+import pytz
 from dateutil import tz as dateutil_tz
 
 from pivot import loaders
@@ -1124,6 +1126,37 @@ def test_dataframe_jsonl_refuses_timezone_that_cannot_roundtrip(
 
     with pytest.raises(TypeError, match="timestamp.*timezone"):
         loaders.DataFrameJSONL().save(frame, tmp_path / "dateutil.jsonl")
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    [
+        pytest.param(ZoneInfo("Europe/Paris"), id="zoneinfo"),
+        pytest.param(pytz.timezone("America/New_York"), id="pytz"),
+        pytest.param(datetime.UTC, id="utc"),
+    ],
+)
+def test_dataframe_jsonl_roundtrips_reconstructible_timezones(
+    tmp_path: pathlib.Path, timezone: datetime.tzinfo
+) -> None:
+    jsonl_file = tmp_path / "timezone.jsonl"
+    frame = pandas.DataFrame(
+        {
+            "timestamp": pandas.to_datetime(
+                pandas.Series(["2024-03-04 12:00", "2024-08-04 12:00"])
+            ).dt.tz_localize(timezone)
+        }
+    )
+
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+    loaded_dtype = typing.cast("pandas.DatetimeTZDtype", loaded["timestamp"].dtype)
+    frame_dtype = typing.cast("pandas.DatetimeTZDtype", frame["timestamp"].dtype)
+
+    assert str(loaded_dtype.tz) == str(frame_dtype.tz)
+    assert [timestamp.utcoffset() for timestamp in loaded["timestamp"].tolist()] == [
+        timestamp.utcoffset() for timestamp in frame["timestamp"].tolist()
+    ]
 
 
 @pytest.mark.parametrize(
