@@ -19,24 +19,12 @@ if TYPE_CHECKING:
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
-    """Build a schema-v2 remote lock while retaining legacy display paths.
-
-    The import resolver matches ``path``/``display`` for user-facing import
-    arguments; key and tag make the fixture pass the current lock validator.
-    """
-    normalized_outs = [
-        {
-            "key": entry.get("key"),
-            "tag": entry.get("tag", "data"),
-            **entry,
-        }
-        for entry in outs
-    ]
+    """Build a schema-v2 remote lock with identity-addressed outputs."""
     data = {
         "code_manifest": {"stage": "hash"},
         "params": {},
         "deps": [],
-        "outs": normalized_outs,
+        "outs": outs,
     }
     return yaml.safe_dump(data).encode()
 
@@ -55,7 +43,8 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": "abc123",
             }
         ]
@@ -87,25 +76,24 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
     )
     read_file.side_effect = _read_file
 
-    resolved = asyncio.run(
-        import_artifact.resolve_remote_path(repo_url, "data/output.csv", "main", None)
-    )
+    resolved = asyncio.run(import_artifact.resolve_remote_path(repo_url, "train", "main", None))
 
     assert resolved["stage"] == "train"
-    assert resolved["path"] == "data/output.csv"
+    assert resolved["path"] == "train"
     assert resolved["hash"] == "abc123"
     assert resolved["size"] == 0
     assert resolved["remote_url"] == remote_url
     assert resolved["rev_lock"] == "deadbeef"
 
 
-def test_resolve_remote_path_ambiguous(mocker: MockerFixture) -> None:
+def test_resolve_remote_path_identity_disambiguates_stages(mocker: MockerFixture) -> None:
     repo_url = "https://github.com/org/repo"
     remote_url = "s3://bucket/prefix"
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": "abc123",
             }
         ]
@@ -137,8 +125,12 @@ def test_resolve_remote_path_ambiguous(mocker: MockerFixture) -> None:
     )
     read_file.side_effect = _read_file
 
-    with pytest.raises(exceptions.PivotError, match="train"):
-        asyncio.run(import_artifact.resolve_remote_path(repo_url, "data/output.csv", "main", None))
+    # Artifact identities include their producer stage, so same-key outputs are unambiguous.
+    resolved = asyncio.run(import_artifact.resolve_remote_path(repo_url, "train", "main", None))
+
+    assert resolved["stage"] == "train"
+    assert resolved["path"] == "train"
+    assert resolved["hash"] == "abc123"
 
 
 def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
@@ -147,7 +139,8 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": "abc123",
             }
         ]
@@ -180,7 +173,7 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
     read_file.side_effect = _read_file
 
     with pytest.raises(exceptions.PivotError, match="Available outputs"):
-        asyncio.run(import_artifact.resolve_remote_path(repo_url, "data/missing.csv", "main", None))
+        asyncio.run(import_artifact.resolve_remote_path(repo_url, "missing", "main", None))
 
 
 def test_read_remote_config_success(mocker: MockerFixture) -> None:
@@ -211,7 +204,8 @@ async def test_import_artifact_creates_pvt(
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": file_hash,
             }
         ]
@@ -254,12 +248,12 @@ async def test_import_artifact_creates_pvt(
 
     result = await import_artifact.import_artifact(
         repo_url,
-        "data/output.csv",
+        "train",
         rev="main",
         project_root=tmp_path,
     )
 
-    data_path = tmp_path / "data" / "output.csv"
+    data_path = tmp_path / "train"
     pvt_path = track.get_pvt_path(data_path)
     assert pathlib.Path(result["data_path"]) == data_path
     assert pathlib.Path(result["pvt_path"]) == pvt_path
@@ -269,6 +263,8 @@ async def test_import_artifact_creates_pvt(
     assert pvt_data is not None
     assert pvt_data["hash"] == file_hash
     assert "source" in pvt_data
+    assert pvt_data["source"]["stage"] == "train"
+    assert pvt_data["source"]["path"] == "train"
     assert pvt_data["source"]["remote"] == remote_url
     assert pvt_data["size"] == len(content), "Size should come from downloaded file"
 
@@ -281,7 +277,8 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": file_hash,
             }
         ]
@@ -322,20 +319,23 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
     result = asyncio.run(
         import_artifact.import_artifact(
             repo_url,
-            "data/output.csv",
+            "train",
             rev="main",
             project_root=tmp_path,
             no_download=True,
         )
     )
 
-    data_path = tmp_path / "data" / "output.csv"
+    data_path = tmp_path / "train"
     pvt_path = track.get_pvt_path(data_path)
     assert pathlib.Path(result["data_path"]) == data_path
     assert pathlib.Path(result["pvt_path"]) == pvt_path
     assert result["downloaded"] is False
     assert not data_path.exists()
-    assert pvt_path.exists()
+    pvt_data = track.read_pvt_file(pvt_path)
+    assert pvt_data is not None
+    assert "source" in pvt_data
+    assert pvt_data["source"]["path"] == "train"
 
 
 async def test_import_artifact_force_overwrites(
@@ -351,7 +351,8 @@ async def test_import_artifact_force_overwrites(
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": file_hash,
             }
         ]
@@ -392,17 +393,17 @@ async def test_import_artifact_force_overwrites(
         return_value=remote_mod.S3Remote(remote_url),
     )
 
-    data_path = tmp_path / "data" / "output.csv"
+    data_path = tmp_path / "train"
     data_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.write_text("old")
     track.write_pvt_file(
         track.get_pvt_path(data_path),
-        track.PvtData(path="output.csv", hash="old", size=3),
+        track.PvtData(path="train", hash="old", size=3),
     )
 
     result = await import_artifact.import_artifact(
         repo_url,
-        "data/output.csv",
+        "train",
         rev="main",
         project_root=tmp_path,
         force=True,

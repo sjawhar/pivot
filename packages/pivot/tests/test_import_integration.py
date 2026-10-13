@@ -13,12 +13,12 @@ import yaml
 
 from pivot import exceptions, import_artifact
 from pivot.remote import storage as remote_mod
+from pivot.storage import lock, track
 from tests import conftest
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
     from types_aiobotocore_s3 import S3Client
-from pivot.storage import track
 
 
 def _make_import_source(
@@ -26,8 +26,8 @@ def _make_import_source(
     repo: str = "https://github.com/org/upstream",
     rev: str = "main",
     rev_lock: str = "abc123deadbeef",
-    stage: str = "train",
-    path: str = "data/output.csv",
+    stage: str = "smoke/train",
+    path: str = "smoke/train",
     remote: str = "s3://bucket/prefix",
 ) -> track.ImportSource:
     return track.ImportSource(
@@ -36,12 +36,9 @@ def _make_import_source(
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
-    """Build a schema-v2 remote lock with user-facing import paths."""
-    normalized_outs = [
-        {"key": entry.get("key"), "tag": entry.get("tag", "data"), **entry} for entry in outs
-    ]
+    """Build a schema-v2 remote lock with identity-addressed outputs."""
     return yaml.safe_dump(
-        {"code_manifest": {"stage": "hash"}, "params": {}, "deps": [], "outs": normalized_outs}
+        {"code_manifest": {"stage": "hash"}, "params": {}, "deps": [], "outs": outs}
     ).encode()
 
 
@@ -66,7 +63,7 @@ def test_discover_import_pvt_files_end_to_end(tmp_path: pathlib.Path) -> None:
             path="imported.csv",
             hash="hash_imported",
             size=500,
-            source=_make_import_source(path="data/imported.csv"),
+            source=_make_import_source(),
         ),
     )
 
@@ -79,7 +76,7 @@ def test_discover_import_pvt_files_end_to_end(tmp_path: pathlib.Path) -> None:
             path="model.pkl",
             hash="hash_model",
             size=2000,
-            source=_make_import_source(stage="eval", path="models/model.pkl"),
+            source=_make_import_source(stage="smoke/eval", path="smoke/eval"),
         ),
     )
 
@@ -88,7 +85,6 @@ def test_discover_import_pvt_files_end_to_end(tmp_path: pathlib.Path) -> None:
         tmp_path / "local.csv.pvt",
         track.PvtData(path="local.csv", hash="hash_local", size=100),
     )
-
     # Create another non-import .pvt
     track.write_pvt_file(
         tmp_path / "another.csv.pvt",
@@ -114,8 +110,8 @@ def test_import_pvt_roundtrip(tmp_path: pathlib.Path) -> None:
         repo="https://github.com/org/upstream",
         rev="v2.0",
         rev_lock="deadbeef12345678",
-        stage="preprocess",
-        path="outputs/data.csv",
+        stage="smoke/preprocess",
+        path="smoke/preprocess",
         remote="s3://my-bucket/cache",
     )
     original = track.PvtData(
@@ -173,12 +169,13 @@ def _setup_source_repo(
 
     pivot_dir = source_dir / ".pivot"
     pivot_dir.mkdir()
-    (pivot_dir / "stages").mkdir()
 
     config = {"remotes": {"origin": remote_url}}
     (pivot_dir / "config.yaml").write_text(yaml.safe_dump(config))
 
-    (pivot_dir / "stages" / f"{stage_name}.lock").write_bytes(_lock_bytes(outs=outs))
+    lock_path = lock.get_stages_dir(pivot_dir) / f"{stage_name}.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(_lock_bytes(outs=outs))
 
     subprocess.run(["git", "add", "."], cwd=source_dir, check=True, capture_output=True)
     subprocess.run(
@@ -215,8 +212,8 @@ async def test_import_from_local_git_repo(
     head_sha = _setup_source_repo(
         source_dir,
         remote_url,
-        "prepare",
-        [{"path": "data/output.csv", "hash": file_hash}],
+        "smoke/prepare",
+        [{"key": None, "tag": "data", "hash": file_hash}],
     )
 
     key = remote_mod._hash_to_key("cache/", file_hash)
@@ -224,7 +221,7 @@ async def test_import_from_local_git_repo(
 
     result = await import_artifact.import_artifact(
         str(source_dir),
-        "data/output.csv",
+        "smoke/prepare",
         rev="main",
         project_root=consumer_dir,
     )
@@ -242,8 +239,8 @@ async def test_import_from_local_git_repo(
     assert source["repo"] == str(source_dir)
     assert source["rev"] == "main"
     assert source["rev_lock"] == head_sha, "rev_lock should be resolved HEAD SHA"
-    assert source["stage"] == "prepare"
-    assert source["path"] == "data/output.csv"
+    assert source["stage"] == "smoke/prepare"
+    assert source["path"] == "smoke/prepare"
     assert source["remote"] == remote_url
 
 
@@ -267,8 +264,8 @@ async def test_import_from_local_repo_then_update(
     _setup_source_repo(
         source_dir,
         remote_url,
-        "train",
-        [{"path": "models/weights.bin", "hash": v1_hash}],
+        "smoke/train",
+        [{"key": None, "tag": "data", "hash": v1_hash}],
     )
 
     key_v1 = remote_mod._hash_to_key("cache/", v1_hash)
@@ -276,7 +273,7 @@ async def test_import_from_local_repo_then_update(
 
     result = await import_artifact.import_artifact(
         str(source_dir),
-        "models/weights.bin",
+        "smoke/train",
         rev="main",
         project_root=consumer_dir,
     )
@@ -289,8 +286,8 @@ async def test_import_from_local_repo_then_update(
     assert pvt_data is not None
     old_rev = pvt_data["source"]["rev_lock"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
-    (source_dir / ".pivot" / "stages" / "train.lock").write_bytes(
-        _lock_bytes(outs=[{"path": "models/weights.bin", "hash": v2_hash}])
+    (source_dir / ".pivot" / "stages" / "smoke" / "train.lock").write_bytes(
+        _lock_bytes(outs=[{"key": None, "tag": "data", "hash": v2_hash}])
     )
     subprocess.run(["git", "add", "."], cwd=source_dir, check=True, capture_output=True)
     subprocess.run(
@@ -317,13 +314,13 @@ async def test_import_from_local_repo_then_update(
     assert updated_pvt["size"] == len(v2_content), "Size should reflect v2 file"
 
 
-async def test_import_from_local_repo_not_found_path(
+async def test_import_from_local_repo_not_found_identity(
     tmp_path: pathlib.Path,
     moto_s3_bucket: str,
     aioboto3_s3_client: S3Client,
     mocker: MockerFixture,
 ) -> None:
-    """Importing a path that doesn't exist in any stage lock file raises PivotError."""
+    """Importing an unknown identity from a stage lock file raises PivotError."""
     content = b"data"
     file_hash = xxhash.xxh64(content).hexdigest()
 
@@ -335,14 +332,14 @@ async def test_import_from_local_repo_not_found_path(
     _setup_source_repo(
         source_dir,
         remote_url,
-        "train",
-        [{"path": "data/output.csv", "hash": file_hash}],
+        "smoke/train",
+        [{"key": None, "tag": "data", "hash": file_hash}],
     )
 
     with pytest.raises(exceptions.PivotError, match="not found in remote outputs"):
         await import_artifact.import_artifact(
             str(source_dir),
-            "data/nonexistent.csv",
+            "smoke/missing",
             rev="main",
             project_root=consumer_dir,
         )
@@ -367,7 +364,7 @@ async def test_full_import_flow_mocked(
 
     # --- Step 1: import_artifact ---
 
-    lock_bytes_v1 = _lock_bytes(outs=[{"path": "data/output.csv", "hash": initial_hash}])
+    lock_bytes_v1 = _lock_bytes(outs=[{"key": None, "tag": "data", "hash": initial_hash}])
 
     mocker.patch(
         "pivot.import_artifact.github.list_directory",
@@ -409,7 +406,7 @@ async def test_full_import_flow_mocked(
     )
 
     result = await import_artifact.import_artifact(
-        repo_url, "data/output.csv", rev="main", project_root=tmp_path
+        repo_url, "train", rev="main", project_root=tmp_path
     )
 
     data_path = pathlib.Path(result["data_path"])
@@ -443,7 +440,7 @@ async def test_full_import_flow_mocked(
 
     # --- Step 4: update_import ---
 
-    lock_bytes_v2 = _lock_bytes(outs=[{"path": "data/output.csv", "hash": updated_hash}])
+    lock_bytes_v2 = _lock_bytes(outs=[{"key": None, "tag": "data", "hash": updated_hash}])
 
     async def _read_file_v2(
         _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
@@ -469,6 +466,7 @@ async def test_full_import_flow_mocked(
     assert data_path.read_bytes() == updated_content
 
     # Verify .pvt file is updated
+
     updated_pvt = track.read_pvt_file(pvt_path)
     assert updated_pvt is not None
     assert updated_pvt["hash"] == updated_hash

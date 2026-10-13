@@ -32,14 +32,15 @@ outs:
   - key: null
     hash: ghi789
     tag: data
-    display: model.pkl
 """
     result = restore._parse_lock_data_from_bytes(content)
 
     assert result is not None
     assert "outs" in result
     out_entry = cast("dict[str, object]", cast("object", result["outs"][0]))
-    assert out_entry["display"] == "model.pkl"
+    # V2 entries identify outputs by identity key and tag rather than a display path.
+    assert out_entry["key"] is None
+    assert out_entry["tag"] == "data"
 
 
 def test_parse_lock_data_from_bytes_invalid() -> None:
@@ -385,7 +386,7 @@ def test_restore_targets_from_revision_output_with_stage(
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [{"key": None, "hash": "def456", "tag": "data", "display": "model.pkl"}],
+        "outs": [{"key": None, "hash": "def456", "tag": "data"}],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
 
