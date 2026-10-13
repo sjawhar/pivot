@@ -5,12 +5,9 @@ import os
 import pathlib
 import threading
 import unicodedata
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 import pathspec
-
-if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -194,43 +191,6 @@ class IgnoreFilter:
             pattern=matched_pattern,
             source=matched_source,
         )
-
-    def filter_entries(
-        self,
-        entries: Iterable[os.DirEntry[str]],
-        base_path: pathlib.Path,
-    ) -> Generator[os.DirEntry[str]]:
-        """Filter directory entries, yielding non-ignored ones.
-
-        Args:
-            entries: Directory entries from os.scandir()
-            base_path: Base path for computing relative paths
-
-        Yields:
-            Entries that are not ignored.
-        """
-        spec = self._get_spec()
-
-        for entry in entries:
-            try:
-                rel_path = pathlib.Path(entry.path).relative_to(base_path)
-            except ValueError:
-                yield entry
-                continue
-
-            path_str = str(rel_path).replace(os.sep, "/")
-
-            # Check protected paths
-            if self._is_protected(path_str):
-                yield entry
-                continue
-
-            # Add trailing slash for directories
-            if entry.is_dir(follow_symlinks=False):
-                path_str += "/"
-
-            if not spec.match_file(path_str):
-                yield entry
 
     def invalidate(self) -> None:
         """Force reload of patterns on next access."""
