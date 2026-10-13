@@ -17,7 +17,7 @@ class StageJsonOutput(TypedDict):
     name: str
     deps: list[str]
     outs: list[str]
-    mutex: list[str]
+    resources: dict[str, int | str]
     variant: str | None
 
 
@@ -66,7 +66,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
                     name=name,
                     deps=[types.identity_key(dep.identity) for dep in info["deps"].values()],
                     outs=[types.identity_key(out.identity) for out in info["outs"]],
-                    mutex=info["mutex"],
+                    resources=info["resources"],
                     variant=info["variant"],
                 )
             )
@@ -88,6 +88,11 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
         deps = [types.identity_key(dep.identity) for dep in info["deps"].values()]
         outs = info["outs"]
         click.echo(f"  {name}")
+        resources = info["resources"]
+        if resources:
+            click.echo(
+                "    resources: " + ", ".join(f"{key}={value}" for key, value in resources.items())
+            )
 
         if show_deps or verbose:
             if deps:

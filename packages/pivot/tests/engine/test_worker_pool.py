@@ -21,7 +21,8 @@ def test_worker_pool_stop_accepting_rejects_new_submissions() -> None:
     pool.start(max_workers=1)
 
     future = pool.submit(_helper_identity, 1)
-    assert future.result(timeout=5) == 1
+    # The first result includes spawning a fresh worker process (several seconds under load).
+    assert future.result(timeout=60) == 1
 
     pool.stop_accepting()
     with pytest.raises(RuntimeError, match="accepting"):

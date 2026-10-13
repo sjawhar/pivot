@@ -43,8 +43,9 @@ def _register_metric_stage(test_pipeline: PipelineLike, name: str) -> Path:
                 tag=ArtifactTag.METRIC,
             )
         ],
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
@@ -52,6 +53,7 @@ def _register_metric_stage(test_pipeline: PipelineLike, name: str) -> Path:
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
     metric_path = project.get_project_root() / "metrics" / f"{name}.json"
     metric_path.parent.mkdir(parents=True, exist_ok=True)

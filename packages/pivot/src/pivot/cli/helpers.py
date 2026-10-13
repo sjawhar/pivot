@@ -85,6 +85,25 @@ def require_workspace_store() -> WorkspaceStore:
     return store
 
 
+def parse_resource_capacities(
+    _ctx: click.Context, _param: click.Parameter, values: tuple[str, ...]
+) -> dict[str, int]:
+    """Parse repeatable ``NAME=CAPACITY`` resource overrides for run commands."""
+    capacities = dict[str, int]()
+    for value in values:
+        name, separator, capacity_text = value.partition("=")
+        normalized_name = name.strip().casefold()
+        if not separator or not normalized_name or not capacity_text.isdecimal():
+            raise click.BadParameter("must use NAME=POSITIVE_INTEGER")
+        capacity = int(capacity_text)
+        if capacity <= 0:
+            raise click.BadParameter("capacity must be a positive integer")
+        if normalized_name in capacities:
+            raise click.BadParameter(f"resource {normalized_name!r} was supplied more than once")
+        capacities[normalized_name] = capacity
+    return capacities
+
+
 def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any
     """Handle non-standard JSON types in JSONL output."""
     if isinstance(obj, enum.Enum):

@@ -1258,8 +1258,9 @@ def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactR
         name=name,
         deps={},
         outs=outs,
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
@@ -1267,6 +1268,7 @@ def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactR
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 

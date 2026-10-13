@@ -1,49 +1,48 @@
 ---
 tags: [python, generics, type-system, outputs]
 category: design
-module: outputs
+module: type-system
 ---
 
-# DirectoryOut Generic Type Mismatch
+# Directory-Style Output Generic Type Consistency
 
 ## Problem
 
-`DirectoryOut[T]` had a type inconsistency: it holds a loader that operates on individual `T` values, but the stage actually returns `dict[str, T]`. This meant:
-- The loader field type was `Loader[T]`
-- But the stage return type annotation was `dict[str, T]`
-
-This was a "type lie" where the generic parameter meant different things in different contexts.
+A directory-style result often returns `dict[str, T]` while its serializer
+writes each individual `T`. Treating the serializer as though it handled the
+whole dictionary hides that distinction and produces misleading type
+annotations.
 
 ## Options Considered
 
-1. **Don't inherit from `Out`** - Simple but duplicates `path`, `cache` fields
-2. **Inherit as `Out[T]`** - Confusing since stage returns `dict[str, T]`, not `T`
-3. **Two-level typing** with `item_loader: Writer[T]` - Awkward with unused inherited `loader`
-4. **Override `loader` with different type** - Violates Liskov Substitution Principle
-5. **Common base class** - Extract shared fields, each subclass defines its own `loader` type
+1. Model the result as a plain `dict[str, T]` and keep its item writer separate.
+2. Inherit from a file-output type and override the writer type.
+3. Introduce a wrapper with explicit result and item types.
+
+The inheritance option makes the parent contract misleading because the parent
+writes a complete result while the child writes individual entries.
 
 ## Solution
 
-Extract a common base class without the `loader` field:
+Use explicit names for both levels of the data model:
 
 ```python
-class BaseOut(Generic[T]):
-    path: PathType
-    cache: bool = True
+@dataclasses.dataclass(frozen=True)
+class FileGroup[T]:
+    path: str
+    item_writer: Writer[T]
 
-class Out(BaseOut[T]):
-    loader: Writer[T]
 
-class DirectoryOut(BaseOut[dict[str, T]]):
-    loader: Writer[T]  # T is item type, dict[str, T] is return type
+def write_group(group: FileGroup[T], values: dict[str, T]) -> None:
+    for relative_path, value in values.items():
+        group.item_writer.save(value, group.path / relative_path)
 ```
 
-This makes the types explicit:
-- `BaseOut[dict[str, T]]` correctly says "the stage returns `dict[str, T]`"
-- `loader: Writer[T]` correctly says "individual items are serialized as `T`"
+The type of the stage result is `dict[str, T]`; the type of the writer input is
+`T`. Keeping them separate makes the serialization contract visible.
 
 ## Key Insight
 
-When a generic class has attributes that operate on a *component* of the generic type parameter (like `DirectoryOut` having a loader for items, not the whole dict), the cleaner solution is to use a base class that captures the "outer" type and let the subclass add the "inner" type attribute. This avoids type lies and Liskov violations.
-
-More generally: if you find yourself wanting a subclass attribute to have an incompatible type with the parent, that's a signal the inheritance hierarchy needs restructuring, not a targeted `# type: ignore`.
+When one attribute operates on a component of a result rather than the result
+itself, encode both types directly. Do not force an inheritance relationship
+whose generic parameter means different things at different levels.

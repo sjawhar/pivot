@@ -10,6 +10,7 @@ import pytest
 from pivot import exceptions, loaders
 from pivot.engine import graph, types
 from pivot.registry import RegistryStageInfo
+from pivot.storage import store as store_mod
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
 
 if TYPE_CHECKING:
@@ -36,8 +37,9 @@ def _create_stage(
         name=name,
         deps={f"_{i}": _artifact_ref(dep) for i, dep in enumerate(deps)},
         outs=[_artifact_ref(out) for out in outs],
+        incremental_inputs={},
         params=None,
-        mutex=list[str](),
+        resources={},
         variant=None,
         signature=None,
         fingerprint=dict[str, str](),
@@ -45,6 +47,7 @@ def _create_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 
@@ -423,6 +426,32 @@ def test_build_graph_raises_on_missing_dependency(tmp_path: Path) -> None:
 
     errors = graph.validate_dependency_sources(stages)
     assert len(errors) == 1
+
+
+def test_validate_dependency_sources_reports_missing_pipeline_input_path(
+    set_project_root: Path,
+) -> None:
+    missing_input = ArtifactIdentity("extra.csv", None)
+    stages = {
+        "demo/combine": _create_stage(
+            "demo/combine",
+            [missing_input],
+            [ArtifactIdentity("demo/combine", None)],
+        )
+    }
+    store = store_mod.WorkspaceStore(
+        project_root=set_project_root,
+        pipeline_name="demo",
+        input_bindings={"extra.csv": "missing/extra.csv"},
+    )
+
+    errors = graph.validate_dependency_sources(stages, store)
+
+    assert len(errors) == 1
+    assert str(errors[0]) == (
+        "Stage 'demo/combine' depends on input 'extra.csv' "
+        "(path missing/extra.csv), which does not exist"
+    )
 
 
 def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:

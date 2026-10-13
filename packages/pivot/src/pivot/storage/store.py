@@ -232,7 +232,7 @@ class WorkspaceStore:
 
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str:
         self._output_producers.add(ref.identity.producer)
-        if ref.tag == types.ArtifactTag.DIRECTORY:
+        if path.is_dir():
             tree_hash, _ = cache.hash_directory(path, None)
             return tree_hash
         file_hash, _ = cache.hash_file(path, None)

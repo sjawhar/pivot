@@ -31,8 +31,9 @@ def _make_stage(
                 tag=tag,
             )
         ],
+        incremental_inputs={},
         params=None,
-        mutex=list[str](),
+        resources={},
         variant=None,
         signature=None,
         fingerprint=dict[str, str](),
@@ -40,6 +41,7 @@ def _make_stage(
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 

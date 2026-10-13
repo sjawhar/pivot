@@ -27,21 +27,25 @@ class RegistryStageInfo(TypedDict):
         name: Unique stage identifier (function name or custom name).
         deps: Named input dependencies (param name -> ArtifactRef).
         outs: Output specs as artifact references.
+        incremental_inputs: Previous-output parameters (param name -> own output identity).
         params: Pydantic model instance with parameter values.
-        mutex: Mutex groups for exclusive execution.
+        resources: Scheduler resource requests declared on the stage.
         variant: Variant name for matrix stages (None for regular stages).
         signature: Function signature for parameter injection.
         fingerprint: Code fingerprint mapping (key -> hash), or None if not computed yet.
         params_arg_name: Name of the StageParams parameter in function signature (or None).
         state_dir: Per-stage state directory (None means use default determined at runtime).
+        no_fingerprint: Use file-level hashing instead of AST fingerprinting.
+        code_deps: Extra project-relative files hashed into a no_fingerprint stage's fingerprint.
     """
 
     func: Callable[..., Any]
     name: str
     deps: dict[str, types.ArtifactRef]
     outs: list[types.ArtifactRef]
+    incremental_inputs: dict[str, types.ArtifactIdentity]
     params: stage_def.StageParams | None
-    mutex: list[str]
+    resources: dict[str, int | str]
     variant: str | None
     signature: Signature | None
     fingerprint: dict[str, str] | None
@@ -49,6 +53,7 @@ class RegistryStageInfo(TypedDict):
     state_dir: pathlib.Path | None
     collection_params: dict[str, str]
     no_fingerprint: bool
+    code_deps: list[str]
 
 
 class StageRegistry:
@@ -128,37 +133,12 @@ class StageRegistry:
         self._cached_dag = None
 
     def snapshot(self) -> dict[str, RegistryStageInfo]:
-        """Create a snapshot of current registry state for backup/restore.
+        """Return a shallow copy of the registered stages.
 
-        Returns a shallow copy of the internal stages dict. Use with `restore()`
-        to implement atomic reload patterns where you want to preserve the previous
-        valid state if the reload fails.
-
-        Example:
-            backup = registry.snapshot()
-            registry.clear()
-            try:
-                reload_stages()
-            except Exception:
-                registry.restore(backup)  # Rollback on failure
+        Engine reload keeps this copy of the previous pipeline's stages to report which
+        stages the reloaded pipeline added, removed, or modified.
         """
         return dict(self._stages)
-
-    def restore(self, snapshot: dict[str, RegistryStageInfo]) -> None:
-        """Restore registry state from a previous snapshot.
-
-        Replaces all current stages with the snapshot contents. Typically used
-        to rollback after a failed reload operation.
-
-        Args:
-            snapshot: Previously captured state from `snapshot()`
-        """
-        self._stages = dict(snapshot)
-        self._cached_dag = None
-
-    def get_all_output_paths(self) -> set[str]:
-        """Get all registered output paths (for watch mode filtering)."""
-        return set[str]()
 
 
 @runtime_checkable
@@ -187,8 +167,6 @@ class PipelineLike(Protocol):
 
     def snapshot(self) -> dict[str, RegistryStageInfo]: ...
 
-    def restore(self, snapshot: dict[str, RegistryStageInfo]) -> None: ...
-
     def include(self, other: PipelineLike) -> None: ...
 
 
@@ -197,7 +175,7 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
     try:
         no_fp = info["no_fingerprint"]
         if no_fp:
-            result = _compute_file_fingerprint(info["func"])
+            result = _compute_file_fingerprint(info["func"], info["code_deps"])
         else:
             result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
         for dep_name, dep in info["deps"].items():
@@ -212,11 +190,11 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
 
 
-def _compute_file_fingerprint(func: Callable[..., Any]) -> dict[str, str]:
+def _compute_file_fingerprint(func: Callable[..., Any], code_deps: list[str]) -> dict[str, str]:
     """Compute file-hash fingerprint (no AST analysis).
 
     Returns dict with keys like ``file:path/to/module.py`` -> hash.
-    Includes the stage function's source file and any ``code_deps``.
+    Includes the stage function's source file and each of ``code_deps``.
     Uses ``inspect.unwrap`` to handle stacked decorators.
     """
     result = dict[str, str]()
@@ -228,7 +206,6 @@ def _compute_file_fingerprint(func: Callable[..., Any]) -> dict[str, str]:
     rel_path = project.to_relative_path(source_file)
     result[f"file:{rel_path}"] = file_hash
 
-    code_deps: list[str] = getattr(func, "__pivot_code_deps__", [])
     root = project.get_project_root()
     for dep_path in code_deps:
         abs_path = (root / dep_path).resolve()

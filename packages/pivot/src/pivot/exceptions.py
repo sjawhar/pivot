@@ -42,14 +42,6 @@ class SecurityValidationError(PivotError):
     """
 
 
-class OutputDuplicationError(ValidationError):
-    """Raised when two stages produce the same output."""
-
-
-class OverlappingOutputPathsError(ValidationError):
-    """Raised when output paths overlap (one is parent/child of another)."""
-
-
 class InvalidPathError(ValidationError):
     """Raised when a path is invalid (e.g., resolves outside project root)."""
 
@@ -72,19 +64,30 @@ class DependencyNotFoundError(DAGError):
     _stage: str
     _dep: str
     _available: list[str]
+    _input_path: str | None
 
     def __init__(
         self,
         stage: str,
         dep: str,
         available_outputs: list[str] | None = None,
+        input_path: str | None = None,
     ) -> None:
         self._stage = stage
         self._dep = dep
         self._available = available_outputs or []
-        super().__init__(
-            f"Stage '{stage}' depends on '{dep}' which is not produced by any stage and does not exist on disk"
-        )
+        self._input_path = input_path
+        if input_path is None:
+            message = (
+                f"Stage '{stage}' depends on '{dep}' which is not produced by any stage "
+                + "and does not exist on disk"
+            )
+        else:
+            message = (
+                f"Stage '{stage}' depends on input '{dep}' (path {input_path}), "
+                + "which does not exist"
+            )
+        super().__init__(message)
 
     @property
     def stage(self) -> str:
@@ -102,8 +105,8 @@ class DependencyNotFoundError(DAGError):
         return "Ensure the file exists or is produced by another stage"
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[str, str, list[str]]]:
-        return (self.__class__, (self._stage, self._dep, self._available))
+    def __reduce__(self) -> tuple[type, tuple[str, str, list[str], str | None]]:
+        return (self.__class__, (self._stage, self._dep, self._available, self._input_path))
 
 
 class MultipleDependencyError(DAGError):
@@ -212,7 +215,7 @@ class CacheRestoreError(CacheError):
 
 
 class UncachedIncrementalOutputError(CacheError):
-    """Raised when an IncrementalOut file exists but is not in cache."""
+    """Raised when an incremental output exists without a cache entry."""
 
 
 class ParamsError(PivotError):

@@ -18,12 +18,14 @@ packages/pivot/src/pivot/
 ├── pipeline/      # Pipeline state, lock files
 ├── remote/        # S3/remote storage
 ├── storage/       # StateDB, cache management (see storage/AGENTS.md)
+├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot tags, format inference
+├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection
-├── registry.py    # Stage registration, discovery
-├── stage_def.py   # Stage definition extraction
+├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
+├── stage_def.py   # StageParams, output writing helpers
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
-├── outputs.py     # Out, DirectoryOut, IncrementalOut
-└── types.py       # TypedDicts, enums, type aliases
+├── outputs.py     # Output spec classes used by the show/metrics/plots code
+└── types.py       # TypedDicts, enums, type aliases, ArtifactIdentity
 
 packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
 ├── client.py          # PivotRpc/PivotClient protocols + TypedDicts
@@ -35,7 +37,6 @@ packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
 ├── types.py           # TUI message types, enums
 ├── widgets/           # Textual widgets (stage list, panels, logs, debug)
 ├── screens/           # Modal screens (help, history, confirm dialogs)
-├── console.py         # Plain-text console output (non-TUI mode)
 └── testing/
     └── fake_server.py # FakeRpcServer test double
 ```
@@ -68,7 +69,7 @@ packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
 ## Core Design
 
 - **Artifact-first**: The DAG emerges from artifact dependencies, not explicit wiring
-- **Pipeline is canonical**: The registry (from `pivot.yaml`/`pipeline.py`) is the single source of truth for stage metadata — deps, outs, cache flags, params. Lock files record execution state (hashes, generations), not stage definitions. Never infer stage properties from lock files.
+- **Pipeline is canonical**: The registry (built from `pipeline.py`) is the single source of truth for stage metadata — deps, outs, tags, params. Lock files record execution state (hashes, generations), not stage definitions. Never infer stage properties from lock files.
 - Per-stage lock files, automatic code fingerprinting, warm worker pools
 - `ProcessPoolExecutor` for true parallelism (GIL would serialize threads)
 - Invalidation is content-addressed: same inputs + same code = same outputs
@@ -85,7 +86,7 @@ Fingerprint checks must be cheap — O(1) shallow/static checks only. No deep re
 - **Soundness risk** (changes could go undetected) → error
 - **Noise risk** (spurious reruns only) → warn
 
-Aggregate all fingerprinting errors before reporting. Don't fail on the first one. Error messages must name the captured variables/types and suggest using `StageParams` or `Dep`.
+Aggregate all fingerprinting errors before reporting. Don't fail on the first one. Error messages must name the captured variables/types and suggest using `StageParams`.
 
 Unsafe fingerprinting is opt-in via a single config flag. Default is strict (error).
 
@@ -110,36 +111,42 @@ Centralize decision logic. The `explain` and `run` paths must use the same skip-
 
 ```bash
 pivot repro                  # Run entire pipeline (DAG-aware)
-pivot repro my_stage         # Run my_stage AND all its dependencies
+pivot repro demo/train       # Run demo/train AND all its dependencies
 pivot repro --watch          # Watch mode - re-run on file changes
 pivot repro --dry-run        # Validate DAG without executing
 
-pivot run my_stage           # Run ONLY my_stage (no dependency resolution)
-pivot run stage1 stage2      # Run specific stages in order (no deps)
+pivot run demo/train         # Run ONLY demo/train (no dependency resolution)
+pivot run demo/a demo/b      # Run specific stages in order (no deps)
 ```
 
 **Key difference:** `repro` resolves dependencies automatically; `run` executes only the named stages.
 
-## Stage Registration
+## Defining Stages and Pipelines
 
-Two methods: `pivot.yaml` (config pointing to functions) or `pipeline.py` (direct `pipeline.register()`).
-
-**Discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py`
+`pipeline.py` defines stages with `@stage` and wires them in a `with Pipeline("name") as pipeline:` block; discovery loads it and reads the module variable `pipeline`. Stage names are `<pipeline>/<function>`.
 
 ```python
-def train(
-    params: TrainParams,
-    data: Annotated[DataFrame, Dep("input.csv", CSV())],
-) -> Annotated[DataFrame, Out("output.csv", CSV())]:
-    return data.dropna()
+class TrainParams(StageParams):
+    min_score: float = 0.5
+
+
+@stage
+def train(data: pd.DataFrame, params: TrainParams) -> pd.DataFrame:
+    return data[data["score"] >= params.min_score]
+
+
+with Pipeline("demo") as pipeline:
+    train(pipeline.input("input.csv"), params=TrainParams())
 ```
 
-- **Dependencies**: `Annotated[T, Dep(path, loader)]` on parameters (`loader` is `Reader[R]`)
-- **Outputs**: `Annotated[T, Out(path, loader)]` in TypedDict return type (`loader` is `Writer[W]`)
-- **Incremental Outputs**: `Annotated[T, IncrementalOut(path, loader)]` for bidirectional (loader is `Loader[W, R]`)
-- **Parameters**: `params: MyParams` where `MyParams` extends `StageParams`
-- Stages must be **pure, serializable, module-level functions** (lambdas/closures fail pickling)
-- Config belongs in Pydantic classes, not YAML files
+- **Inputs**: `pipeline.input(name)` reads `data/raw/<name>`; format from the extension (`compose.py` `_infer_format_from_extension`)
+- **Dependencies**: stage parameters that receive handles (or lists/tuples of handles) at the call site; no annotations on parameters
+- **Outputs**: the return type; format inferred (`DataFrame`→JSONL, `dict`/`list`→YAML, `str`→text) or set with `Annotated[T, loader]`; `TypedDict` for several outputs; `metric`/`plot` tags. Pivot chooses paths (`data/<pipeline>/<stage>.<ext>`)
+- **Parameters**: one `StageParams` subclass per stage, defined beside it; `params.yaml` overrides by stage name
+- **Variants**: Python loops, `pipeline.variant("name")`; composition: imported handles, `Pipeline.include()`
+- Stages must be **pure, module-level functions** (workers receive them by pickling); config belongs in `StageParams`, not module-level collections
+
+User-facing guide: `skills/writing-pivot-stages/SKILL.md`.
 
 ---
 

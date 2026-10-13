@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
-@compose.stage
+@compose.stage(resources={"gpu": 1})
 def stage_a(input_file: str) -> str:
     return "output a"
 
@@ -74,17 +74,12 @@ def test_list_no_stages_json(
 # =============================================================================
 
 
-def test_list_renders_registry_mutex_fixture(
+def test_list_renders_stage_resources(
     mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
 ) -> None:
-    """Render a non-empty registry mutex list.
-
-    This is a test-only rendering fixture: @stage has no mutex/resources API yet.
-    """
-    # Task 19 replaces with @stage(resources=...).
+    """Render a decorator-declared resource in text and JSON output."""
     with mock_discovery:
         stage_b(stage_a(mock_discovery.input("input.txt", t=str)))
-    mock_discovery.get_stage("test/stage_a")["mutex"] = ["gpu"]
 
     result = runner.invoke(cli.cli, ["list", "--json"])
 
@@ -93,18 +88,21 @@ def test_list_renders_registry_mutex_fixture(
     assert "stages" in data
     assert len(data["stages"]) == 2
 
-    # Check stage_a has all required fields
     stage_a_list = [s for s in data["stages"] if s["name"] == "test/stage_a"]
     assert len(stage_a_list) == 1, "Expected exactly one stage_a in output"
     stage_a_json = stage_a_list[0]
     assert stage_a_json["deps"] == ["input.txt"]
     assert stage_a_json["outs"] == ["test/stage_a"]
-    assert stage_a_json["mutex"] == ["gpu"]
+    assert stage_a_json["resources"] == {"gpu": 1}
     assert "variant" in stage_a_json  # Present even if None
 
     stage_b_json = next(s for s in data["stages"] if s["name"] == "test/stage_b")
     assert stage_b_json["deps"] == ["test/stage_a"], "stage_b depends on stage_a's output"
-    assert stage_b_json["mutex"] == []
+    assert stage_b_json["resources"] == {}
+
+    text_result = runner.invoke(cli.cli, ["list"])
+    assert text_result.exit_code == 0, text_result.output
+    assert "resources: gpu=1" in text_result.output
 
 
 def test_list_deps_shows_source_stage(

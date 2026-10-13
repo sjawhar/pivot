@@ -168,7 +168,7 @@ class Engine:
     # Execution orchestration state
     _futures: dict[concurrent.futures.Future[StageResult], str]
     _worker_pool: worker_pool_mod.WorkerPool | None
-    _warned_mutex_groups: set[str]
+    _effective_max_workers: int
 
     # Run state machine (Task 10/11)
     _run_state: _RunState
@@ -182,6 +182,7 @@ class Engine:
     _stored_on_error: OnError
     _stored_parallel: bool
     _stored_max_workers: int | None
+    _stored_resource_capacity: dict[str, int]
 
     # Track whether run() has completed to prevent re-use
     _run_completed: bool
@@ -216,11 +217,9 @@ class Engine:
         self._stage_indices = dict[str, tuple[int, int]]()
         self._deferred_events = collections.defaultdict(list)
 
-        # Execution orchestration state
         self._futures = dict[concurrent.futures.Future[StageResult], str]()
         self._worker_pool = None
-        self._warned_mutex_groups = set[str]()
-        self._effective_max_workers: int = 1
+        self._effective_max_workers = 1
 
         # Run state machine (Task 10/11)
         self._run_state = _RunState.IDLE
@@ -232,11 +231,11 @@ class Engine:
         # Current run_id for stamping events (Task 12)
         self._current_run_id: str | None = None
 
-        # Stored orchestration params (for watch mode re-runs)
         self._stored_no_commit = False
         self._stored_on_error = OnError.FAIL
         self._stored_parallel = True
         self._stored_max_workers = None
+        self._stored_resource_capacity = dict[str, int]()
         self._current_overrides: parameters.ParamsOverrides | None = None
         self._merkle_ids: dict[str, str] = {}
 
@@ -626,11 +625,11 @@ class Engine:
         If already running, coalesces into a restart: cancels the current run
         and queues the new event for replay once the current run completes.
         """
-        # Store orchestration params for watch mode re-runs
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
         self._stored_parallel = event["parallel"]
         self._stored_max_workers = event["max_workers"]
+        self._stored_resource_capacity = dict(event["resource_capacity"])
 
         if self._run_state == _RunState.RUNNING:
             # Coalesce: only the latest restart request survives
@@ -672,6 +671,7 @@ class Engine:
                 single_stage=event["single_stage"],
                 parallel=event["parallel"],
                 max_workers=event["max_workers"],
+                resource_capacity=event["resource_capacity"],
                 no_commit=event["no_commit"],
                 on_error=event["on_error"],
                 cache_dir=event["cache_dir"],
@@ -832,6 +832,7 @@ class Engine:
         single_stage: bool,
         parallel: bool,
         max_workers: int | None,
+        resource_capacity: dict[str, int],
         no_commit: bool,
         on_error: OnError,
         cache_dir: pathlib.Path | None,
@@ -907,7 +908,7 @@ class Engine:
         if not execution_order:
             return {}
 
-        # Check for uncached IncrementalOut files that would be lost
+        # Check for uncached incremental output files that would be lost.
         if not allow_uncached_incremental:
             uncached = executor_core.check_uncached_incremental_outputs(
                 execution_order, self._get_all_stages()
@@ -915,9 +916,11 @@ class Engine:
             if uncached:
                 files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
                 raise pivot_exceptions.UncachedIncrementalOutputError(
-                    f"The following IncrementalOut files exist but are not in cache:\n{files_list}\n\n"
+                    "The following incremental output files exist but are not in cache:\n"
+                    + f"{files_list}\n\n"
                     + "Running the pipeline will DELETE these files and they cannot be restored.\n"
-                    + "To proceed anyway, use allow_uncached_incremental=True or back up these files first."
+                    + "To proceed anyway, use --allow-uncached-incremental or back up these "
+                    + "files first."
                 )
 
         # Compute max workers
@@ -925,6 +928,12 @@ class Engine:
             1
             if not parallel
             else executor_core.compute_max_workers(len(execution_order), max_workers)
+        )
+
+        stage_resources, capacities = self._resolve_stage_resources(
+            execution_order,
+            effective_max_workers,
+            resource_capacity,
         )
 
         # Load config
@@ -942,9 +951,13 @@ class Engine:
         # Ensure state directory exists
         default_state_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize orchestration state
-        await self._initialize_orchestration(execution_order, effective_max_workers)
-        self._warn_single_stage_mutex_groups()
+        # Initialize orchestration state after every stage request has been validated.
+        await self._initialize_orchestration(
+            execution_order,
+            effective_max_workers,
+            stage_resources=stage_resources,
+            resource_capacity=capacities,
+        )
 
         # Worker pool is created lazily on first worker dispatch (see _ensure_worker_pool).
         # If all stages skip in the coordinator, the pool is never started.
@@ -1331,22 +1344,68 @@ class Engine:
 
         await anyio.to_thread.run_sync(_blocking_drain, abandon_on_cancel=True)
 
+    def _resolve_stage_resources(
+        self,
+        execution_order: list[str],
+        max_workers: int,
+        cli_resource_capacity: dict[str, int],
+    ) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+        """Resolve configured and CLI resource capacities for a scheduler run."""
+        capacities = {
+            name.casefold(): capacity for name, capacity in config.get_resource_capacities().items()
+        }
+        capacities.update(
+            {name.casefold(): capacity for name, capacity in cli_resource_capacity.items()}
+        )
+        capacities["cpu"] = max_workers
+
+        requests = dict[str, dict[str, int]]()
+        for stage_name in execution_order:
+            request = {"cpu": 1}
+            for resource, amount in self._get_stage(stage_name)["resources"].items():
+                normalized_resource = resource.casefold()
+                capacity = capacities.setdefault(normalized_resource, 1)
+                if amount == "all":
+                    if normalized_resource != "cpu":
+                        raise exceptions.ValidationError(
+                            f"Stage {stage_name!r} requests 'all' for non-CPU resource {resource!r}"
+                        )
+                    request[normalized_resource] = capacity
+                elif isinstance(amount, int) and not isinstance(amount, bool) and amount > 0:
+                    request[normalized_resource] = amount
+                else:
+                    raise exceptions.ValidationError(
+                        f"Stage {stage_name!r} has an invalid request {amount!r} for resource {resource!r}"
+                    )
+            for resource, amount in request.items():
+                capacity = capacities[resource]
+                if amount > capacity:
+                    msg = f"Stage {stage_name!r} requests {amount} units of resource {resource!r}, but its capacity is {capacity}"
+                    raise exceptions.ValidationError(msg)
+            requests[stage_name] = request
+        return requests, capacities
+
     async def _initialize_orchestration(
         self,
         execution_order: list[str],
         max_workers: int,
+        *,
+        stage_resources: dict[str, dict[str, int]] | None = None,
+        resource_capacity: dict[str, int] | None = None,
     ) -> None:
         """Initialize orchestration state for a new execution."""
         self._futures.clear()
         self._deferred_events.clear()
 
-        # Build stage_mutex map from pipeline registry
-        stage_mutex = {name: self._get_stage(name)["mutex"] for name in execution_order}
-
+        if stage_resources is None:
+            stage_resources = {name: {"cpu": 1} for name in execution_order}
+        if resource_capacity is None:
+            resource_capacity = {"cpu": max_workers}
         self._scheduler.initialize(
             execution_order,
             self._graph,
-            stage_mutex=stage_mutex,
+            stage_resources=stage_resources,
+            resource_capacity=resource_capacity,
         )
         self._effective_max_workers = max_workers
 
@@ -1361,23 +1420,9 @@ class Engine:
                 )
             )
 
-    def _warn_single_stage_mutex_groups(self) -> None:
-        """Warn if any mutex group contains only one stage (likely a typo)."""
-        groups: collections.defaultdict[str, list[str]] = collections.defaultdict(list)
-        for stage_name, mutexes in self._scheduler.stage_mutex.items():
-            for mutex in mutexes:
-                groups[mutex].append(stage_name)
-
-        for group, members in groups.items():
-            if group == executor_core.EXCLUSIVE_MUTEX:
-                continue
-            if len(members) == 1 and group not in self._warned_mutex_groups:
-                self._warned_mutex_groups.add(group)
-                _logger.warning(f"Mutex group '{group}' only contains stage '{members[0]}'")
-
     def _can_start_stage(self, stage_name: str) -> bool:
-        """Check if stage is eligible to start (ready and mutex available)."""
-        return self._scheduler.can_start(stage_name, running_count=len(self._futures))
+        """Check whether a ready stage has all requested resources available."""
+        return self._scheduler.can_start(stage_name)
 
     def _ensure_worker_pool(self) -> worker_pool_mod.WorkerPool:
         """Lazily create and start the worker pool on first worker dispatch."""
@@ -1430,8 +1475,8 @@ class Engine:
                 if not self._can_start_stage(stage_name):
                     continue
 
-                # Acquire mutex locks (must happen before next can_start check)
-                self._scheduler.acquire_mutexes(stage_name)
+                # Reserve every resource before checking the next ready stage.
+                self._scheduler.acquire_resources(stage_name)
 
                 # Transition to PREPARING
                 await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
@@ -1952,13 +1997,11 @@ class Engine:
             )
         )
 
-        # Release mutex locks — guard against underflow to prevent exception
-        # propagating into _orchestrate_execution's try/except, which would call
-        # _handle_stage_completion again and corrupt scheduler state.
+        # Release scheduler-held resources before downstream stages are considered.
         try:
-            self._scheduler.release_mutexes(stage_name)
+            self._scheduler.release_resources(stage_name)
         except ValueError:
-            _logger.error("Mutex underflow releasing locks for stage %s", stage_name)
+            _logger.error("Resource underflow releasing permits for stage %s", stage_name)
 
         failed = result["status"] == StageStatus.FAILED
         newly_ready, newly_blocked = self._scheduler.on_stage_completed(stage_name, failed)
@@ -2262,6 +2305,7 @@ class Engine:
             single_stage=False,
             parallel=self._stored_parallel,
             max_workers=self._stored_max_workers,
+            resource_capacity=dict(self._stored_resource_capacity),
             no_commit=self._stored_no_commit,
             on_error=self._stored_on_error,
             cache_dir=None,

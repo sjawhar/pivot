@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import stat
 import textwrap
 import typing
 from typing import TYPE_CHECKING, Any
@@ -29,19 +30,19 @@ async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> No
     Raises:
         TimeoutError: If socket is not created within timeout.
     """
-    import stat
-
     deadline = anyio.current_time() + timeout
     while anyio.current_time() < deadline:
         if socket_path.exists():
             try:
                 mode = socket_path.stat().st_mode
                 if stat.S_ISSOCK(mode):
+                    connection = await anyio.connect_unix(str(socket_path))
+                    await connection.aclose()
                     return
-            except OSError:
-                pass  # Ignore if socket stat fails (race condition, permissions)
+            except (OSError, anyio.BrokenResourceError, anyio.ClosedResourceError):
+                pass
         await anyio.sleep(0.05)
-    msg = f"Socket {socket_path} not created within {timeout}s"
+    msg = f"Socket {socket_path} not created and connectable within {timeout}s"
     raise TimeoutError(msg)
 
 
@@ -72,7 +73,6 @@ def register_test_stage(
     func: Callable[..., Any],
     name: str | None = None,
     params: type[stage_def.StageParams] | stage_def.StageParams | None = None,
-    mutex: list[str] | None = None,
     variant: str | None = None,
     dep_path_overrides: Mapping[str, outputs.PathType] | None = None,
     out_path_overrides: Mapping[str, outputs.PathType] | None = None,
@@ -85,7 +85,6 @@ def register_test_stage(
         func: The stage function.
         name: Stage name (defaults to function name).
         params: Stage parameters class or instance.
-        mutex: Mutex groups.
         variant: Variant name.
         dep_path_overrides: Override paths for dependencies.
         out_path_overrides: Override paths for outputs.
@@ -142,7 +141,6 @@ def register_test_stage(
                     param_name, t=param_type, path=override_path
                 )
 
-        _ = mutex
         _ = variant
         _ = out_path_overrides
         stage_func(**kwargs)

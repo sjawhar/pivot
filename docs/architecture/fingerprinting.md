@@ -142,20 +142,25 @@ result = eval("process(data)")     # String execution
 
 ### Module-Level Values
 
-Pivot tracks only module-level `bool`, `int`, `float`, `str`, `bytes`, and `None` values. Editing
-one of those values changes the stage fingerprint. Reading any other module-level value—including
-a tuple, frozenset, list, dict, set, enum member, frozen dataclass, frozen Pydantic model, or
-class instance—raises `StageDefinitionError`, because stages must be pure functions.
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; its current value is recorded with `repr()`, so editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance), directly or as `module.NAME`, is a `StageDefinitionError` that names the variable and points to `StageParams`:
 
-Put configuration in `StageParams`:
+```python
+THRESHOLD = 0.5            # allowed: tracked by value
+COLUMNS = ("a", "b")       # error when a stage reads it
+CONFIG = load_config()     # error when a stage reads it (a dict)
+```
+
+Configuration belongs in the stage's `StageParams`:
 
 ```python
 class ProcessParams(StageParams):
     threshold: float = 0.5
+    columns: list[str] = ["a", "b"]
 
 
-def process(params: ProcessParams):
-    return params.threshold
+@stage
+def process(data: pd.DataFrame, params: ProcessParams) -> pd.DataFrame:
+    return data.loc[data["value"] > params.threshold, params.columns]
 ```
 
 For an explicitly unsafe migration path, `core.unsafe_fingerprinting=true` or
@@ -224,17 +229,16 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 Use explain mode to see what changed:
 
 ```bash
-$ pivot status --explain train
+$ pivot status --explain
 
-Stage: train
+Stage: demo/train
   Status: WILL RUN
-  Reason: Code dependency changed
+  Reason: Code changed
 
-  Code changes:
+  Code Changes:
     func:helper_a
       Old: 5995c853
       New: a1b2c3d4
-      File: src/utils.py:15
 ```
 
 ## Manual Invalidation
@@ -243,7 +247,7 @@ If automatic detection fails, manually invalidate:
 
 ```bash
 # Force re-run of specific stage
-pivot repro train --force
+pivot repro demo/train --force
 ```
 
 ## Further Reading

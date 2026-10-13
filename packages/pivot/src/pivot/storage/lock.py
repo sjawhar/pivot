@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 _VALID_STAGE_NAME = re.compile(
     r"[a-zA-Z0-9_@./-]+"
 )  # Allow / for pipeline-prefixed names, . for DVC matrix keys
-_PATH_TRAVERSAL = re.compile(r"(^|/)\.\.(/|$)")  # Reject ../ path traversal
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 
@@ -59,10 +58,14 @@ def get_stages_dir(state_dir: Path) -> Path:
 def stage_name_error(name: str) -> str | None:
     """Return why ``name`` cannot name a lock file, or None if it can.
 
-    This is the single rule for stage names and the variant segments inside them.
+    This is the single rule for stage, pipeline and variant names. A name is a relative path
+    of non-empty segments under ``.pivot/stages``: no leading or doubled ``/``, and no ``.``
+    or ``..`` segment, so the lock file can never land outside that directory.
     """
-    if not name or not _VALID_STAGE_NAME.fullmatch(name) or _PATH_TRAVERSAL.search(name):
-        return "use only letters, digits and the characters _ @ . / - (no '..' segments)"
+    if not name or not _VALID_STAGE_NAME.fullmatch(name):
+        return "use only letters, digits and the characters _ @ . / -"
+    if any(segment in {"", ".", ".."} for segment in name.split("/")):
+        return "'/'-separated parts must be non-empty and not '.' or '..'"
     if len(name) > _MAX_STAGE_NAME_LEN:
         return f"too long ({len(name)} > {_MAX_STAGE_NAME_LEN} characters)"
     return None

@@ -5,14 +5,15 @@ from typing import TYPE_CHECKING
 
 __version__ = "0.2.0a1"
 
-# Public API - only exports that users need when writing pipelines
-# Internal modules like BaseOut and show.* are accessible via their full paths
+# Public API - only exports that users need when writing pipelines.
+# Internal modules are accessible via their full paths.
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders
     from pivot import merkle as merkle
     from pivot import stage_def as stage_def
     from pivot.compose import Pipeline as Pipeline
+    from pivot.compose import incremental as incremental
     from pivot.compose import metric as metric
     from pivot.compose import plot as plot
     from pivot.compose import stage as stage
@@ -28,6 +29,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "Pipeline": ("pivot.compose", "Pipeline"),
     "stage": ("pivot.compose", "stage"),
     "metric": ("pivot.compose", "metric"),
+    "incremental": ("pivot.compose", "incremental"),
     "plot": ("pivot.compose", "plot"),
     "StageParams": ("pivot.stage_def", "StageParams"),
 }

@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 from conftest import isolated_pivot_dir
 from pivot import cli, compose
-from pivot.cli import console
 
 if TYPE_CHECKING:
     from click.testing import CliRunner
@@ -353,9 +352,6 @@ def test_cli_run_prints_skipped_stages(runner: CliRunner, tmp_path: pathlib.Path
         result1 = runner.invoke(cli.cli, ["run", "test/my_stage"])
         assert result1.exit_code == 0
         assert "ran" in result1.output.lower()
-
-        # Reset console singleton (CliRunner closes streams)
-        console._console = None
 
         # Second run via CLI - should skip
         result2 = runner.invoke(cli.cli, ["run", "test/my_stage"])

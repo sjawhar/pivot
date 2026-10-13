@@ -27,7 +27,7 @@ The `verify` command checks that all stages are cached (code, params, and deps m
 pivot verify
 
 # Verify specific stages
-pivot verify train evaluate
+pivot verify demo/train demo/evaluate
 
 # Allow outputs to exist only on remote (not locally)
 pivot verify --allow-missing
@@ -66,16 +66,16 @@ The `--json` flag produces structured output for programmatic consumption:
   "passed": false,
   "stages": [
     {
-      "name": "preprocess",
+      "name": "demo/preprocess",
       "status": "passed",
       "reason": "",
       "missing_files": []
     },
     {
-      "name": "train",
+      "name": "demo/train",
       "status": "failed",
-      "reason": "Missing files: model.pkl",
-      "missing_files": ["model.pkl"]
+      "reason": "Missing files: data/demo/train.jsonl",
+      "missing_files": ["data/demo/train.jsonl"]
     }
   ]
 }
@@ -107,7 +107,7 @@ For scripts that only need an exit code:
 
 ```bash
 # Exit 0 if clean, exit 1 if stale stages or modified tracked files
-pivot status --quiet
+pivot --quiet status
 ```
 
 ## GitHub Actions Example
@@ -148,7 +148,7 @@ jobs:
         run: pivot verify --allow-missing
 
       - name: Check tracked files
-        run: pivot status --quiet
+        run: pivot --quiet status
 ```
 
 ### Post-Merge Cache Push

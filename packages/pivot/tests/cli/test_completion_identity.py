@@ -42,8 +42,9 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         name=name,
         deps={},
         outs=outs,
+        incremental_inputs={},
         params=None,
-        mutex=[],
+        resources={},
         variant=None,
         signature=inspect.signature(_stage_func),
         fingerprint={"_code": "fake_hash"},
@@ -51,6 +52,7 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         state_dir=None,
         collection_params={},
         no_fingerprint=False,
+        code_deps=[],
     )
 
 

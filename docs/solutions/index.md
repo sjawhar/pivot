@@ -51,7 +51,7 @@ Documented learnings from bugs, design decisions, and implementation patterns. C
 | [Atomic Writes: Track FD Closure](2026-02-01-atomic-writes-track-fd-closure.md) | 2026-02-01 | File descriptor leak with mkstemp() atomic writes |
 | [LMDB: Extend StateDB with Prefixes](2026-02-01-lmdb-extend-with-prefixes.md) | 2026-02-01 | Consolidate state into LMDB with key prefixes |
 | [StateDB Path Strategies](2026-02-01-statedb-path-strategies.md) | 2026-02-01 | `resolve()` for hashes, `normpath()` for generations |
-| [IncrementalOut Uses COPY Mode](2026-02-01-incremental-out-uses-copy-mode.md) | 2026-02-01 | COPY mode prevents cache corruption for incremental outputs |
+| [Incremental outputs restore with COPY mode](2026-02-01-incremental-out-uses-copy-mode.md) | 2026-02-01 | COPY mode prevents cache corruption for incremental outputs |
 
 ## Architecture & Design
 

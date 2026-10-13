@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, cast
 import anyio
 import pytest
 
+from helpers import wait_for_socket as _wait_for_socket
 from pivot.types import (
     StageStatus,
     TuiLogMessage,
@@ -36,13 +37,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pivot_tui.client import PivotRpc
-
-
-async def _wait_for_socket(socket_path: Path, timeout: float = 1.0) -> None:
-    with anyio.move_on_after(timeout):
-        while not socket_path.exists():
-            await anyio.sleep(0.01)
-    assert socket_path.exists(), "Socket should exist"
 
 
 @pytest.mark.anyio

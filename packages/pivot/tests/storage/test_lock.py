@@ -176,6 +176,13 @@ def test_lock_directory_created(tmp_path: Path) -> None:
         pytest.param("stage\nwith\nnewlines", id="newlines"),
         pytest.param("stage\n", id="trailing_newline"),
         pytest.param("../../traversal", id="double_traversal"),
+        pytest.param("/f", id="leading_slash"),
+        pytest.param("/etc/f", id="absolute"),
+        pytest.param("a//f", id="empty_segment"),
+        pytest.param("a/", id="trailing_slash"),
+        pytest.param("./f", id="dot_segment"),
+        pytest.param("a/./f", id="inner_dot_segment"),
+        pytest.param("   ", id="spaces_only"),
     ],
 )
 def test_invalid_stage_name_rejected(tmp_path: Path, invalid_name: str) -> None:

@@ -11,14 +11,15 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import TYPE_CHECKING
 
 import click.testing
 import pytest
+from moto import server as moto_server
 
 from pivot import project
-from pivot.cli import console
 from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
@@ -39,6 +40,7 @@ else:
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
+    from types_aiobotocore_s3 import S3Client
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import OutputEvent
@@ -193,13 +195,11 @@ def _default_project_root(tmp_path_factory: pytest.TempPathFactory) -> pathlib.P
 
 
 @pytest.fixture(autouse=True)
-def reset_pivot_state(
-    mocker: MockerFixture, _default_project_root: pathlib.Path
-) -> Generator[None]:
+def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
     """Reset global pivot state between tests.
 
-    CliRunner can leave console singleton pointing to closed streams,
-    project root cache pointing to old directories, and merged config cached.
+    CliRunner can leave the project root cache pointing to old directories and merged
+    config cached.
 
     Sets project root to a default directory with .pivot to prevent
     ProjectNotInitializedError. Tests that need a specific project root
@@ -208,7 +208,6 @@ def reset_pivot_state(
     Tests using isolated_filesystem() that create their own .pivot should
     reset the cache: project._project_root_cache = None
     """
-    mocker.patch.object(console, "_console", None)
     # Direct assignment (not mocker.patch) so tests can override by setting to None
     project._project_root_cache = _default_project_root
     config_io.clear_config_cache()
@@ -530,3 +529,66 @@ def minimal_pipeline(
     (tmp_path / ".git").mkdir(exist_ok=True)
 
     return test_pipeline
+
+
+# =============================================================================
+# tests.helpers default pipeline
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def bind_test_pipeline_helper(request: pytest.FixtureRequest) -> Generator[None]:
+    """Point tests.helpers' default pipeline at the test_pipeline fixture.
+
+    Active only for tests that request test_pipeline (directly or through
+    mock_discovery, minimal_pipeline, test_engine, ...), so register_test_stage()
+    registers into that pipeline without an explicit pipeline argument.
+    """
+    if "test_pipeline" not in request.fixturenames:
+        yield
+        return
+    from tests import helpers
+
+    helpers.set_test_pipeline(request.getfixturevalue("test_pipeline"))
+    yield
+    helpers.set_test_pipeline(None)
+
+
+# =============================================================================
+# S3 (moto)
+# =============================================================================
+
+
+@pytest.fixture(scope="session")
+def moto_services() -> Generator[dict[str, str]]:
+    """Serve moto in-process, replacing pytest-aioboto3's moto_services.
+
+    The plugin's fixture runs ``moto_server`` as a subprocess with stdout/stderr
+    piped and never read; after ~70 requests in one pytest process the pipe
+    buffer fills with request logs, moto_server blocks writing, and every
+    later S3 call hangs. ThreadedMotoServer has no pipe to fill.
+    """
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    server = moto_server.ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    host, port = server.get_host_and_port()
+    yield {"s3": f"http://{host}:{port}"}
+    server.stop()
+
+
+@pytest.fixture
+async def moto_s3_bucket(
+    moto_patch_session: object, aioboto3_s3_client: S3Client
+) -> AsyncGenerator[str]:
+    """Create a test bucket in moto with unique name for xdist support.
+
+    Uses pytest-aioboto3's moto_patch_session to mock S3 and aioboto3_s3_client
+    to create the bucket. Bucket name includes a unique suffix to prevent
+    conflicts when running tests in parallel with pytest-xdist.
+
+    Yields:
+        str: The bucket name (e.g., "test-bucket-a1b2c3d4").
+    """
+    bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
+    await aioboto3_s3_client.create_bucket(Bucket=bucket_name)
+    yield bucket_name

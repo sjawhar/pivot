@@ -37,8 +37,9 @@ def _make_stage_info(
         "name": name,
         "deps": {},
         "outs": outs,
+        "incremental_inputs": {},
         "params": None,
-        "mutex": [],
+        "resources": {},
         "variant": None,
         "signature": None,
         "fingerprint": None,
@@ -46,6 +47,7 @@ def _make_stage_info(
         "state_dir": state_dir,
         "collection_params": {},
         "no_fingerprint": False,
+        "code_deps": [],
     }
     return info
 

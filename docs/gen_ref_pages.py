@@ -6,21 +6,15 @@ import mkdocs_gen_files
 
 nav = mkdocs_gen_files.Nav()
 
-# Public API modules to document (ordered for navigation)
-PUBLIC_MODULES = [
-    ("pivot", "Package Exports"),
-    ("pivot.registry", "Stage Registration"),
-    ("pivot.outputs", "Output Types"),
-    ("pivot.compose", "Pipeline Composition"),
-    ("pivot.executor", "Execution"),
-    ("pivot.parameters", "Parameters"),
-    ("pivot.explain", "Explain Mode"),
-    ("pivot.types", "Type Definitions"),
-    ("pivot.storage", "Storage & Cache"),
-    ("pivot.dvc_compat", "DVC Compatibility"),
+# Public API modules to document (ordered for navigation): (module, title, members or None for all)
+PUBLIC_MODULES: list[tuple[str, str, list[str] | None]] = [
+    ("pivot.compose", "Pipelines and Stages", ["Pipeline", "stage", "ArtifactHandle"]),
+    ("pivot.stage_def", "Stage Parameters", ["StageParams"]),
+    ("pivot.loaders", "Loaders", None),
+    ("pivot.decorators", "Decorators", ["no_fingerprint"]),
 ]
 
-for module_path, display_name in PUBLIC_MODULES:
+for module_path, display_name, members in PUBLIC_MODULES:
     parts = module_path.split(".")
     doc_path = "/".join(parts) + ".md"
     full_doc_path = "reference/" + doc_path
@@ -28,6 +22,9 @@ for module_path, display_name in PUBLIC_MODULES:
     with mkdocs_gen_files.open(full_doc_path, "w") as fd:
         fd.write(f"# {display_name}\n\n")
         fd.write(f"::: {module_path}\n")
+        if members is not None:
+            fd.write("    options:\n      members:\n")
+            fd.writelines(f"        - {member}\n" for member in members)
 
     nav[tuple(parts)] = doc_path
 

@@ -48,6 +48,7 @@ def _configure_oneshot_source(
     stages: list[str],
     *,
     force: bool,
+    resource_capacity: dict[str, int],
     no_commit: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
@@ -60,6 +61,7 @@ def _configure_oneshot_source(
             force=force,
             reason="cli",
             single_stage=True,  # Always single-stage for run command
+            resource_capacity=resource_capacity,
             no_commit=no_commit,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
@@ -74,6 +76,7 @@ def _run_with_tui(
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
     on_error: OnError = OnError.FAIL,
+    resource_capacity: dict[str, int] | None = None,
     allow_uncached_incremental: bool = False,
     checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
@@ -142,6 +145,7 @@ def _run_with_tui(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity or {},
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -170,6 +174,7 @@ def _run_json_mode(
     force: bool,
     no_commit: bool,
     on_error: OnError,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> dict[str, ExecutionSummary]:
@@ -198,6 +203,7 @@ def _run_json_mode(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -242,6 +248,7 @@ def _run_plain_mode(
     force: bool,
     no_commit: bool,
     on_error: OnError,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
     quiet: bool,
@@ -273,6 +280,7 @@ def _run_plain_mode(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -338,6 +346,14 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
     help="Write TUI messages to JSONL file for monitoring",
 )
 @click.option(
+    "--resources",
+    "resource_capacity",
+    multiple=True,
+    callback=cli_helpers.parse_resource_capacities,
+    metavar="NAME=CAPACITY",
+    help="Set a scheduler resource capacity. May be repeated.",
+)
+@click.option(
     "--no-commit",
     is_flag=True,
     help="Skip writing lock files. Run 'pivot commit' to finalize.",
@@ -356,7 +372,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
 @click.option(
     "--allow-uncached-incremental",
     is_flag=True,
-    help="Allow running stages with IncrementalOut files that exist but aren't in cache.",
+    help="Allow running stages with incremental output files that exist but aren't in cache.",
 )
 @click.option(
     "--checkout-missing",
@@ -375,6 +391,7 @@ def run(
     no_commit: bool,
     fail_fast: bool,
     keep_going: bool,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> None:
@@ -407,6 +424,7 @@ def run(
             tui_log=tui_log,
             no_commit=no_commit,
             on_error=on_error,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
@@ -419,6 +437,7 @@ def run(
             force=force,
             no_commit=no_commit,
             on_error=on_error,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
@@ -428,6 +447,7 @@ def run(
             force=force,
             no_commit=no_commit,
             on_error=on_error,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
             quiet=quiet,
