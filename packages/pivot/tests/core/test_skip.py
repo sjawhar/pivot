@@ -418,6 +418,7 @@ def test_explain_reports_added_and_removed_params() -> None:
         explain=True,
     )
     assert result["changed"] is True
+    assert "param_changes" in result, "explain=True must report param changes"
     changes = {c["key"]: c["change_type"] for c in result["param_changes"]}
     assert changes == {"new_only": "added", "old_only": "removed"}
 
