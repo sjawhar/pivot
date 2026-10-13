@@ -11,6 +11,7 @@ from pivot import config, exceptions, metrics, project, registry, types
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.storage import cache, lock, track
+from pivot.storage import store as store_mod
 from pivot.types import DirHash, FileHash, HashInfo, RemoteStatus, TransferSummary, is_dir_hash
 
 if TYPE_CHECKING:
@@ -109,6 +110,22 @@ def get_stage_dep_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set
     return hashes
 
 
+def _stage_output_identities_by_path(
+    proj_root: pathlib.Path, all_stages: dict[str, RegistryStageInfo]
+) -> dict[str, types.ArtifactIdentity]:
+    """Map each registered stage output's workspace path (project-relative) to its identity."""
+    # Display paths depend only on the qualified stage name, never on the pipeline name.
+    workspace = store_mod.WorkspaceStore(
+        project_root=proj_root, pipeline_name="", input_bindings={}
+    )
+    resolved_root = proj_root.resolve()
+    return {
+        str(workspace.resolve_display_path(out).relative_to(resolved_root)): out.identity
+        for stage_info in all_stages.values()
+        for out in stage_info["outs"]
+    }
+
+
 def _get_file_hash_from_stages(
     target_identity_key: str,
     state_dir: pathlib.Path,
@@ -190,6 +207,7 @@ def get_target_hashes(
     _t = metrics.start()
     proj_root = project.get_project_root()
     hashes = set[str]()
+    output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
 
     for target in targets:
@@ -244,6 +262,12 @@ def get_target_hashes(
 
         abs_path = str(project.normalize_path(target))
         rel_path = project.to_relative_path(abs_path, proj_root)
+
+        # A workspace path of a stage output stands for that output's identity.
+        if all_stages is not None:
+            if output_identities is None:
+                output_identities = _stage_output_identities_by_path(proj_root, all_stages)
+            target_identity = output_identities.get(rel_path, target_identity)
 
         out_hash = _get_file_hash_from_stages(
             types.identity_key(target_identity), state_dir, all_stages
