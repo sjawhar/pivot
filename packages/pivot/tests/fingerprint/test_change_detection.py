@@ -115,13 +115,13 @@ def test_helper_via_direct_import_change_causes_miss(module_dir: pathlib.Path) -
 
     mod = _import_fresh("test_change_stage_direct")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["func:helper"]
+    hash1 = fp1["func:test_change_helpers_direct.helper"]
 
     helpers_py.write_text("def helper(x):\n    return x * 3\n")
     _import_fresh("test_change_helpers_direct")
     mod = _import_fresh("test_change_stage_direct")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["func:helper"]
+    hash2 = fp2["func:test_change_helpers_direct.helper"]
 
     assert hash1 != hash2, "Direct import helper change must cause cache miss"
 
@@ -138,13 +138,13 @@ def test_helper_via_module_attr_change_causes_miss(module_dir: pathlib.Path) -> 
 
     mod = _import_fresh("test_change_stage_mod")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["mod:helpers.helper"]
+    hash1 = fp1["mod:test_change_helpers_mod.helper"]
 
     helpers_py.write_text("def helper(x):\n    return x * 3\n")
     _import_fresh("test_change_helpers_mod")
     mod = _import_fresh("test_change_stage_mod")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["mod:helpers.helper"]
+    hash2 = fp2["mod:test_change_helpers_mod.helper"]
 
     assert hash1 != hash2, "Module attr helper change must cause cache miss"
 
@@ -166,14 +166,14 @@ def test_transitive_dependency_change_causes_miss(module_dir: pathlib.Path) -> N
 
     mod = _import_fresh("test_change_stage_trans")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["mod:leaf_mod.leaf"]
+    hash1 = fp1["mod:test_change_leaf.leaf"]
 
     leaf_py.write_text("def leaf(x):\n    return x + 100\n")
     for m in ["test_change_leaf", "test_change_middle", "test_change_stage_trans"]:
         _import_fresh(m)
     mod = _import_fresh("test_change_stage_trans")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["mod:leaf_mod.leaf"]
+    hash2 = fp2["mod:test_change_leaf.leaf"]
 
     assert hash1 != hash2, "Transitive dependency change must cause cache miss"
 
@@ -191,8 +191,9 @@ def test_module_constant_captured_via_module_attr(module_dir: pathlib.Path) -> N
     mod = _import_fresh("test_change_stage_const")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "mod:config.THRESHOLD" in fp, "Module constant should be captured"
-    assert fp["mod:config.THRESHOLD"] == "0.5", "Constant value should be repr"
+    key = "mod:test_change_config.THRESHOLD"
+    assert key in fp, "Module constant should be captured"
+    assert fp[key] == "0.5", "Constant value should be repr"
 
 
 def test_global_constant_change_causes_miss(module_dir: pathlib.Path) -> None:
@@ -202,12 +203,12 @@ def test_global_constant_change_causes_miss(module_dir: pathlib.Path) -> None:
 
     mod = _import_fresh("test_change_global")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    val1 = fp1["const:MULTIPLIER"]
+    val1 = fp1["const:test_change_global.MULTIPLIER"]
 
     mod_py.write_text("MULTIPLIER = 10\n\ndef stage(x):\n    return x * MULTIPLIER\n")
     mod = _import_fresh("test_change_global")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    val2 = fp2["const:MULTIPLIER"]
+    val2 = fp2["const:test_change_global.MULTIPLIER"]
 
     assert val1 == "2"
     assert val2 == "10"
@@ -362,7 +363,9 @@ def test_underscore_helper_change_detected(module_dir: pathlib.Path) -> None:
     mod = _import_fresh("test_limit_stage_us")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:_private_helper" in fp, "Should capture underscore-prefixed helpers"
+    assert "func:test_limit_helpers_us._private_helper" in fp, (
+        "Should capture underscore-prefixed helpers"
+    )
 
 
 @pytest.mark.xfail(reason="Lazy imports inside function body not analyzed by getclosurevars()")
@@ -379,54 +382,9 @@ def test_lazy_import_change_detected(module_dir: pathlib.Path) -> None:
     mod = _import_fresh("test_limit_stage_lazy")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:helper" in fp, "Should capture lazy imports inside function body"
-
-
-@pytest.mark.xfail(
-    reason="Class instances not modules; class definitions not tracked even when imported"
-)
-def test_class_instance_method_change_detected(module_dir: pathlib.Path) -> None:
-    """Class instance method changes should be tracked for change detection."""
-    helpers_py = module_dir / "test_limit_helpers_method.py"
-    helpers_py.write_text("class Processor:\n    def process(self, x):\n        return x * 2\n")
-
-    stage_py = module_dir / "test_limit_stage_method.py"
-    stage_py.write_text(
-        "from test_limit_helpers_method import Processor\n\n"
-        + "processor = Processor()\n\n"
-        + "def stage():\n    return processor.process(10)\n"
+    assert "func:test_limit_helpers_lazy.helper" in fp, (
+        "Should capture lazy imports inside function body"
     )
-
-    mod = _import_fresh("test_limit_stage_method")
-    fp = fingerprint.get_stage_fingerprint(mod.stage)
-
-    assert "mod:processor.process" in fp, "Should capture instance method usage"
-
-
-def test_dynamic_dispatch_change_detected(
-    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Functions in dispatch dicts are tracked for change detection."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    helpers_py = module_dir / "test_limit_helpers_dyn.py"
-    helpers_py.write_text(
-        "def add(x):\n    return x + 1\n\n"
-        + "def mul(x):\n    return x * 2\n\n"
-        + "FUNCS = {'add': add, 'mul': mul}\n"
-    )
-
-    stage_py = module_dir / "test_limit_stage_dyn.py"
-    stage_py.write_text(
-        "from test_limit_helpers_dyn import FUNCS\n\n"
-        + "def stage(op='add'):\n    return FUNCS[op](10)\n"
-    )
-
-    mod = _import_fresh("test_limit_stage_dyn")
-    fp = fingerprint.get_stage_fingerprint(mod.stage)
-
-    # Collection callables are tracked with key format: func:COLLECTION_NAME['key']
-    assert "func:FUNCS['add']" in fp, "Should capture functions in dispatch dicts"
-    assert "func:FUNCS['mul']" in fp, "Should capture functions in dispatch dicts"
 
 
 # =============================================================================
@@ -477,105 +435,6 @@ def test_multiple_runs_stable(module_dir: pathlib.Path) -> None:
         assert fp == fingerprints[0], "Fingerprints must be stable across runs"
 
 
-def test_dispatch_dict_function_change_causes_miss(
-    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Changing function inside dispatch dict causes cache miss."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    helpers_py = module_dir / "test_dispatch_helpers.py"
-    helpers_py.write_text(
-        "def add(x):\n    return x + 1\n\n"
-        + "def mul(x):\n    return x * 2\n\n"
-        + "FUNCS = {'add': add, 'mul': mul}\n"
-    )
-
-    stage_py = module_dir / "test_dispatch_stage.py"
-    stage_py.write_text(
-        "from test_dispatch_helpers import FUNCS\n\n"
-        + "def stage(op='add'):\n    return FUNCS[op](10)\n"
-    )
-
-    mod = _import_fresh("test_dispatch_stage")
-    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["func:FUNCS['add']"]
-
-    # Change the add function
-    helpers_py.write_text(
-        "def add(x):\n    return x + 999\n\n"  # Changed!
-        + "def mul(x):\n    return x * 2\n\n"
-        + "FUNCS = {'add': add, 'mul': mul}\n"
-    )
-    _import_fresh("test_dispatch_helpers")
-    mod = _import_fresh("test_dispatch_stage")
-    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["func:FUNCS['add']"]
-
-    assert hash1 != hash2, "Dispatch dict function change must cause cache miss"
-
-
-def test_list_callable_tracking(module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Functions in lists are tracked for change detection."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    helpers_py = module_dir / "test_list_helpers.py"
-    helpers_py.write_text(
-        "def step1(x):\n    return x + 1\n\n"
-        + "def step2(x):\n    return x * 2\n\n"
-        + "PIPELINE = [step1, step2]\n"
-    )
-
-    stage_py = module_dir / "test_list_stage.py"
-    stage_py.write_text(
-        "from test_list_helpers import PIPELINE\n\n"
-        + "def stage(x):\n"
-        + "    for step in PIPELINE:\n"
-        + "        x = step(x)\n"
-        + "    return x\n"
-    )
-
-    mod = _import_fresh("test_list_stage")
-    fp = fingerprint.get_stage_fingerprint(mod.stage)
-
-    assert "func:PIPELINE[0]" in fp, "Should capture first function in list"
-    assert "func:PIPELINE[1]" in fp, "Should capture second function in list"
-
-
-def test_fingerprint_ordering_stability(
-    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Fingerprint is stable regardless of dict key ordering in source."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    # Test that different dict key ORDER in source produces same fingerprint
-    # (because we sort keys during processing)
-    helpers_py = module_dir / "test_order_helpers.py"
-
-    # Version 1: dict literal has 'add' first
-    helpers_py.write_text(
-        "def add(x):\n    return x + 1\n\n"
-        + "def mul(x):\n    return x * 2\n\n"
-        + "FUNCS = {'add': add, 'mul': mul}\n"
-    )
-    stage_py = module_dir / "test_order_stage.py"
-    stage_py.write_text(
-        "from test_order_helpers import FUNCS\n\n" + "def stage():\n    return FUNCS\n"
-    )
-
-    mod = _import_fresh("test_order_stage")
-    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-
-    # Version 2: dict literal has 'mul' first (same functions, different key order)
-    helpers_py.write_text(
-        "def add(x):\n    return x + 1\n\n"
-        + "def mul(x):\n    return x * 2\n\n"
-        + "FUNCS = {'mul': mul, 'add': add}\n"  # Only dict key order changed
-    )
-    _import_fresh("test_order_helpers")
-    mod = _import_fresh("test_order_stage")
-    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-
-    # Same functions, same behavior - fingerprints should match
-    assert fp1 == fp2, "Fingerprint should be stable regardless of dict key order"
-
-
 # =============================================================================
 # SECTION 5: Class definition tracking
 # =============================================================================
@@ -595,8 +454,10 @@ def test_class_definition_tracked_with_class_prefix(module_dir: pathlib.Path) ->
     mod = _import_fresh("test_class_stage")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "class:MyProcessor" in fp, "Should capture class with 'class:' prefix"
-    assert "func:MyProcessor" not in fp, "Should NOT use 'func:' prefix for classes"
+    assert "class:test_class_helpers.MyProcessor" in fp, "Should capture class with 'class:' prefix"
+    assert "func:test_class_helpers.MyProcessor" not in fp, (
+        "Should NOT use 'func:' prefix for classes"
+    )
 
 
 def test_class_definition_change_causes_miss(module_dir: pathlib.Path) -> None:
@@ -622,89 +483,6 @@ def test_class_definition_change_causes_miss(module_dir: pathlib.Path) -> None:
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
     assert fp1 != fp2, "Class method change must cause cache miss"
-
-
-def test_class_instance_tracked(module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Module-level class instances have their class tracked."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    helpers_py = module_dir / "test_instance_helpers.py"
-    helpers_py.write_text(
-        "class Processor:\n"
-        + "    def process(self, x):\n"
-        + "        return x * 2\n\n"
-        + "processor = Processor()\n"
-    )
-
-    stage_py = module_dir / "test_instance_stage.py"
-    stage_py.write_text(
-        "from test_instance_helpers import processor\n\n"
-        + "def stage():\n    return processor.process(10)\n"
-    )
-
-    mod = _import_fresh("test_instance_stage")
-    fp = fingerprint.get_stage_fingerprint(mod.stage)
-
-    assert "class:processor.__class__" in fp, "Should capture instance's class"
-
-
-def test_class_instance_change_causes_miss(
-    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Changing class of a module-level instance causes cache miss."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    helpers_py = module_dir / "test_instchange_helpers.py"
-    helpers_py.write_text(
-        "class Processor:\n"
-        + "    def process(self, x):\n"
-        + "        return x * 2\n\n"
-        + "processor = Processor()\n"
-    )
-
-    stage_py = module_dir / "test_instchange_stage.py"
-    stage_py.write_text(
-        "from test_instchange_helpers import processor\n\n"
-        + "def stage():\n    return processor.process(10)\n"
-    )
-
-    mod = _import_fresh("test_instchange_stage")
-    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-
-    # Change the class method
-    helpers_py.write_text(
-        "class Processor:\n"
-        + "    def process(self, x):\n"
-        + "        return x * 999\n\n"
-        + "processor = Processor()\n"
-    )
-    _import_fresh("test_instchange_helpers")
-    mod = _import_fresh("test_instchange_stage")
-    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-
-    assert fp1 != fp2, "Instance class change must cause cache miss"
-
-
-def test_nonlocal_class_instance_tracked(
-    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Class instances captured as nonlocals have their class tracked."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    helpers_py = module_dir / "test_nonlocal_helpers.py"
-    helpers_py.write_text(
-        "class Processor:\n"
-        + "    def process(self, x):\n"
-        + "        return x * 2\n\n"
-        + "def make_stage():\n"
-        + "    processor = Processor()\n"
-        + "    def stage():\n"
-        + "        return processor.process(10)\n"
-        + "    return stage\n\n"
-        + "stage = make_stage()\n"
-    )
-
-    mod = _import_fresh("test_nonlocal_helpers")
-    fp = fingerprint.get_stage_fingerprint(mod.stage)
-
-    assert "class:processor.__class__" in fp, "Should capture nonlocal instance's class"
 
 
 # =============================================================================
@@ -743,9 +521,8 @@ def stage(params: MyParams) -> int:
     mod = _import_fresh("test_params_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
-        "@property change on StageParams must cause cache miss"
-    )
+    key = "class:test_params_prop.MyParams"
+    assert fp1[key] != fp2[key], "@property change on StageParams must cause cache miss"
 
 
 def test_stageparams_method_change_causes_miss(module_dir: pathlib.Path) -> None:
@@ -777,9 +554,8 @@ def stage(params: MyParams) -> int:
     mod = _import_fresh("test_params_method_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
-        "Method change on StageParams must cause cache miss"
-    )
+    key = "class:test_params_method.MyParams"
+    assert fp1[key] != fp2[key], "Method change on StageParams must cause cache miss"
 
 
 def test_stageparams_class_variable_change_causes_miss(module_dir: pathlib.Path) -> None:
@@ -810,9 +586,8 @@ def stage(params: MyParams) -> str:
     mod = _import_fresh("test_params_classvar_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
-        "Class variable change on StageParams must cause cache miss"
-    )
+    key = "class:test_params_classvar.MyParams"
+    assert fp1[key] != fp2[key], "Class variable change on StageParams must cause cache miss"
 
 
 # =============================================================================
@@ -840,7 +615,7 @@ def stage():
     mod = _import_fresh("test_nested_global_ref")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:helper" in fp, "Nested global helper should be captured"
+    assert "func:test_nested_global_ref.helper" in fp, "Nested global helper should be captured"
 
 
 def test_nested_function_global_change_causes_miss(module_dir: pathlib.Path) -> None:
@@ -907,8 +682,8 @@ def stage():
     mod = _import_fresh("test_nested_deep")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:leaf" in fp, "Deeply nested leaf should be captured"
-    assert "func:tweak" in fp, "Deeply nested tweak should be captured"
+    assert "func:test_nested_deep.leaf" in fp, "Deeply nested leaf should be captured"
+    assert "func:test_nested_deep.tweak" in fp, "Deeply nested tweak should be captured"
 
 
 def test_nested_lambda_global_detected(module_dir: pathlib.Path) -> None:
@@ -930,7 +705,7 @@ def stage():
     mod = _import_fresh("test_nested_lambda")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:processor" in fp, "Nested lambda global should be captured"
+    assert "func:test_nested_lambda.processor" in fp, "Nested lambda global should be captured"
 
 
 def test_nested_function_builtin_not_tracked(module_dir: pathlib.Path) -> None:
@@ -990,6 +765,6 @@ def stage():
     # 'upper' is over-included because co_names contains attribute access names
     # and __globals__ has a function with the same name. This is benign:
     # over-invalidation is safe, under-invalidation is catastrophic.
-    assert "func:upper" in fp, (
+    assert "func:test_nested_attr_collision.upper" in fp, (
         "Attribute name colliding with global should be over-included (benign)"
     )

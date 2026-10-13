@@ -28,7 +28,8 @@ Pivot's fingerprinting system:
 | Class definitions | Yes | Full class AST hashed |
 | StageParams subclasses | Yes | Type hint analysis + full class AST + Pydantic field defaults + `default_factory` functions |
 | Custom loaders | Yes | Loader class AST hashed via type hint analysis |
-| Global constants | Yes (value) | `getclosurevars()` + `repr()` |
+| Module-level primitive values | Yes (value) | `getclosurevars()` + `repr()` |
+| Other module-level values | No — error | Use `StageParams` instead |
 | Closure variables | Yes (structure) | `getclosurevars()` captures binding |
 | Default arguments | Yes | Captured in function signature |
 | `functools.partial` | Yes | Bound args + underlying function |
@@ -162,6 +163,9 @@ def process(data: pd.DataFrame, params: ProcessParams) -> pd.DataFrame:
     return data.loc[data["value"] > params.threshold, params.columns]
 ```
 
+For an explicitly unsafe migration path, `core.unsafe_fingerprinting=true` or
+`PIVOT_UNSAFE_FINGERPRINTING=1` downgrades the error to a warning.
+
 ## Why AST + getclosurevars?
 
 Other approaches were tested and rejected:
@@ -199,14 +203,14 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 
 | Prefix | Purpose | Example |
 |--------|---------|---------|
-| `self:` | The stage function itself | `self:` |
-| `func:` | Helper functions (user code callables) | `func:process_data` |
-| `class:` | Class definitions | `class:MyModel` |
-| `const:` | Global constants (primitives via `repr()`) | `const:THRESHOLD` |
-| `mod:` | Module attribute access patterns | `mod:utils.helper` |
-| `partial:` | `functools.partial` bound arguments | `partial:0`, `partial:kwarg_name` |
-| `loader:` | Loader class methods and config | `loader:load`, `loader:save`, `loader:config` |
-| `schema:` | Pydantic model JSON schema | `schema:ModelName` |
+| `self:` | The stage function itself | `self:train` |
+| `func:` | Helper functions (user code callables) | `func:myproject.helpers.process_data` |
+| `class:` | Class definitions | `class:myproject.params.TrainParams` |
+| `const:` | Module-level primitive values | `const:myproject.settings.THRESHOLD` |
+| `mod:` | Module attribute access patterns | `mod:myproject.helpers.process_data` |
+| `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
+| `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
+| `schema:` | Pydantic model JSON schema | `schema:myproject.params.TrainParams` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |
 
 ## Comparison with Other Tools

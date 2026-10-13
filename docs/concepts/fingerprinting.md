@@ -13,12 +13,12 @@ logical keys to hashes:
 | Manifest key | What it represents |
 |--------------|--------------------|
 | `self:<name>` | The stage function's own AST |
-| `func:<name>` | Helper functions called by the stage |
-| `class:<name>` | User-defined classes referenced by the stage |
+| `func:<module>.<qualname>` | Helper functions called by the stage |
+| `class:<module>.<qualname>` | User-defined classes referenced by the stage |
 | `mod:<module>.<attr>` | Attributes accessed on imported user modules |
-| `const:<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`) |
-| `schema:<name>` | Pydantic model JSON schemas |
-| `dep:…:loader:…`, `out:…:loader:…` | Reader/Writer method ASTs and config for each input and output |
+| `const:<module>.<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`) |
+| `schema:<module>.<qualname>` | Pydantic model JSON schemas |
+| `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…` | Reader/Writer method ASTs and config for each input and output |
 
 ### How It Works
 
@@ -47,10 +47,11 @@ If `train()` calls `normalize()` which calls `clip_outliers()`, all three
 functions appear in the manifest. Changing `clip_outliers` triggers a
 re-run of `train` even though `train` itself didn't change.
 
-Module-level attributes are tracked too. If your stage does
-`from myproject import config` and then accesses `config.THRESHOLD`, the
-value of `THRESHOLD` is captured if it is a scalar, and its AST hash if it is
-a function.
+Module-level primitive values are tracked too. If your stage does
+`from myproject import config` and then accesses `config.THRESHOLD`, Pivot captures the primitive
+value or the called function. A stage reading any other module-level value—such as a tuple,
+collection, enum member, frozen model, or instance—raises `StageDefinitionError`; use
+[StageParams](parameters.md) instead.
 
 ## What Triggers a Re-Run
 

@@ -1614,8 +1614,8 @@ def test_ast_hash_cache_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
     assert result == "hash123"
 
 
-def test_clear_ast_hashes_deletes_all_entries(tmp_path: pathlib.Path) -> None:
-    """clear_ast_hashes removes all fp: prefixed entries."""
+def test_clear_fingerprint_caches_deletes_all_ast_hash_entries(tmp_path: pathlib.Path) -> None:
+    """clear_fingerprint_caches removes all fp: prefixed entries."""
     db_path = tmp_path
 
     with state.StateDB(db_path) as db:
@@ -1676,7 +1676,7 @@ def test_clear_ast_hashes_deletes_all_entries(tmp_path: pathlib.Path) -> None:
         )
 
         # Clear all AST hashes
-        deleted = db.clear_ast_hashes()
+        deleted = db.clear_fingerprint_caches()
 
         assert deleted == 3
 
@@ -1701,18 +1701,18 @@ def test_clear_ast_hashes_deletes_all_entries(tmp_path: pathlib.Path) -> None:
         )
 
 
-def test_clear_ast_hashes_returns_zero_when_empty(tmp_path: pathlib.Path) -> None:
-    """clear_ast_hashes returns 0 when no entries exist."""
+def test_clear_fingerprint_caches_returns_zero_when_empty(tmp_path: pathlib.Path) -> None:
+    """clear_fingerprint_caches returns 0 when no entries exist."""
     db_path = tmp_path
 
     with state.StateDB(db_path) as db:
-        deleted = db.clear_ast_hashes()
+        deleted = db.clear_fingerprint_caches()
 
     assert deleted == 0
 
 
-def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None:
-    """clear_ast_hashes only deletes fp: prefixed entries, not other data."""
+def test_clear_fingerprint_caches_keeps_other_state(tmp_path: pathlib.Path) -> None:
+    """clear_fingerprint_caches deletes fp: and sm: entries but no other data."""
     db_path = tmp_path
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
@@ -1727,10 +1727,11 @@ def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None
         db.save(test_file, file_stat, "file_hash")
         db.increment_generation(output_identity)
         db.record_dep_generations("my_stage", {"upstream:out": 5})
+        db.put_raw(b"sm:my_stage\x003.13\x007", b"{}")
 
-        # Clear only AST hashes
-        deleted = db.clear_ast_hashes()
-        assert deleted == 1
+        deleted = db.clear_fingerprint_caches()
+        assert deleted == 2
+        assert db.get_raw(b"sm:my_stage\x003.13\x007") is None
 
         # Verify other entries are untouched
         assert db.get(test_file, file_stat) == "file_hash"
@@ -1738,8 +1739,8 @@ def test_clear_ast_hashes_only_deletes_fp_prefix(tmp_path: pathlib.Path) -> None
         assert db.get_dep_generations("my_stage") == {"upstream:out": 5}
 
 
-def test_clear_ast_hashes_readonly_blocked(tmp_path: pathlib.Path) -> None:
-    """clear_ast_hashes blocked in readonly mode."""
+def test_clear_fingerprint_caches_readonly_blocked(tmp_path: pathlib.Path) -> None:
+    """clear_fingerprint_caches blocked in readonly mode."""
     db_path = tmp_path
 
     with state.StateDB(db_path) as db:
@@ -1751,7 +1752,7 @@ def test_clear_ast_hashes_readonly_blocked(tmp_path: pathlib.Path) -> None:
         state.StateDB(db_path, readonly=True) as db,
         pytest.raises(RuntimeError, match="readonly StateDB"),
     ):
-        db.clear_ast_hashes()
+        db.clear_fingerprint_caches()
 
 
 # -----------------------------------------------------------------------------

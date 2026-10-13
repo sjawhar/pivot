@@ -538,8 +538,8 @@ class StateDB:
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
-    def clear_ast_hashes(self) -> int:
-        """Clear all AST hash cache entries.
+    def clear_fingerprint_caches(self) -> int:
+        """Clear all AST hash (`fp:`) and stage manifest (`sm:`) cache entries.
 
         Returns number of entries deleted.
         """
@@ -549,11 +549,12 @@ class StateDB:
         with self._write_transaction(timeout=self._write_timeout) as txn:
             cursor = txn.cursor()
             keys_to_delete = list[bytes]()
-            if cursor.set_range(_FP_PREFIX):
-                for key, _ in cursor:
-                    if not key.startswith(_FP_PREFIX):
-                        break
-                    keys_to_delete.append(key)
+            for prefix in (_FP_PREFIX, _SM_PREFIX):
+                if cursor.set_range(prefix):
+                    for key, _ in cursor:
+                        if not key.startswith(prefix):
+                            break
+                        keys_to_delete.append(bytes(key))
             for key in keys_to_delete:
                 txn.delete(key)
                 deleted += 1

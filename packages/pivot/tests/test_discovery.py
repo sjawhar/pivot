@@ -118,7 +118,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     pipeline = discovery.discover_pipeline(project_root=tmp_path)
 
     assert pipeline is not None
-    assert "func:normalize" in pipeline.ensure_fingerprint("test/preprocess")
+    assert "func:pipeline.normalize" in pipeline.ensure_fingerprint("test/preprocess")
 
 
 def test_discover_root_pipeline_imports_sibling_stages_module(tmp_path: pathlib.Path) -> None:
@@ -185,7 +185,7 @@ with Pipeline("report", root=pathlib.Path(__file__).parent) as pipeline:
 
     assert pipeline is not None
     assert pipeline.list_stages() == ["report/preprocess"]
-    assert "func:clean" in pipeline.ensure_fingerprint("report/preprocess")
+    assert "func:report.helpers.clean" in pipeline.ensure_fingerprint("report/preprocess")
 
 
 def test_discover_all_reuses_pipeline_imported_by_another_pipeline(
