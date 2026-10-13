@@ -755,6 +755,44 @@ def remove_output(path: pathlib.Path) -> None:
     _clear_path(path)
 
 
+def restore_missing_in_directory(
+    path: pathlib.Path,
+    output_hash: DirHash,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+) -> tuple[int, int]:
+    """Restore only the manifest files missing from an existing directory.
+
+    Additive: files already on disk (edited or not) and files outside the manifest
+    are left untouched.
+
+    Returns:
+        (restored_count, unavailable_count), where unavailable counts missing files
+        whose blob is absent from the cache.
+    """
+    resolved_base = path.resolve()
+    restored = 0
+    unavailable = 0
+    for entry in output_hash["manifest"]:
+        file_path = path / entry["relpath"]
+        if not file_path.resolve().is_relative_to(resolved_base):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {entry['relpath']!r}"
+            )
+        if file_path.exists() or file_path.is_symlink():
+            continue
+        file_cache_path = get_cache_path(cache_dir, entry["hash"])
+        if not file_cache_path.exists():
+            unavailable += 1
+            continue
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _checkout_with_fallback(
+            file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
+        )
+        restored += 1
+    return (restored, unavailable)
+
+
 def protect(path: pathlib.Path) -> None:
     """Make file read-only (mode 0o444)."""
     os.chmod(path, 0o444)

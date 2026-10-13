@@ -107,12 +107,16 @@ def _restore_path_sync(
                     + "Use --force to overwrite or --only-missing to skip existing files."
                 )
             case CheckoutBehavior.SKIP_EXISTING:
-                # For directories with manifests, don't skip - files inside may be missing.
-                # Let restore_from_cache() handle it (does full directory restoration).
-                # DirHash has "manifest" key, FileHash does not.
-                is_directory = is_dir_hash(output_hash)
-                if not is_directory:
+                # Existing file: skip. Existing real directory: fill in only the missing
+                # inner files; never overwrite or swap out files already on disk.
+                if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return ("skipped", path.name)
+                restored, unavailable = cache.restore_missing_in_directory(
+                    path, output_hash, cache_dir, checkout_modes
+                )
+                if unavailable:
+                    return ("missing", path.name)
+                return ("restored" if restored else "skipped", path.name)
             case CheckoutBehavior.FORCE:
                 cache.remove_output(path)
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
