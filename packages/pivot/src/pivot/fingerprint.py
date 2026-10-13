@@ -1070,69 +1070,6 @@ def _serialize_value_for_hash(value: Any) -> str:
     return repr(value)
 
 
-def _process_collection_dependency(
-    name: str,
-    collection: dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any],
-    manifest: dict[str, str],
-    visited: set[int],
-) -> None:
-    """Scan collection for callable user code and add to manifest."""
-    if isinstance(collection, dict):
-        # Use sorted keys for deterministic ordering
-        for key in sorted(collection.keys(), key=_sort_key):
-            value = collection[key]
-            if callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{key!r}]", value, manifest, visited)
-    else:
-        # For sequences and sets, use enumerate for index-based keys
-        # Sort sets for deterministic ordering
-        items = (
-            sorted(collection, key=_sort_key)
-            if isinstance(collection, (set, frozenset))
-            else collection
-        )
-        for i, value in enumerate(items):
-            if callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{i}]", value, manifest, visited)
-
-
-def _sort_key(value: Any) -> tuple[str, str]:
-    """Sort key that handles mixed types safely."""
-    return (type(value).__name__, str(value))
-
-
-def _is_primitive_collection(value: object, _seen: set[int] | None = None) -> bool:
-    """Check if value is a collection containing only primitives (recursively).
-
-    Uses _seen set to detect circular references and prevent infinite recursion.
-    Circular references return False (not a primitive collection).
-    """
-    if isinstance(value, (bool, int, float, str, bytes, type(None))):
-        return True
-    if isinstance(value, (list, tuple, set, frozenset)):
-        obj_id = id(cast("object", value))  # Cast: isinstance leaves element types Unknown
-        if _seen is None:
-            _seen = set()
-        if obj_id in _seen:
-            return False  # Circular reference
-        _seen.add(obj_id)
-        items = cast("list[object] | tuple[object, ...] | set[object] | frozenset[object]", value)
-        return all(_is_primitive_collection(item, _seen) for item in items)
-    if isinstance(value, dict):
-        obj_id = id(cast("object", value))  # Cast: isinstance leaves key/value types Unknown
-        if _seen is None:
-            _seen = set()
-        if obj_id in _seen:
-            return False  # Circular reference
-        _seen.add(obj_id)
-        items_dict = cast("dict[object, object]", value)
-        return all(
-            _is_primitive_collection(k, _seen) and _is_primitive_collection(v, _seen)
-            for k, v in items_dict.items()
-        )
-    return False
-
-
 def _add_callable_to_manifest(
     key: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
@@ -1179,12 +1116,11 @@ def _process_module_dependency(
             _add_callable_to_manifest(key, attr_value, manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
-        elif _is_primitive_collection(attr_value):
-            value_str = _serialize_value_for_hash(attr_value)
-            manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
         else:
-            raise TypeError(
-                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, or collections of primitives."
+            _check_non_scalar_capture(
+                f"{module_name}.{attr_name}",
+                attr_value,
+                _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
             )
 
 
