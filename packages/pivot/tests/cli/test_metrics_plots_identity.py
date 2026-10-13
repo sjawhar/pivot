@@ -13,6 +13,7 @@ from pivot import cli, compose, executor
 
 if TYPE_CHECKING:
     import click.testing
+    import pytest
 
     from conftest import GitRepo
 
@@ -133,3 +134,23 @@ def test_plots_show_default_writes_gallery_under_pivot_dir_with_relative_src(
     assert src is not None
     assert not pathlib.Path(src.group(1)).is_absolute(), src.group(1)
     assert (gallery.parent / src.group(1)).resolve() == (root / _PLOT_REL).resolve()
+
+
+def test_plots_show_from_subdirectory_writes_gallery_at_project_root(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mock_discovery: compose.Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = git_repo
+    _run_and_commit(mock_discovery, git_repo, "abc")
+    sub = root / "sub"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+
+    result = runner.invoke(cli.cli, ["plots", "show"])
+
+    assert result.exit_code == 0, result.output
+    assert "Rendered 1 plot(s) to .pivot/plots/index.html" in result.output
+    assert (root / ".pivot" / "plots" / "index.html").is_file()
+    assert not (sub / ".pivot").exists(), "must not create a stray .pivot in the subdirectory"
