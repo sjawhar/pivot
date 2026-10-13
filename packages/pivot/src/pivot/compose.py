@@ -10,20 +10,21 @@ import functools
 import importlib
 import inspect
 import logging
+import os
+import pathlib
 import types as _stdlib_types
 import typing
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
 
 from typing_extensions import is_typeddict
 
-from . import exceptions, path_policy, project, registry, stage_def, types
+from . import exceptions, outputs, path_policy, project, registry, stage_def, types
 from .storage import lock
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import collections.abc
-    import pathlib
     from collections.abc import Callable
 
     from networkx import DiGraph
@@ -257,6 +258,7 @@ class Pipeline:
     _root: pathlib.Path
     _stages: list[_StageNode]
     _inputs: dict[str, _InputNode]
+    _input_names_by_path: dict[str, str]
     _call_counts: dict[tuple[str, tuple[str, ...]], int]
     _validation_errors: list[str]
     _token: contextvars.Token[Pipeline | None] | None
@@ -273,6 +275,7 @@ class Pipeline:
         self._name = name
         self._stages = []
         self._inputs = {}
+        self._input_names_by_path = dict[str, str]()
         self._call_counts = {}
         self._validation_errors = []
         self._token = None
@@ -363,13 +366,17 @@ class Pipeline:
                         + f"'{existing_path}' and '{path}' in different pipelines."
                     )
             else:
-                self._inputs[name] = _InputNode(
-                    name=name,
-                    python_type=None,
-                    path=path,
-                    format=_get_loaders().PathOnly(),
-                    inherited=True,
+                self._add_input(
+                    _InputNode(
+                        name=name,
+                        python_type=None,
+                        path=path,
+                        format=_get_loaders().PathOnly(),
+                        inherited=True,
+                    )
                 )
+        if not self._constructing:
+            self._check_inputs_against_outputs(self._registry)
         self._registry.invalidate_dag_cache()
 
     def __enter__(self) -> Pipeline:
@@ -417,8 +424,22 @@ class Pipeline:
             new_registry.add_existing(copy.deepcopy(stage_info))
             materialized_stages.add(stage_name)
 
+        self._check_inputs_against_outputs(new_registry)
+
         # Atomic swap — if any step above raises, self._registry is unchanged
         self._registry = new_registry
+
+    def _check_inputs_against_outputs(self, reg: registry.StageRegistry) -> None:
+        """Refuse an input whose path equals, contains, or lies inside a registered output.
+
+        Runs once the registry holds every output: at materialization and after an include()
+        outside a construction block (how --all combines pipelines).
+        """
+        for node in self._inputs.values():
+            normalized = pathlib.Path(os.path.normpath(self._root / node.path))
+            if not normalized.is_relative_to(self._root):
+                continue  # path_policy keeps inputs in the project; outputs always are
+            reg.check_input_path(node.name, normalized.relative_to(self._root).parts)
 
     @typing.overload
     def input(
@@ -492,13 +513,31 @@ class Pipeline:
                 python_type=existing.python_type or object,
             )
         node = _InputNode(name=name, python_type=t, path=path, format=format)
-        self._inputs[name] = node
+        self._add_input(node)
         return ArtifactHandle(
             pipeline=self,
             source=node,
             output_key=None,
             python_type=t or object,
         )
+
+    def _add_input(self, node: _InputNode) -> None:
+        """Bind a new input name, refusing a second name for a file another input reads.
+
+        The workspace store maps each input identity to its path, so two names on one
+        file would collide there mid-run; this rejects them while the pipeline is defined.
+        """
+        path_key = os.path.normpath(self._root / node.path)
+        other = self._input_names_by_path.get(path_key)
+        if other is not None:
+            other_path = self._inputs[other].path
+            spelled = "" if other_path == node.path else f" (as '{node.path}')"
+            raise exceptions.PipelineConfigError(
+                f"Input binding conflict: inputs '{other}' and '{node.name}' are both bound to "
+                + f"'{other_path}'{spelled}. Use one input name per file."
+            )
+        self._inputs[node.name] = node
+        self._input_names_by_path[path_key] = node.name
 
     @contextlib.contextmanager
     def variant(self, name: str) -> collections.abc.Generator[None]:
@@ -507,7 +546,7 @@ class Pipeline:
         All stages registered within the block get @{name} appended to their stage name.
         Nesting is supported: variant("a") inside variant("b") → @b@a suffix.
         """
-        reason = lock.stage_name_error(name)
+        reason = lock.variant_name_error(name)
         if reason is not None:
             raise ValueError(f"Invalid variant name {name!r}: {reason}")
         self._variant_stack.append(name)
@@ -598,7 +637,7 @@ class Pipeline:
                     self._validation_errors.append(
                         f"{stage_name}: parameter '{param_name}' uses p.previous("
                         + (f"{value.key!r}" if value.key is not None else "")
-                        + f") but output '{output_spec.key}' is not tagged incremental."
+                        + f") but {_output_label(output_spec.key)} is not tagged incremental."
                     )
                     continue
                 existing_param = next(
@@ -610,9 +649,10 @@ class Pipeline:
                     None,
                 )
                 if existing_param is not None:
+                    label = _output_label(output_spec.key)
                     self._validation_errors.append(
                         f"{stage_name}: parameters '{existing_param}' and '{param_name}' both "
-                        + f"bind p.previous() to incremental output '{output_spec.key}'."
+                        + f"bind p.previous() to {label}, an incremental output."
                     )
                     continue
                 incremental_inputs[param_name] = output_spec.key
@@ -751,12 +791,14 @@ class Pipeline:
                     + f"'{local_bindings[name]}' locally and '{path}' in a foreign pipeline."
                 )
             if name not in self._inputs:
-                self._inputs[name] = _InputNode(
-                    name=name,
-                    python_type=None,
-                    path=path,
-                    format=_get_loaders().PathOnly(),
-                    inherited=True,
+                self._add_input(
+                    _InputNode(
+                        name=name,
+                        python_type=None,
+                        path=path,
+                        format=_get_loaders().PathOnly(),
+                        inherited=True,
+                    )
                 )
 
 
@@ -832,10 +874,8 @@ def _format_extension(
 
 
 def _infer_input_format_from_type(t: type) -> loaders_mod.Reader[object] | None:
-    import pathlib as _pathlib
-
     loaders = _get_loaders()
-    if t is _pathlib.Path:
+    if t is pathlib.Path:
         return loaders.PathOnly()  # type: ignore[return-value]
     if t is str:
         return loaders.Text()  # type: ignore[return-value]
@@ -866,6 +906,14 @@ def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
 # --- Return type analysis ---
 
 
+def _output_label(key: str) -> str:
+    """Name an output in a user-facing message.
+
+    Users never see SINGLE_OUTPUT_KEY: a single output is the stage's return value.
+    """
+    return "the return value" if key == SINGLE_OUTPUT_KEY else f"output '{key}'"
+
+
 def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec]:
     """Parse a stage return type into output specifications."""
     origin = get_origin(hint)
@@ -892,11 +940,12 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
     tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
     fmt: loaders_mod.Writer[object] | None = None
     loaders = _get_loaders()
+    label = _output_label(key)
     for metadata in args[1:]:
         if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
             if tag is not None:
                 raise exceptions.StageDefinitionError(
-                    f"Stage '{stage_name}' output '{key}' cannot combine "
+                    f"Stage '{stage_name}': {label} cannot combine "
                     + f"{type(tag).__name__.removeprefix('_').removesuffix('Tag').lower()} "
                     + f"with {type(metadata).__name__.removeprefix('_').removesuffix('Tag').lower()}."
                 )
@@ -904,17 +953,23 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
         elif isinstance(metadata, loaders.Writer):
             if fmt is not None:
                 raise exceptions.StageDefinitionError(
-                    f"Stage '{stage_name}' output '{key}' has more than one loader."
+                    f"Stage '{stage_name}': {label} has more than one loader."
                 )
             fmt = typing.cast("loaders_mod.Writer[object]", metadata)
         else:
             metadata_name = (
                 metadata.__name__ if isinstance(metadata, type) else type(metadata).__name__
             )
-            raise exceptions.StageDefinitionError(
-                f"Stage '{stage_name}' output '{key}' has unsupported Annotated metadata "
+            message = (
+                f"Stage '{stage_name}': {label} has unsupported Annotated metadata "
                 + f"'{metadata_name}'."
             )
+            if isinstance(metadata, outputs.DirectoryOut):
+                message += (
+                    " For a directory output, create the directory outside the project and "
+                    + "return a pathlib.Path to it."
+                )
+            raise exceptions.StageDefinitionError(message)
 
     if fmt is None:
         if isinstance(tag, _PlotTag):
@@ -928,7 +983,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
         not isinstance(fmt, loaders.Loader) or type(fmt).empty is loaders.Loader.empty
     ):
         raise exceptions.StageDefinitionError(
-            f"Stage '{stage_name}' output '{key}' is incremental but loader "
+            f"Stage '{stage_name}': {label} is incremental but loader "
             + f"'{type(fmt).__name__}' does not implement empty()."
         )
     return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
@@ -1103,10 +1158,7 @@ class ArtifactHandle:
                     output_key=name,
                     python_type=spec.python_type,
                 )
-        available = [spec.key for spec in self._source.output_specs]
-        raise AttributeError(
-            f"Stage '{self._source.name}' has no output '{name}'. Available: {available}"
-        )
+        raise AttributeError(_no_such_output_message(self._source, name))
 
     def __getitem__(self, key: str) -> ArtifactHandle:
         if not isinstance(self._source, _StageNode):
@@ -1119,5 +1171,14 @@ class ArtifactHandle:
                     output_key=key,
                     python_type=spec.python_type,
                 )
-        available = [spec.key for spec in self._source.output_specs]
-        raise KeyError(f"Stage '{self._source.name}' has no output '{key}'. Available: {available}")
+        raise KeyError(_no_such_output_message(self._source, key))
+
+
+def _no_such_output_message(source: _StageNode, key: str) -> str:
+    if [spec.key for spec in source.output_specs] == [SINGLE_OUTPUT_KEY]:
+        return (
+            f"Stage '{source.name}' has no output '{key}': it has a single output, the return "
+            + "value. Pass the handle itself."
+        )
+    available = [spec.key for spec in source.output_specs]
+    return f"Stage '{source.name}' has no output '{key}'. Available: {available}"

@@ -52,23 +52,13 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def test_pipeline(tmp_path: pathlib.Path) -> Generator[PipelineLike]:
-    """Provide a fresh Pipeline for tests.
+def test_pipeline(tmp_path: pathlib.Path) -> PipelineLike:
+    """Provide a fresh Pipeline rooted at tmp_path.
 
-    Also sets up the module-level test pipeline in helpers.py so that
-    register_test_stage() works without explicit pipeline parameter.
-
-    Note: This fixture does NOT mock the project root. Tests that register
-    stages with path annotations should either:
-    1. Use mock_discovery fixture (which mocks project root)
-    2. Or explicitly mock project._project_root_cache themselves
+    This fixture does NOT mock the project root; use mock_discovery for tests that
+    need the pipeline discovered from its root.
     """
-    import helpers
-
-    pipeline = Pipeline("test", root=tmp_path)
-    helpers.set_test_pipeline(pipeline)
-    yield pipeline
-    helpers.set_test_pipeline(None)
+    return Pipeline("test", root=tmp_path)
 
 
 @pytest.fixture
@@ -80,7 +70,7 @@ def mock_discovery(
     """Mock discover_pipeline to return the test_pipeline.
 
     Use this fixture for CLI tests that need stages to be discovered
-    without creating actual pivot.yaml or pipeline.py files.
+    without creating a pipeline.py file.
 
     This fixture:
     - Creates .pivot and .git directories in the pipeline root
@@ -91,9 +81,6 @@ def mock_discovery(
 
     Tests using this fixture should NOT use isolated_filesystem() since
     this fixture already sets up the environment correctly.
-
-    Note: The test_pipeline fixture is automatically used, so stages
-    can be registered via register_test_stage().
     """
     from pivot import discovery
     from pivot.cli import decorators as cli_decorators

@@ -33,15 +33,19 @@ class StageParams(pydantic.BaseModel):
 
 
 def validate_directory_out_key(key: str, output_name: str) -> str:
-    """Validate and normalize a DirectoryOut key (relative path within directory).
+    """Validate and normalize one key of a directory output's dict (a path inside the directory).
 
-    Returns the normalized key (redundant separators removed, Unicode NFC normalized).
+    A directory output is a stage return value of ``dict[str, T]``; each key names a file the
+    worker writes under the output directory. Returns the normalized key (redundant
+    separators removed, Unicode NFC normalized).
 
     Raises:
         ValueError: If key is invalid (empty, whitespace-only, absolute, contains .., no extension)
     """
     if not key or not key.strip():
-        raise ValueError(f"DirectoryOut '{output_name}': empty or whitespace-only key not allowed")
+        raise ValueError(
+            f"Directory output '{output_name}': empty or whitespace-only key not allowed"
+        )
 
     # Normalize Unicode to NFC for consistent cross-platform behavior
     # (macOS HFS+ uses NFD, which could cause duplicate detection issues)
@@ -53,22 +57,24 @@ def validate_directory_out_key(key: str, output_name: str) -> str:
 
     # Check for absolute path
     if normalized.startswith("/"):
-        raise ValueError(f"DirectoryOut '{output_name}': absolute path not allowed: {key!r}")
+        raise ValueError(f"Directory output '{output_name}': absolute path not allowed: {key!r}")
 
     # Check for path traversal (..)
     if ".." in path_obj.parts:
-        raise ValueError(f"DirectoryOut '{output_name}': path traversal not allowed: {key!r}")
+        raise ValueError(f"Directory output '{output_name}': path traversal not allowed: {key!r}")
 
     # Extension required to ensure files match the loader's expected format
     # Use suffix instead of "." in name to correctly reject hidden files without extensions
     if not path_obj.suffix:
-        raise ValueError(f"DirectoryOut '{output_name}': key must include file extension: {key!r}")
+        raise ValueError(
+            f"Directory output '{output_name}': key must include file extension: {key!r}"
+        )
 
     # Reject filenames where the stem (name without extension) is empty or whitespace-only
     # e.g., "   .json" has stem="   " which would create problematic filenames
     if not path_obj.stem.strip():
         raise ValueError(
-            f"DirectoryOut '{output_name}': filename cannot be empty or whitespace-only: {key!r}"
+            f"Directory output '{output_name}': filename cannot be empty or whitespace-only: {key!r}"
         )
 
     return normalized

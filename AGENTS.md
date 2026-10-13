@@ -12,19 +12,18 @@
 packages/pivot/src/pivot/
 ├── cli/           # Click commands, decorators, helpers (see cli/AGENTS.md)
 ├── config/        # YAML parsing, validation
-├── dag/           # Dependency graph construction
+├── dag/           # DAG rendering for `pivot dag` (ASCII, DOT, Mermaid)
 ├── engine/        # Execution coordinator, watch mode, RPC server
 ├── executor/      # Worker process execution (see executor/AGENTS.md)
-├── pipeline/      # Pipeline state, lock files
 ├── remote/        # S3/remote storage
-├── storage/       # StateDB, cache management (see storage/AGENTS.md)
+├── storage/       # StateDB, lock files, cache management (see storage/AGENTS.md)
 ├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot tags, format inference
 ├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection
 ├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
 ├── stage_def.py   # StageParams, output writing helpers
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
-├── outputs.py     # Output spec classes used by the show/metrics/plots code
+├── outputs.py     # DirectoryOut marker (compose rejects it until directory outputs are designed)
 └── types.py       # TypedDicts, enums, type aliases, ArtifactIdentity
 
 packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)

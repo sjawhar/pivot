@@ -6,7 +6,7 @@ import pathlib
 import typing
 from typing import TYPE_CHECKING
 
-from pivot import cli, config, loaders, path_utils, project, types
+from pivot import cli, config, loaders, project, types
 from pivot.cli import checkout as checkout_mod
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import PipelineLike, RegistryStageInfo
@@ -123,10 +123,7 @@ def test_get_stage_output_info_uses_store_paths(mock_discovery: PipelineLike) ->
     expected_path = str(store_instance.resolve_display_path(ref))
 
     assert result == {expected_path: output_hash}
-    canonical = path_utils.canonicalize_artifact_path(
-        types.identity_key(ref.identity), project.get_project_root()
-    )
-    assert expected_path != canonical
+    assert expected_path == str(project.get_project_root() / "data" / "train.csv")
 
 
 def test_checkout_identity_target_restores_store_path(

@@ -88,8 +88,8 @@ def test_get_stage_lock_hashes_uses_identity_paths(
         "train",
         state_dir,
         output_hashes={
-            types.ArtifactIdentity("train", "model"): types.FileHash(hash="abc123"),
-            types.ArtifactIdentity("train", "metrics"): types.FileHash(hash="def456"),
+            types.ArtifactIdentity("train", "model"): types.FileHash(hash="abc1230000000000"),
+            types.ArtifactIdentity("train", "metrics"): types.FileHash(hash="def4560000000000"),
         },
     )
 
@@ -98,7 +98,7 @@ def test_get_stage_lock_hashes_uses_identity_paths(
     workspace_store = cli_helpers.get_workspace_store()
     assert workspace_store is not None
     expected_path = project.to_relative_path(workspace_store.resolve_display_path(data_ref))
-    assert output_hashes == {expected_path: "abc123"}
+    assert output_hashes == {expected_path: "abc1230000000000"}
     assert dep_hashes == {}
 
 
@@ -118,7 +118,7 @@ def test_get_stage_lock_hashes_merged_pipeline_paths(
         stage_name,
         state_dir,
         output_hashes={
-            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc123"),
+            types.ArtifactIdentity(stage_name, "model"): types.FileHash(hash="abc1230000000000"),
         },
     )
 
@@ -127,7 +127,7 @@ def test_get_stage_lock_hashes_merged_pipeline_paths(
     workspace_store = cli_helpers.get_workspace_store()
     assert workspace_store is not None
     expected_path = project.to_relative_path(workspace_store.resolve_display_path(data_ref))
-    assert output_hashes == {expected_path: "abc123"}
+    assert output_hashes == {expected_path: "abc1230000000000"}
     assert dep_hashes == {}
 
 
@@ -156,7 +156,7 @@ def test_get_stage_lock_hashes_without_workspace_store(
         "train",
         state_dir,
         output_hashes={
-            types.ArtifactIdentity("train", "model"): types.FileHash(hash="abc123"),
+            types.ArtifactIdentity("train", "model"): types.FileHash(hash="abc1230000000000"),
         },
     )
 
@@ -170,7 +170,7 @@ def test_get_stage_lock_hashes_without_workspace_store(
 
         # Should fall back to identity_key
         assert "train:model" in output_hashes
-        assert output_hashes["train:model"] == "abc123"
+        assert output_hashes["train:model"] == "abc1230000000000"
         assert dep_hashes == {}
     finally:
         cli_helpers_mod.get_workspace_store = original_get_store
@@ -191,8 +191,8 @@ def test_get_stage_lock_hashes_filters_metric_outputs(
         "train",
         state_dir,
         output_hashes={
-            types.ArtifactIdentity("train", "model"): types.FileHash(hash="data123"),
-            types.ArtifactIdentity("train", "loss"): types.FileHash(hash="metric456"),
+            types.ArtifactIdentity("train", "model"): types.FileHash(hash="da7a123000000000"),
+            types.ArtifactIdentity("train", "loss"): types.FileHash(hash="3e7c456000000000"),
         },
     )
 

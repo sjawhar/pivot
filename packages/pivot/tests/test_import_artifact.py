@@ -45,7 +45,7 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
             {
                 "key": None,
                 "tag": "data",
-                "hash": "abc123",
+                "hash": "abc1230000000000",
             }
         ]
     )
@@ -80,7 +80,7 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
 
     assert resolved["stage"] == "train"
     assert resolved["path"] == "train"
-    assert resolved["hash"] == "abc123"
+    assert resolved["hash"] == "abc1230000000000"
     assert resolved["size"] == 0
     assert resolved["remote_url"] == remote_url
     assert resolved["rev_lock"] == "deadbeef"
@@ -94,7 +94,7 @@ def test_resolve_remote_path_identity_disambiguates_stages(mocker: MockerFixture
             {
                 "key": None,
                 "tag": "data",
-                "hash": "abc123",
+                "hash": "abc1230000000000",
             }
         ]
     )
@@ -130,7 +130,7 @@ def test_resolve_remote_path_identity_disambiguates_stages(mocker: MockerFixture
 
     assert resolved["stage"] == "train"
     assert resolved["path"] == "train"
-    assert resolved["hash"] == "abc123"
+    assert resolved["hash"] == "abc1230000000000"
 
 
 def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
@@ -141,7 +141,7 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
             {
                 "key": None,
                 "tag": "data",
-                "hash": "abc123",
+                "hash": "abc1230000000000",
             }
         ]
     )

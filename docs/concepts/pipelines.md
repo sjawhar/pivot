@@ -95,7 +95,8 @@ with Pipeline("demo") as pipeline:
 
 This defines `demo/trim@keep1`, `demo/trim@keep3` and `demo/sizes`. Nested
 variant blocks append both names (`trim@outer@inner`). Variant names may
-contain letters, digits, `_`, `.` and `-`.
+contain letters, digits, `_`, `.` and `-`; `/` and `@` separate the parts of
+a stage name, so `pipeline.variant()` rejects them.
 
 Each variant has its own lock file, outputs (`data/demo/trim@keep1.jsonl`) and
 parameters. In `params.yaml`, a key without the `@` suffix applies to every
