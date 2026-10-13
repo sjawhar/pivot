@@ -1,13 +1,20 @@
 import dataclasses
 import enum
+import functools
 import json
 import logging
+import math
+import re
+import typing
 from collections.abc import Callable
 from typing import ClassVar
 from unittest import mock
 
 import pydantic
 import pytest
+
+import numpy as np
+import pandas as pd
 
 from pivot import exceptions, fingerprint
 from pivot.config import models
@@ -53,6 +60,17 @@ IMMUTABLE_FROZENSET = frozenset({1, 2})
 PRIMITIVE_INT = 42
 ENUM_MEMBER = CapturedMode.DEFAULT
 CALLABLE_INSTANCE = CallableConfig()
+
+
+class _ExternalCallable:
+    __module__ = "math"
+
+    def __call__(self) -> int:
+        return 7
+
+
+EXTERNAL_CALLABLE = _ExternalCallable()
+COMPILED_PATTERN = re.compile("x")
 
 
 def _callable_helper() -> int:
@@ -129,6 +147,38 @@ def _make_parent_with_nested_non_scalar_capture() -> Callable[[], int]:
         return _child_with_non_scalar_capture() + len(PARENT_BAD)
 
     return parent
+
+
+def _decorator(func: Callable[[], int]) -> Callable[[], int]:
+    @functools.wraps(func)
+    def wrapper() -> int:
+        return func()
+
+    return wrapper
+
+
+@_decorator
+def _decorated_user_function() -> int:
+    return 1
+
+
+def _stage_uses_common_callables() -> int:
+    frame = pd.DataFrame({"value": [1, 2]})
+    return (
+        int(np.mean(frame["value"]))
+        + len(json.dumps({"value": 1}))
+        + int(math.sqrt(4))
+        + typing.cast(int, 1)
+        + _decorated_user_function()
+    )
+
+
+def _stage_uses_external_callable() -> int:
+    return EXTERNAL_CALLABLE()
+
+
+def _stage_uses_compiled_pattern() -> bool:
+    return COMPILED_PATTERN.search("x") is not None
 
 
 @pytest.mark.parametrize(
@@ -233,6 +283,40 @@ def test_nested_non_scalar_capture_errors_are_aggregated() -> None:
 )
 def test_scalar_and_callable_closure_capture_allows_fingerprint(func: Callable[[], object]) -> None:
     fingerprint.get_stage_fingerprint_cached("train", func)
+
+
+def test_common_function_and_class_references_are_allowed() -> None:
+    fingerprint.get_stage_fingerprint(_stage_uses_common_callables)
+
+
+@pytest.mark.parametrize(
+    ("func", "variable", "type_name"),
+    [
+        pytest.param(
+            _stage_uses_external_callable,
+            "EXTERNAL_CALLABLE",
+            "_ExternalCallable",
+            id="external-callable-instance",
+        ),
+        pytest.param(
+            _stage_uses_compiled_pattern,
+            "COMPILED_PATTERN",
+            "Pattern",
+            id="compiled-regex",
+        ),
+    ],
+)
+def test_non_scalar_non_user_values_are_refused(
+    func: Callable[[], object],
+    variable: str,
+    type_name: str,
+) -> None:
+    with pytest.raises(exceptions.StageDefinitionError) as exc:
+        fingerprint.get_stage_fingerprint(func)
+
+    message = str(exc.value)
+    assert variable in message
+    assert f"type: {type_name}" in message
 
 
 def test_unsafe_env_allows_non_scalar_capture(

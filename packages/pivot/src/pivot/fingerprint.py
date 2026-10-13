@@ -827,6 +827,15 @@ def _is_user_class_instance(value: Any) -> bool:
     return not isinstance(value, type) and is_user_code(type(value))
 
 
+def _is_callable_instance(value: Any) -> bool:
+    """Return whether `value` is a callable object rather than a function or class."""
+    return (
+        callable(value)
+        and not isinstance(value, (functools.partial, type))
+        and not inspect.isroutine(value)
+    )
+
+
 def _process_closure_values(
     values: Mapping[str, Any],
     func: Callable[..., Any],
@@ -843,20 +852,17 @@ def _process_closure_values(
             continue
 
         binding_ref = _binding_ref(func, name)
-        # functools.partial fails is_user_code() (module is functools/stdlib)
-        # Must check before general callable check.
-        if _is_user_class_instance(value):
-            _check_non_scalar_capture(name, value, stage_name)
-        elif isinstance(value, functools.partial):
+        # functools.partial fails is_user_code() (module is functools/stdlib).
+        if isinstance(value, functools.partial):
             _process_partial_dependency(
                 binding_ref, cast("functools.partial[Any]", value), manifest, visited
             )
+        elif _is_callable_instance(value) or _is_user_class_instance(value):
+            _check_non_scalar_capture(name, value, stage_name)
         elif callable(value) and is_user_code(value):
             _process_callable_dependency(binding_ref, value, manifest, visited)
         elif callable(value):
-            # Non-user-code callables (stdlib/third-party functions like typing.cast,
-            # json.dumps) are tracked via module dependency when accessed as module.func.
-            # Skip them here because their repr can contain memory addresses.
+            # External functions, classes, and builtins are not user dependencies.
             continue
         elif include_modules and isinstance(value, types.ModuleType):
             _process_module_dependency(name, value, func, manifest, visited)
@@ -1150,7 +1156,7 @@ def _process_module_dependency(
         except AttributeError:
             manifest[key] = "unknown"
             continue
-        if _is_user_class_instance(attr_value):
+        if _is_callable_instance(attr_value) or _is_user_class_instance(attr_value):
             _check_non_scalar_capture(
                 f"{module_name}.{attr_name}",
                 attr_value,
