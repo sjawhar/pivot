@@ -50,7 +50,9 @@ Each thread has its own anyio event loop — socket connections are never shared
 
 - `EventPoller.stop()` uses a `threading.Event` + task group cancellation to interrupt blocked RPC calls
 - TUI quit handlers call `poller.stop()` then `client.disconnect()`
-- `poller_thread.join(timeout=2.0)` ensures clean shutdown before process exit
+- `run_tui_with_engine()` owns a second `threading.Event`, `poller_stop`. The engine thread sets it in its `finally` when the engine finishes, and the main thread sets it once `app.run()` returns. The poller's connect-retry loop waits on it between attempts and gives up as soon as it is set, so a one-shot engine that finishes and removes its socket before the poller connects does not leave the poller retrying. A connected poller is stopped by the same event.
+- Because `poller_stop` is always set by the time `app.run()` returns, `poller_thread.join()` waits with no timeout.
+- When the engine thread ends it posts `TuiShutdown(error=...)`. Run mode exits on it. Watch mode ignores a normal shutdown and keeps running until the user quits, but on an engine error it exits with return code 1, and `run_tui_with_engine()` re-raises the engine's exception so the command fails.
 - Both engine and poller threads are daemon threads — killed on process exit as fallback
 
 ## Message Types
