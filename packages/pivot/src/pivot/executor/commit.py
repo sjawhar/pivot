@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import pathlib
 
-from pivot import config, exceptions, parameters, project, registry, run_history, types
+from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot.executor import worker
 from pivot.storage import lock
 from pivot.storage import state as state_mod
@@ -149,10 +149,14 @@ def commit_stages(
             if not force and stage_names is None:
                 lock_data = production_lock.read()
                 if lock_data is not None:
-                    changed, _ = production_lock.is_changed_with_lock_data(
-                        lock_data, fingerprint, current_params, dep_hashes, out_paths
+                    decision = skip.check_stage(
+                        lock_data=lock_data,
+                        fingerprint=fingerprint,
+                        params=current_params,
+                        dep_hashes=dep_hashes_by_identity,
+                        out_paths=[out.identity for out in stage_outs],
                     )
-                    if not changed:
+                    if not decision["changed"]:
                         continue
 
             # 6. Hash and cache outputs

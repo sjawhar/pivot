@@ -76,17 +76,6 @@ def _make_worker_stage_info(
     )
 
 
-def test_tracked_dict_records_accessed_keys() -> None:
-    tracked = worker.TrackedDict({"a": "one", "b": "two"})
-
-    assert tracked.accessed_keys == frozenset(), "Should be empty before access"
-
-    assert tracked["a"] == "one"
-    assert tracked.accessed_keys == frozenset({"a"}), "Should record accessed key"
-
-    assert tracked["b"] == "two"
-    assert tracked.accessed_keys == frozenset({"a", "b"}), "Should track all accessed keys"
-
 
 def test_execute_stage_uses_store_spec_for_io(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
@@ -141,7 +130,7 @@ def test_execute_stage_uses_store_spec_for_io(
     assert result["status"] == types.StageStatus.RAN
 
 
-def test_execute_stage_records_accessed_group_keys(
+def test_execute_stage_loads_directory_dependency(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     group_dir = tmp_path / "data" / "upstream"
@@ -183,8 +172,6 @@ def test_execute_stage_records_accessed_group_keys(
     result = worker.execute_stage("stage", stage_info, worker_env, output_queue)
 
     assert result["status"] == types.StageStatus.RAN
-    assert "accessed_dep_keys" in result
-    assert result["accessed_dep_keys"] == {"group": {"a.txt"}}, "Should record accessed group keys"
 
 
 def test_execute_stage_single_field_typeddict(

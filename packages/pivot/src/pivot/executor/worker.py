@@ -30,6 +30,7 @@ from pivot import (
     path_utils,
     project,
     run_history,
+    skip,
     stage_def,
     types,
 )
@@ -157,23 +158,6 @@ class WorkerStageInfo(TypedDict):
     collection_params: dict[str, str]
 
 
-class TrackedDict(dict[str, Any]):
-    """Dict wrapper that records which keys were accessed."""
-
-    _accessed_keys: set[str]
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
-        self._accessed_keys = set[str]()
-
-    @override
-    def __getitem__(self, key: str) -> Any:
-        self._accessed_keys.add(key)
-        return super().__getitem__(key)
-
-    @property
-    def accessed_keys(self) -> frozenset[str]:
-        return frozenset(self._accessed_keys)
 
 
 def _make_result(
@@ -181,19 +165,15 @@ def _make_result(
     reason: str,
     ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
-    accessed_dep_keys: dict[str, set[str]] | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
-    result = StageResult(
+    return StageResult(
         status=status,
         reason=reason,
         input_hash=input_hash,
         output_lines=ring_buffer.snapshot(),
         metrics=metrics.get_entries(),
     )
-    if accessed_dep_keys is not None:
-        result["accessed_dep_keys"] = accessed_dep_keys
-    return result
 
 
 def execute_stage(
@@ -329,7 +309,6 @@ def execute_stage(
 
                     skip_reason, run_reason, input_hash = _check_skip_or_run(
                         stage_info,
-                        production_lock,
                         lock_data,
                         current_fingerprint,
                         current_params,
@@ -405,7 +384,7 @@ def execute_stage(
                                 deferred_writes=deferred,
                             )
 
-                output_paths, accessed_dep_keys = _run_stage_function_with_store(
+                output_paths = _run_stage_function_with_store(
                     stage_info["func"],
                     stage_name,
                     output_queue,
@@ -429,7 +408,6 @@ def execute_stage(
                         run_reason,
                         ring_buffer,
                         input_hash=input_hash,
-                        accessed_dep_keys=accessed_dep_keys,
                     )
 
                 # Build lock data
@@ -451,16 +429,14 @@ def execute_stage(
                         state_db,
                         file_hash_entries=file_hash_entries,
                     )
-                    result = StageResult(
+                    return StageResult(
                         status=StageStatus.RAN,
                         reason=run_reason,
                         input_hash=input_hash,
                         output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
                         deferred_writes=deferred,
-                        accessed_dep_keys=accessed_dep_keys,
                     )
-                    return result
         except exceptions.OutputMissingError as e:
             return _make_result(StageStatus.FAILED, str(e), ring_buffer, input_hash=input_hash)
         except SystemExit as e:
@@ -556,36 +532,28 @@ def _deps_list_for_input_hash(
 
 def _check_skip_or_run(
     stage_info: WorkerStageInfo,
-    stage_lock: lock.StageLock,
     lock_data: LockData | None,
     current_fingerprint: dict[str, str],
     current_params: dict[str, Any],
     dep_hashes: dict[str, HashInfo],
 ) -> tuple[str | None, str, str]:
-    """Determine if stage can skip or must run.
-
-    Returns (skip_reason, run_reason, input_hash) where exactly one of skip/run reason is meaningful:
-    - If skip_reason is not None: stage can skip, run_reason is empty
-    - If skip_reason is None: stage must run, run_reason explains why
-    - input_hash is always returned for run cache recording
-    """
-    out_paths = _get_normalized_out_paths(stage_info)
+    """Determine if stage can skip or must run."""
+    out_identities = [out.identity for out in stage_info["outs"]]
     out_specs = _get_output_specs(stage_info)
     deps_list = _deps_list_for_input_hash(stage_info, dep_hashes)
     input_hash = run_history.compute_input_hash(
         current_fingerprint, current_params, deps_list, out_specs
     )
-
-    if lock_data is None:
-        return None, "No previous run", input_hash
-
-    changed, run_reason = stage_lock.is_changed_with_lock_data(
-        lock_data, current_fingerprint, current_params, dep_hashes, out_paths
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint=current_fingerprint,
+        params=current_params,
+        dep_hashes=_to_identity_hashes(dep_hashes),
+        out_paths=out_identities,
     )
-    if not changed:
-        return "unchanged", "", input_hash
-
-    return None, run_reason, input_hash
+    if decision["changed"]:
+        return None, decision["reason"], input_hash
+    return "unchanged", "", input_hash
 
 
 def _cleanup_restored_paths(restored_paths: list[pathlib.Path]) -> None:
@@ -799,7 +767,7 @@ def _load_dep_from_store(ref: types.ArtifactRef, store: store_mod.Store) -> Any:
         for file_path in sorted(p for p in dir_path.rglob("*") if p.is_file()):
             rel_key = file_path.relative_to(dir_path).as_posix()
             values[rel_key] = loader.load(file_path)
-        return TrackedDict(values)
+        return values
     return loader.load(path)
 
 
@@ -918,7 +886,7 @@ def _run_stage_function_with_store(
     store: store_mod.Store,
     params_arg_name: str | None,
     collection_params: dict[str, str],
-) -> tuple[dict[types.ArtifactRef, pathlib.Path], dict[str, set[str]]]:
+) -> dict[types.ArtifactRef, pathlib.Path]:
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
         _QueueWriter(stage_name, output_queue, is_stderr=True, ring_buffer=ring_buffer),

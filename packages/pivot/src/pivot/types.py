@@ -175,7 +175,6 @@ class StageResult(TypedDict):
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
-    accessed_dep_keys: NotRequired[dict[str, set[str]]]
 
 
 # =============================================================================
@@ -336,8 +335,6 @@ class DepEntry(TypedDict):
     key: str | None
     hash: str
     display: NotRequired[str]
-    accessed_keys: NotRequired[list[str]]
-    accessed_hashes: NotRequired[dict[str, str]]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 

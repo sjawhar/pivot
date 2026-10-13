@@ -113,11 +113,6 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
         entry = DepEntry(producer=identity.producer, key=identity.key, hash=hash_info["hash"])
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
-        raw_info = dict(hash_info)  # shallow copy to check extra keys
-        if "accessed_keys" in raw_info:
-            entry["accessed_keys"] = cast("list[str]", raw_info["accessed_keys"])
-        if "accessed_hashes" in raw_info:
-            entry["accessed_hashes"] = cast("dict[str, str]", raw_info["accessed_hashes"])
         deps_list.append(entry)
     deps_list.sort(key=lambda e: (e["producer"], e["key"] or ""))
 
@@ -154,17 +149,7 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
             hash_info: HashInfo = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
             hash_info = FileHash(hash=entry["hash"])
-        if "accessed_keys" in entry or "accessed_hashes" in entry:
-            raw = dict[str, object](hash=hash_info["hash"])  # type: ignore[call-overload] - building mutable copy
-            if is_dir_hash(hash_info):
-                raw["manifest"] = hash_info["manifest"]
-            if "accessed_keys" in entry:
-                raw["accessed_keys"] = entry["accessed_keys"]
-            if "accessed_hashes" in entry:
-                raw["accessed_hashes"] = entry["accessed_hashes"]
-            dep_hashes[identity] = cast("HashInfo", cast("object", raw))
-        else:
-            dep_hashes[identity] = hash_info
+        dep_hashes[identity] = hash_info
 
     output_hashes = dict[ArtifactIdentity, HashInfo]()
     for entry in data["outs"]:
