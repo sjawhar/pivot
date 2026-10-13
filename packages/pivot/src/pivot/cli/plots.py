@@ -23,8 +23,8 @@ def plots() -> None:
     "-o",
     "--output",
     type=click.Path(path_type=pathlib.Path),
-    default="pivot_plots/index.html",
-    help="Output HTML path (default: pivot_plots/index.html)",
+    default=".pivot/plots/index.html",
+    help="Output HTML path (default: .pivot/plots/index.html)",
 )
 @click.option("--open", "open_browser", is_flag=True, help="Open browser after rendering")
 @cli_decorators.with_error_handling

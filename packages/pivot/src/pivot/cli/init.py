@@ -25,6 +25,9 @@ _GITIGNORE_CONTENT = """\
 
 # Config lock (held while editing config.yaml)
 /config.yaml.lock
+
+# Generated plots gallery (pivot plots show)
+/plots/
 """
 
 
