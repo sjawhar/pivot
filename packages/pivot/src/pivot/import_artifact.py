@@ -140,9 +140,13 @@ async def read_remote_config(
 
     default_remote = config_data.get("default_remote")
     if default_remote is not None and not isinstance(default_remote, str):
-        raise exceptions.RemoteError(
-            f"Remote config default_remote must be a remote name, got {default_remote!r}"
+        # Warn-first: the source config is a saved input outside this repo.
+        logger.warning(
+            "Remote config default_remote in %s must be a remote name, got %r; ignoring it",
+            repo_url,
+            default_remote,
         )
+        default_remote = None
     if default_remote is None:
         if len(remotes) == 1:
             default_remote = next(iter(remotes.keys()))
