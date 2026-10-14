@@ -796,8 +796,13 @@ def _write_output_with_store(
             writer.save(output_value, destination)
         except TypeError as e:
             if isinstance(writer, loaders.YAML):
+                output = (
+                    "its YAML output"
+                    if ref.identity.key is None
+                    else f"YAML output {ref.identity.key!r}"
+                )
                 raise TypeError(
-                    f"Stage '{ref.identity.producer}' cannot write YAML output {ref.identity.key!r}: {e}"
+                    f"Stage '{ref.identity.producer}' cannot write {output}: {e}"
                 ) from e
             raise
 

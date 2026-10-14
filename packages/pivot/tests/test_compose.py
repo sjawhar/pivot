@@ -2106,7 +2106,11 @@ def test_metric_dataframe_fails_at_write_with_stage_and_type(
     )
 
     assert result["status"] == types.StageStatus.FAILED
-    assert "metricsafe/_helper_metric_dataframe" in result["reason"]
+    assert (
+        "Stage 'metricsafe/_helper_metric_dataframe' cannot write its YAML output"
+        in (result["reason"])
+    )
+    assert "None" not in result["reason"], "a single output has no key to name"
     assert "DataFrame" in result["reason"]
 
 
