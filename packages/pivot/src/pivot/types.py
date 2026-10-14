@@ -439,7 +439,7 @@ class DepChange(TypedDict):
 class OutputChange(TypedDict):
     """Change info for an output artifact."""
 
-    path: ArtifactIdentity
+    identity: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType | None  # None means unchanged
@@ -688,7 +688,7 @@ class TuiStatusMessage(TypedDict):
     elapsed: float | None
     run_id: str
     explanation: NotRequired[StageExplanation | None]
-    output_summary: NotRequired[list[dict[str, object]] | None]
+    output_summary: NotRequired[list[OutputChange] | None]
 
 
 class TuiWatchMessage(TypedDict):

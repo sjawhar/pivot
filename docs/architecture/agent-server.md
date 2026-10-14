@@ -35,7 +35,7 @@ Example response:
 }
 ```
 
-**Artifact identities:** every artifact identity in a response, including those inside `stage_info`, `explain` and the events returned by `events_since`, is sent as an object `{"producer": "<stage>", "key": "<output key or null>"}`.
+**Artifact identities:** every artifact identity in a response is sent as an object `{"producer": "<stage>", "key": "<output key or null>"}`. That covers `stage_info`, `explain`, and the events returned by `events_since`, including each `stage_completed.output_summary[].identity`.
 
 ## Available Methods
 

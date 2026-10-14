@@ -21,6 +21,8 @@ import pytest
 
 from helpers import wait_for_socket as _wait_for_socket
 from pivot.types import (
+    ArtifactIdentity,
+    ChangeType,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -861,14 +863,14 @@ async def test_poller_completed_carries_output_summary(tmp_path: Path) -> None:
     server = FakeRpcServer()
     output_summary = [
         {
-            "path": "output.csv",
+            "identity": {"producer": "train", "key": "output"},
             "change_type": "modified",
             "output_type": "out",
             "old_hash": "abc123",
             "new_hash": "def456",
         },
         {
-            "path": "metrics.json",
+            "identity": {"producer": "train", "key": None},
             "change_type": "added",
             "output_type": "metric",
             "old_hash": None,
@@ -913,10 +915,12 @@ async def test_poller_completed_carries_output_summary(tmp_path: Path) -> None:
     assert msg["stage"] == "train"
     assert "output_summary" in msg, "TuiStatusMessage should carry output_summary"
     summary = msg["output_summary"]
-    assert isinstance(summary, list), "output_summary should be a list"
+    assert summary is not None
     assert len(summary) == 2, "Should have two output entries"
-    assert summary[0]["path"] == "output.csv"  # type: ignore[index]
-    assert summary[1]["path"] == "metrics.json"  # type: ignore[index]
+    assert summary[0]["identity"] == ArtifactIdentity("train", "output")
+    assert summary[0]["change_type"] == ChangeType.MODIFIED
+    assert summary[1]["identity"] == ArtifactIdentity("train", None)
+    assert summary[1]["output_type"] == "metric"
 
 
 @pytest.mark.anyio
@@ -1084,7 +1088,7 @@ async def test_poller_stops_on_json_decode_error_in_watch_mode() -> None:
 
 
 # =============================================================================
-# Fix (c): Invalid explanation/output_summary payloads → graceful skip
+# Fix (c): Invalid explanation payloads → graceful skip; invalid output_summary → error
 # =============================================================================
 
 
@@ -1218,48 +1222,54 @@ async def test_explanation_missing_multiple_required_keys_skipped(tmp_path: Path
     assert "explanation" not in msg, "Incomplete explanation should be skipped"
 
 
-@pytest.mark.anyio
-async def test_invalid_output_summary_payload_skipped(tmp_path: Path) -> None:
-    """Non-list output_summary payload is skipped — no 'output_summary' key on message."""
-    socket_path = tmp_path / "poller.sock"
-    server = FakeRpcServer()
-    server.inject_event(
-        {
-            "type": "stage_completed",
-            "stage": "train",
-            "index": 0,
-            "total": 1,
-            "status": "ran",
-            "reason": "",
-            "duration_ms": 500,
-            "run_id": "run-bad-out",
-            "output_summary": "not a list",  # invalid: should be list
-        }
-    )
+@pytest.mark.parametrize(
+    "output_summary",
+    [
+        pytest.param("not a list", id="not-a-list"),
+        pytest.param(
+            [
+                {
+                    "identity": "train:output",
+                    "change_type": None,
+                    "output_type": "out",
+                    "old_hash": None,
+                    "new_hash": "x",
+                }
+            ],
+            id="identity-as-key-string",
+        ),
+        pytest.param(
+            [
+                {
+                    "identity": {"producer": "train", "key": None},
+                    "change_type": None,
+                    "output_type": "table",
+                    "old_hash": None,
+                    "new_hash": "x",
+                }
+            ],
+            id="unknown-output-type",
+        ),
+    ],
+)
+def test_malformed_output_summary_raises(output_summary: object) -> None:
+    """A malformed output_summary is a protocol error; nothing guesses an identity."""
+    from pivot_tui import event_poller
+    from pivot_tui.rpc_client_impl import RpcProtocolError
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
-
-    await server.start(socket_path)
-    try:
-        await _wait_for_socket(socket_path)
-        client = RpcPivotClient()
-        await client.connect(socket_path)
-
-        poller = EventPoller(client, messages.append)
-
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(poller.run)
-            await anyio.sleep(0.3)
-            poller.stop()
-
-        await client.disconnect()
-    finally:
-        await server.stop()
-
-    assert len(messages) >= 1, "Should have received at least one message"
-    msg = cast("TuiStatusMessage", messages[0])
-    assert msg["stage"] == "train", "Message should still be created"
-    assert "output_summary" not in msg, "Invalid output_summary should be skipped"
+    event: dict[str, object] = {
+        "type": "stage_completed",
+        "stage": "train",
+        "index": 0,
+        "total": 1,
+        "status": "ran",
+        "reason": "",
+        "duration_ms": 500,
+        "run_id": "run-bad-out",
+        "output_summary": output_summary,
+    }
+    with pytest.raises(RpcProtocolError):
+        event_poller._make_completed_message(event)
 
 
 # =============================================================================

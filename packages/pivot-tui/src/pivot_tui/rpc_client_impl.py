@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import anyio
 
-from pivot.types import ArtifactIdentity, ChangeType, DepChange, StageExplanation
+from pivot.types import ArtifactIdentity, ChangeType, DepChange, OutputChange, StageExplanation
 from pivot_tui.client import (
     CommitResult,
     EngineStatus,
@@ -33,7 +33,13 @@ if TYPE_CHECKING:
 
     from pivot.types import CodeChange, ParamChange
 
-__all__ = ["RpcError", "RpcProtocolError", "RpcPivotClient", "decode_stage_explanation"]
+__all__ = [
+    "RpcError",
+    "RpcProtocolError",
+    "RpcPivotClient",
+    "decode_output_summary",
+    "decode_stage_explanation",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -302,6 +308,38 @@ def _as_dep_changes(value: list[object]) -> list[DepChange]:
                 old_hash=_as_optional_str(d["old_hash"], "old_hash"),
                 new_hash=_as_optional_str(d["new_hash"], "new_hash"),
                 change_type=ChangeType(change_type),
+            )
+        )
+    return changes
+
+
+def _as_output_type(value: object) -> Literal["out", "metric", "plot"]:
+    match value:
+        case "out":
+            return "out"
+        case "metric":
+            return "metric"
+        case "plot":
+            return "plot"
+        case _:
+            raise RpcProtocolError("'out', 'metric' or 'plot' (output_type)", repr(value))
+
+
+def decode_output_summary(value: object) -> list[OutputChange]:
+    """Decode a ``stage_completed`` event's ``output_summary``, rebuilding artifact identities."""
+    if not isinstance(value, list):
+        raise RpcProtocolError("list", type(value).__name__)
+    changes = list[OutputChange]()
+    for item in cast("list[object]", value):
+        d = _as_dict(item)
+        change_type = _as_optional_str(d["change_type"], "change_type")
+        changes.append(
+            OutputChange(
+                identity=_as_identity(d["identity"]),
+                old_hash=_as_optional_str(d["old_hash"], "old_hash"),
+                new_hash=_as_optional_str(d["new_hash"], "new_hash"),
+                change_type=None if change_type is None else ChangeType(change_type),
+                output_type=_as_output_type(d["output_type"]),
             )
         )
     return changes

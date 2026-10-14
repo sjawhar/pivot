@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
     from anyio.streams.memory import MemoryObjectSendStream
 
-    from pivot.types import CompletionType, OnError, StageExplanation
+    from pivot.types import ArtifactIdentity, CompletionType, OnError, StageExplanation
 
 __all__ = [
     "StageExecutionState",
@@ -162,9 +162,9 @@ class StageStarted(TypedDict):
 
 
 class OutputChangeSummary(TypedDict):
-    """Summary of output changes for a single output file."""
+    """Summary of output changes for a single output artifact."""
 
-    path: str
+    identity: ArtifactIdentity
     change_type: str | None  # "added", "modified", "removed", "unchanged", or None if unknown
     output_type: str  # "out", "metric", "plot"
     old_hash: str | None

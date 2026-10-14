@@ -8,6 +8,7 @@ on disk and observes the engine's output events and the files its stages write.
 from __future__ import annotations
 
 import functools
+import json
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -21,7 +22,7 @@ from pivot.engine import engine as engine_mod
 from pivot.engine.types import EngineState, OutputEvent
 from pivot.storage import store as store_mod
 from pivot.types import StageStatus
-from pivot_tui import rpc_client_impl
+from pivot_tui import event_poller, rpc_client_impl
 
 if TYPE_CHECKING:
     import pathlib
@@ -550,3 +551,41 @@ async def test_refusal_added_mid_session_waits_for_fix(
             assert reload_event["stages_modified"] == ["reload/change"]
             assert change_output.read_text() == "x-v3", "the fixed pipeline runs"
             tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_stage_completed_output_identity_reaches_tui_as_artifact_identity(
+    watch_project: pathlib.Path,
+) -> None:
+    """``output_summary`` identities cross the RPC wire as ``{producer, key}`` objects."""
+    (watch_project / "pipeline.py").write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    identity = pipeline.get_stage("reload/change")["outs"][0].identity
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(
+            sources.OneShotSource(
+                stages=["reload/change"], force=False, reason="test", max_workers=1
+            )
+        )
+        await eng.run()
+
+    completed = next(
+        event
+        for event in recorder.events
+        if event["type"] == "stage_completed" and event["stage"] == "reload/change"
+    )
+    wire = json.loads(agent_rpc._encode_wire(completed))
+    assert wire["output_summary"][0]["identity"] == {
+        "producer": identity.producer,
+        "key": identity.key,
+    }
+
+    msg = event_poller._make_completed_message(wire)
+    assert msg is not None
+    assert "output_summary" in msg
+    summary = msg["output_summary"]
+    assert summary is not None
+    assert summary[0]["identity"] == identity

@@ -29,10 +29,7 @@ import textual.timer
 import textual.widget
 import textual.widgets
 
-from pivot import types
 from pivot.types import (
-    ChangeType,
-    OutputChange,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -99,43 +96,6 @@ def format_reload_summary(
         return None
 
     return f"Reloaded: {', '.join(parts)}"
-
-
-_logger = logging.getLogger(__name__)
-
-
-def _safe_change_type(raw: object) -> ChangeType | None:
-    """Convert raw change_type to ChangeType, returning None for unknown values."""
-    if raw is None:
-        return None
-    try:
-        return ChangeType(str(raw))
-    except ValueError:
-        _logger.warning("Unknown change_type %r, treating as None", raw)
-        return None
-
-
-def _convert_output_summary(
-    raw: list[dict[str, object]] | None,
-) -> list[OutputChange] | None:
-    """Convert raw output_summary dicts from events to typed OutputChange list."""
-    if raw is None:
-        return None
-    result = list[OutputChange]()
-    for item in raw:
-        change_type_raw = item.get("change_type")
-        path_raw = item.get("path")
-        path_key = path_raw if isinstance(path_raw, str) else "unknown"
-        result.append(
-            OutputChange(
-                path=types.identity_from_key(path_key),
-                old_hash=str(item["old_hash"]) if item.get("old_hash") is not None else None,
-                new_hash=str(item["new_hash"]) if item.get("new_hash") is not None else None,
-                change_type=_safe_change_type(change_type_raw),
-                output_type=str(item.get("output_type", "out")),  # pyright: ignore[reportArgumentType] - raw JSON str
-            )
-        )
-    return result
 
 
 class MessagePoster(Protocol):
@@ -553,7 +513,7 @@ class PivotApp(textual.app.App[None]):
         if "explanation" in msg:
             info.live_input_snapshot = msg["explanation"]
         if "output_summary" in msg:
-            info.live_output_snapshot = _convert_output_summary(msg["output_summary"])
+            info.live_output_snapshot = msg["output_summary"]
 
         # Watch mode: history capture
         if self._watch_mode:

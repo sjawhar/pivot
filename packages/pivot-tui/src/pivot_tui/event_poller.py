@@ -29,7 +29,11 @@ from pivot.types import (
     TuiWatchMessage,
     WatchStatus,
 )
-from pivot_tui.rpc_client_impl import RpcProtocolError, decode_stage_explanation
+from pivot_tui.rpc_client_impl import (
+    RpcProtocolError,
+    decode_output_summary,
+    decode_stage_explanation,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -239,12 +243,10 @@ def _make_completed_message(event: dict[str, object]) -> TuiStatusMessage | None
         elapsed=duration_ms / 1000.0,
         run_id=run_id,
     )
-    output_summary = event.get("output_summary")
-    if isinstance(output_summary, list):
-        msg["output_summary"] = cast("list[dict[str, object]]", output_summary)
-    elif output_summary is not None:
-        _logger.warning(
-            "Invalid output_summary payload, skipping: %s", type(output_summary).__name__
+    if "output_summary" in event:
+        output_summary = event["output_summary"]
+        msg["output_summary"] = (
+            None if output_summary is None else decode_output_summary(output_summary)
         )
     return msg
 

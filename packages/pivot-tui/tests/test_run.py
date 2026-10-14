@@ -1209,18 +1209,20 @@ def test_handle_status_stores_explanation_on_stage_info() -> None:
 
 
 def test_handle_status_stores_output_summary_on_stage_info() -> None:
-    """_handle_status converts output_summary and stores on StageInfo.live_output_snapshot."""
+    """_handle_status stores the decoded output_summary on StageInfo.live_output_snapshot."""
     from unittest.mock import patch
+
+    from pivot.types import ChangeType, OutputChange
 
     app = run_tui.PivotApp(stage_names=["train"])
     output_summary = [
-        {
-            "path": "output.csv",
-            "change_type": "modified",
-            "output_type": "out",
-            "old_hash": "aaa",
-            "new_hash": "bbb",
-        },
+        OutputChange(
+            identity=ArtifactIdentity("train", None),
+            change_type=ChangeType.MODIFIED,
+            output_type="out",
+            old_hash="aaa",
+            new_hash="bbb",
+        ),
     ]
     msg = TuiStatusMessage(
         type=TuiMessageType.STATUS,
@@ -1231,7 +1233,7 @@ def test_handle_status_stores_output_summary_on_stage_info() -> None:
         reason="",
         elapsed=1.0,
         run_id="run-1",
-        output_summary=output_summary,  # pyright: ignore[reportArgumentType]
+        output_summary=output_summary,
     )
     with (
         patch.object(app, "_try_query_one", return_value=None),
@@ -1239,10 +1241,10 @@ def test_handle_status_stores_output_summary_on_stage_info() -> None:
     ):
         app._handle_status(msg)
     snapshot = app._stages["train"].live_output_snapshot
-    assert snapshot is not None, "output_summary should be converted and stored"
+    assert snapshot is not None, "output_summary should be stored"
     assert len(snapshot) == 1
-    assert snapshot[0]["path"] == ArtifactIdentity("output.csv", None)
-    assert snapshot[0]["change_type"] == "modified"
+    assert snapshot[0]["identity"] == ArtifactIdentity("train", None)
+    assert snapshot[0]["change_type"] == ChangeType.MODIFIED
 
 
 def test_handle_status_no_snapshot_fields_leaves_none() -> None:
@@ -1267,38 +1269,3 @@ def test_handle_status_no_snapshot_fields_leaves_none() -> None:
         app._handle_status(msg)
     assert app._stages["train"].live_input_snapshot is None
     assert app._stages["train"].live_output_snapshot is None
-
-
-def test_convert_output_summary_none() -> None:
-    """_convert_output_summary returns None for None input."""
-    assert run_tui._convert_output_summary(None) is None
-
-
-def test_convert_output_summary_converts_change_types() -> None:
-    """_convert_output_summary converts string change_types to ChangeType enums."""
-    from pivot.types import ChangeType
-
-    raw = [
-        {
-            "path": "a.csv",
-            "change_type": "added",
-            "output_type": "out",
-            "old_hash": None,
-            "new_hash": "x",
-        },
-        {
-            "path": "b.csv",
-            "change_type": None,
-            "output_type": "metric",
-            "old_hash": "y",
-            "new_hash": "y",
-        },
-    ]
-    result = run_tui._convert_output_summary(raw)  # pyright: ignore[reportArgumentType]
-    assert result is not None
-    assert len(result) == 2
-    assert result[0]["change_type"] == ChangeType.ADDED
-    assert result[0]["old_hash"] is None
-    assert result[0]["new_hash"] == "x"
-    assert result[1]["change_type"] is None
-    assert result[1]["output_type"] == "metric"

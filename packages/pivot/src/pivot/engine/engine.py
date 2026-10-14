@@ -1949,37 +1949,28 @@ class Engine:
             stage_lock = lock.StageLock(stage_name, stages_dir)
             lock_data = stage_lock.read()
 
-            # Build path -> output_type map from registry
-            outs = stage_info["outs"]
-            outs_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
-            path_to_type = dict[str, str]()
-            for out in outs:
-                match out.tag:
-                    case ArtifactTag.METRIC:
-                        path_to_type[types.identity_key(out.identity)] = "metric"
-                    case ArtifactTag.PLOT:
-                        path_to_type[types.identity_key(out.identity)] = "plot"
-                    case _:
-                        path_to_type[types.identity_key(out.identity)] = "out"
-
             summary = list[OutputChangeSummary]()
-            # Get new hashes from lock file
-            new_hashes = dict[str, str | None]()
+            new_hashes = dict[types.ArtifactIdentity, str]()
             if lock_data is not None and "output_hashes" in lock_data:
                 for identity, hash_info in lock_data["output_hashes"].items():
-                    new_hashes[types.identity_key(identity)] = hash_info["hash"]
+                    new_hashes[identity] = hash_info["hash"]
 
-            for path in outs_paths:
-                new_hash = new_hashes.get(path)
-                output_type = path_to_type.get(path, "out")
+            for out in stage_info["outs"]:
+                match out.tag:
+                    case ArtifactTag.METRIC:
+                        output_type = "metric"
+                    case ArtifactTag.PLOT:
+                        output_type = "plot"
+                    case _:
+                        output_type = "out"
                 # change_type is None because we don't have old hashes at this point
                 summary.append(
                     OutputChangeSummary(
-                        path=path,
+                        identity=out.identity,
                         change_type=None,
                         output_type=output_type,
                         old_hash=None,
-                        new_hash=new_hash,
+                        new_hash=new_hashes.get(out.identity),
                     )
                 )
 

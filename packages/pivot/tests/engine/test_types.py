@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pivot.engine import types
-from pivot.types import ChangeType, OnError, StageExplanation, StageStatus
+from pivot.types import ArtifactIdentity, ChangeType, OnError, StageExplanation, StageStatus
 
 
 def test_stage_execution_state_ordering() -> None:
@@ -307,14 +307,14 @@ def test_stage_completed_with_populated_output_summary() -> None:
     """StageCompleted carries output change summaries when provided."""
     summary = [
         types.OutputChangeSummary(
-            path="output.csv",
+            identity=ArtifactIdentity("train", "output"),
             change_type=None,
             output_type="out",
             old_hash=None,
             new_hash="def456",
         ),
         types.OutputChangeSummary(
-            path="metrics.json",
+            identity=ArtifactIdentity("train", "metrics"),
             change_type=None,
             output_type="metric",
             old_hash=None,
@@ -336,7 +336,7 @@ def test_stage_completed_with_populated_output_summary() -> None:
     output_summary = event["output_summary"]
     assert output_summary is not None
     assert len(output_summary) == 2
-    assert output_summary[0]["path"] == "output.csv"
+    assert output_summary[0]["identity"] == ArtifactIdentity("train", "output")
     assert output_summary[0]["output_type"] == "out"
     assert output_summary[0]["new_hash"] == "def456"
     assert output_summary[1]["output_type"] == "metric"
@@ -345,13 +345,13 @@ def test_stage_completed_with_populated_output_summary() -> None:
 def test_output_change_summary_typeddict() -> None:
     """OutputChangeSummary has all required fields."""
     summary = types.OutputChangeSummary(
-        path="data/output.csv",
+        identity=ArtifactIdentity("train", None),
         change_type="modified",
         output_type="out",
         old_hash="aaa111",
         new_hash="bbb222",
     )
-    assert summary["path"] == "data/output.csv"
+    assert summary["identity"] == ArtifactIdentity("train", None)
     assert summary["change_type"] == "modified"
     assert summary["output_type"] == "out"
     assert summary["old_hash"] == "aaa111"
@@ -359,7 +359,7 @@ def test_output_change_summary_typeddict() -> None:
 
     # With None values (no old hash, unknown change type)
     summary_new = types.OutputChangeSummary(
-        path="new_output.csv",
+        identity=ArtifactIdentity("plot", None),
         change_type=None,
         output_type="plot",
         old_hash=None,
