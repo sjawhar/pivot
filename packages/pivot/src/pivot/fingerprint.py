@@ -3,6 +3,7 @@ import atexit
 import contextlib
 import contextvars
 import dataclasses
+import enum
 import functools
 import inspect
 import json
@@ -44,7 +45,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 13 hashes a function value by its name and code instead of its address-bearing repr.
 # Version 14 walks user functions and classes bound in functools.partial arguments.
 # Version 15 hashes an object with the default repr by its class and attributes, not its address.
-_CACHE_SCHEMA_VERSION = 15
+# Version 16 records the live values a walk read, which a cache hit reads again.
+_CACHE_SCHEMA_VERSION = 16
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -106,6 +108,9 @@ _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, A
     weakref.WeakKeyDictionary()
 )
 
+# Cache for _schema_hash results, keyed by pydantic model class.
+_schema_hash_cache: weakref.WeakKeyDictionary[type, str] = weakref.WeakKeyDictionary()
+
 # Module-level state for persistent AST hash caching.
 # Fingerprinting happens during discovery (single-threaded in coordinator process).
 # Workers (via ProcessPoolExecutor) have their own memory space and don't share this
@@ -138,6 +143,17 @@ _capture_errors: contextvars.ContextVar[list[str] | None] = contextvars.ContextV
 # persistent manifest cache.
 _unsafe_capture_warning: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_unsafe_capture_warning", default=False
+)
+
+# Live values read while computing a cacheable manifest: (path, token) per read. A path is the
+# steps from the stage function to the object being visited, then the step that reads the value.
+_recorded_reads: contextvars.ContextVar[list[tuple[tuple[str, ...], str]] | None] = (
+    contextvars.ContextVar("_recorded_reads", default=None)
+)
+
+# Steps from the stage function to the object the walk is visiting.
+_walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "_walk_path", default=()
 )
 
 
@@ -313,7 +329,12 @@ def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None
 
 
 def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[str, str] | None:
-    """Try to load a cached manifest; returns None on miss."""
+    """Try to load a cached manifest; returns None on miss.
+
+    A hit needs every recorded source file unchanged and every live value the walk read to
+    give the same token again (`_recorded_reads_hold`). Values computed at import from the
+    environment or a data file change without touching any source file.
+    """
     db = _get_state_db()
     if db is None:
         return None
@@ -337,7 +358,12 @@ def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[s
     typed_data = cast("dict[str, Any]", data)
     manifest_raw: object = typed_data.get("m")
     sources_raw: object = typed_data.get("s")
-    if not isinstance(manifest_raw, dict) or not isinstance(sources_raw, dict):
+    reads_raw: object = typed_data.get("r")
+    if (
+        not isinstance(manifest_raw, dict)
+        or not isinstance(sources_raw, dict)
+        or not isinstance(reads_raw, list)
+    ):
         return None
 
     # Narrow types after validation: manifest is {str: str}, sources is {str: [int, int, int]}
@@ -368,7 +394,181 @@ def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[s
         if st.st_mtime_ns != cached_mtime or st.st_size != cached_size or st.st_ino != cached_ino:
             return None  # File changed
 
+    if not _recorded_reads_hold(func, cast("list[object]", reads_raw)):
+        return None
     return manifest
+
+
+class _ValueKind(enum.Enum):
+    """How the walk treats a value read through a global, a cell, a default or `module.NAME`."""
+
+    PARTIAL = "partial"
+    REFUSED = "refused"
+    USER = "user"
+    EXTERNAL = "external"
+    MODULE = "module"
+    LOGGER = "logger"
+    SCALAR = "scalar"
+
+
+def _value_kind(value: Any) -> _ValueKind:
+    """Classify a value a walked function reads; the walk and a cache hit share this."""
+    # functools.partial fails is_user_code() (module is functools/stdlib).
+    if isinstance(value, functools.partial):
+        return _ValueKind.PARTIAL
+    if _is_callable_instance(value) or _is_user_class_instance(value):
+        return _ValueKind.REFUSED
+    if callable(value):
+        return _ValueKind.USER if is_user_code(value) else _ValueKind.EXTERNAL
+    if isinstance(value, types.ModuleType):
+        return _ValueKind.MODULE
+    if isinstance(value, logging.Logger):
+        return _ValueKind.LOGGER
+    if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        return _ValueKind.SCALAR
+    return _ValueKind.REFUSED
+
+
+def _value_token(value: Any) -> str:
+    """Summarise the walk's own entries for a read value; what it reads has its own steps."""
+    kind = _value_kind(value)
+    if kind is _ValueKind.PARTIAL:
+        return f"partial:{_serialize_value_for_hash(value)}"
+    if kind is _ValueKind.USER:
+        prefix = "class" if isinstance(value, type) else "function"
+        return f"{prefix}:{_definition_ref(value)}:{hash_function_ast(value)}"
+    if kind is _ValueKind.MODULE:
+        return f"module:{value.__name__}"
+    if kind is _ValueKind.SCALAR:
+        return f"{type(value).__name__}:{value!r}"
+    return kind.value
+
+
+def _default_token(value: Any) -> str:
+    """Like `_value_token`, for a default argument (see `_process_default_values`)."""
+    from pivot import compose, stage_def
+
+    if isinstance(value, stage_def.StageParams):
+        return f"params:{_serialize_value_for_hash(value)}"
+    if _is_artifact_handles(value, compose.ArtifactHandle):
+        return "handles"
+    return _value_token(value)
+
+
+# A walk step names one move from a visited object to a value it reads: `g:NAME` a global
+# (also recorded when absent), `c:NAME` a closure cell, `d:PARAM` a default, `a:ATTR` a module
+# attribute, `n:NAME` and `np:DOTTED` names in a class's module, `u` the function behind a
+# C-level wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and
+# `s:INDEX` container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a
+# model's field annotations. `hints` and `schema` read the visited object itself.
+_UNREAD = object()
+
+
+def _read_step(owner: Any, step: str) -> Any:
+    """Return the value `step` reaches from `owner`, or `_UNREAD` when nothing is there."""
+    kind, _, arg = step.partition(":")
+    try:
+        match kind:
+            case "g":
+                return owner.__globals__[arg]
+            case "c":
+                return owner.__closure__[owner.__code__.co_freevars.index(arg)].cell_contents
+            case "d":
+                return dict(_function_defaults(owner))[arg]
+            case "a":
+                return getattr(owner, arg)
+            case "n":
+                return vars(sys.modules[owner.__module__])[arg]
+            case "np":
+                namespace = vars(sys.modules[owner.__module__])
+                return _resolve_dotted_path(tuple(arg.split(".")), namespace)
+            case "u":
+                return inspect.unwrap(owner)
+            case "pf":
+                return owner.func
+            case "pa":
+                return owner.args[int(arg)]
+            case "pk":
+                return owner.keywords[arg]
+            case "i":
+                return owner[int(arg)]
+            case "k":
+                return next(item for key, item in owner.items() if repr(key) == arg)
+            case "s":
+                return sorted(owner, key=_serialize_value_for_hash)[int(arg)]
+            case "hc":
+                return _hint_classes(owner)[int(arg)][0]
+            case "fc":
+                return _model_field_classes(owner)[int(arg)]
+            case _:
+                return _UNREAD
+    except (AttributeError, KeyError, IndexError, ValueError, TypeError, StopIteration):
+        return _UNREAD
+
+
+def _read_token(owner: Any, step: str) -> str:
+    """Return the token for what `step` reads from `owner` now.
+
+    Equal tokens mean the walk makes the same decision there and adds the same entries for
+    the value itself.
+    """
+    if step == "hints":
+        return "|".join(f"{_value_token(cls)}:{whole}" for cls, whole in _hint_classes(owner))
+    if step == "schema":
+        if not hasattr(owner, "model_json_schema"):
+            return "absent"
+        field_classes = "|".join(_value_token(cls) for cls in _model_field_classes(owner))
+        return f"{_schema_hash(owner)}|{field_classes}"
+    value = _read_step(owner, step)
+    if value is _UNREAD:
+        return "absent"
+    if step.startswith("d:"):
+        return _default_token(value)
+    return _value_token(value)
+
+
+def _record_read(owner: Any, step: str) -> None:
+    """Record what `owner`'s `step` reads, while a cacheable manifest is being computed."""
+    reads = _recorded_reads.get()
+    if reads is not None:
+        reads.append(((*_walk_path.get(), step), _read_token(owner, step)))
+
+
+@contextlib.contextmanager
+def _walking(step: str) -> Iterator[None]:
+    """Visit the value that `step` reads from the object being visited."""
+    token = _walk_path.set((*_walk_path.get(), step))
+    try:
+        yield
+    finally:
+        _walk_path.reset(token)
+
+
+def _recorded_reads_hold(func: Callable[..., Any], reads: list[object]) -> bool:
+    """Return whether every read recorded from `func` gives its recorded token again."""
+    owners: dict[tuple[str, ...], Any] = {(): func}
+    for entry in reads:
+        if not isinstance(entry, list) or len(cast("list[object]", entry)) != 2:
+            return False
+        path, token = cast("list[object]", entry)
+        if not isinstance(path, list) or not path or not isinstance(token, str):
+            return False
+        steps = cast("list[object]", path)
+        if not all(isinstance(step, str) for step in steps):
+            return False
+        names = cast("list[str]", steps)
+        owner = _walk_to(tuple(names[:-1]), owners)
+        if owner is _UNREAD or _read_token(owner, names[-1]) != token:
+            return False
+    return True
+
+
+def _walk_to(path: tuple[str, ...], owners: dict[tuple[str, ...], Any]) -> Any:
+    """Follow `path` from the stage function, reusing the objects already reached."""
+    if path not in owners:
+        parent = _walk_to(path[:-1], owners)
+        owners[path] = parent if parent is _UNREAD else _read_step(parent, path[-1])
+    return owners[path]
 
 
 def flush_ast_hash_cache() -> None:
@@ -565,8 +765,8 @@ def stage_fingerprint_scope(stage_name: str) -> Iterator[None]:
 def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
     """Like get_stage_fingerprint, but with manifest-level caching.
 
-    On hit, skips the entire closure walk. On miss, computes normally and
-    queues the result for flush at process exit.
+    A hit skips the walk; `_try_manifest_cache_hit` says what it checks. On a miss the walk
+    records every live value it reads, and the result is queued for flush at process exit.
     """
     _t = metrics.start()
 
@@ -581,6 +781,9 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     errors = _capture_errors.get()
     errors_before = len(errors) if errors is not None else 0
     unsafe_token = _unsafe_capture_warning.set(False)
+    reads = list[tuple[tuple[str, ...], str]]()
+    reads_token = _recorded_reads.set(reads)
+    path_token = _walk_path.set(())
     try:
         # Compute with source tracking
         token = _current_stage_name.set(stage_name)
@@ -599,6 +802,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
                 {
                     "m": manifest,
                     "s": {rel_path: list(stats) for rel_path, stats in source_map.items()},
+                    "r": [[list(path), read_token] for path, read_token in reads],
                 },
                 separators=(",", ":"),
             ).encode()
@@ -606,6 +810,8 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
 
         return manifest
     finally:
+        _walk_path.reset(path_token)
+        _recorded_reads.reset(reads_token)
         _unsafe_capture_warning.reset(unsafe_token)
         metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
 
@@ -699,14 +905,20 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         # that function's globals, nonlocals and defaults instead.
         unwrapped = inspect.unwrap(func)
         if unwrapped is not func and inspect.isfunction(unwrapped):
-            for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
-                if not key.startswith("self:"):
-                    manifest[key] = value
+            _record_read(func, "u")
+            with _walking("u"):
+                for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
+                    if not key.startswith("self:"):
+                        manifest[key] = value
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
-    _process_closure_values(closure_vars.globals, func, manifest, visited, skip_dunders=True)
-    _process_closure_values(closure_vars.nonlocals, func, manifest, visited, skip_dunders=False)
+    _process_closure_values(closure_vars.globals, func, manifest, visited, prefix="g")
+    _process_closure_values(closure_vars.nonlocals, func, manifest, visited, prefix="c")
+    # A builtin name is a global lookup that found nothing; a module may bind it at import.
+    for name in closure_vars.builtins:
+        if not name.startswith("__"):
+            _record_read(func, f"g:{name}")
 
     # Discover globals referenced by nested functions/lambdas
     # (getclosurevars only sees the outer function's own bytecode)
@@ -718,13 +930,13 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         new_names = nested_global_names - already_processed
         if new_names:
             nested_globals_dict = dict[str, Any]()
-            for name in new_names:
+            for name in sorted(new_names):
                 if name in func_globals:
                     nested_globals_dict[name] = func_globals[name]
+                elif not name.startswith("__"):
+                    _record_read(func, f"g:{name}")
             if nested_globals_dict:
-                _process_closure_values(
-                    nested_globals_dict, func, manifest, visited, skip_dunders=True
-                )
+                _process_closure_values(nested_globals_dict, func, manifest, visited, prefix="g")
 
     _process_default_values(func, manifest, visited)
     _process_type_hint_dependencies(func, manifest, visited)
@@ -760,28 +972,35 @@ def _process_class_body_dependencies(
         if isinstance(stmt, ast.AnnAssign):
             _collect_annotation_names(stmt.annotation, names, dotted_refs)
 
-    for name in names:
+    for name in sorted(names):
+        _record_read(cls, f"n:{name}")
         if name not in ns:
             continue
         value = ns[name]
         if isinstance(value, type) and is_user_code(value):
-            key = f"class:{_definition_ref(value)}"
-            if key not in manifest:
-                _add_callable_to_manifest(key, value, manifest, visited)
-            if hasattr(value, "model_fields"):
-                _hash_pydantic_schema(
-                    cast("type[_PydanticModelProtocol]", value), manifest, visited
-                )
+            with _walking(f"n:{name}"):
+                key = f"class:{_definition_ref(value)}"
+                if key not in manifest:
+                    _add_callable_to_manifest(key, value, manifest, visited)
+                if hasattr(value, "model_fields"):
+                    _hash_pydantic_schema(
+                        cast("type[_PydanticModelProtocol]", value), manifest, visited
+                    )
 
     for parts in dotted_refs:
+        step = f"np:{'.'.join(parts)}"
+        _record_read(cls, step)
         resolved = _resolve_dotted_path(parts, ns)
         if resolved is None or not isinstance(resolved, type) or not is_user_code(resolved):
             continue
-        key = f"class:{_definition_ref(resolved)}"
-        if key not in manifest:
-            _add_callable_to_manifest(key, resolved, manifest, visited)
-        if hasattr(resolved, "model_fields"):
-            _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", resolved), manifest, visited)
+        with _walking(step):
+            key = f"class:{_definition_ref(resolved)}"
+            if key not in manifest:
+                _add_callable_to_manifest(key, resolved, manifest, visited)
+            if hasattr(resolved, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", resolved), manifest, visited
+                )
 
 
 def _collect_annotation_names(
@@ -1028,16 +1247,19 @@ def _process_closure_values(
     manifest: dict[str, str],
     visited: set[int],
     *,
-    skip_dunders: bool,
+    prefix: str,
 ) -> None:
-    """Process closure variable values (globals or nonlocals) and add to manifest."""
+    """Process the globals (`prefix` "g", dunders skipped) or closure cells ("c") `func` reads."""
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
     for name, value in values.items():
-        if skip_dunders and name.startswith("__"):
+        if prefix == "g" and name.startswith("__"):
             continue
-        _process_captured_value(
-            name, _binding_ref(func, name), value, func, manifest, visited, stage_name
-        )
+        step = f"{prefix}:{name}"
+        _record_read(func, step)
+        with _walking(step):
+            _process_captured_value(
+                name, _binding_ref(func, name), value, func, manifest, visited, stage_name
+            )
 
 
 def _process_captured_value(
@@ -1055,26 +1277,22 @@ def _process_captured_value(
 
     `parameter` names the parameter when the value is a default argument.
     """
-    # functools.partial fails is_user_code() (module is functools/stdlib).
-    if isinstance(value, functools.partial):
-        _process_partial_dependency(
-            binding_ref, cast("functools.partial[Any]", value), manifest, visited
-        )
-    elif _is_callable_instance(value) or _is_user_class_instance(value):
-        _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
-    elif callable(value) and is_user_code(value):
-        _process_callable_dependency(binding_ref, value, manifest, visited)
-    elif callable(value):
-        # External functions, classes, and builtins are not user dependencies.
-        return
-    elif isinstance(value, types.ModuleType):
-        _process_module_dependency(parameter or name, value, func, manifest, visited)
-    elif isinstance(value, logging.Logger):
-        return
-    elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-        manifest[f"const:{binding_ref}"] = repr(value)
-    else:
-        _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+    match _value_kind(value):
+        case _ValueKind.PARTIAL:
+            _process_partial_dependency(
+                binding_ref, cast("functools.partial[Any]", value), manifest, visited
+            )
+        case _ValueKind.USER:
+            _process_callable_dependency(binding_ref, value, manifest, visited)
+        case _ValueKind.MODULE:
+            _process_module_dependency(parameter or name, value, func, manifest, visited)
+        case _ValueKind.SCALAR:
+            manifest[f"const:{binding_ref}"] = repr(value)
+        case _ValueKind.REFUSED:
+            _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+        case _ValueKind.EXTERNAL | _ValueKind.LOGGER:
+            # External functions, classes, builtins and loggers are not user dependencies.
+            return
 
 
 def _process_default_values(
@@ -1100,6 +1318,8 @@ def _process_default_values(
     expressions: dict[str, ast.expr] | None = None
     for parameter, value in defaults:
         binding_ref = f"{func_ref}.{parameter}"
+        step = f"d:{parameter}"
+        _record_read(func, step)
         if isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"default:{binding_ref}"] = repr(value)
             continue
@@ -1115,9 +1335,10 @@ def _process_default_values(
         if expression is not None and _is_literal(expression):
             continue
         source = ast.unparse(expression) if expression is not None else parameter
-        _process_captured_value(
-            source, binding_ref, value, func, manifest, visited, stage_name, parameter=parameter
-        )
+        with _walking(step):
+            _process_captured_value(
+                source, binding_ref, value, func, manifest, visited, stage_name, parameter=parameter
+            )
 
 
 def _is_artifact_handles(value: object, handle_type: type) -> bool:
@@ -1200,13 +1421,48 @@ def _process_partial_dependency(
     manifest[f"partial:{binding_ref}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
 
     underlying = partial_obj.func
+    _record_read(partial_obj, "pf")
     if callable(underlying) and is_user_code(underlying):
         callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
-        _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
+        with _walking("pf"):
+            _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
+    _process_partial_arguments(binding_ref, partial_obj, manifest, visited)
+
+
+def _process_partial_arguments(
+    binding_ref: str,
+    partial_obj: functools.partial[Any],
+    manifest: dict[str, str],
+    visited: set[int],
+) -> None:
+    """Walk the values bound in a partial's arguments (`_process_bound_values`)."""
     for index, item in enumerate(partial_obj.args):
-        _process_bound_values(f"{binding_ref}.args[{index}]", item, manifest, visited)
+        _process_bound_member(
+            f"{binding_ref}.args[{index}]", partial_obj, f"pa:{index}", item, manifest, visited
+        )
     for keyword, item in partial_obj.keywords.items():
-        _process_bound_values(f"{binding_ref}.kwargs[{keyword}]", item, manifest, visited)
+        _process_bound_member(
+            f"{binding_ref}.kwargs[{keyword}]",
+            partial_obj,
+            f"pk:{keyword}",
+            item,
+            manifest,
+            visited,
+        )
+
+
+def _process_bound_member(
+    binding_ref: str,
+    owner: Any,
+    step: str,
+    value: Any,
+    manifest: dict[str, str],
+    visited: set[int],
+) -> None:
+    """Walk `value`, which `step` reads from `owner`, as a bound value."""
+    _record_read(owner, step)
+    with _walking(step):
+        _process_bound_values(binding_ref, value, manifest, visited)
 
 
 def _process_bound_values(
@@ -1224,23 +1480,28 @@ def _process_bound_values(
     """
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
-        _process_bound_values(f"{binding_ref}.func", partial_obj.func, manifest, visited)
-        for index, item in enumerate(partial_obj.args):
-            _process_bound_values(f"{binding_ref}.args[{index}]", item, manifest, visited)
-        for keyword, item in partial_obj.keywords.items():
-            _process_bound_values(f"{binding_ref}.kwargs[{keyword}]", item, manifest, visited)
+        _process_bound_member(
+            f"{binding_ref}.func", partial_obj, "pf", partial_obj.func, manifest, visited
+        )
+        _process_partial_arguments(binding_ref, partial_obj, manifest, visited)
     elif isinstance(value, (list, tuple)):
         items = cast("list[Any] | tuple[Any, ...]", value)
         for index, item in enumerate(items):
-            _process_bound_values(f"{binding_ref}[{index}]", item, manifest, visited)
+            _process_bound_member(
+                f"{binding_ref}[{index}]", items, f"i:{index}", item, manifest, visited
+            )
     elif isinstance(value, (set, frozenset)):
         # Iteration order follows the hash seed, so walk members in canonical order.
         members = sorted(cast("set[Any] | frozenset[Any]", value), key=_serialize_value_for_hash)
         for index, item in enumerate(members):
-            _process_bound_values(f"{binding_ref}{{{index}}}", item, manifest, visited)
+            _process_bound_member(
+                f"{binding_ref}{{{index}}}", value, f"s:{index}", item, manifest, visited
+            )
     elif isinstance(value, dict):
         for key, item in cast("dict[Any, Any]", value).items():
-            _process_bound_values(f"{binding_ref}[{key!r}]", item, manifest, visited)
+            _process_bound_member(
+                f"{binding_ref}[{key!r}]", value, f"k:{key!r}", item, manifest, visited
+            )
     elif isinstance(value, type):
         if is_user_code(value):
             _process_callable_dependency(binding_ref, value, manifest, visited)
@@ -1279,10 +1540,8 @@ def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any
     return resolved
 
 
-def _process_type_hint_dependencies(
-    func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
-) -> None:
-    """Process user-defined classes in type hints, including Pydantic model defaults."""
+def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
+    """Return `func`'s type hints, resolved once per function per process."""
     _t = metrics.start()
     # Check cache first. TypeError raised for non-weakly-referenceable functions (builtins).
     try:
@@ -1300,49 +1559,53 @@ def _process_type_hint_dependencies(
             _get_type_hints_cache[func] = hints
 
     metrics.end("fingerprint.get_type_hints", _t)
-
-    for hint in hints.values():
-        _process_type_hint(hint, manifest, visited)
+    return hints
 
 
-def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -> None:
-    """Process a single type hint, recursively handling generics."""
+def _hint_classes(func: Callable[..., Any]) -> list[tuple[type, bool]]:
+    """Return each user class in `func`'s type hints, with whether it is a whole hint.
+
+    A class that is not a whole hint is the origin of a generic (`MyContainer[int]`).
+    """
+    found = list[tuple[type, bool]]()
+    for hint in _resolved_type_hints(func).values():
+        _collect_hint_classes(hint, found)
+    return found
+
+
+def _collect_hint_classes(hint: Any, found: list[tuple[type, bool]]) -> None:
+    """Add the user classes in one type hint to `found`, recursing into generics."""
     if hint is type(None):
         return
-
     origin = typing.get_origin(hint)
     if origin is not None:
         # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
         if isinstance(origin, type) and is_user_code(origin):
-            origin_type = cast("type[Any]", origin)
-            key = f"class:{_definition_ref(origin_type)}"
-            if key not in manifest:
-                _add_callable_to_manifest(key, origin_type, manifest, visited)
-            if hasattr(origin_type, "model_fields"):
-                _hash_pydantic_schema(
-                    cast("type[_PydanticModelProtocol]", origin_type), manifest, visited
-                )
+            found.append((cast("type[Any]", origin), False))
         for arg in typing.get_args(hint):
-            _process_type_hint(arg, manifest, visited)
+            _collect_hint_classes(arg, found)
         return
+    if isinstance(hint, type) and is_user_code(hint):
+        found.append((cast("type[Any]", hint), True))
 
-    if not isinstance(hint, type):
-        return
 
-    hint_type = cast("type[Any]", hint)
-
-    if not is_user_code(hint_type):
-        return
-    if dataclasses.is_dataclass(hint_type):
-        _check_data_class_methods(hint_type)
-
-    key = f"class:{_definition_ref(hint_type)}"
-    if key not in manifest:
-        _add_callable_to_manifest(key, hint_type, manifest, visited)
-
-    # Always hash Pydantic schema (even if class was already added via closure vars)
-    if hasattr(hint_type, "model_fields"):
-        _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", hint_type), manifest, visited)
+def _process_type_hint_dependencies(
+    func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Process user-defined classes in type hints, including Pydantic model defaults."""
+    _record_read(func, "hints")
+    for index, (hint_class, whole_hint) in enumerate(_hint_classes(func)):
+        with _walking(f"hc:{index}"):
+            if whole_hint and dataclasses.is_dataclass(cast("object", hint_class)):
+                _check_data_class_methods(hint_class)
+            key = f"class:{_definition_ref(hint_class)}"
+            if key not in manifest:
+                _add_callable_to_manifest(key, hint_class, manifest, visited)
+            # Always hash Pydantic schema (even if class was already added via closure vars)
+            if hasattr(hint_class, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", hint_class), manifest, visited
+                )
 
 
 def _strip_schema_metadata(schema: dict[str, Any]) -> dict[str, Any]:
@@ -1389,56 +1652,79 @@ def _hash_pydantic_schema(
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
-    schema_model = model
-    schema_key = f"schema:{_definition_ref(schema_model)}"
+    _record_read(model, "schema")
+    schema_key = f"schema:{_definition_ref(model)}"
     if schema_key in manifest:
         return
     # Insert placeholder to prevent infinite recursion on self-referential models
     # (e.g., class Node(BaseModel): children: list["Node"])
     manifest[schema_key] = "<pending>"
+    for index, field_class in enumerate(_model_field_classes(model)):
+        with _walking(f"fc:{index}"):
+            key = f"class:{_definition_ref(field_class)}"
+            if key not in manifest:
+                _add_callable_to_manifest(key, field_class, manifest, visited)
+            if hasattr(field_class, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", field_class), manifest, visited
+                )
+    manifest[schema_key] = _schema_hash(model)
+
+
+def _schema_hash(model: type[_PydanticModelProtocol]) -> str:
+    """Hash a pydantic model's JSON schema and field defaults, once per class per process.
+
+    A field default is evaluated when the class is created, so it is a live value: a cache hit
+    reads it again through this hash. A class is created once per import, so the hash is
+    memoized by class identity.
+    """
+    try:
+        cached = _schema_hash_cache.get(model)
+    except TypeError:
+        cached = None
+    if cached is not None:
+        return cached
     from pivot import parameters
 
-    schema_raw = schema_model.model_json_schema(schema_generator=parameters.SortedSetJsonSchema)
+    schema_raw = model.model_json_schema(schema_generator=parameters.SortedSetJsonSchema)
     schema = _strip_schema_metadata(schema_raw)
-
-    model_fields = cast("Mapping[str, Any]", getattr(schema_model, "model_fields", {}))
+    model_fields = cast("Mapping[str, Any]", getattr(model, "model_fields", {}))
     default_hashes = dict[str, str]()
     for field_name, field_info in model_fields.items():
-        annotation = getattr(field_info, "annotation", None)
-        if annotation is not None:
-            _discover_pydantic_field_types(annotation, manifest, visited)
-
         default = getattr(field_info, "default", None)
         default_factory = getattr(field_info, "default_factory", None)
         if type(default).__name__ == "PydanticUndefinedType":
             if default_factory is not None and callable(default_factory):
                 default_hashes[field_name] = hash_function_ast(default_factory)
             continue
-
         value_str = _serialize_value_for_hash(default)
         default_hashes[field_name] = xxhash.xxh64(value_str.encode()).hexdigest()
 
     payload = {"schema": schema, "defaults": default_hashes}
-    manifest[schema_key] = xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    result = xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    with contextlib.suppress(TypeError):
+        _schema_hash_cache[model] = result
+    return result
 
 
-def _discover_pydantic_field_types(
-    annotation: Any, manifest: dict[str, str], visited: set[int]
-) -> None:
-    origin = typing.get_origin(annotation)
-    if origin is not None:
-        for arg in typing.get_args(annotation):
-            _discover_pydantic_field_types(arg, manifest, visited)
-        return
+def _model_field_classes(model: Any) -> list[type]:
+    """Return each user class in a pydantic model's field annotations, in field order."""
+    model_fields = cast("Mapping[str, Any]", getattr(model, "model_fields", {}))
+    found = list[type]()
+    for field_info in model_fields.values():
+        annotation = getattr(field_info, "annotation", None)
+        if annotation is not None:
+            found.extend(_annotation_classes(annotation))
+    return found
+
+
+def _annotation_classes(annotation: Any) -> list[type]:
+    """Return the user classes in a field annotation, recursing into generic arguments."""
+    if typing.get_origin(annotation) is not None:
+        return [cls for arg in typing.get_args(annotation) for cls in _annotation_classes(arg)]
     if isinstance(annotation, type) and is_user_code(annotation):
-        annotation_type = cast("type[Any]", annotation)
-        key = f"class:{_definition_ref(annotation_type)}"
-        if key not in manifest:
-            _add_callable_to_manifest(key, annotation_type, manifest, visited)
-        if hasattr(annotation_type, "model_fields"):
-            _hash_pydantic_schema(
-                cast("type[_PydanticModelProtocol]", annotation_type), manifest, visited
-            )
+        return [cast("type[Any]", annotation)]
+    return []
 
 
 def _serialize_value_for_hash(value: Any) -> str:
@@ -1526,6 +1812,8 @@ def _process_module_dependency(
     for mod_name, attr_name in attrs:
         if mod_name not in (name, module_name):
             continue
+        step = f"a:{attr_name}"
+        _record_read(module, step)
         key = f"mod:{module_name}.{attr_name}"
         if key in manifest:
             continue
@@ -1534,22 +1822,23 @@ def _process_module_dependency(
         except AttributeError:
             manifest[key] = "unknown"
             continue
-        if _is_callable_instance(attr_value) or _is_user_class_instance(attr_value):
-            _check_non_scalar_capture(
-                f"{module_name}.{attr_name}",
-                attr_value,
-                _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
-            )
-        elif callable(attr_value) and is_user_code(attr_value):
-            _add_callable_to_manifest(key, attr_value, manifest, visited)
-        elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
-            manifest[key] = repr(attr_value)
-        else:
-            _check_non_scalar_capture(
-                f"{module_name}.{attr_name}",
-                attr_value,
-                _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
-            )
+        with _walking(step):
+            if _is_callable_instance(attr_value) or _is_user_class_instance(attr_value):
+                _check_non_scalar_capture(
+                    f"{module_name}.{attr_name}",
+                    attr_value,
+                    _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
+                )
+            elif callable(attr_value) and is_user_code(attr_value):
+                _add_callable_to_manifest(key, attr_value, manifest, visited)
+            elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
+                manifest[key] = repr(attr_value)
+            else:
+                _check_non_scalar_capture(
+                    f"{module_name}.{attr_name}",
+                    attr_value,
+                    _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
+                )
 
 
 def _get_qualname_for_cache(func: Callable[..., Any]) -> str:

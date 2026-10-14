@@ -15,15 +15,19 @@ _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 def _helper_pivot(
-    cwd: pathlib.Path, *args: str, hash_seed: int | None = None
+    cwd: pathlib.Path,
+    *args: str,
+    hash_seed: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    full_env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
     if hash_seed is not None:
-        env["PYTHONHASHSEED"] = str(hash_seed)
+        full_env["PYTHONHASHSEED"] = str(hash_seed)
+    full_env.update(env or {})
     return subprocess.run(
         [_PIVOT_BIN, *args],
         cwd=cwd,
-        env=env,
+        env=full_env,
         capture_output=True,
         text=True,
         timeout=180,
@@ -977,3 +981,94 @@ def test_variable_read_by_loader_on_two_inputs_is_named_once(tmp_path: pathlib.P
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert output.count("captures non-scalar variable 'KEYS'") == 1, output
+
+
+_ENV_SCALE_PIPELINE = """\
+import os
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+SCALE = int(os.environ.get("SCALE", "2"))
+
+
+@stage
+def scale(x: pd.DataFrame) -> pd.DataFrame:
+    return x * SCALE
+
+
+with Pipeline("env") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+
+def test_scalar_read_from_environment_at_import_reruns_stage(tmp_path: pathlib.Path) -> None:
+    """A cached manifest is reused only while every value the stage reads is unchanged."""
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _ENV_SCALE_PIPELINE, "data/raw/x.csv": "a\n1\n"}
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    assert (root / "data/env/scale.jsonl").read_text() == '{"a":2}\n'
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
+
+    assert "1 stale" in status, status
+    assert (root / "data/env/scale.jsonl").read_text() == '{"a":7}\n', output
+
+
+_SETTINGS_FILE_PIPELINE = """\
+import json
+import pathlib
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+FACTOR = int(json.loads(pathlib.Path("settings.json").read_text())["factor"])
+
+
+def make_stage(factor: int):
+    @stage
+    def made(x: pd.DataFrame) -> pd.DataFrame:
+        return x * factor
+
+    return made
+
+
+made = make_stage(FACTOR)
+
+
+@stage
+def plain(x: pd.DataFrame) -> pd.DataFrame:
+    return x * FACTOR
+
+
+with Pipeline("cfg") as pipeline:
+    made(pipeline.input("x.csv"))
+    plain(pipeline.input("x.csv"))
+"""
+
+
+def test_scalar_read_from_settings_file_at_import_reruns_stages(tmp_path: pathlib.Path) -> None:
+    """A settings file is not project source: the value read from it is checked on a hit."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _SETTINGS_FILE_PIPELINE,
+            "settings.json": '{"factor": 2}\n',
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":2}\n'
+    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":2}\n'
+
+    (root / "settings.json").write_text('{"factor": 7}\n')
+    status = _helper_ok(_helper_pivot(root, "status"))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "2 stale" in status, status
+    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":7}\n', output
+    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":7}\n', output

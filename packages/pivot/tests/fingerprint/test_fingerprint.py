@@ -1260,15 +1260,12 @@ def test_hash_pydantic_schema_adds_schema_and_nested_models():
     assert len(manifest[outer_schema]) == 16
 
 
-def test_discover_pydantic_field_types_tracks_nested_models():
-    """Should walk annotations and capture nested Pydantic models."""
-    manifest = dict[str, str]()
-    visited = set[int]()
-
-    fingerprint._discover_pydantic_field_types(list[_PydanticInnerModel], manifest, visited)
-
-    assert _definition_key("class", _PydanticInnerModel) in manifest
-    assert _definition_key("schema", _PydanticInnerModel) in manifest
+def test_model_field_classes_tracks_nested_models():
+    """Field annotations are walked into generics, so nested Pydantic models are found."""
+    assert fingerprint._model_field_classes(_PydanticOuterModel) == [
+        _PydanticInnerModel,
+        _PydanticInnerModel,
+    ]
 
 
 # ==============================================================================
@@ -1830,11 +1827,12 @@ def test_user_defined_generic_origin_tracked():
     class MyContainer(typing.Generic[T]):
         pass
 
-    hint = MyContainer[int]
+    def stage(items: MyContainer[int]) -> None:
+        pass
 
     manifest = dict[str, str]()
     visited = set[int]()
-    fingerprint._process_type_hint(hint, manifest, visited)
+    fingerprint._process_type_hint_dependencies(stage, manifest, visited)
 
     assert _definition_key("class", MyContainer) in manifest
 
@@ -2304,6 +2302,80 @@ def test_project_module_scan_is_reused_until_loaded_modules_change(
     finally:
         sys.modules.pop("scan_first", None)
         sys.modules.pop("scan_second", None)
+
+
+_READS_MODULE = """\
+import functools
+
+import pydantic
+
+import reads_settings
+
+FACTOR = reads_settings.SOURCE["factor"]
+
+
+class Model(pydantic.BaseModel):
+    width: int = reads_settings.SOURCE["width"]
+
+
+def helper(x, offset=reads_settings.SOURCE["offset"]):
+    return x + offset
+
+
+def apply(x, by):
+    return x * by
+
+
+BOUND = functools.partial(apply, by=reads_settings.SOURCE["by"])
+
+
+def make(scale):
+    def stage(x, model: Model = None):
+        return helper(BOUND(x)) * scale * reads_settings.ATTR + (lambda: FACTOR)()
+
+    return stage
+
+
+stage = make(reads_settings.SOURCE["scale"])
+"""
+
+
+@pytest.mark.parametrize("changed", ["factor", "width", "offset", "by", "scale", "attr"])
+def test_recorded_reads_detect_each_changed_live_value(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """Every value the walk read is checked on a hit: a global read by a nested lambda, a
+    closure cell, a helper's default, a `module.NAME` scalar, a partial argument and a schema
+    field default, each computed at import from a module that is not edited."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    source = {"factor": 1, "width": 2, "offset": 3, "by": 4, "scale": 5}
+    (tmp_path / "reads_settings.py").write_text(f"SOURCE = {source!r}\nATTR = 6\n")
+    (tmp_path / "reads_stage.py").write_text(_READS_MODULE)
+    writes = list[tuple[bytes, bytes]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
+    try:
+        settings = importlib.import_module("reads_settings")
+        module = importlib.import_module("reads_stage")
+        fingerprint.get_stage_fingerprint_cached("r/stage", module.stage)
+        ((_key, raw),) = writes
+        reads = json.loads(raw)["r"]
+        del sys.modules["reads_stage"]
+        module = importlib.import_module("reads_stage")
+        assert fingerprint._recorded_reads_hold(module.stage, reads), "re-import alone must hit"
+
+        if changed == "attr":
+            vars(settings)["ATTR"] += 100
+        else:
+            vars(settings)["SOURCE"][changed] += 100
+        del sys.modules["reads_stage"]
+        module = importlib.import_module("reads_stage")
+
+        assert fingerprint._recorded_reads_hold(module.stage, reads) is False
+    finally:
+        sys.modules.pop("reads_stage", None)
+        sys.modules.pop("reads_settings", None)
 
 
 # ==============================================================================
