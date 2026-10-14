@@ -27,12 +27,12 @@ Pivot's fingerprinting system:
 | Module imports | Yes | AST scanning for attribute access |
 | Class definitions | Yes | Full class AST hashed |
 | StageParams subclasses | Yes | Type hint analysis + full class AST + Pydantic field defaults + `default_factory` functions |
-| Custom loaders | Yes | Loader class AST hashed via type hint analysis |
+| Custom loaders | Yes | Loader method ASTs hashed; functions and classes in loader config walked like stage helpers. Module values read inside the loader's own `load()`/`save()` are not walked |
 | Module-level primitive values | Yes (value) | `getclosurevars()` + `repr()` |
 | Other module-level values | No — error | Use `StageParams` instead |
 | Closure variables | Yes (structure) | `getclosurevars()` captures binding |
 | Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
-| `functools.partial` | Yes | Bound args + underlying function |
+| `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
 
 **Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are not tracked unless they're Pydantic model field defaults.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import subprocess
@@ -562,3 +563,207 @@ def test_loader_config_with_user_function_stays_cached_and_tracks_edits(
     (root / "pipeline.py").write_text(pipeline.replace("return {}", 'return {"n": 0}'))
     edited = _helper_ok(_helper_pivot(root, "repro"))
     assert "1 ran" in edited, edited
+
+
+_TRANSFORM_LOADER_PIPELINE = """\
+import dataclasses
+import json
+import pathlib
+from collections.abc import Callable
+from typing import Annotated
+
+from pivot import Pipeline, loaders, stage
+
+FACTOR = 2
+COLS = ("a",)
+
+
+def scale_rows(data: dict) -> dict:
+    return {key: value * FACTOR for key, value in data.items()}
+
+
+def make_scaler(factor: int) -> Callable[[dict], dict]:
+    def scale(data: dict) -> dict:
+        return {key: value * factor for key, value in data.items()}
+
+    return scale
+
+
+def keep_cols(data: dict) -> dict:
+    return {key: data[key] for key in COLS}
+
+
+def identity(data: dict) -> dict:
+    return data
+
+
+@dataclasses.dataclass(frozen=True)
+class Transformed(loaders.Loader[dict, dict]):
+    transform: Callable[[dict], dict] = identity
+
+    def load(self, path: pathlib.Path) -> dict:
+        return json.loads(path.read_text())
+
+    def save(self, data: dict, path: pathlib.Path) -> None:
+        path.write_text(json.dumps(self.transform(data)))
+
+
+OUT = Transformed(transform=TRANSFORM)
+
+
+@stage
+def make(raw: dict) -> Annotated[dict, OUT]:
+    return {"a": 3}
+
+
+with Pipeline("l") as pipeline:
+    make(pipeline.input("t.json", format=loaders.JSON()))
+"""
+
+
+@pytest.mark.parametrize(
+    ("transform", "edit", "before", "after"),
+    [
+        pytest.param("scale_rows", ("FACTOR = 2", "FACTOR = 7"), 6, 21, id="global-read"),
+        pytest.param(
+            "make_scaler(2)", ("make_scaler(2)", "make_scaler(5)"), 6, 15, id="closure-value"
+        ),
+    ],
+)
+def test_value_read_by_loader_config_function_reruns_stage(
+    tmp_path: pathlib.Path, transform: str, edit: tuple[str, str], before: int, after: int
+) -> None:
+    """A function in loader config is walked like a stage helper, so what it reads is tracked."""
+    pipeline = _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", transform)
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(_helper_pivot(root, "repro"))
+    (output,) = (root / "data/l").iterdir()
+    assert json.loads(output.read_text()) == {"a": before}
+
+    (root / "pipeline.py").write_text(pipeline.replace(*edit))
+    rerun = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert json.loads(output.read_text()) == {"a": after}, rerun
+
+
+_PARTIAL_ARGUMENT_PIPELINE = """\
+import functools
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+FACTOR = 2
+COLS = ("a",)
+
+
+def factor() -> int:
+    return FACTOR
+
+
+def cols() -> list[str]:
+    return list(COLS)
+
+
+def apply(raw: pd.DataFrame, get) -> pd.DataFrame:
+    return raw * get()
+
+
+def select(raw: pd.DataFrame, get) -> pd.DataFrame:
+    return raw[get()]
+
+
+BOUND = BINDING
+
+
+@stage
+def scale(raw: pd.DataFrame) -> pd.DataFrame:
+    return BOUND(raw)
+
+
+with Pipeline("d") as pipeline:
+    scale(pipeline.input("t.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        pytest.param("functools.partial(apply, get=factor)", id="keyword"),
+        pytest.param(
+            "functools.partial(apply, get=functools.partial(factor))", id="nested-partial"
+        ),
+    ],
+)
+def test_value_read_by_partial_argument_function_reruns_stage(
+    tmp_path: pathlib.Path, binding: str
+) -> None:
+    """A function bound as a partial argument is walked like a stage helper."""
+    pipeline = _PARTIAL_ARGUMENT_PIPELINE.replace("BINDING", binding)
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+
+    (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert (root / "data/d/scale.jsonl").read_text() == '{"a":7}\n{"a":14}\n', output
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "files"),
+    [
+        pytest.param(
+            _PARTIAL_ARGUMENT_PIPELINE.replace("BINDING", "functools.partial(select, get=cols)"),
+            {"data/raw/t.csv": "a\n1\n"},
+            id="partial-argument",
+        ),
+        pytest.param(
+            _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", "keep_cols"),
+            {"data/raw/t.json": "{}\n"},
+            id="loader-config",
+        ),
+    ],
+)
+def test_non_scalar_read_by_bound_function_is_an_error(
+    tmp_path: pathlib.Path, pipeline: str, files: dict[str, str]
+) -> None:
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, **files})
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"tuple read by a bound function was accepted:\n{output}"
+    assert "captures non-scalar variable 'COLS' (type: tuple)" in output, output
+
+
+def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathlib.Path) -> None:
+    pipeline = (
+        _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", "keep_cols")
+        .replace('COLS = ("a",)', 'COLS = ("a",)\nSTAGE_KEYS = ["k"]')
+        .replace('return {"a": 3}', 'return {"a": len(STAGE_KEYS)}')
+    )
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "'STAGE_KEYS' (type: list)" in output, output
+    assert "'COLS' (type: tuple)" in output, output
+
+
+def test_editing_model_class_used_by_loader_reruns_stage(tmp_path: pathlib.Path) -> None:
+    """A user class in loader config is walked, so editing its definition reruns the stage."""
+    pipeline = _LOADER_CONFIG_PIPELINE.replace("LOADER", "ModelJSON(model=Item)")
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(_helper_pivot(root, "repro"))
+    (output,) = (root / "data/m").iterdir()
+    assert json.loads(output.read_text()) == {"name": "x"}
+
+    (root / "pipeline.py").write_text(
+        pipeline.replace('    name: str = "none"\n', '    name: str = "none"\n    extra: int = 1\n')
+    )
+    rerun = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert json.loads(output.read_text()) == {"name": "x", "extra": 1}, rerun

@@ -42,7 +42,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 11 walks the function behind a functools.cache or lru_cache helper.
 # Version 12 hashes set members and dict entries in sorted order, not hash-seed order.
 # Version 13 hashes a function value by its name and code instead of its address-bearing repr.
-_CACHE_SCHEMA_VERSION = 13
+# Version 14 walks user functions and classes bound in functools.partial arguments.
+_CACHE_SCHEMA_VERSION = 14
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -516,22 +517,43 @@ def get_stage_fingerprint(
     if visited is None:
         visited = set()
 
-    errors = _capture_errors.get()
-    token: contextvars.Token[list[str] | None] | None = None
-    if errors is None:
-        errors = list[str]()
-        token = _capture_errors.set(errors)
-
     _t = metrics.start()
     try:
-        result = _get_stage_fingerprint_impl(func, visited)
-        if token is not None and errors:
-            raise exceptions.StageDefinitionError("\n\n".join(errors))
-        return result
+        with _collected_capture_errors():
+            return _get_stage_fingerprint_impl(func, visited)
     finally:
         metrics.end("fingerprint.get_stage_fingerprint", _t)
-        if token is not None:
-            _capture_errors.reset(token)
+
+
+@contextlib.contextmanager
+def _collected_capture_errors() -> Iterator[None]:
+    """Collect unsafe-capture errors and raise them together, unless a caller already does."""
+    if _capture_errors.get() is not None:
+        yield
+        return
+    errors = list[str]()
+    token = _capture_errors.set(errors)
+    try:
+        yield
+    finally:
+        _capture_errors.reset(token)
+    if errors:
+        raise exceptions.StageDefinitionError("\n\n".join(errors))
+
+
+@contextlib.contextmanager
+def stage_fingerprint_scope(stage_name: str) -> Iterator[None]:
+    """Name the stage being fingerprinted and raise all of its unsafe-capture errors together.
+
+    Wraps a stage's manifest and its input and output loader fingerprints, so a refusal found
+    in loader config is reported with the stage's own refusals.
+    """
+    token = _current_stage_name.set(stage_name)
+    try:
+        with _collected_capture_errors():
+            yield
+    finally:
+        _current_stage_name.reset(token)
 
 
 def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
@@ -550,6 +572,8 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
         return cached
 
     metrics.count("fingerprint.manifest_cache.miss")
+    errors = _capture_errors.get()
+    errors_before = len(errors) if errors is not None else 0
     unsafe_token = _unsafe_capture_warning.set(False)
     try:
         # Compute with source tracking
@@ -560,7 +584,9 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
         finally:
             _current_stage_name.reset(token)
 
-        if not _unsafe_capture_warning.get():
+        # Inside a stage_fingerprint_scope, refusals are raised later; never cache them.
+        refused = errors is not None and len(errors) > errors_before
+        if not _unsafe_capture_warning.get() and not refused:
             _record_project_modules(source_map)
             key = _make_manifest_cache_key(stage_name, func)
             value = json.dumps(
@@ -844,9 +870,11 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     # Cast to Any for dataclass introspection - loader is a dataclass but generic params are unknown
     loader_any = cast("Any", loader)
     field_values = list[str]()
+    visited = set[int]()
     for field in dataclasses.fields(loader_any):
         value = getattr(loader_any, field.name)
         field_values.append(f"{field.name}={_serialize_value_for_hash(value)}")
+        _process_bound_values(f"{class_name}.{field.name}", value, manifest, visited)
     if field_values:
         config_str = ",".join(field_values)
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
@@ -1136,6 +1164,51 @@ def _process_partial_dependency(
     if callable(underlying) and is_user_code(underlying):
         callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
         _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
+    for index, item in enumerate(partial_obj.args):
+        _process_bound_values(f"{binding_ref}.args[{index}]", item, manifest, visited)
+    for keyword, item in partial_obj.keywords.items():
+        _process_bound_values(f"{binding_ref}.kwargs[{keyword}]", item, manifest, visited)
+
+
+def _process_bound_values(
+    binding_ref: str, value: Any, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Walk each user function and user class bound inside `value` as a stage helper.
+
+    Loader config and `functools.partial` arguments hash a function by its name and code
+    only, so the module values it reads would otherwise go unseen. The walk descends into
+    partials, lists, tuples, sets and dict values. Each user function, including one behind
+    a `functools.cache` wrapper, and each user class gets the walk a stage helper gets:
+    globals, closure values, defaults, and the non-scalar refusal.
+    """
+    if isinstance(value, functools.partial):
+        partial_obj = cast("functools.partial[Any]", value)
+        _process_bound_values(f"{binding_ref}.func", partial_obj.func, manifest, visited)
+        for index, item in enumerate(partial_obj.args):
+            _process_bound_values(f"{binding_ref}.args[{index}]", item, manifest, visited)
+        for keyword, item in partial_obj.keywords.items():
+            _process_bound_values(f"{binding_ref}.kwargs[{keyword}]", item, manifest, visited)
+    elif isinstance(value, (list, tuple)):
+        items = cast("list[Any] | tuple[Any, ...]", value)
+        for index, item in enumerate(items):
+            _process_bound_values(f"{binding_ref}[{index}]", item, manifest, visited)
+    elif isinstance(value, (set, frozenset)):
+        # Iteration order follows the hash seed, so walk members in canonical order.
+        members = sorted(cast("set[Any] | frozenset[Any]", value), key=_serialize_value_for_hash)
+        for index, item in enumerate(members):
+            _process_bound_values(f"{binding_ref}{{{index}}}", item, manifest, visited)
+    elif isinstance(value, dict):
+        for key, item in cast("dict[Any, Any]", value).items():
+            _process_bound_values(f"{binding_ref}[{key!r}]", item, manifest, visited)
+    elif isinstance(value, type):
+        if is_user_code(value):
+            _process_callable_dependency(binding_ref, value, manifest, visited)
+            if hasattr(value, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", value), manifest, visited
+                )
+    elif callable(value) and inspect.isfunction(inspect.unwrap(value)) and is_user_code(value):
+        _process_callable_dependency(binding_ref, value, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:

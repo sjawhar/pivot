@@ -330,7 +330,15 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
     closure.
 
 12. **`functools.partial` IS tracked**: Partial objects include module-qualified bound-argument
-    keys and the underlying user function's definition key.
+    keys and the underlying user function's definition key. A user function or class bound as
+    an argument, directly, inside a nested partial, or inside a list, tuple, set or dict, gets
+    the stage-helper walk: its globals, closure values and defaults are tracked, and a
+    non-scalar it reads is refused. Loader config fields get the same walk.
+
+    Tests: `test_functools.py::test_function_in_partial_argument_collection_is_walked`,
+    `test_manifest_cache_cli.py::test_value_read_by_partial_argument_function_reruns_stage`,
+    `test_manifest_cache_cli.py::test_value_read_by_loader_config_function_reruns_stage`,
+    `test_manifest_cache_cli.py::test_non_scalar_read_by_bound_function_is_an_error`
 
 13. **StageParams classes fully tracked**: `StageParams` subclasses used in type hints are tracked
     via `_process_type_hint_dependencies()`. The entire class definition is hashed, including
