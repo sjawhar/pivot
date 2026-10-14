@@ -1953,8 +1953,10 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     canonical JSON text: a set's iteration order, and a dict built from a set, follow the
     hash seed. A Python function becomes `["function", function_identity]`, closure values
     and defaults included, because its `repr` holds a memory address and two closures from one
-    factory share a definition; `active` holds the functions being named, so a function that
-    captures itself ends there. A library function, or a library module's own callable export,
+    factory share a definition. `active` holds the ids of the functions, containers and
+    objects on the path being canonicalised: one met again (`self.me = self`, a list holding
+    itself) becomes `["cycle", N]`, N steps back up the path, the same in every process. A
+    library function, or a library module's own callable export,
     becomes `["external", _library_name]`: its repr can hold an address (`np.mean`). A
     `functools.partial` is canonicalised through its function and arguments. A pydantic
     instance is dumped in python mode, which keeps each secret (`SecretStr`, `SecretBytes`,
@@ -1965,35 +1967,41 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     Other leaves keep their `repr`, tagged with their type. A class is a leaf, even a pydantic
     model class: only an instance is dumped.
     """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if id(value) in active:
+        return ["cycle", len(active) - active.index(id(value))]
     if hasattr(value, "model_dump") and not isinstance(value, type):
-        return _canonicalize_value_for_hash(value.model_dump(), active)
+        return _canonicalize_value_for_hash(value.model_dump(), (*active, id(value)))
     if inspect.isfunction(value):
         return ["function", _function_identity(value, active)]
     if _is_library_callable(value):
         return ["external", _library_name(value)]
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
+        inner = (*active, id(partial_obj))
         return [
             "partial",
-            _canonicalize_value_for_hash(partial_obj.func, active),
-            _canonicalize_value_for_hash(partial_obj.args, active),
-            _canonicalize_value_for_hash(partial_obj.keywords, active),
+            _canonicalize_value_for_hash(partial_obj.func, inner),
+            _canonicalize_value_for_hash(partial_obj.args, inner),
+            _canonicalize_value_for_hash(partial_obj.keywords, inner),
         ]
     if isinstance(value, dict):
+        mapping = cast("dict[Any, Any]", value)
+        inner = (*active, id(mapping))
         entries = [
-            [_canonicalize_value_for_hash(key, active), _canonicalize_value_for_hash(item, active)]
-            for key, item in cast("dict[Any, Any]", value).items()
+            [_canonicalize_value_for_hash(key, inner), _canonicalize_value_for_hash(item, inner)]
+            for key, item in mapping.items()
         ]
         entries.sort(key=json.dumps)
         return ["dict", entries]
     if isinstance(value, (list, tuple, set, frozenset)):
         collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
-        items = [_canonicalize_value_for_hash(item, active) for item in collection]
+        inner = (*active, id(collection))
+        items = [_canonicalize_value_for_hash(item, inner) for item in collection]
         if isinstance(collection, (set, frozenset)):
             items.sort(key=json.dumps)
         return [type(collection).__name__, items]
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
     if isinstance(value, types.ModuleType):
         return ["module", value.__name__]
     from pivot import parameters
@@ -2001,7 +2009,8 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     if parameters.is_secret(value):
         return ["secret", parameters.secret_digest(value)]
     if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
-        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value), active)]
+        inner = (*active, id(value))
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value), inner)]
     return [type(value).__name__, repr(value)]
 
 

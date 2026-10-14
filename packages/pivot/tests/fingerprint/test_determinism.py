@@ -351,6 +351,51 @@ def test_library_callables_are_named_without_addresses(tmp_path: pathlib.Path) -
     assert not any("0x" in value for value in entries.values()), entries
 
 
+_CYCLE_SCRIPT = """\
+import json
+
+from pivot import fingerprint
+
+
+class Node:
+    def __init__(self, factor):
+        self.me = self
+        self.factor = factor
+
+
+loop = [1]
+loop.append(loop)
+for value in (Node(2), Node(3), loop):
+    print(fingerprint._serialize_value_for_hash(value))
+"""
+
+
+def test_self_referencing_values_canonicalise_to_a_stable_cycle_token(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An object or list that holds itself ends in `["cycle", N]`, the same in every process."""
+    (tmp_path / ".pivot").mkdir()
+    script = tmp_path / "cycle_values.py"
+    script.write_text(_CYCLE_SCRIPT)
+    outputs = {
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in range(3)
+    }
+
+    assert len(outputs) == 1, outputs
+    node_two, node_three, loop = (json.loads(line) for line in outputs.pop().splitlines())
+    assert node_two != node_three, "the attribute beside the cycle is still hashed"
+    assert '["cycle", 2]' in json.dumps(node_two), node_two
+    assert loop == ["list", [1, ["cycle", 1]]], loop
+
+
 class _Opts:
     depth: int
     tags: set[str]

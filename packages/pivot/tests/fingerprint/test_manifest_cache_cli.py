@@ -1286,6 +1286,77 @@ def test_reimported_stage_with_a_nan_value_is_one_stage(tmp_path: pathlib.Path, 
     assert "1 ran" in output, output
 
 
+_SELF_REFERENCE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class Node:
+    def __init__(self) -> None:
+        self.me = self
+        self.factor = 2
+
+
+NODE = Node()
+
+
+{definition}
+
+
+with Pipeline("cyc") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+_SELF_REFERENCE_CELL = """\
+def make_stage(node: Node):
+    @stage
+    def scale(x: pd.DataFrame) -> pd.DataFrame:
+        return x * node.factor
+
+    return scale
+
+
+scale = make_stage(NODE)"""
+
+_SELF_REFERENCE_DEFAULT = """\
+@stage
+def scale(x: pd.DataFrame, node: Node = NODE) -> pd.DataFrame:
+    return x * node.factor"""
+
+
+@pytest.mark.parametrize(
+    ("definition", "variable"),
+    [
+        pytest.param(_SELF_REFERENCE_CELL, "node", id="closure-cell"),
+        pytest.param(_SELF_REFERENCE_DEFAULT, "NODE", id="default"),
+    ],
+)
+def test_self_referencing_object_is_refused_not_a_crash(
+    tmp_path: pathlib.Path, definition: str, variable: str
+) -> None:
+    """An object that holds itself is a D2 refusal, and unsafe mode warns and runs."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _SELF_REFERENCE_PIPELINE.format(definition=definition),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    refused = _helper_pivot(root, "repro")
+    unsafe = _helper_pivot(root, "repro", env={"PIVOT_UNSAFE_FINGERPRINTING": "1"})
+
+    refused_output = refused.stdout + refused.stderr
+    assert refused.returncode != 0, refused_output
+    assert "recursion" not in refused_output, refused_output
+    assert f"captures non-scalar variable '{variable}'" in refused_output, refused_output
+    assert "(type: Node)" in refused_output, refused_output
+    unsafe_output = _helper_ok(unsafe)
+    assert "1 ran" in unsafe_output, unsafe_output
+    assert (root / "data/cyc/scale.jsonl").read_text() == '{"a":2}\n'
+
+
 _TWO_CLOSURES_MODULE = """\
 def make(factor):
     def inner(x):
