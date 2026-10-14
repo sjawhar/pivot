@@ -1174,6 +1174,26 @@ def test_repro_included_pipeline_file_target_runs(
     assert summary in result.output, result.output
 
 
+def test_list_all_skips_a_file_that_re_exports_another_files_pipeline(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A root pipeline.py exporting prep's pipeline object declares no second pipeline."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "scores.csv").write_text("name,score\na,0.2\n")
+        (cwd / "prep").mkdir()
+        (cwd / "prep" / "pipeline.py").write_text(_PREP_PIPELINE)
+        (cwd / "pipeline.py").write_text("from prep.pipeline import pipeline\n")
+
+        result = runner.invoke(cli.cli, ["--verbose", "list", "--all", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert [s["name"] for s in json.loads(result.stdout)["stages"]] == ["prep/drop_low"]
+    assert (
+        "--all: prep/pipeline.py exports the same pipeline object 'prep' as pipeline.py; skipping"
+    ) in result.stderr, result.stderr
+
+
 def test_repro_diamond_of_includes_runs_the_shared_stage_once(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

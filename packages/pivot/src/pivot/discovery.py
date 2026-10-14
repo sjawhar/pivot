@@ -399,7 +399,7 @@ def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> Pipe
         return None
 
     pipelines = list[PipelineLike]()
-    paths_by_name = dict[str, pathlib.Path]()
+    first_by_name = dict[str, tuple[pathlib.Path, PipelineLike]]()
     for path in config_paths:
         try:
             pipeline = _load_pipeline_from_module(path, session)
@@ -413,14 +413,21 @@ def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> Pipe
             logger.warning(f"--all: failed to load pipeline from {path}, skipping")
             continue
         # A pipeline name names .pivot/stages/<name>/ and data/<name>/, so two files
-        # declaring one name would silently share stages, locks and outputs.
-        first_path = paths_by_name.setdefault(pipeline.name, path)
+        # declaring one name would silently share stages, locks and outputs. A file that
+        # exports a pipeline object another file already gave (a re-export) declares nothing.
+        first_path, first_pipeline = first_by_name.setdefault(pipeline.name, (path, pipeline))
         if first_path != path:
-            raise DiscoveryError(
-                f"Pipeline name '{pipeline.name}' is declared by both "
-                + f"{first_path.relative_to(root)} and {path.relative_to(root)}. "
-                + "Pipeline names must be unique within a project; rename one of them."
+            if first_pipeline is not pipeline:
+                raise DiscoveryError(
+                    f"Pipeline name '{pipeline.name}' is declared by both "
+                    + f"{first_path.relative_to(root)} and {path.relative_to(root)}. "
+                    + "Pipeline names must be unique within a project; rename one of them."
+                )
+            logger.debug(
+                f"--all: {path.relative_to(root)} exports the same pipeline object "
+                + f"'{pipeline.name}' as {first_path.relative_to(root)}; skipping"
             )
+            continue
         pipelines.append(pipeline)
         logger.info(f"  {pipeline.name}: {path} ({len(pipeline.list_stages())} stages)")
 
