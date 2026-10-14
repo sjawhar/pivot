@@ -86,6 +86,8 @@ Restored 3 file(s)
 
 After pulling, `pivot repro` skips stages whose outputs are already present and match their lock file hashes.
 
+Every downloaded file is checked against the hash it is stored under before it enters the local cache. A file that does not match is discarded and counted as failed (`Hash mismatch: expected …, got …`), and `pivot pull` exits without restoring anything; re-push that file from a machine that has a good copy. The check catches corruption in storage or transfer. It does not authenticate who wrote the file.
+
 ### Selective Pull
 
 ```bash
