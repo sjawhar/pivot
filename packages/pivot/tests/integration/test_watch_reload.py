@@ -605,6 +605,19 @@ async def test_watch_started_on_refused_pipeline_waits_for_fix(
                 "no stage runs while the pipeline is invalid"
             )
 
+            rpc_source = agent_rpc.AgentRpcSource(
+                socket_path=watch_project / "unused.sock",
+                handler=agent_rpc.AgentRpcHandler(engine=eng),
+            )
+            commit_send, _ = anyio.create_memory_object_stream[InputEvent](1)
+            commit_response = await rpc_source._handle_request(
+                {"jsonrpc": "2.0", "method": "commit", "id": 1}, commit_send
+            )
+            assert commit_response is not None
+            assert "error" in commit_response, "RPC commit on a refused pipeline gets a reply"
+            assert commit_response["error"]["code"] == -32003
+            assert "captures non-scalar variable 'SUFFIXES'" in commit_response["error"]["message"]
+
             pipeline_py.write_text(_helper_pipeline_source("-v2", third="other"))
             reload_index = await recorder.wait_for(_helper_is_reload)
             done = await recorder.wait_for(_helper_completes("reload/change"), start=reload_index)
@@ -619,7 +632,11 @@ async def test_refusal_added_mid_session_waits_for_fix(
     watch_project: pathlib.Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A refused edit mid-session is invalid like one at startup: RPC run and data runs refused."""
+    """A refused edit mid-session is invalid like one at startup: run, commit and data refused.
+
+    A commit while invalid would pair the edited input with the output of the old code and
+    make the fixing reload skip the stage, so it must be refused too.
+    """
     caplog.set_level(logging.DEBUG, logger="pivot.engine.engine")
     pipeline_py = watch_project / "pipeline.py"
     pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
@@ -667,6 +684,14 @@ async def test_refusal_added_mid_session_waits_for_fix(
                     await anyio.sleep(0.05)
             assert change_output.read_text() == "x-v1", "the last good pipeline does not run"
 
+            commit_response = await rpc_source._handle_request(
+                {"jsonrpc": "2.0", "method": "commit", "id": 2}, run_send
+            )
+            assert commit_response is not None
+            assert "error" in commit_response, "RPC commit is refused while invalid"
+            assert commit_response["error"]["code"] == -32003
+            assert "Pipeline invalid - waiting for fix" in commit_response["error"]["message"]
+
             pipeline_py.write_text(_helper_pipeline_source("-v3", third="other"))
             reload_index = await recorder.wait_for(_helper_is_reload, start=invalid_index)
             done = await recorder.wait_for(_helper_completes("reload/change"), start=reload_index)
@@ -680,6 +705,9 @@ async def test_refusal_added_mid_session_waits_for_fix(
             reload_event = recorder.events[reload_index]
             assert reload_event["type"] == "pipeline_reloaded"
             assert reload_event["stages_modified"] == ["reload/change"]
+            assert recorder.completed("reload/change", start=reload_index) == StageStatus.RAN, (
+                "the fix reruns the stage on the data edited while invalid"
+            )
             assert change_output.read_text() == "y-v3", "the fixed pipeline runs on the new input"
             tg.cancel_scope.cancel()
 

@@ -1759,6 +1759,43 @@ async def test_rpc_commit_propagates_error(
             tg.cancel_scope.cancel()
 
 
+@pytest.mark.anyio
+async def test_rpc_query_pivot_error_gets_an_error_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PivotError from a query handler is a JSON-RPC error with its message, not a drop."""
+    from pivot import exceptions
+
+    socket_path = tmp_path / "agent.sock"
+
+    def _raise(_pipeline: object) -> tuple[list[str], list[str]]:
+        raise exceptions.PivotError("Stage 'test/s': fingerprinting failed: captures 'X'")
+
+    monkeypatch.setattr("pivot.executor.commit.commit_stages", _raise)
+
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
+        source = AgentRpcSource(socket_path=socket_path, handler=AgentRpcHandler(engine=engine))
+        send, _ = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await helpers.wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                await conn.send(
+                    json.dumps({"jsonrpc": "2.0", "method": "commit", "id": 1}).encode() + b"\n"
+                )
+                response = json.loads((await conn.receive(4096)).decode())
+                assert response["error"]["code"] == -32603
+                assert (
+                    response["error"]["message"]
+                    == "Stage 'test/s': fingerprinting failed: captures 'X'"
+                )
+
+            tg.cancel_scope.cancel()
+
+
 # =============================================================================
 # diff_output Query
 # =============================================================================

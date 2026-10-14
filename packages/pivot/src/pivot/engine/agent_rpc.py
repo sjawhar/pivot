@@ -13,8 +13,8 @@ import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import BaseModel, ValidationError, field_validator
 
+from pivot import exceptions, parameters, project, types
 from pivot import explain as explain_mod
-from pivot import parameters, project, types
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
@@ -198,6 +198,7 @@ _CLIENT_TIMEOUT = 300  # 5 minutes
 _ERR_STAGE_NOT_FOUND = -32001
 _ERR_PIPELINE_INVALID = -32003
 _ERR_ENGINE_STARTING = -32004
+_ERR_INTERNAL = -32603
 
 
 def _json_rpc_response(result: object, request_id: JsonRpcId) -> JsonRpcSuccessResponse | None:
@@ -362,7 +363,8 @@ class AgentRpcHandler:
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case "commit":
-                # Commit fingerprints every stage; wait for the startup snapshot first.
+                # Commit fingerprints every stage, so it never runs alongside the startup
+                # snapshot. Over the socket it is refused while starting or invalid instead.
                 await self._engine.wait_for_startup_fingerprints()
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
@@ -602,20 +604,9 @@ class AgentRpcSource:
             if not isinstance(force, bool):
                 return _json_rpc_error(-32602, "Invalid params: force must be boolean", request_id)
 
-            # Never hold the reply for the startup snapshot: refuse at once while it runs, then
-            # refuse a run the engine would drop because its pipeline is invalid
-            if self._handler is not None and self._handler.starting:
-                return _json_rpc_error(
-                    _ERR_ENGINE_STARTING,
-                    "Engine is starting: fingerprinting stages; try again when it is ready",
-                    request_id,
-                )
-            if self._handler is not None and self._handler.pipeline_error is not None:
-                return _json_rpc_error(
-                    _ERR_PIPELINE_INVALID,
-                    f"Pipeline invalid - waiting for fix: {self._handler.pipeline_error}",
-                    request_id,
-                )
+            refusal = self._refuse_while_not_ready(request_id)
+            if refusal is not None:
+                return refusal
 
             # Validate stage names exist (if handler available)
             if self._handler is not None and stages is not None:
@@ -667,6 +658,13 @@ class AgentRpcSource:
                 self._handler._on_error = on_error  # pyright: ignore[reportPrivateUsage]
             return _json_rpc_response(True, request_id)
 
+        # Commit records the workspace as the pipeline's current state, so it is refused when
+        # that state is not trustworthy, exactly like run
+        if method == "commit":
+            refusal = self._refuse_while_not_ready(request_id)
+            if refusal is not None:
+                return refusal
+
         # Queries handled by handler (if available)
         if self._handler is not None:
             try:
@@ -679,9 +677,34 @@ class AgentRpcSource:
                     return _json_rpc_error(-32601, "Method not found", request_id)
                 # Invalid params or other handler errors
                 return _json_rpc_error(-32602, f"Invalid params: {msg}", request_id)
+            except exceptions.PivotError as e:
+                # A Pivot error (a stage that fails to fingerprint, a failed commit) gets a reply
+                # carrying its message instead of a dropped connection
+                return _json_rpc_error(_ERR_INTERNAL, e.format_user_message(), request_id)
 
         # Unknown method, no handler
         return _json_rpc_error(-32601, "Method not found", request_id)
+
+    def _refuse_while_not_ready(self, request_id: JsonRpcId) -> JsonRpcErrorResponse | None:
+        """Refuse at once while the startup snapshot runs, or while the pipeline is invalid.
+
+        Never holds the reply for the snapshot; returns None when the request may proceed.
+        """
+        if self._handler is None:
+            return None
+        if self._handler.starting:
+            return _json_rpc_error(
+                _ERR_ENGINE_STARTING,
+                "Engine is starting: fingerprinting stages; try again when it is ready",
+                request_id,
+            )
+        if self._handler.pipeline_error is not None:
+            return _json_rpc_error(
+                _ERR_PIPELINE_INVALID,
+                f"Pipeline invalid - waiting for fix: {self._handler.pipeline_error}",
+                request_id,
+            )
+        return None
 
 
 class BroadcastEventSink:
