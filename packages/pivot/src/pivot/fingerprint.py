@@ -1201,7 +1201,9 @@ def _process_bound_values(
     only, so the module values it reads would otherwise go unseen. The walk descends into
     partials, lists, tuples, sets and dict values. Each user function, including one behind
     a `functools.cache` wrapper, and each user class gets the walk a stage helper gets:
-    globals, closure values, defaults, and the non-scalar refusal.
+    globals, closure values, defaults, and the non-scalar refusal. An instance of a user
+    class with `__call__` is refused, as it is when a stage reads one: what its `__call__`
+    reads is not walked, and its repr does not record its behaviour.
     """
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
@@ -1229,6 +1231,8 @@ def _process_bound_values(
                 _hash_pydantic_schema(
                     cast("type[_PydanticModelProtocol]", value), manifest, visited
                 )
+    elif callable(value) and _is_user_class_instance(value):
+        _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
     elif callable(value) and inspect.isfunction(inspect.unwrap(value)) and is_user_code(value):
         _process_callable_dependency(binding_ref, value, manifest, visited)
 

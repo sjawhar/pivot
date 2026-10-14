@@ -597,6 +597,11 @@ def identity(data: dict) -> dict:
     return data
 
 
+class Scaler:
+    def __call__(self, data: dict) -> dict:
+        return {key: value * FACTOR for key, value in data.items()}
+
+
 @dataclasses.dataclass(frozen=True)
 class Transformed(loaders.Loader[dict, dict]):
     transform: Callable[[dict], dict] = identity
@@ -673,6 +678,11 @@ def select(raw: pd.DataFrame, get) -> pd.DataFrame:
     return raw[get()]
 
 
+class Scaler:
+    def __call__(self) -> int:
+        return FACTOR
+
+
 BOUND = BINDING
 
 
@@ -735,6 +745,39 @@ def test_non_scalar_read_by_bound_function_is_an_error(
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"tuple read by a bound function was accepted:\n{output}"
     assert "captures non-scalar variable 'COLS' (type: tuple)" in output, output
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "files", "stage", "binding"),
+    [
+        pytest.param(
+            _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", "Scaler()"),
+            {"data/raw/t.json": "{}\n"},
+            "l/make",
+            "pipeline.Transformed.transform",
+            id="loader-config",
+        ),
+        pytest.param(
+            _PARTIAL_ARGUMENT_PIPELINE.replace("BINDING", "functools.partial(apply, get=Scaler())"),
+            {"data/raw/t.csv": "a\n1\n"},
+            "d/scale",
+            "pipeline.BOUND.kwargs[get]",
+            id="partial-argument",
+        ),
+    ],
+)
+def test_user_callable_instance_bound_in_config_is_an_error(
+    tmp_path: pathlib.Path, pipeline: str, files: dict[str, str], stage: str, binding: str
+) -> None:
+    """A callable object's `__call__` reads are not walked, so it is refused like a stage read."""
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, **files})
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"callable instance was accepted:\n{output}"
+    assert f"Stage '{stage}'" in output, output
+    assert f"captures non-scalar variable '{binding}' (type: Scaler)" in output, output
 
 
 def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathlib.Path) -> None:
