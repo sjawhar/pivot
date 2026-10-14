@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import isolated_pivot_dir, send_rpc
-from pivot import cli, compose, executor
+from pivot import cli, compose, executor, loaders
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
@@ -1523,7 +1523,7 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
     def scaled() -> list[int] | None:
         if not output.exists():
             return None
-        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+        return [int(n) for n in loaders.DataFrameJSONL().load(output)["n"].tolist()]
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(

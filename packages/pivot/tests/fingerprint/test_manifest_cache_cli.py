@@ -11,6 +11,8 @@ import sys
 import pytest
 from tests.conftest import init_git_repo
 
+from pivot import loaders
+
 _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
@@ -46,6 +48,12 @@ def _helper_ok(proc: subprocess.CompletedProcess[str]) -> str:
     output = proc.stdout + proc.stderr
     assert proc.returncode == 0, output
     return output
+
+
+def _helper_rows(path: pathlib.Path) -> list[dict[str, object]]:
+    """The records a stage wrote to a DataFrameJSONL output, as the next stage loads them."""
+    records = loaders.DataFrameJSONL().load(path).to_dict(orient="records")
+    return [{str(key): value for key, value in record.items()} for record in records]
 
 
 _TUPLE_PIPELINE = """\
@@ -105,13 +113,13 @@ def test_editing_sibling_module_scalar_reruns_stage(tmp_path: pathlib.Path) -> N
         },
     )
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":10}\n{"a":20}\n'
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 10}, {"a": 20}]
 
     # Different size, so Python's mtime+size bytecode check cannot reuse stale bytecode.
     (root / "settings.py").write_text("FACTOR = 200\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":200}\n{"a":400}\n', output
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 200}, {"a": 400}], output
 
 
 _FROM_IMPORT_PIPELINE = """\
@@ -145,7 +153,7 @@ def test_editing_from_imported_scalar_reruns_stage(tmp_path: pathlib.Path) -> No
     (root / "settings.py").write_text("FACTOR = 200\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":200}\n{"a":400}\n', output
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 200}, {"a": 400}], output
 
 
 _REBOUND_HELPER_PIPELINE = """\
@@ -180,7 +188,7 @@ def test_rebinding_module_attribute_callable_reruns_stage(tmp_path: pathlib.Path
     (root / "settings.py").write_text("from transforms import triple as transform\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":3}\n{"a":6}\n', output
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 3}, {"a": 6}], output
 
 
 _LIST_DEFAULT_PIPELINE = """\
@@ -293,14 +301,14 @@ def test_editing_scalar_module_value_used_as_default_reruns_stage(
 ) -> None:
     root = _helper_project(tmp_path, {**files, "data/raw/t.csv": "a\n1\n2\n"})
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     rel_path, old, new = edit
     path = root / rel_path
     path.write_text(path.read_text().replace(old, new))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":50}\n{"a":100}\n', output
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 50}, {"a": 100}], output
 
 
 def _helper_same_named_pipeline(origin: str) -> str:
@@ -380,12 +388,12 @@ def test_editing_scalar_read_by_cached_helper_reruns_stage(
     pipeline = _CACHED_HELPER_PIPELINE.replace("@functools.cache", decorator)
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":7}\n{"a":14}\n', output
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 7}, {"a": 14}], output
 
 
 def test_non_scalar_read_by_cached_helper_is_an_error(tmp_path: pathlib.Path) -> None:
@@ -467,12 +475,12 @@ def test_artifact_handle_default_is_wired_as_an_input(tmp_path: pathlib.Path) ->
 
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/h/scale.jsonl").read_text() == '{"a":3}\n{"a":6}\n', output
-    assert (root / "data/h/total.jsonl").read_text() == '{"a":1}\n{"a":2}\n', output
+    assert _helper_rows(root / "data/h/scale.jsonl") == [{"a": 3}, {"a": 6}], output
+    assert _helper_rows(root / "data/h/total.jsonl") == [{"a": 1}, {"a": 2}], output
 
     (root / "data/raw/t.csv").write_text("a\n5\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/h/scale.jsonl").read_text() == '{"a":15}\n', output
+    assert _helper_rows(root / "data/h/scale.jsonl") == [{"a": 15}], output
 
 
 _LOADER_CONFIG_PIPELINE = """\
@@ -756,12 +764,12 @@ def test_value_read_by_partial_argument_function_reruns_stage(
     pipeline = _PARTIAL_ARGUMENT_PIPELINE.replace("BINDING", binding)
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":7}\n{"a":14}\n', output
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 7}, {"a": 14}], output
 
 
 @pytest.mark.parametrize(
