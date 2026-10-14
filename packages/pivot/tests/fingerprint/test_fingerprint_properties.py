@@ -278,15 +278,24 @@ def _run_cache_key(stage_name: str, overrides: parameters.ParamsOverrides) -> st
     )
 
 
+def _canonical(params: dict[str, object]) -> str:
+    """Params as the run-cache key serializes them (run_history.compute_input_hash)."""
+    return json.dumps(params, sort_keys=True, separators=(",", ":"))
+
+
 @_SETTINGS
 @hypothesis.given(_overrides, _overrides)
+@hypothesis.example({"rate": 0.0}, {"rate": -0.0})
 def test_override_changes_run_cache_key_exactly_when_effective_params_change(
     first: dict[str, object], second: dict[str, object]
 ) -> None:
+    """Params compare as the key serializes them: 0.0 == -0.0 in Python, but not in JSON."""
     first_overrides = {_STAGE: first}
     second_overrides = {_STAGE: second}
 
-    same_params = _effective(_STAGE, first_overrides) == _effective(_STAGE, second_overrides)
+    same_params = _canonical(_effective(_STAGE, first_overrides)) == _canonical(
+        _effective(_STAGE, second_overrides)
+    )
     same_key = _run_cache_key(_STAGE, first_overrides) == _run_cache_key(_STAGE, second_overrides)
 
     assert same_key == same_params, (
