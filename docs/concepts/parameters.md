@@ -71,7 +71,9 @@ params/scale:
 
 Only the listed fields change. For [variants](pipelines.md#variants), a key
 without the `@` suffix applies to every variant, and a key with the full name
-(`params/scale@big`) is applied on top of it.
+(`params/scale@big`) is applied on top of it. A field with a Pydantic alias
+(`learning_rate: float = Field(0.01, alias="lr")`) takes either name; one key
+that sets it under both is refused.
 
 Keys are checked when overrides load. A key with no pipeline part (`scale:`)
 is refused with the qualified names it could mean, and so is a key for a

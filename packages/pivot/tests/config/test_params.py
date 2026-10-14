@@ -297,6 +297,221 @@ def test_load_params_yaml_names_the_nested_model_of_an_unknown_field(tmp_path: P
         parameters.load_params_yaml(pipeline, params_file)
 
 
+class _AliasedOptimizer(stage_def.StageParams):
+    momentum: float = pydantic.Field(0.9, alias="mom")
+
+
+class _AliasedParams(stage_def.StageParams):
+    learning_rate: float = pydantic.Field(0.01, alias="lr")
+    epochs: int = 3
+    optimizer: _AliasedOptimizer = _AliasedOptimizer.model_validate({})
+
+
+class _ByNameParams(stage_def.StageParams):
+    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(populate_by_name=True)
+    learning_rate: float = pydantic.Field(0.01, alias="lr")
+
+
+@pytest.mark.parametrize(
+    ("params", "override", "expected"),
+    [
+        (
+            _AliasedParams(lr=0.5),
+            {"epochs": 4},
+            {"learning_rate": 0.5, "epochs": 4, "optimizer": {"momentum": 0.9}},
+        ),
+        (
+            _AliasedParams(lr=0.5),
+            {"lr": 0.2},
+            {"learning_rate": 0.2, "epochs": 3, "optimizer": {"momentum": 0.9}},
+        ),
+        (
+            _AliasedParams(lr=0.5),
+            {"learning_rate": 0.2},
+            {"learning_rate": 0.2, "epochs": 3, "optimizer": {"momentum": 0.9}},
+        ),
+        (
+            _AliasedParams(lr=0.5),
+            {"optimizer": {"mom": 0.1}},
+            {"learning_rate": 0.5, "epochs": 3, "optimizer": {"momentum": 0.1}},
+        ),
+        (
+            _AliasedParams(lr=0.5),
+            {"optimizer": {"momentum": 0.1}},
+            {"learning_rate": 0.5, "epochs": 3, "optimizer": {"momentum": 0.1}},
+        ),
+        (
+            _ByNameParams.model_validate({"learning_rate": 0.5}),
+            {"learning_rate": 0.2},
+            {"learning_rate": 0.2},
+        ),
+        (_ByNameParams.model_validate({"learning_rate": 0.5}), {"lr": 0.2}, {"learning_rate": 0.2}),
+    ],
+    ids=[
+        "other-field",
+        "by-alias",
+        "by-name",
+        "nested-by-alias",
+        "nested-by-name",
+        "populate-by-name-by-name",
+        "populate-by-name-by-alias",
+    ],
+)
+def test_override_reaches_an_aliased_field_by_alias_or_by_name(
+    params: stage_def.StageParams, override: dict[str, object], expected: dict[str, object]
+) -> None:
+    """The code's values for aliased fields survive, and either name in params.yaml applies."""
+    assert parameters.get_effective_params(params, "p/s", {"p/s": override}) == expected
+
+
+class _SplitAliasParams(stage_def.StageParams):
+    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(serialize_by_alias=True)
+    sep: str = pydantic.Field(",", validation_alias="sep_in", serialization_alias="sep_out")
+    header: bool = True
+
+
+def test_override_keeps_a_field_whose_input_and_output_aliases_differ() -> None:
+    """The value from code survives an override of another field, whatever the field dumps as."""
+    effective = parameters.apply_overrides(
+        _SplitAliasParams.model_validate({"sep_in": ";"}), "p/s", {"p/s": {"header": False}}
+    )
+
+    assert (effective.sep, effective.header) == (";", False)
+
+
+class _ChoiceParams(stage_def.StageParams):
+    learning_rate: float = pydantic.Field(
+        0.01, validation_alias=pydantic.AliasChoices("lr", "rate")
+    )
+    epochs: int = 3
+
+
+class _PathParams(stage_def.StageParams):
+    sep: str = pydantic.Field(",", validation_alias=pydantic.AliasPath("csv", "sep"))
+    header: bool = True
+
+
+@pytest.mark.parametrize(
+    ("params", "override", "expected"),
+    [
+        (
+            _ChoiceParams.model_validate({"rate": 0.5}),
+            {"epochs": 4},
+            {"learning_rate": 0.5, "epochs": 4},
+        ),
+        (
+            _ChoiceParams.model_validate({"rate": 0.5}),
+            {"rate": 0.2},
+            {"learning_rate": 0.2, "epochs": 3},
+        ),
+        (
+            _ChoiceParams.model_validate({"rate": 0.5}),
+            {"lr": 0.2},
+            {"learning_rate": 0.2, "epochs": 3},
+        ),
+        (
+            _PathParams.model_validate({"csv": {"sep": ";"}}),
+            {"header": False},
+            {"sep": ";", "header": False},
+        ),
+        (
+            _PathParams.model_validate({"csv": {"sep": ";"}}),
+            {"sep": "|"},
+            {"sep": "|", "header": True},
+        ),
+    ],
+    ids=[
+        "choices-other-field",
+        "choices-second-choice",
+        "choices-first-choice",
+        "path-other-field",
+        "path-by-name",
+    ],
+)
+def test_override_reaches_a_field_with_alias_choices_or_an_alias_path(
+    params: stage_def.StageParams, override: dict[str, object], expected: dict[str, object]
+) -> None:
+    assert parameters._override_errors(params, "p/s", {"p/s": override}) == []
+    assert parameters.get_effective_params(params, "p/s", {"p/s": override}) == expected
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        (
+            {"rat": 0.2},
+            "field 'rat' is not a field of _ChoiceParams; did you mean 'rate'?",
+        ),
+        (
+            {"rate": 0.2, "lr": 0.3},
+            "field 'learning_rate' is set twice, as 'rate' and as 'lr'",
+        ),
+    ],
+    ids=["typo", "two-choices"],
+)
+def test_alias_choices_typo_and_double_setting_are_refused(
+    override: dict[str, object], message: str
+) -> None:
+    params = _ChoiceParams.model_validate({"rate": 0.5})
+
+    assert parameters._override_errors(params, "p/s", {"p/s": override}) == [
+        ("p/s", f"params.yaml key 'p/s': {message}")
+    ]
+
+
+def test_aliased_field_typo_is_refused_suggesting_the_alias() -> None:
+    errors = parameters._override_errors(_AliasedParams(lr=0.5), "p/s", {"p/s": {"lrr": 0.2}})
+
+    assert errors == [
+        (
+            "p/s",
+            "params.yaml key 'p/s': field 'lrr' is not a field of _AliasedParams; "
+            + "did you mean 'lr'?",
+        )
+    ]
+
+
+def test_variant_key_by_field_name_replaces_base_key_by_alias() -> None:
+    """Both spellings name one field, so the variant's key wins over the base key's."""
+    overrides = {"p/s": {"lr": 0.2}, "p/s@v": {"learning_rate": 0.3}}
+
+    effective = parameters.get_effective_params(_AliasedParams(lr=0.5), "p/s@v", overrides)
+
+    assert effective["learning_rate"] == 0.3
+
+
+def test_one_key_setting_a_field_by_name_and_by_alias_is_refused() -> None:
+    errors = parameters._override_errors(
+        _AliasedParams(lr=0.5), "p/s", {"p/s": {"lr": 0.2, "learning_rate": 0.3}}
+    )
+
+    assert errors == [
+        (
+            "p/s",
+            "params.yaml key 'p/s': field 'learning_rate' is set twice, "
+            + "as 'lr' and as 'learning_rate'",
+        )
+    ]
+
+
+@stage
+def _aliased_stage(params: _AliasedParams) -> None:
+    pass
+
+
+def test_load_params_yaml_accepts_an_aliased_field_by_either_name(tmp_path: Path) -> None:
+    with Pipeline("a", root=tmp_path) as pipeline:
+        _aliased_stage(params=_AliasedParams(lr=0.5))
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("a/_aliased_stage:\n  lr: 0.2\n  optimizer:\n    momentum: 0.1\n")
+
+    overrides = parameters.load_params_yaml(pipeline, params_file)
+
+    assert parameters.get_effective_params(
+        pipeline.get_stage("a/_aliased_stage")["params"], "a/_aliased_stage", overrides
+    ) == {"learning_rate": 0.2, "epochs": 3, "optimizer": {"momentum": 0.1}}
+
+
 # -----------------------------------------------------------------------------
 # build_params_instance tests
 # -----------------------------------------------------------------------------

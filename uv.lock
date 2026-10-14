@@ -2254,7 +2254,7 @@ requires-dist = [
     { name = "pivot", extras = ["matplotlib"], marker = "extra == 'dev'", editable = "packages/pivot" },
     { name = "pivot", extras = ["s3"], marker = "extra == 'dev'", editable = "packages/pivot" },
     { name = "pivot-tui", marker = "extra == 'tui'", editable = "packages/pivot-tui" },
-    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pydantic", specifier = ">=2.11" },
     { name = "pygtrie", specifier = ">=2.5.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest-aioboto3", marker = "extra == 'dev'", specifier = ">=0.1.0" },
