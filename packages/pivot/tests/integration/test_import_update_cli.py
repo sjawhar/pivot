@@ -401,7 +401,7 @@ def test_import_rejects_remote_content_that_does_not_match_its_hash(
     result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/total", "--out", "t.txt"])
 
     assert result.exit_code != 0
-    assert "Downloaded file hash mismatch" in result.output
+    assert "Hash mismatch" in result.output
     assert not (consumer / "t.txt").exists(), "corrupt content must not stay in the workspace"
     assert not (consumer / "t.txt.pvt").exists()
 

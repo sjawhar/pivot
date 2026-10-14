@@ -6,6 +6,7 @@ import pathlib
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import xxhash
 from botocore import exceptions as botocore_exc
 
 from pivot import exceptions
@@ -26,6 +27,11 @@ def _helper_patch_s3_client(
     mock_client_cm = mocker.AsyncMock()
     mock_client_cm.__aenter__.return_value = client
     mocker.patch.object(s3_remote._session, "client", return_value=mock_client_cm)
+
+
+def _helper_hash(content: bytes) -> str:
+    """Content-addressed key for content, as pivot's cache computes it."""
+    return xxhash.xxh64(content).hexdigest()
 
 
 # -----------------------------------------------------------------------------
@@ -447,7 +453,7 @@ async def test_download_file(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file gets object from S3."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"downloaded content")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -467,7 +473,7 @@ async def test_download_file_streaming_body_api_regression(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Regression test: StreamingBody.read() works without async-with."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"test content for regression")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -487,7 +493,7 @@ async def test_download_file_readonly(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file with readonly=True sets 0o444 permissions (for cache files)."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"cached content")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -715,22 +721,22 @@ async def test_download_batch(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch downloads multiple files in parallel."""
-    items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
+    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"dest{i}.txt") for i in range(3)]
 
-    for cache_hash, _ in items:
+    for i, (cache_hash, _) in enumerate(items):
         await aioboto3_s3_client.put_object(
             Bucket=s3_remote.bucket,
             Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
-            Body=b"content",
+            Body=f"content {i}".encode(),
         )
 
     results = await s3_remote.download_batch(items, concurrency=10)
 
     assert len(results) == 3
     assert all(r["success"] for r in results)
-    for _, path in items:
+    for i, (_, path) in enumerate(items):
         assert path.exists()
-        assert path.read_bytes() == b"content"
+        assert path.read_bytes() == f"content {i}".encode()
 
 
 async def test_download_batch_empty() -> None:
@@ -932,13 +938,13 @@ async def test_download_batch_with_callback(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch calls callback for each completed download."""
-    items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
+    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"dest{i}.txt") for i in range(3)]
 
-    for cache_hash, _ in items:
+    for i, (cache_hash, _) in enumerate(items):
         await aioboto3_s3_client.put_object(
             Bucket=s3_remote.bucket,
             Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
-            Body=b"content",
+            Body=f"content {i}".encode(),
         )
 
     callback_values = list[int]()
@@ -958,7 +964,7 @@ async def test_download_file_default_permissions(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file without readonly flag creates file with default permissions."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"writable content")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -983,13 +989,13 @@ async def test_download_batch_readonly(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch with readonly=True sets 0o444 permissions on all files."""
-    items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"cached{i}.txt") for i in range(3)]
+    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"cached{i}.txt") for i in range(3)]
 
-    for cache_hash, _ in items:
+    for i, (cache_hash, _) in enumerate(items):
         await aioboto3_s3_client.put_object(
             Bucket=s3_remote.bucket,
             Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
-            Body=b"content",
+            Body=f"content {i}".encode(),
         )
 
     results = await s3_remote.download_batch(items, concurrency=10, readonly=True)

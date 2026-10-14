@@ -249,9 +249,8 @@ async def _atomic_download(
         fd = -1  # Mark as closed
         if actual_hash != expected_hash:
             raise exceptions.RemoteError(
-                "Downloaded remote cache content hash mismatch: "
-                + f"expected {expected_hash}, got {actual_hash}. "
-                + "Re-push the cache entry from a trusted source."
+                f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
+                + f"for {bucket}/{key}. Re-push it from a trusted source."
             )
         if readonly:
             os.chmod(tmp_path, 0o444)
