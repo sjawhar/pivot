@@ -1120,14 +1120,19 @@ def test_repro_pipeline_file_target_already_discovered_runs(
         assert (cwd / "data" / run_from / "scale.jsonl").exists()
 
 
-_PREP_PIPELINE = (
-    "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
-    + "class DropLowParams(StageParams):\n    min_score: float = 0.5\n\n\n"
-    + "@stage\ndef drop_low(raw: pd.DataFrame, params: DropLowParams) -> pd.DataFrame:\n"
-    + '    return raw[raw["score"] >= params.min_score]\n\n\n'
-    + 'with Pipeline("prep") as pipeline:\n'
-    + '    kept = drop_low(pipeline.input("scores.csv"), params=DropLowParams())\n'
-)
+def _prep_pipeline(params_fields: str = "") -> str:
+    return (
+        "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+        + "class DropLowParams(StageParams):\n    min_score: float = 0.5\n"
+        + params_fields
+        + "\n\n@stage\ndef drop_low(raw: pd.DataFrame, params: DropLowParams) -> pd.DataFrame:\n"
+        + '    return raw[raw["score"] >= params.min_score]\n\n\n'
+        + 'with Pipeline("prep") as pipeline:\n'
+        + '    kept = drop_low(pipeline.input("scores.csv"), params=DropLowParams())\n'
+    )
+
+
+_PREP_PIPELINE = _prep_pipeline()
 
 _REPORT_PIPELINE = (
     "from typing import Annotated\n\nimport pandas as pd\n\n"
@@ -1139,11 +1144,11 @@ _REPORT_PIPELINE = (
 )
 
 
-def _write_prep_report_project(cwd: pathlib.Path) -> None:
+def _write_prep_report_project(cwd: pathlib.Path, prep: str = _PREP_PIPELINE) -> None:
     """docs/guides/multi-pipeline.md: prep/, report/ and a root pipeline including both."""
     (cwd / "data" / "raw").mkdir(parents=True)
     (cwd / "data" / "raw" / "scores.csv").write_text("name,score\na,0.2\nb,0.7\nc,0.9\n")
-    for name, text in (("prep", _PREP_PIPELINE), ("report", _REPORT_PIPELINE)):
+    for name, text in (("prep", prep), ("report", _REPORT_PIPELINE)):
         (cwd / name).mkdir()
         (cwd / name / "pipeline.py").write_text(text)
     (cwd / "pipeline.py").write_text(
@@ -1172,6 +1177,50 @@ def test_repro_included_pipeline_file_target_runs(
 
     assert result.exit_code == 0, result.output
     assert summary in result.output, result.output
+
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
+
+
+def _pivot_with_hash_seed(
+    cwd: pathlib.Path, hash_seed: int, *args: str
+) -> subprocess.CompletedProcess[str]:
+    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    env["PYTHONHASHSEED"] = str(hash_seed)
+    return subprocess.run(
+        [_PIVOT_BIN, *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("hash_seed", [0, 1, 2, 3])
+def test_params_holding_sets_and_nan_stay_one_stage_in_every_process(
+    tmp_path: pathlib.Path, hash_seed: int
+) -> None:
+    """include() deep-copies a set, which may reorder it, and a re-import makes a new NaN."""
+    _write_prep_report_project(
+        tmp_path,
+        _prep_pipeline(
+            "    ids: set[int] = {0, 3, 11}\n"
+            + '    tags: frozenset[str] = frozenset({"alpha", "beta", "gamma", "delta", "eps"})\n'
+            + '    ceiling: float = float("nan")\n'
+        ),
+    )
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".pivot").mkdir()
+
+    listed = _pivot_with_hash_seed(tmp_path, hash_seed, "list")
+    ran = _pivot_with_hash_seed(tmp_path, hash_seed, "repro", "prep/pipeline.py")
+
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "prep/drop_low" in listed.stdout, listed.stdout
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert "1 ran" in ran.stdout + ran.stderr, ran.stdout + ran.stderr
 
 
 def test_list_all_skips_a_file_that_re_exports_another_files_pipeline(

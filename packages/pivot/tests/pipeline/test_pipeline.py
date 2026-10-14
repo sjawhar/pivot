@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownParameterType=false
 from __future__ import annotations
 
+import copy
 import importlib.util
 import inspect
 import sys
@@ -238,6 +239,30 @@ def test_include_keeps_one_stage_whose_definition_was_imported_twice(
     assert combined.list_stages() == ["same/train"]
 
 
+class _CollectionParams(stage_def.StageParams):
+    ids: set[int] = set()
+    ceiling: float = 0.0
+
+
+@pytest.mark.parametrize(
+    ("first", "again"),
+    [
+        (_CollectionParams(ids={0, 3, 11}), copy.deepcopy(_CollectionParams(ids={0, 3, 11}))),
+        (_CollectionParams(ceiling=float("nan")), _CollectionParams(ceiling=float("nan"))),
+    ],
+    ids=["set-iterates-in-another-order", "new-nan"],
+)
+def test_include_keeps_one_stage_whose_params_encode_alike(
+    tmp_path: pathlib.Path, first: _CollectionParams, again: _CollectionParams
+) -> None:
+    """A deep copy may rebuild a set in another order; a re-import makes a new NaN."""
+    assert first.model_dump(mode="json") != again.model_dump(mode="json")
+
+    combined = _include_both(tmp_path, _train_info(params=first), _train_info(params=again))
+
+    assert combined.list_stages() == ["same/train"]
+
+
 def test_include_keeps_one_stage_whose_formats_and_types_differ(tmp_path: pathlib.Path) -> None:
     """Formats and Python types follow from the function; a re-imported user type is new."""
     again = _train_info(
@@ -324,8 +349,8 @@ def test_include_names_the_params_classes_when_both_print_alike(tmp_path: pathli
 
     with pytest.raises(
         exceptions.PipelineConfigError,
-        match=r"different params \(\(.*TrainParams', \{'seed': 1\}\) vs "
-        + r"\('elsewhere', .*TrainParams', \{'seed': 1\}\)\)",
+        match=r"different params \(\(.*TrainParams', '\{\"seed\": 1\}'\) vs "
+        + r"\('elsewhere', .*TrainParams', '\{\"seed\": 1\}'\)\)",
     ):
         _include_both(tmp_path, _train_info(), _train_info(params=elsewhere(seed=1)))
 

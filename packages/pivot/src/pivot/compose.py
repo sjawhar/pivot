@@ -9,6 +9,7 @@ import enum
 import functools
 import importlib
 import inspect
+import json
 import logging
 import os
 import pathlib
@@ -18,7 +19,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import exceptions, outputs, path_policy, project, registry, stage_def, types
+from . import exceptions, outputs, parameters, path_policy, project, registry, stage_def, types
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -184,7 +185,9 @@ def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, s
     """Each part of a stage besides its function, as (label, comparison key, display).
 
     Every key survives importing the pipeline file again. Params compare by class module and
-    qualname plus JSON values, because pydantic equality needs one class object. Formats and
+    qualname plus their canonical JSON text: set members sorted (``parameters.sort_set_members``,
+    the encoding recorded in the lock file) so a deep-copied set matches, and NaN written as
+    ``NaN`` so a re-imported NaN matches. Pydantic equality needs one class object. Formats and
     Python types are left out: they follow from the function, and a re-imported type is new.
     """
     deps = {name: (ref.identity, ref.tag) for name, ref in info["deps"].items()}
@@ -194,7 +197,14 @@ def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, s
     params_key = (
         None
         if params is None
-        else (type(params).__module__, type(params).__qualname__, params.model_dump(mode="json"))
+        else (
+            type(params).__module__,
+            type(params).__qualname__,
+            json.dumps(
+                parameters.sort_set_members(params, params.model_dump(mode="json")),
+                sort_keys=True,
+            ),
+        )
     )
     return [
         ("inputs", deps, _show_items({name: _show_ref(*ref) for name, ref in deps.items()})),
