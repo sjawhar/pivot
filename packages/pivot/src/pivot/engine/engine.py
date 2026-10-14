@@ -237,9 +237,13 @@ class Engine:
     # Run state machine (Task 10/11)
     _run_state: _RunState
     _run_task_group: TaskGroup | None
+    # Requests made since the running run began, replayed once it ends
     _restart_pending: RunRequested | None
     # The request of the run in progress; a restart that cancels it replays its stages too
     _running_request: RunRequested | None
+    # The request of a run a restart cancelled, merged into the restart only when it replays;
+    # an explicit cancel clears it, so that run's own stages stay cancelled
+    _cancelled_request: RunRequested | None
     _reload_pending: set[str] | None
     _idle_condition: anyio.Condition
 
@@ -300,6 +304,7 @@ class Engine:
         self._run_task_group = None
         self._restart_pending = None
         self._running_request = None
+        self._cancelled_request = None
         self._reload_pending = None
         self._idle_condition = anyio.Condition()
 
@@ -722,6 +727,8 @@ class Engine:
             case "run_requested":
                 await self._handle_run_requested(event)
             case "cancel_requested":
+                # An explicit cancel: the run's own stages do not replay with a queued restart
+                self._cancelled_request = None
                 await self._handle_cancel_requested()
             case "data_artifact_changed":
                 await self._handle_data_artifact_changed(event)
@@ -731,11 +738,11 @@ class Engine:
     async def _handle_run_requested(self, event: RunRequested) -> None:
         """Handle a RunRequested event by spawning a non-blocking execution task.
 
-        If already running, coalesces into a restart: cancels the current run and queues one
-        request covering both it and the new event, replayed once the current run completes.
-        While a run is cancelling, the event joins the pending restart, or becomes it after an
-        explicit cancel. A restart waiting behind a deferred reload is folded into that reload's
-        re-run.
+        If already running, coalesces into a restart: cancels the current run and queues the new
+        event, replayed with the cancelled run's stages once that run ends. While a run is
+        cancelling, the event joins the queued restart. An explicit cancel, before or after,
+        keeps the cancelled run's stages out of the replay. A restart waiting behind a deferred
+        reload is folded into that reload's re-run.
         """
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
@@ -748,15 +755,15 @@ class Engine:
             return
 
         if self._run_state == _RunState.RUNNING:
-            # Coalesce into one restart covering both the cancelled run and this request
+            # Coalesce: hold the cancelled run's request apart, merged in only at replay
             assert self._running_request is not None
-            self._restart_pending = _merge_run_requests(self._running_request, event)
+            self._cancelled_request = self._running_request
+            self._restart_pending = event
             await self._handle_cancel_requested()
             return
 
         if self._run_state == _RunState.CANCELLING:
-            # Wait for the stopping run: join its pending restart, or after an explicit cancel
-            # become the restart on its own, so the stages the cancel stopped stay stopped
+            # Wait for the stopping run and join the restart queued behind it
             self._restart_pending = (
                 event
                 if self._restart_pending is None
@@ -764,10 +771,10 @@ class Engine:
             )
             return
 
-        if self._restart_pending is not None:
+        pending = self._take_restart()
+        if pending is not None:
             # Only a deferred reload's re-run starts while a restart waits; it runs both
-            pending = self._drop_removed_stages(self._restart_pending)
-            self._restart_pending = None
+            pending = self._drop_removed_stages(pending)
             if pending is not None:
                 event = _merge_run_requests(pending, event)
 
@@ -832,14 +839,12 @@ class Engine:
                         CodeOrConfigChanged(type="code_or_config_changed", paths=reload_paths)
                     )
 
-                # Replay a restart no reload re-run absorbed (clear before call for future-safety)
-                if self._restart_pending is not None:
-                    restart: RunRequested | None = self._restart_pending
-                    self._restart_pending = None
-                    if reload_pending is not None:
-                        restart = self._drop_removed_stages(restart)
-                    if restart is not None:
-                        await self._handle_run_requested(restart)
+                # Replay a restart no reload re-run absorbed (taken before the call)
+                restart = self._take_restart()
+                if restart is not None and reload_pending is not None:
+                    restart = self._drop_removed_stages(restart)
+                if restart is not None:
+                    await self._handle_run_requested(restart)
 
                 if self._run_state == _RunState.IDLE and not self._has_pending_work():
                     async with self._idle_condition:
@@ -856,6 +861,20 @@ class Engine:
                     EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
                 )
                 self._current_run_id = None
+
+    def _take_restart(self) -> RunRequested | None:
+        """Remove and return the queued restart, with the cancelled run's stages merged in.
+
+        The cancelled run's request is held apart until now so an explicit cancel made after the
+        restart was queued can still drop it.
+        """
+        restart = self._restart_pending
+        cancelled = self._cancelled_request
+        self._restart_pending = None
+        self._cancelled_request = None
+        if restart is None or cancelled is None:
+            return restart
+        return _merge_run_requests(cancelled, restart)
 
     def _drop_removed_stages(self, request: RunRequested) -> RunRequested | None:
         """``request`` without stages a reload removed since it was made; None if none remain.

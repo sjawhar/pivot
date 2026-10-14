@@ -19,6 +19,7 @@ from pivot.engine.engine import Engine
 from pivot.engine.sinks import ResultCollectorSink
 from pivot.engine.sources import OneShotSource
 from pivot.engine.types import (
+    CancelRequested,
     CodeOrConfigChanged,
     DataArtifactChanged,
     EngineDiagnostic,
@@ -1138,20 +1139,22 @@ async def test_engine_restart_after_deferred_reload_skips_removed_stages() -> No
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("cancel", "replayed"),
+    ("steps", "replayed"),
     [
-        pytest.param("restart", ["stage_a", "stage_b", "stage_c"], id="joins-the-pending-restart"),
-        pytest.param("explicit", ["stage_c"], id="after-an-explicit-cancel"),
+        pytest.param(["stage_b", "stage_c"], ["stage_a", "stage_b", "stage_c"], id="edits-only"),
+        pytest.param(["cancel", "stage_c"], ["stage_c"], id="cancel-then-edit"),
+        pytest.param(["stage_c", "cancel"], ["stage_c"], id="edit-then-cancel"),
     ],
 )
 async def test_engine_run_request_while_cancelling_waits_for_the_run_to_end(
-    cancel: str,
+    steps: list[str],
     replayed: list[str],
 ) -> None:
     """A request made while a run is cancelling starts no second run alongside it.
 
-    It joins the pending restart, or after an explicit cancel becomes the restart on its own, so
-    the stages that cancel stopped are not merged back in.
+    Requests that cancel a run replay with its stages once it ends. An explicit cancel, made
+    before or after those requests, stops the run's own stages from replaying; the requests
+    still replay.
     """
     calls = list[list[str] | None]()
     in_flight = 0
@@ -1180,14 +1183,14 @@ async def test_engine_run_request_while_cancelling_waits_for_the_run_to_end(
 
         async with anyio.create_task_group() as tg:
             engine._run_task_group = tg
-            await engine._handle_run_requested(_helper_run_request(["stage_a"]))
+            await engine._handle_input_event(_helper_run_request(["stage_a"]))
             await anyio.wait_all_tasks_blocked()
-            if cancel == "restart":
-                await engine._handle_run_requested(_helper_run_request(["stage_b"]))
-            else:
-                await engine._handle_cancel_requested()
-            assert engine._run_state == engine_mod._RunState.CANCELLING
-            await engine._handle_run_requested(_helper_run_request(["stage_c"]))
+            for step in steps:
+                if step == "cancel":
+                    await engine._handle_input_event(CancelRequested(type="cancel_requested"))
+                else:
+                    await engine._handle_input_event(_helper_run_request([step]))
+                assert engine._run_state == engine_mod._RunState.CANCELLING
             await anyio.wait_all_tasks_blocked()
             release.set()
 
