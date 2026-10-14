@@ -6,6 +6,7 @@ final state only, so the tests are deterministic however the OS interleaves the 
 
 from __future__ import annotations
 
+import fcntl
 import multiprocessing
 import os
 from typing import TYPE_CHECKING
@@ -17,14 +18,12 @@ from pivot.types import is_dir_hash
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Callable
     from multiprocessing.synchronize import Barrier
-
-    from pivot.types import DirHash
 
 _PROCESSES = 6
 _INCREMENTS = 40
 _FILES_PER_PROCESS = 25
-_RESTORES_PER_PROCESS = 30
 
 
 def _hammer_state_dir(state_dir: pathlib.Path, worker: int, barrier: Barrier) -> None:
@@ -43,9 +42,11 @@ def _hammer_state_dir(state_dir: pathlib.Path, worker: int, barrier: Barrier) ->
                 assert reader.get_generation("shared/stage") is not None
 
 
-def _run_processes(target: object, args_for: list[tuple[object, ...]]) -> list[int | None]:
+def _run_processes(
+    target: Callable[..., None], args_for: list[tuple[object, ...]]
+) -> list[int | None]:
     ctx = multiprocessing.get_context("spawn")
-    processes = [ctx.Process(target=target, args=args) for args in args_for]  # pyright: ignore[reportArgumentType]
+    processes = [ctx.Process(target=target, args=args) for args in args_for]
     for process in processes:
         process.start()
     for process in processes:
@@ -75,61 +76,48 @@ def test_concurrent_writers_lose_no_generation_increments_or_hash_entries(
                 assert db.get(path, path.stat()) == f"{worker:08x}{i:08x}"
 
 
-def _restore_directory(
-    target: pathlib.Path,
-    output_hash: DirHash,
-    cache_dir: pathlib.Path,
-    state_dir: pathlib.Path,
-    barrier: Barrier,
-) -> None:
-    barrier.wait(timeout=60)
-    for _ in range(_RESTORES_PER_PROCESS):
-        assert cache.restore_from_cache(
-            target,
-            output_hash,
-            cache_dir,
-            checkout_modes=[cache.CheckoutMode.COPY],
-            state_dir=state_dir,
-        )
-
-
 @pytest.mark.xfail(
     strict=True,
     reason="red test for Task 8 (storage-fixes Slice 2 PR): "
     + "directory restore lock is unlinked while a waiter holds it",
 )
-def test_concurrent_directory_restores_leave_one_complete_tree_and_no_temps(
-    tmp_path: pathlib.Path,
-) -> None:
+def test_directory_restore_keeps_the_lock_file_a_waiter_holds(tmp_path: pathlib.Path) -> None:
+    """Restores of one directory exclude each other through one lock file.
+
+    A second restorer waiting on that lock holds an fd to the lock file. If the first restorer
+    unlinks the file when it finishes, a third restorer creates a new file and locks it while
+    the waiter locks the old one, and both restore the same directory at once.
+    """
     source = tmp_path / "out"
     (source / "nested").mkdir(parents=True)
-    expected = {f"f{i}.txt": f"content {i}" for i in range(20)}
-    expected["nested/deep.txt"] = "deep"
-    for rel, content in expected.items():
-        (source / rel).write_text(content)
+    (source / "a.txt").write_text("a")
+    (source / "nested" / "deep.txt").write_text("deep")
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / ".pivot"
-    state_dir.mkdir()
     output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
     assert is_dir_hash(output_hash)
     cache.remove_output(source)
-    barrier = multiprocessing.get_context("spawn").Barrier(_PROCESSES)
+    lock_path = cache._get_lock_path(source, state_dir)
 
-    exit_codes = _run_processes(
-        _restore_directory,
-        [(source, output_hash, cache_dir, state_dir, barrier) for _ in range(_PROCESSES)],
-    )
+    waiter = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        assert cache.restore_from_cache(
+            source,
+            output_hash,
+            cache_dir,
+            checkout_modes=[cache.CheckoutMode.COPY],
+            state_dir=state_dir,
+        )
+        assert (source / "nested" / "deep.txt").read_text() == "deep"
 
-    assert exit_codes == [0] * _PROCESSES, f"a restore process failed: {exit_codes}"
-    restored = {
-        str(path.relative_to(source)): path.read_text()
-        for path in source.rglob("*")
-        if path.is_file()
-    }
-    assert restored == expected, "the restored tree must be complete and contain nothing else"
-    leftovers = [
-        name
-        for name in os.listdir(tmp_path)
-        if name.startswith((cache._RESTORE_TEMP_PREFIX, cache._BACKUP_TEMP_PREFIX))
-    ]
-    assert leftovers == [], f"restore temp/backup dirs left behind: {leftovers}"
+        assert lock_path.exists(), "the restore deleted the lock file the waiter holds"
+        assert lock_path.stat().st_ino == os.fstat(waiter).st_ino
+        fcntl.flock(waiter, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        newcomer = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(newcomer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(newcomer)
+    finally:
+        os.close(waiter)
