@@ -38,11 +38,15 @@ class _FakeApp:
     posted: list[object]
     event_poller: object | None
     ran: bool
+    return_code: int | None
+    run_return_code: int
 
-    def __init__(self) -> None:
+    def __init__(self, *, run_return_code: int = 0) -> None:
         self.posted = list[object]()
         self.event_poller = None
         self.ran = False
+        self.return_code = None
+        self.run_return_code = run_return_code
 
     def post_message(self, message: object) -> bool:
         self.posted.append(message)
@@ -53,6 +57,7 @@ class _FakeApp:
 
     def run(self) -> None:
         self.ran = True
+        self.return_code = self.run_return_code
 
 
 class _FakeRpcPivotClient:
@@ -84,6 +89,9 @@ class _FakeEventPoller:
 
     async def run(self) -> None:
         self.ran = True
+
+    def stop(self) -> None:
+        return None
 
 
 class _DoneFuture(concurrent.futures.Future[str]):
@@ -715,14 +723,28 @@ def test_run_tui_with_engine_retries_poller_connect(
     _FakeRpcPivotClient.instances = []
     _FakeRpcPivotClient.failures_before_success = 2
 
+    # The poller stops retrying once the engine finishes or the TUI exits, so keep both
+    # running until the poller has connected.
     async def _engine_fn(socket_ready: threading.Event) -> str:
+        import anyio
+
         socket_ready.set()
+        with anyio.fail_after(10):
+            while app.event_poller is None:
+                await anyio.sleep(0.01)
         return "ok"
 
-    async def _fake_sleep(_duration: float) -> None:
-        return None
+    def _run_until_connected() -> None:
+        import time
 
-    mocker.patch("pivot.cli._run_common.anyio.sleep", new=_fake_sleep)
+        app.ran = True
+        deadline = time.monotonic() + 10
+        while app.event_poller is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        app.return_code = 0
+
+    app.run = _run_until_connected
+    mocker.patch.object(_run_common, "_POLLER_CONNECT_RETRY_S", 0.01)
     mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
     mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
 
@@ -772,3 +794,156 @@ def test_run_tui_with_engine_skips_setting_done_future(tmp_path: pathlib.Path) -
 
     assert result_future.set_result_called is False
     assert result_future.set_exception_called is False
+
+
+def test_run_tui_with_engine_exits_nonzero_when_app_crashes(
+    mocker: MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    """A TUI that exits with a non-zero return code (unhandled exception) fails the command."""
+    app = _FakeApp(run_return_code=1)
+
+    async def _engine_fn(socket_ready: threading.Event) -> None:
+        socket_ready.set()
+
+    _FakeRpcPivotClient.instances = []
+    _FakeRpcPivotClient.failures_before_success = 0
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            oneshot=False,
+            suppress_keyboard_interrupt=True,
+        )
+
+    assert exc_info.value.code == 1
+
+
+def test_run_tui_with_engine_watch_engine_crash_exits_tui_and_fails(
+    mocker: MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    """A watch-mode engine that crashes ends the TUI and fails the command with its error."""
+    import time
+
+    import pivot_tui.run as tui_run
+
+    app = _FakeApp()
+
+    def _run_until_shutdown() -> None:
+        app.ran = True
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(isinstance(m, tui_run.TuiShutdown) for m in app.posted):
+                break
+            time.sleep(0.01)
+        app.return_code = 1
+
+    app.run = _run_until_shutdown
+
+    async def _engine_fn(socket_ready: threading.Event) -> None:
+        socket_ready.set()
+        raise RuntimeError("engine crashed")
+
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+
+    with pytest.raises(RuntimeError, match="engine crashed"):
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            oneshot=False,
+            suppress_keyboard_interrupt=True,
+        )
+
+    shutdowns = [m for m in app.posted if isinstance(m, tui_run.TuiShutdown)]
+    assert len(shutdowns) == 1
+    assert shutdowns[0].error is not None
+    assert "engine crashed" in shutdowns[0].error
+
+
+def test_run_tui_with_engine_watch_quit_while_engine_runs_succeeds(
+    mocker: MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    """Quitting the watch TUI while the engine is still running returns normally (exit 0)."""
+    import threading
+
+    import anyio
+
+    app = _FakeApp()
+    release_engine = threading.Event()
+    engine_threads_before = set(threading.enumerate())
+
+    async def _engine_fn(socket_ready: threading.Event) -> None:
+        socket_ready.set()
+        while not release_engine.is_set():
+            await anyio.sleep(0.01)
+
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+
+    try:
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            oneshot=False,
+            suppress_keyboard_interrupt=True,
+        )
+    finally:
+        release_engine.set()
+        for thread in set(threading.enumerate()) - engine_threads_before:
+            thread.join(timeout=5)
+
+    assert app.ran is True
+
+
+def test_run_tui_with_engine_stops_poller_when_engine_finishes_before_connect(
+    mocker: MockerFixture, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A one-shot engine that finishes before the poller connects ends the poller thread.
+
+    The engine removes its socket on exit, so a poller still retrying connect must stop
+    when the engine (and TUI) finish, not keep retrying after the command returns.
+    """
+    import threading
+    import time
+
+    app = _FakeApp()
+    result_future: concurrent.futures.Future[str] = concurrent.futures.Future()
+
+    async def _engine_fn(socket_ready: threading.Event) -> str:
+        socket_ready.set()
+        return "ok"
+
+    class _SlowFirstConnectClient:
+        connect_calls: int = 0
+
+        async def connect(self, _socket_path: pathlib.Path) -> None:
+            type(self).connect_calls += 1
+            if type(self).connect_calls == 1:
+                time.sleep(3.0)
+            raise OSError("socket removed: engine already finished")
+
+        async def disconnect(self) -> None:
+            return None
+
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _SlowFirstConnectClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+    threads_before = set(threading.enumerate())
+
+    with caplog.at_level(logging.DEBUG, logger="pivot.cli._run_common"):
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            result_future=result_future,
+        )
+
+    new_threads = [t for t in threading.enumerate() if t not in threads_before and t.is_alive()]
+    assert new_threads == [], f"poller thread still alive after return: {new_threads}"
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert result_future.result(timeout=1) == "ok"

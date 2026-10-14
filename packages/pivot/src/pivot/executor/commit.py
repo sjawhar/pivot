@@ -30,6 +30,7 @@ def _split_identity(identity: str) -> tuple[str, str | None]:
 
 
 def commit_stages(
+    pipeline: registry.PipelineLike,
     stage_names: list[str] | None = None,
     force: bool = False,
 ) -> tuple[list[str], list[str]]:
@@ -42,15 +43,13 @@ def commit_stages(
     stages' lock files and cache entries remain written.
 
     Args:
+        pipeline: The pipeline whose stages are committed.
         stage_names: Specific stages to commit. None means all stale stages.
         force: If True, commit even if lock file is unchanged.
 
     Returns:
         Tuple of (committed, failed) stage name lists.
     """
-    from pivot.cli import helpers as cli_helpers
-
-    pipeline = cli_helpers.get_pipeline()
     all_stage_names = pipeline.list_stages()
 
     # Resolve target stages

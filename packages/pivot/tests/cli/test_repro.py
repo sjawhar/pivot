@@ -600,6 +600,68 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
             proc.wait()
 
 
+def test_repro_serve_runs_stale_stages_at_startup(tmp_path: pathlib.Path) -> None:
+    """repro --watch --serve runs stale stages once at startup without --force."""
+    # Logs live outside the watched project so writing them triggers no watch events.
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".pivot").mkdir()
+    raw_dir = project / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "input.txt").write_text("data")
+    (project / "pipeline.py").write_text("""\
+from __future__ import annotations
+
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def process(input_file: str) -> str:
+    return input_file
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    process(pipeline.input("input.txt"))
+""")
+
+    output_path = project / "data" / "test" / "process.txt"
+    stdout_path = tmp_path / "serve.stdout"
+    stderr_path = tmp_path / "serve.stderr"
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+            cwd=project,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+
+    try:
+        for _ in range(150):
+            if output_path.exists():
+                break
+            time.sleep(0.1)
+
+        assert output_path.exists(), (
+            "Serve mode did not run the stale stage within 15s.\n"
+            + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+            + f"stderr: {stderr_path.read_text(errors='replace')}"
+        )
+        assert output_path.read_text() == "data"
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def test_repro_debounce_requires_watch(
     mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,

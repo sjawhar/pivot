@@ -160,13 +160,13 @@ def test_output_change_creation() -> None:
     """OutputChange TypedDict can be created with all fields."""
     identity = ArtifactIdentity("/path/to/file.csv", None)
     change = OutputChange(
-        path=identity,
+        identity=identity,
         old_hash="abc123",
         new_hash="def456",
         change_type=ChangeType.MODIFIED,
         output_type="out",
     )
-    assert change["path"] == identity
+    assert change["identity"] == identity
     assert change["old_hash"] == "abc123"
     assert change["new_hash"] == "def456"
     assert change["change_type"] == ChangeType.MODIFIED
@@ -177,7 +177,7 @@ def test_output_change_with_metric_type() -> None:
     """OutputChange can have metric output_type."""
     identity = ArtifactIdentity("/metrics.json", None)
     change = OutputChange(
-        path=identity,
+        identity=identity,
         old_hash=None,
         new_hash="xyz789",
         change_type=ChangeType.ADDED,
@@ -190,7 +190,7 @@ def test_output_change_with_plot_type() -> None:
     """OutputChange can have plot output_type."""
     identity = ArtifactIdentity("/plot.png", None)
     change = OutputChange(
-        path=identity,
+        identity=identity,
         old_hash="old123",
         new_hash=None,
         change_type=ChangeType.REMOVED,
@@ -435,7 +435,7 @@ def test_output_panel_is_changed_with_change() -> None:
     panel = diff_panels.OutputDiffPanel()
     panel._output_by_path = {
         identity_key(identity): OutputChange(
-            path=identity,
+            identity=identity,
             old_hash="abc",
             new_hash="def",
             change_type=ChangeType.MODIFIED,
@@ -452,7 +452,7 @@ def test_output_panel_is_changed_unchanged() -> None:
     panel = diff_panels.OutputDiffPanel()
     panel._output_by_path = {
         identity_key(identity): OutputChange(
-            path=identity,
+            identity=identity,
             old_hash="abc",
             new_hash="abc",
             change_type=None,  # Unchanged
@@ -516,7 +516,7 @@ def test_output_panel_set_from_snapshot(mocker: MockerFixture) -> None:
     identity = ArtifactIdentity("/path/output.csv", None)
     changes = [
         OutputChange(
-            path=identity,
+            identity=identity,
             old_hash="old",
             new_hash="new",
             change_type=ChangeType.MODIFIED,

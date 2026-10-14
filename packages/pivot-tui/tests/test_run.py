@@ -4,6 +4,7 @@ import collections
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 import textual.binding
 import textual.widgets
@@ -341,6 +342,64 @@ async def test_run_app_navigation_stays_at_bounds(
 
 
 @pytest.mark.asyncio
+async def test_run_app_selecting_stage_with_dep_change_from_wire_shows_input_panel(
+    simple_run_app: run_tui.PivotApp,
+) -> None:
+    """Selecting a stage whose live explanation carries a dependency change renders it.
+
+    The explanation travels the engine's real JSON-RPC encoding and the TUI's event
+    conversion, so the identity arrives exactly as `pivot repro --tui --watch` delivers it.
+    """
+    import json
+
+    from pivot import types
+    from pivot.engine import agent_rpc
+    from pivot_tui import diff_panels, event_poller
+
+    explanation = types.StageExplanation(
+        stage_name="stage2",
+        will_run=True,
+        is_forced=False,
+        reason="Input dependencies changed",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[
+            types.DepChange(
+                identity=types.ArtifactIdentity("stage1", "features"),
+                old_hash="036db852cd264fe0",
+                new_hash="0030de75fd10b9ca",
+                change_type=types.ChangeType.MODIFIED,
+            )
+        ],
+        upstream_stale=[],
+    )
+    event = {
+        "type": "stage_started",
+        "stage": "stage2",
+        "index": 2,
+        "total": 3,
+        "run_id": "run-dep",
+        "explanation": explanation,
+    }
+    wire = json.loads(agent_rpc._encode_wire(event))
+    msg = event_poller._make_started_message(wire)
+    assert msg is not None
+
+    async with simple_run_app.run_test() as pilot:
+        await pilot.pause()
+        simple_run_app.post_message(run_tui.TuiUpdate(msg))
+        await pilot.pause()
+
+        simple_run_app.action_nav_down()
+        await pilot.pause()
+
+        assert simple_run_app.selected_stage_name == "stage2"
+        input_panel = simple_run_app.query_one("#input-panel", diff_panels.InputDiffPanel)
+        assert input_panel._dep_by_path.keys() == {"stage1:features"}
+        assert simple_run_app.return_code is None, "TUI must not crash on navigation"
+
+
+@pytest.mark.asyncio
 async def test_run_app_quit_action(simple_run_app: run_tui.PivotApp) -> None:
     """action_quit exits the app."""
     async with simple_run_app.run_test() as pilot:
@@ -549,6 +608,79 @@ async def test_watch_tui_app_with_tui_log(
     assert log_path.exists()
 
 
+@pytest.mark.asyncio
+async def test_watch_tui_title_returns_to_watching_when_engine_goes_idle() -> None:
+    """The engine's idle event, as the poller converts it from the wire, resets the title."""
+    import json
+
+    from pivot.engine import agent_rpc
+    from pivot.engine.types import EngineState, EngineStateChanged
+    from pivot_tui import event_poller
+
+    wire = json.loads(
+        agent_rpc._encode_wire(
+            EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
+        )
+    )
+    msg = event_poller._convert_event(wire)
+    assert msg is not None, "the idle event must reach the TUI"
+
+    app = run_tui.PivotApp(stage_names=["demo/a"], watch_mode=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.title = "[▶] demo/a running"
+        app.post_message(run_tui.TuiUpdate(msg))
+        await pilot.pause()
+        assert app.title.endswith("[●] Watching for changes...")
+
+
+@pytest.mark.asyncio
+async def test_watch_tui_shows_invalid_pipeline_until_next_good_reload() -> None:
+    """A reload error stays on screen until a reload loads a good pipeline."""
+    import textual.widgets
+
+    app = run_tui.PivotApp(stage_names=["demo/a"], watch_mode=True)
+    error = "Stage 'demo/a': captures non-scalar variable 'FACTORS' (type: tuple)."
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        banner = app.query_one("#pipeline-error", textual.widgets.Static)
+        assert not banner.display, "no error line while the pipeline is valid"
+
+        app.post_message(
+            run_tui.TuiUpdate(
+                TuiReloadMessage(
+                    type=TuiMessageType.RELOAD,
+                    stages=["demo/a"],
+                    stages_added=[],
+                    stages_removed=[],
+                    stages_modified=[],
+                    error=error,
+                )
+            )
+        )
+        await pilot.pause()
+        assert banner.display, "the invalid pipeline's error is shown"
+        assert error in str(banner.content)
+        assert "Pipeline invalid" in app.title
+
+        app.post_message(
+            run_tui.TuiUpdate(
+                TuiReloadMessage(
+                    type=TuiMessageType.RELOAD,
+                    stages=["demo/a"],
+                    stages_added=[],
+                    stages_removed=[],
+                    stages_modified=["demo/a"],
+                    error=None,
+                )
+            )
+        )
+        await pilot.pause()
+        assert not banner.display, "the next good reload clears the error"
+        assert "Pipeline invalid" not in app.title
+
+
 # =============================================================================
 # Reload Summary Message Formatting (Issue #289)
 # =============================================================================
@@ -604,6 +736,7 @@ def test_handle_reload_calls_notify_with_summary(mocker: MockerFixture) -> None:
     mocker.patch.object(app, "_rebuild_stage_list")
     mocker.patch.object(app, "_update_detail_panel")
     mock_notify = mocker.patch.object(app, "notify")
+    mocker.patch.object(app, "_show_pipeline_error")
 
     # Create reload message with changes
     reload_msg = TuiReloadMessage(
@@ -612,6 +745,7 @@ def test_handle_reload_calls_notify_with_summary(mocker: MockerFixture) -> None:
         stages_added=["stage_c"],
         stages_removed=["stage_b"],
         stages_modified=["stage_a"],
+        error=None,
     )
 
     # Call _handle_reload directly
@@ -633,6 +767,7 @@ def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
     mocker.patch.object(app, "_rebuild_stage_list")
     mocker.patch.object(app, "_update_detail_panel")
     mock_notify = mocker.patch.object(app, "notify")
+    mocker.patch.object(app, "_show_pipeline_error")
 
     # Reload message with no changes
     reload_msg = TuiReloadMessage(
@@ -641,6 +776,7 @@ def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
         stages_added=[],
         stages_removed=[],
         stages_modified=[],
+        error=None,
     )
 
     app._handle_reload(reload_msg)
@@ -691,6 +827,34 @@ def test_on_tui_shutdown_no_bell_in_watch_mode(mocker: MockerFixture) -> None:
 
     # Bell should NOT be called in watch mode
     mock_bell.assert_not_called()
+
+
+def test_on_tui_shutdown_without_error_keeps_watch_mode_running(mocker: MockerFixture) -> None:
+    """A watch-mode shutdown with no error leaves the TUI up until the user quits."""
+    app = run_tui.PivotApp(stage_names=["stage1"], watch_mode=True)
+    mocker.patch.object(app, "_write_to_log")
+    mock_exit = mocker.patch.object(app, "exit")
+
+    app.on_tui_shutdown(run_tui.TuiShutdown())
+
+    mock_exit.assert_not_called()
+
+
+def test_on_tui_shutdown_with_engine_error_exits_watch_mode_nonzero(
+    mocker: MockerFixture,
+) -> None:
+    """A crashed watch engine ends the TUI with a non-zero return code."""
+    app = run_tui.PivotApp(stage_names=["stage1"], watch_mode=True)
+    mock_poller = mocker.MagicMock()
+    app.set_event_poller(mock_poller)
+    mocker.patch.object(app, "_write_to_log")
+    mocker.patch.object(app, "_close_log_file")
+    mock_exit = mocker.patch.object(app, "exit")
+
+    app.on_tui_shutdown(run_tui.TuiShutdown(error="RuntimeError('engine crashed')"))
+
+    mock_exit.assert_called_once_with(return_code=1)
+    mock_poller.stop.assert_called_once()
 
 
 def test_on_tui_shutdown_stops_event_poller(mocker: MockerFixture) -> None:
@@ -818,6 +982,7 @@ def test_tui_update_with_reload_message() -> None:
         stages_added=["s2"],
         stages_removed=[],
         stages_modified=["s1"],
+        error=None,
     )
     update = run_tui.TuiUpdate(msg)
     assert update.msg["type"] == "reload"
@@ -942,7 +1107,8 @@ async def test_action_force_rerun_stage_calls_rpc(mocker: MockerFixture) -> None
 
     mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_called_once_with(stages=["stage_a"], force=True)
 
@@ -956,7 +1122,8 @@ async def test_action_force_rerun_all_calls_rpc(mocker: MockerFixture) -> None:
 
     mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_all()
+    app.action_force_rerun_all()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_called_once_with(force=True)
 
@@ -969,7 +1136,8 @@ async def test_action_force_rerun_not_in_watch_mode(mocker: MockerFixture) -> No
     app = run_tui.PivotApp(stage_names=["stage_a"], client=mock_client)
     app._selected_stage_name = "stage_a"
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
 
@@ -983,7 +1151,8 @@ async def test_action_force_rerun_no_stage_selected(mocker: MockerFixture) -> No
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1001,7 +1170,8 @@ async def test_action_force_rerun_while_running(mocker: MockerFixture) -> None:
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1018,7 +1188,8 @@ async def test_action_force_rerun_all_while_running(mocker: MockerFixture) -> No
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_all()
+    app.action_force_rerun_all()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1035,13 +1206,114 @@ async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) 
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     # Should have been called twice: once for "Forcing re-run...", once for failure
     assert mock_notify.call_count == 2
     # Last call should be the error
     last_call_args = str(mock_notify.call_args_list[-1])
     assert "Failed" in last_call_args or "error" in last_call_args
+
+
+@pytest.mark.anyio
+async def test_action_force_rerun_reports_refused_run(mocker: MockerFixture) -> None:
+    """A run the engine refuses (invalid pipeline) is shown to the user, not raised."""
+    from pivot_tui.rpc_client_impl import RpcError
+
+    mock_client = AsyncMock()
+    mock_client.run.side_effect = RpcError(-32003, "Pipeline invalid - waiting for fix: boom")
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True, client=mock_client)
+    app._selected_stage_name = "stage_a"
+    mock_notify = mocker.patch.object(app, "notify")
+
+    app.action_force_rerun_stage()
+    app.action_force_rerun_all()
+    await app.workers.wait_for_complete()
+
+    errors = [call for call in mock_notify.call_args_list if call.kwargs.get("severity") == "error"]
+    assert [call.args[0] for call in errors] == [
+        "Pipeline invalid - waiting for fix: boom",
+        "Pipeline invalid - waiting for fix: boom",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "method"), [("R", "run"), ("r", "run"), ("c", "commit")])
+async def test_slow_rpc_reply_does_not_freeze_the_app(
+    tmp_path: pathlib.Path, key: str, method: str
+) -> None:
+    """While an RPC reply is held (an engine still starting), the app keeps handling keys."""
+    import time
+
+    reply_delay = 3.0
+    socket_path = tmp_path / "pivot.sock"
+    server = FakeRpcServer()
+    server.delay_reply(method, reply_delay)
+    await server.start(socket_path)
+    await wait_for_socket(socket_path)
+    try:
+        app = run_tui.PivotApp(
+            stage_names=["demo/a", "demo/b"], watch_mode=True, socket_path=socket_path
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.selected_stage_name == "demo/a"
+            start = time.monotonic()
+            await pilot.press(key)
+            await pilot.press("j")
+            await pilot.pause(0.3)
+            assert time.monotonic() - start < reply_delay / 2, (
+                "the key handler waited for the RPC reply"
+            )
+            assert app.selected_stage_name == "demo/b", "keys are handled while the reply is held"
+            assert app.is_running, "the app does not exit"
+            await app.workers.wait_for_complete()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        pytest.param(TimeoutError(), "Engine did not answer", id="timeout"),
+        pytest.param(anyio.EndOfStream(), "Engine closed the connection", id="connection-lost"),
+        pytest.param(
+            pivot_tui.rpc_client_impl.RpcError(
+                -32003, "Pipeline invalid - waiting for fix: Stage 'demo/a': captures 'X'"
+            ),
+            "Pipeline invalid - waiting for fix: Stage 'demo/a': captures 'X'",
+            id="pipeline-invalid",
+        ),
+        pytest.param(
+            pivot_tui.rpc_client_impl.RpcError(
+                -32004, "Engine is starting: fingerprinting stages; try again when it is ready"
+            ),
+            "Engine is starting: fingerprinting stages; try again when it is ready",
+            id="engine-starting",
+        ),
+    ],
+)
+async def test_rpc_action_failure_is_a_notification(
+    mocker: MockerFixture, error: Exception, expected: str
+) -> None:
+    """A timed-out or refused RPC reply is shown to the user; it never escapes the action."""
+    mock_client = AsyncMock()
+    mock_client.run.side_effect = error
+    mock_client.commit.side_effect = error
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True, client=mock_client)
+    app._selected_stage_name = "stage_a"
+    mock_notify = mocker.patch.object(app, "notify")
+
+    app.action_force_rerun_stage()
+    app.action_force_rerun_all()
+    app.action_commit()
+    await app.workers.wait_for_complete()
+
+    errors = [c.args[0] for c in mock_notify.call_args_list if c.kwargs.get("severity") == "error"]
+    assert len(errors) == 3, errors
+    assert all(expected in message for message in errors), errors
 
 
 def test_pivot_app_accepts_client(mocker: MockerFixture) -> None:
@@ -1070,7 +1342,8 @@ async def test_pivot_app_connects_with_socket_path(
         mock_notify = mocker.patch.object(app, "notify")
         async with app.run_test() as pilot:
             await pilot.pause()
-            await app.action_commit()
+            app.action_commit()
+            await app.workers.wait_for_complete()
         assert any("Committed 1" in str(call) for call in mock_notify.call_args_list), (
             "Should notify on successful commit"
         )
@@ -1123,18 +1396,20 @@ def test_handle_status_stores_explanation_on_stage_info() -> None:
 
 
 def test_handle_status_stores_output_summary_on_stage_info() -> None:
-    """_handle_status converts output_summary and stores on StageInfo.live_output_snapshot."""
+    """_handle_status stores the decoded output_summary on StageInfo.live_output_snapshot."""
     from unittest.mock import patch
+
+    from pivot.types import ChangeType, OutputChange
 
     app = run_tui.PivotApp(stage_names=["train"])
     output_summary = [
-        {
-            "path": "output.csv",
-            "change_type": "modified",
-            "output_type": "out",
-            "old_hash": "aaa",
-            "new_hash": "bbb",
-        },
+        OutputChange(
+            identity=ArtifactIdentity("train", None),
+            change_type=ChangeType.MODIFIED,
+            output_type="out",
+            old_hash="aaa",
+            new_hash="bbb",
+        ),
     ]
     msg = TuiStatusMessage(
         type=TuiMessageType.STATUS,
@@ -1145,7 +1420,7 @@ def test_handle_status_stores_output_summary_on_stage_info() -> None:
         reason="",
         elapsed=1.0,
         run_id="run-1",
-        output_summary=output_summary,  # pyright: ignore[reportArgumentType]
+        output_summary=output_summary,
     )
     with (
         patch.object(app, "_try_query_one", return_value=None),
@@ -1153,10 +1428,10 @@ def test_handle_status_stores_output_summary_on_stage_info() -> None:
     ):
         app._handle_status(msg)
     snapshot = app._stages["train"].live_output_snapshot
-    assert snapshot is not None, "output_summary should be converted and stored"
+    assert snapshot is not None, "output_summary should be stored"
     assert len(snapshot) == 1
-    assert snapshot[0]["path"] == ArtifactIdentity("output.csv", None)
-    assert snapshot[0]["change_type"] == "modified"
+    assert snapshot[0]["identity"] == ArtifactIdentity("train", None)
+    assert snapshot[0]["change_type"] == ChangeType.MODIFIED
 
 
 def test_handle_status_no_snapshot_fields_leaves_none() -> None:
@@ -1181,38 +1456,3 @@ def test_handle_status_no_snapshot_fields_leaves_none() -> None:
         app._handle_status(msg)
     assert app._stages["train"].live_input_snapshot is None
     assert app._stages["train"].live_output_snapshot is None
-
-
-def test_convert_output_summary_none() -> None:
-    """_convert_output_summary returns None for None input."""
-    assert run_tui._convert_output_summary(None) is None
-
-
-def test_convert_output_summary_converts_change_types() -> None:
-    """_convert_output_summary converts string change_types to ChangeType enums."""
-    from pivot.types import ChangeType
-
-    raw = [
-        {
-            "path": "a.csv",
-            "change_type": "added",
-            "output_type": "out",
-            "old_hash": None,
-            "new_hash": "x",
-        },
-        {
-            "path": "b.csv",
-            "change_type": None,
-            "output_type": "metric",
-            "old_hash": "y",
-            "new_hash": "y",
-        },
-    ]
-    result = run_tui._convert_output_summary(raw)  # pyright: ignore[reportArgumentType]
-    assert result is not None
-    assert len(result) == 2
-    assert result[0]["change_type"] == ChangeType.ADDED
-    assert result[0]["old_hash"] is None
-    assert result[0]["new_hash"] == "x"
-    assert result[1]["change_type"] is None
-    assert result[1]["output_type"] == "metric"

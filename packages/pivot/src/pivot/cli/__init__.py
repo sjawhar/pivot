@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import TypedDict, override
+import sys
+from typing import TextIO, TypedDict, override
 
 import click
 
@@ -137,6 +138,23 @@ class PivotGroup(click.Group):
                 formatter.write_dl(uncategorized)
 
 
+class _StderrHandler(logging.StreamHandler[TextIO]):
+    """Log handler that writes to whatever ``sys.stderr`` is when a record is emitted.
+
+    ``logging.basicConfig`` binds the stderr object present at startup, so records bypass a
+    redirect installed later; rich's live console swaps ``sys.stderr`` to print stderr writes
+    above its pinned area.
+    """
+
+    def __init__(self) -> None:
+        logging.Handler.__init__(self)
+
+    @property
+    @override
+    def stream(self) -> TextIO:  # pyright: ignore[reportIncompatibleVariableOverride] - read-only view of the current sys.stderr
+        return sys.stderr
+
+
 def _setup_logging(verbose: bool, quiet: bool) -> None:
     """Configure logging for CLI output."""
     if quiet:
@@ -145,7 +163,9 @@ def _setup_logging(verbose: bool, quiet: bool) -> None:
         level = logging.DEBUG
     else:
         level = logging.INFO
-    logging.basicConfig(level=level, format="%(message)s", force=True)
+    handler = _StderrHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
 @click.group(cls=PivotGroup)

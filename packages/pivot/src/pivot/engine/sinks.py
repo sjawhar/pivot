@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -158,7 +159,7 @@ _MAX_LOG_LINES_PER_STAGE = 50
 
 
 class StaticConsoleSink:
-    """Pipe/CI sink: buffers completions, prints sorted report on close."""
+    """Pipe/CI sink: buffers completions, prints a sorted report when each run ends."""
 
     _console: rich.console.Console
     _show_output: bool
@@ -203,11 +204,14 @@ class StaticConsoleSink:
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")
+            case "engine_state_changed":
+                # ACTIVE starts a run and IDLE ends one; each run gets its own report.
+                self._finish_run()
             case _:
                 pass
 
-    async def close(self) -> None:
-        """Print sorted completion report."""
+    def _finish_run(self) -> None:
+        """Print the buffered run's sorted report and reset per-run state."""
         _print_completions(
             self._console,
             self._completion_buffer,
@@ -215,6 +219,14 @@ class StaticConsoleSink:
             max_name_width=self._max_name_width,
             stage_logs=self._stage_logs,
         )
+        self._max_name_width = 0
+        self._completion_buffer.clear()
+        self._stage_logs.clear()
+        self._total = 0
+
+    async def close(self) -> None:
+        """Print the report of a run that has not ended yet."""
+        self._finish_run()
 
 
 class _LiveRenderable:
@@ -232,7 +244,7 @@ class _LiveRenderable:
 
 
 class LiveConsoleSink:
-    """TTY sink with live pinned status area. Completions print on close."""
+    """TTY sink with live pinned status area. Completions print when each run ends."""
 
     _console: rich.console.Console
     _show_output: bool
@@ -325,10 +337,14 @@ class LiveConsoleSink:
     def _ensure_live(self) -> None:
         if self._live is not None:
             return
+        # While the live area is drawn, stderr writes (the CLI's log records) must print above
+        # it, or the next redraw erases them. rich swaps sys.stderr for that while live; only do
+        # it when stderr is the terminal, so `2>file` keeps every record in the file.
         self._live = rich.live.Live(
             self._build_live_renderable(),
             console=self._console,
             refresh_per_second=1,
+            redirect_stderr=sys.stderr.isatty(),
         )
         self._live.start()
 
@@ -371,13 +387,18 @@ class LiveConsoleSink:
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")
+            case "engine_state_changed":
+                # ACTIVE starts a run and IDLE ends one; each run gets its own display.
+                self._finish_run()
             case _:
                 pass
 
-    async def close(self) -> None:
+    def _finish_run(self) -> None:
+        """Stop the live area, print the run's sorted report, and reset per-run state."""
         if self._live is not None:
             self._live.update(rich.text.Text(""))
             self._live.stop()
+            self._live = None
         _print_completions(
             self._console,
             self._completion_buffer,
@@ -385,6 +406,17 @@ class LiveConsoleSink:
             max_name_width=self._max_name_width,
             stage_logs=self._stage_logs,
         )
+        self._running.clear()
+        self._completed_count = 0
+        self._category_counts.clear()
+        self._max_name_width = 0
+        self._completion_buffer.clear()
+        self._stage_logs.clear()
+        self._total = 0
+
+    async def close(self) -> None:
+        """Report a run that has not ended yet."""
+        self._finish_run()
 
 
 class ResultCollectorSink:

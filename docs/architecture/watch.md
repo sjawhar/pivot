@@ -55,11 +55,15 @@ The same Engine code handles both batch and watch mode:
 | Mode | Entry Point | Event Source |
 |------|-------------|--------------|
 | Batch (`pivot repro`) | `engine.run(exit_on_completion=True)` | OneShotSource |
-| Watch (`pivot repro --watch`) | `engine.run(exit_on_completion=False)` | FilesystemSource |
+| Watch (`pivot repro --watch`) | `engine.run(exit_on_completion=False)` | OneShotSource (startup run) + FilesystemSource |
 
 This unified architecture eliminates divergent code paths between batch and watch modes. Both modes use identical sink configuration, ensuring flags like `--quiet` work consistently.
 
 ## Event Flow
+
+### Startup
+
+A watched engine fingerprints every stage before it starts any other source or handles any input event, because a later reload diffs the edited pipeline against those fingerprints. Only the RPC server starts first, so a TUI or agent connects at once. While the snapshot runs, `run` and `commit` are refused at once with error `-32004` ("Engine is starting"), and `explain`, which fingerprints its stage, waits for it. The startup run and the file watcher start after it.
 
 ### Data Artifact Changes
 
@@ -79,6 +83,8 @@ When Python files or `pipeline.py` change:
 3. Engine rebuilds bipartite graph and updates WatchCoordinator
 4. Engine updates FilesystemSource watch paths
 5. Engine re-runs all stages
+
+A pipeline is invalid when it fails to load (a syntax error, no `pipeline` variable) or a stage fails to fingerprint, whether the startup snapshot finds it or an edit introduces it. The Engine then logs `Pipeline invalid: <error>` and `Pipeline invalid - waiting for fix`, and emits `PipelineReloaded` with `error` set and the stages of the pipeline it still holds. While the pipeline is invalid, nothing runs and nothing is committed: RPC `run` and `commit` are refused with error `-32003`, and data changes and the startup run are dropped with a debug log. Data edited meanwhile therefore still differs from the stage locks, so the next edit that loads a good pipeline clears the error, reloads and reruns those stages.
 
 ### Output Filtering
 

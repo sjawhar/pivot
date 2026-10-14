@@ -5,6 +5,7 @@ import collections
 import concurrent.futures
 import contextlib
 import importlib
+import importlib.util
 import itertools
 import linecache
 import logging
@@ -190,6 +191,12 @@ class Engine:
     # Event signaling dispatcher has finished draining
     _dispatch_complete: anyio.Event
 
+    # Set once a watched engine's startup fingerprint snapshot has finished
+    _startup_fingerprinted: anyio.Event
+    # Why the pipeline is invalid: set by the startup snapshot or any rejected reload, cleared
+    # by the next good reload. While set, no run starts (RPC run, data change, or startup).
+    _pipeline_error: str | None
+
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
     ) -> None:
@@ -245,10 +252,23 @@ class Engine:
         # Event signaling dispatcher has finished draining (recreated each run())
         self._dispatch_complete = anyio.Event()
 
+        self._startup_fingerprinted = anyio.Event()
+        self._pipeline_error = None
+
     @property
     def state(self) -> EngineState:
         """Current engine state."""
         return self._state
+
+    @property
+    def pipeline_error(self) -> str | None:
+        """Why the loaded pipeline cannot run, or None when it can."""
+        return self._pipeline_error
+
+    @property
+    def is_starting(self) -> bool:
+        """Whether a watched engine is still taking its startup fingerprint snapshot."""
+        return self._watches_filesystem() and not self._startup_fingerprinted.is_set()
 
     @property
     def sources(self) -> list[EventSource]:
@@ -347,9 +367,23 @@ class Engine:
         async with anyio.create_task_group() as tg:
             self._run_task_group = tg
 
-            # Start all sources with channel cleanup
+            # The RPC server needs no fingerprints, so it listens while the startup snapshot
+            # runs: clients connect at once, `run` is refused with "Engine is starting" until the
+            # snapshot finishes, and queries that fingerprint wait for it. Every other source,
+            # the startup run and the file watcher included, starts after the snapshot.
             for source in self._sources:
-                tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
+                if isinstance(source, agent_rpc.AgentRpcSource):
+                    tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
+
+            if self._watches_filesystem():
+                try:
+                    await self._fingerprint_watched_stages()
+                finally:
+                    self._startup_fingerprinted.set()
+
+            for source in self._sources:
+                if not isinstance(source, agent_rpc.AgentRpcSource):
+                    tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
 
             # Start sink dispatcher
             tg.start_soon(self._dispatch_outputs)
@@ -630,6 +664,10 @@ class Engine:
         self._stored_parallel = event["parallel"]
         self._stored_max_workers = event["max_workers"]
         self._stored_resource_capacity = dict(event["resource_capacity"])
+
+        if self._pipeline_error is not None:
+            _logger.debug("Pipeline invalid - ignoring run request until it is fixed")
+            return
 
         if self._run_state == _RunState.RUNNING:
             # Coalesce: only the latest restart request survives
@@ -1919,37 +1957,28 @@ class Engine:
             stage_lock = lock.StageLock(stage_name, stages_dir)
             lock_data = stage_lock.read()
 
-            # Build path -> output_type map from registry
-            outs = stage_info["outs"]
-            outs_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
-            path_to_type = dict[str, str]()
-            for out in outs:
-                match out.tag:
-                    case ArtifactTag.METRIC:
-                        path_to_type[types.identity_key(out.identity)] = "metric"
-                    case ArtifactTag.PLOT:
-                        path_to_type[types.identity_key(out.identity)] = "plot"
-                    case _:
-                        path_to_type[types.identity_key(out.identity)] = "out"
-
             summary = list[OutputChangeSummary]()
-            # Get new hashes from lock file
-            new_hashes = dict[str, str | None]()
+            new_hashes = dict[types.ArtifactIdentity, str]()
             if lock_data is not None and "output_hashes" in lock_data:
                 for identity, hash_info in lock_data["output_hashes"].items():
-                    new_hashes[types.identity_key(identity)] = hash_info["hash"]
+                    new_hashes[identity] = hash_info["hash"]
 
-            for path in outs_paths:
-                new_hash = new_hashes.get(path)
-                output_type = path_to_type.get(path, "out")
+            for out in stage_info["outs"]:
+                match out.tag:
+                    case ArtifactTag.METRIC:
+                        output_type = "metric"
+                    case ArtifactTag.PLOT:
+                        output_type = "plot"
+                    case _:
+                        output_type = "out"
                 # change_type is None because we don't have old hashes at this point
                 summary.append(
                     OutputChangeSummary(
-                        path=path,
+                        identity=out.identity,
                         change_type=None,
                         output_type=output_type,
                         old_hash=None,
-                        new_hash=new_hash,
+                        new_hash=new_hashes.get(out.identity),
                     )
                 )
 
@@ -2128,6 +2157,59 @@ class Engine:
 
         return any(isinstance(source, FilesystemSource) for source in self._sources)
 
+    async def wait_for_startup_fingerprints(self) -> None:
+        """Wait until a watched engine's startup fingerprint snapshot has finished.
+
+        RPC queries that fingerprint stages wait here, so no stage is fingerprinted on two
+        threads at once. Returns at once for an engine without a filesystem source, which
+        takes no snapshot.
+        """
+        if self._watches_filesystem():
+            await self._startup_fingerprinted.wait()
+
+    async def _fingerprint_watched_stages(self) -> None:
+        """Fingerprint every stage before a watched engine starts its watcher and startup run.
+
+        A code reload diffs the edited pipeline against these cached fingerprints; computing
+        the old ones after the edit would read the edited source and report nothing modified.
+        Each stage is fingerprinted in a worker thread so the RPC server keeps answering, and
+        nothing else fingerprints until this returns (see ``wait_for_startup_fingerprints``),
+        so the startup run's skip check reuses the cached values.
+
+        A stage that fails to fingerprint makes the pipeline invalid, as a ``pipeline.py``
+        syntax error does on reload: the errors are logged and no run starts until an edit
+        reloads a pipeline whose every stage fingerprints.
+        """
+        pipeline = self._pipeline
+        if pipeline is None:
+            return
+        errors = list[exceptions.PivotError]()
+        for stage_name in pipeline.list_stages():
+            try:
+                _ = await anyio.to_thread.run_sync(pipeline.ensure_fingerprint, stage_name)
+            except exceptions.PivotError as exc:
+                errors.append(exc)
+        if errors:
+            for exc in errors:
+                _logger.warning(f"Pipeline invalid: {exc}")
+            _logger.error("Pipeline invalid - waiting for fix")
+            self._pipeline_error = "\n".join(str(exc) for exc in errors)
+            await self._emit_pipeline_error(self._pipeline_error)
+
+    async def _emit_pipeline_error(self, message: str) -> None:
+        """Report an invalid pipeline; the stage list stays the loaded pipeline's."""
+        stages = self._pipeline.list_stages() if self._pipeline is not None else list[str]()
+        await self.emit(
+            PipelineReloaded(
+                type="pipeline_reloaded",
+                stages=stages,
+                stages_added=list[str](),
+                stages_removed=list[str](),
+                stages_modified=list[str](),
+                error=message,
+            )
+        )
+
     def _snapshot_watch_output(self, path: pathlib.Path) -> _WatchOutputSnapshot:
         """Capture every currently visible path in one output's filesystem tree."""
         entries = dict[pathlib.Path, _WatchOutputSignature]()
@@ -2233,16 +2315,33 @@ class Engine:
         # Invalidate manifest cache entries for changed source files
         fingerprint.invalidate_manifests_for_paths(event["paths"])
 
-        # Reload registry - returns old_stages on success, None on failure
+        # CPython reuses cached bytecode while the source's size and whole-second mtime match,
+        # so a same-size edit within a second of the last write would reload the old code.
+        for path in event["paths"]:
+            if path.endswith(".py"):
+                cached = pathlib.Path(importlib.util.cache_from_source(path))
+                try:
+                    cached.unlink(missing_ok=True)
+                except OSError as exc:
+                    _logger.warning(
+                        "Could not remove %s (%s); its stale bytecode may be reused if %s "
+                        + "kept its size and mtime second",
+                        cached,
+                        exc.strerror,
+                        path,
+                    )
+
+        # Reload registry - returns the old stages on success, the error message on failure
         reload_result = self._reload_registry()
 
-        if reload_result is None:
+        if isinstance(reload_result, str):
             _logger.error("Pipeline invalid - waiting for fix")
+            await self._emit_pipeline_error(reload_result)
             return
+        old_stages = reload_result
 
         # Emit reload event
-        old_stages, old_pipeline_ref = reload_result
-        await self._emit_reload_event(old_stages, old_pipeline_ref)
+        await self._emit_reload_event(old_stages)
 
         # Flush manifest cache so cached manifests survive the reload
         fingerprint.flush_manifest_cache()
@@ -2412,17 +2511,17 @@ class Engine:
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
-    def _reload_registry(
-        self,
-    ) -> tuple[dict[str, RegistryStageInfo], registry.PipelineLike | None] | None:
+    def _reload_registry(self) -> dict[str, RegistryStageInfo] | str:
         """Reload the pipeline by re-importing pipeline definition.
 
-        Returns old_stages and old_pipeline_ref if reload succeeded, None if pipeline is invalid.
-        The caller should emit the reload event using the returned old_stages.
+        Returns the old pipeline's stages if reload succeeded, or the error message if the
+        pipeline is invalid: it fails to load, or one of its stages fails to fingerprint. On
+        failure the last loaded pipeline stays loaded but is marked invalid, so nothing runs until
+        a good reload. The new fingerprints stay cached for the reload event's diff. The caller
+        should emit the reload event using the returned stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
-        old_pipeline_ref = old_pipeline if old_pipeline else None
         root = project.get_project_root()
 
         # Clear project modules from sys.modules
@@ -2434,16 +2533,30 @@ class Engine:
 
             new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
             if new_pipeline is None:
-                _logger.warning("No pipeline found during reload")
-                return None
+                return self._reject_reload(old_pipeline, ["No pipeline found during reload"])
+
+            errors = list[str]()
+            for stage_name in new_pipeline.list_stages():
+                try:
+                    _ = new_pipeline.ensure_fingerprint(stage_name)
+                except exceptions.PivotError as exc:
+                    errors.append(str(exc))
+            if errors:
+                return self._reject_reload(old_pipeline, errors)
 
             self._pipeline = new_pipeline
-            return old_stages, old_pipeline_ref
+            self._pipeline_error = None
+            return old_stages
         except Exception as e:
-            _logger.warning(f"Pipeline invalid: {e}")
-            # Restore old pipeline on failure
-            self._pipeline = old_pipeline
-            return None
+            return self._reject_reload(old_pipeline, [str(e)])
+
+    def _reject_reload(self, old_pipeline: registry.PipelineLike | None, errors: list[str]) -> str:
+        """Keep the last loaded pipeline but mark it invalid; return the error message."""
+        for error in errors:
+            _logger.warning(f"Pipeline invalid: {error}")
+        self._pipeline = old_pipeline
+        self._pipeline_error = "\n".join(errors)
+        return self._pipeline_error
 
     def _clear_project_modules(self, root: pathlib.Path) -> None:
         """Remove project modules from sys.modules."""
@@ -2465,12 +2578,13 @@ class Engine:
         for name in to_remove:
             del sys.modules[name]
 
-    async def _emit_reload_event(
-        self,
-        old_stages: dict[str, RegistryStageInfo],
-        old_pipeline_ref: registry.PipelineLike | None,
-    ) -> None:
-        """Emit PipelineReloaded event with diff information."""
+    async def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
+        """Emit PipelineReloaded event with diff information.
+
+        Old fingerprints are the ones cached before the edit (see
+        ``_fingerprint_watched_stages``); recomputing them now would read the edited source.
+        A stage without a cached old fingerprint counts as modified.
+        """
         new_stage_names = self._list_stages()
         new_stages_set = set(new_stage_names)
         old_stage_names = set(old_stages.keys())
@@ -2478,43 +2592,13 @@ class Engine:
         added = sorted(new_stages_set - old_stage_names)
         removed = sorted(old_stage_names - new_stages_set)
 
-        # Detect modified stages by comparing fingerprints
-        modified = list[str]()
+        # ``_reload_registry`` fingerprinted every new stage: shared ones are compared now, and
+        # all of them are the baseline the next reload compares against.
         pipeline = self._require_pipeline()
-        new_pipeline_ref = pipeline
+        modified = list[str]()
         for stage_name in sorted(old_stage_names & new_stages_set):
-            had_error = False
-            if old_pipeline_ref is None:
-                old_fp = None
-                had_error = True
-                _logger.warning(
-                    "Fingerprinting failed for stage '%s' during reload (old registry unavailable)",
-                    stage_name,
-                )
-            else:
-                try:
-                    old_fp = old_pipeline_ref.ensure_fingerprint(stage_name)
-                except exceptions.PivotError as exc:
-                    old_fp = None
-                    had_error = True
-                    _logger.warning(
-                        "Fingerprinting failed for stage '%s' during reload (old registry): %s",
-                        stage_name,
-                        exc,
-                    )
-
-            try:
-                new_fp = new_pipeline_ref.ensure_fingerprint(stage_name)
-            except exceptions.PivotError as exc:
-                new_fp = None
-                had_error = True
-                _logger.warning(
-                    "Fingerprinting failed for stage '%s' during reload (new registry): %s",
-                    stage_name,
-                    exc,
-                )
-
-            if had_error or old_fp != new_fp:
+            old_fp = old_stages[stage_name]["fingerprint"]
+            if old_fp is None or old_fp != pipeline.ensure_fingerprint(stage_name):
                 modified.append(stage_name)
 
         await self.emit(

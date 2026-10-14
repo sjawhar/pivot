@@ -34,15 +34,15 @@ def _helper_valid_stage() -> dict[str, int]:
 _diff_expected: DataDiffResult | None = None
 
 
-def _helper_commit_stages_train_eval() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_train_eval(_pipeline: object) -> tuple[list[str], list[str]]:
     return (["train", "eval"], ["broken_stage"])
 
 
-def _helper_commit_stages_empty() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_empty(_pipeline: object) -> tuple[list[str], list[str]]:
     return (list[str](), list[str]())
 
 
-def _helper_commit_stages_stage_a() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_stage_a(_pipeline: object) -> tuple[list[str], list[str]]:
     return (["stage_a"], [])
 
 
@@ -102,6 +102,27 @@ async def test_agent_rpc_source_accepts_connections(tmp_path: Path) -> None:
 
     assert len(events_received) == 1
     assert events_received[0]["type"] == "run_requested"
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_signals_ready_once_listening(tmp_path: Path) -> None:
+    """``ready`` is set only once the socket accepts connections, so a client can connect."""
+    import functools
+    import threading
+
+    socket_path = tmp_path / "agent.sock"
+    ready = threading.Event()
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+    source = AgentRpcSource(socket_path=socket_path, ready=ready)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(functools.partial(source.run, send))
+        with anyio.fail_after(5):
+            while not ready.is_set():
+                await anyio.sleep(0.01)
+        connection = await anyio.connect_unix(str(socket_path))
+        await connection.aclose()
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.anyio
@@ -488,6 +509,65 @@ async def test_agent_rpc_source_handles_status_query(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_sends_artifact_identities_as_objects(tmp_path: Path) -> None:
+    """Identities inside events and explanations use stage_info's {producer, key} form."""
+    from pivot import types
+
+    buffer = EventBuffer(max_events=10)
+    buffer.handle_sync(
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=1,
+            total=1,
+            run_id="run",
+            explanation=types.StageExplanation(
+                stage_name="train",
+                will_run=True,
+                is_forced=False,
+                reason="Input dependencies changed",
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[
+                    types.DepChange(
+                        identity=types.ArtifactIdentity("prepare", "features"),
+                        old_hash="aaa",
+                        new_hash="bbb",
+                        change_type=types.ChangeType.MODIFIED,
+                    )
+                ],
+                upstream_stale=[],
+            ),
+        )
+    )
+    socket_path = tmp_path / "agent.sock"
+    handler = AgentRpcHandler(engine=MagicMock(), event_buffer=buffer)
+    source = AgentRpcSource(socket_path=socket_path, handler=handler)
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {
+                "jsonrpc": "2.0",
+                "method": "events_since",
+                "params": {"version": 0},
+                "id": 1,
+            }
+            await conn.send(json.dumps(request).encode() + b"\n")
+            response = json.loads((await conn.receive(65536)).decode())
+        tg.cancel_scope.cancel()
+
+        event = response["result"]["events"][0]["event"]
+        assert event["explanation"]["dep_changes"][0]["identity"] == {
+            "producer": "prepare",
+            "key": "features",
+        }
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_rejects_oversized_messages(tmp_path: Path) -> None:
     """AgentRpcSource rejects messages larger than 1MB to prevent memory exhaustion."""
     socket_path = tmp_path / "agent.sock"
@@ -630,6 +710,40 @@ async def test_rpc_run_invalid_stage_returns_error(
 
 
 @pytest.mark.anyio
+async def test_rpc_run_on_invalid_pipeline_returns_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RPC run while the pipeline is invalid is refused with the reason, not accepted."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    (tmp_path / ".pivot").mkdir()
+
+    pipeline = Pipeline("test", root=tmp_path)
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
+
+    async with Engine(pipeline=pipeline) as eng:
+        eng._pipeline_error = "Stage 'test/valid_stage': captures non-scalar variable 'X'"
+        source = AgentRpcSource(
+            socket_path=tmp_path / "test.sock", handler=AgentRpcHandler(engine=eng)
+        )
+        send, recv = anyio.create_memory_object_stream[InputEvent](16)
+
+        response = await source._handle_request(
+            {"jsonrpc": "2.0", "method": "run", "params": {"force": True}, "id": 1}, send
+        )
+
+        assert response is not None
+        assert "error" in response
+        error = response["error"]
+        assert error["code"] == -32003
+        assert "Pipeline invalid" in error["message"]
+        assert "captures non-scalar variable 'X'" in error["message"]
+        with pytest.raises(anyio.WouldBlock):
+            recv.receive_nowait()
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_connection_timeout() -> None:
     """AgentRpcSource has timeout protection for idle connections.
 
@@ -687,6 +801,8 @@ async def test_agent_rpc_source_accepts_new_connections_after_handler_exception(
         """
 
         _call_count: int
+        starting: bool = False
+        pipeline_error: str | None = None
 
         def __init__(self) -> None:
             self._call_count = 0
@@ -1516,8 +1632,7 @@ async def test_handler_commit_dispatches_to_commit_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query calls commit_stages and returns committed/failed lists."""
-    mock_engine = MagicMock()
-    handler = AgentRpcHandler(engine=mock_engine)
+    handler = AgentRpcHandler(engine=Engine(pipeline=Pipeline("test", root=tmp_path)))
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
@@ -1538,8 +1653,7 @@ async def test_handler_commit_empty_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query returns empty lists when nothing to commit."""
-    mock_engine = MagicMock()
-    handler = AgentRpcHandler(engine=mock_engine)
+    handler = AgentRpcHandler(engine=Engine(pipeline=Pipeline("test", root=tmp_path)))
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
@@ -1549,6 +1663,24 @@ async def test_handler_commit_empty_result(
     result = cast("CommitResult", await handler.handle_query("commit"))
     assert result["committed"] == [], "Should return empty committed list"
     assert result["failed"] == [], "Should return empty failed list"
+
+
+@pytest.mark.anyio
+async def test_handler_commit_uses_the_engine_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit runs on the engine's pipeline; the server thread has no Click context."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    (tmp_path / ".pivot").mkdir()
+    pipeline = Pipeline("test", root=tmp_path)
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
+
+    async with Engine(pipeline=pipeline) as eng:
+        result = cast("CommitResult", await AgentRpcHandler(engine=eng).handle_query("commit"))
+
+    assert result["committed"] + result["failed"] == ["test/valid_stage"]
 
 
 @pytest.mark.anyio
@@ -1564,7 +1696,7 @@ async def test_rpc_commit_via_socket(
         _helper_commit_stages_stage_a,
     )
 
-    async with Engine() as engine:
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
         handler = AgentRpcHandler(engine=engine)
         source = AgentRpcSource(socket_path=socket_path, handler=handler)
 
@@ -1596,7 +1728,7 @@ async def test_rpc_commit_propagates_error(
     """Commit query propagates errors from commit_stages — server closes connection."""
     socket_path = tmp_path / "agent.sock"
 
-    def _raise() -> tuple[list[str], list[str]]:
+    def _raise(_pipeline: object) -> tuple[list[str], list[str]]:
         raise RuntimeError("No pipeline loaded")
 
     monkeypatch.setattr(
@@ -1604,7 +1736,7 @@ async def test_rpc_commit_propagates_error(
         _raise,
     )
 
-    async with Engine() as engine:
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
         handler = AgentRpcHandler(engine=engine)
         source = AgentRpcSource(socket_path=socket_path, handler=handler)
 
@@ -1623,6 +1755,43 @@ async def test_rpc_commit_propagates_error(
                 # Client sees EndOfStream.
                 with pytest.raises(anyio.EndOfStream):
                     await conn.receive(4096)
+
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_rpc_query_pivot_error_gets_an_error_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PivotError from a query handler is a JSON-RPC error with its message, not a drop."""
+    from pivot import exceptions
+
+    socket_path = tmp_path / "agent.sock"
+
+    def _raise(_pipeline: object) -> tuple[list[str], list[str]]:
+        raise exceptions.PivotError("Stage 'test/s': fingerprinting failed: captures 'X'")
+
+    monkeypatch.setattr("pivot.executor.commit.commit_stages", _raise)
+
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
+        source = AgentRpcSource(socket_path=socket_path, handler=AgentRpcHandler(engine=engine))
+        send, _ = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await helpers.wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                await conn.send(
+                    json.dumps({"jsonrpc": "2.0", "method": "commit", "id": 1}).encode() + b"\n"
+                )
+                response = json.loads((await conn.receive(4096)).decode())
+                assert response["error"]["code"] == -32603
+                assert (
+                    response["error"]["message"]
+                    == "Stage 'test/s': fingerprinting failed: captures 'X'"
+                )
 
             tg.cancel_scope.cancel()
 

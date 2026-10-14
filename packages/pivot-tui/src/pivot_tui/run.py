@@ -17,6 +17,7 @@ from typing import (
     override,
 )
 
+import anyio
 import rich.markup
 import textual  # for textual.work decorator
 import textual.app
@@ -29,10 +30,7 @@ import textual.timer
 import textual.widget
 import textual.widgets
 
-from pivot import types
 from pivot.types import (
-    ChangeType,
-    OutputChange,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -101,43 +99,6 @@ def format_reload_summary(
     return f"Reloaded: {', '.join(parts)}"
 
 
-_logger = logging.getLogger(__name__)
-
-
-def _safe_change_type(raw: object) -> ChangeType | None:
-    """Convert raw change_type to ChangeType, returning None for unknown values."""
-    if raw is None:
-        return None
-    try:
-        return ChangeType(str(raw))
-    except ValueError:
-        _logger.warning("Unknown change_type %r, treating as None", raw)
-        return None
-
-
-def _convert_output_summary(
-    raw: list[dict[str, object]] | None,
-) -> list[OutputChange] | None:
-    """Convert raw output_summary dicts from events to typed OutputChange list."""
-    if raw is None:
-        return None
-    result = list[OutputChange]()
-    for item in raw:
-        change_type_raw = item.get("change_type")
-        path_raw = item.get("path")
-        path_key = path_raw if isinstance(path_raw, str) else "unknown"
-        result.append(
-            OutputChange(
-                path=types.identity_from_key(path_key),
-                old_hash=str(item["old_hash"]) if item.get("old_hash") is not None else None,
-                new_hash=str(item["new_hash"]) if item.get("new_hash") is not None else None,
-                change_type=_safe_change_type(change_type_raw),
-                output_type=str(item.get("output_type", "out")),  # pyright: ignore[reportArgumentType] - raw JSON str
-            )
-        )
-    return result
-
-
 class MessagePoster(Protocol):
     """Protocol for posting messages to a Textual app.
 
@@ -163,10 +124,17 @@ class TuiUpdate(textual.message.Message):
 
 
 class TuiShutdown(textual.message.Message):
-    """Message sent when TuiSink is closing.
+    """Message sent when the engine thread finishes.
 
-    Used by both run mode and watch mode to signal clean shutdown.
+    Used by both run mode and watch mode. ``error`` describes the exception that ended the
+    engine, or is None when it finished normally.
     """
+
+    error: str | None
+
+    def __init__(self, error: str | None = None) -> None:
+        self.error = error
+        super().__init__()
 
 
 _TUI_BINDINGS: list[textual.binding.BindingType] = [
@@ -218,6 +186,12 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+# Shown when an RPC reply times out in the client (the engine is busy or gone)
+_NO_REPLY = "Engine did not answer in time"
+# Shown when the engine closed the RPC connection (for example after a server-side error)
+_CONNECTION_LOST = "Engine closed the connection"
+_CONNECTION_ERRORS = (anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError)
 
 # Minimum terminal size for proper display
 _MIN_TERMINAL_WIDTH = 80
@@ -299,6 +273,8 @@ class PivotApp(textual.app.App[None]):
         self._socket_path = socket_path
         self._event_poller: EventPoller | None = None
         self._log_file_lock: threading.Lock = threading.Lock()
+        # Why the watched pipeline is invalid, shown until a reload loads a good pipeline
+        self._pipeline_error: str | None = None
 
         # Open log file if configured
         if tui_log:
@@ -388,6 +364,7 @@ class PivotApp(textual.app.App[None]):
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
         yield textual.widgets.Header()
+        yield textual.widgets.Static(id="pipeline-error", markup=False)
 
         with textual.containers.Horizontal(id="main-split"):
             yield StageListPanel(list(self._stages.values()), id="stage-list")
@@ -452,25 +429,30 @@ class PivotApp(textual.app.App[None]):
         except Exception:
             _logger.exception("Error handling TUI update for %s: %s", msg["type"], msg)
 
-    def on_tui_shutdown(self, _event: TuiShutdown) -> None:  # pragma: no cover
-        """Handle TuiSink shutdown signal (both run and watch modes).
+    def on_tui_shutdown(self, event: TuiShutdown) -> None:  # pragma: no cover
+        """Handle the engine finishing (both run and watch modes).
 
-        In run mode: signals execution is complete, triggers exit with bell notification
-        In watch mode: logs shutdown, TUI continues until user quits
+        In run mode: execution is complete; exit with a bell notification.
+        In watch mode: a normal finish keeps the TUI up until the user quits; an engine
+        crash exits with return code 1 so the command fails.
         """
         self._write_to_log('{"type": "shutdown"}\n')
-        if not self._watch_mode:
-            # Run mode: notify user and exit after shutdown signal
-            with self._quit_lock:
-                if self._quitting:
-                    return
-                self._quitting = True
+        if self._watch_mode and event.error is None:
+            return
+        with self._quit_lock:
+            if self._quitting:
+                return
+            self._quitting = True
+        if event.error is None:
             self.bell()
-            if self._event_poller is not None:
-                self._event_poller.stop()
-            self._shutdown_event.set()
-            self._close_log_file()
+        if self._event_poller is not None:
+            self._event_poller.stop()
+        self._shutdown_event.set()
+        self._close_log_file()
+        if event.error is None:
             self.exit()
+        else:
+            self.exit(return_code=1)
 
     def _handle_log(self, msg: TuiLogMessage) -> None:  # pragma: no cover
         """Handle log message."""
@@ -541,7 +523,7 @@ class PivotApp(textual.app.App[None]):
         if "explanation" in msg:
             info.live_input_snapshot = msg["explanation"]
         if "output_summary" in msg:
-            info.live_output_snapshot = _convert_output_summary(msg["output_summary"])
+            info.live_output_snapshot = msg["output_summary"]
 
         # Watch mode: history capture
         if self._watch_mode:
@@ -592,7 +574,8 @@ class PivotApp(textual.app.App[None]):
         prefix = self._get_keep_going_prefix()
         match msg["status"]:
             case WatchStatus.WAITING:
-                self.title = f"{prefix}[●] Watching for changes..."
+                if self._pipeline_error is None:
+                    self.title = f"{prefix}[●] Watching for changes..."
             case WatchStatus.RESTARTING:
                 self.title = f"{prefix}[↻] Reloading code..."
             case WatchStatus.DETECTING:
@@ -600,9 +583,27 @@ class PivotApp(textual.app.App[None]):
             case WatchStatus.ERROR:
                 self.title = f"{prefix}[!] {rich.markup.escape(msg['message'])}"
 
+    def _show_pipeline_error(self) -> None:
+        """Show why the pipeline is invalid under the header, or hide the line once it is fixed."""
+        line = self.query_one("#pipeline-error", textual.widgets.Static)
+        prefix = self._get_keep_going_prefix()
+        if self._pipeline_error is None:
+            line.display = False
+            self.title = f"{prefix}[●] Watching for changes..."
+        else:
+            line.update(f"Pipeline invalid - waiting for fix\n{self._pipeline_error}")
+            line.display = True
+            self.title = f"{prefix}[!] Pipeline invalid - waiting for fix"
+
     def _handle_reload(self, msg: TuiReloadMessage) -> None:  # pragma: no cover
         """Handle registry reload (watch mode only)."""
         if not self._watch_mode:
+            return
+
+        self._pipeline_error = msg["error"]
+        self._show_pipeline_error()
+        if msg["error"] is not None:
+            # The engine kept the pipeline it had; the stage list is unchanged.
             return
 
         new_stages = msg["stages"]
@@ -1156,43 +1157,55 @@ class PivotApp(textual.app.App[None]):
         self._viewing_history_index = result
         self._update_history_view()
 
-    async def action_commit(self) -> None:  # pragma: no cover
+    def action_commit(self) -> None:  # pragma: no cover
         """Commit current workspace state (watch mode only)."""
-        if self._commit_in_progress:
+        if not self._watch_mode or self._commit_in_progress:
             return
-        self._commit_in_progress = True
-        try:
-            if not self._watch_mode:
-                return
-            if self._has_running_stages:
-                self.notify("Cannot commit while stages are running", severity="warning")
-                return
-            if self._cancel_commit:
-                self._cancel_commit = False
-                return
-            if self._client is None:
-                self.notify("No client connection", severity="warning")
-                return
+        if self._has_running_stages:
+            self.notify("Cannot commit while stages are running", severity="warning")
+            return
+        if self._cancel_commit:
+            self._cancel_commit = False
+            return
+        if self._client is None:
+            self.notify("No client connection", severity="warning")
+            return
 
-            self.notify("Committing...")
-            result = await self._client.commit()
-            committed = result["committed"]
-            failed = result["failed"]
-            if failed:
-                self.notify(
-                    f"Committed {len(committed)}, failed {len(failed)} stage(s)",
-                    severity="warning",
-                )
-            elif committed:
-                self.notify(f"Committed {len(committed)} stage(s)")
-            else:
-                self.notify("Nothing to commit")
-        except Exception as e:
-            self.notify(f"Commit failed: {e}", severity="error")
+        self._commit_in_progress = True
+        self.notify("Committing...")
+        self._send_commit(self._client)
+
+    @textual.work(group="rpc")
+    async def _send_commit(self, client: PivotClient) -> None:  # pragma: no cover
+        """Commit off the message loop: the reply waits for the engine's startup snapshot."""
+        from pivot_tui.rpc_client_impl import RpcError
+
+        try:
+            result = await client.commit()
+        except TimeoutError:
+            self.notify(f"Commit failed: {_NO_REPLY}", severity="error")
+            return
+        except _CONNECTION_ERRORS:
+            self.notify(f"Commit failed: {_CONNECTION_LOST}", severity="error")
+            return
+        except RpcError as exc:
+            self.notify(f"Commit failed: {exc.message}", severity="error")
+            return
         finally:
             self._commit_in_progress = False
+        committed = result["committed"]
+        failed = result["failed"]
+        if failed:
+            self.notify(
+                f"Committed {len(committed)}, failed {len(failed)} stage(s)",
+                severity="warning",
+            )
+        elif committed:
+            self.notify(f"Committed {len(committed)} stage(s)")
+        else:
+            self.notify("Nothing to commit")
 
-    async def action_force_rerun_stage(self) -> None:  # pragma: no cover
+    def action_force_rerun_stage(self) -> None:  # pragma: no cover
         """Force re-run the currently selected stage (watch mode only)."""
         if not self._watch_mode:
             return
@@ -1208,11 +1221,9 @@ class PivotApp(textual.app.App[None]):
 
         stage_name = self._selected_stage_name
         self.notify(f"Forcing re-run of {stage_name}...")
-        success = await self._client.run(stages=[stage_name], force=True)
-        if not success:
-            self.notify("Failed to send re-run command", severity="error")
+        self._send_run(self._client, [stage_name])
 
-    async def action_force_rerun_all(self) -> None:  # pragma: no cover
+    def action_force_rerun_all(self) -> None:  # pragma: no cover
         """Force re-run all stages (watch mode only)."""
         if not self._watch_mode:
             return
@@ -1224,7 +1235,29 @@ class PivotApp(textual.app.App[None]):
             return
 
         self.notify("Forcing re-run of all stages...")
-        success = await self._client.run(force=True)
+        self._send_run(self._client, None)
+
+    @textual.work(group="rpc")
+    async def _send_run(
+        self, client: PivotClient, stages: list[str] | None
+    ) -> None:  # pragma: no cover
+        """Send a forced run off the message loop; show the engine's refusal if it declines."""
+        from pivot_tui.rpc_client_impl import RpcError
+
+        try:
+            if stages is None:
+                success = await client.run(force=True)
+            else:
+                success = await client.run(stages=stages, force=True)
+        except TimeoutError:
+            self.notify(f"Re-run failed: {_NO_REPLY}", severity="error")
+            return
+        except _CONNECTION_ERRORS:
+            self.notify(f"Re-run failed: {_CONNECTION_LOST}", severity="error")
+            return
+        except RpcError as exc:
+            self.notify(exc.message, severity="error")
+            return
         if not success:
             self.notify("Failed to send re-run command", severity="error")
 

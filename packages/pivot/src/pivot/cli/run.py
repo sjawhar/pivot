@@ -136,10 +136,10 @@ def _run_with_tui(
                 engine=eng,
                 event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
             )
-            eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+            eng.add_source(
+                AgentRpcSource(socket_path=socket_path, handler=rpc_handler, ready=socket_ready)
+            )
             eng.add_sink(BroadcastEventSink())
-
-            socket_ready.set()
 
             _configure_oneshot_source(
                 eng,

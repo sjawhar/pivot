@@ -443,6 +443,11 @@ def test_run_tui_with_tui_log_validation_passes(
     assert "Cannot write to" not in result.output
     # The log file should have been created during validation (touch())
     assert log_path.exists()
+    # The TUI event poller thread must not outlive the command.
+    import threading
+
+    live_pollers = [t for t in threading.enumerate() if "poller" in t.name and t.is_alive()]
+    assert live_pollers == []
 
 
 # =============================================================================

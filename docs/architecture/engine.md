@@ -66,14 +66,16 @@ Sinks consume output events via `sink.handle()`:
 
 | Sink | Output | Use Case |
 |------|--------|----------|
-| `StaticConsoleSink` | Rich terminal (buffered) | Pipe/CI — buffers completions, prints sorted report on close |
-| `LiveConsoleSink` | Rich terminal (live) | TTY — live progress bar with running/completed counts |
+| `StaticConsoleSink` | Rich terminal (buffered) | Pipe/CI — buffers completions, prints a sorted report when each run ends |
+| `LiveConsoleSink` | Rich terminal (live) | TTY — live progress bar with running/completed counts for the current run; log records print above it |
 | `ResultCollectorSink` | Dict collection | Programmatic result access |
 | `JsonlSink` | JSONL records | `--jsonl` output for machine consumption |
 | `BroadcastEventSink` | Pub-sub | Agent RPC subscribers |
 | `EventBuffer` | Ring buffer | Agent RPC polling (`events_since`) |
 
 The CLI chooses between `StaticConsoleSink` and `LiveConsoleSink` automatically based on whether stdout is a TTY. The TUI is **not** a sink — it is a separate package (`pivot-tui`) that connects as a JSON-RPC client. See [TUI Architecture](tui.md).
+
+Both console sinks treat each `engine_state_changed` event as a run boundary: they print the finished run's report and reset their counters, so every watch-mode run reports only its own stages.
 
 Sinks are supervised by the Engine: each sink receives events via its own bounded
 queue. Slow or failing sinks are temporarily disabled and re-enabled after
