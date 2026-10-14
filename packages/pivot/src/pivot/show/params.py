@@ -37,7 +37,7 @@ def collect_params_from_stages(
     from pivot.cli import helpers as cli_helpers
 
     result = dict[str, StageParams]()
-    overrides = parameters.load_params_yaml()
+    overrides = parameters.load_params_yaml(cli_helpers.get_pipeline())
 
     stage_list = list(stages) if stages else cli_helpers.list_stages()
     for stage_name in stage_list:

@@ -296,6 +296,7 @@ class Pipeline:
     _included_stages: dict[str, registry.RegistryStageInfo]
     _previous_markers: list[_PreviousOutputMarker]
     _constructing: bool
+    _loaded_pipelines: set[str]
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
         reason = lock.stage_name_error(name)
@@ -313,6 +314,7 @@ class Pipeline:
         self._previous_markers = list[_PreviousOutputMarker]()
         self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
+        self._loaded_pipelines = {name}
 
         if root is not None:
             self._root = root.resolve()
@@ -334,6 +336,15 @@ class Pipeline:
     @property
     def input_bindings(self) -> dict[str, str]:
         return {name: node.path for name, node in self._inputs.items()}
+
+    @property
+    def loaded_pipelines(self) -> frozenset[str]:
+        """Names of the pipelines whose every stage this one holds: itself and each it includes.
+
+        A pipeline reached only through handles contributes just the stages it produces those
+        handles with, so it is not listed.
+        """
+        return frozenset(self._loaded_pipelines)
 
     def _require_materialized(self) -> None:
         if self._constructing:
@@ -406,6 +417,7 @@ class Pipeline:
                 )
         if not self._constructing:
             self._check_inputs_against_outputs(self._registry)
+        self._loaded_pipelines.update(other.loaded_pipelines)
         self._registry.invalidate_dag_cache()
 
     def __enter__(self) -> Pipeline:

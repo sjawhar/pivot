@@ -937,7 +937,7 @@ class Engine:
         )
 
         # Load config
-        overrides = parameters.load_params_yaml()
+        overrides = parameters.load_params_yaml(pipeline)
         checkout_modes = config.get_checkout_mode_order()
         self._current_overrides = overrides
         self._merkle_ids = dict[str, str]()

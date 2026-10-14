@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from pivot import exceptions, parameters, project
+from pivot import exceptions, parameters, project, stage_def
+from pivot.compose import Pipeline, stage
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -49,27 +50,45 @@ class TupleParams(BaseModel):
 # -----------------------------------------------------------------------------
 
 
+class _LoadParams(stage_def.StageParams):
+    lr: float = 0.01
+
+
+@stage
+def _load_stage(params: _LoadParams) -> None:
+    pass
+
+
+def _pipeline(tmp_path: Path, name: str = "p") -> Pipeline:
+    """A pipeline with stages '<name>/_load_stage' and '<name>/_load_stage@v'."""
+    with Pipeline(name, root=tmp_path) as pipeline:
+        _load_stage(params=_LoadParams())
+        with pipeline.variant("v"):
+            _load_stage(params=_LoadParams())
+    return pipeline
+
+
 def test_load_params_yaml_missing_file(tmp_path: Path, mocker: MockerFixture) -> None:
     mocker.patch.object(project, "get_project_root", return_value=tmp_path)
-    result = parameters.load_params_yaml()
+    result = parameters.load_params_yaml(_pipeline(tmp_path))
     assert result == {}, "Missing params.yaml should return empty dict"
 
 
 def test_load_params_yaml_from_explicit_path(tmp_path: Path) -> None:
     params_file = tmp_path / "params.yaml"
-    params_file.write_text("train:\n  learning_rate: 0.001\n  epochs: 200\n")
+    params_file.write_text("p/_load_stage:\n  lr: 0.001\n")
 
-    result = parameters.load_params_yaml(params_file)
-    assert result == {"train": {"learning_rate": 0.001, "epochs": 200}}
+    result = parameters.load_params_yaml(_pipeline(tmp_path), params_file)
+    assert result == {"p/_load_stage": {"lr": 0.001}}
 
 
 def test_load_params_yaml_from_project_root(tmp_path: Path, mocker: MockerFixture) -> None:
     mocker.patch.object(project, "get_project_root", return_value=tmp_path)
     params_file = tmp_path / "params.yaml"
-    params_file.write_text("stage1:\n  lr: 0.01\nstage2:\n  batch: 64\n")
+    params_file.write_text("p/_load_stage:\n  lr: 0.01\np/_load_stage@v:\n  lr: 0.5\n")
 
-    result = parameters.load_params_yaml()
-    assert result == {"stage1": {"lr": 0.01}, "stage2": {"batch": 64}}
+    result = parameters.load_params_yaml(_pipeline(tmp_path))
+    assert result == {"p/_load_stage": {"lr": 0.01}, "p/_load_stage@v": {"lr": 0.5}}
 
 
 def test_load_params_yaml_non_dict_root_raises(tmp_path: Path) -> None:
@@ -78,15 +97,18 @@ def test_load_params_yaml_non_dict_root_raises(tmp_path: Path) -> None:
     params_file.write_text("- item1\n- item2\n")
 
     with pytest.raises(exceptions.ParamsError, match="root must be a dict"):
-        parameters.load_params_yaml(params_file)
+        parameters.load_params_yaml(_pipeline(tmp_path), params_file)
 
 
-def test_load_params_yaml_filters_non_dict_values(tmp_path: Path) -> None:
+def test_load_params_yaml_refuses_non_dict_stage_value(tmp_path: Path) -> None:
     params_file = tmp_path / "params.yaml"
-    params_file.write_text("valid:\n  key: value\ninvalid: just_a_string\n")
+    params_file.write_text("p/_load_stage: 3\n")
 
-    result = parameters.load_params_yaml(params_file)
-    assert result == {"valid": {"key": "value"}}, "Non-dict stage values should be filtered"
+    with pytest.raises(
+        exceptions.PipelineConfigError,
+        match="params.yaml key 'p/_load_stage' must map parameter names to values, got int",
+    ):
+        parameters.load_params_yaml(_pipeline(tmp_path), params_file)
 
 
 def test_load_params_yaml_invalid_yaml_raises(tmp_path: Path) -> None:
@@ -95,7 +117,59 @@ def test_load_params_yaml_invalid_yaml_raises(tmp_path: Path) -> None:
     params_file.write_text("invalid: yaml: content: ::::")
 
     with pytest.raises(exceptions.ParamsError, match="Failed to parse"):
-        parameters.load_params_yaml(params_file)
+        parameters.load_params_yaml(_pipeline(tmp_path), params_file)
+
+
+def test_load_params_yaml_lists_every_bad_key(tmp_path: Path) -> None:
+    """A bare key, a typo and a non-mapping value are all reported in one error."""
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("_load_stage:\n  lr: 1\np/_load_stgae:\n  lr: 2\np/_load_stage@v: [1]\n")
+
+    with pytest.raises(exceptions.PipelineConfigError) as exc_info:
+        parameters.load_params_yaml(_pipeline(tmp_path), params_file)
+
+    assert str(exc_info.value).splitlines() == [
+        "params.yaml key '_load_stage' names no stage; keys are '<pipeline>/<stage>', "
+        + "e.g. 'p/_load_stage'",
+        "params.yaml key 'p/_load_stgae' names no stage in pipeline 'p'; "
+        + "did you mean 'p/_load_stage' or 'p/_load_stage@v'?",
+        "params.yaml key 'p/_load_stage@v' must map parameter names to values, got list",
+    ]
+
+
+def test_load_params_yaml_skips_key_for_pipeline_not_loaded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("other/train:\n  lr: 1\nnested/other/train:\n  lr: 2\n")
+
+    with caplog.at_level("DEBUG", logger="pivot.parameters"):
+        result = parameters.load_params_yaml(_pipeline(tmp_path), params_file)
+
+    assert result == {"other/train": {"lr": 1}, "nested/other/train": {"lr": 2}}
+    assert "pipeline 'other' is not loaded in this run; skipping" in caplog.text
+    assert "pipeline 'nested/other' is not loaded in this run; skipping" in caplog.text
+
+
+def test_load_params_yaml_typo_without_close_match_points_to_list(tmp_path: Path) -> None:
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("p/zzz:\n  lr: 1\n")
+
+    with pytest.raises(
+        exceptions.PipelineConfigError,
+        match="names no stage in pipeline 'p'; run 'pivot list' to see its stages",
+    ):
+        parameters.load_params_yaml(_pipeline(tmp_path), params_file)
+
+
+def test_load_params_yaml_checks_keys_of_included_pipelines(tmp_path: Path) -> None:
+    combined = Pipeline("all", root=tmp_path)
+    combined.include(_pipeline(tmp_path, "a"))
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("a/_load_stage:\n  lr: 1\na/_load_stag:\n  lr: 2\n")
+
+    with pytest.raises(exceptions.PipelineConfigError, match="names no stage in pipeline 'a'"):
+        parameters.load_params_yaml(combined, params_file)
 
 
 # -----------------------------------------------------------------------------

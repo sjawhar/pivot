@@ -168,7 +168,7 @@ scores/scale@x10:
   factor: 100
 ```
 
-`pivot params show` prints the effective values.
+`pivot params show` prints the effective values. A key with no pipeline part, or one that names no stage of a loaded pipeline, is refused with the names it could mean.
 
 ## Module-level constants
 
