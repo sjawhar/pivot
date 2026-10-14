@@ -257,18 +257,19 @@ def _check_output_path_free(
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
     """Compute and return a stage fingerprint, wrapping errors."""
     try:
-        no_fp = info["no_fingerprint"]
-        if no_fp:
-            result = _compute_file_fingerprint(info["func"], info["code_deps"])
-        else:
-            result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
-        for dep_name, dep in info["deps"].items():
-            for key, value in fingerprint.get_loader_fingerprint(dep.format).items():
-                result[f"dep:{dep_name}:{key}"] = value
-        for out in info["outs"]:
-            out_key = types.identity_key(out.identity)
-            for key, value in fingerprint.get_loader_fingerprint(out.format).items():
-                result[f"out:{out_key}:{key}"] = value
+        with fingerprint.stage_fingerprint_scope(stage_name):
+            no_fp = info["no_fingerprint"]
+            if no_fp:
+                result = _compute_file_fingerprint(info["func"], info["code_deps"])
+            else:
+                result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
+            for dep_name, dep in info["deps"].items():
+                for key, value in fingerprint.get_loader_fingerprint(dep.format).items():
+                    result[f"dep:{dep_name}:{key}"] = value
+            for out in info["outs"]:
+                out_key = types.identity_key(out.identity)
+                for key, value in fingerprint.get_loader_fingerprint(out.format).items():
+                    result[f"out:{out_key}:{key}"] = value
         return result
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc

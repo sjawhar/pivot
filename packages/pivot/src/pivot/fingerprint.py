@@ -23,6 +23,8 @@ import xxhash
 from pivot import ast_utils, exceptions, metrics
 
 if TYPE_CHECKING:
+    import pydantic.json_schema
+
     from pivot import loaders
     from pivot.storage.state import StateDB
 
@@ -34,7 +36,14 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # invalidates manifests that might have been persisted after unsafe capture warnings. Version 6
 # also invalidates entries written before discovery imported pipeline.py as a real module.
 # Version 7 invalidates manifests whose source maps omitted imported project modules.
-_CACHE_SCHEMA_VERSION = 7
+# Version 8 adds default argument values, which earlier manifests did not record.
+# Version 9 keys manifests by the stage function's identity as well as the stage name.
+# Version 10 drops a bare @stage decorator from code hashes, as the called form already was.
+# Version 11 walks the function behind a functools.cache or lru_cache helper.
+# Version 12 hashes set members and dict entries in sorted order, not hash-seed order.
+# Version 13 hashes a function value by its name and code instead of its address-bearing repr.
+# Version 14 walks user functions and classes bound in functools.partial arguments.
+_CACHE_SCHEMA_VERSION = 14
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -48,7 +57,9 @@ class _PydanticModelProtocol(Protocol):
     model_fields: Mapping[str, Any]
 
     @classmethod
-    def model_json_schema(cls) -> dict[str, Any]: ...
+    def model_json_schema(
+        cls, *, schema_generator: "type[pydantic.json_schema.GenerateJsonSchema]"
+    ) -> dict[str, Any]: ...
 
 
 def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
@@ -174,9 +185,29 @@ def _get_state_db() -> "StateDB | None":
         return None
 
 
-def _make_manifest_cache_key(stage_name: str) -> bytes:
-    """Build StateDB key for manifest cache entry."""
-    return f"sm:{stage_name}\x00{_PYTHON_VERSION}\x00{_CACHE_SCHEMA_VERSION}".encode()
+def _make_manifest_cache_key(stage_name: str, func: Callable[..., Any]) -> bytes:
+    """Build StateDB key for the manifest of `func` registered as `stage_name`.
+
+    The key names the function as well as the stage, because two pipeline files can register
+    the same stage name with different functions. A cached manifest for one never answers for
+    the other.
+    """
+    module = getattr(func, "__module__", None) or "<unknown>"
+    qualname = getattr(func, "__qualname__", None) or getattr(func, "__name__", "<unknown>")
+    code = getattr(func, "__code__", None)
+    source = code.co_filename if isinstance(code, types.CodeType) else "<unknown>"
+    identity = f"{module}\x00{qualname}\x00{_portable_source_path(source)}"
+    return f"sm:{stage_name}\x00{identity}\x00{_PYTHON_VERSION}\x00{_CACHE_SCHEMA_VERSION}".encode()
+
+
+def _portable_source_path(source: str) -> str:
+    """Return `source` relative to the project root, so a moved project keeps its cache."""
+    from pivot import project
+
+    try:
+        return str(pathlib.Path(source).resolve().relative_to(project.get_project_root()))
+    except (OSError, ValueError):
+        return source
 
 
 def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int] | None:
@@ -280,13 +311,13 @@ def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None
         source_map.setdefault(rel_path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
 
 
-def _try_manifest_cache_hit(stage_name: str) -> dict[str, str] | None:
+def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[str, str] | None:
     """Try to load a cached manifest; returns None on miss."""
     db = _get_state_db()
     if db is None:
         return None
 
-    key = _make_manifest_cache_key(stage_name)
+    key = _make_manifest_cache_key(stage_name, func)
     try:
         raw = db.get_raw(key)
     except Exception:
@@ -486,22 +517,48 @@ def get_stage_fingerprint(
     if visited is None:
         visited = set()
 
-    errors = _capture_errors.get()
-    token: contextvars.Token[list[str] | None] | None = None
-    if errors is None:
-        errors = list[str]()
-        token = _capture_errors.set(errors)
-
     _t = metrics.start()
     try:
-        result = _get_stage_fingerprint_impl(func, visited)
-        if token is not None and errors:
-            raise exceptions.StageDefinitionError("\n\n".join(errors))
-        return result
+        with _collected_capture_errors():
+            return _get_stage_fingerprint_impl(func, visited)
     finally:
         metrics.end("fingerprint.get_stage_fingerprint", _t)
-        if token is not None:
-            _capture_errors.reset(token)
+
+
+@contextlib.contextmanager
+def _collected_capture_errors() -> Iterator[None]:
+    """Collect unsafe-capture errors and raise them together, unless a caller already does.
+
+    Each walked function reports what it reads, so one variable read by a loader's `load()`
+    and `save()`, or by one loader on two inputs, produces the same message several times.
+    Each distinct message is listed once, in first-seen order.
+    """
+    if _capture_errors.get() is not None:
+        yield
+        return
+    errors = list[str]()
+    token = _capture_errors.set(errors)
+    try:
+        yield
+    finally:
+        _capture_errors.reset(token)
+    if errors:
+        raise exceptions.StageDefinitionError("\n\n".join(dict.fromkeys(errors)))
+
+
+@contextlib.contextmanager
+def stage_fingerprint_scope(stage_name: str) -> Iterator[None]:
+    """Name the stage being fingerprinted and raise all of its unsafe-capture errors together.
+
+    Wraps a stage's manifest and its input and output loader fingerprints, so a refusal found
+    in loader config is reported with the stage's own refusals.
+    """
+    token = _current_stage_name.set(stage_name)
+    try:
+        with _collected_capture_errors():
+            yield
+    finally:
+        _current_stage_name.reset(token)
 
 
 def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
@@ -513,13 +570,15 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     _t = metrics.start()
 
     # Try cache hit
-    cached = _try_manifest_cache_hit(stage_name)
+    cached = _try_manifest_cache_hit(stage_name, func)
     if cached is not None:
         metrics.count("fingerprint.manifest_cache.hit")
         metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
         return cached
 
     metrics.count("fingerprint.manifest_cache.miss")
+    errors = _capture_errors.get()
+    errors_before = len(errors) if errors is not None else 0
     unsafe_token = _unsafe_capture_warning.set(False)
     try:
         # Compute with source tracking
@@ -530,9 +589,11 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
         finally:
             _current_stage_name.reset(token)
 
-        if not _unsafe_capture_warning.get():
+        # Inside a stage_fingerprint_scope, refusals are raised later; never cache them.
+        refused = errors is not None and len(errors) > errors_before
+        if not _unsafe_capture_warning.get() and not refused:
             _record_project_modules(source_map)
-            key = _make_manifest_cache_key(stage_name)
+            key = _make_manifest_cache_key(stage_name, func)
             value = json.dumps(
                 {
                     "m": manifest,
@@ -631,6 +692,15 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         metrics.end("fingerprint.getclosurevars", _t_closure)
         if isinstance(func, type):
             _process_class_body_dependencies(func, manifest, visited)
+            return manifest
+        # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
+        # getclosurevars rejects it. The function it wraps reads the module values, so walk
+        # that function's globals, nonlocals and defaults instead.
+        unwrapped = inspect.unwrap(func)
+        if unwrapped is not func and inspect.isfunction(unwrapped):
+            for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
+                if not key.startswith("self:"):
+                    manifest[key] = value
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
@@ -655,6 +725,7 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
                     nested_globals_dict, func, manifest, visited, skip_dunders=True
                 )
 
+    _process_default_values(func, manifest, visited)
     _process_type_hint_dependencies(func, manifest, visited)
 
     return manifest
@@ -772,12 +843,23 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     - Writer: 'loader:<module>.<qualname>:save'
     - Loader: All of the above
     - Always: 'loader:<module>.<qualname>:config' for dataclass field values
+
+    A user loader class's own `load`, `save` and `empty`, and the functions and classes bound
+    in its config fields, are walked like stage helpers, so the module values they read are
+    tracked or refused. Methods inherited from `pivot.loaders` are framework code and are
+    only hashed.
     """
     manifest = dict[str, str]()
     class_name = _definition_ref(type(loader))
+    visited = set[int]()
 
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
+
+    for method_name in ("load", "save", "empty"):
+        method = _user_defined_method(type(loader), method_name)
+        if method is not None:
+            _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
 
     # Fingerprint save() if this is a Writer
     if isinstance(loader, loaders_module.Writer):
@@ -806,12 +888,25 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     field_values = list[str]()
     for field in dataclasses.fields(loader_any):
         value = getattr(loader_any, field.name)
-        field_values.append(f"{field.name}={value!r}")
+        field_values.append(f"{field.name}={_serialize_value_for_hash(value)}")
+        _process_bound_values(f"{class_name}.{field.name}", value, manifest, visited)
     if field_values:
         config_str = ",".join(field_values)
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
+
+
+def _user_defined_method(cls: type, name: str) -> Callable[..., Any] | None:
+    """Return the function behind `cls`'s nearest `name` attribute when user code defines it."""
+    for klass in cls.__mro__:
+        if name in klass.__dict__:
+            member = klass.__dict__[name]
+            function = getattr(member, "__func__", member)
+            if inspect.isfunction(function) and is_user_code(function):
+                return function
+            return None
+    return None
 
 
 def _is_unsafe_fingerprinting_enabled() -> bool:
@@ -830,14 +925,18 @@ def _is_unsafe_fingerprinting_enabled() -> bool:
         return False
 
 
-def _check_non_scalar_capture(var_name: str, value: Any, stage_name: str) -> None:
+def _check_non_scalar_capture(
+    var_name: str, value: Any, stage_name: str, *, parameter: str | None = None
+) -> None:
+    subject = f"captures non-scalar variable '{var_name}'"
+    if parameter is not None:
+        subject += f" as the default of parameter '{parameter}'"
     message = (
-        f"Stage '{stage_name}': captures non-scalar variable '{var_name}' "
-        + f"(type: {type(value).__name__}).\n"
+        f"Stage '{stage_name}': {subject} (type: {type(value).__name__}).\n"
         + "Pivot tracks only module-level bool, int, float, str, bytes, and None values. "
         + "Other values may change without a reliable fingerprint, which can cause silent wrong "
         + "outputs.\n"
-        + "Fix: pass this data via StageParams or as a function parameter.\n"
+        + "Fix: move this value into the stage's StageParams, or read it from a pipeline input.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
     if _is_unsafe_fingerprinting_enabled():
@@ -924,28 +1023,146 @@ def _process_closure_values(
     for name, value in values.items():
         if skip_dunders and name.startswith("__"):
             continue
+        _process_captured_value(
+            name, _binding_ref(func, name), value, func, manifest, visited, stage_name
+        )
 
-        binding_ref = _binding_ref(func, name)
-        # functools.partial fails is_user_code() (module is functools/stdlib).
-        if isinstance(value, functools.partial):
-            _process_partial_dependency(
-                binding_ref, cast("functools.partial[Any]", value), manifest, visited
-            )
-        elif _is_callable_instance(value) or _is_user_class_instance(value):
-            _check_non_scalar_capture(name, value, stage_name)
-        elif callable(value) and is_user_code(value):
-            _process_callable_dependency(binding_ref, value, manifest, visited)
-        elif callable(value):
-            # External functions, classes, and builtins are not user dependencies.
+
+def _process_captured_value(
+    name: str,
+    binding_ref: str,
+    value: Any,
+    func: Callable[..., Any],
+    manifest: dict[str, str],
+    visited: set[int],
+    stage_name: str,
+    *,
+    parameter: str | None = None,
+) -> None:
+    """Fingerprint one value `func` reads, or refuse it as a non-scalar capture.
+
+    `parameter` names the parameter when the value is a default argument.
+    """
+    # functools.partial fails is_user_code() (module is functools/stdlib).
+    if isinstance(value, functools.partial):
+        _process_partial_dependency(
+            binding_ref, cast("functools.partial[Any]", value), manifest, visited
+        )
+    elif _is_callable_instance(value) or _is_user_class_instance(value):
+        _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+    elif callable(value) and is_user_code(value):
+        _process_callable_dependency(binding_ref, value, manifest, visited)
+    elif callable(value):
+        # External functions, classes, and builtins are not user dependencies.
+        return
+    elif isinstance(value, types.ModuleType):
+        _process_module_dependency(parameter or name, value, func, manifest, visited)
+    elif isinstance(value, logging.Logger):
+        return
+    elif isinstance(value, (bool, int, float, str, bytes, type(None))):
+        manifest[f"const:{binding_ref}"] = repr(value)
+    else:
+        _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+
+
+def _process_default_values(
+    func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Fingerprint default argument values, which no code hash records.
+
+    A default is evaluated once, when its module loads, so `cols=COLUMNS` puts the name
+    `COLUMNS` in the AST and never its value. A scalar or a StageParams instance is tracked by
+    value: a stage's own params hash does not cover a StageParams default on a helper. An
+    ArtifactHandle default, or a list or tuple of them, is skipped: the pipeline wires it as a
+    real input, which is hashed as a dependency. Any other value is treated like a captured
+    module value, unless its default is a literal that the function's AST hash already
+    records, such as `keys=("a", "b")`.
+    """
+    defaults = _function_defaults(func)
+    if not defaults:
+        return
+    from pivot import compose, stage_def
+
+    stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
+    func_ref = _definition_ref(func)
+    expressions: dict[str, ast.expr] | None = None
+    for parameter, value in defaults:
+        binding_ref = f"{func_ref}.{parameter}"
+        if isinstance(value, (bool, int, float, str, bytes, type(None))):
+            manifest[f"default:{binding_ref}"] = repr(value)
             continue
-        elif isinstance(value, types.ModuleType):
-            _process_module_dependency(name, value, func, manifest, visited)
-        elif isinstance(value, logging.Logger):
+        if isinstance(value, stage_def.StageParams):
+            serialized = _serialize_value_for_hash(value)
+            manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
             continue
-        elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{binding_ref}"] = repr(value)
-        else:
-            _check_non_scalar_capture(name, value, stage_name)
+        if _is_artifact_handles(value, compose.ArtifactHandle):
+            continue
+        if expressions is None:
+            expressions = _default_expressions(func)
+        expression = expressions.get(parameter)
+        if expression is not None and _is_literal(expression):
+            continue
+        source = ast.unparse(expression) if expression is not None else parameter
+        _process_captured_value(
+            source, binding_ref, value, func, manifest, visited, stage_name, parameter=parameter
+        )
+
+
+def _is_artifact_handles(value: object, handle_type: type) -> bool:
+    """Return whether `value` is a handle, or a non-empty list or tuple of handles."""
+    if isinstance(value, handle_type):
+        return True
+    if isinstance(value, (list, tuple)):
+        items = cast("list[object] | tuple[object, ...]", value)
+        return bool(items) and all(isinstance(item, handle_type) for item in items)
+    return False
+
+
+def _function_defaults(func: Callable[..., Any]) -> list[tuple[str, Any]]:
+    """Return (parameter, default value) for each parameter of `func` that has a default."""
+    code = getattr(func, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        return []
+    positional: tuple[Any, ...] = getattr(func, "__defaults__", None) or ()
+    keyword: dict[str, Any] = getattr(func, "__kwdefaults__", None) or {}
+    names = code.co_varnames[: code.co_argcount]
+    pairs = list(zip(names[len(names) - len(positional) :], positional, strict=True))
+    pairs.extend(keyword.items())
+    return pairs
+
+
+def _default_expressions(func: Callable[..., Any]) -> dict[str, ast.expr]:
+    """Map each defaulted parameter to its default expression in the hashed source.
+
+    Empty when the code hash does not come from this function's own source: there is no
+    source, or `func` is a `functools.wraps` wrapper, whose hash is bytecode, which holds no
+    defaults. Every default is then checked by value.
+    """
+    if hasattr(func, "__wrapped__"):
+        return {}
+    try:
+        node = ast_utils.get_function_ast(func)
+    except (ValueError, SyntaxError):
+        return {}
+    if node.name != getattr(func, "__name__", None):
+        return {}
+    args = node.args
+    positional = [*args.posonlyargs, *args.args]
+    defaulted = positional[len(positional) - len(args.defaults) :]
+    expressions = {arg.arg: default for arg, default in zip(defaulted, args.defaults, strict=True)}
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+        if default is not None:
+            expressions[arg.arg] = default
+    return expressions
+
+
+def _is_literal(expression: ast.expr) -> bool:
+    """Return whether `expression` is a Python literal, fully recorded by the AST."""
+    try:
+        ast.literal_eval(expression)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return True
 
 
 def _process_callable_dependency(
@@ -974,6 +1191,55 @@ def _process_partial_dependency(
     if callable(underlying) and is_user_code(underlying):
         callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
         _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
+    for index, item in enumerate(partial_obj.args):
+        _process_bound_values(f"{binding_ref}.args[{index}]", item, manifest, visited)
+    for keyword, item in partial_obj.keywords.items():
+        _process_bound_values(f"{binding_ref}.kwargs[{keyword}]", item, manifest, visited)
+
+
+def _process_bound_values(
+    binding_ref: str, value: Any, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Walk each user function and user class bound inside `value` as a stage helper.
+
+    Loader config and `functools.partial` arguments hash a function by its name and code
+    only, so the module values it reads would otherwise go unseen. The walk descends into
+    partials, lists, tuples, sets and dict values. Each user function, including one behind
+    a `functools.cache` wrapper, and each user class gets the walk a stage helper gets:
+    globals, closure values, defaults, and the non-scalar refusal. An instance of a user
+    class with `__call__` is refused, as it is when a stage reads one: what its `__call__`
+    reads is not walked, and its repr does not record its behaviour.
+    """
+    if isinstance(value, functools.partial):
+        partial_obj = cast("functools.partial[Any]", value)
+        _process_bound_values(f"{binding_ref}.func", partial_obj.func, manifest, visited)
+        for index, item in enumerate(partial_obj.args):
+            _process_bound_values(f"{binding_ref}.args[{index}]", item, manifest, visited)
+        for keyword, item in partial_obj.keywords.items():
+            _process_bound_values(f"{binding_ref}.kwargs[{keyword}]", item, manifest, visited)
+    elif isinstance(value, (list, tuple)):
+        items = cast("list[Any] | tuple[Any, ...]", value)
+        for index, item in enumerate(items):
+            _process_bound_values(f"{binding_ref}[{index}]", item, manifest, visited)
+    elif isinstance(value, (set, frozenset)):
+        # Iteration order follows the hash seed, so walk members in canonical order.
+        members = sorted(cast("set[Any] | frozenset[Any]", value), key=_serialize_value_for_hash)
+        for index, item in enumerate(members):
+            _process_bound_values(f"{binding_ref}{{{index}}}", item, manifest, visited)
+    elif isinstance(value, dict):
+        for key, item in cast("dict[Any, Any]", value).items():
+            _process_bound_values(f"{binding_ref}[{key!r}]", item, manifest, visited)
+    elif isinstance(value, type):
+        if is_user_code(value):
+            _process_callable_dependency(binding_ref, value, manifest, visited)
+            if hasattr(value, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", value), manifest, visited
+                )
+    elif callable(value) and _is_user_class_instance(value):
+        _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
+    elif callable(value) and inspect.isfunction(inspect.unwrap(value)) and is_user_code(value):
+        _process_callable_dependency(binding_ref, value, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
@@ -1118,7 +1384,9 @@ def _hash_pydantic_schema(
     # Insert placeholder to prevent infinite recursion on self-referential models
     # (e.g., class Node(BaseModel): children: list["Node"])
     manifest[schema_key] = "<pending>"
-    schema_raw = schema_model.model_json_schema()
+    from pivot import parameters
+
+    schema_raw = schema_model.model_json_schema(schema_generator=parameters.SortedSetJsonSchema)
     schema = _strip_schema_metadata(schema_raw)
 
     model_fields = cast("Mapping[str, Any]", getattr(schema_model, "model_fields", {}))
@@ -1163,29 +1431,50 @@ def _discover_pydantic_field_types(
 
 def _serialize_value_for_hash(value: Any) -> str:
     """Serialize a value to a stable string for hashing."""
-    if hasattr(value, "model_dump"):
-        return json.dumps(value.model_dump(), sort_keys=True, default=str)
+    return json.dumps(_canonicalize_value_for_hash(value))
 
-    if isinstance(value, (list, tuple)):
-        items: list[Any] = []
-        for item in cast("list[Any]", value):
-            if hasattr(item, "model_dump"):
-                items.append(item.model_dump())
-            else:
-                items.append(item)
-        return json.dumps(items, sort_keys=True, default=str)
 
-    if isinstance(value, (set, frozenset)):
-        # Sort for deterministic ordering
-        items_to_sort = cast("set[Any] | frozenset[Any]", value)
-        return json.dumps(
-            sorted(items_to_sort, key=lambda x: (type(x).__name__, str(x))), default=str
-        )
+def _canonicalize_value_for_hash(value: Any) -> Any:
+    """Return a JSON-ready form of `value` that does not depend on PYTHONHASHSEED.
 
+    Collections become `[type, items]` nodes, so a set stays distinct from a list or from a
+    string that looks like one. Set members and dict entries are sorted by their full
+    canonical JSON text: a set's iteration order, and a dict built from a set, follow the
+    hash seed. A Python function is named by its module and qualname, plus its code hash when
+    it is user code, because its `repr` holds a memory address; a `functools.partial` is
+    canonicalised through its function and arguments for the same reason. Other leaves keep
+    their `repr`, tagged with their type. A class is a leaf, even a pydantic model class: only
+    an instance is dumped.
+    """
+    if hasattr(value, "model_dump") and not isinstance(value, type):
+        return _canonicalize_value_for_hash(value.model_dump())
+    if inspect.isfunction(value):
+        code_hash = hash_function_ast(value) if is_user_code(value) else None
+        return ["function", _definition_ref(value), code_hash]
+    if isinstance(value, functools.partial):
+        partial_obj = cast("functools.partial[Any]", value)
+        return [
+            "partial",
+            _canonicalize_value_for_hash(partial_obj.func),
+            _canonicalize_value_for_hash(partial_obj.args),
+            _canonicalize_value_for_hash(partial_obj.keywords),
+        ]
     if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, default=str)
-
-    return repr(value)
+        entries = [
+            [_canonicalize_value_for_hash(key), _canonicalize_value_for_hash(item)]
+            for key, item in cast("dict[Any, Any]", value).items()
+        ]
+        entries.sort(key=json.dumps)
+        return ["dict", entries]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
+        items = [_canonicalize_value_for_hash(item) for item in collection]
+        if isinstance(collection, (set, frozenset)):
+            items.sort(key=json.dumps)
+        return [type(collection).__name__, items]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return [type(value).__name__, repr(value)]
 
 
 def _add_callable_to_manifest(
@@ -1427,8 +1716,14 @@ def _resolve_static_callee(expr: ast.expr, globals_dict: dict[str, Any]) -> obje
     return namespace.get(expr.attr)
 
 
-def _strip_resource_stage_decorator(tree: ast.Module, globals_dict: dict[str, Any]) -> None:
-    """Exclude only the outer Pivot resource decorator from a stage code hash."""
+def _strip_stage_decorator(tree: ast.Module, globals_dict: dict[str, Any]) -> None:
+    """Exclude Pivot's own stage decorator from a stage code hash.
+
+    Drops each decorator on the stage's own FunctionDef that statically resolves to
+    `pivot.compose.stage`: bare (`@stage`, `@compose.stage`) or called
+    (`@stage(resources=...)`). Resources are scheduler admission, not stage code, so adding,
+    removing or changing them keeps the hash. Other decorators stay hashed.
+    """
     from pivot import compose
 
     outer = next(
@@ -1440,11 +1735,10 @@ def _strip_resource_stage_decorator(tree: ast.Module, globals_dict: dict[str, An
     outer.decorator_list = [
         decorator
         for decorator in outer.decorator_list
-        if not (
-            isinstance(decorator, ast.Call)
-            and any(keyword.arg == "resources" for keyword in decorator.keywords)
-            and _resolve_static_callee(decorator.func, globals_dict) is compose.stage
+        if _resolve_static_callee(
+            decorator.func if isinstance(decorator, ast.Call) else decorator, globals_dict
         )
+        is not compose.stage
     ]
 
 
@@ -1497,7 +1791,7 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         _t_norm = metrics.start()
         if hasattr(func, "__pivot_resources__"):
             globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
-            _strip_resource_stage_decorator(tree, globals_dict)
+            _strip_stage_decorator(tree, globals_dict)
         tree = _normalize_ast(tree)
         ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
         metrics.end("fingerprint.normalize_and_dump", _t_norm)

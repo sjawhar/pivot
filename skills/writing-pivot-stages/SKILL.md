@@ -172,7 +172,7 @@ scores/scale@x10:
 
 ## Module-level constants
 
-A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance), directly or as `module.NAME`, is an error that names the variable. Move it into the stage's `StageParams`.
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance), directly, as `module.NAME`, or as a default argument (`cols=COLUMNS`), is an error that names the variable. Move it into the stage's `StageParams`.
 
 ## Variants and fan-out
 

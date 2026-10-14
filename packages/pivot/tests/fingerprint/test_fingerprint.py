@@ -36,6 +36,11 @@ def _loader_key(loader: object, member: str) -> str:
     return _definition_key("loader", type(loader)) + f":{member}"
 
 
+def _cached_stage() -> int:
+    """Function that hand-built manifest cache entries are keyed under."""
+    return 0
+
+
 # --- Module-level helper functions for testing ---
 # These must be at module level to properly capture imports in their closures
 
@@ -2245,7 +2250,7 @@ def test_cached_manifest_source_map_includes_module_attribute_source(
     )
     writes = list[tuple[bytes, bytes]]()
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
-    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name: None)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
     try:
         stage_module = importlib.import_module("f8_stage")
         fingerprint.get_stage_fingerprint_cached("f8/scale", stage_module.scale)
@@ -2563,11 +2568,13 @@ def builtin_stage(items):
 
 
 def test_make_manifest_cache_key_format():
-    """_make_manifest_cache_key encodes stage name, python version, and schema version."""
-    key = fingerprint._make_manifest_cache_key("train")
+    """The key names the stage, the function, the python version, and the schema version."""
+    key = fingerprint._make_manifest_cache_key("train", _cached_stage)
     decoded = key.decode()
     assert decoded.startswith("sm:")
     assert "train" in decoded
+    assert _cached_stage.__module__ in decoded
+    assert _cached_stage.__qualname__ in decoded
     assert fingerprint._PYTHON_VERSION in decoded
     assert str(fingerprint._CACHE_SCHEMA_VERSION) in decoded
     # Null byte separators present
@@ -2576,9 +2583,25 @@ def test_make_manifest_cache_key_format():
 
 def test_make_manifest_cache_key_different_stages_differ():
     """Different stage names produce different keys."""
-    key1 = fingerprint._make_manifest_cache_key("train")
-    key2 = fingerprint._make_manifest_cache_key("evaluate")
+    key1 = fingerprint._make_manifest_cache_key("train", _cached_stage)
+    key2 = fingerprint._make_manifest_cache_key("evaluate", _cached_stage)
     assert key1 != key2
+
+
+def test_make_manifest_cache_key_different_functions_differ(tmp_path, monkeypatch):
+    """One stage name registered with functions from two files gets two keys."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    functions = list[typing.Callable[[], int]]()
+    for directory in ("a", "b"):
+        path = tmp_path / directory / "pipeline.py"
+        path.parent.mkdir()
+        path.write_text("def make():\n    return 1\n")
+        namespace = dict[str, typing.Any]()
+        exec(compile(path.read_text(), str(path), "exec"), namespace)  # noqa: S102 - test fixture
+        functions.append(namespace["make"])
+
+    first, second = (fingerprint._make_manifest_cache_key("rep/make", f) for f in functions)
+    assert first != second
 
 
 def test_flush_manifest_cache_empty():
@@ -2624,7 +2647,7 @@ def test_try_manifest_cache_hit_corrupted_json(tmp_path, monkeypatch):
 
     # Write corrupted data directly into the db
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("bad_stage")
+        key = fingerprint._make_manifest_cache_key("bad_stage", _cached_stage)
         db.put_raw(key, b"NOT VALID JSON {{{")
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2634,7 +2657,7 @@ def test_try_manifest_cache_hit_corrupted_json(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("bad_stage")
+        result = fingerprint._try_manifest_cache_hit("bad_stage", _cached_stage)
         assert result is None, "Corrupted JSON should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2649,7 +2672,7 @@ def test_try_manifest_cache_hit_no_db(monkeypatch):
     fingerprint._state_db_init_attempted = True  # Already failed
 
     try:
-        result = fingerprint._try_manifest_cache_hit("any_stage")
+        result = fingerprint._try_manifest_cache_hit("any_stage", _cached_stage)
         assert result is None
     finally:
         fingerprint._state_db_init_attempted = False
@@ -2752,7 +2775,7 @@ def test_try_manifest_cache_hit_non_dict_json(tmp_path, monkeypatch):
     db_path = state_dir
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("list_stage")
+        key = fingerprint._make_manifest_cache_key("list_stage", _cached_stage)
         db.put_raw(key, b"[1, 2, 3]")  # Valid JSON, but not a dict
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2762,7 +2785,7 @@ def test_try_manifest_cache_hit_non_dict_json(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("list_stage")
+        result = fingerprint._try_manifest_cache_hit("list_stage", _cached_stage)
         assert result is None, "Non-dict JSON should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2780,7 +2803,7 @@ def test_try_manifest_cache_hit_missing_m_or_s_keys(tmp_path, monkeypatch):
     db_path = state_dir
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("missing_keys")
+        key = fingerprint._make_manifest_cache_key("missing_keys", _cached_stage)
         db.put_raw(key, b'{"m": {"self:x": "hash"}}')  # Missing "s" key
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2790,7 +2813,7 @@ def test_try_manifest_cache_hit_missing_m_or_s_keys(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("missing_keys")
+        result = fingerprint._try_manifest_cache_hit("missing_keys", _cached_stage)
         assert result is None, "Missing 's' key should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2808,7 +2831,7 @@ def test_try_manifest_cache_hit_empty_sources_forces_recompute(tmp_path, monkeyp
     db_path = state_dir
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("empty_sources")
+        key = fingerprint._make_manifest_cache_key("empty_sources", _cached_stage)
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{}}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2818,7 +2841,7 @@ def test_try_manifest_cache_hit_empty_sources_forces_recompute(tmp_path, monkeyp
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("empty_sources")
+        result = fingerprint._try_manifest_cache_hit("empty_sources", _cached_stage)
         assert result is None, "Empty sources should force recompute"
     finally:
         if fingerprint._state_db is not None:
@@ -2840,7 +2863,7 @@ def test_try_manifest_cache_hit_corrupted_stats_length(tmp_path, monkeypatch):
     src_file.write_text("def stage(): pass\n")
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("bad_stats")
+        key = fingerprint._make_manifest_cache_key("bad_stats", _cached_stage)
         db.put_raw(key, b'{"m":{"self:stage":"hash"},"s":{"stage.py":[1000,200]}}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2850,7 +2873,7 @@ def test_try_manifest_cache_hit_corrupted_stats_length(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("bad_stats")
+        result = fingerprint._try_manifest_cache_hit("bad_stats", _cached_stage)
         assert result is None, "Stats array with wrong length should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2869,7 +2892,7 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
 
     # Test with absolute path
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("traversal_abs")
+        key = fingerprint._make_manifest_cache_key("traversal_abs", _cached_stage)
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"/etc/passwd":[1000,200,555]}}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2879,7 +2902,7 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("traversal_abs")
+        result = fingerprint._try_manifest_cache_hit("traversal_abs", _cached_stage)
         assert result is None, "Absolute path in sources should be rejected"
     finally:
         if fingerprint._state_db is not None:
@@ -2889,14 +2912,14 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
 
     # Test with ../ traversal
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("traversal_dotdot")
+        key = fingerprint._make_manifest_cache_key("traversal_dotdot", _cached_stage)
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"../../etc/passwd":[1000,200,555]}}')
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("traversal_dotdot")
+        result = fingerprint._try_manifest_cache_hit("traversal_dotdot", _cached_stage)
         assert result is None, "Path traversal with .. should be rejected"
     finally:
         if fingerprint._state_db is not None:
@@ -2963,7 +2986,7 @@ def test_stage():
 
         # Step 3: Verify manifest is in StateDB
         with state.StateDB(db_path, readonly=True) as db:
-            key = fingerprint._make_manifest_cache_key("test_stage")
+            key = fingerprint._make_manifest_cache_key("test_stage", func)
             raw = db.get_raw(key)
             assert raw is not None, "Manifest should be persisted in StateDB"
             data = json.loads(raw)
@@ -2991,9 +3014,9 @@ def test_invalidate_manifests_for_paths_selective(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
-    key_a = fingerprint._make_manifest_cache_key("stage_a")
-    key_b = fingerprint._make_manifest_cache_key("stage_b")
-    key_c = fingerprint._make_manifest_cache_key("stage_c")
+    key_a = fingerprint._make_manifest_cache_key("stage_a", _cached_stage)
+    key_b = fingerprint._make_manifest_cache_key("stage_b", _cached_stage)
+    key_c = fingerprint._make_manifest_cache_key("stage_c", _cached_stage)
 
     with state_mod.StateDB(db_path) as db:
         db.put_raw(
@@ -3072,7 +3095,7 @@ def invalidate_stage():
     try:
         spec.loader.exec_module(module)
 
-        key = fingerprint._make_manifest_cache_key("invalidate_stage")
+        key = fingerprint._make_manifest_cache_key("invalidate_stage", module.invalidate_stage)
         fingerprint.get_stage_fingerprint_cached("invalidate_stage", module.invalidate_stage)
         fingerprint.flush_manifest_cache()
 

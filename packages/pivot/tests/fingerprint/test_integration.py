@@ -339,7 +339,7 @@ def test_non_scalar_module_attribute_raises(
     message = str(exc.value)
     assert f"{helper_name}.VALUE" in message
     assert f"type: {type_name}" in message
-    assert "Fix: pass this data via StageParams" in message
+    assert "Fix: move this value into the stage's StageParams" in message
 
 
 def test_unsafe_fingerprinting_warns_for_non_scalar_module_attribute(
@@ -365,7 +365,7 @@ def test_unsafe_fingerprinting_warns_for_non_scalar_module_attribute(
 
 def _collision_module_source(value: int, default: int) -> str:
     return f"""\
-from pydantic import BaseModel
+from pivot.stage_def import StageParams
 
 VALUE = {value}
 
@@ -374,7 +374,7 @@ def helper() -> int:
     return VALUE
 
 
-class Config(BaseModel):
+class Config(StageParams):
     value: int = {default}
 
 

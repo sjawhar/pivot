@@ -274,7 +274,9 @@ def test_non_scalar_closure_capture_raises(
     assert "Stage 'train'" in message, "Should include stage name"
     assert var_name in message, "Should include captured variable name"
     assert f"type: {type_name}" in message, "Should include captured variable type"
-    assert "Fix: pass this data via StageParams" in message, "Should include suggestion"
+    assert "Fix: move this value into the stage's StageParams" in message, (
+        "Should include suggestion"
+    )
     assert "PIVOT_UNSAFE_FINGERPRINTING=1" in message, "Should include suppression hint"
 
 
@@ -401,7 +403,7 @@ def test_unsafe_capture_does_not_populate_manifest_cache(
         def append(self, entry: tuple[bytes, bytes]) -> None:
             cached["unsafe-cache"] = json.loads(entry[1])["m"]
 
-    def cache_hit(stage_name: str) -> dict[str, str] | None:
+    def cache_hit(stage_name: str, _func: Callable[..., object]) -> dict[str, str] | None:
         return cached.get(stage_name)
 
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", ManifestWrites())
@@ -448,3 +450,96 @@ def test_unsafe_config_allows_non_scalar_capture(
 def test_nested_mutable_in_tuple_raises() -> None:
     with pytest.raises(exceptions.StageDefinitionError, match="NESTED_MUTABLE_TUPLE"):
         fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+
+
+DEFAULT_COLUMNS = ["a"]
+DEFAULT_FACTOR = 2
+
+
+def _stage_with_list_default(cols: list[str] = DEFAULT_COLUMNS) -> list[str]:
+    return cols
+
+
+def _stage_with_keyword_list_default(*, cols: list[str] = DEFAULT_COLUMNS) -> list[str]:
+    return cols
+
+
+def _stage_with_literal_defaults(
+    factor: int = 3, keys: tuple[str, ...] = ("a", "b"), *, limit: float = 0.5
+) -> int:
+    return factor + len(keys) + int(limit)
+
+
+def _stage_with_scalar_module_default(factor: int = DEFAULT_FACTOR) -> int:
+    return factor
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        pytest.param(_stage_with_list_default, id="positional"),
+        pytest.param(_stage_with_keyword_list_default, id="keyword-only"),
+    ],
+)
+def test_non_scalar_module_value_as_default_raises(func: Callable[..., object]) -> None:
+    with pytest.raises(exceptions.StageDefinitionError) as exc:
+        fingerprint.get_stage_fingerprint(func)
+
+    message = str(exc.value)
+    assert "captures non-scalar variable 'DEFAULT_COLUMNS'" in message
+    assert "as the default of parameter 'cols'" in message
+
+
+def test_literal_defaults_are_allowed() -> None:
+    manifest = fingerprint.get_stage_fingerprint(_stage_with_literal_defaults)
+
+    ref = f"{__name__}._stage_with_literal_defaults"
+    assert manifest[f"default:{ref}.factor"] == "3"
+    assert manifest[f"default:{ref}.limit"] == "0.5"
+    assert f"default:{ref}.keys" not in manifest, "a literal default is covered by the AST hash"
+
+
+def test_scalar_module_default_is_tracked_by_value() -> None:
+    manifest = fingerprint.get_stage_fingerprint(_stage_with_scalar_module_default)
+
+    assert manifest[f"default:{__name__}._stage_with_scalar_module_default.factor"] == "2"
+
+
+def test_wrapped_function_default_is_checked_by_value() -> None:
+    """A `functools.wraps` wrapper is hashed as bytecode, which holds no default values."""
+
+    def _wrap(func: Callable[..., object]) -> Callable[..., object]:
+        @functools.wraps(func)
+        def wrapper(keys: tuple[int, ...] = (1, 2)) -> object:
+            return func(keys)
+
+        return wrapper
+
+    wrapped = _wrap(_stage_with_list_default)
+
+    with pytest.raises(exceptions.StageDefinitionError, match="parameter 'keys'"):
+        fingerprint.get_stage_fingerprint(wrapped)
+
+
+@functools.cache
+def _cached_helper_with_list_default(cols: list[str] = DEFAULT_COLUMNS) -> int:
+    return len(cols)
+
+
+@functools.lru_cache(maxsize=2)
+def _cached_helper_reading_list() -> int:
+    return len(DEFAULT_COLUMNS)
+
+
+def _stage_calls_cached_helpers() -> int:
+    return _cached_helper_with_list_default() + _cached_helper_reading_list()
+
+
+def test_cached_helper_globals_and_defaults_are_checked() -> None:
+    """A C-level cache wrapper hides the helper from getclosurevars; its function is walked."""
+    with pytest.raises(exceptions.StageDefinitionError) as exc:
+        fingerprint.get_stage_fingerprint(_stage_calls_cached_helpers)
+
+    message = str(exc.value)
+    assert "as the default of parameter 'cols'" in message
+    assert "captures non-scalar variable 'DEFAULT_COLUMNS' (type: list)" in message

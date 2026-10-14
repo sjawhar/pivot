@@ -50,7 +50,7 @@ def test_fingerprint_reset_clears_stage_manifest_cache(
         project._project_root_cache = None
         pivot_dir = pathlib.Path(isolated_dir) / ".pivot"
         pivot_dir.mkdir()
-        manifest_key = fingerprint._make_manifest_cache_key("demo/stage")
+        manifest_key = fingerprint._make_manifest_cache_key("demo/stage", fingerprint.is_user_code)
         with state.StateDB(pivot_dir, readonly=False) as db:
             db.put_raw(manifest_key, b'{"m":{},"s":{}}')
 

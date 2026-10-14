@@ -282,3 +282,58 @@ def test_nested_wraps():
     assert _definition_key("func", inspect.unwrap(my_stage)) in fp, (
         f"inner wrapper not tracked via closure. Got: {list(fp.keys())}"
     )
+
+
+# --- Functions bound as partial arguments ---
+
+_BOUND_FACTOR = 3
+
+
+def _reads_bound_factor() -> int:
+    return _BOUND_FACTOR
+
+
+@functools.cache
+def _cached_reads_bound_factor() -> int:
+    return _BOUND_FACTOR
+
+
+def _apply_all(getters: list[object]) -> int:
+    return len(getters)
+
+
+def _const_key(name: str) -> str:
+    return f"const:{__name__}.{name}"
+
+
+def test_function_in_partial_argument_collection_is_walked():
+    """A user function inside a list bound to a partial is walked like a stage helper."""
+    bound = functools.partial(_apply_all, [_reads_bound_factor])
+
+    def stage() -> int:
+        return bound()
+
+    fp = fingerprint.get_stage_fingerprint(stage)
+
+    assert fp[_const_key("_BOUND_FACTOR")] == "3"
+    assert _definition_key("func", _reads_bound_factor) in fp
+
+
+def test_cached_function_in_partial_argument_is_walked():
+    bound = functools.partial(_apply_all, getters=[_cached_reads_bound_factor])
+
+    def stage() -> int:
+        return bound()
+
+    assert fingerprint.get_stage_fingerprint(stage)[_const_key("_BOUND_FACTOR")] == "3"
+
+
+def test_library_function_in_partial_argument_is_not_walked():
+    bound = functools.partial(_apply_all, [inspect.unwrap])
+
+    def stage() -> int:
+        return bound()
+
+    fp = fingerprint.get_stage_fingerprint(stage)
+
+    assert not any("inspect" in key for key in fp), list(fp)
