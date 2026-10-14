@@ -304,6 +304,7 @@ class JSONL(Loader[list[dict[str, Any]], list[dict[str, Any]]]):
 
 _DATAFRAME_METADATA_KEY = "__pivot_dataframe_metadata__"
 _DATAFRAME_METADATA_VERSION = 1
+_DATAFRAME_METADATA_FIELDS = frozenset({"version", "columns", "temporal_columns"})
 
 
 def _json_default(value: object) -> object:
@@ -428,15 +429,62 @@ def _restore_temporal_jsonl_column(
     return pandas.Series(parsed.dt.tz_convert(timezone))
 
 
+_JsonlHeader = tuple[list[tuple[str, str]], dict[str, collections_abc.Mapping[str, object]]]
+
+
+def _parse_jsonl_header(record: object, path: pathlib.Path) -> _JsonlHeader | None:
+    """Return the columns and temporal metadata of a header record, or None for a data row.
+
+    Only a record with exactly the header's shape is the header: one key, the reserved
+    name, holding exactly ``version``, ``columns`` and ``temporal_columns``. Any other
+    first record, including a row of a column with the reserved name, is data.
+    """
+    if not isinstance(record, dict):
+        return None
+    outer = cast("dict[object, object]", record)
+    if set(outer) != {_DATAFRAME_METADATA_KEY}:
+        return None
+    raw_metadata = outer[_DATAFRAME_METADATA_KEY]
+    if not isinstance(raw_metadata, dict):
+        return None
+    metadata = cast("dict[object, object]", raw_metadata)
+    if metadata.keys() != _DATAFRAME_METADATA_FIELDS:
+        return None
+    if metadata["version"] != _DATAFRAME_METADATA_VERSION:
+        raise ValueError(f"Unsupported DataFrameJSONL metadata version at {path}")
+    raw_columns = metadata["columns"]
+    if not isinstance(raw_columns, list):
+        raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
+    columns = list[tuple[str, str]]()
+    for raw_column in cast("list[object]", raw_columns):
+        column = cast("dict[object, object]", raw_column) if isinstance(raw_column, dict) else {}
+        name = column.get("name")
+        dtype = column.get("dtype")
+        if not isinstance(name, str) or not isinstance(dtype, str):
+            raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
+        columns.append((name, dtype))
+    raw_temporal = metadata["temporal_columns"]
+    if not isinstance(raw_temporal, dict):
+        raise ValueError(f"Invalid DataFrameJSONL temporal metadata at {path}")
+    temporal_columns = dict[str, collections_abc.Mapping[str, object]]()
+    for name, column_metadata in cast("dict[object, object]", raw_temporal).items():
+        if not isinstance(name, str) or not isinstance(column_metadata, dict):
+            raise ValueError(f"Invalid DataFrameJSONL temporal column metadata at {path}")
+        temporal_columns[name] = cast("collections_abc.Mapping[str, object]", column_metadata)
+    return columns, temporal_columns
+
+
 @dataclasses.dataclass(frozen=True)
 class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
 
     One JSON object per row; the index is not written. The first line is a
-    reserved ``{"__pivot_dataframe_metadata__": ...}`` JSON object recording every
-    column's name and dtype, in order, plus how temporal columns were written. A
-    non-Pivot JSONL reader sees that explicit metadata record followed by normal
-    row records; it can skip the first line to read the data rows unchanged.
+    ``{"__pivot_dataframe_metadata__": ...}`` JSON object recording every column's
+    name and dtype, in order, plus how temporal columns were written. A non-Pivot
+    JSONL reader sees that explicit metadata record followed by normal row records;
+    it can skip the first line to read the data rows unchanged. Only a first line
+    with exactly the header's shape is read as the header, so a column may have any
+    name, including ``__pivot_dataframe_metadata__``, and headerless files load as rows.
 
     - a zero-row frame keeps its columns and dtypes.
 
@@ -458,9 +506,7 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     def load(self, path: pathlib.Path, *, max_rows: int | None = None) -> pandas.DataFrame:
         """Load all rows, or at most ``max_rows`` data records after the metadata header."""
         records = list[object]()
-        has_metadata = False
-        columns = list[tuple[str, str]]()
-        temporal_columns = dict[str, collections_abc.Mapping[str, object]]()
+        header: _JsonlHeader | None = None
         with path.open() as f:
             for line_num, line in enumerate(f, 1):
                 if not line.strip():
@@ -469,53 +515,17 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                     record = cast("object", json.loads(line))
                 except json.JSONDecodeError as e:
                     raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
-                if line_num == 1 and isinstance(record, dict):
-                    metadata_record = cast("dict[object, object]", record)
-                    if set(metadata_record) == {_DATAFRAME_METADATA_KEY}:
-                        raw_metadata = metadata_record[_DATAFRAME_METADATA_KEY]
-                        if not isinstance(raw_metadata, dict):
-                            raise ValueError(
-                                f"Invalid DataFrameJSONL metadata at {path}: expected object"
-                            )
-                        typed_metadata = cast("dict[object, object]", raw_metadata)
-                        if typed_metadata.get("version") != _DATAFRAME_METADATA_VERSION:
-                            raise ValueError(
-                                f"Unsupported DataFrameJSONL metadata version at {path}"
-                            )
-                        raw_columns = typed_metadata.get("columns")
-                        if not isinstance(raw_columns, list):
-                            raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
-                        for raw_column in cast("list[object]", raw_columns):
-                            column = (
-                                cast("dict[object, object]", raw_column)
-                                if isinstance(raw_column, dict)
-                                else {}
-                            )
-                            name = column.get("name")
-                            dtype = column.get("dtype")
-                            if not isinstance(name, str) or not isinstance(dtype, str):
-                                raise ValueError(
-                                    f"Invalid DataFrameJSONL column metadata at {path}"
-                                )
-                            columns.append((name, dtype))
-                        raw_temporal = typed_metadata.get("temporal_columns", {})
-                        if not isinstance(raw_temporal, dict):
-                            raise ValueError(f"Invalid DataFrameJSONL temporal metadata at {path}")
-                        temporal_mapping = cast("dict[object, object]", raw_temporal)
-                        for name, metadata in temporal_mapping.items():
-                            if not isinstance(name, str) or not isinstance(metadata, dict):
-                                raise ValueError(
-                                    f"Invalid DataFrameJSONL temporal column metadata at {path}"
-                                )
-                            temporal_columns[name] = cast(
-                                "collections_abc.Mapping[str, object]", metadata
-                            )
-                        has_metadata = True
+                if line_num == 1:
+                    header = _parse_jsonl_header(record, path)
+                    if header is not None:
                         continue
-                records.append(cast("object", record))
+                records.append(record)
                 if max_rows is not None and len(records) >= max_rows:
                     break
-        if has_metadata and not records:
+        if header is None:
+            return pandas.DataFrame(records)
+        columns, temporal_columns = header
+        if not records:
             # No row records carry the keys, so the header alone gives the schema.
             return pandas.DataFrame(
                 {
@@ -524,13 +534,12 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                 }
             )
         frame = pandas.DataFrame(records)
-        if has_metadata:
-            names = [name for name, _ in columns]
-            if list(frame.columns) != names:
-                raise ValueError(
-                    f"DataFrameJSONL rows at {path} have columns {list(frame.columns)}, "
-                    + f"but the metadata header declares {names}"
-                )
+        names = [name for name, _ in columns]
+        if list(frame.columns) != names:
+            raise ValueError(
+                f"DataFrameJSONL rows at {path} have columns {list(frame.columns)}, "
+                + f"but the metadata header declares {names}"
+            )
         for name, metadata in temporal_columns.items():
             frame[name] = _restore_temporal_jsonl_column(frame[name], metadata)
         for name, dtype in columns:
@@ -541,22 +550,18 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
         return frame
 
     def row_count(self, path: pathlib.Path) -> int:
-        """Count data records while skipping the optional Pivot metadata header."""
+        """Count data records, skipping the metadata header on the first line."""
         count = 0
-        first_record = True
         with path.open() as f:
             for line_num, line in enumerate(f, 1):
                 if not line.strip():
                     continue
-                if first_record:
-                    first_record = False
+                if line_num == 1:
                     try:
                         record = cast("object", json.loads(line))
                     except json.JSONDecodeError as e:
                         raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
-                    if isinstance(record, dict) and set(cast("dict[object, object]", record)) == {
-                        _DATAFRAME_METADATA_KEY
-                    }:
+                    if _parse_jsonl_header(record, path) is not None:
                         continue
                 count += 1
         return count
@@ -569,10 +574,6 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             duplicated = sorted({str(c) for c in data.columns[data.columns.duplicated()]})
             raise ValueError(
                 f"DataFrameJSONL requires unique column names, duplicated: {duplicated}"
-            )
-        if _DATAFRAME_METADATA_KEY in {str(name) for name in data.columns}:
-            raise ValueError(
-                f"DataFrameJSONL reserves column name {_DATAFRAME_METADATA_KEY!r} for metadata"
             )
 
         encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"), default=_json_default)

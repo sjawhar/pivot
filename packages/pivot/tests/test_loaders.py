@@ -1229,3 +1229,52 @@ def test_dataframe_jsonl_refuses_cells_json_cannot_hold(
 
     with pytest.raises(TypeError, match=rf"column 'col'.*{type_name}"):
         loaders.DataFrameJSONL().save(df, tmp_path / "bad.jsonl")
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pytest.param(pandas.DataFrame({"__pivot_dataframe_metadata__": [1, 2]}), id="only"),
+        pytest.param(
+            pandas.DataFrame({"__pivot_dataframe_metadata__": ["a", "b"], "n": [1, 2]}),
+            id="with-other",
+        ),
+        pytest.param(
+            pandas.DataFrame({"__pivot_dataframe_metadata__": pandas.Series([], dtype="int64")}),
+            id="zero-rows",
+        ),
+    ],
+)
+def test_dataframe_jsonl_roundtrips_a_column_named_like_the_header(
+    tmp_path: pathlib.Path, frame: pandas.DataFrame
+) -> None:
+    jsonl_file = tmp_path / "header-named.jsonl"
+
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaders.DataFrameJSONL().load(jsonl_file), frame)
+    assert loaders.DataFrameJSONL().row_count(jsonl_file) == len(frame)
+
+
+def test_dataframe_jsonl_reads_a_headerless_first_row_named_like_the_header(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Only a first line with the exact header shape is the header; anything else is a row."""
+    jsonl_file = tmp_path / "old-format.jsonl"
+    jsonl_file.write_text(
+        '{"__pivot_dataframe_metadata__":1}\n{"__pivot_dataframe_metadata__":2}\n'
+    )
+
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    assert loaded["__pivot_dataframe_metadata__"].tolist() == [1, 2]
+    assert loaders.DataFrameJSONL().row_count(jsonl_file) == 2
+
+
+def test_dataframe_jsonl_refuses_an_unknown_header_version(tmp_path: pathlib.Path) -> None:
+    jsonl_file = tmp_path / "future.jsonl"
+    header = {"version": 2, "columns": [], "temporal_columns": {}}
+    jsonl_file.write_text(json.dumps({"__pivot_dataframe_metadata__": header}) + "\n")
+
+    with pytest.raises(ValueError, match="Unsupported DataFrameJSONL metadata version"):
+        loaders.DataFrameJSONL().load(jsonl_file)

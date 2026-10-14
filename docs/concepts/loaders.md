@@ -76,8 +76,9 @@ all-null `datetime` and `timedelta` dtypes. It never guesses that an ISO-shaped
 string column is temporal.
 
 Non-Pivot JSONL readers see the explicit first record and must skip it before
-reading data rows. Treat `__pivot_dataframe_metadata__` as reserved: a
-DataFrame with a column of that name cannot be written.
+reading data rows. Pivot treats the first line as the header only when it has
+exactly this shape, so a column may have any name, including
+`__pivot_dataframe_metadata__`, and a JSONL file without a header loads as rows.
 
 ### Pickle is a trusted-code boundary
 
