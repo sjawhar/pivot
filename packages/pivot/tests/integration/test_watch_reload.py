@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -240,6 +241,42 @@ async def test_pipeline_edit_before_any_run_reports_edited_stage_as_modified(
             assert reload_event["stages_modified"] == ["reload/change"], (
                 "the edited stage is modified even though no run fingerprinted it before the edit"
             )
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_same_size_edit_within_one_second_reloads_new_code(
+    watch_project: pathlib.Path,
+) -> None:
+    """An edit that keeps pipeline.py's size and whole-second mtime still reloads its new code.
+
+    CPython validates cached bytecode by source size and mtime in whole seconds, so such an
+    edit would otherwise import the previous ``__pycache__`` entry.
+    """
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
+    pipeline = _helper_discover(watch_project)
+    first = pipeline_py.stat()
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await _helper_wait_until_watching(eng)
+
+            edited = _helper_pipeline_source("-v1", third="renamed")
+            assert len(edited) == first.st_size
+            pipeline_py.write_text(edited)
+            os.utime(pipeline_py, ns=(first.st_atime_ns, first.st_mtime_ns))
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            reload_event = recorder.events[reload_index]
+            assert reload_event["type"] == "pipeline_reloaded"
+            assert reload_event["stages_added"] == ["reload/renamed"], (
+                "the reload must import the edited source, not stale bytecode"
+            )
+            assert reload_event["stages_removed"] == ["reload/removed"]
             tg.cancel_scope.cancel()
 
 
