@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import decimal
 import json
+import logging
 import os
 import pathlib
 import signal
@@ -95,6 +97,13 @@ def matrix() -> pd.DataFrame:
 @compose.stage
 def first_col(m: pd.DataFrame) -> list[float]:
     return [float(value) for value in m[0]]
+
+
+@compose.stage
+def chatty_lossy() -> pd.DataFrame:
+    for row in range(60):
+        logging.getLogger("etl").warning("skipping malformed row %d", row)
+    return pd.DataFrame({"price": [decimal.Decimal("0.1")]})
 
 
 _EMPTY_PIPELINE = (
@@ -1131,6 +1140,27 @@ def test_repro_keeps_integer_column_labels_for_the_next_stage(
     assert result.exit_code == 0, result.output
     written = (mock_discovery.root / "data" / "test" / "first_col.yaml").read_text()
     assert written == "- 1.5\n- 3.5\n"
+
+
+def test_repro_reports_lossy_output_after_many_stage_warnings(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """The stage's own warnings are capped with a count; Pivot's own warning always shows."""
+    with mock_discovery:
+        chatty_lossy()
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "WARNING: skipping malformed row 49" in text
+    assert "WARNING: skipping malformed row 50" not in text
+    assert (
+        "WARNING: Stage 'test/chatty_lossy' wrote its DataFrameJSONL output in a form Pivot "
+        + "cannot read back: DataFrameJSONL cannot write column 'price'"
+    ) in text, result.output
+    assert "… 10 more warnings (run with --show-output)" in text
 
 
 def _same_named_pipeline(side: str) -> str:

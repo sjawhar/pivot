@@ -812,9 +812,10 @@ def _write_output_with_store(
         for caught_warning in caught:
             if issubclass(caught_warning.category, loaders.LossyOutputWarning):
                 logger.warning(
-                    "Stage '%s' wrote %s in a form Pivot cannot read back: %s",
+                    "Stage '%s' wrote %s %s: %s",
                     ref.identity.producer,
                     output_label,
+                    types.LOSSY_OUTPUT_PHRASE,
                     caught_warning.message,
                 )
             else:

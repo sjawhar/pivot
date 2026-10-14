@@ -108,6 +108,11 @@ class DisplayCategory(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
+# The worker logs every LossyOutputWarning as "Stage '<stage>' wrote <output> <phrase>: ...";
+# the console report keys on the phrase to show those warnings uncapped.
+LOSSY_OUTPUT_PHRASE = "in a form Pivot cannot read back"
+
+
 def categorize_stage_result(status: StageStatus) -> DisplayCategory:
     """Map status to display category for consistent UI."""
     match status:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -11,7 +12,7 @@ import rich.markup
 import rich.text
 
 from pivot.engine.types import LogLine, StageCompleted
-from pivot.types import DisplayCategory, categorize_stage_result
+from pivot.types import LOSSY_OUTPUT_PHRASE, DisplayCategory, categorize_stage_result
 
 if TYPE_CHECKING:
     from pivot.engine.types import OutputEvent
@@ -84,6 +85,19 @@ def _categorize(event: StageCompleted) -> DisplayCategory:
     return categorize_stage_result(event["status"])
 
 
+@dataclasses.dataclass
+class _StageWarnings:
+    """A stage's ``WARNING:`` lines for the report.
+
+    Pivot's own output-write warnings are always kept; the stage's own warnings keep
+    the first ``_MAX_LOG_LINES_PER_STAGE`` and count the rest.
+    """
+
+    stage: list[str] = dataclasses.field(default_factory=list[str])
+    lossy_outputs: list[str] = dataclasses.field(default_factory=list[str])
+    dropped: int = 0
+
+
 def _print_completions(
     console: rich.console.Console,
     events: list[StageCompleted],
@@ -91,7 +105,7 @@ def _print_completions(
     total: int,
     max_name_width: int,
     stage_logs: dict[str, list[str]] | None = None,
-    stage_warnings: dict[str, list[str]] | None = None,
+    stage_warnings: dict[str, _StageWarnings] | None = None,
 ) -> None:
     """Print buffered completions sorted by index with skip collapsing.
 
@@ -158,10 +172,16 @@ def _print_completions(
                 if event["reason"]:
                     for detail in _format_error_detail(event["reason"], total=total):
                         console.print(detail)
-            else:
-                for warning_line in warnings_by_stage.get(event["stage"], []):
+            elif event["stage"] in warnings_by_stage:
+                buffered = warnings_by_stage[event["stage"]]
+                for warning_line in [*buffered.stage, *buffered.lossy_outputs]:
                     escaped = rich.markup.escape(warning_line)
                     console.print(f"          [yellow]{escaped}[/yellow]")
+                if buffered.dropped:
+                    console.print(
+                        f"          [yellow]… {buffered.dropped} more warnings "
+                        + "(run with --show-output)[/yellow]"
+                    )
             i += 1
 
 
@@ -171,20 +191,26 @@ _MAX_LOG_LINES_PER_STAGE = 50
 def _buffer_log_line(
     event: LogLine,
     stage_logs: dict[str, list[str]],
-    stage_warnings: dict[str, list[str]],
+    stage_warnings: dict[str, _StageWarnings],
 ) -> None:
     """Keep a stage's output for a failure report and its warnings for every report.
 
     Warnings have their own buffer: output writes log them after the stage's own output,
     which can already fill the log buffer.
     """
+    line = event["line"]
     buf = stage_logs.setdefault(event["stage"], [])
     if len(buf) < _MAX_LOG_LINES_PER_STAGE:
-        buf.append(event["line"])
-    if event["line"].startswith("WARNING:"):
-        warning_buf = stage_warnings.setdefault(event["stage"], [])
-        if len(warning_buf) < _MAX_LOG_LINES_PER_STAGE:
-            warning_buf.append(event["line"])
+        buf.append(line)
+    if not line.startswith("WARNING:"):
+        return
+    buffered = stage_warnings.setdefault(event["stage"], _StageWarnings())
+    if LOSSY_OUTPUT_PHRASE in line and line.startswith("WARNING: Stage '"):
+        buffered.lossy_outputs.append(line)
+    elif len(buffered.stage) < _MAX_LOG_LINES_PER_STAGE:
+        buffered.stage.append(line)
+    else:
+        buffered.dropped += 1
 
 
 class StaticConsoleSink:
@@ -195,7 +221,7 @@ class StaticConsoleSink:
     _max_name_width: int
     _completion_buffer: list[StageCompleted]
     _stage_logs: dict[str, list[str]]
-    _stage_warnings: dict[str, list[str]]
+    _stage_warnings: dict[str, _StageWarnings]
     _total: int
 
     def __init__(self, *, console: rich.console.Console, show_output: bool = False) -> None:
@@ -204,7 +230,7 @@ class StaticConsoleSink:
         self._max_name_width = 0
         self._completion_buffer = list[StageCompleted]()
         self._stage_logs = dict[str, list[str]]()
-        self._stage_warnings = dict[str, list[str]]()
+        self._stage_warnings = dict[str, _StageWarnings]()
         self._total = 0
 
     async def handle(self, event: OutputEvent) -> None:
@@ -285,7 +311,7 @@ class LiveConsoleSink:
     _max_name_width: int
     _completion_buffer: list[StageCompleted]
     _stage_logs: dict[str, list[str]]
-    _stage_warnings: dict[str, list[str]]
+    _stage_warnings: dict[str, _StageWarnings]
     _total: int
     _live: rich.live.Live | None
 
@@ -300,7 +326,7 @@ class LiveConsoleSink:
         self._max_name_width = 0
         self._completion_buffer = list[StageCompleted]()
         self._stage_logs = dict[str, list[str]]()
-        self._stage_warnings = dict[str, list[str]]()
+        self._stage_warnings = dict[str, _StageWarnings]()
         self._total = 0
         self._live = None
 

@@ -18,6 +18,7 @@ from rich.console import Console
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+from pivot import types
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks
 from pivot.engine.types import (
@@ -678,6 +679,54 @@ async def test_sink_does_not_repeat_streamed_warnings() -> None:
     await sink.close()
 
     assert output.getvalue().count("WARNING: lossy") == 1
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_always_reports_lossy_output_warnings_after_many_stage_warnings(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """Pivot's own output-write warning is never lost behind the stage's warnings."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=400)
+    sink = sink_type(console=console, show_output=False)
+
+    for i in range(60):
+        await sink.handle(
+            LogLine(
+                type="log_line",
+                seq=i,
+                stage="noisy",
+                line=f"WARNING: skipping malformed row {i}",
+                is_stderr=True,
+            )
+        )
+    lossy = (
+        f"WARNING: Stage 'noisy' wrote its DataFrameJSONL output {types.LOSSY_OUTPUT_PHRASE}: "
+        + "DataFrameJSONL cannot write column 'price'"
+    )
+    await sink.handle(LogLine(type="log_line", seq=60, stage="noisy", line=lossy, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=61,
+            stage="noisy",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert lossy in result
+    assert "WARNING: skipping malformed row 49" in result
+    assert "WARNING: skipping malformed row 50" not in result
+    assert "… 10 more warnings (run with --show-output)" in result
+    assert result.index("skipping malformed row 49") < result.index("… 10 more warnings")
 
 
 async def test_static_sink_log_lines_stream_before_completions() -> None:
