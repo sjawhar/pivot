@@ -88,7 +88,7 @@ def _helper_checkout_crash_after_backup_rename(
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
 ) -> None:
-    """Simulate a killed checkout immediately after its directory backup rename."""
+    """Simulate a restore killed immediately after its directory backup rename."""
     original_rename = pathlib.Path.rename
 
     def _rename_and_crash(source: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
@@ -98,13 +98,12 @@ def _helper_checkout_crash_after_backup_rename(
         return result
 
     pathlib.Path.rename = _rename_and_crash  # pyright: ignore[reportAttributeAccessIssue]
-    _ = checkout_mod._restore_path_sync(
+    _ = cache.restore_from_cache(
         path,
         output_hash,
         cache_dir,
-        [cache.CheckoutMode.COPY],
-        checkout_mod.CheckoutBehavior.SKIP_EXISTING,
-        state_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        state_dir=state_dir,
     )
 
 
