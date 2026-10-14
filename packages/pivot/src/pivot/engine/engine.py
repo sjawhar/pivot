@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import concurrent.futures
 import contextlib
+import contextvars
 import importlib
 import importlib.util
 import itertools
@@ -12,6 +13,7 @@ import logging
 import pathlib
 import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 import anyio
 import anyio.from_thread
+import anyio.lowlevel
 import anyio.to_thread
 
 from pivot import (
@@ -78,7 +81,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    import threading
+    from collections.abc import Callable
 
     import networkx as nx
     from anyio.abc import TaskGroup
@@ -165,6 +168,36 @@ def _merge_run_requests(earlier: RunRequested, later: RunRequested) -> RunReques
         allow_uncached_incremental=later["allow_uncached_incremental"],
         checkout_missing=later["checkout_missing"],
     )
+
+
+async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
+    """Run ``func`` on a new daemon thread and wait for its result; cancelling abandons it.
+
+    anyio's worker threads are not daemon threads when the event loop runs on the main thread,
+    so interpreter shutdown joins any still running. This is for work the process must not wait
+    for when it exits, such as importing an edited pipeline.py that may never return.
+    """
+    token = anyio.lowlevel.current_token()
+    done = anyio.Event()
+    results = list[T]()
+    failures = list[BaseException]()
+    context = contextvars.copy_context()
+
+    def _target() -> None:
+        try:
+            results.append(context.run(func))
+        except BaseException as exc:  # re-raised in the waiting task
+            failures.append(exc)
+        # Once the event loop has finished or is closing (RunFinishedError, or "Event loop is
+        # closed" in the race between the two), nobody waits for the result
+        with contextlib.suppress(RuntimeError):
+            anyio.from_thread.run_sync(done.set, token=token)
+
+    threading.Thread(target=_target, name="pivot reload", daemon=True).start()
+    await done.wait()
+    if failures:
+        raise failures[0]
+    return results[0]
 
 
 class Engine:
@@ -2612,14 +2645,15 @@ class Engine:
         a good reload. The new fingerprints stay cached for the reload event's diff. The caller
         should emit the reload event using the returned stages.
 
-        The import and the fingerprints run in one worker thread (``_load_pipeline``), so the
-        RPC server keeps answering; the pipeline swap happens here, on the event loop.
+        The import and the fingerprints run in one daemon thread (``_load_pipeline``), so the
+        RPC server keeps answering and an exit never waits for an import that hangs; the pipeline
+        swap happens here, on the event loop.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
         root = project.get_project_root()
         try:
-            new_pipeline, errors = await anyio.to_thread.run_sync(self._load_pipeline, root)
+            new_pipeline, errors = await _run_in_daemon_thread(lambda: self._load_pipeline(root))
         except Exception as e:
             return self._reject_reload(old_pipeline, [str(e)])
         if new_pipeline is None:
@@ -2632,7 +2666,7 @@ class Engine:
         return old_stages
 
     def _load_pipeline(self, root: pathlib.Path) -> tuple[registry.PipelineLike | None, list[str]]:
-        """Re-import the project's pipeline and fingerprint every stage, in a worker thread.
+        """Re-import the project's pipeline and fingerprint every stage, in a daemon thread.
 
         All of a reload's ``sys.modules`` changes (dropping project modules, importing the edited
         ones) happen in this one call, on one thread. Returns the new pipeline, or None if the

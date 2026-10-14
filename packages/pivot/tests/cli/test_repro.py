@@ -1466,3 +1466,82 @@ def test_list_keeps_one_pipeline_included_three_times(
 
     assert result.exit_code == 0, result.output
     assert [s["name"] for s in json.loads(result.stdout)["stages"]] == ["prep/drop_low"]
+
+
+def test_repro_watch_ctrl_c_exits_while_a_reload_import_hangs(tmp_path: pathlib.Path) -> None:
+    """Ctrl-C stops plain watch at once even while an edited pipeline.py's import never returns."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".pivot").mkdir()
+    (project / "data" / "raw").mkdir(parents=True)
+    (project / "data" / "raw" / "input.txt").write_text("data")
+    source = """\
+from __future__ import annotations
+
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def process(input_file: str) -> str:
+    return input_file
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+    pipeline_py = project / "pipeline.py"
+    pipeline_py.write_text(source)
+    output_path = project / "data" / "test" / "process.txt"
+    # Outside the project, so neither the marker nor the logs are watch events
+    importing = tmp_path / "importing"
+    stdout_path = tmp_path / "watch.stdout"
+    stderr_path = tmp_path / "watch.stderr"
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch"],
+            cwd=project,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+
+    def _logs() -> str:
+        return (
+            f"stdout: {stdout_path.read_text(errors='replace')}\n"
+            + f"stderr: {stderr_path.read_text(errors='replace')}"
+        )
+
+    try:
+        for _ in range(300):
+            if output_path.exists():
+                break
+            time.sleep(0.1)
+        assert output_path.exists(), f"the startup run did not finish within 30s\n{_logs()}"
+
+        pipeline_py.write_text(
+            source
+            + f"\npathlib.Path({str(importing)!r}).write_text('importing')\n"
+            + "import time\ntime.sleep(600)\n"
+        )
+        for _ in range(300):
+            if importing.exists():
+                break
+            time.sleep(0.1)
+        assert importing.exists(), f"the reload did not import the edit within 30s\n{_logs()}"
+
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"watch was still running 2 s after Ctrl-C\n{_logs()}")
+        assert proc.returncode == 0, _logs()
+        assert "Watch mode stopped." in stdout_path.read_text(), _logs()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()

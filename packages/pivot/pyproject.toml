@@ -14,7 +14,7 @@ classifiers = [
 ]
 dependencies = [
   "aiohttp>=3.9",
-  "anyio>=4.0",
+  "anyio>=4.11",
   "click>=8.0",
   "cloudpickle>=3.0",
   "deepmerge>=2.0",

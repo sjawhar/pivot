@@ -114,6 +114,26 @@ async def test_async_filesystem_source_emits_code_changed_for_py_files(tmp_path:
     assert len(code_events) >= 1, "Should emit code_or_config_changed for .py files"
 
 
+async def test_async_filesystem_source_stops_promptly_when_cancelled(tmp_path: Path) -> None:
+    """Cancelling FilesystemSource.run returns at once, not when watchfiles' 5 s wait times out."""
+    import time
+
+    import anyio
+
+    from pivot.engine.sources import FilesystemSource
+    from pivot.engine.types import InputEvent
+
+    send, _recv = anyio.create_memory_object_stream[InputEvent](10)
+    source = FilesystemSource(watch_paths=[tmp_path], debounce_ms=100)
+    start = 0.0
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        await anyio.sleep(0.3)
+        start = time.monotonic()
+        tg.cancel_scope.cancel()
+    assert time.monotonic() - start < 1.0, "the watcher stops when its source is cancelled"
+
+
 async def test_async_filesystem_source_set_watch_paths_signals_stop_event() -> None:
     """FilesystemSource.set_watch_paths() signals stop event when running."""
     from pivot.engine.sources import FilesystemSource
