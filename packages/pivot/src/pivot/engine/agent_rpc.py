@@ -197,6 +197,7 @@ _CLIENT_TIMEOUT = 300  # 5 minutes
 # Custom error codes
 _ERR_STAGE_NOT_FOUND = -32001
 _ERR_PIPELINE_INVALID = -32003
+_ERR_ENGINE_STARTING = -32004
 
 
 def _json_rpc_response(result: object, request_id: JsonRpcId) -> JsonRpcSuccessResponse | None:
@@ -252,12 +253,14 @@ class AgentRpcHandler:
         self._event_buffer = event_buffer
         self._on_error = OnError.FAIL
 
-    async def pipeline_error(self) -> str | None:
-        """Why the engine's pipeline cannot run, or None when it can.
+    @property
+    def starting(self) -> bool:
+        """Whether the engine is still taking its startup fingerprint snapshot."""
+        return self._engine.is_starting
 
-        Waits for the startup snapshot first: it is what finds a stage that fails to fingerprint.
-        """
-        await self._engine.wait_for_startup_fingerprints()
+    @property
+    def pipeline_error(self) -> str | None:
+        """Why the engine's pipeline cannot run, or None when it can."""
         return self._engine.pipeline_error
 
     def validate_stages(self, stages: list[str] | None) -> str | None:
@@ -596,11 +599,18 @@ class AgentRpcSource:
             if not isinstance(force, bool):
                 return _json_rpc_error(-32602, "Invalid params: force must be boolean", request_id)
 
-            # Refuse a run the engine would drop because its pipeline is invalid
-            if self._handler is not None and (error := await self._handler.pipeline_error()):
+            # Never hold the reply for the startup snapshot: refuse at once while it runs, then
+            # refuse a run the engine would drop because its pipeline is invalid
+            if self._handler is not None and self._handler.starting:
+                return _json_rpc_error(
+                    _ERR_ENGINE_STARTING,
+                    "Engine is starting: fingerprinting stages; try again when it is ready",
+                    request_id,
+                )
+            if self._handler is not None and self._handler.pipeline_error is not None:
                 return _json_rpc_error(
                     _ERR_PIPELINE_INVALID,
-                    f"Pipeline invalid - waiting for fix: {error}",
+                    f"Pipeline invalid - waiting for fix: {self._handler.pipeline_error}",
                     request_id,
                 )
 

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from conftest import send_rpc
+from conftest import send_rpc, wait_for_engine_ready
 
 if TYPE_CHECKING:
     import pathlib
@@ -87,15 +87,7 @@ pipeline = _cp
                 + f"stderr: {stderr_path.read_text(errors='replace')}"
             )
 
-        # Poll until status query succeeds (server is ready)
-        for _ in range(30):
-            try:
-                response = send_rpc(sock_path, "status")
-                if "result" in response:
-                    break
-            except (ConnectionRefusedError, FileNotFoundError):
-                pass
-            time.sleep(0.1)
+        wait_for_engine_ready(sock_path)
 
         yield sock_path
     finally:

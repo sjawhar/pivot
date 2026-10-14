@@ -266,6 +266,11 @@ class Engine:
         return self._pipeline_error
 
     @property
+    def is_starting(self) -> bool:
+        """Whether a watched engine is still taking its startup fingerprint snapshot."""
+        return self._watches_filesystem() and not self._startup_fingerprinted.is_set()
+
+    @property
     def sources(self) -> list[EventSource]:
         """Registered async event sources (returns a copy)."""
         return list(self._sources)
@@ -356,21 +361,18 @@ class Engine:
         if self._output_send is None or self._output_recv is None:
             raise RuntimeError("Engine must be used as async context manager")
 
-        from pivot.engine.sources import FilesystemSource
-
         # Create fresh dispatch completion event (Events can only be set once)
         self._dispatch_complete = anyio.Event()
 
         async with anyio.create_task_group() as tg:
             self._run_task_group = tg
 
-            # Only the file watcher waits for the startup snapshot: an edit it reports reloads
-            # the pipeline, and the reload diffs against the snapshot's fingerprints. Every other
-            # source starts now, so the RPC socket listens at once and the startup run request
-            # is queued ahead of any client request; the input loop below handles both after
-            # the snapshot.
+            # The RPC server needs no fingerprints, so it listens while the startup snapshot
+            # runs: clients connect at once, `run` is refused with "Engine is starting" until the
+            # snapshot finishes, and queries that fingerprint wait for it. Every other source,
+            # the startup run and the file watcher included, starts after the snapshot.
             for source in self._sources:
-                if not isinstance(source, FilesystemSource):
+                if isinstance(source, agent_rpc.AgentRpcSource):
                     tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
 
             if self._watches_filesystem():
@@ -380,7 +382,7 @@ class Engine:
                     self._startup_fingerprinted.set()
 
             for source in self._sources:
-                if isinstance(source, FilesystemSource):
+                if not isinstance(source, agent_rpc.AgentRpcSource):
                     tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
 
             # Start sink dispatcher

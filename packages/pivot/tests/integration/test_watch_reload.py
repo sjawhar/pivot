@@ -432,81 +432,20 @@ async def test_watched_startup_serves_rpc_while_fingerprinting(
 
 
 @pytest.mark.anyio
-async def test_run_requested_during_startup_snapshot_is_not_replaced_by_startup_run(
+@pytest.mark.parametrize("refused", [False, True], ids=["valid", "refused"])
+async def test_run_requested_during_startup_snapshot_is_refused_at_once(
     watch_project: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    refused: bool,
 ) -> None:
-    """A forced run sent while the startup snapshot runs still runs after it.
+    """A run sent while the startup snapshot runs gets -32004 at once and queues nothing.
 
-    The startup run is the first input event, so the forced run arrives second and wins the
-    engine's restart coalescing instead of being cancelled by the startup run.
+    After the snapshot the usual rules apply: -32003 for a refused pipeline, accepted otherwise.
     """
     from pivot import registry
 
-    (watch_project / "pipeline.py").write_text(_helper_pipeline_source("-v1", third="other"))
-    async with engine_mod.Engine(pipeline=_helper_discover(watch_project)) as first:
-        first.add_source(
-            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
-        )
-        await first.run()
-
-    pipeline = _helper_discover(watch_project)
-    compute = registry._compute_fingerprint
-
-    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
-        time.sleep(1.0)
-        return compute(stage_name, info)
-
-    monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
-    recorder = _Recorder()
-    socket_path = watch_project / "rpc.sock"
-    ready = threading.Event()
-
-    async with engine_mod.Engine(pipeline=pipeline) as eng:
-        eng.add_sink(recorder)
-        handler = agent_rpc.AgentRpcHandler(engine=eng)
-        eng.add_source(
-            agent_rpc.AgentRpcSource(socket_path=socket_path, handler=handler, ready=ready)
-        )
-        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
-        eng.add_source(
-            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
-        )
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
-            client = rpc_client_impl.RpcPivotClient()
-            with anyio.fail_after(2):
-                while not ready.is_set():
-                    await anyio.sleep(0.01)
-                await client.connect(socket_path)
-            try:
-                assert await client.run(stages=["reload/change"], force=True)
-            finally:
-                await client.disconnect()
-            await recorder.wait_for(_helper_completes("reload/change"))
-            await recorder.wait_for(_helper_is_idle)
-            tg.cancel_scope.cancel()
-
-    completions = [
-        event["status"]
-        for event in recorder.events
-        if event["type"] == "stage_completed" and event["stage"] == "reload/change"
-    ]
-    assert completions[-1] == StageStatus.RAN, (
-        f"the forced run must run reload/change, saw completions {completions}"
-    )
-
-
-@pytest.mark.anyio
-async def test_run_requested_during_startup_snapshot_of_refused_pipeline_is_refused(
-    watch_project: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A run sent while the snapshot runs waits for it, then is refused if it found an error."""
-    from pivot import registry
-
     (watch_project / "pipeline.py").write_text(
-        _helper_pipeline_source("-v1", third="other", refused=True)
+        _helper_pipeline_source("-v1", third="other", refused=refused)
     )
     pipeline = _helper_discover(watch_project)
     compute = registry._compute_fingerprint
@@ -537,17 +476,34 @@ async def test_run_requested_during_startup_snapshot_of_refused_pipeline_is_refu
                     await anyio.sleep(0.01)
                 await client.connect(socket_path)
             try:
-                assert len(finished) < 3, "the run is sent while the snapshot still runs"
-                with pytest.raises(rpc_client_impl.RpcError) as refused:
+                with anyio.fail_after(0.5), pytest.raises(rpc_client_impl.RpcError) as starting:
                     await client.run(stages=["reload/change"], force=True)
-                assert refused.value.code == -32003
-                assert "captures non-scalar variable 'SUFFIXES'" in refused.value.message
+                assert starting.value.code == -32004
+                assert "Engine is starting" in starting.value.message
+                assert len(finished) < 3, "the reply came before the snapshot finished"
+
+                await _helper_wait_until_watching(eng)
+                if refused:
+                    with pytest.raises(rpc_client_impl.RpcError) as invalid:
+                        await client.run(stages=["reload/change"], force=True)
+                    assert invalid.value.code == -32003
+                    assert "captures non-scalar variable 'SUFFIXES'" in invalid.value.message
+                else:
+                    assert await client.run(stages=["reload/change"], force=True)
             finally:
                 await client.disconnect()
-            await _helper_wait_until_watching(eng)
+            if not refused:
+                await recorder.wait_for(_helper_completes("reload/change"))
+                await recorder.wait_for(_helper_is_idle)
             tg.cancel_scope.cancel()
 
-    assert not any(event["type"] == "stage_completed" for event in recorder.events)
+    completions = [e for e in recorder.events if e["type"] == "stage_completed"]
+    if refused:
+        assert completions == [], "nothing runs: the early run was refused, not queued"
+    else:
+        assert [e["stage"] for e in completions] == ["reload/change"], (
+            "only the run sent after the snapshot ran; the early one was not queued"
+        )
 
 
 @pytest.mark.anyio

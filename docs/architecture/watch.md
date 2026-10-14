@@ -63,7 +63,7 @@ This unified architecture eliminates divergent code paths between batch and watc
 
 ### Startup
 
-A watched engine fingerprints every stage before it starts `FilesystemSource` or handles any input event, because a later reload diffs the edited pipeline against those fingerprints. The RPC server and the startup `OneShotSource` start first, so a TUI or agent connects at once and its run requests queue behind the startup run; `explain` and `commit`, which fingerprint stages, wait for the snapshot.
+A watched engine fingerprints every stage before it starts any other source or handles any input event, because a later reload diffs the edited pipeline against those fingerprints. Only the RPC server starts first, so a TUI or agent connects at once. While the snapshot runs, `run` is refused at once with error `-32004` ("Engine is starting"), and `explain` and `commit`, which fingerprint stages, wait for it. The startup run and the file watcher start after it.
 
 ### Data Artifact Changes
 

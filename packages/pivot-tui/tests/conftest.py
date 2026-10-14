@@ -434,3 +434,30 @@ def send_rpc(
         sock.sendall(json.dumps(request).encode() + b"\n")
         response = sock.recv(4096).decode()
     return json.loads(response)
+
+
+def wait_for_engine_ready(sock_path: pathlib.Path, timeout: float = 30.0) -> None:
+    """Wait until a watched engine started with ``--force`` has finished its startup run.
+
+    The RPC socket answers while the startup fingerprint snapshot runs, and ``run`` is refused
+    with -32004 until it ends; the startup run's return to idle shows the engine takes runs.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = send_rpc(sock_path, "events_since", {"version": 0})
+        except (ConnectionRefusedError, FileNotFoundError):
+            response = {}
+        result = response.get("result")
+        if isinstance(result, dict):
+            events = cast("list[dict[str, dict[str, object]]]", result["events"])
+            if any(
+                entry["event"]["type"] == "engine_state_changed"
+                and entry["event"]["state"] == "idle"
+                for entry in events
+            ):
+                return
+        time.sleep(0.1)
+    raise TimeoutError(f"engine at {sock_path} did not finish its startup run in {timeout}s")
