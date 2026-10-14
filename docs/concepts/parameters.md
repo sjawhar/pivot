@@ -123,11 +123,14 @@ recorded value does not depend on Python's hash seed.
 
 ### Secret parameters
 
-A secret (`pydantic.SecretStr`, `SecretBytes`, `Secret[T]`) is never recorded as its
+A secret (`pydantic.SecretStr`, `SecretBytes`, `Secret[T]`) is not recorded as its
 value. The lock file holds `hmac:` plus the first 16 hex digits of the value's
 HMAC-SHA256 under the project's secret key, so changing the secret re-runs the stage,
 while someone who has the lock file but not the key cannot test guesses at the value.
-`pivot params show` and `status --explain` show the digest.
+`pivot params show` and `status --explain` show the digest, and an error about an invalid
+secret value shows `'**********'`. The one exception is your own code: a
+`field_serializer` or `model_serializer` that calls `get_secret_value()` puts what it
+returns into the record as written.
 
 The key is `.pivot/secret.key`: 32 random bytes, created the first time a stage with a
 secret is checked, with mode 0600, and listed in `.pivot/.gitignore`. Never commit it.

@@ -613,8 +613,11 @@ def _encode(original: object, encoded: Any, digest: _Digest | None) -> Any:
 
     The walk pairs each encoded node with the object it came from: JSON mode iterates the
     stored set itself, so the pairing is exact. A node that a custom serializer reshaped no
-    longer matches its object and is left as the serializer produced it; a secret is
-    replaced whatever its serializer produced, so no serializer puts its value in the record.
+    longer matches its object and is left as the serializer produced it. A secret whose own
+    node survives serialization is replaced whatever its serializer produced. A serializer
+    on a container that calls ``get_secret_value()`` itself (a ``field_serializer`` joining a
+    ``list[SecretStr]`` into one string, a ``model_serializer`` exposing a secret) reshapes
+    the node, so its output, the value included, is recorded as written.
     """
     if digest is not None and isinstance(
         original, (pydantic.SecretStr, pydantic.SecretBytes, pydantic.Secret)
