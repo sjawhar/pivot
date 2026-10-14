@@ -195,10 +195,14 @@ class _OtherParams(_SeedParams):
     pass
 
 
-def _input_ref(name: str, tag: types.ArtifactTag = types.ArtifactTag.DATA) -> types.ArtifactRef:
+def _input_ref(
+    name: str,
+    tag: types.ArtifactTag = types.ArtifactTag.DATA,
+    fmt: loaders.Reader[Any] | None = None,
+) -> types.ArtifactRef:
     return types.ArtifactRef(
         identity=types.ArtifactIdentity(producer=name, key=None),
-        format=loaders.YAML(),
+        format=fmt if fmt is not None else loaders.YAML(),
         python_type=dict,
         tag=tag,
     )
@@ -263,18 +267,18 @@ def test_include_keeps_one_stage_whose_params_encode_alike(
     assert combined.list_stages() == ["same/train"]
 
 
-def test_include_keeps_one_stage_whose_formats_and_types_differ(tmp_path: pathlib.Path) -> None:
-    """Formats and Python types follow from the function; a re-imported user type is new."""
+def test_include_keeps_one_stage_whose_python_types_differ(tmp_path: pathlib.Path) -> None:
+    """No run-time code reads ArtifactRef.python_type, and a re-imported user type is new."""
     again = _train_info(
         deps={
             "x": types.ArtifactRef(
-                types.ArtifactIdentity("x.csv", None), loaders.CSV(), list, types.ArtifactTag.DATA
+                types.ArtifactIdentity("x.csv", None), loaders.YAML(), list, types.ArtifactTag.DATA
             )
         },
         outs=[
             types.ArtifactRef(
                 identity=types.ArtifactIdentity(producer="same/train", key="out"),
-                format=loaders.JSON(),
+                format=loaders.YAML(),
                 python_type=list,
                 tag=types.ArtifactTag.DATA,
             )
@@ -282,6 +286,43 @@ def test_include_keeps_one_stage_whose_formats_and_types_differ(tmp_path: pathli
     )
 
     combined = _include_both(tmp_path, _train_info(), again)
+
+    assert combined.list_stages() == ["same/train"]
+
+
+def test_include_keeps_one_stage_whose_loaders_were_re_created_with_a_user_function(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Importing a file again re-creates `JSON(empty_factory=make_empty)` with a new function."""
+    path = tmp_path / "factories.py"
+    path.write_text("def make_empty() -> dict:\n    return {}\n")
+
+    def load_factory() -> Callable[[], dict[str, Any]]:
+        spec = importlib.util.spec_from_file_location("_t29_factories", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        return module.make_empty
+
+    first_factory, again_factory = load_factory(), load_factory()
+    assert first_factory is not again_factory
+
+    def info(factory: Callable[[], dict[str, Any]]) -> registry.RegistryStageInfo:
+        loader = loaders.JSON(empty_factory=factory)
+        return _train_info(
+            deps={"x": _input_ref("x.csv", fmt=loader)},
+            outs=[
+                types.ArtifactRef(
+                    identity=types.ArtifactIdentity(producer="same/train", key="out"),
+                    format=loader,
+                    python_type=dict,
+                    tag=types.ArtifactTag.DATA,
+                )
+            ],
+        )
+
+    combined = _include_both(tmp_path, info(first_factory), info(again_factory))
 
     assert combined.list_stages() == ["same/train"]
 
@@ -295,12 +336,36 @@ _METRIC_OUT = types.ArtifactRef(
 
 _DIFFERENCES: dict[str, tuple[dict[str, Any], str]] = {
     "input": ({"deps": {"x": _input_ref("y.csv")}}, "inputs (x=x.csv vs x=y.csv)"),
+    "input-format": (
+        {"deps": {"x": _input_ref("x.csv", fmt=loaders.CSV(sep=";"))}},
+        "input formats (x=YAML(empty_factory=<class 'dict'>) vs "
+        + "x=CSV(index_col=None, sep=';', dtype=None))",
+    ),
+    "input-format-config": (
+        {"deps": {"x": _input_ref("x.csv", fmt=loaders.YAML(empty_factory=list))}},
+        "input formats (x=YAML(empty_factory=<class 'dict'>) vs "
+        + "x=YAML(empty_factory=<class 'list'>))",
+    ),
     "input-tag": (
         {"deps": {"x": _input_ref("x.csv", types.ArtifactTag.METRIC)}},
         "inputs (x=x.csv vs x=x.csv (metric))",
     ),
     "input-name": ({"deps": {"y": _input_ref("x.csv")}}, "inputs (x=x.csv vs y=x.csv)"),
     "output-tag": ({"outs": [_METRIC_OUT]}, "outputs (same/train:out vs same/train:out (metric))"),
+    "output-format": (
+        {
+            "outs": [
+                types.ArtifactRef(
+                    identity=types.ArtifactIdentity(producer="same/train", key="out"),
+                    format=loaders.JSON(),
+                    python_type=dict,
+                    tag=types.ArtifactTag.DATA,
+                )
+            ]
+        },
+        "output formats (YAML(empty_factory=<class 'dict'>) vs "
+        + "JSON(indent=2, empty_factory=<class 'dict'>))",
+    ),
     "incremental": (
         {"incremental_inputs": {"prev": types.ArtifactIdentity("same/train", "out")}},
         "incremental inputs (none vs prev=same/train:out)",

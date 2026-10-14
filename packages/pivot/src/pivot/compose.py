@@ -19,7 +19,17 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import exceptions, outputs, parameters, path_policy, project, registry, stage_def, types
+from . import (
+    exceptions,
+    fingerprint,
+    outputs,
+    parameters,
+    path_policy,
+    project,
+    registry,
+    stage_def,
+    types,
+)
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -181,17 +191,29 @@ def _show_items(items: collections.abc.Mapping[str, object]) -> str:
     return ", ".join(f"{name}={value}" for name, value in sorted(items.items())) or "none"
 
 
+def _format_key(fmt: loaders_mod.Reader[Any] | loaders_mod.Writer[Any]) -> tuple[str, str, str]:
+    """A loader as its class's module and qualname plus its canonical config text.
+
+    The config text is what the fingerprint hashes as ``loader:...:config``, so a user
+    function in a field (``JSON(empty_factory=make_empty)``) compares by definition and code.
+    """
+    return (type(fmt).__module__, type(fmt).__qualname__, fingerprint.loader_config_text(fmt))
+
+
 def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, str]]:
     """Each part of a stage besides its function, as (label, comparison key, display).
 
     Every key survives importing the pipeline file again. Params compare by class module and
     qualname plus their canonical JSON text: set members sorted (``parameters.sort_set_members``,
     the encoding recorded in the lock file) so a deep-copied set matches, and NaN written as
-    ``NaN`` so a re-imported NaN matches. Pydantic equality needs one class object. Formats and
-    Python types are left out: they follow from the function, and a re-imported type is new.
+    ``NaN`` so a re-imported NaN matches. Pydantic equality needs one class object. Formats
+    compare through ``_format_key``: the caller picks an input's format. Python types are left
+    out: nothing at run time reads them, and a re-imported user type is a new object.
     """
     deps = {name: (ref.identity, ref.tag) for name, ref in info["deps"].items()}
+    dep_formats = {name: _format_key(ref.format) for name, ref in info["deps"].items()}
     outs = [(ref.identity, ref.tag) for ref in info["outs"]]
+    out_formats = [_format_key(ref.format) for ref in info["outs"]]
     incremental = info["incremental_inputs"]
     params = info["params"]
     params_key = (
@@ -208,8 +230,14 @@ def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, s
     )
     return [
         ("inputs", deps, _show_items({name: _show_ref(*ref) for name, ref in deps.items()})),
+        (
+            "input formats",
+            dep_formats,
+            _show_items({name: repr(ref.format) for name, ref in info["deps"].items()}),
+        ),
         ("input collections", info["collection_params"], _show_items(info["collection_params"])),
         ("outputs", outs, ", ".join(_show_ref(*ref) for ref in outs) or "none"),
+        ("output formats", out_formats, ", ".join(repr(ref.format) for ref in info["outs"])),
         (
             "incremental inputs",
             incremental,

@@ -1085,6 +1085,71 @@ def test_list_refuses_two_same_named_pipelines_calling_one_shared_stage(
     assert "rename one of the pipelines" in result.output, result.output
 
 
+def test_list_refuses_two_same_named_pipelines_reading_one_input_differently(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The caller picks an input's format: one shared stage parsing x.csv two ways is two."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a;b\n1;2\n")
+        (cwd / "shared").mkdir()
+        (cwd / "shared" / "stages.py").write_text(
+            "import pandas as pd\n\nfrom pivot import stage\n\n\n"
+            + '@stage\ndef make(x: pd.DataFrame) -> dict:\n    return {"cols": list(x.columns)}\n'
+        )
+        for side, fmt in (("left", ""), ("right", ', format=loaders.CSV(sep=";")')):
+            (cwd / side).mkdir()
+            (cwd / side / "pipeline.py").write_text(
+                "from pivot import Pipeline, loaders, stage\nfrom shared.stages import make\n\n\n"
+                + f"@stage\ndef use_{side}(m: dict) -> dict:\n    return m\n\n\n"
+                + 'with Pipeline("rep") as pipeline:\n'
+                + f'    use_{side}(make(pipeline.input("x.csv"{fmt})))\n'
+            )
+        (cwd / "pipeline.py").write_text(
+            "from pivot import Pipeline\n"
+            + "from left.pipeline import pipeline as left\n"
+            + "from right.pipeline import pipeline as right\n\n"
+            + 'with Pipeline("all") as pipeline:\n'
+            + "    pipeline.include(left)\n"
+            + "    pipeline.include(right)\n"
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    assert (
+        "Stage 'rep/make' is defined twice with different input formats "
+        + "(x=CSV(index_col=None, sep=',', dtype=None) vs x=CSV(index_col=None, sep=';', "
+        + "dtype=None)), both calling make in shared/stages.py"
+    ) in result.output, result.output
+
+
+def test_repro_pipeline_file_target_whose_loader_holds_a_user_function_runs(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Importing prep again re-creates `JSON(empty_factory=make_empty)`: still one stage."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "rows.json").write_text('{"a": 1}\n')
+        (cwd / "prep").mkdir()
+        (cwd / "prep" / "pipeline.py").write_text(
+            "from pivot import Pipeline, loaders, stage\n\n\n"
+            + "def make_empty() -> dict:\n    return {}\n\n\n"
+            + '@stage\ndef keep(rows: dict) -> dict:\n    return {"n": len(rows)}\n\n\n'
+            + 'with Pipeline("prep") as pipeline:\n'
+            + '    keep(pipeline.input("rows.json", format=loaders.JSON(empty_factory=make_empty)))\n'
+        )
+        (cwd / "pipeline.py").write_text(
+            "from pivot import Pipeline\nfrom prep.pipeline import pipeline as prep\n\n"
+            + 'with Pipeline("all") as pipeline:\n    pipeline.include(prep)\n'
+        )
+
+        result = runner.invoke(cli.cli, ["repro", "prep/pipeline.py"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 ran" in result.output, result.output
+
+
 def _scale_pipeline(name: str) -> str:
     return (
         "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"

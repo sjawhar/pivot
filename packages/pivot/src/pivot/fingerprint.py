@@ -882,19 +882,30 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
                     manifest[f"loader:{class_name}:empty"] = hash_function_ast(typed_loader.empty)
                     break
 
-    # Config hash from dataclass fields
-    # Cast to Any for dataclass introspection - loader is a dataclass but generic params are unknown
     loader_any = cast("Any", loader)
-    field_values = list[str]()
     for field in dataclasses.fields(loader_any):
         value = getattr(loader_any, field.name)
-        field_values.append(f"{field.name}={_serialize_value_for_hash(value)}")
         _process_bound_values(f"{class_name}.{field.name}", value, manifest, visited)
-    if field_values:
-        config_str = ",".join(field_values)
+    config_str = loader_config_text(loader_any)
+    if config_str:
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
+
+
+def loader_config_text(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> str:
+    """Return a loader's dataclass field values as `name=<canonical JSON>`, comma-joined.
+
+    This is the text hashed as `loader:<module>.<qualname>:config`. It does not depend on
+    PYTHONHASHSEED or object identity: a function in a field is its definition and code hash,
+    so a loader re-created by importing its pipeline file again gives the same text.
+    """
+    # Cast to Any for dataclass introspection - loader is a dataclass but generic params are unknown
+    loader_any = cast("Any", loader)
+    return ",".join(
+        f"{field.name}={_serialize_value_for_hash(getattr(loader_any, field.name))}"
+        for field in dataclasses.fields(loader_any)
+    )
 
 
 def _user_defined_method(cls: type, name: str) -> Callable[..., Any] | None:
