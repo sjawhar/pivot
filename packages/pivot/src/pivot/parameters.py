@@ -26,6 +26,8 @@ from pivot import exceptions, project, yaml_config
 if TYPE_CHECKING:
     import pathlib
 
+    import pydantic_core
+
     from pivot.registry import PipelineLike
 
 logger = logging.getLogger(__name__)
@@ -142,17 +144,63 @@ def _override_errors(
         for error in exc.errors():
             loc = error["loc"]
             key = _override_key(params_cls, stage_name, loc[0] if loc else None, overrides)
-            path = ".".join(str(part) for part in loc)
-            detail = (
-                f"value {error['input']!r} is invalid for {params_cls.__name__}: " + error["msg"]
-            )
-            found.append((key, f"params.yaml key '{key}': field '{path}' {detail}"))
+            found.append((key, f"params.yaml key '{key}': {_describe_error(params_cls, error)}"))
     found.extend(
         (key, _unknown_field_message(key, path, owner))
         for key, path, owner in unknown
         if owner.model_config.get("extra") != "allow"
     )
     return found
+
+
+def describe_validation_error(
+    params_cls: type[pydantic.BaseModel], exc: pydantic.ValidationError
+) -> str:
+    """One line per error of validating ``params_cls``, never showing a secret's value."""
+    return "\n".join(_describe_error(params_cls, error) for error in exc.errors())
+
+
+def _describe_error(params_cls: type[pydantic.BaseModel], error: pydantic_core.ErrorDetails) -> str:
+    """Describe a validation error of ``params_cls`` as ``field '<path>' ...``.
+
+    The value is shown as ``'**********'`` when the top-level field holds a secret anywhere
+    (``_holds_secret``), so a sibling value inside the same field is masked too. A key that
+    is not a field is described without its value: it may be a misspelled secret.
+    """
+    loc = error["loc"]
+    path = ".".join(str(part) for part in loc)
+    if error["type"] == "extra_forbidden":
+        return f"field '{path}' is not a field of {params_cls.__name__}"
+    field = _field_named(params_cls, loc[0]) if loc else None
+    secret = field is None or _holds_secret(field.annotation, set())
+    shown = "'**********'" if secret else repr(error["input"])
+    return f"field '{path}' value {shown} is invalid for {params_cls.__name__}: {error['msg']}"
+
+
+def _field_named(
+    model: type[pydantic.BaseModel], key: int | str
+) -> pydantic.fields.FieldInfo | None:
+    """Return ``model``'s field that ``key`` names by field name or input alias, or None."""
+    for name, field in model.model_fields.items():
+        if key == name or key in _input_aliases(field):
+            return field
+    return None
+
+
+_SECRET_TYPES = (pydantic.SecretStr, pydantic.SecretBytes, pydantic.Secret)
+
+
+def _holds_secret(annotation: object, seen: set[type[pydantic.BaseModel]]) -> bool:
+    """Whether a value of ``annotation`` may contain a secret, at any depth."""
+    for candidate in (annotation, typing.get_origin(annotation)):
+        if isinstance(candidate, type) and issubclass(candidate, _SECRET_TYPES):
+            return True
+    if isinstance(annotation, type) and issubclass(annotation, pydantic.BaseModel):
+        if annotation in seen:
+            return False
+        seen.add(annotation)
+        return any(_holds_secret(f.annotation, seen) for f in annotation.model_fields.values())
+    return any(_holds_secret(arg, seen) for arg in typing.get_args(annotation))
 
 
 def _unknown_field_message(

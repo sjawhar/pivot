@@ -172,11 +172,13 @@ def get_stage_explanation(
     try:
         current_params = parameters.get_effective_params(params_instance, stage_name, overrides)
     except pydantic.ValidationError as error:
+        assert params_instance is not None, "only params validation raises here"
         return StageExplanation(
             stage_name=stage_name,
             will_run=True,
             is_forced=force,
-            reason=f"Invalid params.yaml:\n{error}",
+            reason="Invalid params.yaml:\n"
+            + parameters.describe_validation_error(type(params_instance), error),
             code_changes=[],
             param_changes=[],
             dep_changes=[],

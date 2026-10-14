@@ -959,6 +959,55 @@ def test_params_without_secrets_never_create_a_key(
     assert not (tmp_path / ".pivot" / "secret.key").exists()
 
 
+class _PinHolder(BaseModel):
+    pin: pydantic.Secret[int] = pydantic.Secret[int](1)
+    label: str = "x"
+
+
+class _InvalidSecretParams(stage_def.StageParams):
+    pin: pydantic.Secret[int] = pydantic.Secret[int](1)
+    token: pydantic.SecretStr | None = None
+    keys: list[pydantic.SecretStr] = []
+    holder: _PinHolder = _PinHolder()
+    epochs: int = 3
+
+
+@pytest.mark.parametrize(
+    ("override", "path", "plaintext"),
+    [
+        ({"pin": "99x999"}, "pin", "99x999"),
+        ({"token": 424242}, "token", "424242"),
+        ({"keys": [7777777]}, "keys.0", "7777777"),
+        ({"holder": {"pin": "55y555"}}, "holder.pin", "55y555"),
+    ],
+    ids=["secret", "optional-secret", "list-of-secrets", "nested-secret"],
+)
+def test_an_invalid_secret_value_is_not_echoed_in_the_error(
+    override: dict[str, object], path: str, plaintext: str
+) -> None:
+    errors = parameters._override_errors(_InvalidSecretParams(), "p/s", {"p/s": override})
+
+    assert len(errors) == 1, errors
+    message = errors[0][1]
+    assert message.startswith(
+        f"params.yaml key 'p/s': field '{path}' value '**********' is invalid"
+    )
+    assert plaintext not in message
+
+
+def test_an_invalid_plain_value_is_still_shown() -> None:
+    errors = parameters._override_errors(_InvalidSecretParams(), "p/s", {"p/s": {"epochs": "ten"}})
+
+    assert errors == [
+        (
+            "p/s",
+            "params.yaml key 'p/s': field 'epochs' value 'ten' is invalid for "
+            + "_InvalidSecretParams: Input should be a valid integer, unable to parse string as an "
+            + "integer",
+        )
+    ]
+
+
 # -----------------------------------------------------------------------------
 # List replacement tests (deepmerge should replace, not append)
 # -----------------------------------------------------------------------------
