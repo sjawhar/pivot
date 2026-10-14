@@ -17,6 +17,7 @@ import numpy
 import pandas
 import pytest
 import pytz
+import yaml
 from dateutil import tz as dateutil_tz
 
 from pivot import loaders
@@ -209,14 +210,15 @@ def test_yaml_loader_roundtrips_numpy_values_as_plain_data(tmp_path: pathlib.Pat
     assert "python/" not in yaml_file.read_text()
 
 
-def test_yaml_loader_refuses_non_plain_data_before_writing(tmp_path: pathlib.Path) -> None:
+def test_yaml_loader_writes_non_plain_data_as_before_with_a_warning(tmp_path: pathlib.Path) -> None:
+    """Warn-first: the output keeps its previous bytes, and the warning says how to fix it."""
     yaml_file = tmp_path / "metric.yaml"
-    yaml_file.write_text("old: value\n")
+    data = {"frame": pandas.DataFrame({"value": [1.0]})}
 
-    with pytest.raises(TypeError, match="DataFrame"):
-        loaders.YAML[object]().save(pandas.DataFrame({"value": [1.0]}), yaml_file)
+    with pytest.warns(loaders.LossyOutputWarning, match=r"got DataFrame at root\['frame'\]"):
+        loaders.YAML[object]().save(data, yaml_file)
 
-    assert yaml_file.read_text() == "old: value\n"
+    assert yaml_file.read_text() == yaml.dump(data, default_flow_style=False)
 
 
 @dataclasses.dataclass
@@ -224,27 +226,39 @@ class _UnserializableMetric:
     value: float
 
 
-def test_yaml_loader_refuses_dataclass_with_type_name(tmp_path: pathlib.Path) -> None:
-    with pytest.raises(TypeError, match="_UnserializableMetric"):
-        loaders.YAML[object]().save(_UnserializableMetric(0.5), tmp_path / "metric.yaml")
-
-
 @pytest.mark.parametrize(
-    ("value", "type_name"),
+    ("data", "match"),
     [
-        pytest.param(numpy.datetime64("2024-01-01T00:00:00.000000001"), "datetime64"),
-        pytest.param(numpy.timedelta64(5, "ns"), "timedelta64"),
+        pytest.param(_UnserializableMetric(0.5), "_UnserializableMetric at root", id="dataclass"),
         pytest.param(
-            numpy.array(["2024-01-01T00:00:00.000000001"], dtype="datetime64[ns]"),
+            {"value": numpy.datetime64("2024-01-01T00:00:00.000000001")},
             "datetime64",
+            id="datetime64",
         ),
+        pytest.param({"value": numpy.timedelta64(5, "ns")}, "timedelta64", id="timedelta64"),
+        pytest.param(
+            {"value": numpy.array(["2024-01-01T00:00:00.000000001"], dtype="datetime64[ns]")},
+            "datetime64",
+            id="datetime64-array",
+        ),
+        pytest.param({"value": numpy.longdouble("1.5")}, "longdouble", id="longdouble"),
+        pytest.param({(1, 2): "pair"}, "tuple key at root", id="tuple-key"),
     ],
 )
-def test_yaml_loader_refuses_numpy_temporal_values(
-    tmp_path: pathlib.Path, value: object, type_name: str
+def test_yaml_loader_warns_for_values_safe_load_cannot_read(
+    tmp_path: pathlib.Path, data: object, match: str
 ) -> None:
-    with pytest.raises(TypeError, match=type_name):
-        loaders.YAML[object]().save({"value": value}, tmp_path / "metric.yaml")
+    yaml_file = tmp_path / "metric.yaml"
+
+    with pytest.warns(loaders.LossyOutputWarning, match=match):
+        loaders.YAML[object]().save(data, yaml_file)
+
+    assert yaml_file.read_text() == yaml.dump(data, default_flow_style=False)
+
+
+def test_yaml_loader_refuses_values_the_old_writer_also_refused(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(TypeError, match="generator"):
+        loaders.YAML[object]().save({"rows": (n for n in range(2))}, tmp_path / "metric.yaml")
 
 
 def test_pickle_loader_warns_about_cache_and_remote_trust(tmp_path: pathlib.Path) -> None:
@@ -1152,11 +1166,23 @@ def test_dataframe_jsonl_roundtrips_all_nan_float_dtype(tmp_path: pathlib.Path) 
     pandas.testing.assert_frame_equal(loaded, frame)
 
 
-def test_dataframe_jsonl_refuses_extended_precision_float(tmp_path: pathlib.Path) -> None:
-    df = pandas.DataFrame({"x": numpy.array([numpy.longdouble("1.0000000000000000009")])})
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(numpy.array([numpy.longdouble("1.0000000000000000009")]), id="float128"),
+        pytest.param(pandas.period_range("2024-01", periods=2, freq="M"), id="period"),
+        pytest.param([(n for n in range(2)), None], id="generator"),
+    ],
+)
+def test_dataframe_jsonl_refuses_columns_the_old_writer_also_refused(
+    tmp_path: pathlib.Path, values: object
+) -> None:
+    df = pandas.DataFrame({"x": values})
 
-    with pytest.raises(TypeError, match="float128"):
-        loaders.DataFrameJSONL().save(df, tmp_path / "float128.jsonl")
+    with pytest.raises(TypeError, match="DataFrameJSONL cannot write column 'x'"):
+        loaders.DataFrameJSONL().save(df, tmp_path / "refused.jsonl")
+
+    assert not (tmp_path / "refused.jsonl").exists()
 
 
 @pytest.mark.parametrize(
@@ -1167,10 +1193,12 @@ def test_dataframe_jsonl_refuses_extended_precision_float(tmp_path: pathlib.Path
         pytest.param(dateutil_tz.gettz("Europe/London"), id="dateutil-tzfile"),
     ],
 )
-def test_dataframe_jsonl_refuses_timezone_that_cannot_roundtrip(
+def test_dataframe_jsonl_writes_timezone_that_cannot_roundtrip_as_before_with_a_warning(
     tmp_path: pathlib.Path, timezone: datetime.tzinfo | None
 ) -> None:
+    """Warn-first: the frame keeps the old headerless epoch-millisecond form."""
     assert timezone is not None
+    jsonl_file = tmp_path / "dateutil.jsonl"
     frame = pandas.DataFrame(
         {
             "timestamp": pandas.to_datetime(
@@ -1179,8 +1207,10 @@ def test_dataframe_jsonl_refuses_timezone_that_cannot_roundtrip(
         }
     )
 
-    with pytest.raises(TypeError, match="timestamp.*timezone"):
-        loaders.DataFrameJSONL().save(frame, tmp_path / "dateutil.jsonl")
+    with pytest.warns(loaders.LossyOutputWarning, match="column 'timestamp'.*timezone"):
+        loaders.DataFrameJSONL().save(frame, jsonl_file)
+
+    assert jsonl_file.read_text() == frame.to_json(lines=True, orient="records")
 
 
 @pytest.mark.parametrize(
@@ -1214,21 +1244,31 @@ def test_dataframe_jsonl_roundtrips_reconstructible_timezones(
     ]
 
 
+@dataclasses.dataclass
+class _Cell:
+    x: int
+
+
 @pytest.mark.parametrize(
     ("cell", "type_name"),
     [
         pytest.param(decimal.Decimal("0.1"), "Decimal", id="decimal"),
         pytest.param({1, 2}, "set", id="set"),
         pytest.param(b"raw", "bytes", id="bytes"),
+        pytest.param(_Cell(1), "_Cell", id="dataclass"),
+        pytest.param(complex(1, 2), "complex", id="complex"),
     ],
 )
-def test_dataframe_jsonl_refuses_cells_json_cannot_hold(
+def test_dataframe_jsonl_writes_cells_json_cannot_hold_as_before_with_a_warning(
     tmp_path: pathlib.Path, cell: object, type_name: str
 ) -> None:
-    df = pandas.DataFrame({"col": [cell, None]})
+    jsonl_file = tmp_path / "lossy.jsonl"
+    df = pandas.DataFrame({"col": [cell, None], "n": [1, 2]})
 
-    with pytest.raises(TypeError, match=rf"column 'col'.*{type_name}"):
-        loaders.DataFrameJSONL().save(df, tmp_path / "bad.jsonl")
+    with pytest.warns(loaders.LossyOutputWarning, match=rf"column 'col'.*{type_name}"):
+        loaders.DataFrameJSONL().save(df, jsonl_file)
+
+    assert jsonl_file.read_text() == df.to_json(lines=True, orient="records")
 
 
 @pytest.mark.parametrize(

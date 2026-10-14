@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import queue
 import tempfile
 import typing
 from typing import TYPE_CHECKING, Annotated, NotRequired, Required, TypedDict
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Annotated, NotRequired, Required, TypedDict
 import numpy
 import pandas as pd
 import pytest
+import yaml
 
 from pivot import exceptions, fingerprint, loaders, stage_def, types
 from pivot.compose import (
@@ -2095,7 +2097,18 @@ def _helper_metric_dataframe(params: stage_def.StageParams) -> Annotated[pd.Data
     return pd.DataFrame({"value": [1.0]})
 
 
-def test_metric_dataframe_fails_at_write_with_stage_and_type(
+def _helper_stage_logs(output_queue: mp.Queue[OutputMessage]) -> list[str]:
+    lines = list[str]()
+    while True:
+        try:
+            message = output_queue.get(timeout=0.5)
+        except queue.Empty:
+            return lines
+        if message is not None and message["kind"] == types.OutputMessageKind.LOG:
+            lines.append(message["line"])
+
+
+def test_metric_dataframe_warns_with_stage_and_output_and_keeps_old_yaml(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     with Pipeline("metricsafe", root=tmp_path) as pipeline:
@@ -2105,13 +2118,16 @@ def test_metric_dataframe_fails_at_write_with_stage_and_type(
         pipeline, "metricsafe/_helper_metric_dataframe", tmp_path, output_queue
     )
 
-    assert result["status"] == types.StageStatus.FAILED
-    assert (
-        "Stage 'metricsafe/_helper_metric_dataframe' cannot write its YAML output"
-        in (result["reason"])
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = [line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")]
+    assert len(warnings) == 1, warnings
+    assert "Stage 'metricsafe/_helper_metric_dataframe' wrote its YAML output" in warnings[0]
+    assert "got DataFrame at root" in warnings[0]
+    assert "None" not in warnings[0], "a single output has no key to name"
+    written = tmp_path / "metrics" / "metricsafe" / "_helper_metric_dataframe.yaml"
+    assert written.read_text() == yaml.dump(
+        pd.DataFrame({"value": [1.0]}), default_flow_style=False
     )
-    assert "None" not in result["reason"], "a single output has no key to name"
-    assert "DataFrame" in result["reason"]
 
 
 @stage
@@ -2119,7 +2135,7 @@ def _helper_metric_longdouble(params: stage_def.StageParams) -> Annotated[dict, 
     return {"mean": numpy.longdouble("1.0000000000000000009")}
 
 
-def test_metric_longdouble_fails_at_write_with_stage_and_type(
+def test_metric_longdouble_warns_with_stage_and_type(
     worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
     with Pipeline("metricsafe", root=tmp_path) as pipeline:
@@ -2129,6 +2145,41 @@ def test_metric_longdouble_fails_at_write_with_stage_and_type(
         pipeline, "metricsafe/_helper_metric_longdouble", tmp_path, output_queue
     )
 
-    assert result["status"] == types.StageStatus.FAILED
-    assert "metricsafe/_helper_metric_longdouble" in result["reason"]
-    assert "longdouble" in result["reason"]
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = [line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")]
+    assert len(warnings) == 1, warnings
+    assert "metricsafe/_helper_metric_longdouble" in warnings[0]
+    assert "longdouble" in warnings[0]
+
+
+class _HelperFrameAndCounts(TypedDict):
+    frame: pd.DataFrame
+    counts: dict
+
+
+@stage
+def _helper_lossy_keyed_outputs(params: stage_def.StageParams) -> _HelperFrameAndCounts:
+    return _HelperFrameAndCounts(
+        frame=pd.DataFrame({"cell": [{1, 2}]}), counts={"when": numpy.timedelta64(5, "ns")}
+    )
+
+
+def test_lossy_keyed_outputs_warn_naming_each_output(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("lossy", root=tmp_path) as pipeline:
+        _helper_lossy_keyed_outputs(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "lossy/_helper_lossy_keyed_outputs", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = sorted(
+        line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")
+    )
+    assert len(warnings) == 2, warnings
+    assert "Stage 'lossy/_helper_lossy_keyed_outputs' wrote output 'counts'" in warnings[0]
+    assert "timedelta64" in warnings[0]
+    assert "Stage 'lossy/_helper_lossy_keyed_outputs' wrote output 'frame'" in warnings[1]
+    assert "column 'cell'" in warnings[1]

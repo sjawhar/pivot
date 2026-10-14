@@ -3,7 +3,8 @@
 Each case builds the mistake a row describes, runs the CLI, and checks three things: the row's
 quoted text is in SKILL.md, that quote matches the concrete message the case expects (with
 `<placeholder>` and quoted one-letter names such as `'x'` as wildcards), and the command prints
-that message. A final test checks that every row of the table has a case.
+that message, failing unless the row is a warning. A final test checks that every row of the
+table has a case.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ class _Case:
     files: dict[str, str]
     args: tuple[str, ...] = ("list",)
     cwd: str = "."
+    fails: bool = True
+    """False for a warning: the command prints the message and still exits 0."""
 
 
 _CASES = {
@@ -176,9 +179,12 @@ _CASES = {
             + "pipeline.include(inner)\n"
         },
     ),
-    "non-plain-value-in-yaml": _Case(
-        doc="`YAML output must contain plain data; got <type>`",
-        observed="YAML output must contain plain data; got DataFrame",
+    "lossy-yaml-output": _Case(
+        doc="`wrote its YAML output in a form Pivot cannot read back`",
+        observed=(
+            "WARNING: Stage 'demo/s' wrote its YAML output in a form Pivot cannot read back: "
+            + "YAML output must contain plain data; got DataFrame"
+        ),
         files={
             "pipeline.py": _HEAD
             + "@stage\ndef s(raw: pd.DataFrame) -> dict:\n"
@@ -186,6 +192,7 @@ _CASES = {
             + 'with Pipeline("demo") as pipeline:\n    s(pipeline.input("t.csv"))\n'
         },
         args=("repro",),
+        fails=False,
     ),
 }
 
@@ -238,8 +245,9 @@ def test_common_error_is_quoted_as_the_cli_prints_it(
 
         result = runner.invoke(cli.cli, list(case.args))
 
-    assert result.exit_code != 0, result.output
-    assert case.observed in result.output, result.output
+    assert (result.exit_code != 0) == case.fails, result.output
+    # The console wraps long lines; compare the words.
+    assert " ".join(case.observed.split()) in " ".join(result.output.split()), result.output
 
 
 @pytest.mark.parametrize(

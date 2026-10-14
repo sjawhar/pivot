@@ -4,6 +4,7 @@ import abc
 import collections.abc as collections_abc
 import dataclasses
 import datetime
+import itertools
 import json
 import math
 import operator
@@ -23,6 +24,30 @@ if TYPE_CHECKING:
 import numpy
 import pandas
 import yaml
+
+
+class LossyOutputWarning(UserWarning):
+    """An output was written in Pivot's old form because the exact form cannot hold it.
+
+    The old form loses or garbles the value (unreadable YAML tags, epoch-millisecond
+    timestamps, stringified cells). A later release will refuse these values.
+    """
+
+
+class _NotPlainDataError(TypeError):
+    """A YAML output value that ``yaml.safe_load`` could not read back."""
+
+
+_YAML_SCALAR_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    datetime.date,
+    datetime.datetime,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,11 +170,12 @@ class JSON[T](Loader[T, T]):
 
 @dataclasses.dataclass(frozen=True)
 class YAML[T](Loader[T, T]):
-    """YAML file loader that writes only values safe_load can read.
+    """YAML file loader that writes values ``yaml.safe_load`` reads back.
 
-    Numpy scalars and arrays are converted to equivalent Python values. Other
-    arbitrary Python objects raise ``TypeError`` instead of being written as
-    unsafe ``!!python/*`` tags.
+    Numpy scalars and arrays are converted to equivalent Python values. Any other
+    Python object (a DataFrame, a dataclass, a NumPy temporal or extended-precision
+    value, a non-scalar key) is written as before, with Python-specific ``!!python/*``
+    tags that no Pivot reader can load, and raises ``LossyOutputWarning``.
 
     Args:
         empty_factory: Callable returning the first-run value for an incremental output.
@@ -169,13 +195,13 @@ class YAML[T](Loader[T, T]):
             if value is pandas.NaT or value is pandas.NA:
                 return None
             if isinstance(value, (numpy.datetime64, numpy.timedelta64)):
-                raise TypeError(
+                raise _NotPlainDataError(
                     f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
                     + "Convert NumPy temporal values explicitly."
                 )
             if isinstance(value, numpy.ndarray):
                 if value.dtype.kind in "mM":
-                    raise TypeError(
+                    raise _NotPlainDataError(
                         f"YAML output must contain plain data; got {value.dtype} array at {location}. "
                         + "Convert NumPy temporal values explicitly."
                     )
@@ -183,38 +209,46 @@ class YAML[T](Loader[T, T]):
             if isinstance(value, numpy.generic):
                 unwrapped = value.item()
                 if isinstance(unwrapped, numpy.generic):
-                    raise TypeError(
+                    raise _NotPlainDataError(
                         f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
                         + "Convert extended-precision NumPy values explicitly."
                     )
                 return plain(unwrapped, location)
-            if type(value) in (
-                type(None),
-                bool,
-                int,
-                float,
-                str,
-                bytes,
-                datetime.date,
-                datetime.datetime,
-            ):
+            if type(value) in _YAML_SCALAR_TYPES:
                 return value
             if isinstance(value, collections_abc.Mapping):
                 mapping = cast("collections_abc.Mapping[object, object]", value)
                 plain_mapping = dict[object, object]()
                 for key, item in mapping.items():
                     plain_key = plain(key, f"{location} key")
+                    if type(plain_key) not in _YAML_SCALAR_TYPES:
+                        raise _NotPlainDataError(
+                            f"YAML output must contain plain data; got {type(key).__name__} key "
+                            + f"at {location}. Use str, int, float or bool keys."
+                        )
                     plain_mapping[plain_key] = plain(item, f"{location}[{key!r}]")
                 return plain_mapping
             if isinstance(value, (list, tuple)):
                 items = cast("list[object] | tuple[object, ...]", value)
                 return [plain(item, f"{location}[{index}]") for index, item in enumerate(items)]
-            raise TypeError(
+            raise _NotPlainDataError(
                 f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
                 + "Convert DataFrames with .to_dict() and dataclasses with dataclasses.asdict()."
             )
 
-        content = yaml.safe_dump(plain(data, "root"), default_flow_style=False)
+        try:
+            content = yaml.safe_dump(plain(data, "root"), default_flow_style=False)
+        except _NotPlainDataError as not_plain:
+            try:
+                content = yaml.dump(data, default_flow_style=False)
+            except (TypeError, yaml.YAMLError) as e:
+                raise TypeError(str(not_plain)) from e
+            warnings.warn(
+                f"{not_plain} It was written with Python-specific YAML tags; a later release "
+                + "will refuse it.",
+                LossyOutputWarning,
+                stacklevel=2,
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
 
@@ -474,6 +508,45 @@ def _parse_jsonl_header(record: object, path: pathlib.Path) -> _JsonlHeader | No
     return columns, temporal_columns
 
 
+def _write_text_atomically(path: pathlib.Path, chunks: collections_abc.Iterable[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(chunks)
+        os.rename(tmp_path_str, path)
+    except Exception:
+        tmp_path = pathlib.Path(tmp_path_str)
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def _write_old_jsonl_format(
+    data: pandas.DataFrame, path: pathlib.Path, column: str, error: TypeError
+) -> None:
+    """Write the headerless pandas JSONL Pivot wrote before, with a warning.
+
+    A value the old writer also refused is still refused.
+    """
+    message = (
+        f"DataFrameJSONL cannot write column {column!r}: {error}. Convert it to "
+        + "str/int/float/bool/list/dict values, or pick another format for this "
+        + "output, e.g. Annotated[pd.DataFrame, Pickle()]."
+    )
+    try:
+        content = data.to_json(lines=True, orient="records")
+    except (TypeError, ValueError, OverflowError):
+        raise TypeError(message) from error
+    warnings.warn(
+        f"{message} It was written in the old headerless format (dates as epoch "
+        + "milliseconds, other cells as pandas renders them); a later release will refuse it.",
+        LossyOutputWarning,
+        stacklevel=3,
+    )
+    _write_text_atomically(path, [content])
+
+
 @dataclasses.dataclass(frozen=True)
 class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
@@ -497,9 +570,11 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
       metadata, including all-null columns.
     - strings remain strings, including ISO-shaped strings.
 
-    Cells that JSON cannot hold (``Decimal``, ``set``, ``bytes``, arbitrary
-    objects) raise ``TypeError`` naming the column. Saves atomically via temp
-    file + rename.
+    A column the exact format cannot hold (``Decimal``, ``set``, ``bytes`` or other
+    object cells, a timezone that cannot be rebuilt from its name) is written in
+    the old headerless pandas format with a ``LossyOutputWarning`` naming the
+    column; a column that format also cannot hold raises ``TypeError``. Saves
+    atomically via temp file + rename.
     """
 
     @override
@@ -586,11 +661,8 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             try:
                 column, written_dtype, temporal_metadata = _encode_jsonl_column(data[name], encoder)
             except TypeError as e:
-                raise TypeError(
-                    f"DataFrameJSONL cannot write column {string_name!r}: {e}. Convert it to "
-                    + "str/int/float/bool/list/dict values, or pick another format for this "
-                    + "output, e.g. Annotated[pd.DataFrame, Pickle()]."
-                ) from e
+                _write_old_jsonl_format(data, path, string_name, e)
+                return
             columns.append(column)
             keys.append(encoder.encode(string_name) + ":")
             column_schema.append({"name": string_name, "dtype": written_dtype})
@@ -604,20 +676,11 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                 "temporal_columns": temporal_columns,
             }
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(encoder.encode(metadata) + "\n")
-                for cells in zip(*columns, strict=True):
-                    f.write("{" + ",".join(map(operator.add, keys, cells)) + "}\n")
-            os.rename(tmp_path_str, path)
-        except Exception:
-            tmp_path = pathlib.Path(tmp_path_str)
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
+        rows = (
+            "{" + ",".join(map(operator.add, keys, cells)) + "}\n"
+            for cells in zip(*columns, strict=True)
+        )
+        _write_text_atomically(path, itertools.chain([encoder.encode(metadata) + "\n"], rows))
 
     @override
     def empty(self) -> pandas.DataFrame:

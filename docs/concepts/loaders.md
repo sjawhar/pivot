@@ -80,6 +80,14 @@ reading data rows. Pivot treats the first line as the header only when it has
 exactly this shape, so a column may have any name, including
 `__pivot_dataframe_metadata__`, and a JSONL file without a header loads as rows.
 
+A column this format cannot hold exactly (`Decimal`, `set`, `bytes` or other
+object cells, or a timezone that cannot be rebuilt from its name, such as a
+`dateutil` offset) makes Pivot write the whole frame in its previous headerless
+pandas form, with dates as epoch milliseconds, and print a warning under the
+stage naming the column. Convert the column, or choose another format such as
+`Annotated[pd.DataFrame, loaders.Pickle()]`; a later release will fail the stage
+instead.
+
 ### Pickle is a trusted-code boundary
 
 Loading a pickle can execute arbitrary code. Only load Pickle artifacts written

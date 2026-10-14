@@ -9,8 +9,9 @@ import signal
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
+import pandas as pd
 import pytest
 
 from conftest import isolated_pivot_dir, send_rpc
@@ -67,6 +68,11 @@ def quiet() -> str:
     sys.stdout.write("This should not appear\n")
     sys.stdout.flush()
     return "done"
+
+
+@compose.stage
+def frame_metric() -> Annotated[pd.DataFrame, compose.metric]:
+    return pd.DataFrame({"value": [1.0]})
 
 
 _EMPTY_PIPELINE = (
@@ -1028,6 +1034,41 @@ def test_repro_without_show_output_hides_logs(
     assert "This should not appear" not in result.output
     # But should show completion
     assert "quiet" in result.output
+
+
+def test_repro_shows_lossy_output_warning_without_show_output(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A plain `pivot repro` prints a stage's warning in its report and still exits 0."""
+    with mock_discovery:
+        frame_metric()
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    # The console wraps long lines; compare the words.
+    text = " ".join(result.output.split())
+    warning = (
+        "WARNING: Stage 'test/frame_metric' wrote its YAML output in a form Pivot cannot "
+        + "read back: YAML output must contain plain data; got DataFrame at root."
+    )
+    assert warning in text, result.output
+    assert text.index("✓ test/frame_metric done") < text.index(warning), "prints under its stage"
+    assert "Summary: 1 ran, 0 cached, 0 blocked, 0 failed" in text
+
+
+def test_repro_quiet_suppresses_lossy_output_warning(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    with mock_discovery:
+        frame_metric()
+
+    result = runner.invoke(cli.cli, ["--quiet", "repro"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "", "Quiet mode should suppress the warning"
 
 
 def _same_named_pipeline(side: str) -> str:

@@ -172,9 +172,11 @@ loaders.CSV()]` saves a CSV under `metrics/`.
 
 A `dict` or `list` output is written as YAML. Numpy scalars and arrays are
 converted to plain Python numbers and lists, so `{"mean": df["v"].mean()}`
-works. A DataFrame, a dataclass, or any other object inside it fails the stage
-when it is written, naming the stage, the type and where it sits; convert it
-first (`df.to_dict()`, `dataclasses.asdict(x)`).
+works. A DataFrame, a dataclass, or any other object inside it is written with
+Python-specific YAML tags that `pivot metrics show` and downstream stages cannot
+read, and the `pivot repro` report prints a warning under the stage naming the
+output, the type and where it sits. Convert it first (`df.to_dict()`,
+`dataclasses.asdict(x)`); a later release will fail the stage instead.
 
 ## How Pivot writes outputs
 

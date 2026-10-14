@@ -619,6 +619,67 @@ async def test_static_sink_ignores_log_lines_when_show_output_disabled() -> None
     assert output.getvalue() == "", "Should ignore log lines when show_output=False"
 
 
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_reports_worker_warnings_of_a_stage_that_ran(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """Warnings a stage logged reach the report; its other output stays hidden."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sink_type(console=console, show_output=False)
+
+    for line in ("progress 50%", "WARNING: Stage 'train' wrote its YAML output lossily"):
+        await sink.handle(LogLine(type="log_line", seq=0, stage="train", line=line, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "WARNING: Stage 'train' wrote its YAML output lossily" in result
+    assert result.index("train") < result.index("WARNING:"), "warning prints under its stage"
+    assert "progress 50%" not in result
+
+
+async def test_sink_does_not_repeat_streamed_warnings() -> None:
+    """With --show-output the warning already streamed; the report does not print it twice."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sinks.StaticConsoleSink(console=console, show_output=True)
+
+    await sink.handle(
+        LogLine(type="log_line", seq=0, stage="train", line="WARNING: lossy", is_stderr=True)
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    assert output.getvalue().count("WARNING: lossy") == 1
+
+
 async def test_static_sink_log_lines_stream_before_completions() -> None:
     """Log lines print in real-time, completions print on close."""
     output = StringIO()
