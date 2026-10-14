@@ -87,6 +87,16 @@ def current_dims(dims: pd.DataFrame) -> list[str]:
     return [str(k) for k in dims.loc[dims["valid_to"] > pd.Timestamp("2025-01-01"), "k"]]
 
 
+@compose.stage
+def matrix() -> pd.DataFrame:
+    return pd.DataFrame(np.array([[1.5, 2.5], [3.5, 4.5]]))
+
+
+@compose.stage
+def first_col(m: pd.DataFrame) -> list[float]:
+    return [float(value) for value in m[0]]
+
+
 _EMPTY_PIPELINE = (
     "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
 )
@@ -1106,6 +1116,21 @@ def test_repro_never_writes_an_out_of_range_date_as_a_different_date(
             "valid_to": np.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]"),
         }
     ).to_json(lines=True, orient="records")
+
+
+def test_repro_keeps_integer_column_labels_for_the_next_stage(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A frame built from a numpy array has labels 0, 1; the next stage indexes m[0]."""
+    with mock_discovery:
+        first_col(matrix())
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    written = (mock_discovery.root / "data" / "test" / "first_col.yaml").read_text()
+    assert written == "- 1.5\n- 3.5\n"
 
 
 def _same_named_pipeline(side: str) -> str:

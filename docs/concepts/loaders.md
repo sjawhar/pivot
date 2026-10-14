@@ -70,7 +70,10 @@ records:
 ```
 
 `columns` lists every column's name and dtype in order, so a zero-row frame
-keeps its columns and dtypes. Pivot uses `temporal_columns` to restore only the
+keeps its columns and dtypes. An integer column label, such as the `0` and `1`
+of a frame built from a numpy array, is written as its JSON key with
+`"label":"int"` in its entry and comes back as an integer, so `m[0]` still works
+in the next stage. Pivot uses `temporal_columns` to restore only the
 columns it marked as temporal, retain the original timezone names, and preserve
 all-null `datetime` and `timedelta` dtypes. It never guesses that an ISO-shaped
 string column is temporal.
@@ -88,11 +91,17 @@ That includes pandas' inexact float parsing (`0.3` reads as
 `0.30000000000000004`). Exact floats and restored dtypes apply to files Pivot
 writes with the header.
 
-A column this format cannot hold exactly (`Decimal`, `set`, `bytes` or other
-object cells, or a timezone that cannot be rebuilt from its name, such as a
-`dateutil` offset) makes Pivot write the whole frame in its previous headerless
-pandas form, with dates as epoch milliseconds, and print a warning under the
-stage naming the column. Convert the column, or choose another format such as
+Some frames cannot be written exactly. In that case Pivot writes the whole frame
+in its previous headerless pandas form, with dates as epoch milliseconds, and
+prints a warning under the stage naming the column. The cases are:
+
+- `Decimal`, `set`, `bytes` or other object cells
+- a timezone that cannot be rebuilt from its name, such as a `dateutil` offset
+- datetimes with mixed UTC offsets in one column
+- a date outside the nanosecond range (1677 to 2262), such as a `9999-12-31` sentinel
+- a column label that is neither str nor int, or an int and a str label with the same text
+
+Convert the column, or choose another format such as
 `Annotated[pd.DataFrame, loaders.Pickle()]`; a later release will fail the stage
 instead.
 

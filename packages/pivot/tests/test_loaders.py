@@ -1347,6 +1347,65 @@ def test_dataframe_jsonl_writes_mixed_timezone_datetimes_as_before_with_a_warnin
 @pytest.mark.parametrize(
     "frame",
     [
+        pytest.param(pandas.DataFrame(numpy.array([[1.5, 2.5], [3.5, 4.5]])), id="range"),
+        pytest.param(
+            pandas.DataFrame({numpy.int64(3): [1], numpy.int64(7): [2]}), id="numpy-int64"
+        ),
+        pytest.param(pandas.DataFrame({0: [1], "a": [2]}), id="int-and-str"),
+        pytest.param(pandas.DataFrame({0: pandas.Series([], dtype="float64")}), id="zero-rows"),
+        pytest.param(pandas.DataFrame({"0": [1], "1": [2]}), id="digit-strings-stay-strings"),
+    ],
+)
+def test_dataframe_jsonl_roundtrips_integer_column_labels(
+    tmp_path: pathlib.Path, frame: pandas.DataFrame
+) -> None:
+    """`m[0]` must work downstream of a frame built from a numpy array."""
+    jsonl_file = tmp_path / "labels.jsonl"
+
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, frame)
+    assert [type(label) for label in loaded.columns] == [
+        int if isinstance(label, (int, numpy.integer)) else str for label in frame.columns
+    ]
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pytest.param(pandas.DataFrame({1: [1], "1": [2]}), id="int-and-str-same-text"),
+        pytest.param(pandas.DataFrame({1.5: [1]}), id="float"),
+        pytest.param(pandas.DataFrame({True: [1]}), id="bool"),
+        pytest.param(pandas.DataFrame({None: [1]}), id="none"),
+        pytest.param(
+            pandas.DataFrame(
+                [[1, 2]], columns=pandas.MultiIndex.from_tuples([("a", "x"), ("a", "y")])
+            ),
+            id="tuple",
+        ),
+        pytest.param(pandas.DataFrame({pandas.Timestamp("2024-01-01"): [1]}), id="timestamp"),
+    ],
+)
+def test_dataframe_jsonl_writes_labels_json_keys_cannot_hold_as_before_with_a_warning(
+    tmp_path: pathlib.Path, frame: pandas.DataFrame
+) -> None:
+    """Labels that are not str or int, or that collide as JSON keys, keep base's format."""
+    jsonl_file = tmp_path / "labels.jsonl"
+
+    with pytest.warns(loaders.LossyOutputWarning, match=r"column label"):
+        loaders.DataFrameJSONL().save(frame, jsonl_file)
+
+    assert jsonl_file.read_text() == frame.to_json(lines=True, orient="records")
+    pandas.testing.assert_frame_equal(
+        loaders.DataFrameJSONL().load(jsonl_file),
+        pandas.read_json(jsonl_file, lines=True, orient="records", convert_dates=False),
+    )
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
         pytest.param(pandas.DataFrame({"__pivot_dataframe_metadata__": [1, 2]}), id="only"),
         pytest.param(
             pandas.DataFrame({"__pivot_dataframe_metadata__": ["a", "b"], "n": [1, 2]}),

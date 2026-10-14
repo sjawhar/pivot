@@ -484,7 +484,8 @@ def _restore_temporal_jsonl_column(
     return pandas.Series(parsed.dt.tz_convert(timezone))
 
 
-_JsonlHeader = tuple[list[tuple[str, str]], dict[str, collections_abc.Mapping[str, object]]]
+# Columns as (label, dtype) in order; a label is an int when its entry says "label": "int".
+_JsonlHeader = tuple[list[tuple[str | int, str]], dict[str, collections_abc.Mapping[str, object]]]
 
 
 def _parse_jsonl_header(record: object, path: pathlib.Path) -> _JsonlHeader | None:
@@ -510,14 +511,19 @@ def _parse_jsonl_header(record: object, path: pathlib.Path) -> _JsonlHeader | No
     raw_columns = metadata["columns"]
     if not isinstance(raw_columns, list):
         raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
-    columns = list[tuple[str, str]]()
+    columns = list[tuple[str | int, str]]()
     for raw_column in cast("list[object]", raw_columns):
         column = cast("dict[object, object]", raw_column) if isinstance(raw_column, dict) else {}
         name = column.get("name")
         dtype = column.get("dtype")
-        if not isinstance(name, str) or not isinstance(dtype, str):
+        label_type = column.get("label", "str")
+        if (
+            not isinstance(name, str)
+            or not isinstance(dtype, str)
+            or label_type not in ("str", "int")
+        ):
             raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
-        columns.append((name, dtype))
+        columns.append((int(name) if label_type == "int" else name, dtype))
     raw_temporal = metadata["temporal_columns"]
     if not isinstance(raw_temporal, dict):
         raise ValueError(f"Invalid DataFrameJSONL temporal metadata at {path}")
@@ -543,18 +549,18 @@ def _write_text_atomically(path: pathlib.Path, chunks: collections_abc.Iterable[
         raise
 
 
+_PICK_ANOTHER_FORMAT = (
+    "or pick another format for this output, e.g. Annotated[pd.DataFrame, Pickle()]."
+)
+
+
 def _write_old_jsonl_format(
-    data: pandas.DataFrame, path: pathlib.Path, column: str, error: TypeError
+    data: pandas.DataFrame, path: pathlib.Path, message: str, error: Exception
 ) -> None:
     """Write the headerless pandas JSONL Pivot wrote before, with a warning.
 
     A value the old writer also refused is still refused.
     """
-    message = (
-        f"DataFrameJSONL cannot write column {column!r}: {error}. Convert it to "
-        + "str/int/float/bool/list/dict values, or pick another format for this "
-        + "output, e.g. Annotated[pd.DataFrame, Pickle()]."
-    )
     try:
         content = data.to_json(lines=True, orient="records")
     except (TypeError, ValueError, OverflowError):
@@ -586,7 +592,8 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     so external inputs give the same values they always did. The exactness below
     applies to files Pivot writes with the header.
 
-    - a zero-row frame keeps its columns and dtypes.
+    - a zero-row frame keeps its columns and dtypes; str and int column labels
+      come back with their type.
 
     - floats: written as the shortest exact text, read back bit-identical
       (NaN and +/-inf are written as ``null`` and read back as NaN).
@@ -597,11 +604,13 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
       metadata, including all-null columns.
     - strings remain strings, including ISO-shaped strings.
 
-    A column the exact format cannot hold (``Decimal``, ``set``, ``bytes`` or other
-    object cells, a timezone that cannot be rebuilt from its name) is written in
-    the old headerless pandas format with a ``LossyOutputWarning`` naming the
-    column; a column that format also cannot hold raises ``TypeError``. Saves
-    atomically via temp file + rename.
+    A frame the exact format cannot hold is written in the old headerless pandas
+    format with a ``LossyOutputWarning`` naming the column or label: ``Decimal``,
+    ``set``, ``bytes`` or other object cells, a timezone that cannot be rebuilt from
+    its name, datetimes with mixed UTC offsets, a date outside the nanosecond range,
+    a label that is neither str nor int, or an int and a str label with the same text.
+    A frame that format also cannot hold raises ``TypeError``. Saves atomically via
+    temp file + rename.
     """
 
     @override
@@ -633,16 +642,17 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
                 if max_rows is not None and len(records) >= max_rows:
                     break
         columns, temporal_columns = header
+        labels = [label for label, _ in columns]
         if not records:
             # No row records carry the keys, so the header alone gives the schema.
             return pandas.DataFrame(
                 {
-                    name: pandas.Series([], dtype=pandas.api.types.pandas_dtype(dtype))
-                    for name, dtype in columns
+                    label: pandas.Series([], dtype=pandas.api.types.pandas_dtype(dtype))
+                    for label, dtype in columns
                 }
             )
         frame = pandas.DataFrame(records)
-        names = [name for name, _ in columns]
+        names = [str(label) for label in labels]
         if list(frame.columns) != names:
             raise ValueError(
                 f"DataFrameJSONL rows at {path} have columns {list(frame.columns)}, "
@@ -650,11 +660,12 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             )
         for name, metadata in temporal_columns.items():
             frame[name] = _restore_temporal_jsonl_column(frame[name], metadata)
-        for name, dtype in columns:
+        for name, (_, dtype) in zip(names, columns, strict=True):
             # An all-null float column has only nulls in its rows; restore its dtype.
             float_dtype = pandas.api.types.pandas_dtype(dtype)
             if pandas.api.types.is_float_dtype(float_dtype):
                 frame[name] = frame[name].astype(float_dtype)
+        frame.columns = pandas.Index(labels)
         return frame
 
     def row_count(self, path: pathlib.Path) -> int:
@@ -685,20 +696,52 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             )
 
         encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"), default=_json_default)
+        names = list[str]()
+        column_schema = list[dict[str, str]]()
+        # Stubs type labels as str; at runtime a label is any hashable. tolist() turns
+        # numpy integer labels into Python ints.
+        for label in cast("list[object]", data.columns.tolist()):
+            if isinstance(label, int) and not isinstance(label, bool):
+                names.append(str(label))
+                column_schema.append({"name": names[-1], "label": "int"})
+            elif isinstance(label, str):
+                names.append(label)
+                column_schema.append({"name": label})
+            else:
+                message = (
+                    f"DataFrameJSONL cannot write column label {label!r} "
+                    + f"({type(label).__name__}): labels must be str or int. Rename the "
+                    + f"column, {_PICK_ANOTHER_FORMAT}"
+                )
+                _write_old_jsonl_format(data, path, message, TypeError(message))
+                return
+        if len(set(names)) != len(names):
+            colliding = sorted({name for name in names if names.count(name) > 1})
+            message = (
+                f"DataFrameJSONL cannot write column labels {colliding}: an int and a str "
+                + f"label share the same JSON key. Rename one, {_PICK_ANOTHER_FORMAT}"
+            )
+            _write_old_jsonl_format(data, path, message, TypeError(message))
+            return
+
         keys = list[str]()
         columns = list[list[str]]()
-        column_schema = list[dict[str, str]]()
         temporal_columns = dict[str, dict[str, object]]()
-        for name in data.columns:
-            string_name = str(name)
+        for position, (string_name, schema) in enumerate(zip(names, column_schema, strict=True)):
             try:
-                column, written_dtype, temporal_metadata = _encode_jsonl_column(data[name], encoder)
+                column, written_dtype, temporal_metadata = _encode_jsonl_column(
+                    data.iloc[:, position], encoder
+                )
             except TypeError as e:
-                _write_old_jsonl_format(data, path, string_name, e)
+                message = (
+                    f"DataFrameJSONL cannot write column {string_name!r}: {e}. Convert it to "
+                    + f"str/int/float/bool/list/dict values, {_PICK_ANOTHER_FORMAT}"
+                )
+                _write_old_jsonl_format(data, path, message, e)
                 return
             columns.append(column)
             keys.append(encoder.encode(string_name) + ":")
-            column_schema.append({"name": string_name, "dtype": written_dtype})
+            schema["dtype"] = written_dtype
             if temporal_metadata is not None:
                 temporal_columns[string_name] = temporal_metadata
 
