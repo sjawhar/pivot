@@ -262,6 +262,51 @@ def test_distinct_partial_arguments_have_distinct_fingerprints(
     assert first_args != second_args
 
 
+class _Item(pydantic.BaseModel):
+    name: str = "none"
+
+
+def test_model_class_partial_argument_is_hashed_as_a_class() -> None:
+    """A pydantic model class is a leaf: only an instance has model_dump() to call."""
+
+    def build(model: type[pydantic.BaseModel]) -> pydantic.BaseModel:
+        return model()
+
+    bound = functools.partial(build, _Item)
+
+    def stage() -> pydantic.BaseModel:
+        return bound()
+
+    manifest = fingerprint.get_stage_fingerprint(stage)
+
+    assert any(key.endswith(".args") for key in manifest)
+
+
+class _OtherItem(pydantic.BaseModel):
+    name: str = "other"
+
+
+@pytest.mark.filterwarnings("ignore::pydantic.json_schema.PydanticJsonSchemaWarning")
+def test_stage_params_field_defaulting_to_a_class_is_hashed() -> None:
+    """Pydantic leaves a class default out of the schema; the defaults hash still has it."""
+
+    class ItemParams(pydantic.BaseModel):
+        model: type[pydantic.BaseModel] = _Item
+
+    class OtherParams(pydantic.BaseModel):
+        model: type[pydantic.BaseModel] = _OtherItem
+
+    def item_stage(params: ItemParams) -> None:
+        pass
+
+    def other_stage(params: OtherParams) -> None:
+        pass
+
+    item_schema = fingerprint.get_stage_fingerprint(item_stage)[_schema_key(ItemParams)]
+    other_schema = fingerprint.get_stage_fingerprint(other_stage)[_schema_key(OtherParams)]
+    assert item_schema != other_schema
+
+
 # --- In-process tests for Pydantic default_factory with builtins ---
 
 

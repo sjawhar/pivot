@@ -1335,9 +1335,10 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
     Collections become `[type, items]` nodes, so a set stays distinct from a list or from a
     string that looks like one. Set members and dict entries are sorted by their full
     canonical JSON text: a set's iteration order, and a dict built from a set, follow the
-    hash seed. Other leaves keep their `repr`, tagged with their type.
+    hash seed. Other leaves keep their `repr`, tagged with their type. A class is a leaf, even
+    a pydantic model class: only an instance is dumped.
     """
-    if hasattr(value, "model_dump"):
+    if hasattr(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump())
     if isinstance(value, dict):
         entries = [

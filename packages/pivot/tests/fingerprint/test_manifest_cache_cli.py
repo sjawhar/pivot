@@ -472,3 +472,68 @@ def test_artifact_handle_default_is_wired_as_an_input(tmp_path: pathlib.Path) ->
     (root / "data/raw/t.csv").write_text("a\n5\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
     assert (root / "data/h/scale.jsonl").read_text() == '{"a":15}\n', output
+
+
+_LOADER_CONFIG_PIPELINE = """\
+import dataclasses
+import json
+import pathlib
+from typing import Annotated
+
+import pydantic
+
+from pivot import Pipeline, loaders, stage
+
+
+class Item(pydantic.BaseModel):
+    name: str = "none"
+
+
+def make_empty() -> dict:
+    return {}
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelJSON(loaders.Loader[dict, dict]):
+    model: type[pydantic.BaseModel] = Item
+
+    def load(self, path: pathlib.Path) -> dict:
+        return self.model.model_validate_json(path.read_text()).model_dump()
+
+    def save(self, data: dict, path: pathlib.Path) -> None:
+        path.write_text(json.dumps(self.model.model_validate(data).model_dump()))
+
+
+@stage
+def make(raw: dict) -> Annotated[dict, LOADER]:
+    return {"name": "x"}
+
+
+with Pipeline("m") as pipeline:
+    make(pipeline.input("t.json", format=loaders.JSON()))
+"""
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [
+        pytest.param("loaders.JSON(empty_factory=Item)", id="json-model-class"),
+        pytest.param("loaders.YAML(empty_factory=Item)", id="yaml-model-class"),
+        pytest.param("ModelJSON()", id="custom-loader-model-field"),
+    ],
+)
+def test_loader_config_with_model_class_stays_cached(tmp_path: pathlib.Path, loader: str) -> None:
+    """A pydantic model class in a loader's config is hashed as a class, not dumped."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _LOADER_CONFIG_PIPELINE.replace("LOADER", loader),
+            "data/raw/t.json": "{}\n",
+        },
+    )
+
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in first, first
+
+    second = _helper_ok(_helper_pivot(root, "repro"))
+    assert "0 ran, 1 cached" in second, second
