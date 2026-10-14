@@ -182,7 +182,7 @@ async def test_poller_converts_engine_state_idle_to_watch(tmp_path: Path) -> Non
     server.inject_event(
         {
             "type": "engine_state_changed",
-            "new_state": "idle",
+            "state": "idle",
         }
     )
 
@@ -219,7 +219,7 @@ async def test_poller_ignores_engine_state_active(tmp_path: Path) -> None:
     server.inject_event(
         {
             "type": "engine_state_changed",
-            "new_state": "active",
+            "state": "active",
         }
     )
 
@@ -244,6 +244,40 @@ async def test_poller_ignores_engine_state_active(tmp_path: Path) -> None:
 
     # Only the polling continues, no messages from "active" state
     assert all(m.get("type") != TuiMessageType.WATCH for m in messages)  # type: ignore[union-attr]
+
+
+def test_engine_idle_event_from_the_wire_becomes_waiting_watch_message() -> None:
+    """A real EngineStateChanged(IDLE), encoded as the RPC server sends it, sets watch status."""
+    import json
+
+    from pivot.engine import agent_rpc
+    from pivot.engine.types import EngineState, EngineStateChanged
+    from pivot_tui import event_poller
+
+    event = EngineStateChanged(type="engine_state_changed", seq=7, state=EngineState.IDLE)
+    wire = json.loads(agent_rpc._encode_wire(event))
+
+    msg = event_poller._convert_event(wire)
+
+    assert msg is not None
+    assert msg["type"] == TuiMessageType.WATCH
+    assert msg["status"] == WatchStatus.WAITING
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param({"type": "engine_state_changed"}, id="missing-state"),
+        pytest.param({"type": "engine_state_changed", "state": "paused"}, id="unknown-state"),
+    ],
+)
+def test_malformed_engine_state_event_raises(event: dict[str, object]) -> None:
+    """A malformed engine_state_changed is an error, never a silent no-op."""
+    from pivot_tui import event_poller
+    from pivot_tui.rpc_client_impl import RpcProtocolError
+
+    with pytest.raises((KeyError, RpcProtocolError)):
+        event_poller._convert_event(event)
 
 
 @pytest.mark.anyio

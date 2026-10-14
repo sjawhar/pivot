@@ -271,9 +271,11 @@ def _make_log_message(event: dict[str, object]) -> TuiLogMessage | None:
 
 
 def _make_watch_message(event: dict[str, object]) -> TuiWatchMessage | None:
-    new_state = event.get("new_state")
-    if new_state != "idle":
+    state = event["state"]
+    if state == "active":
         return None
+    if state != "idle":
+        raise RpcProtocolError("'idle' or 'active' (state)", repr(state))
     return TuiWatchMessage(
         type=TuiMessageType.WATCH,
         status=WatchStatus.WAITING,

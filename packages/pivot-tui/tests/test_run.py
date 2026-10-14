@@ -608,6 +608,32 @@ async def test_watch_tui_app_with_tui_log(
 
 
 @pytest.mark.asyncio
+async def test_watch_tui_title_returns_to_watching_when_engine_goes_idle() -> None:
+    """The engine's idle event, as the poller converts it from the wire, resets the title."""
+    import json
+
+    from pivot.engine import agent_rpc
+    from pivot.engine.types import EngineState, EngineStateChanged
+    from pivot_tui import event_poller
+
+    wire = json.loads(
+        agent_rpc._encode_wire(
+            EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
+        )
+    )
+    msg = event_poller._convert_event(wire)
+    assert msg is not None, "the idle event must reach the TUI"
+
+    app = run_tui.PivotApp(stage_names=["demo/a"], watch_mode=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.title = "[▶] demo/a running"
+        app.post_message(run_tui.TuiUpdate(msg))
+        await pilot.pause()
+        assert app.title.endswith("[●] Watching for changes...")
+
+
+@pytest.mark.asyncio
 async def test_watch_tui_shows_invalid_pipeline_until_next_good_reload() -> None:
     """A reload error stays on screen until a reload loads a good pipeline."""
     import textual.widgets
