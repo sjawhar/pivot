@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import difflib
 import hashlib
 import json
 import logging
-import types
 import typing
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
@@ -112,40 +112,41 @@ def _override_errors(
 
     Returns (params.yaml key, message) for each error, naming the key that gave the field:
     the variant's own key when it sets the field, otherwise the base key. An unknown key is
-    refused at any depth unless its model sets ``extra="allow"``: pydantic reports it for a
-    model that forbids extra fields, and the walk here for one that would ignore it.
+    refused at any depth unless its model sets ``extra="allow"``; the walk in
+    ``_merge_overrides`` finds them, so values are then checked with ``extra="ignore"``. When
+    that check passes, the walk saw every mapping's model, so it saw every unknown key.
     """
     params_cls = type(params)
-    found = list[tuple[str, str]]()
+    unknown: _UnknownKeys = []
     set_twice = list[tuple[str, str]]()
-    owners = dict[tuple[int | str, ...], type[pydantic.BaseModel]]()
-    for key in _override_keys(stage_name):
-        unknown: _KeyPaths = []
-        try:
-            _ = _rename_fields(params_cls, overrides.get(key, {}), unknown)
-        except exceptions.ParamsError as exc:
-            set_twice.append((key, f"params.yaml key '{key}': {exc}"))
-            continue
-        for path, owner in unknown:
-            owners[path] = owner
-            if owner.model_config.get("extra") not in ("allow", "forbid"):
-                found.append((key, _unknown_field_message(key, path, owner)))
+    data = _merge_overrides(
+        params_cls,
+        params.model_dump(round_trip=True, by_alias=False),
+        params,
+        stage_name,
+        overrides,
+        unknown,
+        set_twice,
+    )
     if set_twice:
         return set_twice
+    found = list[tuple[str, str]]()
     try:
-        _ = apply_overrides(params, stage_name, overrides)
+        _ = params_cls.model_validate(data, by_alias=True, by_name=True, extra="ignore")
     except pydantic.ValidationError as exc:
         for error in exc.errors():
             loc = error["loc"]
             key = _override_key(params_cls, stage_name, loc[0] if loc else None, overrides)
-            if error["type"] == "extra_forbidden" and loc in owners:
-                found.append((key, _unknown_field_message(key, loc, owners[loc])))
-                continue
             path = ".".join(str(part) for part in loc)
             detail = (
                 f"value {error['input']!r} is invalid for {params_cls.__name__}: " + error["msg"]
             )
             found.append((key, f"params.yaml key '{key}': field '{path}' {detail}"))
+    found.extend(
+        (key, _unknown_field_message(key, path, owner))
+        for key, path, owner in unknown
+        if owner.model_config.get("extra") != "allow"
+    )
     return found
 
 
@@ -244,31 +245,15 @@ def build_params_instance[T: pydantic.BaseModel](
 
     Raises:
         pydantic.ValidationError: If required fields missing or type mismatch
+        ParamsError: One key sets a field twice, by its name and by an alias.
     """
     if overrides is None:
         return params_cls()
-
-    merged_overrides = _get_merged_overrides(params_cls, stage_name, overrides)
-    return params_cls.model_validate(merged_overrides, by_alias=False, by_name=True)
-
-
-def _get_merged_overrides(
-    model: type[pydantic.BaseModel], stage_name: str, overrides: ParamsOverrides
-) -> dict[str, Any]:
-    """Get merged overrides for a stage, keyed by field name, base-name overrides first.
-
-    Each key's fields are renamed from alias to name before merging, so a variant's
-    ``learning_rate:`` replaces its base key's ``lr:``. Deep-copies values from overrides to
-    prevent mutation of shared structures.
-
-    Raises:
-        ParamsError: One key sets a field twice, by its name and by an alias.
-    """
-    merged = dict[str, Any]()
-    for key in _override_keys(stage_name):
-        renamed = _rename_fields(model, copy.deepcopy(overrides.get(key, {})))
-        merged = _params_merger.merge(merged, renamed)
-    return merged
+    set_twice = list[tuple[str, str]]()
+    data = _merge_overrides(params_cls, {}, None, stage_name, overrides, [], set_twice)
+    if set_twice:
+        raise exceptions.ParamsError("; ".join(message for _, message in set_twice))
+    return params_cls.model_validate(data, by_alias=True, by_name=True)
 
 
 def apply_overrides[T: pydantic.BaseModel](
@@ -283,7 +268,8 @@ def apply_overrides[T: pydantic.BaseModel](
     2. Full variant name overrides (e.g., 'demo/process@v1' for one variant)
 
     Nested BaseModel fields are merged recursively - only specified keys are
-    overridden, preserving unspecified nested values.
+    overridden, preserving unspecified nested values. A field may be spelled by its name
+    or any of its aliases, at any depth.
 
     Args:
         params_instance: Existing Pydantic model instance
@@ -292,22 +278,139 @@ def apply_overrides[T: pydantic.BaseModel](
 
     Returns:
         New instance with overrides applied (original unchanged)
+
+    Raises:
+        pydantic.ValidationError: The merged values fail validation.
+        ParamsError: One key sets a field twice, by its name and by an alias.
     """
-    if overrides is None:
+    if overrides is None or not any(key in overrides for key in _override_keys(stage_name)):
         return params_instance
 
     params_cls = type(params_instance)
-    merged_overrides = _get_merged_overrides(params_cls, stage_name, overrides)
-    if not merged_overrides:
-        return params_instance
+    set_twice = list[tuple[str, str]]()
+    # The round-trip dump is keyed by field name (by_alias=False holds even when the model
+    # serializes by alias) and leaves out computed fields, which a model that forbids extra
+    # fields would refuse.
+    data = _merge_overrides(
+        params_cls,
+        params_instance.model_dump(round_trip=True, by_alias=False),
+        params_instance,
+        stage_name,
+        overrides,
+        [],
+        set_twice,
+    )
+    if set_twice:
+        raise exceptions.ParamsError("; ".join(message for _, message in set_twice))
+    return params_cls.model_validate(data, by_alias=True, by_name=True)
 
-    # Everything is keyed by field name and validated by name only, so any alias form works:
-    # a string alias, AliasChoices, an AliasPath. The round-trip dump leaves out computed
-    # fields, which a model that forbids extra fields would refuse; by_alias=False holds even
-    # when the model serializes by alias.
-    base_dict = params_instance.model_dump(round_trip=True, by_alias=False)
-    merged = _params_merger.merge(base_dict, merged_overrides)
-    return params_cls.model_validate(merged, by_alias=False, by_name=True)
+
+# (params.yaml key, path of field names, list indexes and dict keys, model the key was given to)
+type _UnknownKeys = list[tuple[str, tuple[int | str, ...], type[pydantic.BaseModel]]]
+
+
+def _merge_overrides(
+    params_cls: type[pydantic.BaseModel],
+    data: dict[str, Any],
+    structure: object,
+    stage_name: str,
+    overrides: ParamsOverrides,
+    unknown: _UnknownKeys,
+    set_twice: list[tuple[str, str]],
+) -> dict[str, Any]:
+    """Deep-merge the stage's params.yaml keys, base key first, into ``data``.
+
+    The merge needs one spelling per field, so a variant's ``learning_rate:`` replaces its
+    base key's ``lr:``. Each key's value is first merged as written and validated with
+    ``extra="ignore"``, only to learn its structure: which model each mapping became, and
+    which union arm was taken. ``_normalize`` then walks the value beside that structure.
+    When the merged value fails validation, the keys that failed are left out of the
+    structure, so one bad value does not hide a typo elsewhere; the final validation
+    reports the value. Unknown keys go to ``unknown`` and fields set twice to ``set_twice``.
+    Deep-copies values from overrides to prevent mutation of shared structures.
+    """
+    for key in _override_keys(stage_name):
+        if key not in overrides:
+            continue
+        raw = copy.deepcopy(overrides[key])
+        try:
+            structure = _structure_of(params_cls, data, raw)
+        except pydantic.ValidationError as exc:
+            failed = {error["loc"][0] for error in exc.errors() if error["loc"]}
+            kept = {name: value for name, value in raw.items() if name not in failed}
+            with contextlib.suppress(pydantic.ValidationError):
+                structure = _structure_of(params_cls, data, kept)
+        twice = list[str]()
+        normalized = _normalize(raw, structure, key, (), unknown, twice)
+        set_twice.extend((key, f"params.yaml key '{key}': {message}") for message in twice)
+        data = _params_merger.merge(data, normalized)
+    return data
+
+
+def _structure_of(
+    params_cls: type[pydantic.BaseModel], data: dict[str, Any], raw: dict[str, Any]
+) -> pydantic.BaseModel:
+    candidate = _params_merger.merge(copy.deepcopy(data), copy.deepcopy(raw))
+    return params_cls.model_validate(candidate, by_alias=True, by_name=True, extra="ignore")
+
+
+def _normalize(
+    value: Any,
+    structure: object,
+    key: str,
+    path: tuple[int | str, ...],
+    unknown: _UnknownKeys,
+    twice: list[str],
+) -> Any:
+    """Return ``value`` with each mapping that became a model keyed by field name.
+
+    ``structure`` is what ``value`` validated to. A mapping beside a model has each key that
+    is a field's alias renamed to the field's name; a key that names no field is kept, so
+    validation sees it, and added to ``unknown``. Lists and tuples pair by position, dicts
+    by key. Anything else is returned as written.
+    """
+    if isinstance(value, dict) and isinstance(structure, pydantic.BaseModel):
+        model = type(structure)
+        fields = model.model_fields
+        names = {alias: name for name, info in fields.items() for alias in _input_aliases(info)}
+        normalized = dict[str, Any]()
+        spelled = dict[str, str]()
+        for item_key, item in cast("dict[str, Any]", value).items():
+            name = item_key if item_key in fields else names.get(item_key)
+            if name is None:
+                normalized[item_key] = item
+                unknown.append((key, (*path, item_key), model))
+                continue
+            if name in spelled:
+                field_path = ".".join(str(part) for part in (*path, name))
+                twice.append(
+                    f"field '{field_path}' is set twice, as '{spelled[name]}' and as '{item_key}'"
+                )
+                continue
+            spelled[name] = item_key
+            nested = getattr(structure, name, None)
+            normalized[name] = _normalize(item, nested, key, (*path, name), unknown, twice)
+        return normalized
+    if isinstance(value, dict) and isinstance(structure, dict):
+        held = cast("dict[Any, Any]", structure)
+        return {
+            item_key: _normalize(item, held.get(item_key), key, (*path, item_key), unknown, twice)
+            for item_key, item in cast("dict[Any, Any]", value).items()
+        }
+    if isinstance(value, (list, tuple)) and isinstance(structure, (list, tuple)):
+        held_items = list(cast("list[Any] | tuple[Any, ...]", structure))
+        return [
+            _normalize(
+                item,
+                held_items[index] if index < len(held_items) else None,
+                key,
+                (*path, index),
+                unknown,
+                twice,
+            )
+            for index, item in enumerate(cast("list[Any] | tuple[Any, ...]", value))
+        ]
+    return cast("Any", value)
 
 
 def _input_aliases(field: pydantic.fields.FieldInfo) -> list[str]:
@@ -319,84 +422,6 @@ def _input_aliases(field: pydantic.fields.FieldInfo) -> list[str]:
     if isinstance(alias, pydantic.AliasChoices):
         return [choice for choice in alias.choices if isinstance(choice, str)]
     return []
-
-
-def _nested_model(annotation: object) -> type[pydantic.BaseModel] | None:
-    """Return the model a field holds as ``M`` or ``M | None``, or None."""
-    if isinstance(annotation, type) and issubclass(annotation, pydantic.BaseModel):
-        return annotation
-    origin = typing.get_origin(annotation)
-    if origin is types.UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] - runtime identity check
-        models = [m for arg in typing.get_args(annotation) if (m := _nested_model(arg)) is not None]
-        if len(models) == 1:
-            return models[0]
-    return None
-
-
-type _KeyPaths = list[tuple[tuple[int | str, ...], type[pydantic.BaseModel]]]
-
-
-def _rename_fields(
-    model: type[pydantic.BaseModel],
-    values: dict[str, Any],
-    unknown: _KeyPaths | None = None,
-    path: tuple[int | str, ...] = (),
-) -> dict[str, Any]:
-    """Key ``values`` by field name, through nested models.
-
-    A key may be a field's name or one of its input aliases. Keys that name no field are
-    kept, so validation sees them, and each is added to ``unknown`` with its path (field
-    names, list indexes, dict keys) and the model it was given to.
-
-    Raises:
-        ParamsError: ``values`` sets one field under two of its keys.
-    """
-    fields = model.model_fields
-    names = {alias: name for name, field in fields.items() for alias in _input_aliases(field)}
-    renamed = dict[str, Any]()
-    spelled = dict[str, str]()
-    for key, value in values.items():
-        name = key if key in fields else names.get(key)
-        if name is None:
-            renamed[key] = value
-            if unknown is not None:
-                unknown.append(((*path, key), model))
-            continue
-        if name in spelled:
-            raise exceptions.ParamsError(
-                f"field '{name}' is set twice, as '{spelled[name]}' and as '{key}'"
-            )
-        spelled[name] = key
-        renamed[name] = _rename_nested(fields[name].annotation, value, unknown, (*path, name))
-    return renamed
-
-
-def _rename_nested(
-    annotation: object, value: Any, unknown: _KeyPaths | None, path: tuple[int | str, ...]
-) -> Any:
-    """Apply ``_rename_fields`` inside a value held as ``M``, ``M | None``, a sequence of M,
-    or a dict of M."""
-    model = _nested_model(annotation)
-    if model is not None:
-        if isinstance(value, dict):
-            return _rename_fields(model, cast("dict[str, Any]", value), unknown, path)
-        return value
-    origin, args = typing.get_origin(annotation), typing.get_args(annotation)
-    if origin in (list, tuple) and args and isinstance(value, (list, tuple)):
-        item_type = args[0] if origin is list or args[1:] == (Ellipsis,) else None
-        if item_type is not None:
-            items: list[Any] = list(cast("list[Any]", value))
-            return [
-                _rename_nested(item_type, item, unknown, (*path, index))
-                for index, item in enumerate(items)
-            ]
-    if origin is dict and len(args) == 2 and isinstance(value, dict):
-        entries = cast("dict[Any, Any]", value)
-        return {
-            key: _rename_nested(args[1], item, unknown, (*path, key))
-            for key, item in entries.items()
-        }
-    return cast("Any", value)
 
 
 def validate_params_cls(params_cls: object) -> TypeGuard[type[pydantic.BaseModel]]:

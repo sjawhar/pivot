@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import collections.abc  # noqa: TC003 - pydantic resolves the field annotations at runtime
 import hashlib
 import json
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar, cast
 
 import pydantic
 import pytest
@@ -581,6 +582,108 @@ def test_load_params_yaml_accepts_an_aliased_field_by_either_name(tmp_path: Path
     assert parameters.get_effective_params(
         pipeline.get_stage("a/_aliased_stage")["params"], "a/_aliased_stage", overrides
     ) == {"learning_rate": 0.2, "epochs": 3, "optimizer": {"momentum": 0.1}}
+
+
+class _Head(BaseModel):
+    size: int = pydantic.Field(8, alias="sz")
+
+
+class _ShapesParams(stage_def.StageParams):
+    maybe: list[_Head] | None = None
+    seq: collections.abc.Sequence[_Head] = ()
+    pair: tuple[_Head, _Head] = (_Head.model_validate({}), _Head.model_validate({}))
+    annotated: list[Annotated[_Head, pydantic.Field(description="a head")]] = []
+    either: _Head | int = 0
+
+
+_SHAPES: list[tuple[str, object, str]] = [
+    ("maybe", [{}], "maybe.0"),
+    ("seq", [{}], "seq.0"),
+    ("pair", [{"size": 1}, {}], "pair.1"),
+    ("annotated", [{}], "annotated.0"),
+    ("either", {}, "either"),
+]
+_SHAPE_IDS = ["list-or-none", "sequence", "fixed-tuple", "annotated-items", "model-or-int"]
+
+
+def _with_key(value: object, key: str, item: object) -> object:
+    """``value`` with ``key: item`` added to its last mapping."""
+    if isinstance(value, dict):
+        return {**value, key: item}
+    items = list(cast("list[dict[str, object]]", value))
+    return [*items[:-1], {**items[-1], key: item}]
+
+
+@pytest.mark.parametrize(("field", "value", "path"), _SHAPES, ids=_SHAPE_IDS)
+def test_typo_inside_a_model_in_any_container_shape_is_refused(
+    field: str, value: object, path: str
+) -> None:
+    errors = parameters._override_errors(
+        _ShapesParams(), "p/s", {"p/s": {field: _with_key(value, "siez", 3)}}
+    )
+
+    assert errors == [
+        (
+            "p/s",
+            f"params.yaml key 'p/s': field '{path}.siez' is not a field of _Head; "
+            + "did you mean 'size' or 'sz'?",
+        )
+    ]
+
+
+@pytest.mark.parametrize(("field", "value", "path"), _SHAPES, ids=_SHAPE_IDS)
+@pytest.mark.parametrize("spelling", ["sz", "size"])
+def test_alias_inside_a_model_in_any_container_shape_applies(
+    field: str, value: object, path: str, spelling: str
+) -> None:
+    del path
+    override = {"p/s": {field: _with_key(value, spelling, 16)}}
+
+    assert parameters._override_errors(_ShapesParams(), "p/s", override) == []
+    effective = parameters.apply_overrides(_ShapesParams(), "p/s", override)
+    held = getattr(effective, field)
+    last = held if isinstance(held, _Head) else list(held)[-1]
+    assert last.size == 16
+
+
+@pytest.mark.parametrize(("field", "value", "path"), _SHAPES, ids=_SHAPE_IDS)
+def test_nested_field_set_by_name_and_alias_in_any_container_shape_is_refused(
+    field: str, value: object, path: str
+) -> None:
+    both = _with_key(_with_key(value, "sz", 1), "size", 2)
+
+    assert parameters._override_errors(_ShapesParams(), "p/s", {"p/s": {field: both}}) == [
+        ("p/s", f"params.yaml key 'p/s': field '{path}.size' is set twice, as 'sz' and as 'size'")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("base", "variant", "expected"),
+    [
+        ({"lr": 0.2}, {"learning_rate": 0.3}, 0.3),
+        ({"learning_rate": 0.2}, {"lr": 0.3}, 0.3),
+    ],
+    ids=["base-by-alias", "base-by-name"],
+)
+def test_variant_key_replaces_base_key_whichever_spells_the_field(
+    base: dict[str, object], variant: dict[str, object], expected: float
+) -> None:
+    overrides = {"p/s": base, "p/s@v": variant}
+    params = _AliasedParams(lr=0.5)
+
+    assert parameters._override_errors(params, "p/s@v", overrides) == []
+    assert parameters.get_effective_params(params, "p/s@v", overrides)["learning_rate"] == expected
+    assert parameters.get_effective_params(params, "p/s", overrides)["learning_rate"] == 0.2
+
+
+def test_variant_key_replaces_base_key_spelling_a_nested_field_differently() -> None:
+    overrides = {"p/s": {"optimizer": {"mom": 0.1}}, "p/s@v": {"optimizer": {"momentum": 0.2}}}
+    params = _AliasedParams(lr=0.5)
+
+    assert parameters._override_errors(params, "p/s@v", overrides) == []
+    assert parameters.get_effective_params(params, "p/s@v", overrides)["optimizer"] == {
+        "momentum": 0.2
+    }
 
 
 # -----------------------------------------------------------------------------
