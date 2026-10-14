@@ -158,7 +158,7 @@ def _helper_discover(root: pathlib.Path) -> PipelineLike:
 
 async def _helper_wait_until_watching(eng: engine_mod.Engine) -> None:
     """Return once the engine's startup snapshot is done and its file watcher is running."""
-    await eng.wait_for_startup_fingerprints()
+    await eng.wait_for_fingerprints()
     await anyio.wait_all_tasks_blocked()
 
 
@@ -429,6 +429,85 @@ async def test_watched_startup_serves_rpc_while_fingerprinting(
     assert sorted(calls) == ["reload/change", "reload/keep", "reload/other"], (
         "each stage is fingerprinted exactly once, even with explain issued mid-snapshot"
     )
+
+
+@pytest.mark.anyio
+async def test_reload_fingerprints_off_the_event_loop(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While a reload imports and fingerprints slowly, the RPC server keeps answering.
+
+    ``status`` answers within 1 s mid-reload, and ``run`` and ``commit`` are refused at once
+    with -32004 "Engine is reloading" until the new pipeline is in.
+    """
+    from pivot import registry
+
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
+    pipeline = _helper_discover(watch_project)
+    recorder = _Recorder()
+    socket_path = watch_project / "rpc.sock"
+    ready = threading.Event()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        handler = agent_rpc.AgentRpcHandler(engine=eng)
+        eng.add_source(
+            agent_rpc.AgentRpcSource(socket_path=socket_path, handler=handler, ready=ready)
+        )
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            client = rpc_client_impl.RpcPivotClient()
+            with anyio.fail_after(5):
+                while not ready.is_set():
+                    await anyio.sleep(0.01)
+                await client.connect(socket_path)
+            await _helper_wait_until_watching(eng)
+
+            compute = registry._compute_fingerprint
+            reload_started = threading.Event()
+            finished = list[str]()
+
+            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+                reload_started.set()
+                time.sleep(1.0)
+                finished.append(stage_name)
+                return compute(stage_name, info)
+
+            monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
+            pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
+            try:
+                with anyio.fail_after(10):
+                    while not reload_started.is_set():
+                        await anyio.sleep(0.01)
+
+                start = time.monotonic()
+                with anyio.fail_after(5):
+                    status = await client.status()
+                assert time.monotonic() - start < 1.0, "status answers within 1 s mid-reload"
+                assert status["state"] == "idle"
+                assert len(finished) < 3, "status answered while the reload still fingerprints"
+
+                for request in (client.run(force=True), client.commit()):
+                    with anyio.fail_after(1), pytest.raises(rpc_client_impl.RpcError) as refused:
+                        await request
+                    assert refused.value.code == -32004
+                    assert "Engine is reloading" in refused.value.message
+                assert len(finished) < 3, "run and commit were refused before the reload ended"
+            finally:
+                await client.disconnect()
+
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            reload_event = recorder.events[reload_index]
+            assert reload_event["type"] == "pipeline_reloaded"
+            assert reload_event["stages_added"] == ["reload/added"]
+            assert reload_event["stages_removed"] == ["reload/removed"]
+            done = await recorder.wait_for(_helper_completes("reload/added"), start=reload_index)
+            await recorder.wait_for(_helper_is_idle, start=done)
+            assert not eng.is_reloading, "the reload ends once its re-run has started"
+            tg.cancel_scope.cancel()
 
 
 @pytest.mark.anyio

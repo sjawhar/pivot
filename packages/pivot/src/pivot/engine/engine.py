@@ -196,6 +196,8 @@ class Engine:
     # Why the pipeline is invalid: set by the startup snapshot or any rejected reload, cleared
     # by the next good reload. While set, no run starts (RPC run, data change, or startup).
     _pipeline_error: str | None
+    # Set while no code reload is in flight; replaced by a fresh Event when one starts
+    _reload_done: anyio.Event
 
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
@@ -254,6 +256,8 @@ class Engine:
 
         self._startup_fingerprinted = anyio.Event()
         self._pipeline_error = None
+        self._reload_done = anyio.Event()
+        self._reload_done.set()
 
     @property
     def state(self) -> EngineState:
@@ -269,6 +273,11 @@ class Engine:
     def is_starting(self) -> bool:
         """Whether a watched engine is still taking its startup fingerprint snapshot."""
         return self._watches_filesystem() and not self._startup_fingerprinted.is_set()
+
+    @property
+    def is_reloading(self) -> bool:
+        """Whether a code reload is in flight: import, fingerprints, then the re-run's start."""
+        return not self._reload_done.is_set()
 
     @property
     def sources(self) -> list[EventSource]:
@@ -2157,15 +2166,17 @@ class Engine:
 
         return any(isinstance(source, FilesystemSource) for source in self._sources)
 
-    async def wait_for_startup_fingerprints(self) -> None:
-        """Wait until a watched engine's startup fingerprint snapshot has finished.
+    async def wait_for_fingerprints(self) -> None:
+        """Wait until neither the startup snapshot nor a code reload is fingerprinting stages.
 
         RPC queries that fingerprint stages wait here, so no stage is fingerprinted on two
         threads at once. Returns at once for an engine without a filesystem source, which
-        takes no snapshot.
+        takes no snapshot and never reloads.
         """
         if self._watches_filesystem():
             await self._startup_fingerprinted.wait()
+        while self.is_reloading:
+            await self._reload_done.wait()
 
     async def _fingerprint_watched_stages(self) -> None:
         """Fingerprint every stage before a watched engine starts its watcher and startup run.
@@ -2173,7 +2184,7 @@ class Engine:
         A code reload diffs the edited pipeline against these cached fingerprints; computing
         the old ones after the edit would read the edited source and report nothing modified.
         Each stage is fingerprinted in a worker thread so the RPC server keeps answering, and
-        nothing else fingerprints until this returns (see ``wait_for_startup_fingerprints``),
+        nothing else fingerprints until this returns (see ``wait_for_fingerprints``),
         so the startup run's skip check reuses the cached values.
 
         A stage that fails to fingerprint makes the pipeline invalid, as a ``pipeline.py``
@@ -2259,6 +2270,11 @@ class Engine:
 
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
+        if self.is_reloading:
+            # Only a reload deferred to the end of a run overlaps the input loop; the re-run it
+            # starts checks every stage against the inputs as they are now.
+            _logger.debug("Data changed during a reload - its re-run covers the change")
+            return
         paths = [pathlib.Path(path) for path in event["paths"]]
         filtered_paths = list[pathlib.Path]()
         deferred_paths = list[tuple[str, pathlib.Path]]()
@@ -2297,16 +2313,30 @@ class Engine:
     async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
         """Handle code/config changes by reloading registry and re-running.
 
-        If a run is active, defers the reload until the current run completes.
+        If a run is active, defers the reload until the current run completes. Reloads run one
+        at a time: an edit that arrives while a reload deferred to the end of a run is still in
+        flight waits for it, then reloads again.
         """
-        if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
-            _logger.info("Code/config changed while running - deferring reload")
-            if self._reload_pending is None:
-                self._reload_pending = set(event["paths"])
-            else:
-                self._reload_pending.update(event["paths"])
-            return
+        while True:
+            if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
+                _logger.info("Code/config changed while running - deferring reload")
+                if self._reload_pending is None:
+                    self._reload_pending = set(event["paths"])
+                else:
+                    self._reload_pending.update(event["paths"])
+                return
+            if not self.is_reloading:
+                break
+            await self._reload_done.wait()
 
+        self._reload_done = anyio.Event()
+        try:
+            await self._reload_and_rerun(event)
+        finally:
+            self._reload_done.set()
+
+    async def _reload_and_rerun(self, event: CodeOrConfigChanged) -> None:
+        """Reload the edited pipeline off the event loop, then re-run every stage."""
         _logger.info("Code/config changed - reloading pipeline")
 
         # Invalidate caches
@@ -2332,7 +2362,7 @@ class Engine:
                     )
 
         # Reload registry - returns the old stages on success, the error message on failure
-        reload_result = self._reload_registry()
+        reload_result = await self._reload_registry()
 
         if isinstance(reload_result, str):
             _logger.error("Pipeline invalid - waiting for fix")
@@ -2511,7 +2541,7 @@ class Engine:
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
-    def _reload_registry(self) -> dict[str, RegistryStageInfo] | str:
+    async def _reload_registry(self) -> dict[str, RegistryStageInfo] | str:
         """Reload the pipeline by re-importing pipeline definition.
 
         Returns the old pipeline's stages if reload succeeded, or the error message if the
@@ -2519,36 +2549,46 @@ class Engine:
         failure the last loaded pipeline stays loaded but is marked invalid, so nothing runs until
         a good reload. The new fingerprints stay cached for the reload event's diff. The caller
         should emit the reload event using the returned stages.
+
+        The import and the fingerprints run in one worker thread (``_load_pipeline``), so the
+        RPC server keeps answering; the pipeline swap happens here, on the event loop.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
         root = project.get_project_root()
-
-        # Clear project modules from sys.modules
-        self._clear_project_modules(root)
-
-        # Use discovery to reload the pipeline
         try:
-            from pivot import discovery
-
-            new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
-            if new_pipeline is None:
-                return self._reject_reload(old_pipeline, ["No pipeline found during reload"])
-
-            errors = list[str]()
-            for stage_name in new_pipeline.list_stages():
-                try:
-                    _ = new_pipeline.ensure_fingerprint(stage_name)
-                except exceptions.PivotError as exc:
-                    errors.append(str(exc))
-            if errors:
-                return self._reject_reload(old_pipeline, errors)
-
-            self._pipeline = new_pipeline
-            self._pipeline_error = None
-            return old_stages
+            new_pipeline, errors = await anyio.to_thread.run_sync(self._load_pipeline, root)
         except Exception as e:
             return self._reject_reload(old_pipeline, [str(e)])
+        if new_pipeline is None:
+            return self._reject_reload(old_pipeline, ["No pipeline found during reload"])
+        if errors:
+            return self._reject_reload(old_pipeline, errors)
+
+        self._pipeline = new_pipeline
+        self._pipeline_error = None
+        return old_stages
+
+    def _load_pipeline(self, root: pathlib.Path) -> tuple[registry.PipelineLike | None, list[str]]:
+        """Re-import the project's pipeline and fingerprint every stage, in a worker thread.
+
+        All of a reload's ``sys.modules`` changes (dropping project modules, importing the edited
+        ones) happen in this one call, on one thread. Returns the new pipeline, or None if the
+        project defines none, and the fingerprint errors.
+        """
+        from pivot import discovery
+
+        self._clear_project_modules(root)
+        new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
+        if new_pipeline is None:
+            return None, list[str]()
+        errors = list[str]()
+        for stage_name in new_pipeline.list_stages():
+            try:
+                _ = new_pipeline.ensure_fingerprint(stage_name)
+            except exceptions.PivotError as exc:
+                errors.append(str(exc))
+        return new_pipeline, errors
 
     def _reject_reload(self, old_pipeline: registry.PipelineLike | None, errors: list[str]) -> str:
         """Keep the last loaded pipeline but mark it invalid; return the error message."""

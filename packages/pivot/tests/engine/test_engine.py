@@ -1074,6 +1074,16 @@ async def test_engine_aexit_closes_sinks_when_source_raises() -> None:
 # =============================================================================
 
 
+async def _helper_reload_ok() -> dict[str, RegistryStageInfo]:
+    """Stand-in for Engine._reload_registry: a reload that succeeded with no old stages."""
+    return {}
+
+
+async def _helper_reload_failed() -> str:
+    """Stand-in for Engine._reload_registry: a reload that found the pipeline invalid."""
+    return "Failed to load pipeline.py"
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("parallel", "max_workers", "expected_restart_calls"),
@@ -1108,7 +1118,7 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
         mock_pipeline.get.return_value = MagicMock()
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
-        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass
@@ -1144,7 +1154,7 @@ async def test_engine_code_reload_restores_project_watch_root(
     async with Engine(pipeline=pipeline) as engine:
         engine.add_source(source)
         engine._stored_parallel = False
-        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test seam
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test seam
 
         async def _ignore_reload(*_args: object) -> None:
             pass
@@ -1182,7 +1192,7 @@ async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
         engine._stored_parallel = True
 
         # Mock reload to FAIL
-        engine._reload_registry = lambda: "Failed to load pipeline.py"  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_failed  # type: ignore[assignment] - test mock
         engine._invalidate_caches = lambda: None  # type: ignore[assignment] - test mock
 
         event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
@@ -1216,7 +1226,7 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
 
-        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass
