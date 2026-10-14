@@ -110,36 +110,52 @@ def _override_errors(
     """Validate a stage's params with its overrides applied, as a run does.
 
     Returns (params.yaml key, message) for each error, naming the key that gave the field:
-    the variant's own key when it sets the field, otherwise the base key.
+    the variant's own key when it sets the field, otherwise the base key. An unknown key is
+    refused at any depth unless its model sets ``extra="allow"``: pydantic reports it for a
+    model that forbids extra fields, and the walk here for one that would ignore it.
     """
     params_cls = type(params)
     found = list[tuple[str, str]]()
+    set_twice = list[tuple[str, str]]()
+    owners = dict[tuple[int | str, ...], type[pydantic.BaseModel]]()
     for key in _override_keys(stage_name):
+        unknown: _KeyPaths = []
         try:
-            _ = _rename_fields(params_cls, overrides.get(key, {}))
+            _ = _rename_fields(params_cls, overrides.get(key, {}), unknown)
         except exceptions.ParamsError as exc:
-            found.append((key, f"params.yaml key '{key}': {exc}"))
-    if found:
-        return found
+            set_twice.append((key, f"params.yaml key '{key}': {exc}"))
+            continue
+        for path, owner in unknown:
+            owners[path] = owner
+            if owner.model_config.get("extra") not in ("allow", "forbid"):
+                found.append((key, _unknown_field_message(key, path, owner)))
+    if set_twice:
+        return set_twice
     try:
         _ = apply_overrides(params, stage_name, overrides)
     except pydantic.ValidationError as exc:
         for error in exc.errors():
             loc = error["loc"]
             key = _override_key(params_cls, stage_name, loc[0] if loc else None, overrides)
+            if error["type"] == "extra_forbidden" and loc in owners:
+                found.append((key, _unknown_field_message(key, loc, owners[loc])))
+                continue
             path = ".".join(str(part) for part in loc)
-            owner = _model_at(params_cls, loc[:-1])
-            if error["type"] == "extra_forbidden" and owner is not None:
-                detail = f"is not a field of {owner.__name__}; " + _field_hint(
-                    str(loc[-1]), _field_keys(owner)
-                )
-            else:
-                detail = (
-                    f"value {error['input']!r} is invalid for {params_cls.__name__}: "
-                    + error["msg"]
-                )
+            detail = (
+                f"value {error['input']!r} is invalid for {params_cls.__name__}: " + error["msg"]
+            )
             found.append((key, f"params.yaml key '{key}': field '{path}' {detail}"))
     return found
+
+
+def _unknown_field_message(
+    key: str, path: tuple[int | str, ...], owner: type[pydantic.BaseModel]
+) -> str:
+    return (
+        f"params.yaml key '{key}': field '{'.'.join(str(part) for part in path)}' is not a "
+        + f"field of {owner.__name__}; "
+        + _field_hint(str(path[-1]), _field_keys(owner))
+    )
 
 
 def _field_keys(model: type[pydantic.BaseModel]) -> list[str]:
@@ -147,23 +163,6 @@ def _field_keys(model: type[pydantic.BaseModel]) -> list[str]:
     return [
         key for name, field in model.model_fields.items() for key in (name, *_input_aliases(field))
     ]
-
-
-def _model_at(
-    model: type[pydantic.BaseModel], loc: tuple[int | str, ...]
-) -> type[pydantic.BaseModel] | None:
-    """Return the model a field path leads to through nested model fields, or None.
-
-    None when the path passes through anything but a model-typed field (a list or dict of
-    models, a union); the caller then reports pydantic's own message for the error.
-    """
-    for part in loc:
-        field = model.model_fields.get(str(part))
-        nested = _nested_model(field.annotation) if field is not None else None
-        if nested is None:
-            return None
-        model = nested
-    return model
 
 
 def _field_hint(name: str, fields: list[str]) -> str:
@@ -333,11 +332,20 @@ def _nested_model(annotation: object) -> type[pydantic.BaseModel] | None:
     return None
 
 
-def _rename_fields(model: type[pydantic.BaseModel], values: dict[str, Any]) -> dict[str, Any]:
+type _KeyPaths = list[tuple[tuple[int | str, ...], type[pydantic.BaseModel]]]
+
+
+def _rename_fields(
+    model: type[pydantic.BaseModel],
+    values: dict[str, Any],
+    unknown: _KeyPaths | None = None,
+    path: tuple[int | str, ...] = (),
+) -> dict[str, Any]:
     """Key ``values`` by field name, through nested models.
 
     A key may be a field's name or one of its input aliases. Keys that name no field are
-    kept, so validation reports them.
+    kept, so validation sees them, and each is added to ``unknown`` with its path (field
+    names, list indexes, dict keys) and the model it was given to.
 
     Raises:
         ParamsError: ``values`` sets one field under two of its keys.
@@ -350,33 +358,43 @@ def _rename_fields(model: type[pydantic.BaseModel], values: dict[str, Any]) -> d
         name = key if key in fields else names.get(key)
         if name is None:
             renamed[key] = value
+            if unknown is not None:
+                unknown.append(((*path, key), model))
             continue
         if name in spelled:
             raise exceptions.ParamsError(
                 f"field '{name}' is set twice, as '{spelled[name]}' and as '{key}'"
             )
         spelled[name] = key
-        renamed[name] = _rename_nested(fields[name].annotation, value)
+        renamed[name] = _rename_nested(fields[name].annotation, value, unknown, (*path, name))
     return renamed
 
 
-def _rename_nested(annotation: object, value: Any) -> Any:
+def _rename_nested(
+    annotation: object, value: Any, unknown: _KeyPaths | None, path: tuple[int | str, ...]
+) -> Any:
     """Apply ``_rename_fields`` inside a value held as ``M``, ``M | None``, a sequence of M,
     or a dict of M."""
     model = _nested_model(annotation)
     if model is not None:
         if isinstance(value, dict):
-            return _rename_fields(model, cast("dict[str, Any]", value))
+            return _rename_fields(model, cast("dict[str, Any]", value), unknown, path)
         return value
     origin, args = typing.get_origin(annotation), typing.get_args(annotation)
     if origin in (list, tuple) and args and isinstance(value, (list, tuple)):
         item_type = args[0] if origin is list or args[1:] == (Ellipsis,) else None
         if item_type is not None:
             items: list[Any] = list(cast("list[Any]", value))
-            return [_rename_nested(item_type, item) for item in items]
+            return [
+                _rename_nested(item_type, item, unknown, (*path, index))
+                for index, item in enumerate(items)
+            ]
     if origin is dict and len(args) == 2 and isinstance(value, dict):
         entries = cast("dict[Any, Any]", value)
-        return {key: _rename_nested(args[1], item) for key, item in entries.items()}
+        return {
+            key: _rename_nested(args[1], item, unknown, (*path, key))
+            for key, item in entries.items()
+        }
     return cast("Any", value)
 
 

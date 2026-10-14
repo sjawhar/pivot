@@ -157,7 +157,7 @@ Any other type fails with `Cannot infer serialization format for type int`; wrap
 
 ## Configuration: one `StageParams` per stage
 
-Each stage gets its own `StageParams` subclass, defined directly above the stage that uses it. Fields are typed, with defaults; nested Pydantic models, lists and dicts are fine (`exclude: list[str] = []`, no `default_factory`). Unknown fields are refused, in code and in `params.yaml`. Pass the instance at the call site: `scale(rows, params=ScaleParams(factor=2))`. A stage whose params all have defaults may declare `params: CleanParams = CleanParams()`.
+Each stage gets its own `StageParams` subclass, defined directly above the stage that uses it. Fields are typed, with defaults; nested Pydantic models, lists and dicts are fine (`exclude: list[str] = []`, no `default_factory`). Unknown fields are refused, in code and in `params.yaml`; in `params.yaml` a typo inside a nested model is refused too, unless that model sets `extra="allow"`. Pass the instance at the call site: `scale(rows, params=ScaleParams(factor=2))`. A stage whose params all have defaults may declare `params: CleanParams = CleanParams()`.
 
 Changing a param value re-runs that stage. `params.yaml` at the project root overrides values without editing code; keys are qualified stage names, and a key without `@...` applies to every variant:
 

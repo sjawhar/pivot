@@ -50,7 +50,9 @@ reads, and the classes drift away from the code that uses them.
   copies them. Nested Pydantic models work too.
 - Unknown fields are refused, in code (`FilterParams(min_valu=15)`) and in
   `params.yaml` alike. A class that needs extra fields sets its own
-  `model_config = pydantic.ConfigDict(extra="allow")`.
+  `model_config = pydantic.ConfigDict(extra="allow")`. In `params.yaml` this
+  holds at every depth: a typo inside a nested model is refused too, unless that
+  model sets `extra="allow"`.
 - A stage whose fields all have defaults may declare a default
   (`params: FilterParams = FilterParams()`) and be called without it.
 - Values that are not data (a number, a string, a list of names) go here, never

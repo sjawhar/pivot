@@ -587,6 +587,62 @@ def test_misspelled_params_field_is_refused_with_close_matches(
     assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
 
 
+def _write_nested_project(cwd: pathlib.Path, params_yaml: str) -> None:
+    """A stage whose params hold a plain BaseModel and one that allows extra fields."""
+    (cwd / "data" / "raw").mkdir(parents=True)
+    (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+    (cwd / "params.yaml").write_text(params_yaml)
+    (cwd / "pipeline.py").write_text(
+        "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+        + "class Opt(pydantic.BaseModel):\n    momentum: float = 0.9\n\n\n"
+        + "class Loose(pydantic.BaseModel):\n"
+        + '    model_config = pydantic.ConfigDict(extra="allow")\n'
+        + "    momentum: float = 0.9\n\n\n"
+        + "class TrainParams(StageParams):\n    optimizer: Opt = Opt()\n    loose: Loose = Loose()\n\n\n"
+        + "@stage\ndef train(numbers: pd.DataFrame, params: TrainParams) -> dict:\n"
+        + '    return {"momentum": params.optimizer.momentum, "loose": params.loose.model_dump()}\n\n\n'
+        + 'with Pipeline("smoke") as pipeline:\n'
+        + '    train(pipeline.input("numbers.csv"), params=TrainParams())\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["repro"], ["status"], ["params", "show"], ["commit"]],
+    ids=["repro", "status", "params-show", "commit"],
+)
+def test_misspelled_field_of_a_plain_nested_model_is_refused(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, args: list[str]
+) -> None:
+    """Pydantic ignores an unknown key in a plain BaseModel, so the stage ran with the default."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_nested_project(cwd, "smoke/train:\n  optimizer:\n    momentm: 0.5\n")
+
+        result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code != 0, result.output
+    assert (
+        "params.yaml key 'smoke/train': field 'optimizer.momentm' is not a field of Opt; "
+        + "did you mean 'momentum'?"
+    ) in result.output, result.output
+    assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
+
+
+def test_nested_model_that_allows_extra_fields_takes_one_from_params_yaml(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_nested_project(cwd, "smoke/train:\n  loose:\n    extra: 1\n")
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 0, result.output
+        assert yaml.safe_load((cwd / "data" / "smoke" / "train.yaml").read_text()) == {
+            "momentum": 0.9,
+            "loose": {"momentum": 0.9, "extra": 1},
+        }
+
+
 def test_qualified_params_keys_apply_to_base_and_variant(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

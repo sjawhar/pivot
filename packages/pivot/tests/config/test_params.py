@@ -297,6 +297,75 @@ def test_load_params_yaml_names_the_nested_model_of_an_unknown_field(tmp_path: P
         parameters.load_params_yaml(pipeline, params_file)
 
 
+class _PlainOptimizer(BaseModel):
+    momentum: float = 0.9
+
+
+class _AllowingOptimizer(BaseModel):
+    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow")
+    momentum: float = 0.9
+    inner: _PlainOptimizer = _PlainOptimizer()
+
+
+class _PlainNestedParams(stage_def.StageParams):
+    optimizer: _PlainOptimizer = _PlainOptimizer()
+    layers: list[_PlainOptimizer] = []
+    named: dict[str, _PlainOptimizer] = {}
+    loose: _AllowingOptimizer = _AllowingOptimizer()
+
+
+@stage
+def _plain_nested_stage(params: _PlainNestedParams) -> None:
+    pass
+
+
+def _plain_nested_pipeline(tmp_path: Path) -> Pipeline:
+    with Pipeline("n", root=tmp_path) as pipeline:
+        _plain_nested_stage(params=_PlainNestedParams())
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    ("params_yaml", "path"),
+    [
+        ("  optimizer:\n    momentm: 0.5\n", "optimizer.momentm"),
+        ("  layers:\n  - momentm: 0.5\n", "layers.0.momentm"),
+        ("  named:\n    a:\n      momentm: 0.5\n", "named.a.momentm"),
+        ("  loose:\n    inner:\n      momentm: 0.5\n", "loose.inner.momentm"),
+    ],
+    ids=["model", "list-of-models", "dict-of-models", "inside-an-allowing-model"],
+)
+def test_load_params_yaml_refuses_a_typo_inside_a_plain_nested_model(
+    tmp_path: Path, params_yaml: str, path: str
+) -> None:
+    """Pydantic ignores an unknown key in a plain BaseModel, so the typo would run the default."""
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("n/_plain_nested_stage:\n" + params_yaml)
+
+    with pytest.raises(exceptions.PipelineConfigError) as exc_info:
+        parameters.load_params_yaml(_plain_nested_pipeline(tmp_path), params_file)
+
+    assert str(exc_info.value) == (
+        f"params.yaml key 'n/_plain_nested_stage': field '{path}' is not a field of "
+        + "_PlainOptimizer; did you mean 'momentum'?"
+    )
+
+
+def test_load_params_yaml_lets_a_nested_model_that_allows_extra_fields_take_one(
+    tmp_path: Path,
+) -> None:
+    pipeline = _plain_nested_pipeline(tmp_path)
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("n/_plain_nested_stage:\n  loose:\n    extra: 1\n")
+
+    overrides = parameters.load_params_yaml(pipeline, params_file)
+
+    effective = parameters.get_effective_params(
+        pipeline.get_stage("n/_plain_nested_stage")["params"], "n/_plain_nested_stage", overrides
+    )
+    assert effective["loose"] == {"momentum": 0.9, "inner": {"momentum": 0.9}, "extra": 1}
+
+
 class _AliasedOptimizer(stage_def.StageParams):
     momentum: float = pydantic.Field(0.9, alias="mom")
 
