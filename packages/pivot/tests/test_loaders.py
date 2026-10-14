@@ -1312,6 +1312,39 @@ def test_dataframe_jsonl_writes_out_of_nanosecond_range_values_as_before_with_a_
 
 
 @pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(
+            [
+                datetime.datetime.fromisoformat("2024-01-15T10:00:00-05:00"),
+                datetime.datetime.fromisoformat("2024-07-15T10:00:00-04:00"),
+            ],
+            id="mixed-offsets",
+        ),
+        pytest.param(
+            [
+                datetime.datetime(2024, 1, 15, 10),
+                datetime.datetime.fromisoformat("2024-07-15T10:00:00-04:00"),
+            ],
+            id="naive-and-aware",
+        ),
+    ],
+)
+def test_dataframe_jsonl_writes_mixed_timezone_datetimes_as_before_with_a_warning(
+    tmp_path: pathlib.Path, values: list[datetime.datetime]
+) -> None:
+    """DST-spanning datetime objects have no single dtype; base wrote them, so must we."""
+    jsonl_file = tmp_path / "mixed.jsonl"
+    df = pandas.DataFrame({"at": values})
+    assert df["at"].dtype == object
+
+    with pytest.warns(loaders.LossyOutputWarning, match=r"column 'at'"):
+        loaders.DataFrameJSONL().save(df, jsonl_file)
+
+    assert jsonl_file.read_text() == df.to_json(lines=True, orient="records")
+
+
+@pytest.mark.parametrize(
     "frame",
     [
         pytest.param(pandas.DataFrame({"__pivot_dataframe_metadata__": [1, 2]}), id="only"),

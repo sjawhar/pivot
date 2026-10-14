@@ -412,7 +412,11 @@ def _encode_jsonl_column(
     if pandas.api.types.is_object_dtype(dtype) and pandas.api.types.infer_dtype(
         series, skipna=True
     ) in ("date", "datetime"):
-        series = pandas.Series(pandas.to_datetime(series))
+        try:
+            series = pandas.Series(pandas.to_datetime(series))
+        except ValueError as e:
+            # Mixed UTC offsets, or naive and aware values together, have no single dtype.
+            raise TypeError(f"datetime values with no single timezone: {e}") from e
         dtype = series.dtype
     if isinstance(dtype, pandas.DatetimeTZDtype):
         # Values are ISO UTC text; metadata must rebuild the original zone semantics.
