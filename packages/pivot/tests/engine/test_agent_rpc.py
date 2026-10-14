@@ -34,15 +34,15 @@ def _helper_valid_stage() -> dict[str, int]:
 _diff_expected: DataDiffResult | None = None
 
 
-def _helper_commit_stages_train_eval() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_train_eval(_pipeline: object) -> tuple[list[str], list[str]]:
     return (["train", "eval"], ["broken_stage"])
 
 
-def _helper_commit_stages_empty() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_empty(_pipeline: object) -> tuple[list[str], list[str]]:
     return (list[str](), list[str]())
 
 
-def _helper_commit_stages_stage_a() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_stage_a(_pipeline: object) -> tuple[list[str], list[str]]:
     return (["stage_a"], [])
 
 
@@ -1632,7 +1632,7 @@ async def test_handler_commit_dispatches_to_commit_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query calls commit_stages and returns committed/failed lists."""
-    handler = AgentRpcHandler(engine=Engine())
+    handler = AgentRpcHandler(engine=Engine(pipeline=Pipeline("test", root=tmp_path)))
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
@@ -1653,7 +1653,7 @@ async def test_handler_commit_empty_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query returns empty lists when nothing to commit."""
-    handler = AgentRpcHandler(engine=Engine())
+    handler = AgentRpcHandler(engine=Engine(pipeline=Pipeline("test", root=tmp_path)))
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
@@ -1663,6 +1663,24 @@ async def test_handler_commit_empty_result(
     result = cast("CommitResult", await handler.handle_query("commit"))
     assert result["committed"] == [], "Should return empty committed list"
     assert result["failed"] == [], "Should return empty failed list"
+
+
+@pytest.mark.anyio
+async def test_handler_commit_uses_the_engine_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit runs on the engine's pipeline; the server thread has no Click context."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    (tmp_path / ".pivot").mkdir()
+    pipeline = Pipeline("test", root=tmp_path)
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
+
+    async with Engine(pipeline=pipeline) as eng:
+        result = cast("CommitResult", await AgentRpcHandler(engine=eng).handle_query("commit"))
+
+    assert result["committed"] + result["failed"] == ["test/valid_stage"]
 
 
 @pytest.mark.anyio
@@ -1678,7 +1696,7 @@ async def test_rpc_commit_via_socket(
         _helper_commit_stages_stage_a,
     )
 
-    async with Engine() as engine:
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
         handler = AgentRpcHandler(engine=engine)
         source = AgentRpcSource(socket_path=socket_path, handler=handler)
 
@@ -1710,7 +1728,7 @@ async def test_rpc_commit_propagates_error(
     """Commit query propagates errors from commit_stages — server closes connection."""
     socket_path = tmp_path / "agent.sock"
 
-    def _raise() -> tuple[list[str], list[str]]:
+    def _raise(_pipeline: object) -> tuple[list[str], list[str]]:
         raise RuntimeError("No pipeline loaded")
 
     monkeypatch.setattr(
@@ -1718,7 +1736,7 @@ async def test_rpc_commit_propagates_error(
         _raise,
     )
 
-    async with Engine() as engine:
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
         handler = AgentRpcHandler(engine=engine)
         source = AgentRpcSource(socket_path=socket_path, handler=handler)
 
