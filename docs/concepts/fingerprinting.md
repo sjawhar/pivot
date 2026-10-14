@@ -17,6 +17,7 @@ logical keys to hashes:
 | `class:<module>.<qualname>` | User-defined classes referenced by the stage |
 | `mod:<module>.<attr>` | Attributes accessed on imported user modules |
 | `const:<module>.<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`) |
+| `default:<module>.<qualname>.<parameter>` | Default argument values (scalars and `StageParams`) |
 | `schema:<module>.<qualname>` | Pydantic model JSON schemas |
 | `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…` | Reader/Writer method ASTs and config for each input and output |
 
@@ -100,6 +101,12 @@ COLUMNS = {"score": float}  # Module-level dict
 def process(data: pd.DataFrame) -> pd.DataFrame:
     return data.astype(COLUMNS)  # Error!
 ```
+
+The same rule covers a default argument that reads a module value, such as
+`def process(data, cols=COLUMNS)`, on the stage or on a helper it calls. A
+default is evaluated when the module loads, so Pivot checks its value: a scalar
+is tracked, and anything else is refused. A literal default such as
+`cols=("a", "b")` is part of the function's code and is tracked with it.
 
 Fix: move the value into the stage's [StageParams](parameters.md). Configuration
 in module-level collections is not supported.

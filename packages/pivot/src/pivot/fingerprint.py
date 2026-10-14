@@ -34,7 +34,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # invalidates manifests that might have been persisted after unsafe capture warnings. Version 6
 # also invalidates entries written before discovery imported pipeline.py as a real module.
 # Version 7 invalidates manifests whose source maps omitted imported project modules.
-_CACHE_SCHEMA_VERSION = 7
+# Version 8 adds default argument values, which earlier manifests did not record.
+_CACHE_SCHEMA_VERSION = 8
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -655,6 +656,7 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
                     nested_globals_dict, func, manifest, visited, skip_dunders=True
                 )
 
+    _process_default_values(func, manifest, visited)
     _process_type_hint_dependencies(func, manifest, visited)
 
     return manifest
@@ -830,14 +832,18 @@ def _is_unsafe_fingerprinting_enabled() -> bool:
         return False
 
 
-def _check_non_scalar_capture(var_name: str, value: Any, stage_name: str) -> None:
+def _check_non_scalar_capture(
+    var_name: str, value: Any, stage_name: str, *, parameter: str | None = None
+) -> None:
+    subject = f"captures non-scalar variable '{var_name}'"
+    if parameter is not None:
+        subject += f" as the default of parameter '{parameter}'"
     message = (
-        f"Stage '{stage_name}': captures non-scalar variable '{var_name}' "
-        + f"(type: {type(value).__name__}).\n"
+        f"Stage '{stage_name}': {subject} (type: {type(value).__name__}).\n"
         + "Pivot tracks only module-level bool, int, float, str, bytes, and None values. "
         + "Other values may change without a reliable fingerprint, which can cause silent wrong "
         + "outputs.\n"
-        + "Fix: pass this data via StageParams or as a function parameter.\n"
+        + "Fix: move this value into the stage's StageParams, or read it from a pipeline input.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
     if _is_unsafe_fingerprinting_enabled():
@@ -924,28 +930,132 @@ def _process_closure_values(
     for name, value in values.items():
         if skip_dunders and name.startswith("__"):
             continue
+        _process_captured_value(
+            name, _binding_ref(func, name), value, func, manifest, visited, stage_name
+        )
 
-        binding_ref = _binding_ref(func, name)
-        # functools.partial fails is_user_code() (module is functools/stdlib).
-        if isinstance(value, functools.partial):
-            _process_partial_dependency(
-                binding_ref, cast("functools.partial[Any]", value), manifest, visited
-            )
-        elif _is_callable_instance(value) or _is_user_class_instance(value):
-            _check_non_scalar_capture(name, value, stage_name)
-        elif callable(value) and is_user_code(value):
-            _process_callable_dependency(binding_ref, value, manifest, visited)
-        elif callable(value):
-            # External functions, classes, and builtins are not user dependencies.
+
+def _process_captured_value(
+    name: str,
+    binding_ref: str,
+    value: Any,
+    func: Callable[..., Any],
+    manifest: dict[str, str],
+    visited: set[int],
+    stage_name: str,
+    *,
+    parameter: str | None = None,
+) -> None:
+    """Fingerprint one value `func` reads, or refuse it as a non-scalar capture.
+
+    `parameter` names the parameter when the value is a default argument.
+    """
+    # functools.partial fails is_user_code() (module is functools/stdlib).
+    if isinstance(value, functools.partial):
+        _process_partial_dependency(
+            binding_ref, cast("functools.partial[Any]", value), manifest, visited
+        )
+    elif _is_callable_instance(value) or _is_user_class_instance(value):
+        _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+    elif callable(value) and is_user_code(value):
+        _process_callable_dependency(binding_ref, value, manifest, visited)
+    elif callable(value):
+        # External functions, classes, and builtins are not user dependencies.
+        return
+    elif isinstance(value, types.ModuleType):
+        _process_module_dependency(parameter or name, value, func, manifest, visited)
+    elif isinstance(value, logging.Logger):
+        return
+    elif isinstance(value, (bool, int, float, str, bytes, type(None))):
+        manifest[f"const:{binding_ref}"] = repr(value)
+    else:
+        _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+
+
+def _process_default_values(
+    func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Fingerprint default argument values, which no code hash records.
+
+    A default is evaluated once, when its module loads, so `cols=COLUMNS` puts the name
+    `COLUMNS` in the AST and never its value. A scalar or a StageParams instance is tracked by
+    value: a stage's own params hash does not cover a StageParams default on a helper. Any
+    other value is treated like a captured module value, unless its default is a literal that
+    the function's AST hash already records, such as `keys=("a", "b")`.
+    """
+    defaults = _function_defaults(func)
+    if not defaults:
+        return
+    from pivot import stage_def
+
+    stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
+    func_ref = _definition_ref(func)
+    expressions: dict[str, ast.expr] | None = None
+    for parameter, value in defaults:
+        binding_ref = f"{func_ref}.{parameter}"
+        if isinstance(value, (bool, int, float, str, bytes, type(None))):
+            manifest[f"default:{binding_ref}"] = repr(value)
             continue
-        elif isinstance(value, types.ModuleType):
-            _process_module_dependency(name, value, func, manifest, visited)
-        elif isinstance(value, logging.Logger):
+        if isinstance(value, stage_def.StageParams):
+            serialized = _serialize_value_for_hash(value)
+            manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
             continue
-        elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{binding_ref}"] = repr(value)
-        else:
-            _check_non_scalar_capture(name, value, stage_name)
+        if expressions is None:
+            expressions = _default_expressions(func)
+        expression = expressions.get(parameter)
+        if expression is not None and _is_literal(expression):
+            continue
+        source = ast.unparse(expression) if expression is not None else parameter
+        _process_captured_value(
+            source, binding_ref, value, func, manifest, visited, stage_name, parameter=parameter
+        )
+
+
+def _function_defaults(func: Callable[..., Any]) -> list[tuple[str, Any]]:
+    """Return (parameter, default value) for each parameter of `func` that has a default."""
+    code = getattr(func, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        return []
+    positional: tuple[Any, ...] = getattr(func, "__defaults__", None) or ()
+    keyword: dict[str, Any] = getattr(func, "__kwdefaults__", None) or {}
+    names = code.co_varnames[: code.co_argcount]
+    pairs = list(zip(names[len(names) - len(positional) :], positional, strict=True))
+    pairs.extend(keyword.items())
+    return pairs
+
+
+def _default_expressions(func: Callable[..., Any]) -> dict[str, ast.expr]:
+    """Map each defaulted parameter to its default expression in the hashed source.
+
+    Empty when the code hash does not come from this function's own source: there is no
+    source, or `func` is a `functools.wraps` wrapper, whose hash is bytecode, which holds no
+    defaults. Every default is then checked by value.
+    """
+    if hasattr(func, "__wrapped__"):
+        return {}
+    try:
+        node = ast_utils.get_function_ast(func)
+    except (ValueError, SyntaxError):
+        return {}
+    if node.name != getattr(func, "__name__", None):
+        return {}
+    args = node.args
+    positional = [*args.posonlyargs, *args.args]
+    defaulted = positional[len(positional) - len(args.defaults) :]
+    expressions = {arg.arg: default for arg, default in zip(defaulted, args.defaults, strict=True)}
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+        if default is not None:
+            expressions[arg.arg] = default
+    return expressions
+
+
+def _is_literal(expression: ast.expr) -> bool:
+    """Return whether `expression` is a Python literal, fully recorded by the AST."""
+    try:
+        ast.literal_eval(expression)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return True
 
 
 def _process_callable_dependency(

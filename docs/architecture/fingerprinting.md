@@ -31,7 +31,7 @@ Pivot's fingerprinting system:
 | Module-level primitive values | Yes (value) | `getclosurevars()` + `repr()` |
 | Other module-level values | No — error | Use `StageParams` instead |
 | Closure variables | Yes (structure) | `getclosurevars()` captures binding |
-| Default arguments | Yes | Captured in function signature |
+| Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
 | `functools.partial` | Yes | Bound args + underlying function |
 
 **Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are not tracked unless they're Pydantic model field defaults.
@@ -142,7 +142,7 @@ result = eval("process(data)")     # String execution
 
 ### Module-Level Values
 
-A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; its current value is recorded with `repr()`, so editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance), directly or as `module.NAME`, is a `StageDefinitionError` that names the variable and points to `StageParams`:
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; its current value is recorded with `repr()`, so editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance), directly or as `module.NAME`, is a `StageDefinitionError` that names the variable and points to `StageParams`. A default argument such as `cols=COLUMNS` or `factor=settings.FACTOR` on the stage or on a helper it calls follows the same rule, because a default is evaluated once when the module loads and its value never appears in the AST:
 
 ```python
 THRESHOLD = 0.5            # allowed: tracked by value
@@ -207,6 +207,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `func:` | Helper functions (user code callables) | `func:myproject.helpers.process_data` |
 | `class:` | Class definitions | `class:myproject.params.TrainParams` |
 | `const:` | Module-level primitive values | `const:myproject.settings.THRESHOLD` |
+| `default:` | Default argument values that the AST does not record | `default:myproject.stages.scale.factor` |
 | `mod:` | Module attribute access patterns | `mod:myproject.helpers.process_data` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |

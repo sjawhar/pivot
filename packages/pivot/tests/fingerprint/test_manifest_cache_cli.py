@@ -7,6 +7,7 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
 from tests.conftest import init_git_repo
 
 _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
@@ -175,3 +176,123 @@ def test_rebinding_module_attribute_callable_reruns_stage(tmp_path: pathlib.Path
     output = _helper_ok(_helper_pivot(root, "repro"))
 
     assert (root / "data/ms/scale.jsonl").read_text() == '{"a":3}\n{"a":6}\n', output
+
+
+_LIST_DEFAULT_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+COLUMNS = ["a"]
+
+
+@stage
+def pick(raw: pd.DataFrame, cols: list[str] = COLUMNS) -> pd.DataFrame:
+    return raw[cols]
+
+
+with Pipeline("d") as pipeline:
+    pick(pipeline.input("t.csv"))
+"""
+
+
+def test_non_scalar_module_value_as_stage_default_is_an_error(tmp_path: pathlib.Path) -> None:
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _LIST_DEFAULT_PIPELINE, "data/raw/t.csv": "a,b\n1,2\n"}
+    )
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"list default was accepted:\n{output}"
+    assert "parameter 'cols'" in output, output
+    assert "COLUMNS" in output, output
+
+
+_SCALAR_DEFAULT_PIPELINES = {
+    "global": (
+        {
+            "pipeline.py": """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+FACTOR = 2
+
+
+@stage
+def scale(raw: pd.DataFrame, factor: int = FACTOR) -> pd.DataFrame:
+    return raw * factor
+
+
+with Pipeline("d") as pipeline:
+    scale(pipeline.input("t.csv"))
+"""
+        },
+        ("pipeline.py", "FACTOR = 2", "FACTOR = 50"),
+    ),
+    "module-attribute": (
+        {
+            "settings.py": "FACTOR = 2\n",
+            "pipeline.py": """\
+import pandas as pd
+
+import settings
+from pivot import Pipeline, stage
+
+
+@stage
+def scale(raw: pd.DataFrame, factor: int = settings.FACTOR) -> pd.DataFrame:
+    return raw * factor
+
+
+with Pipeline("d") as pipeline:
+    scale(pipeline.input("t.csv"))
+""",
+        },
+        ("settings.py", "FACTOR = 2", "FACTOR = 50"),
+    ),
+    "helper": (
+        {
+            "pipeline.py": """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+FACTOR = 2
+
+
+def multiply(raw, factor=FACTOR):
+    return raw * factor
+
+
+@stage
+def scale(raw: pd.DataFrame) -> pd.DataFrame:
+    return multiply(raw)
+
+
+with Pipeline("d") as pipeline:
+    scale(pipeline.input("t.csv"))
+"""
+        },
+        ("pipeline.py", "FACTOR = 2", "FACTOR = 50"),
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("files", "edit"), _SCALAR_DEFAULT_PIPELINES.values(), ids=_SCALAR_DEFAULT_PIPELINES.keys()
+)
+def test_editing_scalar_module_value_used_as_default_reruns_stage(
+    tmp_path: pathlib.Path, files: dict[str, str], edit: tuple[str, str, str]
+) -> None:
+    root = _helper_project(tmp_path, {**files, "data/raw/t.csv": "a\n1\n2\n"})
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+
+    rel_path, old, new = edit
+    path = root / rel_path
+    path.write_text(path.read_text().replace(old, new))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert (root / "data/d/scale.jsonl").read_text() == '{"a":50}\n{"a":100}\n', output
