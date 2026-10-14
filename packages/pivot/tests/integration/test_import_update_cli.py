@@ -239,10 +239,6 @@ def test_import_rejects_source_without_usable_remote(
     assert not (consumer / "smoke").exists(), "a failed import writes nothing"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 9: non-string default_remote must be refused",
-)
 def test_import_refuses_non_string_default_remote(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:
@@ -258,6 +254,7 @@ def test_import_refuses_non_string_default_remote(
 
     assert result.exit_code != 0
     assert "default_remote" in result.output, "the error must name the bad config key"
+    assert "got 7" in result.output, "the error must name the bad value"
     assert not (consumer / "smoke").exists(), "a refused import writes nothing"
 
 
