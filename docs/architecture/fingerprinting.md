@@ -34,6 +34,7 @@ Pivot's fingerprinting system:
 | Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
 | Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
+| Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
 
 **Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are not tracked unless they're Pydantic model field defaults.
 

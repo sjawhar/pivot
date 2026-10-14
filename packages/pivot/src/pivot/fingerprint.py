@@ -51,7 +51,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 18 keys manifests by the function's full identity (closure values and defaults
 # included) and keys closure values under the binding the closure was reached through.
 # Version 19 records each library function or class a stage reads by name (`ext:` entries).
-_CACHE_SCHEMA_VERSION = 19
+# Version 20 hashes a secret in a default, loader config or partial by its keyed digest.
+_CACHE_SCHEMA_VERSION = 20
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1945,10 +1946,14 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     factory share a definition; `active` holds the functions being named, so a function that
     captures itself ends there. A library function, or a library module's own callable export,
     becomes `["external", _library_name]`: its repr can hold an address (`np.mean`). A
-    `functools.partial` is canonicalised through its function and arguments. An object whose
-    class keeps `object.__repr__` (which holds the address) and that has a `__dict__` becomes
-    `[module.qualname, canonical(vars(obj))]`. Other leaves keep their `repr`, tagged with their
-    type. A class is a leaf, even a pydantic model class: only an instance is dumped.
+    `functools.partial` is canonicalised through its function and arguments. A pydantic
+    instance is dumped in python mode, which keeps each secret (`SecretStr`, `SecretBytes`,
+    `Secret[T]`) as its own object; a secret becomes `["secret", digest]`, the keyed digest the
+    lock file records for it (`parameters.secret_digest`), so changing it changes the hash and
+    no fingerprint holds its value. An object whose class keeps `object.__repr__` (which holds
+    the address) and that has a `__dict__` becomes `[module.qualname, canonical(vars(obj))]`.
+    Other leaves keep their `repr`, tagged with their type. A class is a leaf, even a pydantic
+    model class: only an instance is dumped.
     """
     if hasattr(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump(), active)
@@ -1981,6 +1986,10 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         return value
     if isinstance(value, types.ModuleType):
         return ["module", value.__name__]
+    from pivot import parameters
+
+    if parameters.is_secret(value):
+        return ["secret", parameters.secret_digest(value)]
     if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value), active)]
     return [type(value).__name__, repr(value)]

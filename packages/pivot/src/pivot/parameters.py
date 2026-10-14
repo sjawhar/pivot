@@ -549,6 +549,23 @@ def encode_params(params: pydantic.BaseModel) -> Any:
     return _encode(params, params.model_dump(mode="json"), digest)
 
 
+def is_secret(
+    value: object,
+) -> TypeGuard[pydantic.SecretStr | pydantic.SecretBytes | pydantic.Secret[Any]]:
+    """Whether ``value`` is a ``SecretStr``, ``SecretBytes`` or ``Secret[T]``."""
+    return isinstance(value, _SECRET_TYPES)
+
+
+def secret_digest(secret: pydantic.SecretStr | pydantic.SecretBytes | pydantic.Secret[Any]) -> str:
+    """Return the digest ``encode_params`` records for ``secret``, under the project's key.
+
+    The fingerprint hashes a secret it finds in a helper's default, a loader's config or a
+    partial's arguments through this, so changing the secret changes the fingerprint while
+    no manifest, token or lock holds its value.
+    """
+    return _secret_digest(_secret_key(), secret)
+
+
 _SECRET_KEY_ENV = "PIVOT_SECRET_KEY"
 _SECRET_KEY_FILE = "secret.key"
 

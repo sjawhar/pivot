@@ -175,6 +175,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Closure value with `0x` in repr (non-deterministic) | 🚫  | `test_fingerprint.py::test_hash_unrecognized_closure_value_memory_address_raises` |
 | Closure value with repr > 10KB        | 🚫        | `test_fingerprint.py::test_hash_unrecognized_closure_value_large_repr_raises` |
 | Two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) | ✅ | `test_manifest_cache_cli.py::test_two_closures_from_one_factory_keep_their_values_in_every_process` |
+| Secret in a helper default or loader field changes | ✅ | `test_manifest_cache_cli.py::test_changing_a_secret_read_by_a_stage_reruns_it`, `test_functools.py::test_secret_partial_argument_hashes_by_keyed_digest` |
 | Factory-built stage under a same-named pipeline, run separately | ✅ | `test_manifest_cache_cli.py::test_same_named_pipelines_run_separately_keep_factory_closures_apart` |
 | `include()` of two factory-built stages under one name | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_two_factory_closures_under_one_stage_name` |
 | `include()` of one stage read through two factory-built loaders | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_one_stage_reading_through_two_factory_loaders` |

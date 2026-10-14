@@ -1469,3 +1469,88 @@ def test_method_bound_to_a_scalar_class_or_library_is_allowed(
     output = _helper_ok(_helper_pivot(root, "repro"))
 
     assert "1 ran" in output, output
+
+
+_SECRET_DEFAULT_PIPELINE = """\
+import os
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, StageParams, stage
+
+
+class Creds(StageParams):
+    token: pydantic.SecretStr = pydantic.SecretStr("unset")
+
+
+def _length(creds: Creds = Creds(token=pydantic.SecretStr(os.environ["TOKEN"]))) -> int:
+    return len(creds.token.get_secret_value())
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({"a": [_length()]})
+
+
+with Pipeline("sec") as pipeline:
+    measure(pipeline.input("x.csv"))
+"""
+
+_SECRET_LOADER_PIPELINE = """\
+import dataclasses
+import os
+from typing import Any
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenCSV(loaders.CSV):
+    token: pydantic.SecretStr = pydantic.SecretStr("unset")
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return pd.DataFrame({"a": [len(self.token.get_secret_value())]})
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+
+
+with Pipeline("sec") as pipeline:
+    token = pydantic.SecretStr(os.environ["TOKEN"])
+    measure(pipeline.input("x.csv", format=TokenCSV(token=token)))
+"""
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        pytest.param(_SECRET_DEFAULT_PIPELINE, id="stage-params-default"),
+        pytest.param(_SECRET_LOADER_PIPELINE, id="loader-field"),
+    ],
+)
+def test_changing_a_secret_read_by_a_stage_reruns_it(tmp_path: pathlib.Path, pipeline: str) -> None:
+    """A secret in a helper default or loader config is fingerprinted by its keyed digest."""
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+    env = {"TOKEN": "first-secret"}
+    _helper_ok(_helper_pivot(root, "repro", env=env))
+    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":12}\n'
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"TOKEN": "second-secret-x"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"TOKEN": "second-secret-x"}))
+
+    assert "1 stale" in status, status
+    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":15}\n', output
+    lock = (root / ".pivot/stages/sec/measure.lock").read_text()
+    assert "first-secret" not in lock and "second-secret-x" not in lock, lock
+    key_file = root / ".pivot/secret.key"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+    ignored = subprocess.run(
+        ["git", "check-ignore", ".pivot/secret.key"], cwd=root, capture_output=True, text=True
+    )
+    assert ignored.returncode == 0, "secret.key must be gitignored"
