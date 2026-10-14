@@ -710,6 +710,40 @@ async def test_rpc_run_invalid_stage_returns_error(
 
 
 @pytest.mark.anyio
+async def test_rpc_run_on_invalid_pipeline_returns_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RPC run while the pipeline is invalid is refused with the reason, not accepted."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    (tmp_path / ".pivot").mkdir()
+
+    pipeline = Pipeline("test", root=tmp_path)
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
+
+    async with Engine(pipeline=pipeline) as eng:
+        eng._pipeline_error = "Stage 'test/valid_stage': captures non-scalar variable 'X'"
+        source = AgentRpcSource(
+            socket_path=tmp_path / "test.sock", handler=AgentRpcHandler(engine=eng)
+        )
+        send, recv = anyio.create_memory_object_stream[InputEvent](16)
+
+        response = await source._handle_request(
+            {"jsonrpc": "2.0", "method": "run", "params": {"force": True}, "id": 1}, send
+        )
+
+        assert response is not None
+        assert "error" in response
+        error = response["error"]
+        assert error["code"] == -32003
+        assert "Pipeline invalid" in error["message"]
+        assert "captures non-scalar variable 'X'" in error["message"]
+        with pytest.raises(anyio.WouldBlock):
+            recv.receive_nowait()
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_connection_timeout() -> None:
     """AgentRpcSource has timeout protection for idle connections.
 
@@ -767,6 +801,7 @@ async def test_agent_rpc_source_accepts_new_connections_after_handler_exception(
         """
 
         _call_count: int
+        pipeline_error: str | None = None
 
         def __init__(self) -> None:
             self._call_count = 0

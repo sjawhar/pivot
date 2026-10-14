@@ -40,6 +40,8 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from pivot_tui.client import PivotClient
     from pivot_tui.event_poller import EventPoller
 from pivot_tui.diff_panels import InputDiffPanel, OutputDiffPanel
@@ -1202,9 +1204,7 @@ class PivotApp(textual.app.App[None]):
 
         stage_name = self._selected_stage_name
         self.notify(f"Forcing re-run of {stage_name}...")
-        success = await self._client.run(stages=[stage_name], force=True)
-        if not success:
-            self.notify("Failed to send re-run command", severity="error")
+        await self._send_run(self._client.run(stages=[stage_name], force=True))
 
     async def action_force_rerun_all(self) -> None:  # pragma: no cover
         """Force re-run all stages (watch mode only)."""
@@ -1218,7 +1218,17 @@ class PivotApp(textual.app.App[None]):
             return
 
         self.notify("Forcing re-run of all stages...")
-        success = await self._client.run(force=True)
+        await self._send_run(self._client.run(force=True))
+
+    async def _send_run(self, request: Coroutine[object, object, bool]) -> None:  # pragma: no cover
+        """Await a run request; show the engine's refusal (an invalid pipeline) if it declines."""
+        from pivot_tui.rpc_client_impl import RpcError
+
+        try:
+            success = await request
+        except RpcError as exc:
+            self.notify(exc.message, severity="error")
+            return
         if not success:
             self.notify("Failed to send re-run command", severity="error")
 

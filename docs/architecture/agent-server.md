@@ -191,6 +191,7 @@ The Engine uses locks to protect atomic state transitions. When a `run` request 
 | `-32603` | Internal error | Server-side exception |
 | `-32001` | Execution in progress | A run is already executing |
 | `-32002` | Stage not found | Requested stage doesn't exist (includes suggestions for typos) |
+| `-32003` | Pipeline invalid | `run` refused because the watched pipeline is invalid; the message carries the error. Refused until an edit reloads a good pipeline |
 
 ## Client Example
 

@@ -1182,6 +1182,27 @@ async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) 
     assert "Failed" in last_call_args or "error" in last_call_args
 
 
+@pytest.mark.anyio
+async def test_action_force_rerun_reports_refused_run(mocker: MockerFixture) -> None:
+    """A run the engine refuses (invalid pipeline) is shown to the user, not raised."""
+    from pivot_tui.rpc_client_impl import RpcError
+
+    mock_client = AsyncMock()
+    mock_client.run.side_effect = RpcError(-32003, "Pipeline invalid - waiting for fix: boom")
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True, client=mock_client)
+    app._selected_stage_name = "stage_a"
+    mock_notify = mocker.patch.object(app, "notify")
+
+    await app.action_force_rerun_stage()
+    await app.action_force_rerun_all()
+
+    errors = [call for call in mock_notify.call_args_list if call.kwargs.get("severity") == "error"]
+    assert [call.args[0] for call in errors] == [
+        "Pipeline invalid - waiting for fix: boom",
+        "Pipeline invalid - waiting for fix: boom",
+    ]
+
+
 def test_pivot_app_accepts_client(mocker: MockerFixture) -> None:
     """PivotApp stores client when passed."""
     client = mocker.MagicMock()

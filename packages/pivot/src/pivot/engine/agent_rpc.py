@@ -196,6 +196,7 @@ _CLIENT_TIMEOUT = 300  # 5 minutes
 
 # Custom error codes
 _ERR_STAGE_NOT_FOUND = -32001
+_ERR_PIPELINE_INVALID = -32003
 
 
 def _json_rpc_response(result: object, request_id: JsonRpcId) -> JsonRpcSuccessResponse | None:
@@ -250,6 +251,11 @@ class AgentRpcHandler:
         self._engine = engine
         self._event_buffer = event_buffer
         self._on_error = OnError.FAIL
+
+    @property
+    def pipeline_error(self) -> str | None:
+        """Why the engine's pipeline cannot run, or None when it can."""
+        return self._engine.pipeline_error
 
     def validate_stages(self, stages: list[str] | None) -> str | None:
         """Validate stage names exist. Returns error message or None if valid."""
@@ -586,6 +592,14 @@ class AgentRpcSource:
             force = params.get("force", False)
             if not isinstance(force, bool):
                 return _json_rpc_error(-32602, "Invalid params: force must be boolean", request_id)
+
+            # Refuse a run the engine would drop because its pipeline is invalid
+            if self._handler is not None and self._handler.pipeline_error is not None:
+                return _json_rpc_error(
+                    _ERR_PIPELINE_INVALID,
+                    f"Pipeline invalid - waiting for fix: {self._handler.pipeline_error}",
+                    request_id,
+                )
 
             # Validate stage names exist (if handler available)
             if self._handler is not None and stages is not None:
