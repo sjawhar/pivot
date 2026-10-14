@@ -1,6 +1,7 @@
 # pyright: reportUnusedFunction=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownArgumentType=false
 """Tests for fingerprinting functools.partial and functools.wraps."""
 
+import dataclasses
 import functools
 import inspect
 import json
@@ -200,6 +201,35 @@ def test_secret_partial_argument_hashes_by_keyed_digest(
     text = json.dumps(manifests)
     assert "first-secret" not in text and "second-secret" not in text
     assert (tmp_path / ".pivot" / "secret.key").exists()
+
+
+@dataclasses.dataclass(frozen=True)
+class _Auth:
+    token: pydantic.SecretStr
+    user: str = "u"
+
+
+def _helper_with_auth(auth: _Auth) -> int:
+    return len(auth.token.get_secret_value())
+
+
+def test_secret_in_a_dataclass_partial_argument_hashes_by_keyed_digest(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataclass is canonicalised field by field, so its secret reaches the digest."""
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    hashes = [
+        fingerprint._serialize_value_for_hash(
+            functools.partial(_helper_with_auth, _Auth(pydantic.SecretStr(value)))
+        )
+        for value in ("first-secret", "second-secret")
+    ]
+
+    assert hashes[0] != hashes[1], "a changed secret must change the hash"
+    assert "first-secret" not in hashes[0] and "**********" not in hashes[0], hashes[0]
+    assert '"secret", "hmac:' in hashes[0], hashes[0]
 
 
 # --- Tests for functools.wraps ---

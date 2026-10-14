@@ -1680,12 +1680,80 @@ with Pipeline("sec") as pipeline:
     measure(pipeline.input("x.csv", format=TokenCSV(token=token)))
 """
 
+_SECRET_IN_DATACLASS_LOADER_PIPELINE = """\
+import dataclasses
+import os
+from typing import Any
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Auth:
+    token: pydantic.SecretStr
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenCSV(loaders.CSV):
+    auth: Auth = Auth(pydantic.SecretStr("unset"))
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return pd.DataFrame({"a": [len(self.auth.token.get_secret_value())]})
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+
+
+with Pipeline("sec") as pipeline:
+    auth = Auth(pydantic.SecretStr(os.environ["TOKEN"]))
+    measure(pipeline.input("x.csv", format=TokenCSV(auth=auth)))
+"""
+
+_SECRET_IN_DATACLASS_PARTIAL_PIPELINE = """\
+import dataclasses
+import functools
+import os
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Auth:
+    token: pydantic.SecretStr
+
+
+def _length(auth: Auth) -> int:
+    return len(auth.token.get_secret_value())
+
+
+LENGTH = functools.partial(_length, Auth(pydantic.SecretStr(os.environ["TOKEN"])))
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({"a": [LENGTH()]})
+
+
+with Pipeline("sec") as pipeline:
+    measure(pipeline.input("x.csv"))
+"""
+
 
 @pytest.mark.parametrize(
     "pipeline",
     [
         pytest.param(_SECRET_DEFAULT_PIPELINE, id="stage-params-default"),
         pytest.param(_SECRET_LOADER_PIPELINE, id="loader-field"),
+        pytest.param(_SECRET_IN_DATACLASS_LOADER_PIPELINE, id="dataclass-in-loader-field"),
+        pytest.param(_SECRET_IN_DATACLASS_PARTIAL_PIPELINE, id="dataclass-in-partial-argument"),
     ],
 )
 def test_changing_a_secret_read_by_a_stage_reruns_it(tmp_path: pathlib.Path, pipeline: str) -> None:

@@ -134,8 +134,8 @@ returns into the record as written.
 
 The same digest is what the code fingerprint hashes for a secret found outside a stage's
 own params: a `StageParams` default on a helper, a loader's config field, or a
-`functools.partial` argument. Changing that secret re-runs the stage, and no manifest or
-lock holds its value.
+`functools.partial` argument, including one inside a dataclass or pydantic model held
+there. Changing that secret re-runs the stage, and no manifest or lock holds its value.
 
 The key is `.pivot/secret.key`: 32 random bytes, created the first time a stage with a
 secret is checked, with mode 0600, and listed in `.pivot/.gitignore`. Never commit it.

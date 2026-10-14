@@ -52,7 +52,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # included) and keys closure values under the binding the closure was reached through.
 # Version 19 records each library function or class a stage reads by name (`ext:` entries).
 # Version 20 hashes a secret in a default, loader config or partial by its keyed digest.
-_CACHE_SCHEMA_VERSION = 20
+# Version 21 hashes a dataclass instance field by field, not by its generated repr.
+_CACHE_SCHEMA_VERSION = 21
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1962,8 +1963,11 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     instance is dumped in python mode, which keeps each secret (`SecretStr`, `SecretBytes`,
     `Secret[T]`) as its own object; a secret becomes `["secret", digest]`, the keyed digest the
     lock file records for it (`parameters.secret_digest`), so changing it changes the hash and
-    no fingerprint holds its value. An object whose class keeps `object.__repr__` (which holds
-    the address) and that has a `__dict__` becomes `[module.qualname, canonical(vars(obj))]`.
+    no fingerprint holds its value. A dataclass instance becomes `[module.qualname,
+    canonical({field: value})]`, field by field, so a secret inside one reaches that leaf
+    rather than the generated repr's mask. An object whose class keeps `object.__repr__`
+    (which holds the address) and that has a `__dict__` becomes
+    `[module.qualname, canonical(vars(obj))]`.
     Other leaves keep their `repr`, tagged with their type. A class is a leaf, even a pydantic
     model class: only an instance is dumped.
     """
@@ -2008,6 +2012,10 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
 
     if parameters.is_secret(value):
         return ["secret", parameters.secret_digest(value)]
+    if not isinstance(value, type) and dataclasses.is_dataclass(cast("object", value)):
+        inner = (*active, id(value))
+        fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
     if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
         inner = (*active, id(value))
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value), inner)]
