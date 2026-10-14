@@ -431,3 +431,44 @@ def test_set_valued_params_stay_cached_across_processes(tmp_path: pathlib.Path) 
         _helper_ok(_helper_pivot(root, "fingerprint", "reset", hash_seed=seed))
         status = _helper_ok(_helper_pivot(root, "status", hash_seed=seed))
         assert "1 cached, 0 stale" in status, f"PYTHONHASHSEED={seed}:\n{status}"
+
+
+_HANDLE_DEFAULT_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+with Pipeline("h") as pipeline:
+    RAW = pipeline.input("t.csv")
+    PARTS = [pipeline.input("t.csv")]
+
+
+    @stage
+    def scale(raw: pd.DataFrame = RAW) -> pd.DataFrame:
+        return raw * 3
+
+
+    @stage
+    def total(parts: list[pd.DataFrame] = PARTS) -> pd.DataFrame:
+        return sum(parts[1:], parts[0])
+
+
+    scale()
+    total()
+"""
+
+
+def test_artifact_handle_default_is_wired_as_an_input(tmp_path: pathlib.Path) -> None:
+    """A handle default is a real pipeline input, not module state, so it is not refused."""
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _HANDLE_DEFAULT_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"}
+    )
+
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert (root / "data/h/scale.jsonl").read_text() == '{"a":3}\n{"a":6}\n', output
+    assert (root / "data/h/total.jsonl").read_text() == '{"a":1}\n{"a":2}\n', output
+
+    (root / "data/raw/t.csv").write_text("a\n5\n")
+    output = _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/h/scale.jsonl").read_text() == '{"a":15}\n', output

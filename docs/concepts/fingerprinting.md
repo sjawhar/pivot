@@ -106,7 +106,9 @@ The same rule covers a default argument that reads a module value, such as
 `def process(data, cols=COLUMNS)`, on the stage or on a helper it calls. A
 default is evaluated when the module loads, so Pivot checks its value: a scalar
 is tracked, and anything else is refused. A literal default such as
-`cols=("a", "b")` is part of the function's code and is tracked with it.
+`cols=("a", "b")` is part of the function's code and is tracked with it. A
+default that is a pipeline input handle (`raw=RAW` with
+`RAW = pipeline.input("t.csv")`) is wired as an input and tracked by its content.
 
 Fix: move the value into the stage's [StageParams](parameters.md). Configuration
 in module-level collections is not supported.

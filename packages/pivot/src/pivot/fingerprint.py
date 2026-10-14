@@ -1016,14 +1016,16 @@ def _process_default_values(
 
     A default is evaluated once, when its module loads, so `cols=COLUMNS` puts the name
     `COLUMNS` in the AST and never its value. A scalar or a StageParams instance is tracked by
-    value: a stage's own params hash does not cover a StageParams default on a helper. Any
-    other value is treated like a captured module value, unless its default is a literal that
-    the function's AST hash already records, such as `keys=("a", "b")`.
+    value: a stage's own params hash does not cover a StageParams default on a helper. An
+    ArtifactHandle default, or a list or tuple of them, is skipped: the pipeline wires it as a
+    real input, which is hashed as a dependency. Any other value is treated like a captured
+    module value, unless its default is a literal that the function's AST hash already
+    records, such as `keys=("a", "b")`.
     """
     defaults = _function_defaults(func)
     if not defaults:
         return
-    from pivot import stage_def
+    from pivot import compose, stage_def
 
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
     func_ref = _definition_ref(func)
@@ -1037,6 +1039,8 @@ def _process_default_values(
             serialized = _serialize_value_for_hash(value)
             manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
             continue
+        if _is_artifact_handles(value, compose.ArtifactHandle):
+            continue
         if expressions is None:
             expressions = _default_expressions(func)
         expression = expressions.get(parameter)
@@ -1046,6 +1050,16 @@ def _process_default_values(
         _process_captured_value(
             source, binding_ref, value, func, manifest, visited, stage_name, parameter=parameter
         )
+
+
+def _is_artifact_handles(value: object, handle_type: type) -> bool:
+    """Return whether `value` is a handle, or a non-empty list or tuple of handles."""
+    if isinstance(value, handle_type):
+        return True
+    if isinstance(value, (list, tuple)):
+        items = cast("list[object] | tuple[object, ...]", value)
+        return bool(items) and all(isinstance(item, handle_type) for item in items)
+    return False
 
 
 def _function_defaults(func: Callable[..., Any]) -> list[tuple[str, Any]]:
