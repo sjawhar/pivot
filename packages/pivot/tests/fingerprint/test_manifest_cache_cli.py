@@ -537,3 +537,28 @@ def test_loader_config_with_model_class_stays_cached(tmp_path: pathlib.Path, loa
 
     second = _helper_ok(_helper_pivot(root, "repro"))
     assert "0 ran, 1 cached" in second, second
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [
+        pytest.param("loaders.JSON(empty_factory=make_empty)", id="user-function"),
+        pytest.param(
+            "loaders.JSON(empty_factory=functools.partial(make_empty))", id="partial-of-function"
+        ),
+    ],
+)
+def test_loader_config_with_user_function_stays_cached_and_tracks_edits(
+    tmp_path: pathlib.Path, loader: str
+) -> None:
+    """A function in a loader's config hashes by its name and code, not its memory address."""
+    pipeline = "import functools\n" + _LOADER_CONFIG_PIPELINE.replace("LOADER", loader)
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(_helper_pivot(root, "repro"))
+
+    second = _helper_ok(_helper_pivot(root, "repro"))
+    assert "0 ran, 1 cached" in second, second
+
+    (root / "pipeline.py").write_text(pipeline.replace("return {}", 'return {"n": 0}'))
+    edited = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in edited, edited

@@ -262,6 +262,45 @@ def test_distinct_partial_arguments_have_distinct_fingerprints(
     assert first_args != second_args
 
 
+_FUNCTION_ARGUMENT_SCRIPT = """\
+import functools
+
+from pivot import fingerprint
+
+
+def make_empty():
+    return {}
+
+
+def helper(factory):
+    return factory()
+
+
+bound = functools.partial(helper, make_empty)
+
+
+def stage():
+    return bound()
+
+
+print(next(v for k, v in fingerprint.get_stage_fingerprint(stage).items() if k.endswith(".args")))
+"""
+
+
+def test_function_argument_hash_is_stable_across_processes(tmp_path: pathlib.Path) -> None:
+    """A function value hashes by name and code, not by the address in its repr."""
+    (tmp_path / ".pivot").mkdir()
+    script = tmp_path / "function_argument_stage.py"
+    script.write_text(_FUNCTION_ARGUMENT_SCRIPT)
+    results = {
+        subprocess.run(
+            [sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        for _ in range(3)
+    }
+    assert len(results) == 1, results
+
+
 class _Item(pydantic.BaseModel):
     name: str = "none"
 

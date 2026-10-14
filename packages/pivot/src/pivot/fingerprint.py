@@ -41,7 +41,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 10 drops a bare @stage decorator from code hashes, as the called form already was.
 # Version 11 walks the function behind a functools.cache or lru_cache helper.
 # Version 12 hashes set members and dict entries in sorted order, not hash-seed order.
-_CACHE_SCHEMA_VERSION = 12
+# Version 13 hashes a function value by its name and code instead of its address-bearing repr.
+_CACHE_SCHEMA_VERSION = 13
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1335,11 +1336,25 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
     Collections become `[type, items]` nodes, so a set stays distinct from a list or from a
     string that looks like one. Set members and dict entries are sorted by their full
     canonical JSON text: a set's iteration order, and a dict built from a set, follow the
-    hash seed. Other leaves keep their `repr`, tagged with their type. A class is a leaf, even
-    a pydantic model class: only an instance is dumped.
+    hash seed. A Python function is named by its module and qualname, plus its code hash when
+    it is user code, because its `repr` holds a memory address; a `functools.partial` is
+    canonicalised through its function and arguments for the same reason. Other leaves keep
+    their `repr`, tagged with their type. A class is a leaf, even a pydantic model class: only
+    an instance is dumped.
     """
     if hasattr(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump())
+    if inspect.isfunction(value):
+        code_hash = hash_function_ast(value) if is_user_code(value) else None
+        return ["function", _definition_ref(value), code_hash]
+    if isinstance(value, functools.partial):
+        partial_obj = cast("functools.partial[Any]", value)
+        return [
+            "partial",
+            _canonicalize_value_for_hash(partial_obj.func),
+            _canonicalize_value_for_hash(partial_obj.args),
+            _canonicalize_value_for_hash(partial_obj.keywords),
+        ]
     if isinstance(value, dict):
         entries = [
             [_canonicalize_value_for_hash(key), _canonicalize_value_for_hash(item)]
