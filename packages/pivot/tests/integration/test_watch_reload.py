@@ -510,16 +510,22 @@ async def test_reload_fingerprints_off_the_event_loop(
             tg.cancel_scope.cancel()
 
 
-def _helper_chains_source(b_suffix: str) -> str:
-    """pipeline.py with two independent stages: from_a reads a.txt and from_b reads b.txt."""
+def _helper_chains_source(b_suffix: str, *, a_sleep: float = 0.0) -> str:
+    """pipeline.py with two independent stages: from_a reads a.txt and from_b reads b.txt.
+
+    With ``a_sleep``, from_a sleeps that many seconds, so a run stays busy in it.
+    """
     return f"""\
 from __future__ import annotations
+
+import time
 
 from pivot.compose import Pipeline, stage
 
 
 @stage
 def from_a(raw: str) -> str:
+    time.sleep({a_sleep!r})
     return raw + "-a"
 
 
@@ -587,6 +593,52 @@ async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
             await recorder.wait_for(_helper_is_idle, start=reload_index)
             assert a_output.read_text() == "a2-a", "the mid-reload data edit is picked up"
             assert b_output.read_text() == "b1-v2", "the code-edited stage re-runs"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_data_edit_while_a_run_is_cancelling_waits_for_it(
+    watch_project: pathlib.Path,
+) -> None:
+    """A data edit made while a run is cancelling keeps watch alive and is picked up afterwards.
+
+    Editing a.txt twice cancels the first from_a run, which stays CANCELLING until its stage
+    ends. A b.txt edit then joins the pending restart instead of starting a second run against
+    a worker pool that has stopped accepting stages.
+    """
+    raw_dir = watch_project / "data" / "raw"
+    (raw_dir / "a.txt").write_text("a1")
+    (raw_dir / "b.txt").write_text("b1")
+    (watch_project / "pipeline.py").write_text(_helper_chains_source("-b", a_sleep=1.5))
+    pipeline = _helper_discover(watch_project)
+    a_output = _helper_output_path(watch_project, pipeline, "chains/from_a")
+    b_output = _helper_output_path(watch_project, pipeline, "chains/from_b")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(sources.OneShotSource(stages=None, force=False, reason="test"))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+
+            (raw_dir / "a.txt").write_text("a2")
+            await recorder.wait_for(
+                lambda e: e["type"] == "stage_started" and e["stage"] == "chains/from_a",
+                start=first_idle,
+            )
+            (raw_dir / "a.txt").write_text("a3")
+            with anyio.fail_after(5):
+                while eng._run_state != engine_mod._RunState.CANCELLING:
+                    await anyio.sleep(0.01)
+            b_edit = len(recorder.events)
+            (raw_dir / "b.txt").write_text("b2")
+
+            done = await recorder.wait_for(_helper_completes("chains/from_b"), start=b_edit)
+            await recorder.wait_for(_helper_is_idle, start=done)
+            assert a_output.read_text() == "a3-a", "the second a.txt edit is picked up"
+            assert b_output.read_text() == "b2-b", "the b.txt edit made while cancelling is too"
             tg.cancel_scope.cancel()
 
 

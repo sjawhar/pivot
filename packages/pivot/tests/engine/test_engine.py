@@ -1136,6 +1136,65 @@ async def test_engine_restart_after_deferred_reload_skips_removed_stages() -> No
     assert calls[-1] == ["stage_a"], "the replayed restart runs what still exists"
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("cancel", "replayed"),
+    [
+        pytest.param("restart", ["stage_a", "stage_b", "stage_c"], id="joins-the-pending-restart"),
+        pytest.param("explicit", ["stage_c"], id="after-an-explicit-cancel"),
+    ],
+)
+async def test_engine_run_request_while_cancelling_waits_for_the_run_to_end(
+    cancel: str,
+    replayed: list[str],
+) -> None:
+    """A request made while a run is cancelling starts no second run alongside it.
+
+    It joins the pending restart, or after an explicit cancel becomes the restart on its own, so
+    the stages that cancel stopped are not merged back in.
+    """
+    calls = list[list[str] | None]()
+    in_flight = 0
+    most_in_flight = 0
+    release = anyio.Event()
+
+    async with Engine() as engine:
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            nonlocal in_flight, most_in_flight
+            in_flight += 1
+            most_in_flight = max(most_in_flight, in_flight)
+            calls.append(cast("list[str] | None", kwargs["stages"]))
+            try:
+                if len(calls) == 1:
+                    # A stage still running keeps the cancelled run in CANCELLING
+                    with anyio.fail_after(5):
+                        await engine._cancel_event.wait()
+                        await release.wait()
+                return {}
+            finally:
+                in_flight -= 1
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(_helper_run_request(["stage_a"]))
+            await anyio.wait_all_tasks_blocked()
+            if cancel == "restart":
+                await engine._handle_run_requested(_helper_run_request(["stage_b"]))
+            else:
+                await engine._handle_cancel_requested()
+            assert engine._run_state == engine_mod._RunState.CANCELLING
+            await engine._handle_run_requested(_helper_run_request(["stage_c"]))
+            await anyio.wait_all_tasks_blocked()
+            release.set()
+
+    assert most_in_flight == 1, f"a second run started while the first was cancelling: {calls}"
+    assert calls == [["stage_a"], replayed]
+
+
 # =============================================================================
 # Cleanup Tests
 # =============================================================================

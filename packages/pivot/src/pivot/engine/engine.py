@@ -733,7 +733,9 @@ class Engine:
 
         If already running, coalesces into a restart: cancels the current run and queues one
         request covering both it and the new event, replayed once the current run completes.
-        A restart waiting behind a deferred reload is folded into that reload's re-run.
+        While a run is cancelling, the event joins the pending restart, or becomes it after an
+        explicit cancel. A restart waiting behind a deferred reload is folded into that reload's
+        re-run.
         """
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
@@ -750,6 +752,16 @@ class Engine:
             assert self._running_request is not None
             self._restart_pending = _merge_run_requests(self._running_request, event)
             await self._handle_cancel_requested()
+            return
+
+        if self._run_state == _RunState.CANCELLING:
+            # Wait for the stopping run: join its pending restart, or after an explicit cancel
+            # become the restart on its own, so the stages the cancel stopped stay stopped
+            self._restart_pending = (
+                event
+                if self._restart_pending is None
+                else _merge_run_requests(self._restart_pending, event)
+            )
             return
 
         if self._restart_pending is not None:
