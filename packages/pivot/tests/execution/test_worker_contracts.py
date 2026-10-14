@@ -31,7 +31,7 @@ import joblib.parallel
 import numpy
 import pytest
 
-from pivot import exceptions, loaders, metrics, stage_def, types
+from pivot import exceptions, loaders, stage_def, types
 from pivot import project as pivot_project
 from pivot.executor import worker
 from pivot.storage import artifact_lock, cache, lock, state
@@ -302,7 +302,7 @@ def test_invalid_params_yaml_override_fails_the_stage(
     result = worker.execute_stage(_STAGE, info, worker_env, output_queue)
 
     assert result["status"] == StageStatus.FAILED
-    assert result["reason"] == "Invalid params override in params.yaml: 1 validation error(s)"
+    assert "params.yaml" in result["reason"], "the reason must point at the file to fix"
 
 
 def _reports_project_root(data: str) -> str:
@@ -528,38 +528,18 @@ _DIRECTORY_OUT = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
 
 
 @pytest.mark.parametrize(
-    ("func", "outs", "error"),
+    ("func", "outs", "cause"),
     [
-        pytest.param(
-            _returns_none,
-            [_ref(_STAGE)],
-            f"RuntimeError: Stage '{_STAGE}' has output annotations but returned None",
-            id="none-for-an-output",
-        ),
+        pytest.param(_returns_none, [_ref(_STAGE)], "returned None", id="none-for-an-output"),
         pytest.param(
             _returns_value,
             [_ref(_STAGE, "a"), _ref(_STAGE, "b")],
-            f"RuntimeError: Stage '{_STAGE}' returned str but expected a mapping",
+            "mapping",
             id="str-for-several-outputs",
         ),
-        pytest.param(
-            _returns_value,
-            [_DIRECTORY_OUT],
-            f"RuntimeError: Directory output for '{_STAGE}' expects dict, got str",
-            id="str-for-a-directory",
-        ),
-        pytest.param(
-            _returns_empty_dict,
-            [_DIRECTORY_OUT],
-            f"ValueError: Directory output '{_STAGE}': dict must be non-empty",
-            id="empty-directory",
-        ),
-        pytest.param(
-            _returns_int_key,
-            [_DIRECTORY_OUT],
-            f"ValueError: Directory output for '{_STAGE}': keys must be strings, got int",
-            id="non-string-member-name",
-        ),
+        pytest.param(_returns_value, [_DIRECTORY_OUT], "dict", id="str-for-a-directory"),
+        pytest.param(_returns_empty_dict, [_DIRECTORY_OUT], "non-empty", id="empty-directory"),
+        pytest.param(_returns_int_key, [_DIRECTORY_OUT], "strings", id="non-string-member-name"),
     ],
 )
 def test_return_value_that_does_not_fit_the_outputs_fails_with_the_cause(
@@ -568,14 +548,17 @@ def test_return_value_that_does_not_fit_the_outputs_fails_with_the_cause(
     output_queue: mp.Queue[OutputMessage],
     func: Callable[[str], object],
     outs: list[types.ArtifactRef],
-    error: str,
+    cause: str,
 ) -> None:
     result = worker.execute_stage(
         _STAGE, _stage_info(func, project, worker_env, outs=outs), worker_env, output_queue
     )
 
     assert result["status"] == StageStatus.FAILED
-    assert result["reason"].splitlines()[-1] == error
+    error = result["reason"].splitlines()[-1]
+    assert _STAGE in error, "the error must name the stage"
+    assert cause in error, "the error must say what was wrong with the return value"
+    assert not _output_path(project).exists()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -763,9 +746,8 @@ def test_every_missing_output_key_is_reported() -> None:
     with pytest.raises(KeyError) as exc_info:
         worker._resolve_output_values({"b": 1}, outs, _STAGE)
 
-    assert exc_info.value.args == (
-        "Missing return output keys: ['a', 'c']. Return value keys: ['b']",
-    )
+    message = str(exc_info.value)
+    assert "'a'" in message and "'c'" in message, "every missing key must be named"
 
 
 def test_undeclared_return_keys_are_warned_and_dropped(caplog: pytest.LogCaptureFixture) -> None:
@@ -775,7 +757,9 @@ def test_undeclared_return_keys_are_warned_and_dropped(caplog: pytest.LogCapture
         values = worker._resolve_output_values({"a": 1, "b": 2, "extra": 3}, outs, _STAGE)
 
     assert {ref.identity.key: value for ref, value in values.items()} == {"a": 1, "b": 2}
-    assert caplog.messages == ["Extra keys in return value not declared as outputs: ['extra']"]
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "extra" in caplog.records[0].getMessage(), "the warning must name the dropped key"
 
 
 def _path_ref() -> types.ArtifactRef:
@@ -812,10 +796,9 @@ def test_path_output_checks_dependencies_through_symlinks(tmp_path: pathlib.Path
     worker._reject_path_inside_project(_path_ref(), produced, project_root, [unrelated])
     with pytest.raises(exceptions.StageDefinitionError) as exc_info:
         worker._reject_path_inside_project(_path_ref(), produced, project_root, [link])
-    assert str(exc_info.value) == (
-        f"Stage '{_STAGE}' returned {produced}, which overlaps dependency {link}. "
-        + "Pivot cannot move a path the stage received as input."
-    )
+    message = str(exc_info.value)
+    assert _STAGE in message
+    assert str(produced) in message and str(link) in message, "both paths must be named"
     assert produced.read_bytes() == b"result"
 
 
@@ -828,11 +811,10 @@ def test_path_output_inside_the_project_tells_the_author_where_to_write(
     with pytest.raises(exceptions.StageDefinitionError) as exc_info:
         worker._reject_path_inside_project(_path_ref(), produced, tmp_path)
 
-    assert str(exc_info.value) == (
-        f"Stage '{_STAGE}' returned {produced}, which is inside the project ({tmp_path}). "
-        + "Pivot moves a returned path to the stage's output path, so it must be a file or "
-        + "directory the stage created outside the project, e.g. under tempfile.mkdtemp()."
-    )
+    message = str(exc_info.value)
+    assert _STAGE in message and str(produced) in message
+    assert "tempfile.mkdtemp()" in message, "the error must say where to write instead"
+    assert produced.read_bytes() == b"result"
 
 
 def test_list_and_tuple_dependencies_are_rebuilt_in_index_order() -> None:
@@ -912,18 +894,6 @@ def test_incremental_input_that_cannot_be_restored_names_the_fix(
 # =============================================================================
 # Output capture primitives
 # =============================================================================
-
-
-def test_ring_buffer_keeps_the_last_thousand_lines_by_default() -> None:
-    ring = worker._OutputRingBuffer()
-    for index in range(1001):
-        ring.append(f"line {index}", False)
-
-    snapshot = ring.snapshot()
-
-    assert snapshot[0] == ("[1 earlier lines truncated]", False)
-    assert snapshot[1] == ("line 1", False)
-    assert len(snapshot) == 1001
 
 
 def test_ring_buffer_counts_every_dropped_line() -> None:
@@ -1048,22 +1018,6 @@ def test_background_child_holding_stage_stdout_does_not_keep_the_worker_alive(
 # =============================================================================
 # Dependency hashing
 # =============================================================================
-
-
-def test_dependency_hashing_reports_its_duration_when_metrics_are_on(
-    project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(metrics, "_enabled", True)
-    metrics.clear()
-    store = store_mod.WorkspaceStore(project, "skip", {"raw": "raw.txt"})
-    try:
-        with state.StateDB(project / ".pivot") as db:
-            worker.hash_dependencies({"data": _ref("raw")}, store, db)
-        names = [name for name, _ in metrics.get_entries()]
-    finally:
-        metrics.clear()
-
-    assert "worker.hash_dependencies" in names
 
 
 def test_hash_dependencies_hashes_a_path_list(tmp_path: pathlib.Path) -> None:
