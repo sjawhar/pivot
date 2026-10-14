@@ -801,10 +801,12 @@ async def test_agent_rpc_source_accepts_new_connections_after_handler_exception(
         """
 
         _call_count: int
-        pipeline_error: str | None = None
 
         def __init__(self) -> None:
             self._call_count = 0
+
+        async def pipeline_error(self) -> str | None:
+            return None
 
         def validate_stages(self, stages: list[str] | None) -> str | None:
             return None

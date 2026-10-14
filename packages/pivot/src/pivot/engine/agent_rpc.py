@@ -252,9 +252,12 @@ class AgentRpcHandler:
         self._event_buffer = event_buffer
         self._on_error = OnError.FAIL
 
-    @property
-    def pipeline_error(self) -> str | None:
-        """Why the engine's pipeline cannot run, or None when it can."""
+    async def pipeline_error(self) -> str | None:
+        """Why the engine's pipeline cannot run, or None when it can.
+
+        Waits for the startup snapshot first: it is what finds a stage that fails to fingerprint.
+        """
+        await self._engine.wait_for_startup_fingerprints()
         return self._engine.pipeline_error
 
     def validate_stages(self, stages: list[str] | None) -> str | None:
@@ -594,10 +597,10 @@ class AgentRpcSource:
                 return _json_rpc_error(-32602, "Invalid params: force must be boolean", request_id)
 
             # Refuse a run the engine would drop because its pipeline is invalid
-            if self._handler is not None and self._handler.pipeline_error is not None:
+            if self._handler is not None and (error := await self._handler.pipeline_error()):
                 return _json_rpc_error(
                     _ERR_PIPELINE_INVALID,
-                    f"Pipeline invalid - waiting for fix: {self._handler.pipeline_error}",
+                    f"Pipeline invalid - waiting for fix: {error}",
                     request_id,
                 )
 

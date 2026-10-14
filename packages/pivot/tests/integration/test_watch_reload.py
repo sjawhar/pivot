@@ -498,6 +498,59 @@ async def test_run_requested_during_startup_snapshot_is_not_replaced_by_startup_
 
 
 @pytest.mark.anyio
+async def test_run_requested_during_startup_snapshot_of_refused_pipeline_is_refused(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run sent while the snapshot runs waits for it, then is refused if it found an error."""
+    from pivot import registry
+
+    (watch_project / "pipeline.py").write_text(
+        _helper_pipeline_source("-v1", third="other", refused=True)
+    )
+    pipeline = _helper_discover(watch_project)
+    compute = registry._compute_fingerprint
+    finished = list[str]()
+
+    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+        time.sleep(1.0)
+        finished.append(stage_name)
+        return compute(stage_name, info)
+
+    monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
+    recorder = _Recorder()
+    socket_path = watch_project / "rpc.sock"
+    ready = threading.Event()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        handler = agent_rpc.AgentRpcHandler(engine=eng)
+        eng.add_source(
+            agent_rpc.AgentRpcSource(socket_path=socket_path, handler=handler, ready=ready)
+        )
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            client = rpc_client_impl.RpcPivotClient()
+            with anyio.fail_after(2):
+                while not ready.is_set():
+                    await anyio.sleep(0.01)
+                await client.connect(socket_path)
+            try:
+                assert len(finished) < 3, "the run is sent while the snapshot still runs"
+                with pytest.raises(rpc_client_impl.RpcError) as refused:
+                    await client.run(stages=["reload/change"], force=True)
+                assert refused.value.code == -32003
+                assert "captures non-scalar variable 'SUFFIXES'" in refused.value.message
+            finally:
+                await client.disconnect()
+            await _helper_wait_until_watching(eng)
+            tg.cancel_scope.cancel()
+
+    assert not any(event["type"] == "stage_completed" for event in recorder.events)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("broken_source", "expected_error"),
     [
