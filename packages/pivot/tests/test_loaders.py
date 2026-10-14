@@ -1311,6 +1311,32 @@ def test_dataframe_jsonl_reads_a_headerless_first_row_named_like_the_header(
     assert loaders.DataFrameJSONL().row_count(jsonl_file) == 2
 
 
+def test_dataframe_jsonl_reads_a_headerless_file_exactly_as_pandas_did(
+    tmp_path: pathlib.Path,
+) -> None:
+    """External inputs keep the values earlier releases gave: pandas' parser, not exact floats.
+
+    A stage's result must not depend on which Pivot release parsed its raw input.
+    """
+    jsonl_file = tmp_path / "runs.jsonl"
+    jsonl_file.write_text(
+        '{"score":0.3,"weight":0.35,"missing":null,"flag":true,"name":"02134"}\n'
+        + '{"score":0.7,"weight":null,"missing":null,"flag":null,"name":"x"}\n'
+    )
+    expected = pandas.read_json(jsonl_file, lines=True, orient="records", convert_dates=False)
+
+    loaded = loaders.DataFrameJSONL().load(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, expected, check_exact=True)
+    assert loaded["score"].tolist() == expected["score"].tolist()
+    first_row = pandas.read_json(
+        jsonl_file, lines=True, orient="records", convert_dates=False, nrows=1
+    )
+    pandas.testing.assert_frame_equal(
+        loaders.DataFrameJSONL().load(jsonl_file, max_rows=1), first_row, check_exact=True
+    )
+
+
 def test_dataframe_jsonl_refuses_an_unknown_header_version(tmp_path: pathlib.Path) -> None:
     jsonl_file = tmp_path / "future.jsonl"
     header = {"version": 2, "columns": [], "temporal_columns": {}}

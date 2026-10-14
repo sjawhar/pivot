@@ -557,7 +557,13 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     JSONL reader sees that explicit metadata record followed by normal row records;
     it can skip the first line to read the data rows unchanged. Only a first line
     with exactly the header's shape is read as the header, so a column may have any
-    name, including ``__pivot_dataframe_metadata__``, and headerless files load as rows.
+    name, including ``__pivot_dataframe_metadata__``.
+
+    A file without the header (written by another tool, or by Pivot before the
+    header existed) loads exactly as ``pandas.read_json(path, lines=True,
+    orient="records", convert_dates=False)`` reads it, pandas' float parser included,
+    so external inputs give the same values they always did. The exactness below
+    applies to files Pivot writes with the header.
 
     - a zero-row frame keeps its columns and dtypes.
 
@@ -580,25 +586,31 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     @override
     def load(self, path: pathlib.Path, *, max_rows: int | None = None) -> pandas.DataFrame:
         """Load all rows, or at most ``max_rows`` data records after the metadata header."""
-        records = list[object]()
-        header: _JsonlHeader | None = None
         with path.open() as f:
-            for line_num, line in enumerate(f, 1):
+            first_line = f.readline()
+        header: _JsonlHeader | None = None
+        if first_line.strip():
+            try:
+                first_record = cast("object", json.loads(first_line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON at {path}:1: {e}") from e
+            header = _parse_jsonl_header(first_record, path)
+        if header is None:
+            return pandas.read_json(
+                path, lines=True, orient="records", convert_dates=False, nrows=max_rows
+            )
+        records = list[object]()
+        with path.open() as f:
+            next(f)
+            for line_num, line in enumerate(f, 2):
                 if not line.strip():
                     continue
                 try:
-                    record = cast("object", json.loads(line))
+                    records.append(cast("object", json.loads(line)))
                 except json.JSONDecodeError as e:
                     raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
-                if line_num == 1:
-                    header = _parse_jsonl_header(record, path)
-                    if header is not None:
-                        continue
-                records.append(record)
                 if max_rows is not None and len(records) >= max_rows:
                     break
-        if header is None:
-            return pandas.DataFrame(records)
         columns, temporal_columns = header
         if not records:
             # No row records carry the keys, so the header alone gives the schema.

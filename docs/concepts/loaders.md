@@ -78,7 +78,15 @@ string column is temporal.
 Non-Pivot JSONL readers see the explicit first record and must skip it before
 reading data rows. Pivot treats the first line as the header only when it has
 exactly this shape, so a column may have any name, including
-`__pivot_dataframe_metadata__`, and a JSONL file without a header loads as rows.
+`__pivot_dataframe_metadata__`.
+
+A `.jsonl` file without the header, such as a raw input under `data/raw/` or a
+file written by an earlier Pivot release, loads exactly as
+`pd.read_json(path, lines=True, orient="records", convert_dates=False)` reads
+it, so a stage gets the same values from an external file that it always did.
+That includes pandas' inexact float parsing (`0.3` reads as
+`0.30000000000000004`). Exact floats and restored dtypes apply to files Pivot
+writes with the header.
 
 A column this format cannot hold exactly (`Decimal`, `set`, `bytes` or other
 object cells, or a timezone that cannot be rebuilt from its name, such as a
