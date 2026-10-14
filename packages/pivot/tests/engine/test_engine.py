@@ -11,7 +11,7 @@ import anyio
 import networkx as nx
 import pytest
 
-from pivot import loaders, parameters, project, types
+from pivot import exceptions, loaders, parameters, project, types
 from pivot.compose import Pipeline, stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import graph as engine_graph
@@ -1029,6 +1029,111 @@ async def test_engine_concurrent_run_requests_coalesced() -> None:
         assert "run_2_end" in execution_order, (
             f"Second run should have completed: {execution_order}"
         )
+
+
+def _helper_run_request(stages: list[str] | None, *, force: bool = False) -> RunRequested:
+    return RunRequested(
+        type="run_requested",
+        stages=stages,
+        force=force,
+        reason="test",
+        single_stage=False,
+        parallel=True,
+        max_workers=None,
+        resource_capacity={},
+        no_commit=False,
+        on_error=OnError.FAIL,
+        cache_dir=None,
+        allow_uncached_incremental=False,
+        checkout_missing=False,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("first", "second", "replayed"),
+    [
+        pytest.param(
+            (["stage_a"], False), (["stage_b"], False), (["stage_a", "stage_b"], False), id="union"
+        ),
+        pytest.param((None, False), (["stage_b"], False), (None, False), id="all-stays-all"),
+        pytest.param(
+            (["stage_a"], True),
+            (["stage_b"], False),
+            (["stage_a", "stage_b"], True),
+            id="forced-stays-forced",
+        ),
+    ],
+)
+async def test_engine_restart_covers_the_cancelled_run_and_the_new_request(
+    first: tuple[list[str] | None, bool],
+    second: tuple[list[str] | None, bool],
+    replayed: tuple[list[str] | None, bool],
+) -> None:
+    """A request that cancels a run replays both: a restart never narrows what was going to run."""
+    calls = list[tuple[list[str] | None, bool]]()
+
+    async with Engine() as engine:
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            calls.append(
+                (cast("list[str] | None", kwargs["stages"]), cast("bool", kwargs["force"]))
+            )
+            if len(calls) == 1:
+                with anyio.fail_after(5):
+                    await engine._cancel_event.wait()
+            return {}
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(_helper_run_request(first[0], force=first[1]))
+            await anyio.wait_all_tasks_blocked()
+            await engine._handle_run_requested(_helper_run_request(second[0], force=second[1]))
+
+    assert calls == [first, replayed]
+
+
+@pytest.mark.anyio
+async def test_engine_restart_after_deferred_reload_skips_removed_stages() -> None:
+    """A restart replayed after a deferred reload drops the stages that reload removed."""
+    stage_list = ["stage_a", "stage_gone"]
+    calls = list[list[str] | None]()
+
+    async with Engine() as engine:
+        pipeline = MagicMock()
+        pipeline.list_stages.side_effect = lambda: list(stage_list)
+        engine._pipeline = pipeline
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            stages = cast("list[str] | None", kwargs["stages"])
+            unknown = [s for s in stages or [] if s not in stage_list]
+            if unknown:
+                raise exceptions.StageNotFoundError(unknown, available_stages=stage_list)
+            calls.append(stages)
+            if len(calls) == 1:
+                with anyio.fail_after(5):
+                    await engine._cancel_event.wait()
+            return {}
+
+        async def mock_code_changed(_event: CodeOrConfigChanged) -> None:
+            stage_list.remove("stage_gone")
+            await engine._execute_affected_stages(list(stage_list))
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._handle_code_or_config_changed = mock_code_changed  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(_helper_run_request(["stage_a", "stage_gone"]))
+            await anyio.wait_all_tasks_blocked()
+            engine._reload_pending = {"pipeline.py"}
+            await engine._handle_run_requested(_helper_run_request(["stage_gone"]))
+
+    assert calls[0] == ["stage_a", "stage_gone"]
+    assert calls[-1] == ["stage_a"], "the replayed restart runs what still exists"
 
 
 # =============================================================================

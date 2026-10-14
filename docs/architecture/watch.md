@@ -74,6 +74,8 @@ When a dependency file changes:
 3. Engine executes affected stages and their downstream dependencies
 4. StageStarted/StageCompleted events emitted to sinks
 
+A change that arrives while a run is in progress cancels that run and queues one restart. The restart covers the cancelled run's stages and the new change's stages (all stages if either was all), so it never narrows what was going to run. If a code reload was deferred to the end of that run, the restart is folded into the reload's re-run, without stages the reload removed.
+
 ### Code or Config Changes
 
 When Python files or `pipeline.py` change:

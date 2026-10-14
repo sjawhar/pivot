@@ -510,6 +510,86 @@ async def test_reload_fingerprints_off_the_event_loop(
             tg.cancel_scope.cancel()
 
 
+def _helper_chains_source(b_suffix: str) -> str:
+    """pipeline.py with two independent stages: from_a reads a.txt and from_b reads b.txt."""
+    return f"""\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def from_a(raw: str) -> str:
+    return raw + "-a"
+
+
+@stage
+def from_b(raw: str) -> str:
+    return raw + {b_suffix!r}
+
+
+with Pipeline("chains") as pipeline:
+    from_a(pipeline.input("a.txt"))
+    from_b(pipeline.input("b.txt"))
+"""
+
+
+@pytest.mark.anyio
+async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A data edit made while a slow reload runs does not narrow the reload's re-run.
+
+    The engine handles the a.txt edit once the re-run of every stage has started, and the restart
+    it causes must still re-run from_b, whose code the reload changed, as well as from_a.
+    """
+    from pivot import registry
+
+    raw_dir = watch_project / "data" / "raw"
+    (raw_dir / "a.txt").write_text("a1")
+    (raw_dir / "b.txt").write_text("b1")
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_chains_source("-v1"))
+    pipeline = _helper_discover(watch_project)
+    a_output = _helper_output_path(watch_project, pipeline, "chains/from_a")
+    b_output = _helper_output_path(watch_project, pipeline, "chains/from_b")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        # One worker: from_a runs first, so from_b is still queued when the restart cancels
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert (a_output.read_text(), b_output.read_text()) == ("a1-a", "b1-v1")
+
+            compute = registry._compute_fingerprint
+            reload_started = threading.Event()
+
+            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+                reload_started.set()
+                time.sleep(1.0)
+                return compute(stage_name, info)
+
+            monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
+            pipeline_py.write_text(_helper_chains_source("-v2"))
+            with anyio.fail_after(10):
+                while not reload_started.is_set():
+                    await anyio.sleep(0.01)
+            (raw_dir / "a.txt").write_text("a2")
+
+            reload_index = await recorder.wait_for(_helper_is_reload, start=first_idle)
+            await recorder.wait_for(_helper_is_idle, start=reload_index)
+            assert a_output.read_text() == "a2-a", "the mid-reload data edit is picked up"
+            assert b_output.read_text() == "b1-v2", "the code-edited stage re-runs"
+            tg.cancel_scope.cancel()
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("refused", [False, True], ids=["valid", "refused"])
 async def test_run_requested_during_startup_snapshot_is_refused_at_once(

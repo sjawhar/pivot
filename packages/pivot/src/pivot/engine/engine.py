@@ -137,6 +137,36 @@ class _WatchOutputSnapshot:
     entries: dict[pathlib.Path, _WatchOutputSignature]
 
 
+def _merge_run_requests(earlier: RunRequested, later: RunRequested) -> RunRequested:
+    """One request that runs everything ``earlier`` and ``later`` would run.
+
+    A restart replays this instead of ``later`` alone, so it never narrows what was going to run:
+    the stages are the union (None, all stages, wins), the merged run is forced if either was, and
+    dependencies are resolved unless both ran single stages. Every other field comes from
+    ``later``, the newest request.
+    """
+    stages = (
+        None
+        if earlier["stages"] is None or later["stages"] is None
+        else list(dict.fromkeys([*earlier["stages"], *later["stages"]]))
+    )
+    return RunRequested(
+        type="run_requested",
+        stages=stages,
+        force=earlier["force"] or later["force"],
+        reason=later["reason"],
+        single_stage=earlier["single_stage"] and later["single_stage"],
+        parallel=later["parallel"],
+        max_workers=later["max_workers"],
+        resource_capacity=later["resource_capacity"],
+        no_commit=later["no_commit"],
+        on_error=later["on_error"],
+        cache_dir=later["cache_dir"],
+        allow_uncached_incremental=later["allow_uncached_incremental"],
+        checkout_missing=later["checkout_missing"],
+    )
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -175,6 +205,8 @@ class Engine:
     _run_state: _RunState
     _run_task_group: TaskGroup | None
     _restart_pending: RunRequested | None
+    # The request of the run in progress; a restart that cancels it replays its stages too
+    _running_request: RunRequested | None
     _reload_pending: set[str] | None
     _idle_condition: anyio.Condition
 
@@ -234,6 +266,7 @@ class Engine:
         self._run_state = _RunState.IDLE
         self._run_task_group = None
         self._restart_pending = None
+        self._running_request = None
         self._reload_pending = None
         self._idle_condition = anyio.Condition()
 
@@ -665,8 +698,9 @@ class Engine:
     async def _handle_run_requested(self, event: RunRequested) -> None:
         """Handle a RunRequested event by spawning a non-blocking execution task.
 
-        If already running, coalesces into a restart: cancels the current run
-        and queues the new event for replay once the current run completes.
+        If already running, coalesces into a restart: cancels the current run and queues one
+        request covering both it and the new event, replayed once the current run completes.
+        A restart waiting behind a deferred reload is folded into that reload's re-run.
         """
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
@@ -679,12 +713,21 @@ class Engine:
             return
 
         if self._run_state == _RunState.RUNNING:
-            # Coalesce: only the latest restart request survives
-            self._restart_pending = event
+            # Coalesce into one restart covering both the cancelled run and this request
+            assert self._running_request is not None
+            self._restart_pending = _merge_run_requests(self._running_request, event)
             await self._handle_cancel_requested()
             return
 
+        if self._restart_pending is not None:
+            # Only a deferred reload's re-run starts while a restart waits; it runs both
+            pending = self._drop_removed_stages(self._restart_pending)
+            self._restart_pending = None
+            if pending is not None:
+                event = _merge_run_requests(pending, event)
+
         self._run_state = _RunState.RUNNING
+        self._running_request = event
 
         # Clear cancel event before starting new execution
         self._cancel_event = anyio.Event()  # Reset by creating new event
@@ -726,6 +769,7 @@ class Engine:
                 checkout_missing=event["checkout_missing"],
             )
         finally:
+            self._running_request = None
             pending_reload = self._reload_pending is not None
             pending_restart = self._restart_pending is not None
 
@@ -743,11 +787,14 @@ class Engine:
                         CodeOrConfigChanged(type="code_or_config_changed", paths=reload_paths)
                     )
 
-                # Replay coalesced restart request (clear before call for future-safety)
+                # Replay a restart no reload re-run absorbed (clear before call for future-safety)
                 if self._restart_pending is not None:
-                    restart = self._restart_pending
+                    restart: RunRequested | None = self._restart_pending
                     self._restart_pending = None
-                    await self._handle_run_requested(restart)
+                    if reload_pending is not None:
+                        restart = self._drop_removed_stages(restart)
+                    if restart is not None:
+                        await self._handle_run_requested(restart)
 
                 if self._run_state == _RunState.IDLE and not self._has_pending_work():
                     async with self._idle_condition:
@@ -764,6 +811,21 @@ class Engine:
                     EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
                 )
                 self._current_run_id = None
+
+    def _drop_removed_stages(self, request: RunRequested) -> RunRequested | None:
+        """``request`` without stages a reload removed since it was made; None if none remain.
+
+        An empty stage list would mean every stage, so a request left with none is dropped.
+        """
+        if request["stages"] is None:
+            return request
+        current = set(self._list_stages())
+        stages = [stage for stage in request["stages"] if stage in current]
+        if not stages:
+            return None
+        kept = request.copy()
+        kept["stages"] = stages
+        return kept
 
     def _has_pending_work(self) -> bool:
         return self._restart_pending is not None or self._reload_pending is not None
