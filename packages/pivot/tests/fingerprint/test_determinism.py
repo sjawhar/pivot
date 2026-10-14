@@ -302,6 +302,55 @@ def test_function_argument_hash_is_stable_across_processes(tmp_path: pathlib.Pat
     assert len(results) == 1, results
 
 
+_LIBRARY_NAME_SCRIPT = """\
+import functools
+import json
+
+import numpy as np
+
+from pivot import fingerprint
+
+agg = np.mean
+log = np.log
+join = ",".join
+reduce_mean = functools.partial(np.median, axis=0)
+
+
+def stage(x):
+    return agg(x) + log(x) + len(join(["a"])) + reduce_mean(x)
+
+
+manifest = fingerprint.get_stage_fingerprint(stage)
+print(json.dumps({k: v for k, v in manifest.items() if k.startswith(("ext:", "partial:"))}))
+"""
+
+
+def test_library_callables_are_named_without_addresses(tmp_path: pathlib.Path) -> None:
+    """`ext:` entries name a library callable by definition; every process gets the same text."""
+    (tmp_path / ".pivot").mkdir()
+    script = tmp_path / "library_stage.py"
+    script.write_text(_LIBRARY_NAME_SCRIPT)
+    outputs = {
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        for seed in range(3)
+    }
+
+    assert len(outputs) == 1, outputs
+    entries = json.loads(outputs.pop())
+    assert entries["ext:__main__.agg"] == "numpy.mean", entries
+    assert entries["ext:__main__.log"] == "numpy.log", entries
+    assert entries["ext:__main__.join"] == "builtins.str.join[',']", entries
+    assert entries["ext:__main__.reduce_mean.func"] == "numpy.median", entries
+    assert not any("0x" in value for value in entries.values()), entries
+
+
 class _Opts:
     depth: int
     tags: set[str]

@@ -33,6 +33,7 @@ Pivot's fingerprinting system:
 | Closure variables | Yes (value) | `getclosurevars()` nonlocals checked like module-level values, keyed under the binding the closure was reached through, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
+| Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
 
 **Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are not tracked unless they're Pydantic model field defaults.
 
@@ -210,6 +211,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `default:` | Default argument values that the AST does not record | `default:myproject.stages.scale.factor` |
 | `mod:` | Module attribute access patterns | `mod:myproject.helpers.process_data` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
+| `ext:` | A library function or class a stage reads, named by its definition (its code is not hashed) | `ext:myproject.stages.agg` → `numpy.mean` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
 | `schema:` | Pydantic model JSON schema | `schema:myproject.params.TrainParams` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |

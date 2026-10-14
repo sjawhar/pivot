@@ -48,7 +48,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 16 records the live values a walk read, which a cache hit reads again.
 # Version 17 keys manifests by the function's full identity (closure values and defaults
 # included) and keys closure values under the binding the closure was reached through.
-_CACHE_SCHEMA_VERSION = 17
+# Version 18 records each library function or class a stage reads by name (`ext:` entries).
+_CACHE_SCHEMA_VERSION = 18
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -551,6 +552,8 @@ def _value_token(value: Any) -> str:
         return f"module:{value.__name__}"
     if kind is _ValueKind.SCALAR:
         return f"{type(value).__name__}:{value!r}"
+    if kind is _ValueKind.EXTERNAL:
+        return f"external:{_library_name(value)}"
     return kind.value
 
 
@@ -1328,7 +1331,12 @@ def _is_callable_instance(value: Any) -> bool:
 
 
 def _is_library_export(value: Any) -> bool:
-    """Return whether a non-user module binds `value` under its own `__name__`.
+    """Return whether a non-user module binds `value` under its own `__name__`."""
+    return _library_module(value) is not None
+
+
+def _library_module(value: Any) -> types.ModuleType | None:
+    """Return the non-user module that binds `value` under its own `__name__`, if any.
 
     The module named by `__module__` is checked. An object without one (scipy.special's ufuncs,
     such as `expit`) is looked up in every loaded module; `np.frompyfunc` products stay
@@ -1336,19 +1344,65 @@ def _is_library_export(value: Any) -> bool:
     """
     name = getattr(value, "__name__", None)
     if not isinstance(name, str):
-        return False
+        return None
     module_name = getattr(value, "__module__", None)
     candidates: list[types.ModuleType | None]
     if isinstance(module_name, str):
         candidates = [sys.modules.get(module_name)]
     else:
         candidates = list(sys.modules.values())
-    return any(
-        isinstance(module, types.ModuleType)
-        and module.__dict__.get(name) is value
-        and not is_user_code(module)
-        for module in candidates
+    for module in candidates:
+        if (
+            isinstance(module, types.ModuleType)
+            and module.__dict__.get(name) is value
+            and not is_user_code(module)
+        ):
+            return module
+    return None
+
+
+def _library_name(value: Any) -> str:
+    """Name a library callable by where it is defined: `<module>.<qualname>`.
+
+    `np.mean` is `numpy.mean` and `from numpy import median` is `numpy.median`, so a binding
+    that now holds another library function reads as changed. A method bound to a class or a
+    scalar carries it in brackets (`builtins.str.join[',']`): the bound object is part of what
+    the callable does.
+    """
+    bound = getattr(value, "__self__", None)
+    qualname = (
+        getattr(value, "__qualname__", None)
+        or getattr(value, "__name__", None)
+        or type(value).__qualname__
     )
+    module = getattr(value, "__module__", None)
+    if not isinstance(module, str):
+        owner_class = getattr(value, "__objclass__", None)
+        if isinstance(bound, type):
+            module = bound.__module__
+        elif isinstance(owner_class, type):
+            module = owner_class.__module__
+        elif bound is not None and not isinstance(bound, types.ModuleType):
+            module = type(bound).__module__
+        else:
+            exporter = _library_module(value)
+            module = exporter.__name__ if exporter is not None else type(value).__module__
+    name = f"{module}.{qualname}"
+    if isinstance(bound, type):
+        return f"{name}[{_definition_ref(bound)}]"
+    if isinstance(bound, (bool, int, float, str, bytes)):
+        return f"{name}[{bound!r}]"
+    return name
+
+
+def _is_library_callable(value: Any) -> bool:
+    """Return whether `value` is a library routine, or a library module's own callable export.
+
+    These are named by `_library_name`. A class is not: it stays a leaf of the canonical form.
+    """
+    if isinstance(value, type) or not callable(value) or is_user_code(value):
+        return False
+    return inspect.isroutine(value) or _is_library_export(value)
 
 
 def _process_closure_values(
@@ -1414,8 +1468,11 @@ def _process_captured_value(
             manifest[f"const:{binding_ref}"] = repr(value)
         case _ValueKind.REFUSED:
             _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
-        case _ValueKind.EXTERNAL | _ValueKind.LOGGER:
-            # External functions, classes, builtins and loggers are not user dependencies.
+        case _ValueKind.EXTERNAL:
+            # A library function or class is named by where it is defined; its code is not
+            # hashed, but rebinding the name to another one must change the manifest.
+            manifest[f"ext:{binding_ref}"] = _library_name(value)
+        case _ValueKind.LOGGER:
             return
 
 
@@ -1550,6 +1607,8 @@ def _process_partial_dependency(
         callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
         with _walking("pf"):
             _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
+    elif callable(underlying):
+        manifest[f"ext:{binding_ref}.func"] = _library_name(underlying)
     _process_partial_arguments(binding_ref, partial_obj, manifest, visited)
 
 
@@ -1865,16 +1924,19 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     hash seed. A Python function becomes `["function", function_identity]`, closure values
     and defaults included, because its `repr` holds a memory address and two closures from one
     factory share a definition; `active` holds the functions being named, so a function that
-    captures itself ends there. A `functools.partial` is canonicalised through its function
-    and arguments. An object whose class keeps `object.__repr__` (which holds the address)
-    and that has a `__dict__` becomes `[module.qualname, canonical(vars(obj))]`. Other leaves
-    keep their `repr`, tagged with their type. A class is a leaf, even a pydantic model class:
-    only an instance is dumped.
+    captures itself ends there. A library function, or a library module's own callable export,
+    becomes `["external", _library_name]`: its repr can hold an address (`np.mean`). A
+    `functools.partial` is canonicalised through its function and arguments. An object whose
+    class keeps `object.__repr__` (which holds the address) and that has a `__dict__` becomes
+    `[module.qualname, canonical(vars(obj))]`. Other leaves keep their `repr`, tagged with their
+    type. A class is a leaf, even a pydantic model class: only an instance is dumped.
     """
     if hasattr(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump(), active)
     if inspect.isfunction(value):
         return ["function", _function_identity(value, active)]
+    if _is_library_callable(value):
+        return ["external", _library_name(value)]
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
         return [

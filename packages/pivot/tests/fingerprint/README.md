@@ -75,7 +75,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Nested function body change                          | ✅        | `test_fingerprint.py::test_nested_function_not_in_globals` (detected via parent AST hash)                                          |
 | Globals referenced only by nested functions          | ✅        | `test_change_detection.py::test_nested_function_global_reference_detected`, `test_change_detection.py::test_nested_function_global_change_causes_miss` |
 | Helper starting with `_` prefix                      | ✅        | `test_change_detection.py::test_underscore_helper_change_detected`                                                                 |
-| Stdlib callable in closure (e.g., `typing.cast`)     | 🚫        | `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`                                                              |
+| Stdlib callable via its module (e.g., `typing.cast`) | 🚫        | `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`                                                              |
+| Name rebound to another library function (`agg = np.mean` → `np.median`, from-import, partial) | ✅ | `test_manifest_cache_cli.py::test_rebinding_a_library_function_reruns_stage` |
+| Library function chosen at import (`getattr(np, os.environ[...])`) | ✅ | `test_manifest_cache_cli.py::test_library_function_chosen_at_import_reruns_stage` |
+| Library function in loader config stays cached | 🚫 | `test_manifest_cache_cli.py::test_library_function_in_loader_config_stays_cached` |
 | `logging.Logger` in closure                          | 🚫        | Loggers are functionally irrelevant for cache invalidation                                                                          |
 | Helper starting with `__` dunder                     | ❌        | `test_fingerprint.py::test_fingerprint_with_underscore_globals`                                                                     |
 
@@ -402,9 +405,16 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_fingerprint.py::test_resolve_annotations_individually_mixed`
 
-20. **Non-user-code callables silently skipped**: Stdlib/third-party callables captured in closures (e.g., `typing.cast`, `json.dumps`) are skipped rather than hashed. Their `repr()` contains memory addresses (`0x...`) which would trigger false mutable-capture errors. These functions are already tracked via module dependency analysis when accessed as `module.func`.
+20. **Library callables are recorded by name**: A stdlib or third-party function or class read
+    through a global, closure cell, default or partial (`agg = np.mean`,
+    `from numpy import median as agg`) gets an `ext:<binding>` entry holding its definition
+    name (`numpy.mean`); its code is not hashed. Rebinding the name reruns the stage, and a
+    cache hit re-reads the name. In loader config and partial arguments a library function's
+    canonical form is `["external", name]`, since its `repr()` can hold a memory address.
+    Reached through its module (`typing.cast`), a library callable adds no entry.
 
-    Tests: `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`
+    Tests: `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`,
+    `test_manifest_cache_cli.py::test_rebinding_a_library_function_reruns_stage`
 
 21. **Loggers silently skipped**: `logging.Logger` instances captured in closures are skipped. Module-level loggers (`_logger = logging.getLogger(__name__)`) are functionally irrelevant for cache invalidation — their repr can change based on logging configuration.
 

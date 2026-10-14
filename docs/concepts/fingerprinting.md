@@ -19,6 +19,7 @@ logical keys to hashes:
 | `const:<module>.<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`) |
 | `const:<module>.<qualname>.<name>` | Scalars in a closure cell, keyed under the function that holds the cell, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | `default:<module>.<qualname>.<parameter>` | Default argument values (scalars and `StageParams`) |
+| `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); library code is not hashed |
 | `schema:<module>.<qualname>` | Pydantic model JSON schemas |
 | `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…` | Reader/Writer method ASTs and config for each input and output |
 

@@ -1270,3 +1270,127 @@ def test_two_closures_from_one_factory_keep_their_values_in_every_process(
     assert all(manifest == manifests[0] for manifest in manifests), manifests
     assert manifests[0]["const:two_closures.h2.factor"] == "2", manifests[0]
     assert manifests[0]["const:two_closures.h5.factor"] == "5", manifests[0]
+
+
+_LIBRARY_BINDING_PIPELINE = """\
+import functools
+import os
+
+import numpy as np
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+{binding}
+
+
+@stage
+def summarise(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [float(agg(x["a"]))]}})
+
+
+with Pipeline("lib") as pipeline:
+    summarise(pipeline.input("x.csv"))
+"""
+
+
+def _helper_summary(root: pathlib.Path) -> float:
+    return json.loads((root / "data/lib/summarise.jsonl").read_text())["a"]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        pytest.param("agg = np.mean", "agg = np.median", id="module-attribute"),
+        pytest.param(
+            "from numpy import mean as agg", "from numpy import median as agg", id="from-import"
+        ),
+        pytest.param(
+            "agg = functools.partial(np.mean, axis=0)",
+            "agg = functools.partial(np.median, axis=0)",
+            id="partial-function",
+        ),
+    ],
+)
+def test_rebinding_a_library_function_reruns_stage(
+    tmp_path: pathlib.Path, before: str, after: str
+) -> None:
+    """A module-level name bound to a library function is recorded by what it names."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _LIBRARY_BINDING_PIPELINE.format(binding=before),
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert _helper_summary(root) == 3.0
+
+    (root / "pipeline.py").write_text(_LIBRARY_BINDING_PIPELINE.format(binding=after))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in output, output
+    assert _helper_summary(root) == 2.0, output
+
+
+def test_library_function_chosen_at_import_reruns_stage(tmp_path: pathlib.Path) -> None:
+    """A cache hit re-reads which library function the name holds."""
+    binding = 'agg = getattr(np, os.environ.get("AGG", "mean"))'
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _LIBRARY_BINDING_PIPELINE.format(binding=binding),
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={"AGG": "mean"}))
+    assert _helper_summary(root) == 3.0
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"AGG": "median"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"AGG": "median"}))
+
+    assert "1 stale" in status, status
+    assert _helper_summary(root) == 2.0, output
+
+
+_LIBRARY_LOADER_PIPELINE = """\
+import dataclasses
+from collections.abc import Callable
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class AggCSV(loaders.CSV):
+    agg: Callable[..., Any] = np.median
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return pd.DataFrame({"a": [float(self.agg(super().load(path)["a"]))]})
+
+
+@stage
+def summarise(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+
+
+with Pipeline("lib") as pipeline:
+    summarise(pipeline.input("x.csv", format=AggCSV(agg=np.mean)))
+"""
+
+
+def test_library_function_in_loader_config_stays_cached(tmp_path: pathlib.Path) -> None:
+    """A library function in loader config is named by module and qualname, not its address."""
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _LIBRARY_LOADER_PIPELINE, "data/raw/x.csv": "a\n1\n2\n6\n"}
+    )
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in first, first
+
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "0 ran, 1 cached" in second, second
+    assert _helper_summary(root) == 3.0
