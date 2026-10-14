@@ -296,3 +296,48 @@ def test_editing_scalar_module_value_used_as_default_reruns_stage(
     output = _helper_ok(_helper_pivot(root, "repro"))
 
     assert (root / "data/d/scale.jsonl").read_text() == '{"a":50}\n{"a":100}\n', output
+
+
+def _helper_same_named_pipeline(origin: str) -> str:
+    return f"""\
+import pandas as pd
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def make(x: pd.DataFrame) -> dict:
+    return {{"from": "{origin}"}}
+
+
+@stage
+def use_{origin}(m: dict) -> dict:
+    return {{"saw": m["from"]}}
+
+
+with Pipeline("rep") as pipeline:
+    use_{origin}(make(pipeline.input("x.csv")))
+"""
+
+
+def test_same_stage_name_from_another_pipeline_file_is_not_a_cache_hit(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two pipeline.py files declaring `Pipeline("rep")` must not share a cached manifest."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "a/pipeline.py": _helper_same_named_pipeline("a"),
+            "b/pipeline.py": _helper_same_named_pipeline("b"),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root / "a", "repro"))
+    assert (root / "data/rep/make.yaml").read_text() == "from: a\n"
+
+    explain = _helper_ok(_helper_pivot(root / "b", "status", "--explain", "rep/make"))
+    assert "Code changed" in explain, explain
+
+    output = _helper_ok(_helper_pivot(root / "b", "repro"))
+    assert (root / "data/rep/make.yaml").read_text() == "from: b\n", output
+    assert (root / "data/rep/use_b.yaml").read_text() == "saw: b\n", output

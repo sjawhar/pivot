@@ -403,7 +403,7 @@ def test_unsafe_capture_does_not_populate_manifest_cache(
         def append(self, entry: tuple[bytes, bytes]) -> None:
             cached["unsafe-cache"] = json.loads(entry[1])["m"]
 
-    def cache_hit(stage_name: str) -> dict[str, str] | None:
+    def cache_hit(stage_name: str, _func: Callable[..., object]) -> dict[str, str] | None:
         return cached.get(stage_name)
 
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", ManifestWrites())

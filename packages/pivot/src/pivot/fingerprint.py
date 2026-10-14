@@ -35,7 +35,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # also invalidates entries written before discovery imported pipeline.py as a real module.
 # Version 7 invalidates manifests whose source maps omitted imported project modules.
 # Version 8 adds default argument values, which earlier manifests did not record.
-_CACHE_SCHEMA_VERSION = 8
+# Version 9 keys manifests by the stage function's identity as well as the stage name.
+_CACHE_SCHEMA_VERSION = 9
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -175,9 +176,29 @@ def _get_state_db() -> "StateDB | None":
         return None
 
 
-def _make_manifest_cache_key(stage_name: str) -> bytes:
-    """Build StateDB key for manifest cache entry."""
-    return f"sm:{stage_name}\x00{_PYTHON_VERSION}\x00{_CACHE_SCHEMA_VERSION}".encode()
+def _make_manifest_cache_key(stage_name: str, func: Callable[..., Any]) -> bytes:
+    """Build StateDB key for the manifest of `func` registered as `stage_name`.
+
+    The key names the function as well as the stage, because two pipeline files can register
+    the same stage name with different functions. A cached manifest for one never answers for
+    the other.
+    """
+    module = getattr(func, "__module__", None) or "<unknown>"
+    qualname = getattr(func, "__qualname__", None) or getattr(func, "__name__", "<unknown>")
+    code = getattr(func, "__code__", None)
+    source = code.co_filename if isinstance(code, types.CodeType) else "<unknown>"
+    identity = f"{module}\x00{qualname}\x00{_portable_source_path(source)}"
+    return f"sm:{stage_name}\x00{identity}\x00{_PYTHON_VERSION}\x00{_CACHE_SCHEMA_VERSION}".encode()
+
+
+def _portable_source_path(source: str) -> str:
+    """Return `source` relative to the project root, so a moved project keeps its cache."""
+    from pivot import project
+
+    try:
+        return str(pathlib.Path(source).resolve().relative_to(project.get_project_root()))
+    except (OSError, ValueError):
+        return source
 
 
 def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int] | None:
@@ -281,13 +302,13 @@ def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None
         source_map.setdefault(rel_path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
 
 
-def _try_manifest_cache_hit(stage_name: str) -> dict[str, str] | None:
+def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[str, str] | None:
     """Try to load a cached manifest; returns None on miss."""
     db = _get_state_db()
     if db is None:
         return None
 
-    key = _make_manifest_cache_key(stage_name)
+    key = _make_manifest_cache_key(stage_name, func)
     try:
         raw = db.get_raw(key)
     except Exception:
@@ -514,7 +535,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     _t = metrics.start()
 
     # Try cache hit
-    cached = _try_manifest_cache_hit(stage_name)
+    cached = _try_manifest_cache_hit(stage_name, func)
     if cached is not None:
         metrics.count("fingerprint.manifest_cache.hit")
         metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
@@ -533,7 +554,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
 
         if not _unsafe_capture_warning.get():
             _record_project_modules(source_map)
-            key = _make_manifest_cache_key(stage_name)
+            key = _make_manifest_cache_key(stage_name, func)
             value = json.dumps(
                 {
                     "m": manifest,
