@@ -377,6 +377,33 @@ def test_check_lists_every_unavailable_output_and_writes_nothing(
     assert not restorable_path.exists()
 
 
+def test_restore_keeps_checking_outputs_after_restoring_one(
+    project: pathlib.Path, state_db: state.StateDB
+) -> None:
+    """A restored first output must not hide a later output that cannot be restored."""
+    store = _workspace(project, {})
+    restorable = _ref(_STAGE, "restorable")
+    uncached = _ref(_STAGE, "uncached")
+    restorable_path, restorable_hash = _cached_output(project, store, restorable, "cached")
+    restorable_path.unlink()
+    uncached_path = store.prepare_output(uncached)
+    uncached_path.write_text("never cached")
+    uncached_hash = FileHash(hash=cache.hash_file(uncached_path, None)[0])
+    uncached_path.unlink()
+
+    result = _restore(
+        store,
+        [restorable, uncached],
+        {restorable.identity: restorable_hash, uncached.identity: uncached_hash},
+        state_db,
+    )
+
+    assert result == worker.OutputRestoreResult(
+        available=False, outputs_restored=True, unavailable=[uncached]
+    )
+    assert restorable_path.read_text() == "cached"
+
+
 def test_restore_on_cache_store_reports_whether_every_output_is_stored(
     project: pathlib.Path, state_db: state.StateDB
 ) -> None:
