@@ -2317,7 +2317,17 @@ class Engine:
         # so a same-size edit within a second of the last write would reload the old code.
         for path in event["paths"]:
             if path.endswith(".py"):
-                pathlib.Path(importlib.util.cache_from_source(path)).unlink(missing_ok=True)
+                cached = pathlib.Path(importlib.util.cache_from_source(path))
+                try:
+                    cached.unlink(missing_ok=True)
+                except OSError as exc:
+                    _logger.warning(
+                        "Could not remove %s (%s); its stale bytecode may be reused if %s "
+                        + "kept its size and mtime second",
+                        cached,
+                        exc.strerror,
+                        path,
+                    )
 
         # Reload registry - returns the old stages on success, the error message on failure
         reload_result = self._reload_registry()
