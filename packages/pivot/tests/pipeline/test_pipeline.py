@@ -1,25 +1,37 @@
 # pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownParameterType=false
 from __future__ import annotations
 
+import importlib.util
 import inspect
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import exceptions, loaders, registry, types
+from pivot import exceptions, loaders, registry, stage_def, types
 from pivot.compose import Pipeline
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Callable
+    from types import ModuleType
+    from typing import Any
 
 
 def _helper_make_stage_info(
     name: str,
     deps: dict[str, types.ArtifactRef] | None = None,
     outs: list[types.ArtifactRef] | None = None,
+    func: Callable[..., Any] | None = None,
+    params: stage_def.StageParams | None = None,
 ) -> registry.RegistryStageInfo:
+    """Each call without ``func`` defines a new ``_fn`` object with one definition (file and
+    qualname), as importing a pipeline file again does."""
+
     def _fn() -> None: ...
 
+    if func is None:
+        func = _fn
     if outs is None:
         outs = [
             types.ArtifactRef(
@@ -31,15 +43,15 @@ def _helper_make_stage_info(
         ]
 
     return registry.RegistryStageInfo(
-        func=_fn,
+        func=func,
         name=name,
         deps=deps or {},
         outs=outs,
         incremental_inputs={},
-        params=None,
+        params=params,
         resources={},
         variant=None,
-        signature=inspect.signature(_fn),
+        signature=inspect.signature(func),
         fingerprint=None,
         params_arg_name=None,
         state_dir=None,
@@ -132,19 +144,30 @@ def test_include_keeps_one_stage_included_twice(tmp_path: pathlib.Path) -> None:
     assert combined.list_stages() == ["same/train"]
 
 
+def _train_a() -> None: ...
+
+
+def _train_b() -> None: ...
+
+
 @pytest.mark.parametrize("inside_with", [False, True], ids=["after-block", "inside-block"])
 def test_include_refuses_two_functions_under_one_stage_name(
     tmp_path: pathlib.Path, inside_with: bool
 ) -> None:
     """Two pipelines named 'same' would share same/train's lock and outputs."""
     a = Pipeline("same", root=tmp_path)
-    a._registry.add_existing(_make_stage_info("same/train"))
+    a._registry.add_existing(_make_stage_info("same/train", func=_train_a))
 
     b = Pipeline("same", root=tmp_path)
-    b._registry.add_existing(_make_stage_info("same/train"))
+    b._registry.add_existing(_make_stage_info("same/train", func=_train_b))
 
     combined = Pipeline("all", root=tmp_path)
-    with pytest.raises(exceptions.PipelineConfigError, match="'same/train' is defined twice"):
+    with pytest.raises(
+        exceptions.PipelineConfigError,
+        match=r"'same/train' is defined twice with different functions: _train_a and _train_b, "
+        + r"both in .*test_pipeline\.py\. Pipeline names must be unique within a project; "
+        + "rename one of the pipelines.",
+    ):
         if inside_with:
             with combined:
                 combined.include(a)
@@ -152,3 +175,191 @@ def test_include_refuses_two_functions_under_one_stage_name(
         else:
             combined.include(a)
             combined.include(b)
+
+
+class _SeedParams(stage_def.StageParams):
+    seed: int = 0
+
+
+def _params_class() -> type[_SeedParams]:
+    """A new class object on every call, with one module and qualname, as a re-import gives."""
+
+    class TrainParams(_SeedParams):
+        pass
+
+    return TrainParams
+
+
+class _OtherParams(_SeedParams):
+    pass
+
+
+def _input_ref(name: str, tag: types.ArtifactTag = types.ArtifactTag.DATA) -> types.ArtifactRef:
+    return types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer=name, key=None),
+        format=loaders.YAML(),
+        python_type=dict,
+        tag=tag,
+    )
+
+
+def _train_info(**changes: Any) -> registry.RegistryStageInfo:
+    """same/train reading input x.csv with seed=1, from a new function and params class."""
+    info = _make_stage_info(
+        "same/train", deps={"x": _input_ref("x.csv")}, params=_params_class()(seed=1)
+    )
+    info.update(changes)  # pyright: ignore[reportCallIssue, reportArgumentType] - test overrides
+    return info
+
+
+def _include_both(
+    tmp_path: pathlib.Path, first: registry.RegistryStageInfo, again: registry.RegistryStageInfo
+) -> Pipeline:
+    a = Pipeline("same", root=tmp_path)
+    a._registry.add_existing(first)
+    b = Pipeline("same", root=tmp_path)
+    b._registry.add_existing(again)
+    combined = Pipeline("all", root=tmp_path)
+    combined.include(a)
+    combined.include(b)
+    return combined
+
+
+def test_include_keeps_one_stage_whose_definition_was_imported_twice(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot repro path/pipeline.py` imports a discovered file again: new objects, one stage."""
+    first, again = _train_info(), _train_info()
+    assert first["func"] is not again["func"]
+    assert first["params"] != again["params"], "pydantic == needs one class object"
+
+    combined = _include_both(tmp_path, first, again)
+
+    assert combined.list_stages() == ["same/train"]
+
+
+def test_include_keeps_one_stage_whose_formats_and_types_differ(tmp_path: pathlib.Path) -> None:
+    """Formats and Python types follow from the function; a re-imported user type is new."""
+    again = _train_info(
+        deps={
+            "x": types.ArtifactRef(
+                types.ArtifactIdentity("x.csv", None), loaders.CSV(), list, types.ArtifactTag.DATA
+            )
+        },
+        outs=[
+            types.ArtifactRef(
+                identity=types.ArtifactIdentity(producer="same/train", key="out"),
+                format=loaders.JSON(),
+                python_type=list,
+                tag=types.ArtifactTag.DATA,
+            )
+        ],
+    )
+
+    combined = _include_both(tmp_path, _train_info(), again)
+
+    assert combined.list_stages() == ["same/train"]
+
+
+_METRIC_OUT = types.ArtifactRef(
+    identity=types.ArtifactIdentity(producer="same/train", key="out"),
+    format=loaders.YAML(),
+    python_type=dict,
+    tag=types.ArtifactTag.METRIC,
+)
+
+_DIFFERENCES: dict[str, tuple[dict[str, Any], str]] = {
+    "input": ({"deps": {"x": _input_ref("y.csv")}}, "inputs (x=x.csv vs x=y.csv)"),
+    "input-tag": (
+        {"deps": {"x": _input_ref("x.csv", types.ArtifactTag.METRIC)}},
+        "inputs (x=x.csv vs x=x.csv (metric))",
+    ),
+    "input-name": ({"deps": {"y": _input_ref("x.csv")}}, "inputs (x=x.csv vs y=x.csv)"),
+    "output-tag": ({"outs": [_METRIC_OUT]}, "outputs (same/train:out vs same/train:out (metric))"),
+    "incremental": (
+        {"incremental_inputs": {"prev": types.ArtifactIdentity("same/train", "out")}},
+        "incremental inputs (none vs prev=same/train:out)",
+    ),
+    "collection": (
+        {"collection_params": {"x": "tuple"}},
+        "input collections (none vs x=tuple)",
+    ),
+    "params-value": (
+        {"params": _params_class()(seed=2)},
+        "params (TrainParams(seed=1) vs TrainParams(seed=2))",
+    ),
+    "params-class": (
+        {"params": _OtherParams(seed=1)},
+        "params (TrainParams(seed=1) vs _OtherParams(seed=1))",
+    ),
+    "params-none": ({"params": None}, "params (TrainParams(seed=1) vs none)"),
+    "resources": ({"resources": {"gpu": 1}}, "resources (none vs gpu=1)"),
+    "variant": ({"variant": "big"}, "variants (none vs big)"),
+    "no-fingerprint": ({"no_fingerprint": True}, "no_fingerprint (False vs True)"),
+    "code-deps": ({"code_deps": ["helper.py"]}, "code_deps (none vs helper.py)"),
+}
+
+
+@pytest.mark.parametrize(
+    ("changes", "difference"), list(_DIFFERENCES.values()), ids=list(_DIFFERENCES)
+)
+def test_include_refuses_one_function_called_differently_under_one_stage_name(
+    tmp_path: pathlib.Path, changes: dict[str, Any], difference: str
+) -> None:
+    """Two same-named pipelines calling one shared function differently are two stages."""
+    with pytest.raises(exceptions.PipelineConfigError) as excinfo:
+        _include_both(tmp_path, _train_info(), _train_info(**changes))
+
+    message = str(excinfo.value)
+    assert message.startswith(f"Stage 'same/train' is defined twice with different {difference}")
+    assert message.count("test_pipeline.py") == 1, "one definition file is named once"
+    assert "both calling _helper_make_stage_info.<locals>._fn in " in message
+    assert message.endswith("rename one of the pipelines.")
+
+
+def test_include_names_the_params_classes_when_both_print_alike(tmp_path: pathlib.Path) -> None:
+    """Same class name and values, different module: the message shows what differs."""
+    elsewhere = _params_class()
+    elsewhere.__module__ = "elsewhere"
+
+    with pytest.raises(
+        exceptions.PipelineConfigError,
+        match=r"different params \(\(.*TrainParams', \{'seed': 1\}\) vs "
+        + r"\('elsewhere', .*TrainParams', \{'seed': 1\}\)\)",
+    ):
+        _include_both(tmp_path, _train_info(), _train_info(params=elsewhere(seed=1)))
+
+
+def test_include_tells_apart_same_named_functions_behind_one_decorator(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shared functools.wraps decorator must not hide the files that define the stages."""
+
+    def load(name: str, text: str) -> ModuleType:
+        path = tmp_path / f"{name}.py"
+        path.write_text(text)
+        spec = importlib.util.spec_from_file_location(f"_t29_{name}", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        return module
+
+    load(
+        "deco",
+        "import functools\n\n\ndef timed(f):\n    @functools.wraps(f)\n"
+        + "    def inner(*args, **kwargs):\n        return f(*args, **kwargs)\n\n    return inner\n",
+    )
+    left, right = (
+        load(side, "from _t29_deco import timed\n\n\n@timed\ndef make() -> None: ...\n")
+        for side in ("left", "right")
+    )
+
+    with pytest.raises(
+        exceptions.PipelineConfigError, match=r"functions: make in left\.py and make in right\.py"
+    ):
+        _include_both(
+            tmp_path,
+            _make_stage_info("same/train", func=left.make),
+            _make_stage_info("same/train", func=right.make),
+        )

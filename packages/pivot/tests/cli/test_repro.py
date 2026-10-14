@@ -1023,3 +1023,209 @@ def test_list_refuses_include_of_a_different_stage_under_a_registered_name(
     assert "Stage 'rep/make' is defined twice" in result.output, result.output
     assert "left/pipeline.py" in result.output, result.output
     assert "right/pipeline.py" in result.output, result.output
+
+
+_SHARED_STAGES = (
+    "import pandas as pd\n\nfrom pivot import StageParams, stage\n\n\n"
+    + 'class TagParams(StageParams):\n    tag: str = "none"\n\n\n'
+    + "@stage\ndef make(x: pd.DataFrame, params: TagParams) -> dict:\n"
+    + '    return {"a": int(x["a"].iloc[0]), "tag": params.tag}\n'
+)
+
+
+def _shared_stage_pipeline(side: str, input_name: str) -> str:
+    return (
+        "from pivot import Pipeline, stage\n"
+        + "from shared.stages import TagParams, make\n\n\n"
+        + f"@stage\ndef use_{side}(m: dict) -> dict:\n"
+        + '    return {"saw": m}\n\n\n'
+        + 'with Pipeline("rep") as pipeline:\n'
+        + f'    m = make(pipeline.input("{input_name}"), params=TagParams(tag="{side}"))\n'
+        + f"    use_{side}(m)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("right_input", "expected"),
+    [
+        ("y.csv", ["with different inputs (x=x.csv vs x=y.csv)"]),
+        ("x.csv", ["with different params", "tag='left'", "tag='right'"]),
+    ],
+    ids=["inputs-differ", "only-params-differ"],
+)
+def test_list_refuses_two_same_named_pipelines_calling_one_shared_stage(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, right_input: str, expected: list[str]
+) -> None:
+    """One shared function called with other inputs or params is two stages, not one."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a\n1\n")
+        (cwd / "data" / "raw" / "y.csv").write_text("a\n2\n")
+        (cwd / "shared").mkdir()
+        (cwd / "shared" / "stages.py").write_text(_SHARED_STAGES)
+        for side, input_name in (("left", "x.csv"), ("right", right_input)):
+            (cwd / side).mkdir()
+            (cwd / side / "pipeline.py").write_text(_shared_stage_pipeline(side, input_name))
+        (cwd / "pipeline.py").write_text(
+            "from pivot import Pipeline\n"
+            + "from left.pipeline import pipeline as left\n"
+            + "from right.pipeline import pipeline as right\n\n"
+            + 'with Pipeline("all") as pipeline:\n'
+            + "    pipeline.include(left)\n"
+            + "    pipeline.include(right)\n"
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    assert "Stage 'rep/make' is defined twice" in result.output, result.output
+    for fragment in expected:
+        assert fragment in result.output, result.output
+    assert "shared/stages.py" in result.output, result.output
+    assert "rename one of the pipelines" in result.output, result.output
+
+
+def _scale_pipeline(name: str) -> str:
+    return (
+        "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+        + "class ScaleParams(StageParams):\n    factor: int = 10\n\n\n"
+        + "@stage\ndef scale(numbers: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:\n"
+        + "    return numbers * params.factor\n\n\n"
+        + f'with Pipeline("{name}") as pipeline:\n'
+        + '    scale(pipeline.input("numbers.csv"), params=ScaleParams())\n'
+    )
+
+
+@pytest.mark.parametrize("run_from", ["root", "sub"])
+def test_repro_pipeline_file_target_already_discovered_runs(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_from: str,
+) -> None:
+    """`pivot repro pipeline.py` imports the discovered file again; its stages are the same."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+        (cwd / "pipeline.py").write_text(_scale_pipeline("root"))
+        (cwd / "sub").mkdir()
+        (cwd / "sub" / "pipeline.py").write_text(_scale_pipeline("sub"))
+        if run_from == "sub":
+            monkeypatch.chdir(cwd / "sub")
+
+        result = runner.invoke(cli.cli, ["repro", "pipeline.py"])
+
+        assert result.exit_code == 0, result.output
+        assert "1 ran" in result.output, result.output
+        assert (cwd / "data" / run_from / "scale.jsonl").exists()
+
+
+_PREP_PIPELINE = (
+    "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+    + "class DropLowParams(StageParams):\n    min_score: float = 0.5\n\n\n"
+    + "@stage\ndef drop_low(raw: pd.DataFrame, params: DropLowParams) -> pd.DataFrame:\n"
+    + '    return raw[raw["score"] >= params.min_score]\n\n\n'
+    + 'with Pipeline("prep") as pipeline:\n'
+    + '    kept = drop_low(pipeline.input("scores.csv"), params=DropLowParams())\n'
+)
+
+_REPORT_PIPELINE = (
+    "from typing import Annotated\n\nimport pandas as pd\n\n"
+    + "from pivot import Pipeline, metric, stage\nfrom prep.pipeline import kept\n\n\n"
+    + "@stage\ndef count(rows: pd.DataFrame) -> Annotated[dict, metric]:\n"
+    + '    return {"rows": len(rows)}\n\n\n'
+    + 'with Pipeline("report") as pipeline:\n'
+    + "    count(kept)\n"
+)
+
+
+def _write_prep_report_project(cwd: pathlib.Path) -> None:
+    """docs/guides/multi-pipeline.md: prep/, report/ and a root pipeline including both."""
+    (cwd / "data" / "raw").mkdir(parents=True)
+    (cwd / "data" / "raw" / "scores.csv").write_text("name,score\na,0.2\nb,0.7\nc,0.9\n")
+    for name, text in (("prep", _PREP_PIPELINE), ("report", _REPORT_PIPELINE)):
+        (cwd / name).mkdir()
+        (cwd / name / "pipeline.py").write_text(text)
+    (cwd / "pipeline.py").write_text(
+        "from pivot import Pipeline\n"
+        + "from prep.pipeline import pipeline as prep\n"
+        + "from report.pipeline import pipeline as report\n\n"
+        + 'with Pipeline("all") as pipeline:\n'
+        + "    pipeline.include(prep)\n"
+        + "    pipeline.include(report)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "summary"),
+    [("prep/pipeline.py", "1 ran"), ("report/pipeline.py", "2 ran")],
+    ids=["prep", "report"],
+)
+def test_repro_included_pipeline_file_target_runs(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, target: str, summary: str
+) -> None:
+    """A target file the root pipeline already includes is imported again and still runs."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_prep_report_project(cwd)
+
+        result = runner.invoke(cli.cli, ["repro", target])
+
+    assert result.exit_code == 0, result.output
+    assert summary in result.output, result.output
+
+
+def test_repro_diamond_of_includes_runs_the_shared_stage_once(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A includes B and C; both include D and consume its handle. D's stage is one stage."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a\n1\n")
+        (cwd / "d").mkdir()
+        (cwd / "d" / "pipeline.py").write_text(
+            "import pandas as pd\n\nfrom pivot import Pipeline, stage\n\n\n"
+            + '@stage\ndef make(x: pd.DataFrame) -> dict:\n    return {"a": 1}\n\n\n'
+            + 'with Pipeline("d") as pipeline:\n    made = make(pipeline.input("x.csv"))\n'
+        )
+        for side in ("b", "c"):
+            (cwd / side).mkdir()
+            (cwd / side / "pipeline.py").write_text(
+                "from pivot import Pipeline, stage\n"
+                + "from d.pipeline import made\nfrom d.pipeline import pipeline as d\n\n\n"
+                + f"@stage\ndef use_{side}(m: dict) -> dict:\n    return m\n\n\n"
+                + f'with Pipeline("{side}") as pipeline:\n'
+                + f"    pipeline.include(d)\n    use_{side}(made)\n"
+            )
+        (cwd / "pipeline.py").write_text(
+            "from pivot import Pipeline\n"
+            + "from b.pipeline import pipeline as b\nfrom c.pipeline import pipeline as c\n\n"
+            + 'with Pipeline("a") as pipeline:\n'
+            + "    pipeline.include(b)\n    pipeline.include(c)\n"
+        )
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    assert "3 ran" in result.output, result.output
+
+
+def test_list_keeps_one_pipeline_included_three_times(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Twice inside the construction block and once after it: still one stage."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "scores.csv").write_text("name,score\na,0.2\n")
+        (cwd / "prep").mkdir()
+        (cwd / "prep" / "pipeline.py").write_text(_PREP_PIPELINE)
+        (cwd / "pipeline.py").write_text(
+            "from pivot import Pipeline\nfrom prep.pipeline import pipeline as prep\n\n"
+            + 'with Pipeline("all") as pipeline:\n'
+            + "    pipeline.include(prep)\n    pipeline.include(prep)\n"
+            + "pipeline.include(prep)\n"
+        )
+
+        result = runner.invoke(cli.cli, ["list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert [s["name"] for s in json.loads(result.stdout)["stages"]] == ["prep/drop_low"]

@@ -157,13 +157,85 @@ def _iter_all_handles(node: _StageNode) -> list[ArtifactHandle]:
     return result
 
 
-def _stage_source(func: Callable[..., Any], root: pathlib.Path) -> str:
-    """Name the file that defines a stage function, relative to the project root."""
+def _stage_definition(func: Callable[..., Any], root: pathlib.Path) -> tuple[str, str]:
+    """Name the file (relative to the project root) and qualname that define a stage function.
+
+    Importing a pipeline file again makes new function objects with the same definition.
+    """
+    func = inspect.unwrap(func)
     source = inspect.getsourcefile(func)
     if source is None:
-        return func.__module__
+        return func.__module__, func.__qualname__
     path = pathlib.Path(source).resolve()
-    return str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+    location = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+    return location, func.__qualname__
+
+
+def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
+    key = types.identity_key(identity)
+    return key if tag == types.ArtifactTag.DATA else f"{key} ({tag})"
+
+
+def _show_items(items: collections.abc.Mapping[str, object]) -> str:
+    return ", ".join(f"{name}={value}" for name, value in sorted(items.items())) or "none"
+
+
+def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, str]]:
+    """Each part of a stage besides its function, as (label, comparison key, display).
+
+    Every key survives importing the pipeline file again. Params compare by class module and
+    qualname plus JSON values, because pydantic equality needs one class object. Formats and
+    Python types are left out: they follow from the function, and a re-imported type is new.
+    """
+    deps = {name: (ref.identity, ref.tag) for name, ref in info["deps"].items()}
+    outs = [(ref.identity, ref.tag) for ref in info["outs"]]
+    incremental = info["incremental_inputs"]
+    params = info["params"]
+    params_key = (
+        None
+        if params is None
+        else (type(params).__module__, type(params).__qualname__, params.model_dump(mode="json"))
+    )
+    return [
+        ("inputs", deps, _show_items({name: _show_ref(*ref) for name, ref in deps.items()})),
+        ("input collections", info["collection_params"], _show_items(info["collection_params"])),
+        ("outputs", outs, ", ".join(_show_ref(*ref) for ref in outs) or "none"),
+        (
+            "incremental inputs",
+            incremental,
+            _show_items({name: types.identity_key(out) for name, out in incremental.items()}),
+        ),
+        ("params", params_key, "none" if params is None else repr(params)),
+        ("resources", info["resources"], _show_items(info["resources"])),
+        ("variants", info["variant"], info["variant"] or "none"),
+        ("no_fingerprint", info["no_fingerprint"], str(info["no_fingerprint"])),
+        ("code_deps", info["code_deps"], ", ".join(info["code_deps"]) or "none"),
+    ]
+
+
+def _stage_difference(
+    existing: registry.RegistryStageInfo,
+    incoming: registry.RegistryStageInfo,
+    root: pathlib.Path,
+) -> str | None:
+    """Describe the first part that makes two infos different stages, or None if they match."""
+    first_file, first_name = _stage_definition(existing["func"], root)
+    again_file, again_name = _stage_definition(incoming["func"], root)
+    if first_file == again_file and first_name != again_name:
+        return f"functions: {first_name} and {again_name}, both in {first_file}"
+    if first_file != again_file:
+        return f"functions: {first_name} in {first_file} and {again_name} in {again_file}"
+    for (label, first_key, first_shown), (_, again_key, again_shown) in zip(
+        _stage_wiring(existing), _stage_wiring(incoming), strict=True
+    ):
+        if first_key != again_key:
+            if first_shown == again_shown:
+                first_shown, again_shown = repr(first_key), repr(again_key)
+            return (
+                f"{label} ({first_shown} vs {again_shown}), "
+                + f"both calling {first_name} in {first_file}"
+            )
+    return None
 
 
 def _require_same_stage(
@@ -172,17 +244,19 @@ def _require_same_stage(
     incoming: registry.RegistryStageInfo,
     root: pathlib.Path,
 ) -> None:
-    """Allow one stage reached twice; refuse a different function under a registered name.
+    """Allow one stage reached twice; refuse two different stages under one name.
 
-    A stage name is its lock file and output paths, so two functions under one name would
-    share them. deepcopy keeps function identity, so a stage included twice still matches.
+    A stage name is its lock file and output paths, so two different stages under one name
+    would share them. Two infos are one stage when they have the same definition (file and
+    qualname) and the same wiring (``_stage_wiring``). Including one pipeline twice, a diamond
+    of includes, and a pipeline file imported again by ``pivot repro <path>`` all match.
     """
-    if existing["func"] is incoming["func"]:
+    difference = _stage_difference(existing, incoming, root)
+    if difference is None:
         return
     raise exceptions.PipelineConfigError(
-        f"Stage '{stage_name}' is defined twice: in {_stage_source(existing['func'], root)} "
-        + f"and in {_stage_source(incoming['func'], root)}. Pipeline names must be unique "
-        + "within a project; rename one of the pipelines."
+        f"Stage '{stage_name}' is defined twice with different {difference}. "
+        + "Pipeline names must be unique within a project; rename one of the pipelines."
     )
 
 
