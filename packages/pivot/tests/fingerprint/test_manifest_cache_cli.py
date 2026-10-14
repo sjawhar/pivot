@@ -767,3 +767,76 @@ def test_editing_model_class_used_by_loader_reruns_stage(tmp_path: pathlib.Path)
     rerun = _helper_ok(_helper_pivot(root, "repro"))
 
     assert json.loads(output.read_text()) == {"name": "x", "extra": 1}, rerun
+
+
+_LOADER_METHOD_PIPELINE = """\
+import dataclasses
+import json
+import pathlib
+from typing import Annotated
+
+from pivot import Pipeline, loaders, stage
+
+FACTOR = 2
+KEYS = ("a",)
+
+
+@dataclasses.dataclass(frozen=True)
+class Scaled(BASE):
+    def load(self, path: pathlib.Path) -> dict:
+        return json.loads(path.read_text())
+
+    def save(self, data: dict, path: pathlib.Path) -> None:
+        path.write_text(json.dumps(SAVED))
+
+
+OUT = Scaled()
+
+
+@stage
+def make(raw: dict) -> Annotated[dict, OUT]:
+    return {"a": 3}
+
+
+with Pipeline("s") as pipeline:
+    make(pipeline.input("t.json", format=loaders.JSON()))
+"""
+
+
+@pytest.mark.parametrize(
+    "base",
+    [
+        pytest.param("loaders.Loader[dict, dict]", id="loader-subclass"),
+        pytest.param("loaders.JSON[dict]", id="builtin-loader-subclass"),
+    ],
+)
+def test_editing_scalar_read_by_custom_loader_method_reruns_stage(
+    tmp_path: pathlib.Path, base: str
+) -> None:
+    """A user loader's own save() is walked like a stage helper, so what it reads is tracked."""
+    pipeline = _LOADER_METHOD_PIPELINE.replace("BASE", base).replace(
+        "SAVED", '{"a": data["a"] * FACTOR}'
+    )
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(_helper_pivot(root, "repro"))
+    (output,) = (root / "data/s").iterdir()
+    assert json.loads(output.read_text()) == {"a": 6}
+
+    (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
+    rerun = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert json.loads(output.read_text()) == {"a": 21}, rerun
+
+
+def test_non_scalar_read_by_custom_loader_method_is_an_error(tmp_path: pathlib.Path) -> None:
+    pipeline = _LOADER_METHOD_PIPELINE.replace("BASE", "loaders.Loader[dict, dict]").replace(
+        "SAVED", "{key: data[key] for key in KEYS}"
+    )
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"tuple read by a loader's save() was accepted:\n{output}"
+    assert "Stage 's/make'" in output, output
+    assert "captures non-scalar variable 'KEYS' (type: tuple)" in output, output

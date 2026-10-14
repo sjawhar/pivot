@@ -838,12 +838,23 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     - Writer: 'loader:<module>.<qualname>:save'
     - Loader: All of the above
     - Always: 'loader:<module>.<qualname>:config' for dataclass field values
+
+    A user loader class's own `load`, `save` and `empty`, and the functions and classes bound
+    in its config fields, are walked like stage helpers, so the module values they read are
+    tracked or refused. Methods inherited from `pivot.loaders` are framework code and are
+    only hashed.
     """
     manifest = dict[str, str]()
     class_name = _definition_ref(type(loader))
+    visited = set[int]()
 
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
+
+    for method_name in ("load", "save", "empty"):
+        method = _user_defined_method(type(loader), method_name)
+        if method is not None:
+            _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
 
     # Fingerprint save() if this is a Writer
     if isinstance(loader, loaders_module.Writer):
@@ -870,7 +881,6 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     # Cast to Any for dataclass introspection - loader is a dataclass but generic params are unknown
     loader_any = cast("Any", loader)
     field_values = list[str]()
-    visited = set[int]()
     for field in dataclasses.fields(loader_any):
         value = getattr(loader_any, field.name)
         field_values.append(f"{field.name}={_serialize_value_for_hash(value)}")
@@ -880,6 +890,18 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
+
+
+def _user_defined_method(cls: type, name: str) -> Callable[..., Any] | None:
+    """Return the function behind `cls`'s nearest `name` attribute when user code defines it."""
+    for klass in cls.__mro__:
+        if name in klass.__dict__:
+            member = klass.__dict__[name]
+            function = getattr(member, "__func__", member)
+            if inspect.isfunction(function) and is_user_code(function):
+                return function
+            return None
+    return None
 
 
 def _is_unsafe_fingerprinting_enabled() -> bool:

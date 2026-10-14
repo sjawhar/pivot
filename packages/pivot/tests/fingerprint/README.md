@@ -222,6 +222,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | YAML→CSV with existing CSV out  | ✅        | `test_compose.py::test_output_loader_change_detected[yaml-to-csv-with-existing-csv]`   |
 | @no_fingerprint loader collision| ✅        | `test_compose.py::test_no_fingerprint_output_loader_collision`                          |
 | Dep config collision            | ✅        | `test_compose.py::test_dep_loader_config_collision`                                     |
+| Scalar read in custom loader's own `save()` | ✅ | `test_manifest_cache_cli.py::test_editing_scalar_read_by_custom_loader_method_reruns_stage` |
+| Non-scalar read in custom loader's own `save()` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_read_by_custom_loader_method_is_an_error` |
+| Scalar read by a function in loader config | ✅ | `test_manifest_cache_cli.py::test_value_read_by_loader_config_function_reruns_stage` |
+| Pydantic model class in loader config edited | ✅ | `test_manifest_cache_cli.py::test_editing_model_class_used_by_loader_reruns_stage` |
 
 ---
 
