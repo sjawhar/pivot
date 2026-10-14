@@ -191,7 +191,7 @@ The Engine uses locks to protect atomic state transitions. When a `run` request 
 | `-32603` | Internal error | Server-side exception; a query that raises a Pivot error (for example a stage that fails to fingerprint) gets this code with the error's message |
 | `-32001` | Execution in progress | A run is already executing |
 | `-32002` | Stage not found | Requested stage doesn't exist (includes suggestions for typos) |
-| `-32003` | Pipeline invalid | `run` or `commit` refused because the watched pipeline is invalid (it fails to load or a stage fails to fingerprint, at startup or after an edit); the message carries the error. Refused until an edit reloads a good pipeline, so a commit never records outputs the current code did not produce |
+| `-32003` | Pipeline invalid | `run` or `commit` refused because the watched pipeline is invalid (it fails to load, a stage fails to fingerprint, or `params.yaml` fails its checks, at startup or after an edit); the message carries the error. Refused until an edit reloads a good pipeline, so a commit never records outputs the current code did not produce |
 | `-32004` | Engine starting | `run` or `commit` refused because a watched engine is still fingerprinting stages at startup. The reply is immediate; retry once the engine is ready |
 
 ## Client Example

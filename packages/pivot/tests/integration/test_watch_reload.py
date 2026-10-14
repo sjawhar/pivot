@@ -712,6 +712,134 @@ async def test_refusal_added_mid_session_waits_for_fix(
             tg.cancel_scope.cancel()
 
 
+_PARAMS_PIPELINE = """\
+from __future__ import annotations
+
+from pivot import Pipeline, StageParams, stage
+
+
+class SuffixParams(StageParams):
+    suffix: str = "-default"
+
+
+@stage
+def tag(raw: str, params: SuffixParams) -> str:
+    return raw + params.suffix
+
+
+with Pipeline("reload") as pipeline:
+    tag(pipeline.input("input.txt"), params=SuffixParams())
+"""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("bad_params", "expected_error"),
+    [
+        (
+            "reload/tga:\n  suffix: -bad\n",
+            "params.yaml key 'reload/tga' names no stage in pipeline 'reload'; "
+            + "did you mean 'reload/tag'?",
+        ),
+    ],
+    ids=["unknown-key"],
+)
+async def test_watch_started_on_bad_params_yaml_waits_for_fix(
+    watch_project: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+    bad_params: str,
+    expected_error: str,
+) -> None:
+    """A params.yaml error at startup is an invalid pipeline: nothing runs or commits until fixed."""
+    (watch_project / "pipeline.py").write_text(_PARAMS_PIPELINE)
+    params_yaml = watch_project / "params.yaml"
+    params_yaml.write_text(bad_params)
+    pipeline = _helper_discover(watch_project)
+    tag_output = _helper_output_path(watch_project, pipeline, "reload/tag")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        rpc_source = agent_rpc.AgentRpcSource(
+            socket_path=watch_project / "unused.sock",
+            handler=agent_rpc.AgentRpcHandler(engine=eng),
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await _helper_wait_until_watching(eng)
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline)
+            invalid = recorder.events[invalid_index]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert expected_error in invalid["error"]
+            assert eng.pipeline_error == invalid["error"]
+            assert "Pipeline invalid - waiting for fix" in caplog.text
+
+            run_send, run_recv = anyio.create_memory_object_stream[InputEvent](1)
+            for request_id, method in enumerate(("run", "commit"), start=1):
+                response = await rpc_source._handle_request(
+                    {"jsonrpc": "2.0", "method": method, "id": request_id}, run_send
+                )
+                assert response is not None
+                assert "error" in response, f"RPC {method} is refused while params.yaml is bad"
+                assert response["error"]["code"] == -32003
+                assert expected_error in response["error"]["message"]
+            with pytest.raises(anyio.WouldBlock):
+                run_recv.receive_nowait()
+            assert not any(event["type"] == "stage_completed" for event in recorder.events)
+            assert not tag_output.exists()
+
+            params_yaml.write_text("reload/tag:\n  suffix: -fixed\n")
+            reload_index = await recorder.wait_for(_helper_is_reload, start=invalid_index)
+            done = await recorder.wait_for(_helper_completes("reload/tag"), start=reload_index)
+            await recorder.wait_for(_helper_is_idle, start=done)
+            assert eng.pipeline_error is None, "a good params.yaml clears the invalid state"
+            assert recorder.completed("reload/tag", start=reload_index) == StageStatus.RAN
+            assert tag_output.read_text() == "x-fixed"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_run_that_finds_params_yaml_broken_marks_the_pipeline_invalid(
+    watch_project: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An edit the watcher has not reported yet is caught by the run's load: watch stays up."""
+    (watch_project / "pipeline.py").write_text(_PARAMS_PIPELINE)
+    pipeline = _helper_discover(watch_project)
+    tag_output = _helper_output_path(watch_project, pipeline, "reload/tag")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(
+            sources.FilesystemSource(watch_paths=[watch_project / "data" / "raw"], debounce_ms=50)
+        )
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert tag_output.read_text() == "x-default"
+
+            (watch_project / "params.yaml").write_text("reload/tga:\n  suffix: -bad\n")
+            (watch_project / "data" / "raw" / "input.txt").write_text("y")
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            invalid = recorder.events[invalid_index]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert "params.yaml key 'reload/tga' names no stage" in invalid["error"]
+            assert eng.pipeline_error == invalid["error"]
+            assert "Pipeline invalid - waiting for fix" in caplog.text
+            await recorder.wait_for(_helper_is_idle, start=invalid_index)
+            assert tag_output.read_text() == "x-default", "no stage runs on a broken params.yaml"
+            tg.cancel_scope.cancel()
+
+
 @pytest.mark.anyio
 async def test_stage_completed_output_identity_reaches_tui_as_artifact_identity(
     watch_project: pathlib.Path,
