@@ -55,7 +55,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 21 hashes a dataclass instance field by field, not by its generated repr.
 # Version 22 tracks class attributes a stage reads (`Config.SCALE`) and the schema of a
 # pydantic class read as a global.
-_CACHE_SCHEMA_VERSION = 22
+# Version 23 tracks only class attributes a user class body wrote, not library-defined ones.
+_CACHE_SCHEMA_VERSION = 23
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1550,10 +1551,12 @@ def _process_class_reads(
     """Track each attribute `func` reads from user class `cls` through `name` (`Config.SCALE`).
 
     The class AST hash does not see a class attribute computed at import, so each attribute
-    `func` reads gets the rule a module-level value gets: a scalar is `const:<class>.<NAME>`,
-    a non-scalar is refused, a function or class is walked. A member of a user Enum is
-    recorded by name and value. A pydantic or StageParams class is covered by its schema hash,
-    field defaults included. A cache hit re-reads each attribute (`ca:NAME`).
+    `func` reads that the user wrote in a class body (`_is_user_class_attribute`) gets the rule
+    a module-level value gets: a scalar is `const:<class>.<NAME>`, a non-scalar is refused, a
+    function or class is walked. A member of a user Enum is recorded by name and value. A
+    pydantic or StageParams class is covered by its schema hash, field defaults included. A
+    cache hit re-reads each attribute (`ca:NAME`). Any other attribute is left to the class
+    AST hash.
     """
     if hasattr(cls, "model_fields"):
         _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", cls), manifest, visited)
@@ -1562,7 +1565,7 @@ def _process_class_reads(
     read = ast_utils.extract_module_attr_usage(func)
     attributes = dict.fromkeys(path.split(".", 1)[0] for owner, path in read if owner == name)
     for attribute in attributes:
-        if attribute.startswith("__"):
+        if attribute.startswith("__") or not _is_user_class_attribute(cls, attribute):
             continue
         step = f"ca:{attribute}"
         _record_read(cls, step)
@@ -1583,6 +1586,30 @@ def _process_class_reads(
                     visited,
                     stage_name,
                 )
+
+
+def _is_user_class_attribute(cls: type, attribute: str) -> bool:
+    """Whether `attribute` on `cls` is a value the user wrote in a class body.
+
+    The defining class is the first on the MRO that holds the name in its own `__dict__`, and
+    it must be user code: a dict that `BaseHTTPRequestHandler` or a sklearn base defines is
+    not. Also left out: descriptors other than plain functions (property, classmethod,
+    staticmethod, cached_property, a NamedTuple field), the `_sunder_` names the enum
+    machinery puts on an Enum class (`_member_names_`, `_value2member_map_`), and the
+    `_fields` and `_field_defaults` that NamedTuple and namedtuple put on a tuple subclass.
+    """
+    owner = next((klass for klass in cls.__mro__ if attribute in vars(klass)), None)
+    if owner is None or not is_user_code(owner):
+        return False
+    raw = vars(owner)[attribute]
+    if isinstance(raw, (classmethod, staticmethod)) or (
+        hasattr(raw, "__get__") and not callable(raw)
+    ):
+        return False
+    sunder = len(attribute) > 2 and attribute[0] == attribute[-1] == "_"
+    if issubclass(owner, enum.Enum) and sunder and "__" not in (attribute[:2], attribute[-2:]):
+        return False
+    return not (issubclass(owner, tuple) and attribute in ("_fields", "_field_defaults"))
 
 
 def _is_user_enum_member(value: Any) -> bool:

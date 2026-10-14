@@ -1853,3 +1853,66 @@ def test_non_scalar_class_attribute_is_an_error(tmp_path: pathlib.Path) -> None:
     assert proc.returncode != 0, output
     assert "captures non-scalar variable 'pipeline.Config.COLUMNS' (type: tuple)" in output, output
     assert "StageParams" in output, output
+
+
+_LIBRARY_DEFINED_CLASS_ATTRIBUTE_PIPELINE = """\
+import enum
+import http.server
+import typing
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class Opts(typing.NamedTuple):
+    x: int = 1
+
+
+class Color(enum.IntEnum):
+    RED = 1
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    pass
+
+
+class Helper:
+    @property
+    def prop(self) -> int:
+        return 1
+
+
+@stage
+def count(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [{read}]}})
+
+
+with Pipeline("lib") as pipeline:
+    count(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        pytest.param("len(Opts._fields) + len(Opts._field_defaults)", id="namedtuple-fields"),
+        pytest.param(
+            "len(Color._member_names_) + len(Color._value2member_map_)", id="enum-members"
+        ),
+        pytest.param("len(Handler.responses)", id="library-base-dict"),
+        pytest.param("int(isinstance(Helper.prop, property))", id="property-object"),
+    ],
+)
+def test_class_attribute_the_language_or_a_library_defines_is_not_refused(
+    tmp_path: pathlib.Path, read: str
+) -> None:
+    """`NamedTuple._fields`, `Enum._member_names_` and an inherited stdlib dict are not D2's."""
+    pipeline = _LIBRARY_DEFINED_CLASS_ATTRIBUTE_PIPELINE.format(read=read)
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in first, first
+    assert "0 ran, 1 cached" in second, second

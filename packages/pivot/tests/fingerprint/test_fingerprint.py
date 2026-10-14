@@ -2413,27 +2413,40 @@ class _ClassReadMode(enum.Enum):
     FAST = "fast"
 
 
+def _helper_class_callback() -> int:
+    return 1
+
+
 class _ClassReadConfig:
     SCALE: typing.ClassVar[int] = 3
     MODE: typing.ClassVar[_ClassReadMode] = _ClassReadMode.FAST
+    CALLBACK: typing.ClassVar[typing.Callable[[], int]] = _helper_class_callback
 
     @staticmethod
-    def helper() -> int:
-        return 1
+    def static() -> int:
+        return 2
 
 
 def _helper_reads_class_attributes() -> int:
-    return _ClassReadConfig.SCALE + _ClassReadConfig.helper() + len(_ClassReadConfig.MODE.value)
+    return (
+        _ClassReadConfig.SCALE
+        + _ClassReadConfig.CALLBACK()  # pyright: ignore[reportAttributeAccessIssue] - a function stored on the class
+        + _ClassReadConfig.static()
+        + len(_ClassReadConfig.MODE.value)
+    )
 
 
 def test_class_attributes_a_stage_reads_are_tracked_one_by_one() -> None:
-    """A scalar is `const:<class>.<NAME>`, an Enum member is name and value, a method is walked."""
+    """A scalar is `const:<class>.<NAME>`, an Enum member is name and value, a plain function
+    is walked; a staticmethod is left to the class AST hash."""
     manifest = fingerprint.get_stage_fingerprint(_helper_reads_class_attributes)
     config = f"{__name__}._ClassReadConfig"
 
     assert manifest[f"const:{config}.SCALE"] == "3", manifest
     assert manifest[f"const:{config}.MODE"] == '_ClassReadMode.FAST="fast"', manifest
-    assert f"func:{config}.helper" in manifest, manifest
+    assert f"func:{__name__}._helper_class_callback" in manifest, manifest
+    assert not any(key.endswith(f"{config}.static") for key in manifest), manifest
+    assert f"class:{config}" in manifest, manifest
     assert not any(key.startswith(f"const:{config}.__") for key in manifest), manifest
 
 

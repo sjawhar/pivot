@@ -70,6 +70,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Pydantic class read as a global (`Out().scale`), import-time field default | ✅ | `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
 | Class attribute read as `Config.SCALE` (scalar, Enum member, function) | ✅ | `test_fingerprint.py::test_class_attributes_a_stage_reads_are_tracked_one_by_one`, `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
 | Non-scalar class attribute read as `Config.COLUMNS` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_class_attribute_is_an_error` |
+| Class attribute the language or a library defines (`NamedTuple._fields`, `Enum._member_names_`, an inherited stdlib dict, a property object) | 🚫 (class AST only) | `test_manifest_cache_cli.py::test_class_attribute_the_language_or_a_library_defines_is_not_refused` |
+| `settings.Config.SCALE`, `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                  |
 | Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                         |
