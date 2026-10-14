@@ -1397,6 +1397,8 @@ def test_library_function_in_loader_config_stays_cached(tmp_path: pathlib.Path) 
 
 
 _BOUND_METHOD_PIPELINE = """\
+import functools
+
 import numpy as np
 import pandas as pd
 
@@ -1425,13 +1427,25 @@ with Pipeline("lib") as pipeline:
 
 
 @pytest.mark.parametrize(
-    "binding",
+    ("binding", "variable"),
     [
-        pytest.param("method = Scaler(3).apply", id="user-instance"),
-        pytest.param("method = np.random.default_rng(0).normal", id="seeded-generator"),
+        pytest.param("method = Scaler(3).apply", "method", id="user-instance"),
+        pytest.param("method = np.random.default_rng(0).normal", "method", id="seeded-generator"),
+        pytest.param(
+            "method = functools.partial(Scaler(3).apply)",
+            "pipeline.method.func",
+            id="partial-of-user-instance-method",
+        ),
+        pytest.param(
+            "method = functools.partial(np.random.default_rng(0).normal, scale=1.0)",
+            "pipeline.method.func",
+            id="partial-of-seeded-generator-method",
+        ),
     ],
 )
-def test_method_bound_to_an_instance_is_an_error(tmp_path: pathlib.Path, binding: str) -> None:
+def test_method_bound_to_an_instance_is_an_error(
+    tmp_path: pathlib.Path, binding: str, variable: str
+) -> None:
     """`Scaler(3).apply` carries state no code hash records, so the stage is refused."""
     root = _helper_project(
         tmp_path,
@@ -1445,7 +1459,7 @@ def test_method_bound_to_an_instance_is_an_error(tmp_path: pathlib.Path, binding
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
-    assert "captures non-scalar variable 'method' (type: method)" in output, output
+    assert f"captures non-scalar variable '{variable}' (type: method)" in output, output
     assert "StageParams" in output, output
 
 

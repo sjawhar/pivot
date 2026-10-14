@@ -1614,7 +1614,12 @@ def _process_partial_dependency(
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
-    """Process functools.partial: hash underlying func and bound arguments."""
+    """Process functools.partial: hash underlying func and bound arguments.
+
+    The function is classified as any read value is (`_value_kind`): a method bound to an
+    instance (`partial(Scaler(3).apply)`, `partial(default_rng(SEED).normal)`) or a callable
+    instance is refused like a bare one, since no hash records the state it carries.
+    """
     args_str = _serialize_value_for_hash(partial_obj.args)
     kwargs_str = _serialize_value_for_hash(partial_obj.keywords)
     manifest[f"partial:{binding_ref}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
@@ -1622,7 +1627,12 @@ def _process_partial_dependency(
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
-    if callable(underlying) and is_user_code(underlying):
+    if _value_kind(underlying) is _ValueKind.REFUSED:
+        with _walking("pf"):
+            _check_non_scalar_capture(
+                f"{binding_ref}.func", underlying, _current_stage_name.get() or "<unknown>"
+            )
+    elif callable(underlying) and is_user_code(underlying):
         callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
         with _walking("pf"):
             _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
