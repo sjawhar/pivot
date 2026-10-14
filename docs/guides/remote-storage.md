@@ -141,7 +141,7 @@ pivot checkout --only-missing
 
 **Lock files are the bridge.** They map each stage output to its content hash. Push uploads the files referenced by those hashes; pull downloads them. Always commit lock files to version control so other machines know what to pull.
 
-Pulling a stage also fetches the outputs of the upstream stages it depends on, and any dependency tracked with `pivot track`. Raw inputs committed to git (`data/raw/...`) and metric outputs are never pushed or pulled; git carries them.
+Pulling a stage also fetches the outputs of the upstream stages it depends on, and any dependency tracked with `pivot track`. It never fetches raw inputs committed to git (`data/raw/...`), metric outputs (git carries both), or files brought in with `pivot import`: those come from the source repo's remote, and `pivot update` refreshes them.
 
 ## Multiple Remotes
 

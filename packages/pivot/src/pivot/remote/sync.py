@@ -182,9 +182,15 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
 
 
 def _get_tracked_hashes(proj_root: pathlib.Path) -> set[str]:
-    """Blob hashes of every .pvt-tracked file or directory in the project."""
+    """Blob hashes of every `pivot track`-ed file or directory in the project.
+
+    Imports are left out: `pivot import` writes the file straight to the workspace, so its
+    blob never enters the local cache and push never sends it to this project's remote.
+    """
     hashes = set[str]()
     for pvt_data in track.discover_pvt_files(proj_root).values():
+        if track.is_import(pvt_data):
+            continue
         hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt_data))
     return hashes
 
@@ -245,8 +251,8 @@ def get_target_hashes(
                                 hashes |= _extract_file_hashes_from_hash_info(out_hash)
                         if include_deps:
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
-                            # upstream stage outputs and .pvt-tracked inputs. Raw inputs
-                            # committed to git are never in the remote.
+                            # upstream stage outputs and `pivot track` inputs. Raw inputs
+                            # committed to git and `pivot import` inputs are never in the remote.
                             for dep_identity, dep_hash in lock_data["dep_hashes"].items():
                                 dep_blobs = _extract_file_hashes_from_hash_info(dep_hash)
                                 producer_info = all_stages.get(dep_identity.producer)

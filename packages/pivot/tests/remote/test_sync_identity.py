@@ -312,7 +312,7 @@ def test_get_target_hashes_include_deps_skips_raw_inputs(set_project_root: pathl
 def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
     set_project_root: pathlib.Path,
 ) -> None:
-    """An input tracked with `pivot track` is in the cache (and pushed), so pull fetches it."""
+    """A `pivot track` input is in the local cache, so push sends it and pull fetches it."""
     total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
     all_stages = {
         "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
@@ -339,6 +339,51 @@ def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
     )
 
     assert hashes == {"7074a10000000000", "7cacced000000000"}
+
+
+def test_get_target_hashes_include_deps_skips_imported_inputs(
+    set_project_root: pathlib.Path,
+) -> None:
+    """An input brought in with `pivot import` is written to the workspace, never cached or
+    pushed to this project's remote, so pull must not fetch it."""
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+    }
+    raw_dir = set_project_root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    track.write_pvt_file(
+        raw_dir / "numbers.csv.pvt",
+        track.PvtData(
+            path="numbers.csv",
+            hash="1a1a1a0000000000",
+            size=4,
+            source=track.ImportSource(
+                repo="https://github.com/org/upstream",
+                rev="main",
+                rev_lock="0123456789abcdef0123456789abcdef01234567",
+                stage="up/numbers",
+                path="up/numbers",
+                remote="s3://upstream-bucket/cache",
+            ),
+        ),
+    )
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("numbers.csv", None): types.FileHash(hash="1a1a1a0000000000"),
+        },
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"], set_project_root, include_deps=True, all_stages=all_stages
+    )
+
+    assert hashes == {"7074a10000000000"}, "An imported input's blob is not in this remote"
 
 
 def test_get_target_hashes_include_deps_skips_metric_outputs_of_upstream(
