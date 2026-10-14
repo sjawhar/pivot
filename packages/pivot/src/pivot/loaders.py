@@ -371,6 +371,18 @@ def _replace_nonfinite(value: object) -> object:
     return value
 
 
+def _as_nanoseconds(series: pandas.Series[Any]) -> pandas.Series[Any]:
+    """Convert a datetime or timedelta column to nanosecond resolution, or raise TypeError.
+
+    A ``datetime64[us]`` 9999-12-31 overflows the nanosecond range; numpy's own cast
+    wraps it silently to an unrelated date, so pandas' checked conversion is required.
+    """
+    try:
+        return series.dt.as_unit("ns")
+    except (pandas.errors.OutOfBoundsDatetime, pandas.errors.OutOfBoundsTimedelta) as e:
+        raise TypeError(f"value outside the nanosecond range: {e}") from e
+
+
 def _iso_datetime_texts(series: pandas.Series[Any], suffix: str = "") -> list[str]:
     """JSON texts for a naive datetime64 column: quoted ISO 8601 with nanoseconds, NaT as null.
 
@@ -404,6 +416,7 @@ def _encode_jsonl_column(
         dtype = series.dtype
     if isinstance(dtype, pandas.DatetimeTZDtype):
         # Values are ISO UTC text; metadata must rebuild the original zone semantics.
+        series = _as_nanoseconds(series)
         timezone = str(dtype.tz)
         try:
             reconstructed_dtype = pandas.DatetimeTZDtype(tz=timezone)
@@ -423,9 +436,13 @@ def _encode_jsonl_column(
             metadata,
         )
     if pandas.api.types.is_datetime64_dtype(dtype):
-        return _iso_datetime_texts(series), str(dtype), {"kind": "datetime", "timezone": None}
+        return (
+            _iso_datetime_texts(_as_nanoseconds(series)),
+            str(dtype),
+            {"kind": "datetime", "timezone": None},
+        )
     if pandas.api.types.is_timedelta64_dtype(dtype):
-        deltas = cast("list[pandas.Timedelta]", series.tolist())
+        deltas = cast("list[pandas.Timedelta]", _as_nanoseconds(series).tolist())
         return (
             ["null" if delta is pandas.NaT else f'"{delta.isoformat()}"' for delta in deltas],
             str(dtype),

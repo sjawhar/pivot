@@ -11,6 +11,7 @@ import sys
 import time
 from typing import TYPE_CHECKING, Annotated
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -73,6 +74,17 @@ def quiet() -> str:
 @compose.stage
 def frame_metric() -> Annotated[pd.DataFrame, compose.metric]:
     return pd.DataFrame({"value": [1.0]})
+
+
+@compose.stage
+def open_ended_dims() -> pd.DataFrame:
+    valid_to = np.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]")
+    return pd.DataFrame({"k": ["a", "b"], "valid_to": valid_to})
+
+
+@compose.stage
+def current_dims(dims: pd.DataFrame) -> list[str]:
+    return [str(k) for k in dims.loc[dims["valid_to"] > pd.Timestamp("2025-01-01"), "k"]]
 
 
 _EMPTY_PIPELINE = (
@@ -1069,6 +1081,31 @@ def test_repro_quiet_suppresses_lossy_output_warning(
 
     assert result.exit_code == 0, result.output
     assert result.output.strip() == "", "Quiet mode should suppress the warning"
+
+
+def test_repro_never_writes_an_out_of_range_date_as_a_different_date(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A 9999-12-31 sentinel in a datetime64[us] column must not reach the next stage as 1816."""
+    with mock_discovery:
+        current_dims(open_ended_dims())
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    text = " ".join(result.output.split())
+    assert "WARNING: Stage 'test/open_ended_dims' wrote its DataFrameJSONL output" in text, (
+        result.output
+    )
+    assert "column 'valid_to'" in text
+    written = (mock_discovery.root / "data" / "test" / "open_ended_dims.jsonl").read_text()
+    assert "1816" not in written
+    assert written == pd.DataFrame(
+        {
+            "k": ["a", "b"],
+            "valid_to": np.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]"),
+        }
+    ).to_json(lines=True, orient="records")
 
 
 def _same_named_pipeline(side: str) -> str:

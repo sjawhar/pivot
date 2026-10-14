@@ -1172,6 +1172,12 @@ def test_dataframe_jsonl_roundtrips_all_nan_float_dtype(tmp_path: pathlib.Path) 
         pytest.param(numpy.array([numpy.longdouble("1.0000000000000000009")]), id="float128"),
         pytest.param(pandas.period_range("2024-01", periods=2, freq="M"), id="period"),
         pytest.param([(n for n in range(2)), None], id="generator"),
+        pytest.param(
+            pandas.DatetimeIndex(
+                numpy.array(["2500-01-01", "2024-01-01"], dtype="datetime64[s]")
+            ).tz_localize("UTC"),
+            id="tz-aware-out-of-ns-range",
+        ),
     ],
 )
 def test_dataframe_jsonl_refuses_columns_the_old_writer_also_refused(
@@ -1266,6 +1272,40 @@ def test_dataframe_jsonl_writes_cells_json_cannot_hold_as_before_with_a_warning(
     df = pandas.DataFrame({"col": [cell, None], "n": [1, 2]})
 
     with pytest.warns(loaders.LossyOutputWarning, match=rf"column 'col'.*{type_name}"):
+        loaders.DataFrameJSONL().save(df, jsonl_file)
+
+    assert jsonl_file.read_text() == df.to_json(lines=True, orient="records")
+
+
+@pytest.mark.parametrize(
+    ("values", "dtype"),
+    [
+        pytest.param(
+            numpy.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]"),
+            "datetime64[us]",
+            id="us-sentinel-9999",
+        ),
+        pytest.param(
+            numpy.array(["1500-06-01", "2024-01-01"], dtype="datetime64[s]"),
+            "datetime64[s]",
+            id="s-1500",
+        ),
+        pytest.param(
+            numpy.array([10**12, 5], dtype="timedelta64[s]"),
+            "timedelta64[s]",
+            id="s-timedelta-big",
+        ),
+    ],
+)
+def test_dataframe_jsonl_writes_out_of_nanosecond_range_values_as_before_with_a_warning(
+    tmp_path: pathlib.Path, values: object, dtype: str
+) -> None:
+    """A value the nanosecond ISO format cannot hold must not be written as a different date."""
+    jsonl_file = tmp_path / "range.jsonl"
+    df = pandas.DataFrame({"k": ["a", "b"], "at": values})
+    assert str(df["at"].dtype) == dtype
+
+    with pytest.warns(loaders.LossyOutputWarning, match=r"column 'at'"):
         loaders.DataFrameJSONL().save(df, jsonl_file)
 
     assert jsonl_file.read_text() == df.to_json(lines=True, orient="records")
