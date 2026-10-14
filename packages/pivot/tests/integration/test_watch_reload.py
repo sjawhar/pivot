@@ -30,14 +30,20 @@ if TYPE_CHECKING:
     from pivot.registry import PipelineLike
 
 
-def _helper_pipeline_source(change_suffix: str, *, third: str) -> str:
-    """pipeline.py with stages keep, change (input + change_suffix) and ``third``."""
+def _helper_pipeline_source(change_suffix: str, *, third: str, refused: bool = False) -> str:
+    """pipeline.py with stages keep, change (input + change_suffix) and ``third``.
+
+    With ``refused``, ``change`` reads its suffix from a module-level tuple, which
+    fingerprinting refuses.
+    """
+    suffixes = f"SUFFIXES = ({change_suffix!r},)\n\n\n" if refused else ""
+    change_value = "SUFFIXES[0]" if refused else repr(change_suffix)
     return f"""\
 from __future__ import annotations
 
 from pivot.compose import Pipeline, stage
 
-
+{suffixes}
 @stage
 def keep(raw: str) -> str:
     return raw + "-keep"
@@ -45,7 +51,7 @@ def keep(raw: str) -> str:
 
 @stage
 def change(raw: str) -> str:
-    return raw + {change_suffix!r}
+    return raw + {change_value}
 
 
 @stage
@@ -464,4 +470,83 @@ async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
             )
             assert reload_event["stages_removed"] == ["reload/removed"]
             assert recorder.completed("reload/added", start=reload_index) == StageStatus.RAN
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_watch_started_on_refused_pipeline_waits_for_fix(
+    watch_project: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stage refused by fingerprinting at startup leaves the engine watching, not crashed."""
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other", refused=True))
+    pipeline = _helper_discover(watch_project)
+    change_output = _helper_output_path(watch_project, pipeline, "reload/change")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await _helper_wait_until_watching(eng)
+            assert "Pipeline invalid - waiting for fix" in caplog.text
+            assert "captures non-scalar variable 'SUFFIXES'" in caplog.text
+            assert not any(event["type"] == "stage_completed" for event in recorder.events), (
+                "no stage runs while the pipeline is invalid"
+            )
+
+            pipeline_py.write_text(_helper_pipeline_source("-v2", third="other"))
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            done = await recorder.wait_for(_helper_completes("reload/change"), start=reload_index)
+            await recorder.wait_for(_helper_is_idle, start=done)
+            assert recorder.completed("reload/change", start=reload_index) == StageStatus.RAN
+            assert change_output.read_text() == "x-v2", "the fixed pipeline runs"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_refusal_added_mid_session_waits_for_fix(
+    watch_project: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An edit that fingerprinting refuses is an invalid pipeline: no reload, engine stays up."""
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    change_output = _helper_output_path(watch_project, pipeline, "reload/change")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+
+            pipeline_py.write_text(_helper_pipeline_source("-v2", third="other", refused=True))
+            with anyio.fail_after(30):
+                while "Pipeline invalid - waiting for fix" not in caplog.text:
+                    await anyio.sleep(0.05)
+            assert "captures non-scalar variable 'SUFFIXES'" in caplog.text
+
+            pipeline_py.write_text(_helper_pipeline_source("-v3", third="other"))
+            reload_index = await recorder.wait_for(_helper_is_reload, start=first_idle)
+            done = await recorder.wait_for(_helper_completes("reload/change"), start=reload_index)
+            await recorder.wait_for(_helper_is_idle, start=done)
+
+            assert not any(_helper_is_reload(event) for event in recorder.events[:reload_index]), (
+                "a refused pipeline.py must not be reported as a reload"
+            )
+            reload_event = recorder.events[reload_index]
+            assert reload_event["type"] == "pipeline_reloaded"
+            assert reload_event["stages_modified"] == ["reload/change"]
+            assert change_output.read_text() == "x-v3", "the fixed pipeline runs"
             tg.cancel_scope.cancel()

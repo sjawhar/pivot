@@ -192,6 +192,9 @@ class Engine:
 
     # Set once a watched engine's startup fingerprint snapshot has finished
     _startup_fingerprinted: anyio.Event
+    # Set when a watched engine's startup pipeline has a stage that fails to fingerprint;
+    # runs wait until a reload loads a pipeline whose every stage fingerprints
+    _pipeline_invalid: bool
 
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
@@ -249,6 +252,7 @@ class Engine:
         self._dispatch_complete = anyio.Event()
 
         self._startup_fingerprinted = anyio.Event()
+        self._pipeline_invalid = False
 
     @property
     def state(self) -> EngineState:
@@ -652,6 +656,10 @@ class Engine:
         self._stored_parallel = event["parallel"]
         self._stored_max_workers = event["max_workers"]
         self._stored_resource_capacity = dict(event["resource_capacity"])
+
+        if self._pipeline_invalid:
+            _logger.debug("Pipeline invalid - ignoring run request until it is fixed")
+            return
 
         if self._run_state == _RunState.RUNNING:
             # Coalesce: only the latest restart request survives
@@ -2168,16 +2176,25 @@ class Engine:
         Each stage is fingerprinted in a worker thread so the RPC server keeps answering, and
         nothing else fingerprints until this returns (see ``wait_for_startup_fingerprints``),
         so the startup run's skip check reuses the cached values.
+
+        A stage that fails to fingerprint makes the pipeline invalid, as a ``pipeline.py``
+        syntax error does on reload: the errors are logged and no run starts until an edit
+        reloads a pipeline whose every stage fingerprints.
         """
         pipeline = self._pipeline
         if pipeline is None:
             return
+        errors = list[exceptions.PivotError]()
         for stage_name in pipeline.list_stages():
             try:
                 _ = await anyio.to_thread.run_sync(pipeline.ensure_fingerprint, stage_name)
             except exceptions.PivotError as exc:
-                # The startup run reports the same error when it fingerprints the stage.
-                _logger.debug("Fingerprinting failed for stage '%s': %s", stage_name, exc)
+                errors.append(exc)
+        if errors:
+            for exc in errors:
+                _logger.warning(f"Pipeline invalid: {exc}")
+            _logger.error("Pipeline invalid - waiting for fix")
+            self._pipeline_invalid = True
 
     def _snapshot_watch_output(self, path: pathlib.Path) -> _WatchOutputSnapshot:
         """Capture every currently visible path in one output's filesystem tree."""
@@ -2465,8 +2482,10 @@ class Engine:
     def _reload_registry(self) -> dict[str, RegistryStageInfo] | None:
         """Reload the pipeline by re-importing pipeline definition.
 
-        Returns the old pipeline's stages if reload succeeded, None if the pipeline is invalid.
-        The caller should emit the reload event using the returned stages.
+        Returns the old pipeline's stages if reload succeeded, None if the pipeline is invalid:
+        it fails to load, or one of its stages fails to fingerprint. The new fingerprints stay
+        cached for the reload event's diff. The caller should emit the reload event using the
+        returned stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
@@ -2484,7 +2503,20 @@ class Engine:
                 _logger.warning("No pipeline found during reload")
                 return None
 
+            errors = list[exceptions.PivotError]()
+            for stage_name in new_pipeline.list_stages():
+                try:
+                    _ = new_pipeline.ensure_fingerprint(stage_name)
+                except exceptions.PivotError as exc:
+                    errors.append(exc)
+            if errors:
+                for exc in errors:
+                    _logger.warning(f"Pipeline invalid: {exc}")
+                self._pipeline = old_pipeline
+                return None
+
             self._pipeline = new_pipeline
+            self._pipeline_invalid = False
             return old_stages
         except Exception as e:
             _logger.warning(f"Pipeline invalid: {e}")
@@ -2526,24 +2558,13 @@ class Engine:
         added = sorted(new_stages_set - old_stage_names)
         removed = sorted(old_stage_names - new_stages_set)
 
-        # Fingerprint every new stage: shared ones are compared now, and all of them are the
-        # baseline the next reload compares against.
+        # ``_reload_registry`` fingerprinted every new stage: shared ones are compared now, and
+        # all of them are the baseline the next reload compares against.
         pipeline = self._require_pipeline()
-        new_fingerprints = dict[str, dict[str, str] | None]()
-        for stage_name in new_stage_names:
-            try:
-                new_fingerprints[stage_name] = pipeline.ensure_fingerprint(stage_name)
-            except exceptions.PivotError as exc:
-                new_fingerprints[stage_name] = None
-                _logger.warning(
-                    "Fingerprinting failed for stage '%s' during reload: %s", stage_name, exc
-                )
-
         modified = list[str]()
         for stage_name in sorted(old_stage_names & new_stages_set):
             old_fp = old_stages[stage_name]["fingerprint"]
-            new_fp = new_fingerprints[stage_name]
-            if old_fp is None or new_fp is None or old_fp != new_fp:
+            if old_fp is None or old_fp != pipeline.ensure_fingerprint(stage_name):
                 modified.append(stage_name)
 
         await self.emit(
