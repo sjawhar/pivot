@@ -1137,6 +1137,7 @@ async def test_action_force_rerun_not_in_watch_mode(mocker: MockerFixture) -> No
     app._selected_stage_name = "stage_a"
 
     app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
 
@@ -1151,6 +1152,7 @@ async def test_action_force_rerun_no_stage_selected(mocker: MockerFixture) -> No
     mock_notify = mocker.patch.object(app, "notify")
 
     app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1169,6 +1171,7 @@ async def test_action_force_rerun_while_running(mocker: MockerFixture) -> None:
     mock_notify = mocker.patch.object(app, "notify")
 
     app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1186,6 +1189,7 @@ async def test_action_force_rerun_all_while_running(mocker: MockerFixture) -> No
     mock_notify = mocker.patch.object(app, "notify")
 
     app.action_force_rerun_all()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
