@@ -17,7 +17,7 @@ import types
 import typing
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import xxhash
 
@@ -46,7 +46,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 14 walks user functions and classes bound in functools.partial arguments.
 # Version 15 hashes an object with the default repr by its class and attributes, not its address.
 # Version 16 records the live values a walk read, which a cache hit reads again.
-_CACHE_SCHEMA_VERSION = 16
+# Version 17 keys manifests by the function's full identity (closure values and defaults
+# included) and keys closure values under the binding the closure was reached through.
+_CACHE_SCHEMA_VERSION = 17
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -156,6 +158,21 @@ _walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "_walk_path", default=()
 )
 
+# Manifest reference of the function being walked. Its closure cells and defaults are keyed
+# under it, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep apart.
+_owner_ref: contextvars.ContextVar[str | None] = contextvars.ContextVar("_owner_ref", default=None)
+
+
+class FunctionIdentity(TypedDict):
+    """What makes two function objects the same function (`function_identity`)."""
+
+    module: str
+    qualname: str
+    file: str | None
+    code: str | None
+    cells: list[tuple[str, Any]]
+    defaults: list[tuple[str, Any]]
+
 
 def _close_state_db() -> None:
     """Close the readonly StateDB on process exit."""
@@ -205,26 +222,113 @@ def _get_state_db() -> "StateDB | None":
 def _make_manifest_cache_key(stage_name: str, func: Callable[..., Any]) -> bytes:
     """Build StateDB key for the manifest of `func` registered as `stage_name`.
 
-    The key names the function as well as the stage, because two pipeline files can register
-    the same stage name with different functions. A cached manifest for one never answers for
-    the other.
+    The key names the function by its identity (`function_identity`) as well as the stage,
+    because two pipeline files can register the same stage name with different functions, and
+    one factory can build stages that differ only in closure values. A cached manifest for one
+    never answers for the other.
     """
-    module = getattr(func, "__module__", None) or "<unknown>"
-    qualname = getattr(func, "__qualname__", None) or getattr(func, "__name__", "<unknown>")
+    identity = function_identity(func)
+    digest = xxhash.xxh64(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    names = f"{identity['module']}\x00{identity['qualname']}\x00{digest}"
+    return f"sm:{stage_name}\x00{names}\x00{_PYTHON_VERSION}\x00{_CACHE_SCHEMA_VERSION}".encode()
+
+
+def function_identity(func: Callable[..., Any]) -> FunctionIdentity:
+    """Name one function for every check that asks whether two function objects are the same.
+
+    Module, qualname, source file (relative to the project root) and code hash say where the
+    function is defined and what it does. Closure cell values and default values say what it
+    was built with: `make_stage(2)` and `make_stage(5)` share a definition and differ only in
+    a cell. Values take their canonical form (`_canonicalize_value_for_hash`); an
+    ArtifactHandle default is a wired input and is named only as one. Library code is named by
+    module and qualname only.
+
+    Used by the stage-manifest cache key, the canonical form of a function value (loader
+    config, partial arguments), and compose's check that one stage name is one stage.
+    """
+    return _function_identity(func, ())
+
+
+def _function_identity(func: Callable[..., Any], active: tuple[int, ...]) -> FunctionIdentity:
+    """`function_identity`, with `active` holding the functions already being named."""
+    file = _project_file(func)
+    identity = FunctionIdentity(
+        module=getattr(func, "__module__", None) or "<unknown>",
+        qualname=_get_qualname_for_cache(func),
+        file=file,
+        code=None,
+        cells=[],
+        defaults=[],
+    )
+    if not is_user_code(func):
+        # An install path outside the project differs from machine to machine.
+        if file is not None and pathlib.PurePath(file).is_absolute():
+            identity["file"] = None
+        return identity
+    if id(func) in active:
+        return identity
+    active = (*active, id(func))
+    identity["code"] = hash_function_ast(func)
     code = getattr(func, "__code__", None)
-    source = code.co_filename if isinstance(code, types.CodeType) else "<unknown>"
-    identity = f"{module}\x00{qualname}\x00{_portable_source_path(source)}"
-    return f"sm:{stage_name}\x00{identity}\x00{_PYTHON_VERSION}\x00{_CACHE_SCHEMA_VERSION}".encode()
+    closure: tuple[types.CellType, ...] = getattr(func, "__closure__", None) or ()
+    if isinstance(code, types.CodeType):
+        identity["cells"] = [
+            (name, _canonical_binding(_cell_value(cell), active))
+            for name, cell in zip(code.co_freevars, closure, strict=True)
+        ]
+    identity["defaults"] = [
+        (parameter, _canonical_binding(value, active))
+        for parameter, value in _function_defaults(func)
+    ]
+    return identity
 
 
-def _portable_source_path(source: str) -> str:
-    """Return `source` relative to the project root, so a moved project keeps its cache."""
+_EMPTY_CELL = object()
+
+
+def _cell_value(cell: types.CellType) -> Any:
+    """Return a closure cell's value, or `_EMPTY_CELL` for a name not yet bound."""
+    try:
+        return cell.cell_contents
+    except ValueError:
+        return _EMPTY_CELL
+
+
+def _canonical_binding(value: Any, active: tuple[int, ...]) -> Any:
+    """Canonical form of a closure cell or default value in a function identity."""
+    from pivot import compose
+
+    if value is _EMPTY_CELL:
+        return ["empty"]
+    if _is_artifact_handles(value, compose.ArtifactHandle):
+        return ["handle"]
+    return _canonicalize_value_for_hash(value, active)
+
+
+def _project_file(func: Callable[..., Any]) -> str | None:
+    """Return the file defining `func`, relative to the project root when it is inside it."""
     from pivot import project
 
+    code = getattr(func, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        return None
     try:
-        return str(pathlib.Path(source).resolve().relative_to(project.get_project_root()))
-    except (OSError, ValueError):
-        return source
+        root: pathlib.Path | None = project.get_project_root()
+    except exceptions.ProjectNotInitializedError:
+        root = None
+    return _portable_path(code.co_filename, root)
+
+
+@functools.lru_cache(maxsize=4096)
+def _portable_path(filename: str, root: pathlib.Path | None) -> str:
+    """Return `filename` relative to `root` when it is inside it, else unchanged."""
+    try:
+        resolved = pathlib.Path(filename).resolve()
+    except OSError:
+        return filename
+    if root is not None and resolved.is_relative_to(root):
+        return str(resolved.relative_to(root))
+    return filename
 
 
 def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int] | None:
@@ -430,13 +534,19 @@ def _value_kind(value: Any) -> _ValueKind:
 
 
 def _value_token(value: Any) -> str:
-    """Summarise the walk's own entries for a read value; what it reads has its own steps."""
+    """Summarise the walk's own entries for a read value; what it reads has its own steps.
+
+    A user function or class is named by its identity, closure values and defaults included,
+    so a binding that now holds another closure from the same factory reads as changed even
+    where the walk did not descend into it again.
+    """
     kind = _value_kind(value)
     if kind is _ValueKind.PARTIAL:
         return f"partial:{_serialize_value_for_hash(value)}"
     if kind is _ValueKind.USER:
         prefix = "class" if isinstance(value, type) else "function"
-        return f"{prefix}:{_definition_ref(value)}:{hash_function_ast(value)}"
+        identity = json.dumps(function_identity(value), sort_keys=True)
+        return f"{prefix}:{xxhash.xxh64(identity.encode()).hexdigest()}"
     if kind is _ValueKind.MODULE:
         return f"module:{value.__name__}"
     if kind is _ValueKind.SCALAR:
@@ -1249,17 +1359,31 @@ def _process_closure_values(
     *,
     prefix: str,
 ) -> None:
-    """Process the globals (`prefix` "g", dunders skipped) or closure cells ("c") `func` reads."""
+    """Process the globals (`prefix` "g", dunders skipped) or closure cells ("c") `func` reads.
+
+    A global is keyed by its module (`<module>.NAME`); a cell by the function that owns it
+    (`_walk_owner`), since two closures from one factory hold different values under one name.
+    Names are walked in sorted order: getclosurevars collects globals in a set.
+    """
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
-    for name, value in values.items():
+    owner = _walk_owner(func)
+    for name, value in sorted(values.items()):
         if prefix == "g" and name.startswith("__"):
             continue
+        binding_ref = _binding_ref(func, name) if prefix == "g" else f"{owner}.{name}"
         step = f"{prefix}:{name}"
         _record_read(func, step)
         with _walking(step):
-            _process_captured_value(
-                name, _binding_ref(func, name), value, func, manifest, visited, stage_name
-            )
+            _process_captured_value(name, binding_ref, value, func, manifest, visited, stage_name)
+
+
+def _walk_owner(func: Callable[..., Any]) -> str:
+    """Return the manifest reference under which `func`'s closure cells and defaults are keyed.
+
+    That is the reference `func` itself was keyed by (`_add_callable_to_manifest`), or its
+    definition for the stage function.
+    """
+    return _owner_ref.get() or _definition_ref(func)
 
 
 def _process_captured_value(
@@ -1314,7 +1438,7 @@ def _process_default_values(
     from pivot import compose, stage_def
 
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
-    func_ref = _definition_ref(func)
+    func_ref = _walk_owner(func)
     expressions: dict[str, ast.expr] | None = None
     for parameter, value in defaults:
         binding_ref = f"{func_ref}.{parameter}"
@@ -1732,58 +1856,69 @@ def _serialize_value_for_hash(value: Any) -> str:
     return json.dumps(_canonicalize_value_for_hash(value))
 
 
-def _canonicalize_value_for_hash(value: Any) -> Any:
+def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> Any:
     """Return a JSON-ready form of `value` that does not depend on PYTHONHASHSEED.
 
     Collections become `[type, items]` nodes, so a set stays distinct from a list or from a
     string that looks like one. Set members and dict entries are sorted by their full
     canonical JSON text: a set's iteration order, and a dict built from a set, follow the
-    hash seed. A Python function is named by its module and qualname, plus its code hash when
-    it is user code, because its `repr` holds a memory address; a `functools.partial` is
-    canonicalised through its function and arguments for the same reason. An object whose
-    class keeps `object.__repr__` (which holds the address) and that has a `__dict__` becomes
-    `[module.qualname, canonical(vars(obj))]`. Other leaves keep their `repr`, tagged with their
-    type. A class is a leaf, even a pydantic model class: only an instance is dumped.
+    hash seed. A Python function becomes `["function", function_identity]`, closure values
+    and defaults included, because its `repr` holds a memory address and two closures from one
+    factory share a definition; `active` holds the functions being named, so a function that
+    captures itself ends there. A `functools.partial` is canonicalised through its function
+    and arguments. An object whose class keeps `object.__repr__` (which holds the address)
+    and that has a `__dict__` becomes `[module.qualname, canonical(vars(obj))]`. Other leaves
+    keep their `repr`, tagged with their type. A class is a leaf, even a pydantic model class:
+    only an instance is dumped.
     """
     if hasattr(value, "model_dump") and not isinstance(value, type):
-        return _canonicalize_value_for_hash(value.model_dump())
+        return _canonicalize_value_for_hash(value.model_dump(), active)
     if inspect.isfunction(value):
-        code_hash = hash_function_ast(value) if is_user_code(value) else None
-        return ["function", _definition_ref(value), code_hash]
+        return ["function", _function_identity(value, active)]
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
         return [
             "partial",
-            _canonicalize_value_for_hash(partial_obj.func),
-            _canonicalize_value_for_hash(partial_obj.args),
-            _canonicalize_value_for_hash(partial_obj.keywords),
+            _canonicalize_value_for_hash(partial_obj.func, active),
+            _canonicalize_value_for_hash(partial_obj.args, active),
+            _canonicalize_value_for_hash(partial_obj.keywords, active),
         ]
     if isinstance(value, dict):
         entries = [
-            [_canonicalize_value_for_hash(key), _canonicalize_value_for_hash(item)]
+            [_canonicalize_value_for_hash(key, active), _canonicalize_value_for_hash(item, active)]
             for key, item in cast("dict[Any, Any]", value).items()
         ]
         entries.sort(key=json.dumps)
         return ["dict", entries]
     if isinstance(value, (list, tuple, set, frozenset)):
         collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
-        items = [_canonicalize_value_for_hash(item) for item in collection]
+        items = [_canonicalize_value_for_hash(item, active) for item in collection]
         if isinstance(collection, (set, frozenset)):
             items.sort(key=json.dumps)
         return [type(collection).__name__, items]
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, types.ModuleType):
+        return ["module", value.__name__]
     if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
-        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value))]
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value), active)]
     return [type(value).__name__, repr(value)]
 
 
 def _add_callable_to_manifest(
     key: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
-    """Hash callable and merge its transitive dependencies into manifest."""
+    """Hash callable and merge its transitive dependencies into manifest.
+
+    Its closure cells and defaults are keyed under the reference in `key`.
+    """
     manifest[key] = hash_function_ast(func)
-    for child_key, child_val in get_stage_fingerprint(func, visited).items():
+    token = _owner_ref.set(key.partition(":")[2])
+    try:
+        children = get_stage_fingerprint(func, visited)
+    finally:
+        _owner_ref.reset(token)
+    for child_key, child_val in children.items():
         if not child_key.startswith("self:"):
             manifest[child_key] = child_val
 
@@ -1882,9 +2017,20 @@ def _binding_ref(func: Callable[..., Any], name: str) -> str:
 
 
 def _callable_ref(func: Callable[..., Any], binding_ref: str) -> str:
-    """Use callable's definition, retaining the binding path for anonymous lambdas."""
+    """Use callable's definition, or the binding path where one definition makes many.
+
+    A lambda is keyed by its binding, and so is a function defined inside another one that
+    holds closure cells or defaults: two closures from one factory (`h2 = make(2)`,
+    `h5 = make(5)`) share a definition, and their values must not share keys.
+    """
     qualname = getattr(func, "__qualname__", "") or ""
     if "<lambda>" in qualname:
+        return binding_ref
+    if "<locals>" in qualname and (
+        getattr(func, "__closure__", None)
+        or getattr(func, "__defaults__", None)
+        or getattr(func, "__kwdefaults__", None)
+    ):
         return binding_ref
     return _definition_ref(func)
 

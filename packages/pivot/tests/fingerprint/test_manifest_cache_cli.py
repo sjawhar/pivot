@@ -1072,3 +1072,201 @@ def test_scalar_read_from_settings_file_at_import_reruns_stages(tmp_path: pathli
     assert "2 stale" in status, status
     assert (root / "data/cfg/made.jsonl").read_text() == '{"a":7}\n', output
     assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":7}\n', output
+
+
+_FACTORY_STAGES = """\
+import pandas as pd
+
+from pivot import stage
+
+
+def make_stage(factor: int):
+    @stage
+    def make(x: pd.DataFrame) -> pd.DataFrame:
+        return x * factor
+
+    return make
+"""
+
+
+def _factory_side(factor: int) -> str:
+    return (
+        "from pivot import Pipeline\nfrom shared.stages import make_stage\n\n"
+        + f"make = make_stage({factor})\n\n"
+        + 'with Pipeline("rep") as pipeline:\n    make(pipeline.input("x.csv"))\n'
+    )
+
+
+_INCLUDE_BOTH = (
+    "from pivot import Pipeline\n"
+    + "from left.pipeline import pipeline as left\n"
+    + "from right.pipeline import pipeline as right\n\n"
+    + 'with Pipeline("all") as pipeline:\n'
+    + "    pipeline.include(left)\n"
+    + "    pipeline.include(right)\n"
+)
+
+
+def test_include_refuses_two_factory_closures_under_one_stage_name(tmp_path: pathlib.Path) -> None:
+    """make_stage(2) and make_stage(5) share a file and qualname; their closure values differ."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "shared/stages.py": _FACTORY_STAGES,
+            "left/pipeline.py": _factory_side(2),
+            "right/pipeline.py": _factory_side(5),
+            "pipeline.py": _INCLUDE_BOTH,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "list")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert (
+        "Stage 'rep/make' is defined twice with different closure values (factor=2 vs factor=5), "
+        + "both calling make_stage.<locals>.make in shared/stages.py"
+    ) in output, output
+
+
+_FACTORY_LOADER_STAGES = """\
+import dataclasses
+from collections.abc import Callable
+from typing import Any
+
+import pandas as pd
+
+from pivot import loaders, stage
+
+
+def make_scaler(factor: int) -> Callable[[pd.DataFrame], pd.DataFrame]:
+    def scaler(df: pd.DataFrame) -> pd.DataFrame:
+        return df * factor
+
+    return scaler
+
+
+def _identity(df: pd.DataFrame) -> pd.DataFrame:
+    return df
+
+
+@dataclasses.dataclass(frozen=True)
+class ScaledCSV(loaders.CSV):
+    transform: Callable[[pd.DataFrame], pd.DataFrame] = _identity
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return self.transform(super().load(path))
+
+
+@stage
+def make(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+"""
+
+
+def _factory_loader_side(factor: int) -> str:
+    return (
+        "from pivot import Pipeline\nfrom shared.stages import ScaledCSV, make, make_scaler\n\n"
+        + 'with Pipeline("rep") as pipeline:\n'
+        + f'    make(pipeline.input("x.csv", format=ScaledCSV(transform=make_scaler({factor}))))\n'
+    )
+
+
+def test_include_refuses_one_stage_reading_through_two_factory_loaders(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A loader field holding make_scaler(2) or make_scaler(5) reads the input two ways."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "shared/stages.py": _FACTORY_LOADER_STAGES,
+            "left/pipeline.py": _factory_loader_side(2),
+            "right/pipeline.py": _factory_loader_side(5),
+            "pipeline.py": _INCLUDE_BOTH,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "list")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "Stage 'rep/make' is defined twice with different input formats" in output, output
+
+
+def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Right's factor=5 closure never gets left's cached factor=2 manifest."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "shared/stages.py": _FACTORY_STAGES,
+            "left/pipeline.py": _factory_side(2),
+            "right/pipeline.py": _factory_side(5),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    left = _helper_ok(_helper_pivot(root / "left", "repro"))
+    assert (root / "data/rep/make.jsonl").read_text() == '{"a":2}\n', left
+    right = _helper_ok(_helper_pivot(root / "right", "repro"))
+
+    assert "1 ran" in right, right
+    assert (root / "data/rep/make.jsonl").read_text() == '{"a":5}\n', right
+
+
+_TWO_CLOSURES_MODULE = """\
+def make(factor):
+    def inner(x):
+        return x * factor
+
+    return inner
+
+
+h2 = make(2)
+h5 = make(5)
+
+
+def stage(x):
+    return h2(x) + h5(x)
+"""
+
+_TWO_CLOSURES_SCRIPT = """\
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from pivot import fingerprint
+import two_closures
+
+print(json.dumps(fingerprint.get_stage_fingerprint(two_closures.stage), sort_keys=True))
+"""
+
+
+def test_two_closures_from_one_factory_keep_their_values_in_every_process(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`h2 = make(2)` and `h5 = make(5)` key their cells by binding; no hash seed picks one."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "two_closures.py").write_text(_TWO_CLOSURES_MODULE)
+    script = tmp_path / "script.py"
+    script.write_text(_TWO_CLOSURES_SCRIPT)
+    manifests = list[dict[str, str]]()
+    for seed in ("0", "1", "2", "3"):
+        env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+        env["PYTHONHASHSEED"] = seed
+        proc = subprocess.run(
+            [sys.executable, str(script), str(tmp_path)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        manifests.append(json.loads(proc.stdout))
+
+    assert all(manifest == manifests[0] for manifest in manifests), manifests
+    assert manifests[0]["const:two_closures.h2.factor"] == "2", manifests[0]
+    assert manifests[0]["const:two_closures.h5.factor"] == "5", manifests[0]

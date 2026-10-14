@@ -30,7 +30,7 @@ Pivot's fingerprinting system:
 | Custom loaders | Yes | Loader method ASTs hashed. A user loader's own `load()`, `save()` and `empty()`, and functions and classes in its config fields, are walked like stage helpers: module values they read are tracked or refused. Methods inherited from `pivot.loaders` are hashed only |
 | Module-level primitive values | Yes (value) | `getclosurevars()` + `repr()` |
 | Other module-level values | No — error | Use `StageParams` instead |
-| Closure variables | Yes (structure) | `getclosurevars()` captures binding |
+| Closure variables | Yes (value) | `getclosurevars()` nonlocals checked like module-level values, keyed under the binding the closure was reached through, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
 

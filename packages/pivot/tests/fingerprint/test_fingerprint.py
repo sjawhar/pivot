@@ -32,6 +32,12 @@ def _definition_key(prefix: str, value: object) -> str:
     return f"{prefix}:{typed_value.__module__}.{typed_value.__qualname__}"
 
 
+def _owned_key(prefix: str, owner: object, name: str) -> str:
+    """Key of a closure cell or local closure helper, under the function that owns it."""
+    typed_owner: typing.Any = owner
+    return f"{prefix}:{typed_owner.__module__}.{typed_owner.__qualname__}.{name}"
+
+
 def _loader_key(loader: object, member: str) -> str:
     return _definition_key("loader", type(loader)) + f":{member}"
 
@@ -344,8 +350,8 @@ def test_constant_captured():
     fp = fingerprint.get_stage_fingerprint(use_constant)
 
     assert "self:use_constant" in fp
-    assert _const_key("CONSTANT") in fp
-    assert fp[_const_key("CONSTANT")] == "100"
+    assert _owned_key("const", use_constant, "CONSTANT") in fp
+    assert fp[_owned_key("const", use_constant, "CONSTANT")] == "100"
 
 
 def test_multiple_constants_captured():
@@ -361,9 +367,9 @@ def test_multiple_constants_captured():
 
     fp = fingerprint.get_stage_fingerprint(use_constants)
 
-    assert fp[_const_key("PI")] == "3.14159"
-    assert fp[_const_key("MAX_ITER")] == "100"
-    assert fp[_const_key("DEBUG")] == "True"
+    assert fp[_owned_key("const", use_constants, "PI")] == "3.14159"
+    assert fp[_owned_key("const", use_constants, "MAX_ITER")] == "100"
+    assert fp[_owned_key("const", use_constants, "DEBUG")] == "True"
 
 
 def test_transitive_dependencies_captured():
@@ -381,7 +387,7 @@ def test_transitive_dependencies_captured():
     fp = fingerprint.get_stage_fingerprint(top)
 
     assert "self:top" in fp
-    assert _definition_key("func", middle) in fp
+    assert _owned_key("func", top, "middle") in fp
     assert _definition_key("func", leaf) in fp
 
 
@@ -457,7 +463,7 @@ def test_circular_reference_handled():
     fp = fingerprint.get_stage_fingerprint(func_a)
 
     assert "self:func_a" in fp
-    assert _definition_key("func", func_b) in fp
+    assert _owned_key("func", func_a, "func_b") in fp
 
 
 def test_nested_function_not_in_globals():
@@ -925,8 +931,8 @@ def test_fingerprint_with_nonlocal():
     # Should have the function itself
     assert "self:inner" in fp
     # Nonlocal constant should be captured
-    assert _const_key("x") in fp
-    assert fp[_const_key("x")] == "10"
+    assert _owned_key("const", inner_func, "x") in fp
+    assert fp[_owned_key("const", inner_func, "x")] == "10"
 
 
 def test_fingerprint_callable_nonlocal():
@@ -943,7 +949,7 @@ def test_fingerprint_callable_nonlocal():
 
     # Should have the function and the nonlocal
     assert "self:add" in fp
-    assert _const_key("n") in fp
+    assert _owned_key("const", add_five, "n") in fp
 
 
 def test_stdlib_callable_in_closure_does_not_raise():
@@ -1084,7 +1090,7 @@ def test_fingerprint_merges_child_manifest():
 
     # Should have all three functions
     assert "self:top_func" in fp
-    assert _definition_key("func", middle_helper) in fp
+    assert _owned_key("func", top_func, "middle_helper") in fp
     assert _definition_key("func", leaf_helper) in fp
 
     # Should NOT have self:middle_helper or self:leaf_helper

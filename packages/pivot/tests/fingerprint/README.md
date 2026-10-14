@@ -169,6 +169,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Closure value with deterministic repr | ✅        | `test_fingerprint.py::test_fingerprint_captures_unrecognized_closure_value` |
 | Closure value with `0x` in repr (non-deterministic) | 🚫  | `test_fingerprint.py::test_hash_unrecognized_closure_value_memory_address_raises` |
 | Closure value with repr > 10KB        | 🚫        | `test_fingerprint.py::test_hash_unrecognized_closure_value_large_repr_raises` |
+| Two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) | ✅ | `test_manifest_cache_cli.py::test_two_closures_from_one_factory_keep_their_values_in_every_process` |
+| Factory-built stage under a same-named pipeline, run separately | ✅ | `test_manifest_cache_cli.py::test_same_named_pipelines_run_separately_keep_factory_closures_apart` |
+| `include()` of two factory-built stages under one name | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_two_factory_closures_under_one_stage_name` |
+| `include()` of one stage read through two factory-built loaders | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_one_stage_reading_through_two_factory_loaders` |
 
 ---
 
@@ -312,7 +316,10 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 8. **Module-qualified manifest keys**: `func:`, `class:`, `const:`, `schema:`, `partial:`,
    `mod:`, and `loader:` keys use the definition or binding module. A manifest can therefore
    contain `func:project.alpha.helper` and `func:project.beta.helper` without one overwriting
-   the other.
+   the other. A closure cell is keyed under the function that holds it: the stage function's
+   own cells under its definition (`const:project.make_stage.<locals>.make.factor`), a local
+   helper's cells under the binding it was reached through (`const:project.h2.factor`, with the
+   helper at `func:project.h2`), so two closures from one factory keep their own values.
 
 9. **Class body dependency tracking**: When `getclosurevars()` fails on a class, the class body
    is parsed to capture base classes and field annotations. Resolved user-code classes are

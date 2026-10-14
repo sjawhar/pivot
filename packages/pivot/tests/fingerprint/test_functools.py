@@ -11,8 +11,9 @@ def _definition_key(prefix: str, value: object) -> str:
     return f"{prefix}:{value.__module__}.{value.__qualname__}"  # type: ignore[attr-defined] - test types
 
 
-def _partial_key(name: str, member: str) -> str:
-    return f"partial:{__name__}.{name}.{member}"
+def _partial_key(owner: object, name: str, member: str) -> str:
+    """Key of a partial read through a closure cell of `owner`."""
+    return f"partial:{owner.__module__}.{owner.__qualname__}.{name}.{member}"  # type: ignore[attr-defined] - test types
 
 
 # --- Test helpers for functools.partial ---
@@ -75,8 +76,10 @@ def test_partial_is_detected():
 
     fp = fingerprint.get_stage_fingerprint(stage_with_partial)
 
-    assert _partial_key("bound", "args") in fp, f"partial args not tracked. Got: {list(fp.keys())}"
-    assert _partial_key("bound", "kwargs") in fp, (
+    assert _partial_key(stage_with_partial, "bound", "args") in fp, (
+        f"partial args not tracked. Got: {list(fp.keys())}"
+    )
+    assert _partial_key(stage_with_partial, "bound", "kwargs") in fp, (
         f"partial kwargs not tracked. Got: {list(fp.keys())}"
     )
     assert _definition_key("func", _helper_func) in fp, (
@@ -98,9 +101,10 @@ def test_partial_args_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    assert fp1[_partial_key("bound_v1", "args")] != fp2[_partial_key("bound_v2", "args")], (
-        "Different bound args should produce different hashes"
-    )
+    assert (
+        fp1[_partial_key(stage_v1, "bound_v1", "args")]
+        != fp2[_partial_key(stage_v2, "bound_v2", "args")]
+    ), "Different bound args should produce different hashes"
 
 
 def test_partial_kwargs_change_triggers_fingerprint_change():
@@ -117,9 +121,10 @@ def test_partial_kwargs_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    assert fp1[_partial_key("bound_v1", "kwargs")] != fp2[_partial_key("bound_v2", "kwargs")], (
-        "Different bound kwargs should produce different hashes"
-    )
+    assert (
+        fp1[_partial_key(stage_v1, "bound_v1", "kwargs")]
+        != fp2[_partial_key(stage_v2, "bound_v2", "kwargs")]
+    ), "Different bound kwargs should produce different hashes"
 
 
 def test_partial_underlying_func_change_triggers_fingerprint_change():
@@ -156,7 +161,7 @@ def test_partial_in_closure():
     fp = fingerprint.get_stage_fingerprint(stage)
 
     # Should track partial from nonlocals
-    assert _partial_key("bound", "args") in fp, (
+    assert _partial_key(stage, "bound", "args") in fp, (
         f"partial args from closure not tracked. Got: {list(fp.keys())}"
     )
 
