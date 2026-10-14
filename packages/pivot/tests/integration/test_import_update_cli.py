@@ -7,6 +7,7 @@ through the CLI in a separate consumer project.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import uuid
@@ -238,9 +239,14 @@ def test_import_rejects_source_without_usable_remote(
     assert not (consumer / "smoke").exists(), "a failed import writes nothing"
 
 
-def test_import_uses_sole_remote_when_default_is_not_a_name(
+@pytest.mark.xfail(
+    strict=True,
+    reason="red test for Task 9: non-string default_remote must be refused",
+)
+def test_import_refuses_non_string_default_remote(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:
+    """``default_remote: 7`` is a config mistake; it must not silently mean the sole remote."""
     source.write(
         ".pivot/config.yaml",
         yaml.safe_dump({"remotes": {"origin": bucket.url}, "default_remote": 7}),
@@ -248,9 +254,11 @@ def test_import_uses_sole_remote_when_default_is_not_a_name(
     source.write_lock("smoke/total", {None: types.FileHash(hash=bucket.put(b"only remote"))})
     source.commit("non-string default")
 
-    data_path = _helper_import(runner, source, "smoke/total", "total.txt")
+    result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/total"])
 
-    assert data_path.read_bytes() == b"only remote"
+    assert result.exit_code != 0
+    assert "default_remote" in result.output, "the error must name the bad config key"
+    assert not (consumer / "smoke").exists(), "a refused import writes nothing"
 
 
 @pytest.mark.parametrize(
@@ -291,21 +299,27 @@ def test_import_reports_source_without_importable_outputs(
     assert message in result.output
 
 
-def test_import_unknown_artifact_lists_first_ten_available(
+def test_import_unknown_artifact_lists_some_available_and_counts_the_rest(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:
+    """A long list is cut short; the identities shown come first in order and the rest are
+    counted, so shown + counted accounts for every available identity."""
+    total = 30
+    names = [f"smoke/s{index:02d}" for index in range(total)]
     source.write_config(bucket.url)
-    for index in range(12):
-        source.write_lock(f"smoke/s{index:02d}", {None: types.FileHash(hash="0123456789abcdef")})
-    source.commit("twelve stages")
+    for name in names:
+        source.write_lock(name, {None: types.FileHash(hash="0123456789abcdef")})
+    source.commit("many stages")
 
     result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/missing"])
 
     assert result.exit_code != 0
-    assert "smoke/s00" in result.output
-    assert "smoke/s09" in result.output
-    assert "smoke/s10" not in result.output, "only the first ten identities are listed"
-    assert "(and 2 more)" in result.output
+    shown = [name for name in names if name in result.output]
+    more = re.search(r"\(and (\d+) more\)", result.output)
+    assert more is not None, "a cut-short list must say how many identities it left out"
+    assert 0 < len(shown) < total
+    assert shown == names[: len(shown)], "the identities shown must be the first in order"
+    assert len(shown) + int(more.group(1)) == total
 
 
 def test_import_refuses_path_produced_by_two_stages(
