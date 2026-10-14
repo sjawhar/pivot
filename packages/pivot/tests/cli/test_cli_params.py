@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import pytest
 import yaml
 
+from conftest import isolated_pivot_dir
 from pivot import cli, compose, discovery, git, project, stage_def
 
 if TYPE_CHECKING:
+    import pathlib
+
     import click.testing
-    import pytest
     from pytest_mock import MockerFixture
 
 # =============================================================================
@@ -461,3 +464,162 @@ def test_params_diff_without_prior_run_discovers_pipeline(
     # Should not raise NoPipelineError - discovery should have been called
     assert "No pipeline found" not in result.output, f"Output: {result.output}"
     assert result.exit_code == 0, f"Output: {result.output}"
+
+
+# =============================================================================
+# params.yaml keys are checked against the loaded stages
+# =============================================================================
+
+
+def _scale_pipeline(name: str) -> str:
+    return (
+        "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+        + "class ScaleParams(StageParams):\n    factor: int = 10\n\n\n"
+        + "@stage\ndef scale(numbers: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:\n"
+        + "    return numbers * params.factor\n\n\n"
+        + f'with Pipeline("{name}") as pipeline:\n'
+        + '    scale(pipeline.input("numbers.csv"), params=ScaleParams())\n'
+        + '    with pipeline.variant("big"):\n'
+        + '        scale(pipeline.input("numbers.csv"), params=ScaleParams(factor=100))\n'
+    )
+
+
+def _write_scale_project(cwd: pathlib.Path, params_yaml: str, *names: str) -> None:
+    """One scale pipeline per name: at the root for one name, in <name>/ for several."""
+    (cwd / "data" / "raw").mkdir(parents=True)
+    (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+    (cwd / "params.yaml").write_text(params_yaml)
+    if len(names) == 1:
+        (cwd / "pipeline.py").write_text(_scale_pipeline(names[0]))
+        return
+    for name in names:
+        (cwd / name).mkdir()
+        (cwd / name / "pipeline.py").write_text(_scale_pipeline(name))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["repro"], ["status"], ["status", "--explain"], ["params", "show"], ["commit"]],
+    ids=["repro", "status", "status-explain", "params-show", "commit"],
+)
+def test_bare_params_key_is_refused_naming_the_qualified_stage(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, args: list[str]
+) -> None:
+    """Keys used to be bare stage names; a bare 'scale:' must not be dropped silently."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(cwd, "scale:\n  factor: 3\n", "smoke")
+
+        result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code != 0, result.output
+    assert (
+        "params.yaml key 'scale' names no stage; keys are '<pipeline>/<stage>', "
+        + "e.g. 'smoke/scale'"
+    ) in result.output, result.output
+
+
+def test_misspelled_params_key_is_refused_with_close_matches(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A qualified key for a loaded pipeline that matches no stage or variant is a typo."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(
+            cwd, "smoke/scael:\n  factor: 3\nsmoke/scale@bgi:\n  factor: 4\n", "smoke"
+        )
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code != 0, result.output
+    assert (
+        "params.yaml key 'smoke/scael' names no stage in pipeline 'smoke'; "
+        + "did you mean 'smoke/scale' or 'smoke/scale@big'?"
+    ) in result.output, result.output
+    assert (
+        "params.yaml key 'smoke/scale@bgi' names no stage in pipeline 'smoke'; "
+        + "did you mean 'smoke/scale@big'"
+    ) in result.output, result.output
+    assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
+
+
+def test_qualified_params_keys_apply_to_base_and_variant(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(
+            cwd, "smoke/scale:\n  factor: 3\nsmoke/scale@big:\n  factor: 300\n", "smoke"
+        )
+
+        result = runner.invoke(cli.cli, ["params", "show", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "smoke/scale": {"factor": 3},
+        "smoke/scale@big": {"factor": 300},
+    }
+
+
+def test_params_key_for_a_pipeline_not_loaded_is_skipped_at_debug(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running one pipeline of several, keys for the others are neither applied nor refused."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(cwd, "a/scale:\n  factor: 2\nb/scale:\n  factor: 3\n", "a", "b")
+        monkeypatch.chdir(cwd / "a")
+
+        one = runner.invoke(cli.cli, ["--verbose", "params", "show", "--json"])
+        every = runner.invoke(cli.cli, ["params", "show", "--all", "--json"])
+
+    assert one.exit_code == 0, one.output
+    assert (
+        "params.yaml key 'b/scale': pipeline 'b' is not loaded in this run; skipping"
+    ) in one.stderr, one.stderr
+    # A key without '@' applies to every variant of the stage.
+    assert json.loads(one.stdout) == {"a/scale": {"factor": 2}, "a/scale@big": {"factor": 2}}
+    assert every.exit_code == 0, every.output
+    assert json.loads(every.stdout) == {
+        "a/scale": {"factor": 2},
+        "a/scale@big": {"factor": 2},
+        "b/scale": {"factor": 3},
+        "b/scale@big": {"factor": 3},
+    }
+
+
+def test_params_keys_for_an_upstream_pipeline_reached_through_handles(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From report/, prep's reachable stage takes its key; prep's other stage is not loaded."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+        (cwd / "params.yaml").write_text(
+            "prep/scale:\n  factor: 2\nprep/other:\n  factor: 5\nreport/total:\n  factor: 3\n"
+        )
+        (cwd / "prep").mkdir()
+        (cwd / "prep" / "pipeline.py").write_text(
+            "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+            + "class ScaleParams(StageParams):\n    factor: int = 10\n\n\n"
+            + "@stage\ndef scale(numbers: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:\n"
+            + "    return numbers * params.factor\n\n\n"
+            + "@stage\ndef other(numbers: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:\n"
+            + "    return numbers\n\n\n"
+            + 'with Pipeline("prep") as pipeline:\n'
+            + '    numbers = pipeline.input("numbers.csv")\n'
+            + "    scaled = scale(numbers, params=ScaleParams())\n"
+            + "    other(numbers, params=ScaleParams())\n"
+        )
+        (cwd / "report").mkdir()
+        (cwd / "report" / "pipeline.py").write_text(
+            "import pandas as pd\n\nfrom pivot import Pipeline, StageParams, stage\n"
+            + "from prep.pipeline import scaled\n\n\n"
+            + "class TotalParams(StageParams):\n    factor: int = 1\n\n\n"
+            + "@stage\ndef total(rows: pd.DataFrame, params: TotalParams) -> dict:\n"
+            + '    return {"sum": int(rows.to_numpy().sum()) * params.factor}\n\n\n'
+            + 'with Pipeline("report") as pipeline:\n'
+            + "    total(scaled, params=TotalParams())\n"
+        )
+        monkeypatch.chdir(cwd / "report")
+
+        result = runner.invoke(cli.cli, ["params", "show", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"prep/scale": {"factor": 2}, "report/total": {"factor": 3}}

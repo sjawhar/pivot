@@ -12,6 +12,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import typing
 
 import pydantic
 import pytest
@@ -299,6 +300,45 @@ def test_function_argument_hash_is_stable_across_processes(tmp_path: pathlib.Pat
         for _ in range(3)
     }
     assert len(results) == 1, results
+
+
+class _Opts:
+    depth: int
+    tags: set[str]
+
+    def __init__(self, depth: int) -> None:
+        self.depth = depth
+        self.tags = {"b", "a"}
+
+
+class _Named:
+    name: str
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    @typing.override
+    def __repr__(self) -> str:
+        return f"_Named({self.name!r})"
+
+
+def test_object_with_default_repr_is_canonicalised_by_class_and_attributes() -> None:
+    """The default repr holds a memory address, so two equal objects would hash apart."""
+    assert fingerprint._serialize_value_for_hash(_Opts(2)) == fingerprint._serialize_value_for_hash(
+        _Opts(2)
+    )
+    assert fingerprint._serialize_value_for_hash(_Opts(2)) != fingerprint._serialize_value_for_hash(
+        _Opts(3)
+    )
+    assert "0x" not in fingerprint._serialize_value_for_hash(_Opts(2))
+    assert fingerprint._canonicalize_value_for_hash(_Opts(2)) == [
+        f"{__name__}._Opts",
+        ["dict", [["depth", 2], ["tags", ["set", ["a", "b"]]]]],
+    ]
+
+
+def test_object_with_its_own_repr_keeps_the_repr() -> None:
+    assert fingerprint._canonicalize_value_for_hash(_Named("x")) == ["_Named", "_Named('x')"]
 
 
 class _Item(pydantic.BaseModel):

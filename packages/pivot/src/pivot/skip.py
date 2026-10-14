@@ -7,6 +7,7 @@ is handled by callers after this function when changed=True.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pivot.types import (
@@ -55,7 +56,7 @@ def check_stage(
             return ChangeDecision(
                 changed=True, reason="Code changed", run_cache_allowed=run_cache_allowed
             )
-        if lock_data["params"] != params:
+        if not params_equal(lock_data["params"], params):
             return ChangeDecision(
                 changed=True, reason="Params changed", run_cache_allowed=run_cache_allowed
             )
@@ -164,13 +165,23 @@ def diff_params(old: dict[str, Any], new: dict[str, Any]) -> list[ParamChange]:
                     key=key, old_value=old[key], new_value=None, change_type=ChangeType.REMOVED
                 )
             )
-        elif old[key] != new[key]:
+        elif not params_equal(old[key], new[key]):
             changes.append(
                 ParamChange(
                     key=key, old_value=old[key], new_value=new[key], change_type=ChangeType.MODIFIED
                 )
             )
     return changes
+
+
+def params_equal(old: object, new: object) -> bool:
+    """Compare recorded and current params by their canonical JSON text.
+
+    Both sides are JSON-mode dumps with set members already sorted
+    (``parameters.get_effective_params``), so the text is the canonical encoding. Python
+    equality alone would call a NaN param changed on every run, because nan != nan.
+    """
+    return old == new or json.dumps(old, sort_keys=True) == json.dumps(new, sort_keys=True)
 
 
 def diff_dep_hashes(

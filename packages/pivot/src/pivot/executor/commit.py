@@ -74,7 +74,7 @@ def commit_stages(
 
     committed = list[str]()
     failed = list[str]()
-    overrides = parameters.load_params_yaml()
+    overrides = parameters.load_params_yaml(pipeline)
 
     state_dbs = dict[pathlib.Path, state_mod.StateDB]()
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import difflib
 import json
 import logging
 import typing
@@ -16,6 +17,8 @@ from pivot import exceptions, project, yaml_config
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from pivot.registry import PipelineLike
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +37,18 @@ _params_merger = deepmerge.Merger(  # pyright: ignore[reportPrivateImportUsage]
 ParamsOverrides = dict[str, dict[str, Any]]
 
 
-def load_params_yaml(path: Path | None = None) -> ParamsOverrides:
-    """Load params.yaml from project root or specified path.
+def load_params_yaml(pipeline: PipelineLike, path: Path | None = None) -> ParamsOverrides:
+    """Load params.yaml from the project root (or ``path``) and check its keys against ``pipeline``.
 
-    Returns dict of stage_name -> param_dict. Returns empty dict if file missing.
+    Keys are qualified stage names (``<pipeline>/<stage>``); a key without ``@...`` applies to
+    every variant of that stage. Returns stage_name -> param_dict, or an empty dict when the
+    file is missing.
+
+    Raises:
+        ParamsError: The file cannot be read or parsed, or its root is not a mapping.
+        PipelineConfigError: A key has no pipeline part, names no stage of a pipeline loaded
+            in this run, or maps to something other than parameter values. Every bad key is
+            listed. A key for a pipeline not loaded in this run is skipped and logged at debug.
     """
     if path is None:
         path = project.get_project_root() / "params.yaml"
@@ -56,13 +67,54 @@ def load_params_yaml(path: Path | None = None) -> ParamsOverrides:
     if not isinstance(data, dict):
         raise exceptions.ParamsError(f"params.yaml root must be a dict, got {type(data).__name__}")
 
+    stage_names = pipeline.list_stages()
+    valid_keys = set(stage_names) | {name.split("@")[0] for name in stage_names}
+    loaded = pipeline.loaded_pipelines
+
     # YAML dict has unknown key/value types from parsing arbitrary user input
     typed_data = cast("dict[Any, Any]", data)
     result = ParamsOverrides()
+    errors = list[str]()
     for k, v in typed_data.items():
-        if isinstance(v, dict):
-            result[str(k)] = v
+        key = str(k)
+        if not isinstance(v, dict):
+            errors.append(
+                f"params.yaml key '{key}' must map parameter names to values, "
+                + f"got {type(v).__name__}"
+            )
+            continue
+        result[key] = v
+        if key not in valid_keys and (error := _unmatched_key_error(key, valid_keys, loaded)):
+            errors.append(error)
+    if errors:
+        raise exceptions.PipelineConfigError("\n".join(errors))
     return result
+
+
+def _unmatched_key_error(key: str, valid_keys: set[str], loaded: frozenset[str]) -> str | None:
+    """Explain a key that names no registered stage, or return None for an unloaded pipeline.
+
+    A stage name is ``<pipeline>/<function>`` plus ``@variant`` parts, none of which contain
+    ``/``, so everything before a key's last ``/`` is its pipeline.
+    """
+    if "/" not in key:
+        examples = sorted(k for k in valid_keys if k.endswith(f"/{key}")) or sorted(valid_keys)[:1]
+        example = ", e.g. " + " or ".join(f"'{k}'" for k in examples) if examples else ""
+        return f"params.yaml key '{key}' names no stage; keys are '<pipeline>/<stage>'{example}"
+    owner = key.rsplit("/", 1)[0]
+    if owner not in loaded:
+        logger.debug(
+            f"params.yaml key '{key}': pipeline '{owner}' is not loaded in this run; skipping"
+        )
+        return None
+    candidates = sorted(k for k in valid_keys if k.startswith(f"{owner}/"))
+    matches = difflib.get_close_matches(key, candidates, n=3, cutoff=0.6)
+    hint = (
+        "did you mean " + " or ".join(f"'{m}'" for m in matches) + "?"
+        if matches
+        else "run 'pivot list' to see its stages"
+    )
+    return f"params.yaml key '{key}' names no stage in pipeline '{owner}'; {hint}"
 
 
 def build_params_instance[T: pydantic.BaseModel](

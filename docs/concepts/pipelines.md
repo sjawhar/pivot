@@ -104,6 +104,12 @@ variant and a full name overrides one (see [Parameters](parameters.md)).
 
 ## Several Pipelines
 
+Pipeline names must be unique within a project. A pipeline's name is the
+directory of its lock files (`.pivot/stages/<pipeline>/`) and outputs
+(`data/<pipeline>/`), so two pipelines with one name would share both.
+`pivot repro --all` refuses two `pipeline.py` files that declare the same
+name, and names both files.
+
 Imports resolve from the project root (the directory holding `.pivot/`): a root
 `pipeline.py` imports sibling modules directly (`from stages import clean`); a
 pipeline in a subdirectory imports with the full path
@@ -132,8 +138,12 @@ pipeline.include(report)
 ```
 
 Included stages keep their names (`prep/...`, `report/...`) and their own state
-directories. Stages already present are skipped, so including two pipelines
-that share upstream stages is safe. A pipeline cannot include itself.
+directories. A stage reached twice (two included pipelines that share an
+upstream stage, or one pipeline included twice) is added once. Two stages under
+one name are refused unless they are one function (same file and name) called
+with the same inputs and input formats, outputs and output formats, params,
+resources, variant and fingerprint settings; the error names the first
+difference and the source files. A pipeline cannot include itself.
 
 ## State and Cache Layout
 

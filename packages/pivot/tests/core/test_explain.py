@@ -251,6 +251,13 @@ def test_diff_params_unchanged() -> None:
     assert skip.diff_params(params, params) == []
 
 
+def test_diff_params_treats_nan_as_unchanged() -> None:
+    """A recorded NaN is not equal to a fresh NaN in Python; the canonical text is."""
+    assert skip.diff_params({"ceiling": float("nan")}, {"ceiling": float("nan")}) == []
+    assert skip.params_equal({"c": [float("nan")]}, {"c": [float("nan")]})
+    assert not skip.params_equal({"c": float("nan")}, {"c": 1.0})
+
+
 @pytest.mark.parametrize(
     ("old", "new", "expected_identity", "expected_old_hash", "expected_new_hash", "expected_type"),
     [

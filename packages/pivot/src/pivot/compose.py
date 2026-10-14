@@ -9,6 +9,7 @@ import enum
 import functools
 import importlib
 import inspect
+import json
 import logging
 import os
 import pathlib
@@ -18,7 +19,17 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin,
 
 from typing_extensions import is_typeddict
 
-from . import exceptions, outputs, path_policy, project, registry, stage_def, types
+from . import (
+    exceptions,
+    fingerprint,
+    outputs,
+    parameters,
+    path_policy,
+    project,
+    registry,
+    stage_def,
+    types,
+)
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -157,6 +168,136 @@ def _iter_all_handles(node: _StageNode) -> list[ArtifactHandle]:
     return result
 
 
+def _stage_definition(func: Callable[..., Any], root: pathlib.Path) -> tuple[str, str]:
+    """Name the file (relative to the project root) and qualname that define a stage function.
+
+    Importing a pipeline file again makes new function objects with the same definition.
+    """
+    func = inspect.unwrap(func)
+    source = inspect.getsourcefile(func)
+    if source is None:
+        return func.__module__, func.__qualname__
+    path = pathlib.Path(source).resolve()
+    location = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+    return location, func.__qualname__
+
+
+def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
+    key = types.identity_key(identity)
+    return key if tag == types.ArtifactTag.DATA else f"{key} ({tag})"
+
+
+def _show_items(items: collections.abc.Mapping[str, object]) -> str:
+    return ", ".join(f"{name}={value}" for name, value in sorted(items.items())) or "none"
+
+
+def _format_key(fmt: loaders_mod.Reader[Any] | loaders_mod.Writer[Any]) -> tuple[str, str, str]:
+    """A loader as its class's module and qualname plus its canonical config text.
+
+    The config text is what the fingerprint hashes as ``loader:...:config``, so a user
+    function in a field (``JSON(empty_factory=make_empty)``) compares by definition and code.
+    """
+    return (type(fmt).__module__, type(fmt).__qualname__, fingerprint.loader_config_text(fmt))
+
+
+def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, str]]:
+    """Each part of a stage besides its function, as (label, comparison key, display).
+
+    Every key survives importing the pipeline file again. Params compare by class module and
+    qualname plus their canonical JSON text: set members sorted (``parameters.sort_set_members``,
+    the encoding recorded in the lock file) so a deep-copied set matches, and NaN written as
+    ``NaN`` so a re-imported NaN matches. Pydantic equality needs one class object. Formats
+    compare through ``_format_key``: the caller picks an input's format. Python types are left
+    out: nothing at run time reads them, and a re-imported user type is a new object.
+    """
+    deps = {name: (ref.identity, ref.tag) for name, ref in info["deps"].items()}
+    dep_formats = {name: _format_key(ref.format) for name, ref in info["deps"].items()}
+    outs = [(ref.identity, ref.tag) for ref in info["outs"]]
+    out_formats = [_format_key(ref.format) for ref in info["outs"]]
+    incremental = info["incremental_inputs"]
+    params = info["params"]
+    params_key = (
+        None
+        if params is None
+        else (
+            type(params).__module__,
+            type(params).__qualname__,
+            json.dumps(
+                parameters.sort_set_members(params, params.model_dump(mode="json")),
+                sort_keys=True,
+            ),
+        )
+    )
+    return [
+        ("inputs", deps, _show_items({name: _show_ref(*ref) for name, ref in deps.items()})),
+        (
+            "input formats",
+            dep_formats,
+            _show_items({name: repr(ref.format) for name, ref in info["deps"].items()}),
+        ),
+        ("input collections", info["collection_params"], _show_items(info["collection_params"])),
+        ("outputs", outs, ", ".join(_show_ref(*ref) for ref in outs) or "none"),
+        ("output formats", out_formats, ", ".join(repr(ref.format) for ref in info["outs"])),
+        (
+            "incremental inputs",
+            incremental,
+            _show_items({name: types.identity_key(out) for name, out in incremental.items()}),
+        ),
+        ("params", params_key, "none" if params is None else repr(params)),
+        ("resources", info["resources"], _show_items(info["resources"])),
+        ("variants", info["variant"], info["variant"] or "none"),
+        ("no_fingerprint", info["no_fingerprint"], str(info["no_fingerprint"])),
+        ("code_deps", info["code_deps"], ", ".join(info["code_deps"]) or "none"),
+    ]
+
+
+def _stage_difference(
+    existing: registry.RegistryStageInfo,
+    incoming: registry.RegistryStageInfo,
+    root: pathlib.Path,
+) -> str | None:
+    """Describe the first part that makes two infos different stages, or None if they match."""
+    first_file, first_name = _stage_definition(existing["func"], root)
+    again_file, again_name = _stage_definition(incoming["func"], root)
+    if first_file == again_file and first_name != again_name:
+        return f"functions: {first_name} and {again_name}, both in {first_file}"
+    if first_file != again_file:
+        return f"functions: {first_name} in {first_file} and {again_name} in {again_file}"
+    for (label, first_key, first_shown), (_, again_key, again_shown) in zip(
+        _stage_wiring(existing), _stage_wiring(incoming), strict=True
+    ):
+        if first_key != again_key:
+            if first_shown == again_shown:
+                first_shown, again_shown = repr(first_key), repr(again_key)
+            return (
+                f"{label} ({first_shown} vs {again_shown}), "
+                + f"both calling {first_name} in {first_file}"
+            )
+    return None
+
+
+def _require_same_stage(
+    stage_name: str,
+    existing: registry.RegistryStageInfo,
+    incoming: registry.RegistryStageInfo,
+    root: pathlib.Path,
+) -> None:
+    """Allow one stage reached twice; refuse two different stages under one name.
+
+    A stage name is its lock file and output paths, so two different stages under one name
+    would share them. Two infos are one stage when they have the same definition (file and
+    qualname) and the same wiring (``_stage_wiring``). Including one pipeline twice, a diamond
+    of includes, and a pipeline file imported again by ``pivot repro <path>`` all match.
+    """
+    difference = _stage_difference(existing, incoming, root)
+    if difference is None:
+        return
+    raise exceptions.PipelineConfigError(
+        f"Stage '{stage_name}' is defined twice with different {difference}. "
+        + "Pipeline names must be unique within a project; rename one of the pipelines."
+    )
+
+
 def _emit_stage_info(
     node: _StageNode,
     qualified_name: str,
@@ -267,6 +408,7 @@ class Pipeline:
     _included_stages: dict[str, registry.RegistryStageInfo]
     _previous_markers: list[_PreviousOutputMarker]
     _constructing: bool
+    _loaded_pipelines: set[str]
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
         reason = lock.stage_name_error(name)
@@ -284,6 +426,7 @@ class Pipeline:
         self._previous_markers = list[_PreviousOutputMarker]()
         self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
+        self._loaded_pipelines = {name}
 
         if root is not None:
             self._root = root.resolve()
@@ -305,6 +448,15 @@ class Pipeline:
     @property
     def input_bindings(self) -> dict[str, str]:
         return {name: node.path for name, node in self._inputs.items()}
+
+    @property
+    def loaded_pipelines(self) -> frozenset[str]:
+        """Names of the pipelines whose every stage this one holds: itself and each it includes.
+
+        A pipeline reached only through handles contributes just the stages it produces those
+        handles with, so it is not listed.
+        """
+        return frozenset(self._loaded_pipelines)
 
     def _require_materialized(self) -> None:
         if self._constructing:
@@ -342,16 +494,16 @@ class Pipeline:
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        existing_stages = (
-            set(self._included_stages) if self._constructing else set(self._registry.list_stages())
-        )
+        # Own stages are checked against included ones at materialization.
+        registered = self._included_stages if self._constructing else self._registry.snapshot()
         for stage_name in other.list_stages():
-            if stage_name in existing_stages:
-                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+            incoming = other.get_stage(stage_name)
+            existing = registered.get(stage_name)
+            if existing is not None:
+                _require_same_stage(stage_name, existing, incoming, self._root)
                 continue
-            stage_info = copy.deepcopy(other.get_stage(stage_name))
+            stage_info = copy.deepcopy(incoming)
             self._included_stages[stage_name] = stage_info
-            existing_stages.add(stage_name)
             if not self._constructing:
                 self._registry.add_existing(copy.deepcopy(stage_info))
 
@@ -377,6 +529,7 @@ class Pipeline:
                 )
         if not self._constructing:
             self._check_inputs_against_outputs(self._registry)
+        self._loaded_pipelines.update(other.loaded_pipelines)
         self._registry.invalidate_dag_cache()
 
     def __enter__(self) -> Pipeline:
@@ -419,7 +572,9 @@ class Pipeline:
         materialized_stages = set(new_registry.list_stages())
         for stage_name, stage_info in self._included_stages.items():
             if stage_name in materialized_stages:
-                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+                _require_same_stage(
+                    stage_name, new_registry.get(stage_name), stage_info, self._root
+                )
                 continue
             new_registry.add_existing(copy.deepcopy(stage_info))
             materialized_stages.add(stage_name)

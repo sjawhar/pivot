@@ -43,7 +43,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 12 hashes set members and dict entries in sorted order, not hash-seed order.
 # Version 13 hashes a function value by its name and code instead of its address-bearing repr.
 # Version 14 walks user functions and classes bound in functools.partial arguments.
-_CACHE_SCHEMA_VERSION = 14
+# Version 15 hashes an object with the default repr by its class and attributes, not its address.
+_CACHE_SCHEMA_VERSION = 15
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -882,19 +883,30 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
                     manifest[f"loader:{class_name}:empty"] = hash_function_ast(typed_loader.empty)
                     break
 
-    # Config hash from dataclass fields
-    # Cast to Any for dataclass introspection - loader is a dataclass but generic params are unknown
     loader_any = cast("Any", loader)
-    field_values = list[str]()
     for field in dataclasses.fields(loader_any):
         value = getattr(loader_any, field.name)
-        field_values.append(f"{field.name}={_serialize_value_for_hash(value)}")
         _process_bound_values(f"{class_name}.{field.name}", value, manifest, visited)
-    if field_values:
-        config_str = ",".join(field_values)
+    config_str = loader_config_text(loader_any)
+    if config_str:
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
+
+
+def loader_config_text(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> str:
+    """Return a loader's dataclass field values as `name=<canonical JSON>`, comma-joined.
+
+    This is the text hashed as `loader:<module>.<qualname>:config`. It does not depend on
+    PYTHONHASHSEED or object identity: a function in a field is its definition and code hash,
+    so a loader re-created by importing its pipeline file again gives the same text.
+    """
+    # Cast to Any for dataclass introspection - loader is a dataclass but generic params are unknown
+    loader_any = cast("Any", loader)
+    return ",".join(
+        f"{field.name}={_serialize_value_for_hash(getattr(loader_any, field.name))}"
+        for field in dataclasses.fields(loader_any)
+    )
 
 
 def _user_defined_method(cls: type, name: str) -> Callable[..., Any] | None:
@@ -1442,9 +1454,10 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
     canonical JSON text: a set's iteration order, and a dict built from a set, follow the
     hash seed. A Python function is named by its module and qualname, plus its code hash when
     it is user code, because its `repr` holds a memory address; a `functools.partial` is
-    canonicalised through its function and arguments for the same reason. Other leaves keep
-    their `repr`, tagged with their type. A class is a leaf, even a pydantic model class: only
-    an instance is dumped.
+    canonicalised through its function and arguments for the same reason. An object whose
+    class keeps `object.__repr__` (which holds the address) and that has a `__dict__` becomes
+    `[module.qualname, canonical(vars(obj))]`. Other leaves keep their `repr`, tagged with their
+    type. A class is a leaf, even a pydantic model class: only an instance is dumped.
     """
     if hasattr(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump())
@@ -1474,6 +1487,8 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
         return [type(collection).__name__, items]
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value))]
     return [type(value).__name__, repr(value)]
 
 

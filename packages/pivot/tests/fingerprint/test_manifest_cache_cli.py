@@ -565,6 +565,50 @@ def test_loader_config_with_user_function_stays_cached_and_tracks_edits(
     assert "1 ran" in edited, edited
 
 
+_OBJECT_CONFIG_PIPELINE = """\
+import dataclasses
+
+from pivot import Pipeline, loaders, stage
+
+
+class Opts:
+    def __init__(self, depth: int) -> None:
+        self.depth = depth
+
+
+@dataclasses.dataclass(frozen=True)
+class OptsYAML(loaders.YAML):
+    opts: object = None
+
+
+@stage
+def keep(raw: dict) -> dict:
+    return {"n": len(raw)}
+
+
+with Pipeline("o") as pipeline:
+    keep(pipeline.input("t.yaml", format=OptsYAML(opts=Opts(depth=2))))
+"""
+
+
+def test_loader_config_holding_a_plain_object_stays_cached_and_tracks_edits(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An object with the default repr hashes by its class and attributes, not its address."""
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _OBJECT_CONFIG_PIPELINE, "data/raw/t.yaml": "a: 1\n"}
+    )
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in first, first
+
+    second = _helper_ok(_helper_pivot(root, "repro"))
+    assert "0 ran, 1 cached" in second, second
+
+    (root / "pipeline.py").write_text(_OBJECT_CONFIG_PIPELINE.replace("depth=2", "depth=3"))
+    edited = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in edited, edited
+
+
 _TRANSFORM_LOADER_PIPELINE = """\
 import dataclasses
 import json

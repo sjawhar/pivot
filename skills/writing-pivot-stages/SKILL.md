@@ -168,7 +168,7 @@ scores/scale@x10:
   factor: 100
 ```
 
-`pivot params show` prints the effective values.
+`pivot params show` prints the effective values. A key with no pipeline part, or one that names no stage of a loaded pipeline, is refused with the names it could mean.
 
 ## Module-level constants
 
@@ -223,7 +223,7 @@ with Pipeline("report") as pipeline:
     count(kept)
 ```
 
-From `report/`, `pivot repro` runs `prep/drop_low` then `report/count`. From the project root, `pivot repro --all` runs every `pipeline.py` under it. To make one root pipeline, `include()` the others (inside the `with` block or after it):
+From `report/`, `pivot repro` runs `prep/drop_low` then `report/count`. From the project root, `pivot repro --all` runs every `pipeline.py` under it. Pipeline names must be unique within a project: a name is the directory of its locks and outputs (`.pivot/stages/<pipeline>/`, `data/<pipeline>/`), so `--all` refuses two `pipeline.py` files with the same `Pipeline("name")`. To make one root pipeline, `include()` the others (inside the `with` block or after it):
 
 ```python
 # pipeline.py

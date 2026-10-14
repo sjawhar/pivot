@@ -207,7 +207,7 @@ def get_pipeline_explanations(
 
         for stage_name in execution_order:
             pipeline.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml()
+        overrides = parameters.load_params_yaml(pipeline)
 
         store = _make_workspace_store(pipeline)
         explanations_by_name = _get_explanations_in_parallel(
@@ -298,7 +298,7 @@ def get_pipeline_status(
 
         for stage_name in execution_order:
             pipeline.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml()
+        overrides = parameters.load_params_yaml(pipeline)
 
         store = _make_workspace_store(pipeline)
         explanations_by_name = _get_explanations_in_parallel(

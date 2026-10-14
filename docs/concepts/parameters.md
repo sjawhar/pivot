@@ -70,6 +70,12 @@ Only the listed fields change. For [variants](pipelines.md#variants), a key
 without the `@` suffix applies to every variant, and a key with the full name
 (`params/scale@big`) is applied on top of it.
 
+Keys are checked when overrides load. A key with no pipeline part (`scale:`)
+is refused with the qualified names it could mean, and so is a key for a
+loaded pipeline that names none of its stages (`params/scael:`). Each value
+must map parameter names to values. A key for a pipeline that this run does
+not load (running one pipeline of several) is skipped.
+
 ## Change Detection
 
 Pivot serializes the effective parameters (code values plus `params.yaml`

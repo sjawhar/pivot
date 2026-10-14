@@ -294,7 +294,7 @@ class AgentRpcHandler:
 
                 def _get_explanation() -> StageExplanation:
                     try:
-                        overrides = parameters.load_params_yaml()
+                        overrides = parameters.load_params_yaml(pipeline)
                     except Exception as e:
                         raise ValueError(f"Failed to load params.yaml: {e}") from e
                     all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}

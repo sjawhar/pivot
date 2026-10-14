@@ -342,6 +342,58 @@ def test_status_shows_cached_stages(
         assert "0 stale" in result.output
 
 
+_NAN_PARAMS_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, StageParams, stage
+
+
+class ScaleParams(StageParams):
+    factor: int = 10
+    ceiling: float = float("nan")
+
+
+@stage
+def scale(numbers: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:
+    return numbers * params.factor
+
+
+@stage
+def total(scaled: pd.DataFrame, params: ScaleParams) -> dict:
+    return {"sum": int(scaled.to_numpy().sum())}
+
+
+with Pipeline("nan") as pipeline:
+    total(scale(pipeline.input("numbers.csv"), params=ScaleParams()), params=ScaleParams())
+"""
+
+
+def test_status_keeps_a_stage_with_a_nan_param_cached(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The lock records NaN, and nan != nan; params compare by their canonical JSON text."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+        pathlib.Path("pipeline.py").write_text(_NAN_PARAMS_PIPELINE)
+        repro = runner.invoke(cli.cli, ["repro"])
+        assert repro.exit_code == 0, repro.output
+
+        status = runner.invoke(cli.cli, ["status", "--explain"])
+        again = runner.invoke(cli.cli, ["--quiet", "repro", "--json"])
+
+    assert status.exit_code == 0, status.output
+    assert "2 unchanged" in status.output, status.output
+    assert "Params changed" not in status.output, status.output
+    assert again.exit_code == 0, again.output
+    reasons = {
+        event["stage"]: event["reason"]
+        for event in map(json.loads, again.output.strip().splitlines())
+        if event["type"] == "stage_complete"
+    }
+    assert reasons == {"nan/scale": "unchanged", "nan/total": "unchanged (generation)"}, reasons
+
+
 def test_status_keeps_stage_cached_when_only_resources_change(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
