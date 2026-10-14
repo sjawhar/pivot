@@ -399,6 +399,7 @@ def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> Pipe
         return None
 
     pipelines = list[PipelineLike]()
+    paths_by_name = dict[str, pathlib.Path]()
     for path in config_paths:
         try:
             pipeline = _load_pipeline_from_module(path, session)
@@ -408,18 +409,27 @@ def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> Pipe
         except Exception as e:
             logger.warning(f"--all: failed to load pipeline from {path}, skipping ({e})")
             continue
-        if pipeline is not None:
-            pipelines.append(pipeline)
-            logger.info(f"  {pipeline.name}: {path} ({len(pipeline.list_stages())} stages)")
-        else:
+        if pipeline is None:
             logger.warning(f"--all: failed to load pipeline from {path}, skipping")
+            continue
+        # A pipeline name names .pivot/stages/<name>/ and data/<name>/, so two files
+        # declaring one name would silently share stages, locks and outputs.
+        first_path = paths_by_name.setdefault(pipeline.name, path)
+        if first_path != path:
+            raise DiscoveryError(
+                f"Pipeline name '{pipeline.name}' is declared by both "
+                + f"{first_path.relative_to(root)} and {path.relative_to(root)}. "
+                + "Pipeline names must be unique within a project; rename one of them."
+            )
+        pipelines.append(pipeline)
+        logger.info(f"  {pipeline.name}: {path} ({len(pipeline.list_stages())} stages)")
 
     if not pipelines:
         return None
 
     combined = Pipeline("all", root=root)
     for pipeline in pipelines:
-        combined.include(pipeline)  # Auto-prefixes on name collision
+        combined.include(pipeline)
 
     if logger.isEnabledFor(logging.DEBUG):
         local_outputs = set[str]()
@@ -489,7 +499,7 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
         by_dir.setdefault(path.parent, list[pathlib.Path]()).append(path)
 
     # Validate and select canonical config per directory, sorted for deterministic
-    # ordering (auto-prefix collision resolution depends on include order).
+    # load and include order.
     results = list[pathlib.Path]()
     for directory in sorted(by_dir):
         results.append(by_dir[directory][0])

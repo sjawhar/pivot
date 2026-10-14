@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import loaders, registry, types
+from pivot import exceptions, loaders, registry, types
 from pivot.compose import Pipeline
 
 if TYPE_CHECKING:
@@ -121,7 +121,22 @@ def test_include_dep_identities_need_no_rewriting(tmp_path: pathlib.Path) -> Non
     assert downstream["deps"]["data"].identity.producer == "child/upstream"
 
 
-def test_include_skips_duplicate_stage_names(tmp_path: pathlib.Path) -> None:
+def test_include_keeps_one_stage_included_twice(tmp_path: pathlib.Path) -> None:
+    a = Pipeline("same", root=tmp_path)
+    a._registry.add_existing(_make_stage_info("same/train"))
+
+    combined = Pipeline("all", root=tmp_path)
+    combined.include(a)
+    combined.include(a)
+
+    assert combined.list_stages() == ["same/train"]
+
+
+@pytest.mark.parametrize("inside_with", [False, True], ids=["after-block", "inside-block"])
+def test_include_refuses_two_functions_under_one_stage_name(
+    tmp_path: pathlib.Path, inside_with: bool
+) -> None:
+    """Two pipelines named 'same' would share same/train's lock and outputs."""
     a = Pipeline("same", root=tmp_path)
     a._registry.add_existing(_make_stage_info("same/train"))
 
@@ -129,7 +144,11 @@ def test_include_skips_duplicate_stage_names(tmp_path: pathlib.Path) -> None:
     b._registry.add_existing(_make_stage_info("same/train"))
 
     combined = Pipeline("all", root=tmp_path)
-    combined.include(a)
-    combined.include(b)
-
-    assert combined.list_stages() == ["same/train"]
+    with pytest.raises(exceptions.PipelineConfigError, match="'same/train' is defined twice"):
+        if inside_with:
+            with combined:
+                combined.include(a)
+                combined.include(b)
+        else:
+            combined.include(a)
+            combined.include(b)

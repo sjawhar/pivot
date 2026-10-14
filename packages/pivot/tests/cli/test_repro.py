@@ -964,3 +964,62 @@ def test_repro_without_show_output_hides_logs(
     assert "This should not appear" not in result.output
     # But should show completion
     assert "quiet" in result.output
+
+
+def _same_named_pipeline(side: str) -> str:
+    return (
+        "import pandas as pd\n\nfrom pivot import Pipeline, stage\n\n\n"
+        + "@stage\ndef make(x: pd.DataFrame) -> dict:\n"
+        + f'    return {{"from": "{side}"}}\n\n\n'
+        + f"@stage\ndef use_{side}(m: dict) -> dict:\n"
+        + '    return {"saw": m["from"]}\n\n\n'
+        + 'with Pipeline("rep") as pipeline:\n'
+        + f'    use_{side}(make(pipeline.input("x.csv")))\n'
+    )
+
+
+def test_list_all_refuses_two_pipeline_files_with_one_name(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Two pipeline.py files declaring Pipeline("rep") would share stages, locks and outputs."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a\n1\n")
+        for side in ("left", "right"):
+            (cwd / side).mkdir()
+            (cwd / side / "pipeline.py").write_text(_same_named_pipeline(side))
+
+        result = runner.invoke(cli.cli, ["list", "--all"])
+
+    assert result.exit_code != 0, result.output
+    assert "Pipeline name 'rep'" in result.output, result.output
+    assert "left/pipeline.py" in result.output, result.output
+    assert "right/pipeline.py" in result.output, result.output
+
+
+def test_list_refuses_include_of_a_different_stage_under_a_registered_name(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """include() keeps one stage reached twice, but not two functions under one name."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a\n1\n")
+        for side in ("left", "right"):
+            (cwd / side).mkdir()
+            (cwd / side / "pipeline.py").write_text(_same_named_pipeline(side))
+        pathlib.Path("pipeline.py").write_text(
+            "from pivot import Pipeline\n"
+            + "from left.pipeline import pipeline as left\n"
+            + "from right.pipeline import pipeline as right\n\n"
+            + 'pipeline = Pipeline("all")\n'
+            + "pipeline.include(left)\n"
+            + "pipeline.include(left)\n"
+            + "pipeline.include(right)\n"
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code != 0, result.output
+    assert "Stage 'rep/make' is defined twice" in result.output, result.output
+    assert "left/pipeline.py" in result.output, result.output
+    assert "right/pipeline.py" in result.output, result.output

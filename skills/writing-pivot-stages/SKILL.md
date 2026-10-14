@@ -223,7 +223,7 @@ with Pipeline("report") as pipeline:
     count(kept)
 ```
 
-From `report/`, `pivot repro` runs `prep/drop_low` then `report/count`. From the project root, `pivot repro --all` runs every `pipeline.py` under it. To make one root pipeline, `include()` the others (inside the `with` block or after it):
+From `report/`, `pivot repro` runs `prep/drop_low` then `report/count`. From the project root, `pivot repro --all` runs every `pipeline.py` under it. Pipeline names must be unique within a project: a name is the directory of its locks and outputs (`.pivot/stages/<pipeline>/`, `data/<pipeline>/`), so `--all` refuses two `pipeline.py` files with the same `Pipeline("name")`. To make one root pipeline, `include()` the others (inside the `with` block or after it):
 
 ```python
 # pipeline.py

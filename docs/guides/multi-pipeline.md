@@ -109,7 +109,7 @@ with Pipeline("all") as pipeline:
     pipeline.include(report)
 ```
 
-`include()` can be called inside the `with` block or after it. Included stages keep their names (`prep/drop_low`, `report/count`) and state; stages included twice (here `prep/drop_low`, which `report` already pulls in) are added once.
+`include()` can be called inside the `with` block or after it. Included stages keep their names (`prep/drop_low`, `report/count`) and state; stages included twice (here `prep/drop_low`, which `report` already pulls in) are added once. Pipeline names must be unique within a project, so a different function under a stage name already included is refused, naming both source files.
 
 ## Guidelines
 

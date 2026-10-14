@@ -1883,6 +1883,29 @@ def test_cross_pipeline_all_discovery_deduplicates(tmp_path: pathlib.Path) -> No
     assert len([s for s in combined.list_stages() if s == "difficulty/_helper_produce"]) == 1
 
 
+def _helper_other_produce(params: stage_def.StageParams) -> pd.DataFrame:
+    return pd.DataFrame({"other": [1]})
+
+
+def test_include_refuses_included_stage_that_collides_with_own_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An included stage with a pipeline's own stage name, but another function, is refused."""
+    other = Pipeline("same", root=tmp_path)
+    other._registry.add_existing(
+        _make_stage_info(_helper_other_produce, name="same/_helper_produce")
+    )
+
+    with (
+        pytest.raises(
+            exceptions.PipelineConfigError, match="'same/_helper_produce' is defined twice"
+        ),
+        Pipeline("same", root=tmp_path) as pipeline,
+    ):
+        pipeline.include(other)
+        _helper_produce(params=stage_def.StageParams())
+
+
 # --- Stages returning pathlib.Path (PathOnly outputs) ---
 
 

@@ -157,6 +157,35 @@ def _iter_all_handles(node: _StageNode) -> list[ArtifactHandle]:
     return result
 
 
+def _stage_source(func: Callable[..., Any], root: pathlib.Path) -> str:
+    """Name the file that defines a stage function, relative to the project root."""
+    source = inspect.getsourcefile(func)
+    if source is None:
+        return func.__module__
+    path = pathlib.Path(source).resolve()
+    return str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+
+
+def _require_same_stage(
+    stage_name: str,
+    existing: registry.RegistryStageInfo,
+    incoming: registry.RegistryStageInfo,
+    root: pathlib.Path,
+) -> None:
+    """Allow one stage reached twice; refuse a different function under a registered name.
+
+    A stage name is its lock file and output paths, so two functions under one name would
+    share them. deepcopy keeps function identity, so a stage included twice still matches.
+    """
+    if existing["func"] is incoming["func"]:
+        return
+    raise exceptions.PipelineConfigError(
+        f"Stage '{stage_name}' is defined twice: in {_stage_source(existing['func'], root)} "
+        + f"and in {_stage_source(incoming['func'], root)}. Pipeline names must be unique "
+        + "within a project; rename one of the pipelines."
+    )
+
+
 def _emit_stage_info(
     node: _StageNode,
     qualified_name: str,
@@ -342,16 +371,16 @@ class Pipeline:
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
 
-        existing_stages = (
-            set(self._included_stages) if self._constructing else set(self._registry.list_stages())
-        )
+        # Own stages are checked against included ones at materialization.
+        registered = self._included_stages if self._constructing else self._registry.snapshot()
         for stage_name in other.list_stages():
-            if stage_name in existing_stages:
-                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+            incoming = other.get_stage(stage_name)
+            existing = registered.get(stage_name)
+            if existing is not None:
+                _require_same_stage(stage_name, existing, incoming, self._root)
                 continue
-            stage_info = copy.deepcopy(other.get_stage(stage_name))
+            stage_info = copy.deepcopy(incoming)
             self._included_stages[stage_name] = stage_info
-            existing_stages.add(stage_name)
             if not self._constructing:
                 self._registry.add_existing(copy.deepcopy(stage_info))
 
@@ -419,7 +448,9 @@ class Pipeline:
         materialized_stages = set(new_registry.list_stages())
         for stage_name, stage_info in self._included_stages.items():
             if stage_name in materialized_stages:
-                logger.debug("include: skipping duplicate stage '%s'", stage_name)
+                _require_same_stage(
+                    stage_name, new_registry.get(stage_name), stage_info, self._root
+                )
                 continue
             new_registry.add_existing(copy.deepcopy(stage_info))
             materialized_stages.add(stage_name)
