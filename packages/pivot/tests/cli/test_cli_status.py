@@ -175,6 +175,28 @@ with Pipeline("test") as pipeline:
     process(pipeline.input("input.txt"))
 """
 
+_STAGE_DECORATOR_FORMS = {
+    "bare": ("from pivot.compose import Pipeline, stage\n", "@stage"),
+    "called": ("from pivot.compose import Pipeline, stage\n", '@stage(resources={"gpu": 1})'),
+    "module-bare": (
+        "from pivot import compose\nfrom pivot.compose import Pipeline\n",
+        "@compose.stage",
+    ),
+    "module-called": (
+        "from pivot import compose\nfrom pivot.compose import Pipeline\n",
+        '@compose.stage(resources={"gpu": 1})',
+    ),
+}
+
+
+def _stage_decorator_pipeline(imports: str, decorator: str) -> str:
+    return (
+        f"from __future__ import annotations\n\n{imports}\n\n{decorator}\n"
+        + 'def process(input_file: str) -> str:\n    return "done"\n\n\n'
+        + 'with Pipeline("test") as pipeline:\n    process(pipeline.input("input.txt"))\n'
+    )
+
+
 _STAGES_A_B_PIPELINE = """\
 from __future__ import annotations
 
@@ -417,6 +439,35 @@ def test_status_keeps_hostile_decorator_unevaluated_and_hashed(
         assert result.exit_code == 0, result.output
         assert "0 cached" in result.output
         assert "1 stale" in result.output
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        pytest.param("bare", "called", id="add-resources"),
+        pytest.param("called", "bare", id="remove-resources"),
+        pytest.param("module-bare", "module-called", id="module-add-resources"),
+        pytest.param("bare", "module-called", id="import-style-change"),
+    ],
+)
+def test_status_keeps_stage_cached_across_stage_decorator_forms(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, before: str, after: str
+) -> None:
+    """`@stage`, `@stage(resources=...)` and `@compose.stage` hash the same."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_input(cwd)
+        pipeline_path = pathlib.Path("pipeline.py")
+        pipeline_path.write_text(_stage_decorator_pipeline(*_STAGE_DECORATOR_FORMS[before]))
+
+        repro = runner.invoke(cli.cli, ["repro", "--resources", "gpu=2"])
+        assert repro.exit_code == 0, repro.output
+
+        pipeline_path.write_text(_stage_decorator_pipeline(*_STAGE_DECORATOR_FORMS[after]))
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "1 cached" in result.output
+        assert "0 stale" in result.output
 
 
 def test_status_verbose_shows_all_stages(

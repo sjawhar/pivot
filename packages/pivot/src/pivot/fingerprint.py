@@ -36,7 +36,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 7 invalidates manifests whose source maps omitted imported project modules.
 # Version 8 adds default argument values, which earlier manifests did not record.
 # Version 9 keys manifests by the stage function's identity as well as the stage name.
-_CACHE_SCHEMA_VERSION = 9
+# Version 10 drops a bare @stage decorator from code hashes, as the called form already was.
+_CACHE_SCHEMA_VERSION = 10
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1558,8 +1559,14 @@ def _resolve_static_callee(expr: ast.expr, globals_dict: dict[str, Any]) -> obje
     return namespace.get(expr.attr)
 
 
-def _strip_resource_stage_decorator(tree: ast.Module, globals_dict: dict[str, Any]) -> None:
-    """Exclude only the outer Pivot resource decorator from a stage code hash."""
+def _strip_stage_decorator(tree: ast.Module, globals_dict: dict[str, Any]) -> None:
+    """Exclude Pivot's own stage decorator from a stage code hash.
+
+    Drops each decorator on the stage's own FunctionDef that statically resolves to
+    `pivot.compose.stage`: bare (`@stage`, `@compose.stage`) or called
+    (`@stage(resources=...)`). Resources are scheduler admission, not stage code, so adding,
+    removing or changing them keeps the hash. Other decorators stay hashed.
+    """
     from pivot import compose
 
     outer = next(
@@ -1571,11 +1578,10 @@ def _strip_resource_stage_decorator(tree: ast.Module, globals_dict: dict[str, An
     outer.decorator_list = [
         decorator
         for decorator in outer.decorator_list
-        if not (
-            isinstance(decorator, ast.Call)
-            and any(keyword.arg == "resources" for keyword in decorator.keywords)
-            and _resolve_static_callee(decorator.func, globals_dict) is compose.stage
+        if _resolve_static_callee(
+            decorator.func if isinstance(decorator, ast.Call) else decorator, globals_dict
         )
+        is not compose.stage
     ]
 
 
@@ -1628,7 +1634,7 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         _t_norm = metrics.start()
         if hasattr(func, "__pivot_resources__"):
             globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
-            _strip_resource_stage_decorator(tree, globals_dict)
+            _strip_stage_decorator(tree, globals_dict)
         tree = _normalize_ast(tree)
         ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
         metrics.end("fingerprint.normalize_and_dump", _t_norm)
