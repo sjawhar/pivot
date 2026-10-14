@@ -575,20 +575,28 @@ def _create_secret_key(pivot_dir: pathlib.Path, key_file: pathlib.Path) -> None:
     """Write a random key to ``key_file`` with mode 0600, and gitignore it.
 
     The key is written to a private temporary file and hard-linked into place, so a worker
-    racing to create it reads either no file or a whole key, and one key wins.
+    racing to create it reads either no file or a whole key, and one key wins. Only the
+    worker whose link made the key touches ``.gitignore``, after the link, and it only
+    appends the entry when it is missing: the file is never rewritten, so a racing reader
+    never sees it truncated.
     """
-    gitignore = pivot_dir / ".gitignore"
-    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
-    if f"/{_SECRET_KEY_FILE}" not in lines:
-        gitignore.write_text("".join(f"{line}\n" for line in [*lines, f"/{_SECRET_KEY_FILE}"]))
     descriptor, temporary = tempfile.mkstemp(dir=pivot_dir, prefix=".secret-key-")
     try:
         with os.fdopen(descriptor, "w") as handle:
             handle.write(secrets.token_hex(32) + "\n")
-        with contextlib.suppress(FileExistsError):
+        try:
             os.link(temporary, key_file)
+        except FileExistsError:
+            return
     finally:
         os.unlink(temporary)
+    gitignore = pivot_dir / ".gitignore"
+    text = gitignore.read_text() if gitignore.exists() else ""
+    if f"/{_SECRET_KEY_FILE}" not in text.splitlines():
+        with gitignore.open("a") as handle:
+            handle.write(
+                ("\n" if text and not text.endswith("\n") else "") + f"/{_SECRET_KEY_FILE}\n"
+            )
 
 
 def _secret_digest(

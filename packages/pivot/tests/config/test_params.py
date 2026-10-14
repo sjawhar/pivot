@@ -4,6 +4,11 @@ import collections.abc  # noqa: TC003 - pydantic resolves the field annotations 
 import hashlib
 import hmac
 import json
+import os
+import subprocess
+import sys
+import threading
+import time
 from typing import TYPE_CHECKING, Annotated, ClassVar, cast
 
 import pydantic
@@ -957,6 +962,98 @@ def test_params_without_secrets_never_create_a_key(
     _ = parameters.get_effective_params(TrainParams(), "p/s", None)
 
     assert not (tmp_path / ".pivot" / "secret.key").exists()
+
+
+_OLD_GITIGNORE = "# Cache directory\n/cache/\n\n/state.lmdb/\n/locks/\n/agent.sock\n/plots/\n"
+
+
+def _assert_gitignore_kept(root: Path, keys: set[str]) -> None:
+    lines = (root / ".pivot" / ".gitignore").read_text().splitlines()
+    assert [line for line in _OLD_GITIGNORE.splitlines() if line not in lines] == []
+    assert lines.count("/secret.key") == 1, lines
+    assert keys == {(root / ".pivot" / "secret.key").read_text().strip()}
+
+
+def _create_key_at(barrier: threading.Barrier, keys: list[str]) -> None:
+    barrier.wait()
+    keys.append(parameters._secret_key().hex())
+
+
+def test_racing_threads_keep_every_gitignore_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pivot status` explains stages in a thread pool; each thread that finds no key used to
+    rewrite .gitignore, and a reader during the truncation wrote back '/secret.key' alone."""
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    for trial in range(20):
+        root = tmp_path / f"trial{trial}"
+        (root / ".pivot").mkdir(parents=True)
+        (root / ".pivot" / ".gitignore").write_text(_OLD_GITIGNORE)
+        monkeypatch.setattr(project, "_project_root_cache", root)
+        barrier = threading.Barrier(16)
+        keys = list[str]()
+        threads = [threading.Thread(target=_create_key_at, args=(barrier, keys)) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        _assert_gitignore_kept(root, set(keys))
+
+
+_KEY_CHILD = """\
+import pathlib, sys, time
+from pivot import parameters, project
+root, ready, go = (pathlib.Path(arg) for arg in sys.argv[1:4])
+project._project_root_cache = root
+ready.touch()
+while not go.exists():
+    time.sleep(0.0005)
+print(parameters._secret_key().hex())
+"""
+
+
+def test_racing_processes_keep_every_gitignore_line(tmp_path: Path) -> None:
+    child = tmp_path / "child.py"
+    child.write_text(_KEY_CHILD)
+    env = {key: value for key, value in os.environ.items() if key != "PIVOT_SECRET_KEY"}
+    for trial in range(8):
+        root = tmp_path / f"trial{trial}"
+        (root / ".pivot").mkdir(parents=True)
+        (root / ".pivot" / ".gitignore").write_text(_OLD_GITIGNORE)
+        go = root / "go"
+        readies = [root / f"ready{index}" for index in range(8)]
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(child), str(root), str(ready), str(go)],
+                stdout=subprocess.PIPE,
+                env=env,
+                text=True,
+            )
+            for ready in readies
+        ]
+        deadline = time.monotonic() + 60
+        while not all(ready.exists() for ready in readies):
+            assert time.monotonic() < deadline, "children did not start"
+            time.sleep(0.005)
+        go.touch()
+        keys = {process.communicate(timeout=60)[0].strip() for process in processes}
+        assert all(process.returncode == 0 for process in processes)
+
+        _assert_gitignore_kept(root, keys)
+
+
+def test_secret_key_entry_goes_on_its_own_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".pivot" / ".gitignore").write_text("/cache/")
+
+    _ = parameters.get_effective_params(_SecretParams(), "p/s", None)
+
+    assert (tmp_path / ".pivot" / ".gitignore").read_text() == "/cache/\n/secret.key\n"
 
 
 class _PinHolder(BaseModel):
