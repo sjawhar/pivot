@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import difflib
+import hashlib
 import json
 import logging
 import types
@@ -432,19 +433,47 @@ def get_effective_params(
         return {}
 
     effective = apply_overrides(params_instance, stage_name, overrides)
-    return sort_set_members(effective, effective.model_dump(mode="json"))
+    return encode_params(effective)
 
 
-def sort_set_members(original: object, encoded: Any) -> Any:
-    """Return `encoded`, a JSON-mode dump of `original`, with every set's members sorted.
+def encode_params(params: pydantic.BaseModel) -> Any:
+    """Return ``params`` as the lock file records them: a JSON-mode dump with every set's
+    members sorted and every secret replaced by a digest of its value.
 
-    Pydantic encodes a set or frozenset as a list in iteration order, and that order follows
-    PYTHONHASHSEED for str members. Recorded params and hashed schemas would then differ
-    between processes. Members are sorted by their JSON text, after their own nested sets
-    are sorted. The walk pairs each encoded node with the object it came from: JSON mode
-    iterates the stored set itself, so the pairing is exact. A node that a custom serializer
-    reshaped no longer matches its object and is left as the serializer produced it.
+    Pydantic encodes a set or frozenset as a list in iteration order, which follows
+    PYTHONHASHSEED for str members, so members are sorted by their JSON text. It dumps a
+    ``SecretStr``, ``SecretBytes`` or ``Secret[T]`` as ``'**********'``, so a changed secret
+    would not change the record and the stage would not re-run; the record must not hold the
+    value either, so a secret becomes ``sha256:`` plus the first 16 hex digits of its
+    value's SHA-256.
     """
+    return _encode(params, params.model_dump(mode="json"), digest_secrets=True)
+
+
+def _secret_digest(secret: pydantic.SecretStr | pydantic.SecretBytes | pydantic.Secret[Any]) -> str:
+    value: object = secret.get_secret_value()
+    if isinstance(value, str):
+        data = value.encode()
+    elif isinstance(value, bytes):
+        data = value
+    else:
+        data = json.dumps(value, sort_keys=True, default=str).encode()
+    return "sha256:" + hashlib.sha256(data).hexdigest()[:16]
+
+
+def _encode(original: object, encoded: Any, *, digest_secrets: bool) -> Any:
+    """Walk `encoded`, a JSON-mode dump of `original`, sorting set members (after their own
+    nested sets) and, with ``digest_secrets``, replacing each secret by its digest.
+
+    The walk pairs each encoded node with the object it came from: JSON mode iterates the
+    stored set itself, so the pairing is exact. A node that a custom serializer reshaped no
+    longer matches its object and is left as the serializer produced it; a secret is
+    replaced whatever its serializer produced, so no serializer puts its value in the record.
+    """
+    if digest_secrets and isinstance(
+        original, (pydantic.SecretStr, pydantic.SecretBytes, pydantic.Secret)
+    ):
+        return _secret_digest(original)
     if isinstance(encoded, dict):
         encoded_dict = cast("dict[str, Any]", encoded)
         if isinstance(original, pydantic.BaseModel):
@@ -455,19 +484,23 @@ def sort_set_members(original: object, encoded: Any) -> Any:
                     if alias is not None:
                         attributes.setdefault(alias, name)
             return {
-                key: sort_set_members(getattr(original, attributes.get(key, key), None), value)
+                key: _encode(
+                    getattr(original, attributes.get(key, key), None),
+                    value,
+                    digest_secrets=digest_secrets,
+                )
                 for key, value in encoded_dict.items()
             }
         if dataclasses.is_dataclass(original) and not isinstance(original, type):
             return {
-                key: sort_set_members(getattr(original, key, None), value)
+                key: _encode(getattr(original, key, None), value, digest_secrets=digest_secrets)
                 for key, value in encoded_dict.items()
             }
         if isinstance(original, dict):
             original_values = list(cast("dict[Any, Any]", original).values())
             if len(original_values) == len(encoded_dict):
                 return {
-                    key: sort_set_members(item, value)
+                    key: _encode(item, value, digest_secrets=digest_secrets)
                     for (key, value), item in zip(
                         encoded_dict.items(), original_values, strict=True
                     )
@@ -479,7 +512,7 @@ def sort_set_members(original: object, encoded: Any) -> Any:
         if len(original_items) != len(encoded_items):
             return encoded_items
         members = [
-            sort_set_members(item, value)
+            _encode(item, value, digest_secrets=digest_secrets)
             for item, value in zip(original_items, encoded_items, strict=True)
         ]
         if isinstance(original, (set, frozenset)):
@@ -497,4 +530,4 @@ class SortedSetJsonSchema(pydantic.json_schema.GenerateJsonSchema):
 
     @typing.override
     def encode_default(self, dft: Any) -> Any:
-        return sort_set_members(dft, super().encode_default(dft))
+        return _encode(dft, super().encode_default(dft), digest_secrets=False)

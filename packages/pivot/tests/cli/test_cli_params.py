@@ -643,6 +643,44 @@ def test_nested_model_that_allows_extra_fields_takes_one_from_params_yaml(
         }
 
 
+def test_changing_a_secret_param_reruns_the_stage_without_recording_it(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Effective params showed a secret as '**********', so a new secret never reran."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+        (cwd / "pipeline.py").write_text(
+            "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+            + "class FetchParams(StageParams):\n"
+            + '    token: pydantic.SecretStr = pydantic.SecretStr("code-token")\n\n\n'
+            + "@stage\ndef fetch(numbers: pd.DataFrame, params: FetchParams) -> dict:\n"
+            + '    return {"length": len(params.token.get_secret_value())}\n\n\n'
+            + 'with Pipeline("smoke") as pipeline:\n'
+            + '    fetch(pipeline.input("numbers.csv"), params=FetchParams())\n'
+        )
+        lock_file = cwd / ".pivot" / "stages" / "smoke" / "fetch.lock"
+
+        runs = list[str]()
+        locks = list[str]()
+        for token in ("first-token", "first-token", "second-token-longer"):
+            (cwd / "params.yaml").write_text(f"smoke/fetch:\n  token: {token}\n")
+            result = runner.invoke(cli.cli, ["repro"])
+            assert result.exit_code == 0, result.output
+            runs.append(result.output)
+            locks.append(lock_file.read_text())
+        output = yaml.safe_load((cwd / "data" / "smoke" / "fetch.yaml").read_text())
+
+    assert "1 ran" in runs[0], runs[0]
+    assert "0 ran, 1 cached" in runs[1], runs[1]
+    assert "1 ran" in runs[2], runs[2]
+    assert output == {"length": len("second-token-longer")}
+    for lock_text in locks:
+        assert "token" in lock_text
+        assert "first-token" not in lock_text and "second-token" not in lock_text
+    assert locks[0] != locks[2]
+
+
 def test_qualified_params_keys_apply_to_base_and_variant(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

@@ -119,4 +119,7 @@ A stage is skipped only when all three match its last successful run
 ([caching](caching.md)).
 
 The lock file lists a `set` or `frozenset` parameter's members in sorted order, so the
-recorded value does not depend on Python's hash seed.
+recorded value does not depend on Python's hash seed. A secret (`pydantic.SecretStr`,
+`SecretBytes`, `Secret[T]`) is recorded as `sha256:` plus the first 16 hex digits of its
+value's SHA-256, never as the value: changing the secret re-runs the stage, and `pivot
+params show` and `status --explain` show the digest.

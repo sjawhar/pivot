@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import TYPE_CHECKING, ClassVar
 
 import pydantic
@@ -756,6 +758,33 @@ def test_get_effective_params_with_overrides() -> None:
 def test_get_effective_params_no_instance() -> None:
     params_dict = parameters.get_effective_params(None, "train", None)
     assert params_dict == {}
+
+
+class _SecretParams(stage_def.StageParams):
+    token: pydantic.SecretStr = pydantic.SecretStr("code-token")
+    raw: pydantic.SecretBytes = pydantic.SecretBytes(b"code-bytes")
+    keys: list[pydantic.SecretStr] = []
+    epochs: int = 3
+
+
+def test_get_effective_params_records_a_secret_as_a_digest_of_its_value() -> None:
+    """A masked secret ('**********') hid a changed value from change detection."""
+    first = parameters.get_effective_params(
+        _SecretParams(), "p/s", {"p/s": {"token": "first-token", "keys": ["k1"]}}
+    )
+    second = parameters.get_effective_params(
+        _SecretParams(), "p/s", {"p/s": {"token": "second-token", "keys": ["k1"]}}
+    )
+
+    assert first["token"] == "sha256:" + hashlib.sha256(b"first-token").hexdigest()[:16]
+    assert first["raw"] == "sha256:" + hashlib.sha256(b"code-bytes").hexdigest()[:16]
+    assert first["keys"] == ["sha256:" + hashlib.sha256(b"k1").hexdigest()[:16]]
+    assert first["epochs"] == 3
+    assert first["token"] != second["token"]
+    assert first["raw"] == second["raw"]
+    text = json.dumps([first, second])
+    for plaintext in ("first-token", "second-token", "code-bytes", 'k1"'):
+        assert plaintext not in text
 
 
 # -----------------------------------------------------------------------------
