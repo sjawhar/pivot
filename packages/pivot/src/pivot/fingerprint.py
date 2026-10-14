@@ -43,7 +43,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 12 hashes set members and dict entries in sorted order, not hash-seed order.
 # Version 13 hashes a function value by its name and code instead of its address-bearing repr.
 # Version 14 walks user functions and classes bound in functools.partial arguments.
-_CACHE_SCHEMA_VERSION = 14
+# Version 15 hashes an object with the default repr by its class and attributes, not its address.
+_CACHE_SCHEMA_VERSION = 15
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1453,9 +1454,10 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
     canonical JSON text: a set's iteration order, and a dict built from a set, follow the
     hash seed. A Python function is named by its module and qualname, plus its code hash when
     it is user code, because its `repr` holds a memory address; a `functools.partial` is
-    canonicalised through its function and arguments for the same reason. Other leaves keep
-    their `repr`, tagged with their type. A class is a leaf, even a pydantic model class: only
-    an instance is dumped.
+    canonicalised through its function and arguments for the same reason. An object whose
+    class keeps `object.__repr__` (which holds the address) and that has a `__dict__` becomes
+    `[module.qualname, canonical(vars(obj))]`. Other leaves keep their `repr`, tagged with their
+    type. A class is a leaf, even a pydantic model class: only an instance is dumped.
     """
     if hasattr(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump())
@@ -1485,6 +1487,8 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
         return [type(collection).__name__, items]
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value))]
     return [type(value).__name__, repr(value)]
 
 

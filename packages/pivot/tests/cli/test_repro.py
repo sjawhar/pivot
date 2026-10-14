@@ -1124,6 +1124,47 @@ def test_list_refuses_two_same_named_pipelines_reading_one_input_differently(
     ) in result.output, result.output
 
 
+def test_repro_included_stage_whose_loader_holds_a_plain_object_runs_then_stays_cached(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """include() deep-copies `OptsYAML(opts=Opts())`; a default-repr object has no address key."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "rows.yaml").write_text("a: 1\n")
+        (cwd / "prep").mkdir()
+        (cwd / "prep" / "pipeline.py").write_text(
+            "import dataclasses\n\nfrom pivot import Pipeline, loaders, stage\n\n\n"
+            + "class Opts:\n    def __init__(self) -> None:\n        self.depth = 2\n\n\n"
+            + "@dataclasses.dataclass(frozen=True)\nclass OptsYAML(loaders.YAML):\n"
+            + "    opts: object = None\n\n\n"
+            + '@stage\ndef keep(rows: dict) -> dict:\n    return {"n": len(rows)}\n\n\n'
+            + 'with Pipeline("prep") as pipeline:\n'
+            + '    kept = keep(pipeline.input("rows.yaml", format=OptsYAML(opts=Opts())))\n'
+        )
+        (cwd / "report").mkdir()
+        (cwd / "report" / "pipeline.py").write_text(
+            "from pivot import Pipeline, stage\nfrom prep.pipeline import kept\n\n\n"
+            + "@stage\ndef count(k: dict) -> dict:\n    return k\n\n\n"
+            + 'with Pipeline("report") as pipeline:\n    count(kept)\n'
+        )
+        (cwd / "pipeline.py").write_text(
+            "from pivot import Pipeline\n"
+            + "from prep.pipeline import pipeline as prep\n"
+            + "from report.pipeline import pipeline as report\n\n"
+            + 'with Pipeline("all") as pipeline:\n'
+            + "    pipeline.include(prep)\n"
+            + "    pipeline.include(report)\n"
+        )
+
+        first = runner.invoke(cli.cli, ["repro"])
+        second = runner.invoke(cli.cli, ["repro"])
+
+    assert first.exit_code == 0, first.output
+    assert "2 ran" in first.output, first.output
+    assert second.exit_code == 0, second.output
+    assert "0 ran, 2 cached" in second.output, second.output
+
+
 def test_repro_pipeline_file_target_whose_loader_holds_a_user_function_runs(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
