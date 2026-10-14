@@ -519,3 +519,27 @@ def test_wrapped_function_default_is_checked_by_value() -> None:
 
     with pytest.raises(exceptions.StageDefinitionError, match="parameter 'keys'"):
         fingerprint.get_stage_fingerprint(wrapped)
+
+
+@functools.cache
+def _cached_helper_with_list_default(cols: list[str] = DEFAULT_COLUMNS) -> int:
+    return len(cols)
+
+
+@functools.lru_cache(maxsize=2)
+def _cached_helper_reading_list() -> int:
+    return len(DEFAULT_COLUMNS)
+
+
+def _stage_calls_cached_helpers() -> int:
+    return _cached_helper_with_list_default() + _cached_helper_reading_list()
+
+
+def test_cached_helper_globals_and_defaults_are_checked() -> None:
+    """A C-level cache wrapper hides the helper from getclosurevars; its function is walked."""
+    with pytest.raises(exceptions.StageDefinitionError) as exc:
+        fingerprint.get_stage_fingerprint(_stage_calls_cached_helpers)
+
+    message = str(exc.value)
+    assert "as the default of parameter 'cols'" in message
+    assert "captures non-scalar variable 'DEFAULT_COLUMNS' (type: list)" in message

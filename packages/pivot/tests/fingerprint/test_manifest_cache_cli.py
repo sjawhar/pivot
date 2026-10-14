@@ -341,3 +341,56 @@ def test_same_stage_name_from_another_pipeline_file_is_not_a_cache_hit(
     output = _helper_ok(_helper_pivot(root / "b", "repro"))
     assert (root / "data/rep/make.yaml").read_text() == "from: b\n", output
     assert (root / "data/rep/use_b.yaml").read_text() == "saw: b\n", output
+
+
+_CACHED_HELPER_PIPELINE = """\
+import functools
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+FACTOR = 2
+
+
+@functools.cache
+def factor() -> int:
+    return FACTOR
+
+
+@stage
+def scale(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * factor()
+
+
+with Pipeline("d") as pipeline:
+    scale(pipeline.input("t.csv"))
+"""
+
+
+@pytest.mark.parametrize("decorator", ["@functools.cache", "@functools.lru_cache(maxsize=4)"])
+def test_editing_scalar_read_by_cached_helper_reruns_stage(
+    tmp_path: pathlib.Path, decorator: str
+) -> None:
+    pipeline = _CACHED_HELPER_PIPELINE.replace("@functools.cache", decorator)
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+
+    (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert (root / "data/d/scale.jsonl").read_text() == '{"a":7}\n{"a":14}\n', output
+
+
+def test_non_scalar_read_by_cached_helper_is_an_error(tmp_path: pathlib.Path) -> None:
+    pipeline = _CACHED_HELPER_PIPELINE.replace("FACTOR = 2", 'COLUMNS = ["a"]').replace(
+        "def factor() -> int:\n    return FACTOR", "def factor() -> int:\n    return len(COLUMNS)"
+    )
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"list read by a cached helper was accepted:\n{output}"
+    assert "captures non-scalar variable 'COLUMNS'" in output, output

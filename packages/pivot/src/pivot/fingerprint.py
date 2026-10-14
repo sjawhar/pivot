@@ -37,7 +37,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 8 adds default argument values, which earlier manifests did not record.
 # Version 9 keys manifests by the stage function's identity as well as the stage name.
 # Version 10 drops a bare @stage decorator from code hashes, as the called form already was.
-_CACHE_SCHEMA_VERSION = 10
+# Version 11 walks the function behind a functools.cache or lru_cache helper.
+_CACHE_SCHEMA_VERSION = 11
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -654,6 +655,15 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         metrics.end("fingerprint.getclosurevars", _t_closure)
         if isinstance(func, type):
             _process_class_body_dependencies(func, manifest, visited)
+            return manifest
+        # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
+        # getclosurevars rejects it. The function it wraps reads the module values, so walk
+        # that function's globals, nonlocals and defaults instead.
+        unwrapped = inspect.unwrap(func)
+        if unwrapped is not func and inspect.isfunction(unwrapped):
+            for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
+                if not key.startswith("self:"):
+                    manifest[key] = value
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
