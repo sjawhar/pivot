@@ -176,15 +176,14 @@ _CASES = {
             + "pipeline.include(inner)\n"
         },
     ),
-    "numpy-scalar-in-yaml": _Case(
-        doc="`could not determine a constructor for the tag`",
-        observed="could not determine a constructor for the tag",
+    "non-plain-value-in-yaml": _Case(
+        doc="`YAML output must contain plain data; got <type>`",
+        observed="YAML output must contain plain data; got DataFrame",
         files={
             "pipeline.py": _HEAD
             + "@stage\ndef s(raw: pd.DataFrame) -> dict:\n"
-            + '    return {"total": raw["a"].sum()}\n\n\n'
-            + "@stage\ndef t(d: dict) -> dict:\n    return d\n\n\n"
-            + 'with Pipeline("demo") as pipeline:\n    t(s(pipeline.input("t.csv")))\n'
+            + '    return {"frame": raw}\n\n\n'
+            + 'with Pipeline("demo") as pipeline:\n    s(pipeline.input("t.csv"))\n'
         },
         args=("repro",),
     ),
