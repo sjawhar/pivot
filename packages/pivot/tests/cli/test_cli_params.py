@@ -604,6 +604,35 @@ def test_qualified_params_keys_apply_to_base_and_variant(
     }
 
 
+def test_override_of_a_nested_model_used_twice_reaches_the_worker(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A model used by two fields gives the params schema definitions. The worker rebuilds the
+    by-value pickled class from that schema, which pydantic before 2.13 got wrong: the class
+    then refused every field, so any override failed in the worker."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+        (cwd / "params.yaml").write_text("smoke/train:\n  optimizer:\n    momentum: 0.5\n")
+        (cwd / "pipeline.py").write_text(
+            "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+            + "class Opt(pydantic.BaseModel):\n    momentum: float = 0.9\n\n\n"
+            + "class TrainParams(StageParams):\n    optimizer: Opt = Opt()\n"
+            + "    layers: list[Opt] = []\n\n\n"
+            + "@stage\ndef train(numbers: pd.DataFrame, params: TrainParams) -> dict:\n"
+            + '    return {"momentum": params.optimizer.momentum}\n\n\n'
+            + 'with Pipeline("smoke") as pipeline:\n'
+            + '    train(pipeline.input("numbers.csv"), params=TrainParams())\n'
+        )
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 0, result.output
+        assert yaml.safe_load((cwd / "data" / "smoke" / "train.yaml").read_text()) == {
+            "momentum": 0.5
+        }
+
+
 def test_params_key_for_a_pipeline_not_loaded_is_skipped_at_debug(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
