@@ -993,6 +993,8 @@ def test_csv_loader_rejects_files_other_than_the_empty_frame_encoding(
 
     with pytest.raises(error):
         loaders.CSV().load(path)
+
+
 def test_dataframe_jsonl_roundtrips_date_and_time_columns(tmp_path: pathlib.Path) -> None:
     """Date, datetime, tz-aware, NaT and timedelta values come back as datetimes, not ints."""
     jsonl_file = tmp_path / "dates.jsonl"
