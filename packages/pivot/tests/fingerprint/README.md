@@ -222,6 +222,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | YAML→CSV with existing CSV out  | ✅        | `test_compose.py::test_output_loader_change_detected[yaml-to-csv-with-existing-csv]`   |
 | @no_fingerprint loader collision| ✅        | `test_compose.py::test_no_fingerprint_output_loader_collision`                          |
 | Dep config collision            | ✅        | `test_compose.py::test_dep_loader_config_collision`                                     |
+| Scalar read in custom loader's own `save()` | ✅ | `test_manifest_cache_cli.py::test_editing_scalar_read_by_custom_loader_method_reruns_stage` |
+| Non-scalar read in custom loader's own `save()` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_read_by_custom_loader_method_is_an_error` |
+| Scalar read by a function in loader config | ✅ | `test_manifest_cache_cli.py::test_value_read_by_loader_config_function_reruns_stage` |
+| Pydantic model class in loader config edited | ✅ | `test_manifest_cache_cli.py::test_editing_model_class_used_by_loader_reruns_stage` |
 
 ---
 
@@ -330,7 +334,15 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
     closure.
 
 12. **`functools.partial` IS tracked**: Partial objects include module-qualified bound-argument
-    keys and the underlying user function's definition key.
+    keys and the underlying user function's definition key. A user function or class bound as
+    an argument, directly, inside a nested partial, or inside a list, tuple, set or dict, gets
+    the stage-helper walk: its globals, closure values and defaults are tracked, and a
+    non-scalar it reads is refused. Loader config fields get the same walk.
+
+    Tests: `test_functools.py::test_function_in_partial_argument_collection_is_walked`,
+    `test_manifest_cache_cli.py::test_value_read_by_partial_argument_function_reruns_stage`,
+    `test_manifest_cache_cli.py::test_value_read_by_loader_config_function_reruns_stage`,
+    `test_manifest_cache_cli.py::test_non_scalar_read_by_bound_function_is_an_error`
 
 13. **StageParams classes fully tracked**: `StageParams` subclasses used in type hints are tracked
     via `_process_type_hint_dependencies()`. The entire class definition is hashed, including
@@ -346,6 +358,14 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_determinism.py::test_builtin_default_factory_deterministic_across_processes`,
     `test_determinism.py::test_builtin_type_deterministic`
+
+    Set and frozenset values are ordered by their canonical form, not by iteration order,
+    which follows `PYTHONHASHSEED`. This covers `StageParams` schema defaults, `default:`
+    values, loader config, `functools.partial` arguments, and the params recorded in the
+    lock file.
+
+    Tests: `test_determinism.py::test_set_valued_params_are_deterministic_across_hash_seeds`,
+    `test_manifest_cache_cli.py::test_set_valued_params_stay_cached_across_processes`
 
 15. **Module collections are refused**: A stage reading a module-level collection raises
     `StageDefinitionError` unless unsafe fingerprinting is explicitly enabled, in which case

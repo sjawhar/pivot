@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
+import json
 import logging
+import typing
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import deepmerge
 import pydantic
+import pydantic.json_schema
 import yaml
 
 from pivot import exceptions, project, yaml_config
@@ -178,4 +182,69 @@ def get_effective_params(
         return {}
 
     effective = apply_overrides(params_instance, stage_name, overrides)
-    return effective.model_dump(mode="json")
+    return sort_set_members(effective, effective.model_dump(mode="json"))
+
+
+def sort_set_members(original: object, encoded: Any) -> Any:
+    """Return `encoded`, a JSON-mode dump of `original`, with every set's members sorted.
+
+    Pydantic encodes a set or frozenset as a list in iteration order, and that order follows
+    PYTHONHASHSEED for str members. Recorded params and hashed schemas would then differ
+    between processes. Members are sorted by their JSON text, after their own nested sets
+    are sorted. The walk pairs each encoded node with the object it came from: JSON mode
+    iterates the stored set itself, so the pairing is exact. A node that a custom serializer
+    reshaped no longer matches its object and is left as the serializer produced it.
+    """
+    if isinstance(encoded, dict):
+        encoded_dict = cast("dict[str, Any]", encoded)
+        if isinstance(original, pydantic.BaseModel):
+            fields = type(original).model_fields
+            attributes = {name: name for name in fields}
+            for name, field in fields.items():
+                for alias in (field.serialization_alias, field.alias):
+                    if alias is not None:
+                        attributes.setdefault(alias, name)
+            return {
+                key: sort_set_members(getattr(original, attributes.get(key, key), None), value)
+                for key, value in encoded_dict.items()
+            }
+        if dataclasses.is_dataclass(original) and not isinstance(original, type):
+            return {
+                key: sort_set_members(getattr(original, key, None), value)
+                for key, value in encoded_dict.items()
+            }
+        if isinstance(original, dict):
+            original_values = list(cast("dict[Any, Any]", original).values())
+            if len(original_values) == len(encoded_dict):
+                return {
+                    key: sort_set_members(item, value)
+                    for (key, value), item in zip(
+                        encoded_dict.items(), original_values, strict=True
+                    )
+                }
+        return encoded_dict
+    if isinstance(encoded, list) and isinstance(original, (list, tuple, set, frozenset)):
+        encoded_items = cast("list[Any]", encoded)
+        original_items = list(cast("list[Any] | tuple[Any, ...] | set[Any]", original))
+        if len(original_items) != len(encoded_items):
+            return encoded_items
+        members = [
+            sort_set_members(item, value)
+            for item, value in zip(original_items, encoded_items, strict=True)
+        ]
+        if isinstance(original, (set, frozenset)):
+            members.sort(key=lambda member: json.dumps(member, sort_keys=True))
+        return members
+    return cast("Any", encoded)
+
+
+class SortedSetJsonSchema(pydantic.json_schema.GenerateJsonSchema):
+    """JSON schema generator that lists a set default's members in sorted order.
+
+    The stock generator lists them in iteration order, which follows PYTHONHASHSEED, so a
+    fingerprint hashing the schema would change from one process to the next.
+    """
+
+    @typing.override
+    def encode_default(self, dft: Any) -> Any:
+        return sort_set_members(dft, super().encode_default(dft))
