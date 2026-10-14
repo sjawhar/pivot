@@ -190,6 +190,9 @@ class Engine:
     # Event signaling dispatcher has finished draining
     _dispatch_complete: anyio.Event
 
+    # Set once a watched engine's startup fingerprint snapshot has finished
+    _startup_fingerprinted: anyio.Event
+
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
     ) -> None:
@@ -244,6 +247,8 @@ class Engine:
 
         # Event signaling dispatcher has finished draining (recreated each run())
         self._dispatch_complete = anyio.Event()
+
+        self._startup_fingerprinted = anyio.Event()
 
     @property
     def state(self) -> EngineState:
@@ -341,8 +346,7 @@ class Engine:
         if self._output_send is None or self._output_recv is None:
             raise RuntimeError("Engine must be used as async context manager")
 
-        if self._watches_filesystem():
-            self._fingerprint_watched_stages()
+        watched = self._watches_filesystem()
 
         # Create fresh dispatch completion event (Events can only be set once)
         self._dispatch_complete = anyio.Event()
@@ -350,9 +354,21 @@ class Engine:
         async with anyio.create_task_group() as tg:
             self._run_task_group = tg
 
-            # Start all sources with channel cleanup
+            # The RPC server needs no fingerprints, so it listens while the startup snapshot
+            # runs and clients can connect at once.
             for source in self._sources:
-                tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
+                if isinstance(source, agent_rpc.AgentRpcSource):
+                    tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
+
+            if watched:
+                try:
+                    await self._fingerprint_watched_stages()
+                finally:
+                    self._startup_fingerprinted.set()
+
+            for source in self._sources:
+                if not isinstance(source, agent_rpc.AgentRpcSource):
+                    tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
 
             # Start sink dispatcher
             tg.start_soon(self._dispatch_outputs)
@@ -2131,20 +2147,31 @@ class Engine:
 
         return any(isinstance(source, FilesystemSource) for source in self._sources)
 
-    def _fingerprint_watched_stages(self) -> None:
-        """Fingerprint every stage before a watched engine starts its sources.
+    async def wait_for_startup_fingerprints(self) -> None:
+        """Wait until a watched engine's startup fingerprint snapshot has finished.
+
+        RPC queries that fingerprint stages wait here, so no stage is fingerprinted on two
+        threads at once. Returns at once for an engine without a filesystem source, which
+        takes no snapshot.
+        """
+        if self._watches_filesystem():
+            await self._startup_fingerprinted.wait()
+
+    async def _fingerprint_watched_stages(self) -> None:
+        """Fingerprint every stage before a watched engine starts its watcher and startup run.
 
         A code reload diffs the edited pipeline against these cached fingerprints; computing
         the old ones after the edit would read the edited source and report nothing modified.
-        This runs synchronously before any source or run starts, so the startup run's skip
-        check reuses the cached values and no stage is fingerprinted on two threads at once.
+        Each stage is fingerprinted in a worker thread so the RPC server keeps answering, and
+        nothing else fingerprints until this returns (see ``wait_for_startup_fingerprints``),
+        so the startup run's skip check reuses the cached values.
         """
         pipeline = self._pipeline
         if pipeline is None:
             return
         for stage_name in pipeline.list_stages():
             try:
-                _ = pipeline.ensure_fingerprint(stage_name)
+                _ = await anyio.to_thread.run_sync(pipeline.ensure_fingerprint, stage_name)
             except exceptions.PivotError as exc:
                 # The startup run reports the same error when it fingerprints the stage.
                 _logger.debug("Fingerprinting failed for stage '%s': %s", stage_name, exc)

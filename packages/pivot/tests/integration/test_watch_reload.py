@@ -8,17 +8,20 @@ on disk and observes the engine's output events and the files its stages write.
 from __future__ import annotations
 
 import functools
+import threading
+import time
 from typing import TYPE_CHECKING
 
 import anyio
 import pytest
 
 from pivot import discovery, project
+from pivot.engine import agent_rpc, sources
 from pivot.engine import engine as engine_mod
-from pivot.engine import sources
 from pivot.engine.types import EngineState, OutputEvent
 from pivot.storage import store as store_mod
 from pivot.types import StageStatus
+from pivot_tui import rpc_client_impl
 
 if TYPE_CHECKING:
     import pathlib
@@ -138,6 +141,12 @@ def _helper_discover(root: pathlib.Path) -> PipelineLike:
     return pipeline
 
 
+async def _helper_wait_until_watching(eng: engine_mod.Engine) -> None:
+    """Return once the engine's startup snapshot is done and its file watcher is running."""
+    await eng.wait_for_startup_fingerprints()
+    await anyio.wait_all_tasks_blocked()
+
+
 @pytest.mark.anyio
 async def test_pipeline_edit_reloads_and_reruns_changed_stages_with_new_code(
     watch_project: pathlib.Path,
@@ -211,7 +220,7 @@ async def test_pipeline_edit_before_any_run_reports_edited_stage_as_modified(
         eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
         async with anyio.create_task_group() as tg:
             tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
-            await anyio.wait_all_tasks_blocked()
+            await _helper_wait_until_watching(eng)
 
             pipeline_py.write_text(_helper_pipeline_source("-v2", third="other"))
             reload_index = await recorder.wait_for(_helper_is_reload)
@@ -270,6 +279,73 @@ async def test_watched_startup_fingerprints_each_stage_once(
 
 
 @pytest.mark.anyio
+async def test_watched_startup_serves_rpc_while_fingerprinting(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The RPC socket listens before a slow startup fingerprint snapshot finishes.
+
+    ``status`` answers while the snapshot runs; ``explain`` waits for it, so the snapshot stays
+    the only code fingerprinting and each stage is still fingerprinted once.
+    """
+    from pivot import registry
+
+    (watch_project / "pipeline.py").write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    compute = registry._compute_fingerprint
+    calls = list[str]()
+    finished = list[str]()
+
+    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+        calls.append(stage_name)
+        time.sleep(1.0)
+        result = compute(stage_name, info)
+        finished.append(stage_name)
+        return result
+
+    monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
+    recorder = _Recorder()
+    socket_path = watch_project / "rpc.sock"
+    ready = threading.Event()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        handler = agent_rpc.AgentRpcHandler(engine=eng)
+        eng.add_source(
+            agent_rpc.AgentRpcSource(socket_path=socket_path, handler=handler, ready=ready)
+        )
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            client = rpc_client_impl.RpcPivotClient()
+            with anyio.fail_after(2):
+                while not ready.is_set():
+                    await anyio.sleep(0.01)
+                await client.connect(socket_path)
+            try:
+                status = await client.status()
+                assert status["state"] == "idle"
+                assert len(finished) < 3, "status is answered while the snapshot still runs"
+
+                explanation = await client.explain("reload/change")
+                assert explanation["stage_name"] == "reload/change"
+                assert sorted(finished) == ["reload/change", "reload/keep", "reload/other"], (
+                    "explain answers only after the snapshot has fingerprinted every stage"
+                )
+            finally:
+                await client.disconnect()
+            await recorder.wait_for(_helper_is_idle)
+            tg.cancel_scope.cancel()
+
+    assert sorted(calls) == ["reload/change", "reload/keep", "reload/other"], (
+        "each stage is fingerprinted exactly once, even with explain issued mid-snapshot"
+    )
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "broken_source",
     [
@@ -293,7 +369,7 @@ async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
         eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
         async with anyio.create_task_group() as tg:
             tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
-            await anyio.wait_all_tasks_blocked()
+            await _helper_wait_until_watching(eng)
 
             # The engine handles the code event before the data event it observes after it.
             pipeline_py.write_text(broken_source)

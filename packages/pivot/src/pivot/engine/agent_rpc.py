@@ -312,6 +312,8 @@ class AgentRpcHandler:
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
                     raise ValueError("No pipeline loaded")
+                # Explain fingerprints the stage; the startup snapshot must finish first.
+                await self._engine.wait_for_startup_fingerprints()
                 fingerprint = pipeline.ensure_fingerprint(stage)
 
                 def _get_explanation() -> StageExplanation:
@@ -348,6 +350,8 @@ class AgentRpcHandler:
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case "commit":
+                # Commit fingerprints every stage; wait for the startup snapshot first.
+                await self._engine.wait_for_startup_fingerprints()
 
                 def _do_commit() -> CommitResult:
                     from pivot.executor import commit as commit_mod

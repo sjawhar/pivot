@@ -1596,8 +1596,7 @@ async def test_handler_commit_dispatches_to_commit_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query calls commit_stages and returns committed/failed lists."""
-    mock_engine = MagicMock()
-    handler = AgentRpcHandler(engine=mock_engine)
+    handler = AgentRpcHandler(engine=Engine())
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
@@ -1618,8 +1617,7 @@ async def test_handler_commit_empty_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query returns empty lists when nothing to commit."""
-    mock_engine = MagicMock()
-    handler = AgentRpcHandler(engine=mock_engine)
+    handler = AgentRpcHandler(engine=Engine())
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
