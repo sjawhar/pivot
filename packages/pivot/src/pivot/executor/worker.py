@@ -1225,7 +1225,7 @@ def can_skip_via_generation(
     """Check generation counters and cached dependency hashes without rehashing."""
     if lock_data["code_manifest"] != fingerprint:
         return False
-    if lock_data["params"] != current_params:
+    if not skip.params_equal(lock_data["params"], current_params):
         return False
 
     normalized_outs = sorted(outs_paths)
