@@ -1010,6 +1010,34 @@ async def test_download_batch_readonly(
         assert mode == 0o444, f"Expected 0o444 for {path}, got {oct(mode)}"
 
 
+async def test_download_batch_keeps_existing_destination(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """download_batch never replaces a destination that already exists.
+
+    Destinations are content-addressed cache entries. Replacing one while another process
+    hardlinks it from the cache makes that link fail with ENOENT (#461).
+    """
+    content = b"content"
+    cache_hash = _helper_hash(content)
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=content,
+    )
+    dest = tmp_path / "entry"
+    dest.write_bytes(content)
+    inode = dest.stat().st_ino
+
+    results = await s3_remote.download_batch([(cache_hash, dest)], readonly=True)
+
+    assert [r["success"] for r in results] == [True]
+    assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
+    assert [p.name for p in tmp_path.iterdir()] == ["entry"], "no download temp file left"
+
+
 # -----------------------------------------------------------------------------
 # Metrics / Finally Tests
 # -----------------------------------------------------------------------------

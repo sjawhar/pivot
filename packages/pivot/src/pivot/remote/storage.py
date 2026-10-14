@@ -217,6 +217,7 @@ async def _atomic_download(
     local_path: Path,
     expected_hash: str,
     *,
+    overwrite: bool,
     readonly: bool = False,
 ) -> None:
     """Download an expected cache blob atomically and verify its xxh64 integrity.
@@ -225,6 +226,8 @@ async def _atomic_download(
     authenticate remote content.
 
     Args:
+        overwrite: Replace an existing file at local_path. When False, an existing file is
+            kept: a content-addressed cache entry another process may be hardlinking.
         readonly: If True, set file permissions to 0o444 (for cache files).
     """
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,8 +257,14 @@ async def _atomic_download(
             )
         if readonly:
             os.chmod(tmp_path, 0o444)
-        os.replace(tmp_path, local_path)
-        move_succeeded = True
+        if overwrite:
+            os.replace(tmp_path, local_path)
+            move_succeeded = True
+        else:
+            # link() refuses an existing name, so a concurrent reader never sees the
+            # entry disappear. The temp file is removed below either way.
+            with contextlib.suppress(FileExistsError):
+                os.link(tmp_path, local_path)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -570,6 +579,7 @@ class S3Remote:
                     _hash_to_key(self._prefix, cache_hash),
                     local_path,
                     cache_hash,
+                    overwrite=True,
                     readonly=readonly,
                 )
         except botocore_exc.ClientError as e:
@@ -629,7 +639,10 @@ class S3Remote:
         *,
         readonly: bool = False,
     ) -> list[TransferResult]:
-        """Download multiple files in parallel with atomic writes and streaming.
+        """Download multiple cache entries in parallel with atomic writes and streaming.
+
+        A destination that already exists is kept, never replaced: destinations are
+        content-addressed cache entries that other processes may be hardlinking.
 
         Args:
             readonly: If True, set file permissions to 0o444 (for cache files).
@@ -659,6 +672,7 @@ class S3Remote:
                                 _hash_to_key(self._prefix, hash_),
                                 local_path,
                                 hash_,
+                                overwrite=False,
                                 readonly=readonly,
                             )
                             completed += 1
