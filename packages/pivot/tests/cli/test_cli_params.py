@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
+import pathlib
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -10,10 +16,10 @@ from conftest import isolated_pivot_dir
 from pivot import cli, compose, discovery, git, project, stage_def
 
 if TYPE_CHECKING:
-    import pathlib
-
     import click.testing
     from pytest_mock import MockerFixture
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 # =============================================================================
 # Module-level StageParams classes for annotation-based registration
@@ -541,6 +547,216 @@ def test_misspelled_params_key_is_refused_with_close_matches(
     assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
 
 
+@pytest.mark.parametrize(
+    "args",
+    [["repro"], ["status"], ["params", "show"], ["commit"]],
+    ids=["repro", "status", "params-show", "commit"],
+)
+def test_bad_params_value_is_refused_before_any_stage_runs(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, args: list[str]
+) -> None:
+    """A value its StageParams field rejects is refused at load, not when the stage runs."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(cwd, "smoke/scale:\n  factor: not-an-int\n", "smoke")
+
+        result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code != 0, result.output
+    assert result.output.count("field 'factor' value 'not-an-int'") == 1, result.output
+    assert (
+        "params.yaml key 'smoke/scale': field 'factor' value 'not-an-int' is invalid for "
+        + "ScaleParams: Input should be a valid integer, unable to parse string as an integer"
+    ) in result.output, result.output
+    assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["repro"], ["status"], ["params", "show"], ["commit"]],
+    ids=["repro", "status", "params-show", "commit"],
+)
+def test_misspelled_params_field_is_refused_with_close_matches(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, args: list[str]
+) -> None:
+    """A field typo used to be dropped silently, so the stage ran with its code default."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(cwd, "smoke/scale:\n  factr: 20\n", "smoke")
+
+        result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code != 0, result.output
+    assert result.output.count("field 'factr'") == 1, result.output
+    assert (
+        "params.yaml key 'smoke/scale': field 'factr' is not a field of ScaleParams; "
+        + "did you mean 'factor'?"
+    ) in result.output, result.output
+    assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
+
+
+def _write_nested_project(cwd: pathlib.Path, params_yaml: str) -> None:
+    """A stage whose params hold a plain BaseModel and one that allows extra fields."""
+    (cwd / "data" / "raw").mkdir(parents=True)
+    (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+    (cwd / "params.yaml").write_text(params_yaml)
+    (cwd / "pipeline.py").write_text(
+        "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+        + "class Opt(pydantic.BaseModel):\n    momentum: float = 0.9\n\n\n"
+        + "class Loose(pydantic.BaseModel):\n"
+        + '    model_config = pydantic.ConfigDict(extra="allow")\n'
+        + "    momentum: float = 0.9\n\n\n"
+        + "class TrainParams(StageParams):\n    optimizer: Opt = Opt()\n    loose: Loose = Loose()\n\n\n"
+        + "@stage\ndef train(numbers: pd.DataFrame, params: TrainParams) -> dict:\n"
+        + '    return {"momentum": params.optimizer.momentum, "loose": params.loose.model_dump()}\n\n\n'
+        + 'with Pipeline("smoke") as pipeline:\n'
+        + '    train(pipeline.input("numbers.csv"), params=TrainParams())\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["repro"], ["status"], ["params", "show"], ["commit"]],
+    ids=["repro", "status", "params-show", "commit"],
+)
+def test_misspelled_field_of_a_plain_nested_model_is_refused(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, args: list[str]
+) -> None:
+    """Pydantic ignores an unknown key in a plain BaseModel, so the stage ran with the default."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_nested_project(cwd, "smoke/train:\n  optimizer:\n    momentm: 0.5\n")
+
+        result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code != 0, result.output
+    assert (
+        "params.yaml key 'smoke/train': field 'optimizer.momentm' is not a field of Opt; "
+        + "did you mean 'momentum'?"
+    ) in result.output, result.output
+    assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
+
+
+def test_nested_model_that_allows_extra_fields_takes_one_from_params_yaml(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_nested_project(cwd, "smoke/train:\n  loose:\n    extra: 1\n")
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 0, result.output
+        assert yaml.safe_load((cwd / "data" / "smoke" / "train.yaml").read_text()) == {
+            "momentum": 0.9,
+            "loose": {"momentum": 0.9, "extra": 1},
+        }
+
+
+def test_changing_a_secret_param_reruns_the_stage_without_recording_it(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Effective params showed a secret as '**********', so a new secret never reran."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+        (cwd / "pipeline.py").write_text(
+            "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+            + "class FetchParams(StageParams):\n"
+            + '    token: pydantic.SecretStr = pydantic.SecretStr("code-token")\n\n\n'
+            + "@stage\ndef fetch(numbers: pd.DataFrame, params: FetchParams) -> dict:\n"
+            + '    return {"length": len(params.token.get_secret_value())}\n\n\n'
+            + 'with Pipeline("smoke") as pipeline:\n'
+            + '    fetch(pipeline.input("numbers.csv"), params=FetchParams())\n'
+        )
+        lock_file = cwd / ".pivot" / "stages" / "smoke" / "fetch.lock"
+
+        runs = list[str]()
+        locks = list[str]()
+        for token in ("first-token", "first-token", "second-token-longer"):
+            (cwd / "params.yaml").write_text(f"smoke/fetch:\n  token: {token}\n")
+            result = runner.invoke(cli.cli, ["repro"])
+            assert result.exit_code == 0, result.output
+            runs.append(result.output)
+            locks.append(lock_file.read_text())
+        output = yaml.safe_load((cwd / "data" / "smoke" / "fetch.yaml").read_text())
+        key_file = cwd / ".pivot" / "secret.key"
+        key_mode = key_file.stat().st_mode & 0o777
+
+    assert "1 ran" in runs[0], runs[0]
+    assert "0 ran, 1 cached" in runs[1], runs[1]
+    assert "1 ran" in runs[2], runs[2]
+    assert output == {"length": len("second-token-longer")}
+    assert key_mode == 0o600
+    for lock_text, token in zip(
+        locks, ("first-token", "first-token", "second-token-longer"), strict=True
+    ):
+        assert "token: hmac:" in lock_text, lock_text
+        assert token not in lock_text
+        assert hashlib.sha256(token.encode()).hexdigest()[:16] not in lock_text
+    assert locks[0] != locks[2]
+
+
+_SECRET_PIPELINE = (
+    "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+    + "class FetchParams(StageParams):\n"
+    + "    pin: pydantic.Secret[int] = pydantic.Secret[int](424242)\n\n\n"
+    + "@stage\ndef fetch(numbers: pd.DataFrame, params: FetchParams) -> dict:\n"
+    + '    return {"pin_digits": len(str(params.pin.get_secret_value()))}\n\n\n'
+    + 'with Pipeline("smoke") as pipeline:\n'
+    + '    fetch(pipeline.input("numbers.csv"), params=FetchParams())\n'
+)
+
+
+def _secret_clone(path: pathlib.Path) -> None:
+    """A git repository with `pivot init`, the secret pipeline and its input."""
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run([_PIVOT_BIN, "init"], cwd=path, check=True, capture_output=True)
+    (path / "data" / "raw").mkdir(parents=True)
+    (path / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+    (path / "pipeline.py").write_text(_SECRET_PIPELINE)
+
+
+def _pivot(cwd: pathlib.Path, env: dict[str, str], *args: str) -> str:
+    ran = subprocess.run(
+        [_PIVOT_BIN, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=180
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    return ran.stdout + ran.stderr
+
+
+def test_secret_digest_needs_the_key_and_a_shared_key_gives_equal_digests(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A 6-digit secret behind an unkeyed hash falls to a brute-force loop over the lock."""
+    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    env.pop("PIVOT_SECRET_KEY", None)
+    own = tmp_path / "own"
+    _secret_clone(own)
+    _pivot(own, env, "repro")
+    own_lock = (own / ".pivot" / "stages" / "smoke" / "fetch.lock").read_text()
+    ignored = subprocess.run(
+        ["git", "check-ignore", ".pivot/secret.key"], cwd=own, capture_output=True, text=True
+    )
+    shared_env = {**env, "PIVOT_SECRET_KEY": "5e" * 32}
+    shared_locks = list[str]()
+    for name in ("first", "second"):
+        clone = tmp_path / name
+        _secret_clone(clone)
+        _pivot(clone, shared_env, "repro")
+        shared_locks.append((clone / ".pivot" / "stages" / "smoke" / "fetch.lock").read_text())
+        assert not (clone / ".pivot" / "secret.key").exists(), "the environment key is used"
+
+    assert ignored.returncode == 0, "secret.key must be gitignored"
+    assert (own / ".pivot" / "secret.key").stat().st_mode & 0o777 == 0o600
+    digest = yaml.safe_load(own_lock)["params"]["pin"]
+    assert digest.startswith("hmac:")
+    unkeyed = {hashlib.sha256(str(n).encode()).hexdigest()[:16] for n in range(424000, 424500)}
+    assert digest.removeprefix("hmac:") not in unkeyed
+    assert shared_locks[0] == shared_locks[1]
+    shared_digest = yaml.safe_load(shared_locks[0])["params"]["pin"]
+    assert shared_digest == (
+        "hmac:" + hmac.new(bytes.fromhex("5e" * 32), b"424242", hashlib.sha256).hexdigest()[:16]
+    )
+
+
 def test_qualified_params_keys_apply_to_base_and_variant(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
@@ -556,6 +772,35 @@ def test_qualified_params_keys_apply_to_base_and_variant(
         "smoke/scale": {"factor": 3},
         "smoke/scale@big": {"factor": 300},
     }
+
+
+def test_override_of_a_nested_model_used_twice_reaches_the_worker(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A model used by two fields gives the params schema definitions. The worker rebuilds the
+    by-value pickled class from that schema, which pydantic before 2.13 got wrong: the class
+    then refused every field, so any override failed in the worker."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+        (cwd / "params.yaml").write_text("smoke/train:\n  optimizer:\n    momentum: 0.5\n")
+        (cwd / "pipeline.py").write_text(
+            "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+            + "class Opt(pydantic.BaseModel):\n    momentum: float = 0.9\n\n\n"
+            + "class TrainParams(StageParams):\n    optimizer: Opt = Opt()\n"
+            + "    layers: list[Opt] = []\n\n\n"
+            + "@stage\ndef train(numbers: pd.DataFrame, params: TrainParams) -> dict:\n"
+            + '    return {"momentum": params.optimizer.momentum}\n\n\n'
+            + 'with Pipeline("smoke") as pipeline:\n'
+            + '    train(pipeline.input("numbers.csv"), params=TrainParams())\n'
+        )
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 0, result.output
+        assert yaml.safe_load((cwd / "data" / "smoke" / "train.yaml").read_text()) == {
+            "momentum": 0.5
+        }
 
 
 def test_params_key_for_a_pipeline_not_loaded_is_skipped_at_debug(

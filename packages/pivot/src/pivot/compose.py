@@ -204,11 +204,12 @@ def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, s
     """Each part of a stage besides its function, as (label, comparison key, display).
 
     Every key survives importing the pipeline file again. Params compare by class module and
-    qualname plus their canonical JSON text: set members sorted (``parameters.sort_set_members``,
-    the encoding recorded in the lock file) so a deep-copied set matches, and NaN written as
-    ``NaN`` so a re-imported NaN matches. Pydantic equality needs one class object. Formats
-    compare through ``_format_key``: the caller picks an input's format. Python types are left
-    out: nothing at run time reads them, and a re-imported user type is a new object.
+    qualname plus their canonical JSON text (``parameters.encode_params``, the encoding recorded
+    in the lock file: set members sorted so a deep-copied set matches, secrets by digest so two
+    secrets are told apart) with NaN written as ``NaN`` so a re-imported NaN matches. Pydantic
+    equality needs one class object. Formats compare through ``_format_key``: the caller picks
+    an input's format. Python types are left out: nothing at run time reads them, and a
+    re-imported user type is a new object.
     """
     deps = {name: (ref.identity, ref.tag) for name, ref in info["deps"].items()}
     dep_formats = {name: _format_key(ref.format) for name, ref in info["deps"].items()}
@@ -222,10 +223,7 @@ def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, s
         else (
             type(params).__module__,
             type(params).__qualname__,
-            json.dumps(
-                parameters.sort_set_members(params, params.model_dump(mode="json")),
-                sort_keys=True,
-            ),
+            json.dumps(parameters.encode_params(params), sort_keys=True),
         )
     )
     return [

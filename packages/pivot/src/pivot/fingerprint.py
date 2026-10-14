@@ -44,7 +44,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 13 hashes a function value by its name and code instead of its address-bearing repr.
 # Version 14 walks user functions and classes bound in functools.partial arguments.
 # Version 15 hashes an object with the default repr by its class and attributes, not its address.
-_CACHE_SCHEMA_VERSION = 15
+# Version 16 invalidates manifests hashed before StageParams forbade extra fields, which adds
+# additionalProperties: false to a params schema; no project source edit would invalidate them.
+_CACHE_SCHEMA_VERSION = 16
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")

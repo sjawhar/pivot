@@ -151,6 +151,12 @@ jobs:
         run: pivot --quiet status
 ```
 
+If a stage's params hold a secret (`pydantic.SecretStr` and friends), the lock file
+records a digest keyed by the project's secret key. Set `PIVOT_SECRET_KEY` in CI to the
+key the lock files were written with (the contents of a developer's `.pivot/secret.key`,
+stored as a CI secret); without it, CI makes its own key and those stages show as stale.
+See [secret parameters](../concepts/parameters.md#secret-parameters).
+
 ### Post-Merge Cache Push
 
 Add a separate workflow triggered on `push` to `main` that runs `pivot push` after merging. This ensures future CI runs and teammates can pull the latest outputs. The setup steps (checkout, Python, install, configure remote) are the same as above.

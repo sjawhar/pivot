@@ -670,6 +670,32 @@ def test_get_stage_explanation_invalid_params(tmp_path: pathlib.Path) -> None:
     assert "invalid" in result["reason"].lower() or "error" in result["reason"].lower()
 
 
+def test_get_stage_explanation_invalid_params_does_not_echo_a_secret(
+    tmp_path: pathlib.Path,
+) -> None:
+    class SecretParams(pydantic.BaseModel):
+        pin: pydantic.Secret[int] = pydantic.Secret[int](1)
+
+    state_dir = tmp_path / ".pivot"
+    _write_lock(state_dir, "stage", {"self:stage": "abc"}, params={"pin": "x"})
+
+    result = explain.get_stage_explanation(
+        stage_name="stage",
+        fingerprint={"self:stage": "abc"},
+        deps={},
+        outs=[],
+        params_instance=SecretParams(),
+        overrides={"stage": {"pin": "99x999"}},
+        state_dir=state_dir,
+        store=_store(tmp_path),
+    )
+
+    assert result["will_run"] is True
+    assert "Invalid params.yaml" in result["reason"]
+    assert "pin" in result["reason"]
+    assert "99x999" not in result["reason"]
+
+
 @pytest.mark.parametrize(
     ("stage_name", "create_lock"),
     [

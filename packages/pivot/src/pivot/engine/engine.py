@@ -974,8 +974,15 @@ class Engine:
             resource_capacity,
         )
 
-        # Load config
-        overrides = parameters.load_params_yaml(pipeline)
+        # Load config. Startup and every reload check params.yaml, so in watch mode an error
+        # here is an edit the watcher has not reported yet: the pipeline becomes invalid.
+        try:
+            overrides = parameters.load_params_yaml(pipeline)
+        except (pivot_exceptions.ParamsError, pivot_exceptions.PipelineConfigError) as exc:
+            if not self._watches_filesystem():
+                raise
+            await self._invalidate_pipeline([str(exc)])
+            return {}
         checkout_modes = config.get_checkout_mode_order()
         self._current_overrides = overrides
         self._merkle_ids = dict[str, str]()
@@ -2176,25 +2183,33 @@ class Engine:
         nothing else fingerprints until this returns (see ``wait_for_startup_fingerprints``),
         so the startup run's skip check reuses the cached values.
 
-        A stage that fails to fingerprint makes the pipeline invalid, as a ``pipeline.py``
-        syntax error does on reload: the errors are logged and no run starts until an edit
-        reloads a pipeline whose every stage fingerprints.
+        A stage that fails to fingerprint, or a ``params.yaml`` that fails its checks against the
+        pipeline, makes the pipeline invalid, as a ``pipeline.py`` syntax error does on reload: the
+        errors are logged and no run starts until an edit reloads a valid pipeline.
         """
         pipeline = self._pipeline
         if pipeline is None:
             return
-        errors = list[exceptions.PivotError]()
+        errors = list[str]()
         for stage_name in pipeline.list_stages():
             try:
                 _ = await anyio.to_thread.run_sync(pipeline.ensure_fingerprint, stage_name)
             except exceptions.PivotError as exc:
-                errors.append(exc)
+                errors.append(str(exc))
+        try:
+            _ = parameters.load_params_yaml(pipeline)
+        except (exceptions.ParamsError, exceptions.PipelineConfigError) as exc:
+            errors.append(str(exc))
         if errors:
-            for exc in errors:
-                _logger.warning(f"Pipeline invalid: {exc}")
-            _logger.error("Pipeline invalid - waiting for fix")
-            self._pipeline_error = "\n".join(str(exc) for exc in errors)
-            await self._emit_pipeline_error(self._pipeline_error)
+            await self._invalidate_pipeline(errors)
+
+    async def _invalidate_pipeline(self, errors: list[str]) -> None:
+        """Mark the loaded pipeline invalid: log and report ``errors``; nothing runs until a fix."""
+        for error in errors:
+            _logger.warning(f"Pipeline invalid: {error}")
+        _logger.error("Pipeline invalid - waiting for fix")
+        self._pipeline_error = "\n".join(errors)
+        await self._emit_pipeline_error(self._pipeline_error)
 
     async def _emit_pipeline_error(self, message: str) -> None:
         """Report an invalid pipeline; the stage list stays the loaded pipeline's."""
@@ -2515,10 +2530,11 @@ class Engine:
         """Reload the pipeline by re-importing pipeline definition.
 
         Returns the old pipeline's stages if reload succeeded, or the error message if the
-        pipeline is invalid: it fails to load, or one of its stages fails to fingerprint. On
-        failure the last loaded pipeline stays loaded but is marked invalid, so nothing runs until
-        a good reload. The new fingerprints stay cached for the reload event's diff. The caller
-        should emit the reload event using the returned stages.
+        pipeline is invalid: it fails to load, one of its stages fails to fingerprint, or
+        ``params.yaml`` fails its checks against it. On failure the last loaded pipeline stays
+        loaded but is marked invalid, so nothing runs until a good reload. The new fingerprints
+        stay cached for the reload event's diff. The caller should emit the reload event using
+        the returned stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
@@ -2541,6 +2557,10 @@ class Engine:
                     _ = new_pipeline.ensure_fingerprint(stage_name)
                 except exceptions.PivotError as exc:
                     errors.append(str(exc))
+            try:
+                _ = parameters.load_params_yaml(new_pipeline)
+            except (exceptions.ParamsError, exceptions.PipelineConfigError) as exc:
+                errors.append(str(exc))
             if errors:
                 return self._reject_reload(old_pipeline, errors)
 

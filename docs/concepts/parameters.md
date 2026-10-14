@@ -48,6 +48,11 @@ reads, and the classes drift away from the code that uses them.
   A stage takes at most one, and its annotation must not be a union or `Optional`.
 - Mutable defaults are safe (`columns: list[str] = ["id", "value"]`): Pydantic
   copies them. Nested Pydantic models work too.
+- Unknown fields are refused, in code (`FilterParams(min_valu=15)`) and in
+  `params.yaml` alike. A class that needs extra fields sets its own
+  `model_config = pydantic.ConfigDict(extra="allow")`. In `params.yaml` this
+  holds at every depth: a typo inside a nested model is refused too, unless that
+  model sets `extra="allow"`.
 - A stage whose fields all have defaults may declare a default
   (`params: FilterParams = FilterParams()`) and be called without it.
 - Values that are not data (a number, a string, a list of names) go here, never
@@ -68,13 +73,20 @@ params/scale:
 
 Only the listed fields change. For [variants](pipelines.md#variants), a key
 without the `@` suffix applies to every variant, and a key with the full name
-(`params/scale@big`) is applied on top of it.
+(`params/scale@big`) is applied on top of it. A field with a Pydantic alias
+(`learning_rate: float = Field(0.01, alias="lr")`) takes either name; one key
+that sets it under both is refused.
 
 Keys are checked when overrides load. A key with no pipeline part (`scale:`)
 is refused with the qualified names it could mean, and so is a key for a
 loaded pipeline that names none of its stages (`params/scael:`). Each value
-must map parameter names to values. A key for a pipeline that this run does
-not load (running one pipeline of several) is skipped.
+must map parameter names to values, and each stage's params class must accept
+them as that stage sees them (base key merged under the variant's key): a
+field the class does not have (`factr:`) is refused with the fields it could
+mean, and a value its field rejects (`factor: ten`) is refused naming the field,
+the value and the reason. Every problem is listed in one error, and no stage
+runs. A key for a pipeline that this run does not load (running one pipeline of
+several) is skipped.
 
 ## Change Detection
 
@@ -108,3 +120,21 @@ A stage is skipped only when all three match its last successful run
 
 The lock file lists a `set` or `frozenset` parameter's members in sorted order, so the
 recorded value does not depend on Python's hash seed.
+
+### Secret parameters
+
+A secret (`pydantic.SecretStr`, `SecretBytes`, `Secret[T]`) is not recorded as its
+value. The lock file holds `hmac:` plus the first 16 hex digits of the value's
+HMAC-SHA256 under the project's secret key, so changing the secret re-runs the stage,
+while someone who has the lock file but not the key cannot test guesses at the value.
+`pivot params show` and `status --explain` show the digest, and an error about an invalid
+secret value shows `'**********'`. The one exception is your own code: a
+`field_serializer` or `model_serializer` that calls `get_secret_value()` puts what it
+returns into the record as written.
+
+The key is `.pivot/secret.key`: 32 random bytes, created the first time a stage with a
+secret is checked, with mode 0600, and listed in `.pivot/.gitignore`. Never commit it.
+Set `PIVOT_SECRET_KEY` (64 hex digits) to use a key from the environment instead, so CI
+and teammates record the same digests. A clone without the key, and without
+`PIVOT_SECRET_KEY`, makes its own key; each stage that has a secret then re-runs once
+there.
