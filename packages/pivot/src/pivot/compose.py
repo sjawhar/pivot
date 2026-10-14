@@ -289,15 +289,18 @@ def _stage_difference(
     both = f"both calling {first_name} in {first_file}"
     if first["code"] != again["code"]:
         return f"function code, {both}"
+    # Compare canonical JSON text, as the manifest cache key does: a NaN made by importing the
+    # file again is a new float, and `nan != nan`, but both are written `NaN`.
     bound = (
         ("closure values", first["cells"], again["cells"], _cell_values),
         ("default values", first["defaults"], again["defaults"], _default_values),
     )
     for label, first_bound, again_bound, live_values in bound:
-        if first_bound != again_bound:
-            first_values, again_values = dict(first_bound), dict(again_bound)
+        first_values = {name: json.dumps(value) for name, value in first_bound}
+        again_values = {name: json.dumps(value) for name, value in again_bound}
+        if first_values != again_values:
             changed = sorted(
-                name for name in first_values if first_values[name] != again_values[name]
+                name for name in first_values if first_values[name] != again_values.get(name)
             )
             first_live = live_values(existing["func"])
             again_live = live_values(incoming["func"])

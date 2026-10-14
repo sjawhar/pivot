@@ -1217,6 +1217,75 @@ def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
     assert (root / "data/rep/make.jsonl").read_text() == '{"a":5}\n', right
 
 
+_NAN_PREP_DEFAULT = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def drop_low(raw: pd.DataFrame, ceiling: float = float("nan")) -> pd.DataFrame:
+    return raw[raw["score"] >= 0.5]
+
+
+with Pipeline("prep") as pipeline:
+    kept = drop_low(pipeline.input("scores.csv"))
+"""
+
+_NAN_PREP_FACTORY = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+THRESHOLD = float("nan")
+
+
+def make_stage(threshold: float):
+    @stage
+    def drop_low(raw: pd.DataFrame) -> pd.DataFrame:
+        return raw[raw["score"] >= 0.5] if threshold != threshold else raw
+
+    return drop_low
+
+
+drop_low = make_stage(THRESHOLD)
+
+with Pipeline("prep") as pipeline:
+    kept = drop_low(pipeline.input("scores.csv"))
+"""
+
+_NAN_ROOT = """\
+from pivot import Pipeline
+from prep.pipeline import pipeline as prep
+
+with Pipeline("all") as pipeline:
+    pipeline.include(prep)
+"""
+
+
+@pytest.mark.parametrize(
+    "prep",
+    [
+        pytest.param(_NAN_PREP_DEFAULT, id="nan-default"),
+        pytest.param(_NAN_PREP_FACTORY, id="nan-closure-cell"),
+    ],
+)
+def test_reimported_stage_with_a_nan_value_is_one_stage(tmp_path: pathlib.Path, prep: str) -> None:
+    """`pivot repro prep/pipeline.py` imports prep again; its new NaN is the same value."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "prep/pipeline.py": prep,
+            "pipeline.py": _NAN_ROOT,
+            "data/raw/scores.csv": "name,score\na,0.2\nb,0.7\n",
+        },
+    )
+
+    output = _helper_ok(_helper_pivot(root, "repro", "prep/pipeline.py"))
+
+    assert "1 ran" in output, output
+
+
 _TWO_CLOSURES_MODULE = """\
 def make(factor):
     def inner(x):
