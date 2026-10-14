@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
+import pathlib
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -10,10 +16,10 @@ from conftest import isolated_pivot_dir
 from pivot import cli, compose, discovery, git, project, stage_def
 
 if TYPE_CHECKING:
-    import pathlib
-
     import click.testing
     from pytest_mock import MockerFixture
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 # =============================================================================
 # Module-level StageParams classes for annotation-based registration
@@ -670,15 +676,85 @@ def test_changing_a_secret_param_reruns_the_stage_without_recording_it(
             runs.append(result.output)
             locks.append(lock_file.read_text())
         output = yaml.safe_load((cwd / "data" / "smoke" / "fetch.yaml").read_text())
+        key_file = cwd / ".pivot" / "secret.key"
+        key_mode = key_file.stat().st_mode & 0o777
 
     assert "1 ran" in runs[0], runs[0]
     assert "0 ran, 1 cached" in runs[1], runs[1]
     assert "1 ran" in runs[2], runs[2]
     assert output == {"length": len("second-token-longer")}
-    for lock_text in locks:
-        assert "token" in lock_text
-        assert "first-token" not in lock_text and "second-token" not in lock_text
+    assert key_mode == 0o600
+    for lock_text, token in zip(
+        locks, ("first-token", "first-token", "second-token-longer"), strict=True
+    ):
+        assert "token: hmac:" in lock_text, lock_text
+        assert token not in lock_text
+        assert hashlib.sha256(token.encode()).hexdigest()[:16] not in lock_text
     assert locks[0] != locks[2]
+
+
+_SECRET_PIPELINE = (
+    "import pandas as pd\nimport pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+    + "class FetchParams(StageParams):\n"
+    + "    pin: pydantic.Secret[int] = pydantic.Secret[int](424242)\n\n\n"
+    + "@stage\ndef fetch(numbers: pd.DataFrame, params: FetchParams) -> dict:\n"
+    + '    return {"pin_digits": len(str(params.pin.get_secret_value()))}\n\n\n'
+    + 'with Pipeline("smoke") as pipeline:\n'
+    + '    fetch(pipeline.input("numbers.csv"), params=FetchParams())\n'
+)
+
+
+def _secret_clone(path: pathlib.Path) -> None:
+    """A git repository with `pivot init`, the secret pipeline and its input."""
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run([_PIVOT_BIN, "init"], cwd=path, check=True, capture_output=True)
+    (path / "data" / "raw").mkdir(parents=True)
+    (path / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+    (path / "pipeline.py").write_text(_SECRET_PIPELINE)
+
+
+def _pivot(cwd: pathlib.Path, env: dict[str, str], *args: str) -> str:
+    ran = subprocess.run(
+        [_PIVOT_BIN, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=180
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    return ran.stdout + ran.stderr
+
+
+def test_secret_digest_needs_the_key_and_a_shared_key_gives_equal_digests(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A 6-digit secret behind an unkeyed hash falls to a brute-force loop over the lock."""
+    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    env.pop("PIVOT_SECRET_KEY", None)
+    own = tmp_path / "own"
+    _secret_clone(own)
+    _pivot(own, env, "repro")
+    own_lock = (own / ".pivot" / "stages" / "smoke" / "fetch.lock").read_text()
+    ignored = subprocess.run(
+        ["git", "check-ignore", ".pivot/secret.key"], cwd=own, capture_output=True, text=True
+    )
+    shared_env = {**env, "PIVOT_SECRET_KEY": "5e" * 32}
+    shared_locks = list[str]()
+    for name in ("first", "second"):
+        clone = tmp_path / name
+        _secret_clone(clone)
+        _pivot(clone, shared_env, "repro")
+        shared_locks.append((clone / ".pivot" / "stages" / "smoke" / "fetch.lock").read_text())
+        assert not (clone / ".pivot" / "secret.key").exists(), "the environment key is used"
+
+    assert ignored.returncode == 0, "secret.key must be gitignored"
+    assert (own / ".pivot" / "secret.key").stat().st_mode & 0o777 == 0o600
+    digest = yaml.safe_load(own_lock)["params"]["pin"]
+    assert digest.startswith("hmac:")
+    unkeyed = {hashlib.sha256(str(n).encode()).hexdigest()[:16] for n in range(424000, 424500)}
+    assert digest.removeprefix("hmac:") not in unkeyed
+    assert shared_locks[0] == shared_locks[1]
+    shared_digest = yaml.safe_load(shared_locks[0])["params"]["pin"]
+    assert shared_digest == (
+        "hmac:" + hmac.new(bytes.fromhex("5e" * 32), b"424242", hashlib.sha256).hexdigest()[:16]
+    )
 
 
 def test_qualified_params_keys_apply_to_base_and_variant(

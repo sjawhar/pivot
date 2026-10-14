@@ -28,6 +28,9 @@ _GITIGNORE_CONTENT = """\
 
 # Generated plots gallery (pivot plots show)
 /plots/
+
+# Key for secret params' digests in lock files; never commit it
+/secret.key
 """
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections.abc  # noqa: TC003 - pydantic resolves the field annotations at runtime
 import hashlib
+import hmac
 import json
 from typing import TYPE_CHECKING, Annotated, ClassVar, cast
 
@@ -870,8 +871,19 @@ class _SecretParams(stage_def.StageParams):
     epochs: int = 3
 
 
-def test_get_effective_params_records_a_secret_as_a_digest_of_its_value() -> None:
-    """A masked secret ('**********') hid a changed value from change detection."""
+_SECRET_KEY = "ab" * 32
+
+
+def _hmac_digest(key_hex: str, value: bytes) -> str:
+    return "hmac:" + hmac.new(bytes.fromhex(key_hex), value, hashlib.sha256).hexdigest()[:16]
+
+
+def test_get_effective_params_records_a_secret_as_a_keyed_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A masked secret ('**********') hid a changed value from change detection; an unkeyed
+    hash of the value would let anyone with the lock file test guesses offline."""
+    monkeypatch.setenv("PIVOT_SECRET_KEY", _SECRET_KEY)
     first = parameters.get_effective_params(
         _SecretParams(), "p/s", {"p/s": {"token": "first-token", "keys": ["k1"]}}
     )
@@ -879,15 +891,72 @@ def test_get_effective_params_records_a_secret_as_a_digest_of_its_value() -> Non
         _SecretParams(), "p/s", {"p/s": {"token": "second-token", "keys": ["k1"]}}
     )
 
-    assert first["token"] == "sha256:" + hashlib.sha256(b"first-token").hexdigest()[:16]
-    assert first["raw"] == "sha256:" + hashlib.sha256(b"code-bytes").hexdigest()[:16]
-    assert first["keys"] == ["sha256:" + hashlib.sha256(b"k1").hexdigest()[:16]]
+    assert first["token"] == _hmac_digest(_SECRET_KEY, b"first-token")
+    assert first["raw"] == _hmac_digest(_SECRET_KEY, b"code-bytes")
+    assert first["keys"] == [_hmac_digest(_SECRET_KEY, b"k1")]
     assert first["epochs"] == 3
     assert first["token"] != second["token"]
     assert first["raw"] == second["raw"]
     text = json.dumps([first, second])
-    for plaintext in ("first-token", "second-token", "code-bytes", 'k1"'):
-        assert plaintext not in text
+    for value in (b"first-token", b"second-token", b"code-bytes", b"k1"):
+        assert value.decode() + '"' not in text
+        assert hashlib.sha256(value).hexdigest()[:16] not in text, "derivable without the key"
+
+
+def test_secret_key_is_created_once_private_and_gitignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".pivot").mkdir()
+    gitignore = tmp_path / ".pivot" / ".gitignore"
+    gitignore.write_text("/cache/\n")
+
+    first = parameters.get_effective_params(_SecretParams(), "p/s", None)
+    second = parameters.get_effective_params(_SecretParams(), "p/s", None)
+
+    key_file = tmp_path / ".pivot" / "secret.key"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+    key_hex = key_file.read_text().strip()
+    assert len(bytes.fromhex(key_hex)) == 32
+    assert first == second
+    assert first["token"] == _hmac_digest(key_hex, b"code-token")
+    assert gitignore.read_text().splitlines() == ["/cache/", "/secret.key"]
+
+
+def test_secret_key_from_the_environment_overrides_the_key_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".pivot" / "secret.key").write_text("cd" * 32 + "\n")
+    monkeypatch.setenv("PIVOT_SECRET_KEY", _SECRET_KEY)
+
+    effective = parameters.get_effective_params(_SecretParams(), "p/s", None)
+
+    assert effective["token"] == _hmac_digest(_SECRET_KEY, b"code-token")
+
+
+@pytest.mark.parametrize("bad", ["not-hex", "abcd"], ids=["not-hex", "too-short"])
+def test_secret_key_from_the_environment_must_be_32_hex_bytes(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    monkeypatch.setenv("PIVOT_SECRET_KEY", bad)
+
+    with pytest.raises(exceptions.ParamsError, match="PIVOT_SECRET_KEY must be"):
+        parameters.get_effective_params(_SecretParams(), "p/s", None)
+
+
+def test_params_without_secrets_never_create_a_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".pivot").mkdir()
+
+    _ = parameters.get_effective_params(TrainParams(), "p/s", None)
+
+    assert not (tmp_path / ".pivot" / "secret.key").exists()
 
 
 # -----------------------------------------------------------------------------

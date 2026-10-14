@@ -5,9 +5,14 @@ import copy
 import dataclasses
 import difflib
 import hashlib
+import hmac
 import json
 import logging
+import os
+import secrets
+import tempfile
 import typing
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import deepmerge
@@ -19,7 +24,7 @@ import yaml
 from pivot import exceptions, project, yaml_config
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import pathlib
 
     from pivot.registry import PipelineLike
 
@@ -40,7 +45,7 @@ _params_merger = deepmerge.Merger(  # pyright: ignore[reportPrivateImportUsage]
 ParamsOverrides = dict[str, dict[str, Any]]
 
 
-def load_params_yaml(pipeline: PipelineLike, path: Path | None = None) -> ParamsOverrides:
+def load_params_yaml(pipeline: PipelineLike, path: pathlib.Path | None = None) -> ParamsOverrides:
     """Load params.yaml from the project root (or ``path``) and check it against ``pipeline``.
 
     Keys are qualified stage names (``<pipeline>/<stage>``); a key without ``@...`` applies to
@@ -463,19 +468,84 @@ def get_effective_params(
 
 def encode_params(params: pydantic.BaseModel) -> Any:
     """Return ``params`` as the lock file records them: a JSON-mode dump with every set's
-    members sorted and every secret replaced by a digest of its value.
+    members sorted and every secret replaced by a keyed digest of its value.
 
     Pydantic encodes a set or frozenset as a list in iteration order, which follows
     PYTHONHASHSEED for str members, so members are sorted by their JSON text. It dumps a
     ``SecretStr``, ``SecretBytes`` or ``Secret[T]`` as ``'**********'``, so a changed secret
-    would not change the record and the stage would not re-run; the record must not hold the
-    value either, so a secret becomes ``sha256:`` plus the first 16 hex digits of its
-    value's SHA-256.
+    would not change the record and the stage would not re-run. Lock files are committed, so
+    the record must not let anyone test guesses either: a secret becomes ``hmac:`` plus the
+    first 16 hex digits of its value's HMAC-SHA256 under the project's secret key
+    (``_secret_key``). The key is read only when a secret is found.
     """
-    return _encode(params, params.model_dump(mode="json"), digest_secrets=True)
+    key: bytes | None = None
+
+    def digest(secret: pydantic.SecretStr | pydantic.SecretBytes | pydantic.Secret[Any]) -> str:
+        nonlocal key
+        if key is None:
+            key = _secret_key()
+        return _secret_digest(key, secret)
+
+    return _encode(params, params.model_dump(mode="json"), digest)
 
 
-def _secret_digest(secret: pydantic.SecretStr | pydantic.SecretBytes | pydantic.Secret[Any]) -> str:
+_SECRET_KEY_ENV = "PIVOT_SECRET_KEY"
+_SECRET_KEY_FILE = "secret.key"
+
+
+def _secret_key() -> bytes:
+    """Return the 32-byte key secret digests are made with.
+
+    ``PIVOT_SECRET_KEY`` (64 hex digits) wins, so CI and teammates can share digests.
+    Otherwise the key is ``.pivot/secret.key`` under the project root, created on first use
+    with mode 0600 and added to ``.pivot/.gitignore``: it must never be committed. A clone
+    without the key makes a new one, so its stages with secrets re-run once.
+
+    Raises:
+        ParamsError: ``PIVOT_SECRET_KEY`` or the key file does not hold 32 hex-encoded bytes.
+    """
+    if (from_env := os.environ.get(_SECRET_KEY_ENV)) is not None:
+        return _parse_secret_key(from_env, _SECRET_KEY_ENV)
+    pivot_dir = project.get_project_root() / ".pivot"
+    key_file = pivot_dir / _SECRET_KEY_FILE
+    if not key_file.exists():
+        _create_secret_key(pivot_dir, key_file)
+    return _parse_secret_key(key_file.read_text(), str(key_file))
+
+
+def _parse_secret_key(text: str, source: str) -> bytes:
+    try:
+        key = bytes.fromhex(text.strip())
+    except ValueError:
+        key = b""
+    if len(key) != 32:
+        raise exceptions.ParamsError(f"{source} must be 64 hex digits (a 32-byte key)")
+    return key
+
+
+def _create_secret_key(pivot_dir: pathlib.Path, key_file: pathlib.Path) -> None:
+    """Write a random key to ``key_file`` with mode 0600, and gitignore it.
+
+    The key is written to a private temporary file and hard-linked into place, so a worker
+    racing to create it reads either no file or a whole key, and one key wins.
+    """
+    gitignore = pivot_dir / ".gitignore"
+    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
+    if f"/{_SECRET_KEY_FILE}" not in lines:
+        gitignore.write_text("".join(f"{line}\n" for line in [*lines, f"/{_SECRET_KEY_FILE}"]))
+    descriptor, temporary = tempfile.mkstemp(dir=pivot_dir, prefix=".secret-key-")
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(secrets.token_hex(32) + "\n")
+        with contextlib.suppress(FileExistsError):
+            os.link(temporary, key_file)
+    finally:
+        os.unlink(temporary)
+
+
+def _secret_digest(
+    key: bytes, secret: pydantic.SecretStr | pydantic.SecretBytes | pydantic.Secret[Any]
+) -> str:
     value: object = secret.get_secret_value()
     if isinstance(value, str):
         data = value.encode()
@@ -483,22 +553,25 @@ def _secret_digest(secret: pydantic.SecretStr | pydantic.SecretBytes | pydantic.
         data = value
     else:
         data = json.dumps(value, sort_keys=True, default=str).encode()
-    return "sha256:" + hashlib.sha256(data).hexdigest()[:16]
+    return "hmac:" + hmac.new(key, data, hashlib.sha256).hexdigest()[:16]
 
 
-def _encode(original: object, encoded: Any, *, digest_secrets: bool) -> Any:
+type _Digest = Callable[[pydantic.SecretStr | pydantic.SecretBytes | pydantic.Secret[Any]], str]
+
+
+def _encode(original: object, encoded: Any, digest: _Digest | None) -> Any:
     """Walk `encoded`, a JSON-mode dump of `original`, sorting set members (after their own
-    nested sets) and, with ``digest_secrets``, replacing each secret by its digest.
+    nested sets) and, given ``digest``, replacing each secret by its digest.
 
     The walk pairs each encoded node with the object it came from: JSON mode iterates the
     stored set itself, so the pairing is exact. A node that a custom serializer reshaped no
     longer matches its object and is left as the serializer produced it; a secret is
     replaced whatever its serializer produced, so no serializer puts its value in the record.
     """
-    if digest_secrets and isinstance(
+    if digest is not None and isinstance(
         original, (pydantic.SecretStr, pydantic.SecretBytes, pydantic.Secret)
     ):
-        return _secret_digest(original)
+        return digest(original)
     if isinstance(encoded, dict):
         encoded_dict = cast("dict[str, Any]", encoded)
         if isinstance(original, pydantic.BaseModel):
@@ -509,23 +582,19 @@ def _encode(original: object, encoded: Any, *, digest_secrets: bool) -> Any:
                     if alias is not None:
                         attributes.setdefault(alias, name)
             return {
-                key: _encode(
-                    getattr(original, attributes.get(key, key), None),
-                    value,
-                    digest_secrets=digest_secrets,
-                )
+                key: _encode(getattr(original, attributes.get(key, key), None), value, digest)
                 for key, value in encoded_dict.items()
             }
         if dataclasses.is_dataclass(original) and not isinstance(original, type):
             return {
-                key: _encode(getattr(original, key, None), value, digest_secrets=digest_secrets)
+                key: _encode(getattr(original, key, None), value, digest)
                 for key, value in encoded_dict.items()
             }
         if isinstance(original, dict):
             original_values = list(cast("dict[Any, Any]", original).values())
             if len(original_values) == len(encoded_dict):
                 return {
-                    key: _encode(item, value, digest_secrets=digest_secrets)
+                    key: _encode(item, value, digest)
                     for (key, value), item in zip(
                         encoded_dict.items(), original_values, strict=True
                     )
@@ -537,7 +606,7 @@ def _encode(original: object, encoded: Any, *, digest_secrets: bool) -> Any:
         if len(original_items) != len(encoded_items):
             return encoded_items
         members = [
-            _encode(item, value, digest_secrets=digest_secrets)
+            _encode(item, value, digest)
             for item, value in zip(original_items, encoded_items, strict=True)
         ]
         if isinstance(original, (set, frozenset)):
@@ -555,4 +624,4 @@ class SortedSetJsonSchema(pydantic.json_schema.GenerateJsonSchema):
 
     @typing.override
     def encode_default(self, dft: Any) -> Any:
-        return _encode(dft, super().encode_default(dft), digest_secrets=False)
+        return _encode(dft, super().encode_default(dft), None)

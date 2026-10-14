@@ -119,7 +119,19 @@ A stage is skipped only when all three match its last successful run
 ([caching](caching.md)).
 
 The lock file lists a `set` or `frozenset` parameter's members in sorted order, so the
-recorded value does not depend on Python's hash seed. A secret (`pydantic.SecretStr`,
-`SecretBytes`, `Secret[T]`) is recorded as `sha256:` plus the first 16 hex digits of its
-value's SHA-256, never as the value: changing the secret re-runs the stage, and `pivot
-params show` and `status --explain` show the digest.
+recorded value does not depend on Python's hash seed.
+
+### Secret parameters
+
+A secret (`pydantic.SecretStr`, `SecretBytes`, `Secret[T]`) is never recorded as its
+value. The lock file holds `hmac:` plus the first 16 hex digits of the value's
+HMAC-SHA256 under the project's secret key, so changing the secret re-runs the stage,
+while someone who has the lock file but not the key cannot test guesses at the value.
+`pivot params show` and `status --explain` show the digest.
+
+The key is `.pivot/secret.key`: 32 random bytes, created the first time a stage with a
+secret is checked, with mode 0600, and listed in `.pivot/.gitignore`. Never commit it.
+Set `PIVOT_SECRET_KEY` (64 hex digits) to use a key from the environment instead, so CI
+and teammates record the same digests. A clone without the key, and without
+`PIVOT_SECRET_KEY`, makes its own key; each stage that has a secret then re-runs once
+there.
