@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import threading
 import time
@@ -20,7 +21,7 @@ import pytest
 from pivot import discovery, project
 from pivot.engine import agent_rpc, sources
 from pivot.engine import engine as engine_mod
-from pivot.engine.types import EngineState, OutputEvent
+from pivot.engine.types import EngineState, InputEvent, OutputEvent
 from pivot.storage import store as store_mod
 from pivot.types import StageStatus
 from pivot_tui import event_poller, rpc_client_impl
@@ -504,12 +505,14 @@ async def test_run_requested_during_startup_snapshot_is_not_replaced_by_startup_
         pytest.param("value = 1\n", "No pipeline found during reload", id="no-pipeline-variable"),
     ],
 )
-async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
+async def test_broken_pipeline_edit_runs_nothing_until_fixed(
     watch_project: pathlib.Path,
     broken_source: str,
     expected_error: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A broken edit reports its error; data changes still run the last good pipeline's stages."""
+    """A broken edit reports its error and runs nothing, even on data changes, until fixed."""
+    caplog.set_level(logging.DEBUG, logger="pivot.engine.engine")
     pipeline_py = watch_project / "pipeline.py"
     pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
     pipeline = _helper_discover(watch_project)
@@ -523,12 +526,9 @@ async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
             tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
             await _helper_wait_until_watching(eng)
 
-            # The engine handles the code event before the data event it observes after it.
             pipeline_py.write_text(broken_source)
-            (watch_project / "data" / "raw" / "input.txt").write_text("y")
-            removed_done = await recorder.wait_for(_helper_completes("reload/removed"))
-            broken_idle = await recorder.wait_for(_helper_is_idle, start=removed_done)
-            invalid = recorder.events[await recorder.wait_for(_helper_is_invalid_pipeline)]
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline)
+            invalid = recorder.events[invalid_index]
             assert invalid["type"] == "pipeline_reloaded"
             assert invalid["error"] is not None
             assert expected_error in invalid["error"]
@@ -537,21 +537,25 @@ async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
                 "reload/keep",
                 "reload/removed",
             ], "an invalid edit keeps the last good pipeline's stages"
-            assert removed_output.read_text() == "y-removed", (
-                "the last good pipeline's stage ran on the changed input"
-            )
+            assert eng.pipeline_error == invalid["error"]
+
+            (watch_project / "data" / "raw" / "input.txt").write_text("y")
+            with anyio.fail_after(30):
+                while "ignoring run request" not in caplog.text:
+                    await anyio.sleep(0.05)
+            assert not removed_output.exists(), "an invalid pipeline runs nothing on a data change"
 
             pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
-            reload_index = await recorder.wait_for(_helper_is_reload, start=broken_idle)
+            reload_index = await recorder.wait_for(_helper_is_reload, start=invalid_index)
             added_done = await recorder.wait_for(
                 _helper_completes("reload/added"), start=reload_index
             )
             await recorder.wait_for(_helper_is_idle, start=added_done)
 
-            assert not any(_helper_is_reload(event) for event in recorder.events[:reload_index]), (
-                "a broken pipeline.py must not be reported as a successful reload"
-            )
-            assert recorder.completed("reload/removed", start=0) == StageStatus.RAN
+            assert eng.pipeline_error is None, "a good reload clears the invalid state"
+            assert not any(
+                event["type"] == "stage_completed" for event in recorder.events[:reload_index]
+            ), "nothing ran while the pipeline was invalid"
             reload_event = recorder.events[reload_index]
             assert reload_event["type"] == "pipeline_reloaded"
             assert reload_event["stages_added"] == ["reload/added"], (
@@ -606,7 +610,8 @@ async def test_refusal_added_mid_session_waits_for_fix(
     watch_project: pathlib.Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An edit that fingerprinting refuses is an invalid pipeline: no reload, engine stays up."""
+    """A refused edit mid-session is invalid like one at startup: RPC run and data runs refused."""
+    caplog.set_level(logging.DEBUG, logger="pivot.engine.engine")
     pipeline_py = watch_project / "pipeline.py"
     pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
     pipeline = _helper_discover(watch_project)
@@ -619,9 +624,14 @@ async def test_refusal_added_mid_session_waits_for_fix(
         eng.add_source(
             sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
         )
+        rpc_source = agent_rpc.AgentRpcSource(
+            socket_path=watch_project / "unused.sock",
+            handler=agent_rpc.AgentRpcHandler(engine=eng),
+        )
         async with anyio.create_task_group() as tg:
             tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
             first_idle = await recorder.wait_for(_helper_is_idle)
+            assert change_output.read_text() == "x-v1"
 
             pipeline_py.write_text(_helper_pipeline_source("-v2", third="other", refused=True))
             invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
@@ -630,19 +640,38 @@ async def test_refusal_added_mid_session_waits_for_fix(
             assert invalid["error"] is not None
             assert "captures non-scalar variable 'SUFFIXES'" in invalid["error"]
             assert "Pipeline invalid - waiting for fix" in caplog.text
+            assert eng.pipeline_error == invalid["error"], "a mid-session refusal is invalid too"
+
+            run_send, run_recv = anyio.create_memory_object_stream[InputEvent](1)
+            response = await rpc_source._handle_request(
+                {"jsonrpc": "2.0", "method": "run", "params": {"force": True}, "id": 1}, run_send
+            )
+            assert response is not None
+            assert "error" in response, "RPC run is refused, not accepted and dropped"
+            assert response["error"]["code"] == -32003
+            with pytest.raises(anyio.WouldBlock):
+                run_recv.receive_nowait()
+
+            (watch_project / "data" / "raw" / "input.txt").write_text("y")
+            with anyio.fail_after(30):
+                while "ignoring run request" not in caplog.text:
+                    await anyio.sleep(0.05)
+            assert change_output.read_text() == "x-v1", "the last good pipeline does not run"
 
             pipeline_py.write_text(_helper_pipeline_source("-v3", third="other"))
             reload_index = await recorder.wait_for(_helper_is_reload, start=invalid_index)
             done = await recorder.wait_for(_helper_completes("reload/change"), start=reload_index)
             await recorder.wait_for(_helper_is_idle, start=done)
 
-            assert not any(_helper_is_reload(event) for event in recorder.events[:reload_index]), (
-                "a refused pipeline.py must not be reported as a successful reload"
-            )
+            assert eng.pipeline_error is None, "a good reload clears the invalid state"
+            assert not any(
+                event["type"] == "stage_completed"
+                for event in recorder.events[invalid_index:reload_index]
+            ), "nothing ran while the pipeline was invalid"
             reload_event = recorder.events[reload_index]
             assert reload_event["type"] == "pipeline_reloaded"
             assert reload_event["stages_modified"] == ["reload/change"]
-            assert change_output.read_text() == "x-v3", "the fixed pipeline runs"
+            assert change_output.read_text() == "y-v3", "the fixed pipeline runs on the new input"
             tg.cancel_scope.cancel()
 
 

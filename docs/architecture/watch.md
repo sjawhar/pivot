@@ -84,7 +84,7 @@ When Python files or `pipeline.py` change:
 4. Engine updates FilesystemSource watch paths
 5. Engine re-runs all stages
 
-If the edited pipeline fails to load or a stage fails to fingerprint, the Engine keeps the last pipeline it loaded, logs `Pipeline invalid: <error>` and `Pipeline invalid - waiting for fix`, and emits `PipelineReloaded` with `error` set and the loaded pipeline's stages. The next edit that loads a good pipeline reloads and runs. If the startup snapshot finds a stage that fails to fingerprint, there is no good pipeline to run: the Engine emits the same event and refuses run requests until a reload fixes it.
+A pipeline is invalid when it fails to load (a syntax error, no `pipeline` variable) or a stage fails to fingerprint, whether the startup snapshot finds it or an edit introduces it. The Engine then logs `Pipeline invalid: <error>` and `Pipeline invalid - waiting for fix`, and emits `PipelineReloaded` with `error` set and the stages of the pipeline it still holds. While the pipeline is invalid, nothing runs: an RPC `run` is refused with error `-32003`, and data changes and the startup run are dropped with a debug log. The next edit that loads a good pipeline clears the error, reloads and runs.
 
 ### Output Filtering
 

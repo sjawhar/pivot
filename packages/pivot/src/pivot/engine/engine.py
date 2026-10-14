@@ -193,8 +193,8 @@ class Engine:
 
     # Set once a watched engine's startup fingerprint snapshot has finished
     _startup_fingerprinted: anyio.Event
-    # Why the loaded pipeline cannot run: set when a stage fails to fingerprint at startup,
-    # so no earlier good pipeline exists. Runs are refused until a reload loads a good one.
+    # Why the pipeline is invalid: set by the startup snapshot or any rejected reload, cleared
+    # by the next good reload. While set, no run starts (RPC run, data change, or startup).
     _pipeline_error: str | None
 
     def __init__(
@@ -2513,9 +2513,10 @@ class Engine:
         """Reload the pipeline by re-importing pipeline definition.
 
         Returns the old pipeline's stages if reload succeeded, or the error message if the
-        pipeline is invalid: it fails to load, or one of its stages fails to fingerprint. The
-        last good pipeline stays loaded on failure. The new fingerprints stay cached for the
-        reload event's diff. The caller should emit the reload event using the returned stages.
+        pipeline is invalid: it fails to load, or one of its stages fails to fingerprint. On
+        failure the last loaded pipeline stays loaded but is marked invalid, so nothing runs until
+        a good reload. The new fingerprints stay cached for the reload event's diff. The caller
+        should emit the reload event using the returned stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
@@ -2548,14 +2549,12 @@ class Engine:
             return self._reject_reload(old_pipeline, [str(e)])
 
     def _reject_reload(self, old_pipeline: registry.PipelineLike | None, errors: list[str]) -> str:
-        """Keep the last loaded pipeline after a failed reload; return the error message."""
+        """Keep the last loaded pipeline but mark it invalid; return the error message."""
         for error in errors:
             _logger.warning(f"Pipeline invalid: {error}")
         self._pipeline = old_pipeline
-        message = "\n".join(errors)
-        if self._pipeline_error is not None:
-            self._pipeline_error = message
-        return message
+        self._pipeline_error = "\n".join(errors)
+        return self._pipeline_error
 
     def _clear_project_modules(self, root: pathlib.Path) -> None:
         """Remove project modules from sys.modules."""
