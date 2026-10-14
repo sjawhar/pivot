@@ -564,6 +564,29 @@ def test_bad_params_value_is_refused_before_any_stage_runs(
     assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
 
 
+@pytest.mark.parametrize(
+    "args",
+    [["repro"], ["status"], ["params", "show"], ["commit"]],
+    ids=["repro", "status", "params-show", "commit"],
+)
+def test_misspelled_params_field_is_refused_with_close_matches(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, args: list[str]
+) -> None:
+    """A field typo used to be dropped silently, so the stage ran with its code default."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(cwd, "smoke/scale:\n  factr: 20\n", "smoke")
+
+        result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code != 0, result.output
+    assert result.output.count("field 'factr'") == 1, result.output
+    assert (
+        "params.yaml key 'smoke/scale': field 'factr' is not a field of ScaleParams; "
+        + "did you mean 'factor'?"
+    ) in result.output, result.output
+    assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
+
+
 def test_qualified_params_keys_apply_to_base_and_variant(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

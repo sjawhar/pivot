@@ -48,9 +48,9 @@ def load_params_yaml(pipeline: PipelineLike, path: Path | None = None) -> Params
         ParamsError: The file cannot be read or parsed, or its root is not a mapping.
         PipelineConfigError: A key has no pipeline part, names no stage of a pipeline loaded
             in this run, or maps to something other than parameter values; or a stage's
-            params class rejects the values its keys give it. Every problem is listed, in
-            file order. A key for a pipeline not loaded in this run is skipped and logged at
-            debug.
+            params class rejects the values or field names its keys give it. Every problem
+            is listed, grouped by key in file order. A key for a pipeline not loaded in this
+            run is skipped and logged at debug.
     """
     if path is None:
         path = project.get_project_root() / "params.yaml"
@@ -113,21 +113,50 @@ def _override_errors(
     try:
         _ = apply_overrides(params, stage_name, overrides)
     except pydantic.ValidationError as exc:
-        params_cls = type(params).__name__
         found = list[tuple[str, str]]()
         for error in exc.errors():
-            field = str(error["loc"][0]) if error["loc"] else None
-            key = _override_key(stage_name, field, overrides)
-            path = ".".join(str(part) for part in error["loc"])
-            found.append(
-                (
-                    key,
-                    f"params.yaml key '{key}': field '{path}' value {error['input']!r} "
-                    + f"is invalid for {params_cls}: {error['msg']}",
+            loc = error["loc"]
+            key = _override_key(stage_name, str(loc[0]) if loc else None, overrides)
+            path = ".".join(str(part) for part in loc)
+            owner = _model_at(type(params), loc[:-1])
+            if error["type"] == "extra_forbidden" and owner is not None:
+                detail = f"is not a field of {owner.__name__}; " + _field_hint(
+                    str(loc[-1]), list(owner.model_fields)
                 )
-            )
+            else:
+                detail = (
+                    f"value {error['input']!r} is invalid for {type(params).__name__}: "
+                    + error["msg"]
+                )
+            found.append((key, f"params.yaml key '{key}': field '{path}' {detail}"))
         return found
     return []
+
+
+def _model_at(
+    model: type[pydantic.BaseModel], loc: tuple[int | str, ...]
+) -> type[pydantic.BaseModel] | None:
+    """Return the model a field path leads to through nested model fields, or None.
+
+    None when the path passes through anything but a model-typed field (a list or dict of
+    models, a union); the caller then reports pydantic's own message for the error.
+    """
+    for part in loc:
+        field = model.model_fields.get(str(part))
+        annotation = field.annotation if field is not None else None
+        if not (isinstance(annotation, type) and issubclass(annotation, pydantic.BaseModel)):
+            return None
+        model = annotation
+    return model
+
+
+def _field_hint(name: str, fields: list[str]) -> str:
+    matches = difflib.get_close_matches(name, fields, n=3, cutoff=0.6)
+    if matches:
+        return "did you mean " + " or ".join(f"'{m}'" for m in matches) + "?"
+    if fields:
+        return "its fields are " + ", ".join(f"'{f}'" for f in fields)
+    return "it has no fields"
 
 
 def _override_key(stage_name: str, field: str | None, overrides: ParamsOverrides) -> str:
@@ -242,8 +271,9 @@ def apply_overrides[T: pydantic.BaseModel](
     if not merged_overrides:
         return params_instance
 
-    # Deep merge instance values with overrides
-    base_dict = params_instance.model_dump()
+    # Deep merge instance values with overrides. A round-trip dump is valid input: it leaves out
+    # computed fields, which a model that forbids extra fields would refuse.
+    base_dict = params_instance.model_dump(round_trip=True)
     merged = _params_merger.merge(base_dict, merged_overrides)
     return type(params_instance).model_validate(merged)
 

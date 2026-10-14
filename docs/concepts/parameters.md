@@ -48,6 +48,9 @@ reads, and the classes drift away from the code that uses them.
   A stage takes at most one, and its annotation must not be a union or `Optional`.
 - Mutable defaults are safe (`columns: list[str] = ["id", "value"]`): Pydantic
   copies them. Nested Pydantic models work too.
+- Unknown fields are refused, in code (`FilterParams(min_valu=15)`) and in
+  `params.yaml` alike. A class that needs extra fields sets its own
+  `model_config = pydantic.ConfigDict(extra="allow")`.
 - A stage whose fields all have defaults may declare a default
   (`params: FilterParams = FilterParams()`) and be called without it.
 - Values that are not data (a number, a string, a list of names) go here, never
@@ -74,10 +77,12 @@ Keys are checked when overrides load. A key with no pipeline part (`scale:`)
 is refused with the qualified names it could mean, and so is a key for a
 loaded pipeline that names none of its stages (`params/scael:`). Each value
 must map parameter names to values, and each stage's params class must accept
-the values as that stage sees them (base key merged under the variant's key):
-`factor: ten` is refused naming the key, the field, the value and the reason.
-Every problem is listed in one error, and no stage runs. A key for a pipeline
-that this run does not load (running one pipeline of several) is skipped.
+them as that stage sees them (base key merged under the variant's key): a
+field the class does not have (`factr:`) is refused with the fields it could
+mean, and a value its field rejects (`factor: ten`) is refused naming the field,
+the value and the reason. Every problem is listed in one error, and no stage
+runs. A key for a pipeline that this run does not load (running one pipeline of
+several) is skipped.
 
 ## Change Detection
 

@@ -746,8 +746,13 @@ with Pipeline("reload") as pipeline:
             "params.yaml key 'reload/tag': field 'suffix' value 3 is invalid for SuffixParams: "
             + "Input should be a valid string",
         ),
+        (
+            "reload/tag:\n  sufix: -bad\n",
+            "params.yaml key 'reload/tag': field 'sufix' is not a field of SuffixParams; "
+            + "did you mean 'suffix'?",
+        ),
     ],
-    ids=["unknown-key", "bad-value"],
+    ids=["unknown-key", "bad-value", "unknown-field"],
 )
 async def test_watch_started_on_bad_params_yaml_waits_for_fix(
     watch_project: pathlib.Path,

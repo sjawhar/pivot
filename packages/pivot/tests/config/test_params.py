@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
+import pydantic
 import pytest
 from pydantic import BaseModel, ValidationError
 
@@ -205,6 +206,95 @@ def test_load_params_yaml_accepts_a_bad_base_value_every_variant_replaces(
         "q/_load_stage": {"lr": "fast"},
         "q/_load_stage@v": {"lr": 0.25},
     }
+
+
+def test_load_params_yaml_refuses_an_unknown_field_with_close_matches(tmp_path: Path) -> None:
+    """A field typo is refused naming the field and what it could mean, beside other errors."""
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("p/_load_stage:\n  lrr: 0.5\np/_load_stage@v:\n  zzz: 1\n  lr: x\n")
+
+    with pytest.raises(exceptions.PipelineConfigError) as exc_info:
+        parameters.load_params_yaml(_pipeline(tmp_path), params_file)
+
+    assert str(exc_info.value).splitlines() == [
+        "params.yaml key 'p/_load_stage': field 'lrr' is not a field of _LoadParams; "
+        + "did you mean 'lr'?",
+        "params.yaml key 'p/_load_stage@v': field 'lr' value 'x' is invalid for _LoadParams: "
+        + "Input should be a valid number, unable to parse string as a number",
+        "params.yaml key 'p/_load_stage@v': field 'zzz' is not a field of _LoadParams; "
+        + "its fields are 'lr'",
+    ]
+
+
+def test_stage_params_refuses_an_unknown_field_in_code() -> None:
+    """The same typo in code is refused too: StageParams forbids extra fields."""
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        _LoadParams(lrr=0.5)  # pyright: ignore[reportCallIssue] - the typo under test
+
+
+class _LooseParams(stage_def.StageParams):
+    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow")
+    lr: float = 0.01
+
+
+@stage
+def _loose_stage(params: _LooseParams) -> None:
+    pass
+
+
+def test_stage_params_subclass_may_allow_extra_fields(tmp_path: Path) -> None:
+    """A subclass that sets its own extra= keeps it; params.yaml extras then pass through."""
+    with Pipeline("loose", root=tmp_path) as pipeline:
+        _loose_stage(params=_LooseParams())
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("loose/_loose_stage:\n  extra: 1\n")
+
+    assert parameters.load_params_yaml(pipeline, params_file) == {
+        "loose/_loose_stage": {"extra": 1}
+    }
+
+
+class _DerivedParams(stage_def.StageParams):
+    lr: float = 0.01
+
+    @pydantic.computed_field
+    @property
+    def half_lr(self) -> float:
+        return self.lr / 2
+
+
+def test_apply_overrides_keeps_computed_fields_out_of_validation() -> None:
+    """A computed field is dumped but is not an input; with extra='forbid' it must not be fed back."""
+    result = parameters.apply_overrides(_DerivedParams(), "p/s", {"p/s": {"lr": 0.5}})
+
+    assert result.half_lr == 0.25
+
+
+class _OptimizerParams(stage_def.StageParams):
+    momentum: float = 0.9
+
+
+class _NestedLoadParams(stage_def.StageParams):
+    optimizer: _OptimizerParams = _OptimizerParams()
+
+
+@stage
+def _nested_stage(params: _NestedLoadParams) -> None:
+    pass
+
+
+def test_load_params_yaml_names_the_nested_model_of_an_unknown_field(tmp_path: Path) -> None:
+    with Pipeline("n", root=tmp_path) as pipeline:
+        _nested_stage(params=_NestedLoadParams())
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("n/_nested_stage:\n  optimizer:\n    momentm: 0.5\n")
+
+    with pytest.raises(
+        exceptions.PipelineConfigError,
+        match=r"^params\.yaml key 'n/_nested_stage': field 'optimizer\.momentm' is not a field "
+        + r"of _OptimizerParams; did you mean 'momentum'\?$",
+    ):
+        parameters.load_params_yaml(pipeline, params_file)
 
 
 # -----------------------------------------------------------------------------
