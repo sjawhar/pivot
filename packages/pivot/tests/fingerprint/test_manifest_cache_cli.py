@@ -13,8 +13,12 @@ from tests.conftest import init_git_repo
 _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
-def _helper_pivot(cwd: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _helper_pivot(
+    cwd: pathlib.Path, *args: str, hash_seed: int | None = None
+) -> subprocess.CompletedProcess[str]:
     env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    if hash_seed is not None:
+        env["PYTHONHASHSEED"] = str(hash_seed)
     return subprocess.run(
         [_PIVOT_BIN, *args],
         cwd=cwd,
@@ -394,3 +398,36 @@ def test_non_scalar_read_by_cached_helper_is_an_error(tmp_path: pathlib.Path) ->
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"list read by a cached helper was accepted:\n{output}"
     assert "captures non-scalar variable 'COLUMNS'" in output, output
+
+
+_SET_PARAMS_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, StageParams, stage
+
+
+class Params(StageParams):
+    tags: frozenset[str] = frozenset({"alpha", "beta", "gamma", "delta", "eps"})
+
+
+@stage
+def tagged(raw: pd.DataFrame, params: Params = Params()) -> pd.DataFrame:
+    return raw.assign(n=len(params.tags))
+
+
+with Pipeline("sp") as pipeline:
+    tagged(pipeline.input("t.csv"))
+"""
+
+
+def test_set_valued_params_stay_cached_across_processes(tmp_path: pathlib.Path) -> None:
+    """A frozenset field is recorded and hashed in one order, so new processes stay cached."""
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _SET_PARAMS_PIPELINE, "data/raw/t.csv": "a\n1\n"}
+    )
+    _helper_ok(_helper_pivot(root, "repro", hash_seed=0))
+
+    for seed in range(1, 4):
+        _helper_ok(_helper_pivot(root, "fingerprint", "reset", hash_seed=seed))
+        status = _helper_ok(_helper_pivot(root, "status", hash_seed=seed))
+        assert "1 cached, 0 stale" in status, f"PYTHONHASHSEED={seed}:\n{status}"

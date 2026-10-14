@@ -99,3 +99,6 @@ pivot status --explain           # shows old and new values for changed params
 
 A stage is skipped only when all three match its last successful run
 ([caching](caching.md)).
+
+The lock file lists a `set` or `frozenset` parameter's members in sorted order, so the
+recorded value does not depend on Python's hash seed.

@@ -6,6 +6,10 @@ invocations. This is critical because stages may be fingerprinted in different
 processes (main process vs worker) and must produce identical results.
 """
 
+import functools
+import json
+import os
+import pathlib
 import subprocess
 import sys
 
@@ -164,6 +168,98 @@ print(fingerprint.hash_function_ast(list))
         results.append(result.stdout.strip())
 
     assert results[0] == results[1], f"Hashes differ across processes: {results}"
+
+
+_SET_PARAMS_SCRIPT = """\
+import json
+
+from pivot import fingerprint, parameters
+from pivot.stage_def import StageParams
+
+
+class Inner(StageParams):
+    keys: frozenset[str] = frozenset({"k1", "k2", "k3", "k4", "k5"})
+
+
+class Params(StageParams):
+    tags: frozenset[str] = frozenset({"alpha", "beta", "gamma", "delta", "eps"})
+    pairs: set[tuple[str, frozenset[int]]] = {("x", frozenset({1, 2, 3})), ("y", frozenset({4, 5}))}
+    inner: Inner = Inner()
+
+
+def stage(params: Params = Params()) -> int:
+    return len(params.tags)
+
+
+print(json.dumps({
+    "manifest": fingerprint.get_stage_fingerprint(stage),
+    "params": parameters.get_effective_params(Params(), "s/stage"),
+}, sort_keys=True))
+"""
+
+
+def test_set_valued_params_are_deterministic_across_hash_seeds(tmp_path: pathlib.Path) -> None:
+    """Set and frozenset StageParams fields hash and record in one order, whatever the seed."""
+    (tmp_path / ".pivot").mkdir()
+    script = tmp_path / "set_params_stage.py"
+    script.write_text(_SET_PARAMS_SCRIPT)
+    results = [
+        json.loads(
+            subprocess.run(
+                [sys.executable, str(script)],
+                cwd=tmp_path,
+                env={**os.environ, "PYTHONHASHSEED": str(seed)},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+        for seed in range(4)
+    ]
+
+    assert all(result["params"] == results[0]["params"] for result in results), results
+    assert all(result["manifest"] == results[0]["manifest"] for result in results), results
+    assert results[0]["params"]["tags"] == ["alpha", "beta", "delta", "eps", "gamma"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param(frozenset({"a"}), ("a",), id="frozenset-vs-tuple"),
+        pytest.param([set[str]()], ["set([])"], id="empty-set-vs-tag-string"),
+        pytest.param([["set", list[str]()]], [set[str]()], id="tag-shaped-list-vs-set"),
+        pytest.param({1: "x"}, {"1": "x"}, id="int-key-vs-str-key"),
+        pytest.param([b"a"], ["b'a'"], id="bytes-vs-repr-string"),
+    ],
+)
+def test_distinct_partial_arguments_have_distinct_fingerprints(
+    first: object, second: object
+) -> None:
+    """Canonical forms keep collection types apart from look-alike values."""
+
+    def helper(value: object) -> object:
+        return value
+
+    first_partial = functools.partial(helper, first)
+    second_partial = functools.partial(helper, second)
+
+    def first_stage() -> object:
+        return first_partial()
+
+    def second_stage() -> object:
+        return second_partial()
+
+    first_args = next(
+        value
+        for key, value in fingerprint.get_stage_fingerprint(first_stage).items()
+        if key.endswith(".args")
+    )
+    second_args = next(
+        value
+        for key, value in fingerprint.get_stage_fingerprint(second_stage).items()
+        if key.endswith(".args")
+    )
+    assert first_args != second_args
 
 
 # --- In-process tests for Pydantic default_factory with builtins ---

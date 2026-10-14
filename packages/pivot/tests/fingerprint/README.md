@@ -347,6 +347,14 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
     Tests: `test_determinism.py::test_builtin_default_factory_deterministic_across_processes`,
     `test_determinism.py::test_builtin_type_deterministic`
 
+    Set and frozenset values are ordered by their canonical form, not by iteration order,
+    which follows `PYTHONHASHSEED`. This covers `StageParams` schema defaults, `default:`
+    values, loader config, `functools.partial` arguments, and the params recorded in the
+    lock file.
+
+    Tests: `test_determinism.py::test_set_valued_params_are_deterministic_across_hash_seeds`,
+    `test_manifest_cache_cli.py::test_set_valued_params_stay_cached_across_processes`
+
 15. **Module collections are refused**: A stage reading a module-level collection raises
     `StageDefinitionError` unless unsafe fingerprinting is explicitly enabled, in which case
     Pivot warns instead of pretending to track its contents.

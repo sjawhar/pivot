@@ -23,6 +23,8 @@ import xxhash
 from pivot import ast_utils, exceptions, metrics
 
 if TYPE_CHECKING:
+    import pydantic.json_schema
+
     from pivot import loaders
     from pivot.storage.state import StateDB
 
@@ -38,7 +40,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 9 keys manifests by the stage function's identity as well as the stage name.
 # Version 10 drops a bare @stage decorator from code hashes, as the called form already was.
 # Version 11 walks the function behind a functools.cache or lru_cache helper.
-_CACHE_SCHEMA_VERSION = 11
+# Version 12 hashes set members and dict entries in sorted order, not hash-seed order.
+_CACHE_SCHEMA_VERSION = 12
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -52,7 +55,9 @@ class _PydanticModelProtocol(Protocol):
     model_fields: Mapping[str, Any]
 
     @classmethod
-    def model_json_schema(cls) -> dict[str, Any]: ...
+    def model_json_schema(
+        cls, *, schema_generator: "type[pydantic.json_schema.GenerateJsonSchema]"
+    ) -> dict[str, Any]: ...
 
 
 def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
@@ -840,7 +845,7 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     field_values = list[str]()
     for field in dataclasses.fields(loader_any):
         value = getattr(loader_any, field.name)
-        field_values.append(f"{field.name}={value!r}")
+        field_values.append(f"{field.name}={_serialize_value_for_hash(value)}")
     if field_values:
         config_str = ",".join(field_values)
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
@@ -1260,7 +1265,9 @@ def _hash_pydantic_schema(
     # Insert placeholder to prevent infinite recursion on self-referential models
     # (e.g., class Node(BaseModel): children: list["Node"])
     manifest[schema_key] = "<pending>"
-    schema_raw = schema_model.model_json_schema()
+    from pivot import parameters
+
+    schema_raw = schema_model.model_json_schema(schema_generator=parameters.SortedSetJsonSchema)
     schema = _strip_schema_metadata(schema_raw)
 
     model_fields = cast("Mapping[str, Any]", getattr(schema_model, "model_fields", {}))
@@ -1305,29 +1312,35 @@ def _discover_pydantic_field_types(
 
 def _serialize_value_for_hash(value: Any) -> str:
     """Serialize a value to a stable string for hashing."""
+    return json.dumps(_canonicalize_value_for_hash(value))
+
+
+def _canonicalize_value_for_hash(value: Any) -> Any:
+    """Return a JSON-ready form of `value` that does not depend on PYTHONHASHSEED.
+
+    Collections become `[type, items]` nodes, so a set stays distinct from a list or from a
+    string that looks like one. Set members and dict entries are sorted by their full
+    canonical JSON text: a set's iteration order, and a dict built from a set, follow the
+    hash seed. Other leaves keep their `repr`, tagged with their type.
+    """
     if hasattr(value, "model_dump"):
-        return json.dumps(value.model_dump(), sort_keys=True, default=str)
-
-    if isinstance(value, (list, tuple)):
-        items: list[Any] = []
-        for item in cast("list[Any]", value):
-            if hasattr(item, "model_dump"):
-                items.append(item.model_dump())
-            else:
-                items.append(item)
-        return json.dumps(items, sort_keys=True, default=str)
-
-    if isinstance(value, (set, frozenset)):
-        # Sort for deterministic ordering
-        items_to_sort = cast("set[Any] | frozenset[Any]", value)
-        return json.dumps(
-            sorted(items_to_sort, key=lambda x: (type(x).__name__, str(x))), default=str
-        )
-
+        return _canonicalize_value_for_hash(value.model_dump())
     if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, default=str)
-
-    return repr(value)
+        entries = [
+            [_canonicalize_value_for_hash(key), _canonicalize_value_for_hash(item)]
+            for key, item in cast("dict[Any, Any]", value).items()
+        ]
+        entries.sort(key=json.dumps)
+        return ["dict", entries]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
+        items = [_canonicalize_value_for_hash(item) for item in collection]
+        if isinstance(collection, (set, frozenset)):
+            items.sort(key=json.dumps)
+        return [type(collection).__name__, items]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return [type(value).__name__, repr(value)]
 
 
 def _add_callable_to_manifest(
