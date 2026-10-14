@@ -1106,7 +1106,8 @@ async def test_action_force_rerun_stage_calls_rpc(mocker: MockerFixture) -> None
 
     mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_called_once_with(stages=["stage_a"], force=True)
 
@@ -1120,7 +1121,8 @@ async def test_action_force_rerun_all_calls_rpc(mocker: MockerFixture) -> None:
 
     mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_all()
+    app.action_force_rerun_all()
+    await app.workers.wait_for_complete()
 
     mock_client.run.assert_called_once_with(force=True)
 
@@ -1133,7 +1135,7 @@ async def test_action_force_rerun_not_in_watch_mode(mocker: MockerFixture) -> No
     app = run_tui.PivotApp(stage_names=["stage_a"], client=mock_client)
     app._selected_stage_name = "stage_a"
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
 
     mock_client.run.assert_not_called()
 
@@ -1147,7 +1149,7 @@ async def test_action_force_rerun_no_stage_selected(mocker: MockerFixture) -> No
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1165,7 +1167,7 @@ async def test_action_force_rerun_while_running(mocker: MockerFixture) -> None:
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1182,7 +1184,7 @@ async def test_action_force_rerun_all_while_running(mocker: MockerFixture) -> No
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_all()
+    app.action_force_rerun_all()
 
     mock_client.run.assert_not_called()
     mock_notify.assert_called_once()
@@ -1199,7 +1201,8 @@ async def test_action_force_rerun_stage_failure_notifies(mocker: MockerFixture) 
 
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
+    app.action_force_rerun_stage()
+    await app.workers.wait_for_complete()
 
     # Should have been called twice: once for "Forcing re-run...", once for failure
     assert mock_notify.call_count == 2
@@ -1219,14 +1222,85 @@ async def test_action_force_rerun_reports_refused_run(mocker: MockerFixture) -> 
     app._selected_stage_name = "stage_a"
     mock_notify = mocker.patch.object(app, "notify")
 
-    await app.action_force_rerun_stage()
-    await app.action_force_rerun_all()
+    app.action_force_rerun_stage()
+    app.action_force_rerun_all()
+    await app.workers.wait_for_complete()
 
     errors = [call for call in mock_notify.call_args_list if call.kwargs.get("severity") == "error"]
     assert [call.args[0] for call in errors] == [
         "Pipeline invalid - waiting for fix: boom",
         "Pipeline invalid - waiting for fix: boom",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "method"), [("R", "run"), ("r", "run"), ("c", "commit")])
+async def test_slow_rpc_reply_does_not_freeze_the_app(
+    tmp_path: pathlib.Path, key: str, method: str
+) -> None:
+    """While an RPC reply is held (an engine still starting), the app keeps handling keys."""
+    import time
+
+    reply_delay = 3.0
+    socket_path = tmp_path / "pivot.sock"
+    server = FakeRpcServer()
+    server.delay_reply(method, reply_delay)
+    await server.start(socket_path)
+    await wait_for_socket(socket_path)
+    try:
+        app = run_tui.PivotApp(
+            stage_names=["demo/a", "demo/b"], watch_mode=True, socket_path=socket_path
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.selected_stage_name == "demo/a"
+            start = time.monotonic()
+            await pilot.press(key)
+            await pilot.press("j")
+            await pilot.pause(0.3)
+            assert time.monotonic() - start < reply_delay / 2, (
+                "the key handler waited for the RPC reply"
+            )
+            assert app.selected_stage_name == "demo/b", "keys are handled while the reply is held"
+            assert app.is_running, "the app does not exit"
+            await app.workers.wait_for_complete()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        pytest.param(TimeoutError(), "Engine did not answer", id="timeout"),
+        pytest.param(
+            pivot_tui.rpc_client_impl.RpcError(
+                -32004, "Engine is starting: fingerprinting stages; try again when it is ready"
+            ),
+            "Engine is starting: fingerprinting stages; try again when it is ready",
+            id="engine-starting",
+        ),
+    ],
+)
+async def test_rpc_action_failure_is_a_notification(
+    mocker: MockerFixture, error: Exception, expected: str
+) -> None:
+    """A timed-out or refused RPC reply is shown to the user; it never escapes the action."""
+    mock_client = AsyncMock()
+    mock_client.run.side_effect = error
+    mock_client.commit.side_effect = error
+    app = run_tui.PivotApp(stage_names=["stage_a"], watch_mode=True, client=mock_client)
+    app._selected_stage_name = "stage_a"
+    mock_notify = mocker.patch.object(app, "notify")
+
+    app.action_force_rerun_stage()
+    app.action_force_rerun_all()
+    app.action_commit()
+    await app.workers.wait_for_complete()
+
+    errors = [c.args[0] for c in mock_notify.call_args_list if c.kwargs.get("severity") == "error"]
+    assert len(errors) == 3, errors
+    assert all(expected in message for message in errors), errors
 
 
 def test_pivot_app_accepts_client(mocker: MockerFixture) -> None:
@@ -1255,7 +1329,8 @@ async def test_pivot_app_connects_with_socket_path(
         mock_notify = mocker.patch.object(app, "notify")
         async with app.run_test() as pilot:
             await pilot.pause()
-            await app.action_commit()
+            app.action_commit()
+            await app.workers.wait_for_complete()
         assert any("Committed 1" in str(call) for call in mock_notify.call_args_list), (
             "Should notify on successful commit"
         )

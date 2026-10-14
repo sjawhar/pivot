@@ -40,8 +40,6 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
-
     from pivot_tui.client import PivotClient
     from pivot_tui.event_poller import EventPoller
 from pivot_tui.diff_panels import InputDiffPanel, OutputDiffPanel
@@ -187,6 +185,9 @@ _TUI_BINDINGS: list[textual.binding.BindingType] = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+# Shown when an RPC reply times out in the client (the engine is busy or gone)
+_NO_REPLY = "Engine did not answer in time"
 
 # Minimum terminal size for proper display
 _MIN_TERMINAL_WIDTH = 80
@@ -1152,43 +1153,52 @@ class PivotApp(textual.app.App[None]):
         self._viewing_history_index = result
         self._update_history_view()
 
-    async def action_commit(self) -> None:  # pragma: no cover
+    def action_commit(self) -> None:  # pragma: no cover
         """Commit current workspace state (watch mode only)."""
-        if self._commit_in_progress:
+        if not self._watch_mode or self._commit_in_progress:
             return
-        self._commit_in_progress = True
-        try:
-            if not self._watch_mode:
-                return
-            if self._has_running_stages:
-                self.notify("Cannot commit while stages are running", severity="warning")
-                return
-            if self._cancel_commit:
-                self._cancel_commit = False
-                return
-            if self._client is None:
-                self.notify("No client connection", severity="warning")
-                return
+        if self._has_running_stages:
+            self.notify("Cannot commit while stages are running", severity="warning")
+            return
+        if self._cancel_commit:
+            self._cancel_commit = False
+            return
+        if self._client is None:
+            self.notify("No client connection", severity="warning")
+            return
 
-            self.notify("Committing...")
-            result = await self._client.commit()
-            committed = result["committed"]
-            failed = result["failed"]
-            if failed:
-                self.notify(
-                    f"Committed {len(committed)}, failed {len(failed)} stage(s)",
-                    severity="warning",
-                )
-            elif committed:
-                self.notify(f"Committed {len(committed)} stage(s)")
-            else:
-                self.notify("Nothing to commit")
-        except Exception as e:
-            self.notify(f"Commit failed: {e}", severity="error")
+        self._commit_in_progress = True
+        self.notify("Committing...")
+        self._send_commit(self._client)
+
+    @textual.work(group="rpc")
+    async def _send_commit(self, client: PivotClient) -> None:  # pragma: no cover
+        """Commit off the message loop: the reply waits for the engine's startup snapshot."""
+        from pivot_tui.rpc_client_impl import RpcError
+
+        try:
+            result = await client.commit()
+        except TimeoutError:
+            self.notify(f"Commit failed: {_NO_REPLY}", severity="error")
+            return
+        except RpcError as exc:
+            self.notify(f"Commit failed: {exc.message}", severity="error")
+            return
         finally:
             self._commit_in_progress = False
+        committed = result["committed"]
+        failed = result["failed"]
+        if failed:
+            self.notify(
+                f"Committed {len(committed)}, failed {len(failed)} stage(s)",
+                severity="warning",
+            )
+        elif committed:
+            self.notify(f"Committed {len(committed)} stage(s)")
+        else:
+            self.notify("Nothing to commit")
 
-    async def action_force_rerun_stage(self) -> None:  # pragma: no cover
+    def action_force_rerun_stage(self) -> None:  # pragma: no cover
         """Force re-run the currently selected stage (watch mode only)."""
         if not self._watch_mode:
             return
@@ -1204,9 +1214,9 @@ class PivotApp(textual.app.App[None]):
 
         stage_name = self._selected_stage_name
         self.notify(f"Forcing re-run of {stage_name}...")
-        await self._send_run(self._client.run(stages=[stage_name], force=True))
+        self._send_run(self._client, [stage_name])
 
-    async def action_force_rerun_all(self) -> None:  # pragma: no cover
+    def action_force_rerun_all(self) -> None:  # pragma: no cover
         """Force re-run all stages (watch mode only)."""
         if not self._watch_mode:
             return
@@ -1218,14 +1228,23 @@ class PivotApp(textual.app.App[None]):
             return
 
         self.notify("Forcing re-run of all stages...")
-        await self._send_run(self._client.run(force=True))
+        self._send_run(self._client, None)
 
-    async def _send_run(self, request: Coroutine[object, object, bool]) -> None:  # pragma: no cover
-        """Await a run request; show the engine's refusal (an invalid pipeline) if it declines."""
+    @textual.work(group="rpc")
+    async def _send_run(
+        self, client: PivotClient, stages: list[str] | None
+    ) -> None:  # pragma: no cover
+        """Send a forced run off the message loop; show the engine's refusal if it declines."""
         from pivot_tui.rpc_client_impl import RpcError
 
         try:
-            success = await request
+            if stages is None:
+                success = await client.run(force=True)
+            else:
+                success = await client.run(stages=stages, force=True)
+        except TimeoutError:
+            self.notify(f"Re-run failed: {_NO_REPLY}", severity="error")
+            return
         except RpcError as exc:
             self.notify(exc.message, severity="error")
             return

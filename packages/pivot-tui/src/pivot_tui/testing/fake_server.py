@@ -73,6 +73,7 @@ class FakeRpcServer:
     _explanations: dict[str, dict[str, object]]
     _stage_infos: dict[str, dict[str, object]]
     _error_for_method: dict[str, tuple[int, str]]
+    _delay_for_method: dict[str, float]
     _on_error_mode: str
     _run_requests: list[dict[str, object]]
     _diff_results: dict[str, dict[str, object]]
@@ -87,6 +88,7 @@ class FakeRpcServer:
         self._explanations = dict[str, dict[str, object]]()
         self._stage_infos = dict[str, dict[str, object]]()
         self._error_for_method = dict[str, tuple[int, str]]()
+        self._delay_for_method = dict[str, float]()
         self._committed = list[str]()
         self._failed = list[str]()
         self._on_error_mode = "fail"
@@ -135,6 +137,10 @@ class FakeRpcServer:
 
     def clear_error(self, method: str) -> None:
         _ = self._error_for_method.pop(method, None)
+
+    def delay_reply(self, method: str, seconds: float) -> None:
+        """Hold every reply to ``method`` for ``seconds``, like an engine still starting."""
+        self._delay_for_method[method] = seconds
 
     async def start(self, socket_path: Path) -> None:
         if self._task_group is not None:
@@ -228,6 +234,9 @@ class FakeRpcServer:
             return self._json_rpc_error(-32600, "Invalid Request", None, force=True)
 
         method, params, request_id = validated
+
+        if method in self._delay_for_method:
+            await anyio.sleep(self._delay_for_method[method])
 
         injected = self._error_for_method.get(method)
         if injected is not None:
