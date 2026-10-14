@@ -243,8 +243,8 @@ async def test_watched_startup_fingerprints_each_stage_once(
 ) -> None:
     """The pre-start fingerprint snapshot and the startup run's skip check share one computation.
 
-    The snapshot finishes before any source or run starts, so the run reuses its fingerprints
-    and no stage is fingerprinted on two threads at once.
+    The snapshot finishes before the file watcher starts or any input event is handled, so the
+    run reuses its fingerprints and no stage is fingerprinted on two threads at once.
     """
     from pivot import registry
 
@@ -342,6 +342,72 @@ async def test_watched_startup_serves_rpc_while_fingerprinting(
 
     assert sorted(calls) == ["reload/change", "reload/keep", "reload/other"], (
         "each stage is fingerprinted exactly once, even with explain issued mid-snapshot"
+    )
+
+
+@pytest.mark.anyio
+async def test_run_requested_during_startup_snapshot_is_not_replaced_by_startup_run(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced run sent while the startup snapshot runs still runs after it.
+
+    The startup run is the first input event, so the forced run arrives second and wins the
+    engine's restart coalescing instead of being cancelled by the startup run.
+    """
+    from pivot import registry
+
+    (watch_project / "pipeline.py").write_text(_helper_pipeline_source("-v1", third="other"))
+    async with engine_mod.Engine(pipeline=_helper_discover(watch_project)) as first:
+        first.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        await first.run()
+
+    pipeline = _helper_discover(watch_project)
+    compute = registry._compute_fingerprint
+
+    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+        time.sleep(1.0)
+        return compute(stage_name, info)
+
+    monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
+    recorder = _Recorder()
+    socket_path = watch_project / "rpc.sock"
+    ready = threading.Event()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        handler = agent_rpc.AgentRpcHandler(engine=eng)
+        eng.add_source(
+            agent_rpc.AgentRpcSource(socket_path=socket_path, handler=handler, ready=ready)
+        )
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            client = rpc_client_impl.RpcPivotClient()
+            with anyio.fail_after(2):
+                while not ready.is_set():
+                    await anyio.sleep(0.01)
+                await client.connect(socket_path)
+            try:
+                assert await client.run(stages=["reload/change"], force=True)
+            finally:
+                await client.disconnect()
+            await recorder.wait_for(_helper_completes("reload/change"))
+            await recorder.wait_for(_helper_is_idle)
+            tg.cancel_scope.cancel()
+
+    completions = [
+        event["status"]
+        for event in recorder.events
+        if event["type"] == "stage_completed" and event["stage"] == "reload/change"
+    ]
+    assert completions[-1] == StageStatus.RAN, (
+        f"the forced run must run reload/change, saw completions {completions}"
     )
 
 

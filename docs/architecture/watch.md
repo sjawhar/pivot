@@ -61,6 +61,10 @@ This unified architecture eliminates divergent code paths between batch and watc
 
 ## Event Flow
 
+### Startup
+
+A watched engine fingerprints every stage before it starts `FilesystemSource` or handles any input event, because a later reload diffs the edited pipeline against those fingerprints. The RPC server and the startup `OneShotSource` start first, so a TUI or agent connects at once and its run requests queue behind the startup run; `explain` and `commit`, which fingerprint stages, wait for the snapshot.
+
 ### Data Artifact Changes
 
 When a dependency file changes:

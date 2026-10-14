@@ -346,7 +346,7 @@ class Engine:
         if self._output_send is None or self._output_recv is None:
             raise RuntimeError("Engine must be used as async context manager")
 
-        watched = self._watches_filesystem()
+        from pivot.engine.sources import FilesystemSource
 
         # Create fresh dispatch completion event (Events can only be set once)
         self._dispatch_complete = anyio.Event()
@@ -354,20 +354,23 @@ class Engine:
         async with anyio.create_task_group() as tg:
             self._run_task_group = tg
 
-            # The RPC server needs no fingerprints, so it listens while the startup snapshot
-            # runs and clients can connect at once.
+            # Only the file watcher waits for the startup snapshot: an edit it reports reloads
+            # the pipeline, and the reload diffs against the snapshot's fingerprints. Every other
+            # source starts now, so the RPC socket listens at once and the startup run request
+            # is queued ahead of any client request; the input loop below handles both after
+            # the snapshot.
             for source in self._sources:
-                if isinstance(source, agent_rpc.AgentRpcSource):
+                if not isinstance(source, FilesystemSource):
                     tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
 
-            if watched:
+            if self._watches_filesystem():
                 try:
                     await self._fingerprint_watched_stages()
                 finally:
                     self._startup_fingerprinted.set()
 
             for source in self._sources:
-                if not isinstance(source, agent_rpc.AgentRpcSource):
+                if isinstance(source, FilesystemSource):
                     tg.start_soon(self._run_source_with_cleanup, source, self._input_send.clone())
 
             # Start sink dispatcher
