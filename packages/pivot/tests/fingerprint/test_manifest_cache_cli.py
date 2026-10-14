@@ -883,3 +883,53 @@ def test_non_scalar_read_by_custom_loader_method_is_an_error(tmp_path: pathlib.P
     assert proc.returncode != 0, f"tuple read by a loader's save() was accepted:\n{output}"
     assert "Stage 's/make'" in output, output
     assert "captures non-scalar variable 'KEYS' (type: tuple)" in output, output
+
+
+_SHARED_LOADER_PIPELINE = """\
+import dataclasses
+import json
+import pathlib
+
+from pivot import Pipeline, loaders, stage
+
+KEYS = ("a",)
+
+
+@dataclasses.dataclass(frozen=True)
+class Picked(loaders.Loader[dict, dict]):
+    def load(self, path: pathlib.Path) -> dict:
+        return {key: json.loads(path.read_text())[key] for key in KEYS}
+
+    def save(self, data: dict, path: pathlib.Path) -> None:
+        path.write_text(json.dumps({key: data[key] for key in KEYS}))
+
+
+@stage
+def combine(first: dict, second: dict) -> dict:
+    return {**first, **second}
+
+
+with Pipeline("k") as pipeline:
+    combine(
+        pipeline.input("first.json", format=Picked()),
+        pipeline.input("second.json", format=Picked()),
+    )
+"""
+
+
+def test_variable_read_by_loader_on_two_inputs_is_named_once(tmp_path: pathlib.Path) -> None:
+    """One refusal per variable: load() and save() on two inputs all read KEYS."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _SHARED_LOADER_PIPELINE,
+            "data/raw/first.json": '{"a": 1}\n',
+            "data/raw/second.json": '{"a": 2}\n',
+        },
+    )
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert output.count("captures non-scalar variable 'KEYS'") == 1, output

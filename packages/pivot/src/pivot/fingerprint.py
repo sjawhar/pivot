@@ -527,7 +527,12 @@ def get_stage_fingerprint(
 
 @contextlib.contextmanager
 def _collected_capture_errors() -> Iterator[None]:
-    """Collect unsafe-capture errors and raise them together, unless a caller already does."""
+    """Collect unsafe-capture errors and raise them together, unless a caller already does.
+
+    Each walked function reports what it reads, so one variable read by a loader's `load()`
+    and `save()`, or by one loader on two inputs, produces the same message several times.
+    Each distinct message is listed once, in first-seen order.
+    """
     if _capture_errors.get() is not None:
         yield
         return
@@ -538,7 +543,7 @@ def _collected_capture_errors() -> Iterator[None]:
     finally:
         _capture_errors.reset(token)
     if errors:
-        raise exceptions.StageDefinitionError("\n\n".join(errors))
+        raise exceptions.StageDefinitionError("\n\n".join(dict.fromkeys(errors)))
 
 
 @contextlib.contextmanager
