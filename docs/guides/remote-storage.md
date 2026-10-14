@@ -107,7 +107,7 @@ pivot pull --dry-run
 | `-n`, `--dry-run` | Show what would be downloaded |
 | `-j`, `--jobs` | Number of parallel download threads |
 | `-f`, `--force` | Overwrite existing workspace files |
-| `--only-missing` | Only restore files that don't exist on disk (the default without `--force`); a directory with a changed or extra file is refused instead of overwritten |
+| `--only-missing` | Only restore files that don't exist on disk (the default without `--force`); a directory is replaced when every changed or extra file is pivot's own earlier output, and refused (naming the files) when one holds a local change the cache lacks |
 | `--checkout-mode` | `symlink`, `hardlink`, or `copy` (default: project config) |
 
 ## Fetch and Checkout Separately

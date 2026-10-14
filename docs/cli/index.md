@@ -389,7 +389,7 @@ pivot checkout [TARGETS...] [OPTIONS]
 |--------|-------------|
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--force` / `-f` | Overwrite existing files |
-| `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files and refuses (naming them) if any existing file differs from the target or is extra, so local edits are never overwritten; use `--force` to overwrite |
+| `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files; if a file differs from the target or is extra, replaces the directory when every such file is pivot's own earlier output (its content is in the cache), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite |
 | `--all` | Checkout all targets (ignore target filtering) |
 
 ---
@@ -646,7 +646,7 @@ pivot pull [TARGETS...] [OPTIONS]
 | `--dry-run` / `-n` | Show what would be pulled |
 | `--jobs` / `-j N` | Parallel download jobs |
 | `--force` / `-f` | Overwrite existing workspace files |
-| `--only-missing` | Only restore files that don't exist in workspace (the default without `--force`). A directory with a changed or extra file is refused rather than overwritten |
+| `--only-missing` | Only restore files that don't exist in workspace (the default without `--force`). A directory is replaced when every changed or extra file is pivot's own earlier output, and refused (naming the files) when one holds a local change the cache lacks |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--all` | Pull all stages (ignore target filtering) |
 

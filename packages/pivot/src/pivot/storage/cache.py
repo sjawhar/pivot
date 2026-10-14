@@ -14,7 +14,7 @@ import shutil
 import stat
 import tempfile
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import xxhash
 
@@ -755,26 +755,45 @@ def remove_output(path: pathlib.Path) -> None:
     _clear_path(path)
 
 
+class MissingRestore(TypedDict):
+    """Outcome of restore_missing_in_directory."""
+
+    restored: int  # missing files restored in place
+    unavailable: int  # missing files whose blob is not in the cache
+    local_changes: list[str]  # changed or extra files whose content the cache lacks
+    replace: bool  # directory holds only cached content but not the target: replace it whole
+
+
+def _is_cached(cache_dir: pathlib.Path, content_hash: str | None) -> bool:
+    return (
+        content_hash is not None
+        and is_valid_hash(content_hash)
+        and get_cache_path(cache_dir, content_hash).exists()
+    )
+
+
 def restore_missing_in_directory(
     path: pathlib.Path,
     output_hash: DirHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
-) -> tuple[int, int, list[str]]:
-    """Restore a directory's missing target files only when retained content matches.
+) -> MissingRestore:
+    """Restore a directory's missing target files without overwriting local changes.
 
-    Existing files that differ from the target manifest (including files removed
-    from the new manifest) are reported as divergent. No files are restored when
-    divergence exists, so ``--only-missing`` never leaves a silently hybrid tree.
-
-    Returns:
-        (restored_count, unavailable_count, divergent_relpaths).
+    When every existing file matches the target, the missing files are restored in place
+    and nothing else is touched. When some file differs from the target or is not in it,
+    only a whole-directory swap brings the target, and the swap deletes everything the
+    directory holds. It is safe only if every entry it removes is in the cache (pivot's own
+    earlier output): then nothing is written and ``replace`` asks the caller to swap with
+    restore_from_cache. Otherwise nothing is written, and the entries the cache lacks (local
+    edits, extra files, and entries the directory hash ignores) are returned.
     """
     lexical_base = pathlib.Path(os.path.abspath(path))
     resolved_base = path.resolve()
     expected_paths = set[str]()
     missing = list[tuple[DirManifestEntry, pathlib.Path, pathlib.Path]]()
-    divergent = set[str]()
+    # relpath -> hash of the content on disk (None when it cannot be in the cache)
+    changed = dict[str, str | None]()
 
     for entry in output_hash["manifest"]:
         relpath = entry["relpath"]
@@ -796,15 +815,15 @@ def restore_missing_in_directory(
                 if not file_cache_path.exists():
                     missing.append((entry, file_path, file_cache_path))
             else:
-                divergent.add(relpath)
+                changed[relpath] = _get_symlink_cache_hash(file_path, cache_dir)
             continue
         if file_path.exists():
             if not file_path.is_file():
-                divergent.add(relpath)
+                changed[relpath] = None
                 continue
             file_hash, _ = hash_file(file_path)
             if file_hash != entry["hash"]:
-                divergent.add(relpath)
+                changed[relpath] = file_hash
             continue
         if not file_path.parent.resolve().is_relative_to(resolved_base):
             raise exceptions.SecurityValidationError(
@@ -812,24 +831,49 @@ def restore_missing_in_directory(
             )
         missing.append((entry, file_path, file_cache_path))
 
+    # Entries the directory hash ignores (build/, *.swp, ...) are never cached.
+    ignored = list[str]()
+
     def _extra_relpaths(directory: pathlib.Path) -> Generator[str]:
-        """Yield non-ignored file or symlink paths without following symlink directories."""
+        """Yield file or symlink paths without following symlink directories."""
         with os.scandir(directory) as entries:
             for existing_entry in entries:
-                if _should_skip_entry(existing_entry):
-                    continue
                 existing_path = pathlib.Path(existing_entry.path)
-                if existing_entry.is_symlink() or existing_entry.is_file():
+                if _should_skip_entry(existing_entry):
+                    ignored.append(str(existing_path.relative_to(path)))
+                elif existing_entry.is_symlink() or existing_entry.is_file():
                     yield str(existing_path.relative_to(path))
                 elif existing_entry.is_dir():
                     yield from _extra_relpaths(existing_path)
 
     for relpath in _extra_relpaths(path):
-        if relpath not in expected_paths:
-            divergent.add(relpath)
+        if relpath in expected_paths:
+            continue
+        extra_path = path / relpath
+        if extra_path.is_symlink():
+            changed[relpath] = _get_symlink_cache_hash(extra_path, cache_dir)
+        else:
+            changed[relpath], _ = hash_file(extra_path)
+
+    if changed:
+        # Replacing the directory deletes every entry it holds; refuse if any is not cached.
+        local_changes = sorted(
+            [
+                rel
+                for rel, content_hash in changed.items()
+                if not _is_cached(cache_dir, content_hash)
+            ]
+            + ignored
+        )
+        if local_changes:
+            return MissingRestore(
+                restored=0, unavailable=0, local_changes=local_changes, replace=False
+            )
+        return MissingRestore(restored=0, unavailable=0, local_changes=[], replace=True)
+
     unavailable = sum(1 for _, _, file_cache_path in missing if not file_cache_path.exists())
-    if divergent or unavailable:
-        return (0, unavailable, sorted(divergent))
+    if unavailable:
+        return MissingRestore(restored=0, unavailable=unavailable, local_changes=[], replace=False)
 
     for entry, file_path, file_cache_path in missing:
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -837,7 +881,7 @@ def restore_missing_in_directory(
             file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
         )
 
-    return (len(missing), 0, [])
+    return MissingRestore(restored=len(missing), unavailable=0, local_changes=[], replace=False)
 
 
 def protect(path: pathlib.Path) -> None:

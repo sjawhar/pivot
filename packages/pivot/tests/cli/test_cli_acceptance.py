@@ -11,6 +11,9 @@ import os
 import pathlib
 import subprocess
 import sys
+import uuid
+
+import boto3
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -349,3 +352,122 @@ def test_status_pull_count_passes_through_committed_metric_stage(tmp_path: pathl
     out = _ok(_pivot(clone, "status"))
 
     assert "Run `pivot pull` to restore outputs of 2 stages from the remote" in out, out
+
+
+_DIROUT_PIPELINE = """\
+import pathlib
+import tempfile
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def shards(raw: pd.DataFrame) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp())
+    for i, row in raw.iterrows():
+        (out / f"{i}.txt").write_text(str(int(row.sum())))
+    return out
+
+
+with Pipeline("d") as pipeline:
+    shards(pipeline.input("t.csv"))
+"""
+
+
+def _commit(cwd: pathlib.Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=cwd, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", message],
+        cwd=cwd,
+        check=True,
+    )
+
+
+def _dirout_clone_after_teammate_rerun(
+    tmp_path: pathlib.Path, s3_endpoint: str
+) -> tuple[pathlib.Path, dict[str, str]]:
+    """A dev ran a directory-output stage at v1; a teammate re-ran it at v2, pushed and committed.
+
+    Returns the dev's clone after `git pull` (lock at v2, workspace still v1) and the env
+    that points pivot at the S3 remote.
+    """
+    env = _env(
+        AWS_ENDPOINT_URL=s3_endpoint,
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"dirout-{uuid.uuid4().hex[:8]}"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=s3_endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    )
+    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(
+        src,
+        {
+            "pipeline.py": _DIROUT_PIPELINE,
+            "data/raw/t.csv": "a,b\n1,2\n3,4\n",
+            ".gitignore": "/data/d/\n__pycache__/\n",
+        },
+    )
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(src, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    _commit(src, "v1")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    _ok(_pivot(clone, "repro", env=env))
+
+    (src / "data" / "raw" / "t.csv").write_text("a,b\n5,6\n7,8\n")
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    _commit(src, "v2")
+
+    subprocess.run(["git", "pull", "-q", "--ff-only"], cwd=clone, check=True)
+    return clone, env
+
+
+def test_pull_replaces_directory_output_after_teammate_rerun(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """Files pivot wrote earlier are in the local cache, so pull replaces them with the new version."""
+    clone, env = _dirout_clone_after_teammate_rerun(tmp_path, moto_services["s3"])
+    shards = clone / "data" / "d" / "shards.dat"
+    assert (shards / "0.txt").read_text() == "3", "the dev's workspace should still hold v1"
+
+    _ok(_pivot(clone, "pull", "d/shards", env=env))
+
+    assert sorted(p.name for p in shards.iterdir()) == ["0.txt", "1.txt"]
+    assert (shards / "0.txt").read_text() == "11"
+    assert (shards / "1.txt").read_text() == "15"
+
+
+def test_pull_refuses_directory_output_with_hand_edited_file(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A hand edit is not in the cache, so pull refuses, names only that file and keeps it."""
+    clone, env = _dirout_clone_after_teammate_rerun(tmp_path, moto_services["s3"])
+    shards = clone / "data" / "d" / "shards.dat"
+    (shards / "0.txt").unlink()
+    (shards / "0.txt").write_text("mine")
+
+    proc = _pivot(clone, "pull", "d/shards", env=env)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "'shards.dat' has local changes that are not in the cache: 0.txt. Use --force" in out, (
+        out
+    )
+    assert (shards / "0.txt").read_text() == "mine", "the edit must survive"
+    assert (shards / "1.txt").read_text() == "7", "a refused pull must not restore anything"

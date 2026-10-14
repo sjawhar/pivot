@@ -107,21 +107,23 @@ def _restore_path_sync(
                     + "Use --force to overwrite or --only-missing to skip existing files."
                 )
             case CheckoutBehavior.SKIP_EXISTING:
-                # Existing file: skip. Existing real directory: fill in only the missing
-                # inner files; never overwrite or swap out files already on disk.
+                # Existing file: skip. Existing real directory: fill in its missing files, or
+                # swap in the target when every differing file is pivot's own cached output.
+                # Never overwrite content the cache lacks (a local change).
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return ("skipped", path.name)
-                restored, unavailable, divergent = cache.restore_missing_in_directory(
+                outcome = cache.restore_missing_in_directory(
                     path, output_hash, cache_dir, checkout_modes
                 )
-                if divergent:
+                if outcome["local_changes"]:
                     raise click.ClickException(
-                        f"'{path.name}' has files that differ from the target: "
-                        + f"{', '.join(divergent)}. Use --force to overwrite."
+                        f"'{path.name}' has local changes that are not in the cache: "
+                        + f"{', '.join(outcome['local_changes'])}. Use --force to overwrite."
                     )
-                if unavailable:
-                    return ("missing", path.name)
-                return ("restored" if restored else "skipped", path.name)
+                if not outcome["replace"]:
+                    if outcome["unavailable"]:
+                        return ("missing", path.name)
+                    return ("restored" if outcome["restored"] else "skipped", path.name)
             case CheckoutBehavior.FORCE:
                 cache.remove_output(path)
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values

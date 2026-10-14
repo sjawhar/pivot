@@ -102,9 +102,10 @@ def test_checkout_only_missing_accepts_existing_cache_file_symlinks(
     assert (data_dir / "b.txt").is_symlink()
 
 
-def test_pull_reports_directory_that_would_be_hybrid(
+def test_pull_replaces_directory_whose_differing_files_are_all_cached(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner, mocker: MockerFixture
 ) -> None:
+    """Changed and extra files that hold cached content are pivot's own output: pull replaces them."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
     new_pvt_data = _helper_cache_directory(
@@ -124,16 +125,41 @@ def test_pull_reports_directory_that_would_be_hybrid(
 
     result = runner.invoke(cli.cli, ["pull", "data/ext"])
 
-    assert result.exit_code != 0
-    assert "a.txt" in result.output
-    assert "b.txt" in result.output
-    assert "--force" in result.output
-    assert not (data_dir / "c.txt").exists(), "A refused pull must not partially restore files"
+    assert result.exit_code == 0, result.output
+    assert sorted(p.name for p in data_dir.iterdir()) == ["a.txt", "c.txt"]
+    assert (data_dir / "a.txt").read_text() == "one updated\n"
+    assert (data_dir / "c.txt").read_text() == "three\n"
 
 
-def test_checkout_only_missing_refuses_directory_that_would_be_hybrid(
+def test_checkout_only_missing_replaces_directory_of_cached_file_symlinks(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
+    """Symlinks into the cache for an older version are pivot's own output, not local edits."""
+    root = project.get_project_root()
+    data_dir = _helper_track_directory(root)
+    cache.remove_output(data_dir)
+    restored = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "symlink", "data/ext"])
+    assert restored.exit_code == 0, restored.output
+    assert (data_dir / "b.txt").is_symlink()
+    new_pvt_data = _helper_cache_directory(
+        root / "new-ext",
+        {"a.txt": "one updated\n", "c.txt": "three\n"},
+    )
+    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+
+    result = runner.invoke(
+        cli.cli, ["checkout", "--only-missing", "--checkout-mode", "symlink", "data/ext"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sorted(p.name for p in data_dir.iterdir()) == ["a.txt", "c.txt"]
+    assert (data_dir / "a.txt").read_text() == "one updated\n"
+
+
+def test_checkout_only_missing_refuses_update_when_a_file_holds_an_uncached_edit(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    """One edit the cache lacks blocks the update; only that file is named, nothing is restored."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
     new_pvt_data = _helper_cache_directory(
@@ -141,18 +167,39 @@ def test_checkout_only_missing_refuses_directory_that_would_be_hybrid(
         {"a.txt": "one updated\n", "c.txt": "three\n"},
     )
     track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    (data_dir / "b.txt").write_text("two EDITED\n")
 
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
 
     assert result.exit_code != 0
-    assert "a.txt" in result.output
-    assert "b.txt" in result.output
-    assert "--force" in result.output
+    assert "'ext' has local changes that are not in the cache: b.txt. Use --force" in result.output
     assert (data_dir / "a.txt").read_text() == "one\n"
-    assert (data_dir / "b.txt").read_text() == "two\n"
-    assert not (data_dir / "c.txt").exists(), (
-        "A failed checkout must not partially restore new files"
+    assert (data_dir / "b.txt").read_text() == "two EDITED\n"
+    assert not (data_dir / "c.txt").exists(), "A refused checkout must not restore anything"
+
+
+def test_checkout_only_missing_refuses_update_that_would_delete_ignored_entries(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    """Entries the directory hash ignores are never cached, so replacing the directory refuses."""
+    root = project.get_project_root()
+    data_dir = _helper_track_directory(root)
+    new_pvt_data = _helper_cache_directory(
+        root / "new-ext",
+        {"a.txt": "one updated\n", "c.txt": "three\n"},
     )
+    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    (data_dir / "build").mkdir()
+    (data_dir / "build" / "x.o").write_text("object\n")
+    (data_dir / "draft.txt~").write_text("backup\n")
+
+    result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
+
+    assert result.exit_code != 0
+    assert "not in the cache: build, draft.txt~. Use --force" in result.output
+    assert (data_dir / "build" / "x.o").read_text() == "object\n"
+    assert (data_dir / "draft.txt~").read_text() == "backup\n"
+    assert (data_dir / "a.txt").read_text() == "one\n"
 
 
 def test_checkout_only_missing_reports_edited_file_in_directory(
