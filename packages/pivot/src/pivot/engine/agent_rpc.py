@@ -260,6 +260,11 @@ class AgentRpcHandler:
         return self._engine.is_starting
 
     @property
+    def reloading(self) -> bool:
+        """Whether the engine is reloading edited pipeline code."""
+        return self._engine.is_reloading
+
+    @property
     def pipeline_error(self) -> str | None:
         """Why the engine's pipeline cannot run, or None when it can."""
         return self._engine.pipeline_error
@@ -321,12 +326,13 @@ class AgentRpcHandler:
                     return QueryStagesResult(stages=list[str]())
                 return QueryStagesResult(stages=pipeline.list_stages())
             case "explain":
+                # Explain fingerprints the stage; the startup snapshot or a reload must finish
+                # first, and it explains the pipeline loaded once they have.
+                await self._engine.wait_for_fingerprints()
                 stage, reg_info = self._get_stage_info(params)
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
                     raise ValueError("No pipeline loaded")
-                # Explain fingerprints the stage; the startup snapshot must finish first.
-                await self._engine.wait_for_startup_fingerprints()
                 fingerprint = pipeline.ensure_fingerprint(stage)
 
                 def _get_explanation() -> StageExplanation:
@@ -364,8 +370,8 @@ class AgentRpcHandler:
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case "commit":
                 # Commit fingerprints every stage, so it never runs alongside the startup
-                # snapshot. Over the socket it is refused while starting or invalid instead.
-                await self._engine.wait_for_startup_fingerprints()
+                # snapshot or a reload. Over the socket it is refused while either runs instead.
+                await self._engine.wait_for_fingerprints()
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
                     raise ValueError("No pipeline loaded")
@@ -686,9 +692,10 @@ class AgentRpcSource:
         return _json_rpc_error(-32601, "Method not found", request_id)
 
     def _refuse_while_not_ready(self, request_id: JsonRpcId) -> JsonRpcErrorResponse | None:
-        """Refuse at once while the startup snapshot runs, or while the pipeline is invalid.
+        """Refuse at once while stages are fingerprinted, or while the pipeline is invalid.
 
-        Never holds the reply for the snapshot; returns None when the request may proceed.
+        Never holds the reply for the startup snapshot or a reload; returns None when the
+        request may proceed.
         """
         if self._handler is None:
             return None
@@ -696,6 +703,12 @@ class AgentRpcSource:
             return _json_rpc_error(
                 _ERR_ENGINE_STARTING,
                 "Engine is starting: fingerprinting stages; try again when it is ready",
+                request_id,
+            )
+        if self._handler.reloading:
+            return _json_rpc_error(
+                _ERR_ENGINE_STARTING,
+                "Engine is reloading: fingerprinting edited stages; try again when it is ready",
                 request_id,
             )
         if self._handler.pipeline_error is not None:

@@ -802,6 +802,7 @@ async def test_agent_rpc_source_accepts_new_connections_after_handler_exception(
 
         _call_count: int
         starting: bool = False
+        reloading: bool = False
         pipeline_error: str | None = None
 
         def __init__(self) -> None:

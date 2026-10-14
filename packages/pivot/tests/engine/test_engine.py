@@ -11,7 +11,7 @@ import anyio
 import networkx as nx
 import pytest
 
-from pivot import loaders, parameters, project, types
+from pivot import exceptions, loaders, parameters, project, types
 from pivot.compose import Pipeline, stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import graph as engine_graph
@@ -19,6 +19,7 @@ from pivot.engine.engine import Engine
 from pivot.engine.sinks import ResultCollectorSink
 from pivot.engine.sources import OneShotSource
 from pivot.engine.types import (
+    CancelRequested,
     CodeOrConfigChanged,
     DataArtifactChanged,
     EngineDiagnostic,
@@ -1031,6 +1032,172 @@ async def test_engine_concurrent_run_requests_coalesced() -> None:
         )
 
 
+def _helper_run_request(stages: list[str] | None, *, force: bool = False) -> RunRequested:
+    return RunRequested(
+        type="run_requested",
+        stages=stages,
+        force=force,
+        reason="test",
+        single_stage=False,
+        parallel=True,
+        max_workers=None,
+        resource_capacity={},
+        no_commit=False,
+        on_error=OnError.FAIL,
+        cache_dir=None,
+        allow_uncached_incremental=False,
+        checkout_missing=False,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("first", "second", "replayed"),
+    [
+        pytest.param(
+            (["stage_a"], False), (["stage_b"], False), (["stage_a", "stage_b"], False), id="union"
+        ),
+        pytest.param((None, False), (["stage_b"], False), (None, False), id="all-stays-all"),
+        pytest.param(
+            (["stage_a"], True),
+            (["stage_b"], False),
+            (["stage_a", "stage_b"], True),
+            id="forced-stays-forced",
+        ),
+    ],
+)
+async def test_engine_restart_covers_the_cancelled_run_and_the_new_request(
+    first: tuple[list[str] | None, bool],
+    second: tuple[list[str] | None, bool],
+    replayed: tuple[list[str] | None, bool],
+) -> None:
+    """A request that cancels a run replays both: a restart never narrows what was going to run."""
+    calls = list[tuple[list[str] | None, bool]]()
+
+    async with Engine() as engine:
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            calls.append(
+                (cast("list[str] | None", kwargs["stages"]), cast("bool", kwargs["force"]))
+            )
+            if len(calls) == 1:
+                with anyio.fail_after(5):
+                    await engine._cancel_event.wait()
+            return {}
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(_helper_run_request(first[0], force=first[1]))
+            await anyio.wait_all_tasks_blocked()
+            await engine._handle_run_requested(_helper_run_request(second[0], force=second[1]))
+
+    assert calls == [first, replayed]
+
+
+@pytest.mark.anyio
+async def test_engine_restart_after_deferred_reload_skips_removed_stages() -> None:
+    """A restart replayed after a deferred reload drops the stages that reload removed."""
+    stage_list = ["stage_a", "stage_gone"]
+    calls = list[list[str] | None]()
+
+    async with Engine() as engine:
+        pipeline = MagicMock()
+        pipeline.list_stages.side_effect = lambda: list(stage_list)
+        engine._pipeline = pipeline
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            stages = cast("list[str] | None", kwargs["stages"])
+            unknown = [s for s in stages or [] if s not in stage_list]
+            if unknown:
+                raise exceptions.StageNotFoundError(unknown, available_stages=stage_list)
+            calls.append(stages)
+            if len(calls) == 1:
+                with anyio.fail_after(5):
+                    await engine._cancel_event.wait()
+            return {}
+
+        async def mock_code_changed(_event: CodeOrConfigChanged) -> None:
+            stage_list.remove("stage_gone")
+            await engine._execute_affected_stages(list(stage_list))
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._handle_code_or_config_changed = mock_code_changed  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(_helper_run_request(["stage_a", "stage_gone"]))
+            await anyio.wait_all_tasks_blocked()
+            engine._reload_pending = {"pipeline.py"}
+            await engine._handle_run_requested(_helper_run_request(["stage_gone"]))
+
+    assert calls[0] == ["stage_a", "stage_gone"]
+    assert calls[-1] == ["stage_a"], "the replayed restart runs what still exists"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("steps", "replayed"),
+    [
+        pytest.param(["stage_b", "stage_c"], ["stage_a", "stage_b", "stage_c"], id="edits-only"),
+        pytest.param(["cancel", "stage_c"], ["stage_c"], id="cancel-then-edit"),
+        pytest.param(["stage_c", "cancel"], ["stage_c"], id="edit-then-cancel"),
+    ],
+)
+async def test_engine_run_request_while_cancelling_waits_for_the_run_to_end(
+    steps: list[str],
+    replayed: list[str],
+) -> None:
+    """A request made while a run is cancelling starts no second run alongside it.
+
+    Requests that cancel a run replay with its stages once it ends. An explicit cancel, made
+    before or after those requests, stops the run's own stages from replaying; the requests
+    still replay.
+    """
+    calls = list[list[str] | None]()
+    in_flight = 0
+    most_in_flight = 0
+    release = anyio.Event()
+
+    async with Engine() as engine:
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            nonlocal in_flight, most_in_flight
+            in_flight += 1
+            most_in_flight = max(most_in_flight, in_flight)
+            calls.append(cast("list[str] | None", kwargs["stages"]))
+            try:
+                if len(calls) == 1:
+                    # A stage still running keeps the cancelled run in CANCELLING
+                    with anyio.fail_after(5):
+                        await engine._cancel_event.wait()
+                        await release.wait()
+                return {}
+            finally:
+                in_flight -= 1
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_input_event(_helper_run_request(["stage_a"]))
+            await anyio.wait_all_tasks_blocked()
+            for step in steps:
+                if step == "cancel":
+                    await engine._handle_input_event(CancelRequested(type="cancel_requested"))
+                else:
+                    await engine._handle_input_event(_helper_run_request([step]))
+                assert engine._run_state == engine_mod._RunState.CANCELLING
+            await anyio.wait_all_tasks_blocked()
+            release.set()
+
+    assert most_in_flight == 1, f"a second run started while the first was cancelling: {calls}"
+    assert calls == [["stage_a"], replayed]
+
+
 # =============================================================================
 # Cleanup Tests
 # =============================================================================
@@ -1074,6 +1241,16 @@ async def test_engine_aexit_closes_sinks_when_source_raises() -> None:
 # =============================================================================
 
 
+async def _helper_reload_ok() -> dict[str, RegistryStageInfo]:
+    """Stand-in for Engine._reload_registry: a reload that succeeded with no old stages."""
+    return {}
+
+
+async def _helper_reload_failed() -> str:
+    """Stand-in for Engine._reload_registry: a reload that found the pipeline invalid."""
+    return "Failed to load pipeline.py"
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("parallel", "max_workers", "expected_restart_calls"),
@@ -1108,7 +1285,7 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
         mock_pipeline.get.return_value = MagicMock()
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
-        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass
@@ -1144,7 +1321,7 @@ async def test_engine_code_reload_restores_project_watch_root(
     async with Engine(pipeline=pipeline) as engine:
         engine.add_source(source)
         engine._stored_parallel = False
-        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test seam
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test seam
 
         async def _ignore_reload(*_args: object) -> None:
             pass
@@ -1182,7 +1359,7 @@ async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
         engine._stored_parallel = True
 
         # Mock reload to FAIL
-        engine._reload_registry = lambda: "Failed to load pipeline.py"  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_failed  # type: ignore[assignment] - test mock
         engine._invalidate_caches = lambda: None  # type: ignore[assignment] - test mock
 
         event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
@@ -1216,7 +1393,7 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
 
-        engine._reload_registry = lambda: {}  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass

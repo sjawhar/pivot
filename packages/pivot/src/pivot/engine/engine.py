@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import concurrent.futures
 import contextlib
+import contextvars
 import importlib
 import importlib.util
 import itertools
@@ -12,6 +13,7 @@ import logging
 import pathlib
 import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 import anyio
 import anyio.from_thread
+import anyio.lowlevel
 import anyio.to_thread
 
 from pivot import (
@@ -78,7 +81,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    import threading
+    from collections.abc import Callable
 
     import networkx as nx
     from anyio.abc import TaskGroup
@@ -137,6 +140,66 @@ class _WatchOutputSnapshot:
     entries: dict[pathlib.Path, _WatchOutputSignature]
 
 
+def _merge_run_requests(earlier: RunRequested, later: RunRequested) -> RunRequested:
+    """One request that runs everything ``earlier`` and ``later`` would run.
+
+    A restart replays this instead of ``later`` alone, so it never narrows what was going to run:
+    the stages are the union (None, all stages, wins), the merged run is forced if either was, and
+    dependencies are resolved unless both ran single stages. Every other field comes from
+    ``later``, the newest request.
+    """
+    stages = (
+        None
+        if earlier["stages"] is None or later["stages"] is None
+        else list(dict.fromkeys([*earlier["stages"], *later["stages"]]))
+    )
+    return RunRequested(
+        type="run_requested",
+        stages=stages,
+        force=earlier["force"] or later["force"],
+        reason=later["reason"],
+        single_stage=earlier["single_stage"] and later["single_stage"],
+        parallel=later["parallel"],
+        max_workers=later["max_workers"],
+        resource_capacity=later["resource_capacity"],
+        no_commit=later["no_commit"],
+        on_error=later["on_error"],
+        cache_dir=later["cache_dir"],
+        allow_uncached_incremental=later["allow_uncached_incremental"],
+        checkout_missing=later["checkout_missing"],
+    )
+
+
+async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
+    """Run ``func`` on a new daemon thread and wait for its result; cancelling abandons it.
+
+    anyio's worker threads are not daemon threads when the event loop runs on the main thread,
+    so interpreter shutdown joins any still running. This is for work the process must not wait
+    for when it exits, such as importing an edited pipeline.py that may never return.
+    """
+    token = anyio.lowlevel.current_token()
+    done = anyio.Event()
+    results = list[T]()
+    failures = list[BaseException]()
+    context = contextvars.copy_context()
+
+    def _target() -> None:
+        try:
+            results.append(context.run(func))
+        except BaseException as exc:  # re-raised in the waiting task
+            failures.append(exc)
+        # Once the event loop has finished or is closing (RunFinishedError, or "Event loop is
+        # closed" in the race between the two), nobody waits for the result
+        with contextlib.suppress(RuntimeError):
+            anyio.from_thread.run_sync(done.set, token=token)
+
+    threading.Thread(target=_target, name="pivot reload", daemon=True).start()
+    await done.wait()
+    if failures:
+        raise failures[0]
+    return results[0]
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -174,7 +237,13 @@ class Engine:
     # Run state machine (Task 10/11)
     _run_state: _RunState
     _run_task_group: TaskGroup | None
+    # Requests made since the running run began, replayed once it ends
     _restart_pending: RunRequested | None
+    # The request of the run in progress; a restart that cancels it replays its stages too
+    _running_request: RunRequested | None
+    # The request of a run a restart cancelled, merged into the restart only when it replays;
+    # an explicit cancel clears it, so that run's own stages stay cancelled
+    _cancelled_request: RunRequested | None
     _reload_pending: set[str] | None
     _idle_condition: anyio.Condition
 
@@ -196,6 +265,8 @@ class Engine:
     # Why the pipeline is invalid: set by the startup snapshot or any rejected reload, cleared
     # by the next good reload. While set, no run starts (RPC run, data change, or startup).
     _pipeline_error: str | None
+    # Set while no code reload is in flight; replaced by a fresh Event when one starts
+    _reload_done: anyio.Event
 
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
@@ -232,6 +303,8 @@ class Engine:
         self._run_state = _RunState.IDLE
         self._run_task_group = None
         self._restart_pending = None
+        self._running_request = None
+        self._cancelled_request = None
         self._reload_pending = None
         self._idle_condition = anyio.Condition()
 
@@ -254,6 +327,8 @@ class Engine:
 
         self._startup_fingerprinted = anyio.Event()
         self._pipeline_error = None
+        self._reload_done = anyio.Event()
+        self._reload_done.set()
 
     @property
     def state(self) -> EngineState:
@@ -269,6 +344,11 @@ class Engine:
     def is_starting(self) -> bool:
         """Whether a watched engine is still taking its startup fingerprint snapshot."""
         return self._watches_filesystem() and not self._startup_fingerprinted.is_set()
+
+    @property
+    def is_reloading(self) -> bool:
+        """Whether a code reload is in flight: import, fingerprints, then the re-run's start."""
+        return not self._reload_done.is_set()
 
     @property
     def sources(self) -> list[EventSource]:
@@ -647,6 +727,8 @@ class Engine:
             case "run_requested":
                 await self._handle_run_requested(event)
             case "cancel_requested":
+                # An explicit cancel: the run's own stages do not replay with a queued restart
+                self._cancelled_request = None
                 await self._handle_cancel_requested()
             case "data_artifact_changed":
                 await self._handle_data_artifact_changed(event)
@@ -656,8 +738,11 @@ class Engine:
     async def _handle_run_requested(self, event: RunRequested) -> None:
         """Handle a RunRequested event by spawning a non-blocking execution task.
 
-        If already running, coalesces into a restart: cancels the current run
-        and queues the new event for replay once the current run completes.
+        If already running, coalesces into a restart: cancels the current run and queues the new
+        event, replayed with the cancelled run's stages once that run ends. While a run is
+        cancelling, the event joins the queued restart. An explicit cancel, before or after,
+        keeps the cancelled run's stages out of the replay. A restart waiting behind a deferred
+        reload is folded into that reload's re-run.
         """
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
@@ -670,12 +755,31 @@ class Engine:
             return
 
         if self._run_state == _RunState.RUNNING:
-            # Coalesce: only the latest restart request survives
+            # Coalesce: hold the cancelled run's request apart, merged in only at replay
+            assert self._running_request is not None
+            self._cancelled_request = self._running_request
             self._restart_pending = event
             await self._handle_cancel_requested()
             return
 
+        if self._run_state == _RunState.CANCELLING:
+            # Wait for the stopping run and join the restart queued behind it
+            self._restart_pending = (
+                event
+                if self._restart_pending is None
+                else _merge_run_requests(self._restart_pending, event)
+            )
+            return
+
+        pending = self._take_restart()
+        if pending is not None:
+            # Only a deferred reload's re-run starts while a restart waits; it runs both
+            pending = self._drop_removed_stages(pending)
+            if pending is not None:
+                event = _merge_run_requests(pending, event)
+
         self._run_state = _RunState.RUNNING
+        self._running_request = event
 
         # Clear cancel event before starting new execution
         self._cancel_event = anyio.Event()  # Reset by creating new event
@@ -717,6 +821,7 @@ class Engine:
                 checkout_missing=event["checkout_missing"],
             )
         finally:
+            self._running_request = None
             pending_reload = self._reload_pending is not None
             pending_restart = self._restart_pending is not None
 
@@ -734,10 +839,11 @@ class Engine:
                         CodeOrConfigChanged(type="code_or_config_changed", paths=reload_paths)
                     )
 
-                # Replay coalesced restart request (clear before call for future-safety)
-                if self._restart_pending is not None:
-                    restart = self._restart_pending
-                    self._restart_pending = None
+                # Replay a restart no reload re-run absorbed (taken before the call)
+                restart = self._take_restart()
+                if restart is not None and reload_pending is not None:
+                    restart = self._drop_removed_stages(restart)
+                if restart is not None:
                     await self._handle_run_requested(restart)
 
                 if self._run_state == _RunState.IDLE and not self._has_pending_work():
@@ -755,6 +861,35 @@ class Engine:
                     EngineStateChanged(type="engine_state_changed", state=EngineState.IDLE)
                 )
                 self._current_run_id = None
+
+    def _take_restart(self) -> RunRequested | None:
+        """Remove and return the queued restart, with the cancelled run's stages merged in.
+
+        The cancelled run's request is held apart until now so an explicit cancel made after the
+        restart was queued can still drop it.
+        """
+        restart = self._restart_pending
+        cancelled = self._cancelled_request
+        self._restart_pending = None
+        self._cancelled_request = None
+        if restart is None or cancelled is None:
+            return restart
+        return _merge_run_requests(cancelled, restart)
+
+    def _drop_removed_stages(self, request: RunRequested) -> RunRequested | None:
+        """``request`` without stages a reload removed since it was made; None if none remain.
+
+        An empty stage list would mean every stage, so a request left with none is dropped.
+        """
+        if request["stages"] is None:
+            return request
+        current = set(self._list_stages())
+        stages = [stage for stage in request["stages"] if stage in current]
+        if not stages:
+            return None
+        kept = request.copy()
+        kept["stages"] = stages
+        return kept
 
     def _has_pending_work(self) -> bool:
         return self._restart_pending is not None or self._reload_pending is not None
@@ -2164,15 +2299,17 @@ class Engine:
 
         return any(isinstance(source, FilesystemSource) for source in self._sources)
 
-    async def wait_for_startup_fingerprints(self) -> None:
-        """Wait until a watched engine's startup fingerprint snapshot has finished.
+    async def wait_for_fingerprints(self) -> None:
+        """Wait until neither the startup snapshot nor a code reload is fingerprinting stages.
 
         RPC queries that fingerprint stages wait here, so no stage is fingerprinted on two
         threads at once. Returns at once for an engine without a filesystem source, which
-        takes no snapshot.
+        takes no snapshot and never reloads.
         """
         if self._watches_filesystem():
             await self._startup_fingerprinted.wait()
+        while self.is_reloading:
+            await self._reload_done.wait()
 
     async def _fingerprint_watched_stages(self) -> None:
         """Fingerprint every stage before a watched engine starts its watcher and startup run.
@@ -2180,7 +2317,7 @@ class Engine:
         A code reload diffs the edited pipeline against these cached fingerprints; computing
         the old ones after the edit would read the edited source and report nothing modified.
         Each stage is fingerprinted in a worker thread so the RPC server keeps answering, and
-        nothing else fingerprints until this returns (see ``wait_for_startup_fingerprints``),
+        nothing else fingerprints until this returns (see ``wait_for_fingerprints``),
         so the startup run's skip check reuses the cached values.
 
         A stage that fails to fingerprint, or a ``params.yaml`` that fails its checks against the
@@ -2274,6 +2411,11 @@ class Engine:
 
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
+        if self.is_reloading:
+            # Only a reload deferred to the end of a run overlaps the input loop; the re-run it
+            # starts checks every stage against the inputs as they are now.
+            _logger.debug("Data changed during a reload - its re-run covers the change")
+            return
         paths = [pathlib.Path(path) for path in event["paths"]]
         filtered_paths = list[pathlib.Path]()
         deferred_paths = list[tuple[str, pathlib.Path]]()
@@ -2312,16 +2454,30 @@ class Engine:
     async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
         """Handle code/config changes by reloading registry and re-running.
 
-        If a run is active, defers the reload until the current run completes.
+        If a run is active, defers the reload until the current run completes. Reloads run one
+        at a time: an edit that arrives while a reload deferred to the end of a run is still in
+        flight waits for it, then reloads again.
         """
-        if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
-            _logger.info("Code/config changed while running - deferring reload")
-            if self._reload_pending is None:
-                self._reload_pending = set(event["paths"])
-            else:
-                self._reload_pending.update(event["paths"])
-            return
+        while True:
+            if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
+                _logger.info("Code/config changed while running - deferring reload")
+                if self._reload_pending is None:
+                    self._reload_pending = set(event["paths"])
+                else:
+                    self._reload_pending.update(event["paths"])
+                return
+            if not self.is_reloading:
+                break
+            await self._reload_done.wait()
 
+        self._reload_done = anyio.Event()
+        try:
+            await self._reload_and_rerun(event)
+        finally:
+            self._reload_done.set()
+
+    async def _reload_and_rerun(self, event: CodeOrConfigChanged) -> None:
+        """Reload the edited pipeline off the event loop, then re-run every stage."""
         _logger.info("Code/config changed - reloading pipeline")
 
         # Invalidate caches
@@ -2347,7 +2503,7 @@ class Engine:
                     )
 
         # Reload registry - returns the old stages on success, the error message on failure
-        reload_result = self._reload_registry()
+        reload_result = await self._reload_registry()
 
         if isinstance(reload_result, str):
             _logger.error("Pipeline invalid - waiting for fix")
@@ -2526,7 +2682,7 @@ class Engine:
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
-    def _reload_registry(self) -> dict[str, RegistryStageInfo] | str:
+    async def _reload_registry(self) -> dict[str, RegistryStageInfo] | str:
         """Reload the pipeline by re-importing pipeline definition.
 
         Returns the old pipeline's stages if reload succeeded, or the error message if the
@@ -2535,40 +2691,51 @@ class Engine:
         loaded but is marked invalid, so nothing runs until a good reload. The new fingerprints
         stay cached for the reload event's diff. The caller should emit the reload event using
         the returned stages.
+
+        The import, the fingerprints and the ``params.yaml`` checks run in one daemon thread
+        (``_load_pipeline``), so the RPC server keeps answering and an exit never waits for an
+        import that hangs; the pipeline swap happens here, on the event loop.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
         root = project.get_project_root()
-
-        # Clear project modules from sys.modules
-        self._clear_project_modules(root)
-
-        # Use discovery to reload the pipeline
         try:
-            from pivot import discovery
-
-            new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
-            if new_pipeline is None:
-                return self._reject_reload(old_pipeline, ["No pipeline found during reload"])
-
-            errors = list[str]()
-            for stage_name in new_pipeline.list_stages():
-                try:
-                    _ = new_pipeline.ensure_fingerprint(stage_name)
-                except exceptions.PivotError as exc:
-                    errors.append(str(exc))
-            try:
-                _ = parameters.load_params_yaml(new_pipeline)
-            except (exceptions.ParamsError, exceptions.PipelineConfigError) as exc:
-                errors.append(str(exc))
-            if errors:
-                return self._reject_reload(old_pipeline, errors)
-
-            self._pipeline = new_pipeline
-            self._pipeline_error = None
-            return old_stages
+            new_pipeline, errors = await _run_in_daemon_thread(lambda: self._load_pipeline(root))
         except Exception as e:
             return self._reject_reload(old_pipeline, [str(e)])
+        if new_pipeline is None:
+            return self._reject_reload(old_pipeline, ["No pipeline found during reload"])
+        if errors:
+            return self._reject_reload(old_pipeline, errors)
+
+        self._pipeline = new_pipeline
+        self._pipeline_error = None
+        return old_stages
+
+    def _load_pipeline(self, root: pathlib.Path) -> tuple[registry.PipelineLike | None, list[str]]:
+        """Re-import the project's pipeline, fingerprint every stage and check ``params.yaml``.
+
+        Runs in a daemon thread. All of a reload's ``sys.modules`` changes (dropping project
+        modules, importing the edited ones) happen in this one call, on one thread. Returns the
+        new pipeline, or None if the project defines none, and the errors that make it invalid.
+        """
+        from pivot import discovery
+
+        self._clear_project_modules(root)
+        new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
+        if new_pipeline is None:
+            return None, list[str]()
+        errors = list[str]()
+        for stage_name in new_pipeline.list_stages():
+            try:
+                _ = new_pipeline.ensure_fingerprint(stage_name)
+            except exceptions.PivotError as exc:
+                errors.append(str(exc))
+        try:
+            _ = parameters.load_params_yaml(new_pipeline)
+        except (exceptions.ParamsError, exceptions.PipelineConfigError) as exc:
+            errors.append(str(exc))
+        return new_pipeline, errors
 
     def _reject_reload(self, old_pipeline: registry.PipelineLike | None, errors: list[str]) -> str:
         """Keep the last loaded pipeline but mark it invalid; return the error message."""

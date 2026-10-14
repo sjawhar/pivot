@@ -158,7 +158,7 @@ def _helper_discover(root: pathlib.Path) -> PipelineLike:
 
 async def _helper_wait_until_watching(eng: engine_mod.Engine) -> None:
     """Return once the engine's startup snapshot is done and its file watcher is running."""
-    await eng.wait_for_startup_fingerprints()
+    await eng.wait_for_fingerprints()
     await anyio.wait_all_tasks_blocked()
 
 
@@ -429,6 +429,217 @@ async def test_watched_startup_serves_rpc_while_fingerprinting(
     assert sorted(calls) == ["reload/change", "reload/keep", "reload/other"], (
         "each stage is fingerprinted exactly once, even with explain issued mid-snapshot"
     )
+
+
+@pytest.mark.anyio
+async def test_reload_fingerprints_off_the_event_loop(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While a reload imports and fingerprints slowly, the RPC server keeps answering.
+
+    ``status`` answers within 1 s mid-reload, and ``run`` and ``commit`` are refused at once
+    with -32004 "Engine is reloading" until the new pipeline is in.
+    """
+    from pivot import registry
+
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
+    pipeline = _helper_discover(watch_project)
+    recorder = _Recorder()
+    socket_path = watch_project / "rpc.sock"
+    ready = threading.Event()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        handler = agent_rpc.AgentRpcHandler(engine=eng)
+        eng.add_source(
+            agent_rpc.AgentRpcSource(socket_path=socket_path, handler=handler, ready=ready)
+        )
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            client = rpc_client_impl.RpcPivotClient()
+            with anyio.fail_after(5):
+                while not ready.is_set():
+                    await anyio.sleep(0.01)
+                await client.connect(socket_path)
+            await _helper_wait_until_watching(eng)
+
+            compute = registry._compute_fingerprint
+            reload_started = threading.Event()
+            finished = list[str]()
+
+            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+                reload_started.set()
+                time.sleep(1.0)
+                finished.append(stage_name)
+                return compute(stage_name, info)
+
+            monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
+            pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
+            try:
+                with anyio.fail_after(10):
+                    while not reload_started.is_set():
+                        await anyio.sleep(0.01)
+
+                start = time.monotonic()
+                with anyio.fail_after(5):
+                    status = await client.status()
+                assert time.monotonic() - start < 1.0, "status answers within 1 s mid-reload"
+                assert status["state"] == "idle"
+                assert len(finished) < 3, "status answered while the reload still fingerprints"
+
+                for request in (client.run(force=True), client.commit()):
+                    with anyio.fail_after(1), pytest.raises(rpc_client_impl.RpcError) as refused:
+                        await request
+                    assert refused.value.code == -32004
+                    assert "Engine is reloading" in refused.value.message
+                assert len(finished) < 3, "run and commit were refused before the reload ended"
+            finally:
+                await client.disconnect()
+
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            reload_event = recorder.events[reload_index]
+            assert reload_event["type"] == "pipeline_reloaded"
+            assert reload_event["stages_added"] == ["reload/added"]
+            assert reload_event["stages_removed"] == ["reload/removed"]
+            done = await recorder.wait_for(_helper_completes("reload/added"), start=reload_index)
+            await recorder.wait_for(_helper_is_idle, start=done)
+            assert not eng.is_reloading, "the reload ends once its re-run has started"
+            tg.cancel_scope.cancel()
+
+
+def _helper_chains_source(b_suffix: str, *, a_sleep: float = 0.0) -> str:
+    """pipeline.py with two independent stages: from_a reads a.txt and from_b reads b.txt.
+
+    With ``a_sleep``, from_a sleeps that many seconds, so a run stays busy in it.
+    """
+    return f"""\
+from __future__ import annotations
+
+import time
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def from_a(raw: str) -> str:
+    time.sleep({a_sleep!r})
+    return raw + "-a"
+
+
+@stage
+def from_b(raw: str) -> str:
+    return raw + {b_suffix!r}
+
+
+with Pipeline("chains") as pipeline:
+    from_a(pipeline.input("a.txt"))
+    from_b(pipeline.input("b.txt"))
+"""
+
+
+@pytest.mark.anyio
+async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A data edit made while a slow reload runs does not narrow the reload's re-run.
+
+    The engine handles the a.txt edit once the re-run of every stage has started, and the restart
+    it causes must still re-run from_b, whose code the reload changed, as well as from_a.
+    """
+    from pivot import registry
+
+    raw_dir = watch_project / "data" / "raw"
+    (raw_dir / "a.txt").write_text("a1")
+    (raw_dir / "b.txt").write_text("b1")
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_chains_source("-v1"))
+    pipeline = _helper_discover(watch_project)
+    a_output = _helper_output_path(watch_project, pipeline, "chains/from_a")
+    b_output = _helper_output_path(watch_project, pipeline, "chains/from_b")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        # One worker: from_a runs first, so from_b is still queued when the restart cancels
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert (a_output.read_text(), b_output.read_text()) == ("a1-a", "b1-v1")
+
+            compute = registry._compute_fingerprint
+            reload_started = threading.Event()
+
+            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+                reload_started.set()
+                time.sleep(1.0)
+                return compute(stage_name, info)
+
+            monkeypatch.setattr(registry, "_compute_fingerprint", _slow_compute)
+            pipeline_py.write_text(_helper_chains_source("-v2"))
+            with anyio.fail_after(10):
+                while not reload_started.is_set():
+                    await anyio.sleep(0.01)
+            (raw_dir / "a.txt").write_text("a2")
+
+            reload_index = await recorder.wait_for(_helper_is_reload, start=first_idle)
+            await recorder.wait_for(_helper_is_idle, start=reload_index)
+            assert a_output.read_text() == "a2-a", "the mid-reload data edit is picked up"
+            assert b_output.read_text() == "b1-v2", "the code-edited stage re-runs"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_data_edit_while_a_run_is_cancelling_waits_for_it(
+    watch_project: pathlib.Path,
+) -> None:
+    """A data edit made while a run is cancelling keeps watch alive and is picked up afterwards.
+
+    Editing a.txt twice cancels the first from_a run, which stays CANCELLING until its stage
+    ends. A b.txt edit then joins the pending restart instead of starting a second run against
+    a worker pool that has stopped accepting stages.
+    """
+    raw_dir = watch_project / "data" / "raw"
+    (raw_dir / "a.txt").write_text("a1")
+    (raw_dir / "b.txt").write_text("b1")
+    (watch_project / "pipeline.py").write_text(_helper_chains_source("-b", a_sleep=1.5))
+    pipeline = _helper_discover(watch_project)
+    a_output = _helper_output_path(watch_project, pipeline, "chains/from_a")
+    b_output = _helper_output_path(watch_project, pipeline, "chains/from_b")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(sources.OneShotSource(stages=None, force=False, reason="test"))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+
+            (raw_dir / "a.txt").write_text("a2")
+            await recorder.wait_for(
+                lambda e: e["type"] == "stage_started" and e["stage"] == "chains/from_a",
+                start=first_idle,
+            )
+            (raw_dir / "a.txt").write_text("a3")
+            with anyio.fail_after(5):
+                while eng._run_state != engine_mod._RunState.CANCELLING:
+                    await anyio.sleep(0.01)
+            b_edit = len(recorder.events)
+            (raw_dir / "b.txt").write_text("b2")
+
+            done = await recorder.wait_for(_helper_completes("chains/from_b"), start=b_edit)
+            await recorder.wait_for(_helper_is_idle, start=done)
+            assert a_output.read_text() == "a3-a", "the second a.txt edit is picked up"
+            assert b_output.read_text() == "b2-b", "the b.txt edit made while cancelling is too"
+            tg.cancel_scope.cancel()
 
 
 @pytest.mark.anyio
