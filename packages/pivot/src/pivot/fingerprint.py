@@ -521,7 +521,7 @@ def _value_kind(value: Any) -> _ValueKind:
     # functools.partial fails is_user_code() (module is functools/stdlib).
     if isinstance(value, functools.partial):
         return _ValueKind.PARTIAL
-    if _is_callable_instance(value) or _is_user_class_instance(value):
+    if _is_callable_instance(value) or _is_user_class_instance(value) or _carries_instance(value):
         return _ValueKind.REFUSED
     if callable(value):
         return _ValueKind.USER if is_user_code(value) else _ValueKind.EXTERNAL
@@ -1395,6 +1395,22 @@ def _library_name(value: Any) -> str:
     return name
 
 
+def _carries_instance(value: Any) -> bool:
+    """Return whether `value` is a method bound to an object whose state it may read.
+
+    `Scaler(3).apply` and `np.random.default_rng(SEED).normal` carry an instance that no code
+    hash records. A method bound to a module, a class, a scalar or a Logger does not, and
+    neither does a library module's own export (`np.random.normal`, `random.random`), whose
+    state belongs to the library.
+    """
+    bound = getattr(value, "__self__", None)
+    if bound is None or isinstance(
+        bound, (types.ModuleType, type, bool, int, float, str, bytes, logging.Logger)
+    ):
+        return False
+    return not _is_library_export(value)
+
+
 def _is_library_callable(value: Any) -> bool:
     """Return whether `value` is a library routine, or a library module's own callable export.
 
@@ -1658,8 +1674,9 @@ def _process_bound_values(
     partials, lists, tuples, sets and dict values. Each user function, including one behind
     a `functools.cache` wrapper, and each user class gets the walk a stage helper gets:
     globals, closure values, defaults, and the non-scalar refusal. An instance of a user
-    class with `__call__` is refused, as it is when a stage reads one: what its `__call__`
-    reads is not walked, and its repr does not record its behaviour.
+    class with `__call__`, or a method bound to an instance (`Scaler(3).apply`,
+    `default_rng(SEED).normal`), is refused, as it is when a stage reads one: what it reads
+    from its instance is not walked, and its repr does not record that state.
     """
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
@@ -1692,7 +1709,7 @@ def _process_bound_values(
                 _hash_pydantic_schema(
                     cast("type[_PydanticModelProtocol]", value), manifest, visited
                 )
-    elif callable(value) and _is_user_class_instance(value):
+    elif callable(value) and (_is_user_class_instance(value) or _carries_instance(value)):
         _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
     elif callable(value) and inspect.isfunction(inspect.unwrap(value)) and is_user_code(value):
         _process_callable_dependency(binding_ref, value, manifest, visited)
@@ -2020,7 +2037,11 @@ def _process_module_dependency(
             manifest[key] = "unknown"
             continue
         with _walking(step):
-            if _is_callable_instance(attr_value) or _is_user_class_instance(attr_value):
+            if (
+                _is_callable_instance(attr_value)
+                or _is_user_class_instance(attr_value)
+                or _carries_instance(attr_value)
+            ):
                 _check_non_scalar_capture(
                     f"{module_name}.{attr_name}",
                     attr_value,

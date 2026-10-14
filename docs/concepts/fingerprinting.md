@@ -92,7 +92,8 @@ def normalize(df):
 
 A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or
 `None`; editing it re-runs the stage. Reading any other module-level value
-(tuple, list, dict, set, frozenset, enum member, class instance), directly or
+(tuple, list, dict, set, frozenset, enum member, class instance, or a method
+bound to an instance such as `np.random.default_rng(SEED).normal`), directly or
 as `module.NAME`, is a `StageDefinitionError` that names the variable:
 
 ```python

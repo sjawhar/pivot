@@ -63,6 +63,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global primitive constant change                     | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
 | Global collection, enum, or class instance           | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`                                                              |
 | Non-scalar module attribute                          | ✅ (error) | `test_integration.py::test_non_scalar_module_attribute_raises`                                                                      |
+| Method bound to an instance (`Scaler(3).apply`, `default_rng(0).normal`) as a global, cell, partial argument, loader field or `module.NAME` | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`, `test_integration.py::test_non_scalar_module_attribute_raises`, `test_manifest_cache_cli.py::test_method_bound_to_an_instance_is_an_error` |
+| Method bound to a Logger, a scalar, a class or a library module's own state (`np.random.normal`) | 🚫 | `test_safe_fingerprinting.py::test_methods_bound_to_a_logger_scalar_or_library_are_allowed`, `test_manifest_cache_cli.py::test_method_bound_to_a_scalar_class_or_library_is_allowed` |
 | Pydantic schema hash (model_json_schema)             | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                    |
 | Pydantic class in type hint                          | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                           |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
@@ -386,6 +388,11 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 15. **Module collections are refused**: A stage reading a module-level collection raises
     `StageDefinitionError` unless unsafe fingerprinting is explicitly enabled, in which case
     Pivot warns instead of pretending to track its contents.
+
+    A method bound to an instance is refused the same way (`apply = Scaler(3).apply`,
+    `normal = np.random.default_rng(SEED).normal`): the instance it carries is state no code
+    hash records. A method bound to a module, a class, a scalar or a `logging.Logger`, or a
+    library module's own export such as `np.random.normal`, is recorded by name instead.
 
     Tests: `test_integration.py::test_non_scalar_module_attribute_raises`,
     `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`

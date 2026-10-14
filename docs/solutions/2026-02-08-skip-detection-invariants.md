@@ -92,7 +92,7 @@ Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → has
 
 ## Safe Fingerprinting
 
-Pivot fingerprints stage functions by hashing their AST and the ASTs of any helper functions they call. A module-level `bool`, `int`, `float`, `str`, `bytes` or `None` that a stage reads is recorded by value (`const:` keys), so editing it re-runs the stage. Any other module-level value a stage reads (tuple, list, dict, set, frozenset, enum member, class instance) is not safely trackable: its contents can change without the AST changing.
+Pivot fingerprints stage functions by hashing their AST and the ASTs of any helper functions they call. A module-level `bool`, `int`, `float`, `str`, `bytes` or `None` that a stage reads is recorded by value (`const:` keys), so editing it re-runs the stage. Any other module-level value a stage reads (tuple, list, dict, set, frozenset, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`) is not safely trackable: its contents can change without the AST changing. A library function or class it reads is recorded by name (`ext:` keys).
 
 By default, such captures raise `StageDefinitionError` with a message that names the variable and suggests moving it into `StageParams`.
 

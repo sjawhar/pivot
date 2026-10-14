@@ -1394,3 +1394,78 @@ def test_library_function_in_loader_config_stays_cached(tmp_path: pathlib.Path) 
 
     assert "0 ran, 1 cached" in second, second
     assert _helper_summary(root) == 3.0
+
+
+_BOUND_METHOD_PIPELINE = """\
+import numpy as np
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class Scaler:
+    def __init__(self, factor: int) -> None:
+        self.factor = factor
+
+    def apply(self, x: float) -> float:
+        return x * self.factor
+
+
+{binding}
+
+
+@stage
+def summarise(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [float(method(1.0))]}})
+
+
+with Pipeline("lib") as pipeline:
+    summarise(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        pytest.param("method = Scaler(3).apply", id="user-instance"),
+        pytest.param("method = np.random.default_rng(0).normal", id="seeded-generator"),
+    ],
+)
+def test_method_bound_to_an_instance_is_an_error(tmp_path: pathlib.Path, binding: str) -> None:
+    """`Scaler(3).apply` carries state no code hash records, so the stage is refused."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _BOUND_METHOD_PIPELINE.format(binding=binding),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "captures non-scalar variable 'method' (type: method)" in output, output
+    assert "StageParams" in output, output
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        pytest.param("method = ','.join", id="method-of-a-scalar"),
+        pytest.param("method = dict.fromkeys", id="classmethod-of-a-builtin"),
+        pytest.param("method = np.random.normal", id="library-module-export"),
+    ],
+)
+def test_method_bound_to_a_scalar_class_or_library_is_allowed(
+    tmp_path: pathlib.Path, binding: str
+) -> None:
+    """A method bound to a scalar, a class or a library module's own state is not refused."""
+    pipeline = _BOUND_METHOD_PIPELINE.format(binding=binding).replace(
+        "float(method(1.0))", "len(str(method))"
+    )
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in output, output
