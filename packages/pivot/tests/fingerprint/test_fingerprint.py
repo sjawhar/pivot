@@ -2384,6 +2384,30 @@ def test_recorded_reads_detect_each_changed_live_value(
         sys.modules.pop("reads_settings", None)
 
 
+def _helper_make_scaler(factor: int) -> typing.Callable[[int], int]:
+    def scaler(x: int) -> int:
+        return x * factor
+
+    return scaler
+
+
+def test_fingerprint_pass_names_each_function_once_and_ends_with_the_pass() -> None:
+    """Inside one pass a function's identity is computed once; the next pass sees a change."""
+    scaler = _helper_make_scaler(2)
+    before = fingerprint.function_identity(scaler)
+    cell = typing.cast("tuple[types.CellType, ...]", scaler.__closure__)[0]
+
+    with fingerprint.fingerprint_pass():
+        first = fingerprint.function_identity(scaler)
+        cell.cell_contents = 5
+        within = fingerprint.function_identity(scaler)
+    after = fingerprint.function_identity(scaler)
+
+    assert first == before and within is first, "one pass names the function once"
+    assert after["cells"] == [("factor", 5)], after
+    assert after != before, "a new pass reads the changed cell"
+
+
 # ==============================================================================
 # Stage manifest cache tests
 # ==============================================================================

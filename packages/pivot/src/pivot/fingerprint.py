@@ -167,6 +167,41 @@ _walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 # under it, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep apart.
 _owner_ref: contextvars.ContextVar[str | None] = contextvars.ContextVar("_owner_ref", default=None)
 
+# Per-pass memo for `function_identity` and `_hint_classes`, keyed by kind and object id.
+# Set only inside `fingerprint_pass()`; a reload or a mutated cell is seen by the next pass.
+_pass_memo: contextvars.ContextVar[dict[tuple[str, int], Any] | None] = contextvars.ContextVar(
+    "_pass_memo", default=None
+)
+
+
+@contextlib.contextmanager
+def fingerprint_pass() -> Iterator[None]:
+    """Share function identities and type-hint classes across one pass over many stages.
+
+    A cache hit re-reads every recorded value, and stages of one pipeline read the same
+    helpers and model classes: inside the pass each is named once. The memo holds strong
+    references, so an id is never reused within the pass, and it ends with the pass.
+    """
+    if _pass_memo.get() is not None:
+        yield
+        return
+    token = _pass_memo.set({})
+    try:
+        yield
+    finally:
+        _pass_memo.reset(token)
+
+
+def _memoized[T](kind: str, obj: object, compute: Callable[[], T]) -> T:
+    """Return `compute()`, reusing the value for `obj` within one `fingerprint_pass()`."""
+    memo = _pass_memo.get()
+    if memo is None:
+        return compute()
+    key = (kind, id(obj))
+    if key not in memo:
+        memo[key] = (obj, compute())
+    return cast("T", memo[key][1])
+
 
 class FunctionIdentity(TypedDict):
     """What makes two function objects the same function (`function_identity`)."""
@@ -249,9 +284,10 @@ def function_identity(func: Callable[..., Any]) -> FunctionIdentity:
     module and qualname only.
 
     Used by the stage-manifest cache key, the canonical form of a function value (loader
-    config, partial arguments), and compose's check that one stage name is one stage.
+    config, partial arguments), and compose's check that one stage name is one stage. Within
+    one `fingerprint_pass()` each function is named once.
     """
-    return _function_identity(func, ())
+    return _memoized("identity", func, lambda: _function_identity(func, ()))
 
 
 def _function_identity(func: Callable[..., Any], active: tuple[int, ...]) -> FunctionIdentity:
@@ -1779,12 +1815,17 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
 def _hint_classes(func: Callable[..., Any]) -> list[tuple[type, bool]]:
     """Return each user class in `func`'s type hints, with whether it is a whole hint.
 
-    A class that is not a whole hint is the origin of a generic (`MyContainer[int]`).
+    A class that is not a whole hint is the origin of a generic (`MyContainer[int]`). Within
+    one `fingerprint_pass()` each function's hints are collected once.
     """
-    found = list[tuple[type, bool]]()
-    for hint in _resolved_type_hints(func).values():
-        _collect_hint_classes(hint, found)
-    return found
+
+    def collect() -> list[tuple[type, bool]]:
+        found = list[tuple[type, bool]]()
+        for hint in _resolved_type_hints(func).values():
+            _collect_hint_classes(hint, found)
+        return found
+
+    return _memoized("hints", func, collect)
 
 
 def _collect_hint_classes(hint: Any, found: list[tuple[type, bool]]) -> None:
