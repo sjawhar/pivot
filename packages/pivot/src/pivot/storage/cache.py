@@ -411,6 +411,23 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
 FALLBACK_ERRNO = frozenset({errno.EXDEV, errno.EPERM, errno.EACCES})
 
 
+def _stage_checkout(
+    tmp_path: pathlib.Path,
+    cache_path: pathlib.Path,
+    checkout_mode: CheckoutMode,
+    *,
+    executable: bool,
+) -> None:
+    """Create the link or copy of cache_path at tmp_path."""
+    if checkout_mode == CheckoutMode.SYMLINK:
+        tmp_path.symlink_to(cache_path.resolve())
+    elif checkout_mode == CheckoutMode.HARDLINK:
+        os.link(cache_path, tmp_path)
+    else:
+        shutil.copy2(cache_path, tmp_path)
+        os.chmod(tmp_path, 0o755 if executable else 0o644)
+
+
 def _checkout_from_cache(
     path: pathlib.Path,
     cache_path: pathlib.Path,
@@ -431,13 +448,17 @@ def _checkout_from_cache(
 
     tmp_path = path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
     try:
-        if checkout_mode == CheckoutMode.SYMLINK:
-            tmp_path.symlink_to(cache_path.resolve())
-        elif checkout_mode == CheckoutMode.HARDLINK:
-            os.link(cache_path, tmp_path)
-        else:
-            shutil.copy2(cache_path, tmp_path)
-            os.chmod(tmp_path, 0o755 if executable else 0o644)
+        try:
+            _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
+        except PermissionError:
+            # A read-only parent. Replacing an existing entry needs it writable anyway,
+            # so make it writable as _clear_path does (never chmod the file: it may be
+            # a hardlink to the read-only cache), then retry.
+            parent_mode = path.parent.stat().st_mode
+            if parent_mode & stat.S_IWUSR or not (path.exists() or path.is_symlink()):
+                raise
+            os.chmod(path.parent, parent_mode | stat.S_IWUSR)
+            _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
         try:
             tmp_path.replace(path)
         except IsADirectoryError:

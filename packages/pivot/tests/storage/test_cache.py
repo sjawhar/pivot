@@ -1165,6 +1165,30 @@ def test_remove_output_readonly_nested_directory(tmp_path: pathlib.Path) -> None
     assert not test_dir.exists()
 
 
+@pytest.mark.parametrize("mode", [cache.CheckoutMode.COPY, cache.CheckoutMode.HARDLINK])
+def test_save_directory_with_read_only_subdirectory(
+    tmp_path: pathlib.Path, mode: cache.CheckoutMode
+) -> None:
+    """A directory output holding a read-only subdirectory saves and checks out.
+
+    File checkouts stage a temp file beside the target; the stage must not fail on a
+    parent the stage's own code made read-only.
+    """
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    (out / "sub" / "f.txt").write_text("content\n")
+    (out / "top.txt").write_text("top\n")
+    os.chmod(out / "sub", 0o555)
+    try:
+        output_hash = cache.save_to_cache(out, tmp_path / "cache", checkout_mode=mode)
+
+        assert "manifest" in output_hash
+        assert (out / "sub" / "f.txt").read_text() == "content\n"
+        _helper_assert_no_temp_dirs(out / "sub")
+    finally:
+        os.chmod(out / "sub", 0o755)
+
+
 def test_remove_output_hardlinked_file_preserves_cache_permissions(tmp_path: pathlib.Path) -> None:
     """Removing hardlinked output file does not corrupt cache permissions.
 
