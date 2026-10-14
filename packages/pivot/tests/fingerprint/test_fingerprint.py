@@ -2,6 +2,7 @@
 
 import ast
 import dataclasses
+import enum
 import importlib.util
 import inspect
 import json
@@ -2406,6 +2407,34 @@ def test_fingerprint_pass_names_each_function_once_and_ends_with_the_pass() -> N
     assert first == before and within is first, "one pass names the function once"
     assert after["cells"] == [("factor", 5)], after
     assert after != before, "a new pass reads the changed cell"
+
+
+class _ClassReadMode(enum.Enum):
+    FAST = "fast"
+
+
+class _ClassReadConfig:
+    SCALE: typing.ClassVar[int] = 3
+    MODE: typing.ClassVar[_ClassReadMode] = _ClassReadMode.FAST
+
+    @staticmethod
+    def helper() -> int:
+        return 1
+
+
+def _helper_reads_class_attributes() -> int:
+    return _ClassReadConfig.SCALE + _ClassReadConfig.helper() + len(_ClassReadConfig.MODE.value)
+
+
+def test_class_attributes_a_stage_reads_are_tracked_one_by_one() -> None:
+    """A scalar is `const:<class>.<NAME>`, an Enum member is name and value, a method is walked."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_reads_class_attributes)
+    config = f"{__name__}._ClassReadConfig"
+
+    assert manifest[f"const:{config}.SCALE"] == "3", manifest
+    assert manifest[f"const:{config}.MODE"] == '_ClassReadMode.FAST="fast"', manifest
+    assert f"func:{config}.helper" in manifest, manifest
+    assert not any(key.startswith(f"const:{config}.__") for key in manifest), manifest
 
 
 # ==============================================================================

@@ -35,8 +35,9 @@ Pivot's fingerprinting system:
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
 | Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
 | Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
+| Class attributes a stage reads | Yes (value) | Each `Cls.NAME` a walked function reads from a user class follows the module-level rule: a scalar is `const:<module>.<Cls>.<NAME>`, a non-scalar is refused, a function is walked; a member of a user Enum is recorded by name and value. A pydantic or StageParams class read this way is covered by its schema hash, field defaults included |
 
-**Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are not tracked unless they're Pydantic model field defaults.
+**Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are tracked only when a stage reads them as `Cls.NAME`, and for Pydantic model field defaults.
 
 For Pydantic models, both static defaults and `default_factory` functions are tracked:
 

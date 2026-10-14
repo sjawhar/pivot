@@ -1776,3 +1776,80 @@ def test_changing_a_secret_read_by_a_stage_reruns_it(tmp_path: pathlib.Path, pip
         ["git", "check-ignore", ".pivot/secret.key"], cwd=root, capture_output=True, text=True
     )
     assert ignored.returncode == 0, "secret.key must be gitignored"
+
+
+_CLASS_ATTRIBUTE_PIPELINE = """\
+import enum
+import os
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, stage
+
+
+class Config:
+    SCALE = int(os.environ.get("SCALE", "2"))
+    COLUMNS = ("a",)
+
+
+class Mode(enum.Enum):
+    DOUBLE = int(os.environ.get("MODE", "2"))
+
+
+class Out(pydantic.BaseModel):
+    scale: int = int(os.environ.get("OUT", "2"))
+
+
+@stage
+def scale(x: pd.DataFrame) -> pd.DataFrame:
+    return x * {read}
+
+
+with Pipeline("cls") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    ("read", "variable"),
+    [
+        pytest.param("Config.SCALE", "SCALE", id="class-scalar"),
+        pytest.param("Mode.DOUBLE.value", "MODE", id="enum-member"),
+        pytest.param("Out().scale", "OUT", id="pydantic-default"),
+    ],
+)
+def test_value_read_through_a_class_at_import_reruns_stage(
+    tmp_path: pathlib.Path, read: str, variable: str
+) -> None:
+    """`Config.SCALE`, an Enum member and a pydantic field default are re-read on a hit."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _CLASS_ATTRIBUTE_PIPELINE.format(read=read),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={variable: "2"}))
+    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":2}\n'
+    cached = _helper_ok(_helper_pivot(root, "status", env={variable: "2"}))
+
+    status = _helper_ok(_helper_pivot(root, "status", env={variable: "7"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={variable: "7"}))
+
+    assert "1 cached, 0 stale" in cached, cached
+    assert "1 stale" in status, status
+    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":7}\n', output
+
+
+def test_non_scalar_class_attribute_is_an_error(tmp_path: pathlib.Path) -> None:
+    """A tuple read as `Config.COLUMNS` is refused like a module-level tuple."""
+    pipeline = _CLASS_ATTRIBUTE_PIPELINE.format(read="len(Config.COLUMNS)")
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "captures non-scalar variable 'pipeline.Config.COLUMNS' (type: tuple)" in output, output
+    assert "StageParams" in output, output

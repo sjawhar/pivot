@@ -53,7 +53,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 19 records each library function or class a stage reads by name (`ext:` entries).
 # Version 20 hashes a secret in a default, loader config or partial by its keyed digest.
 # Version 21 hashes a dataclass instance field by field, not by its generated repr.
-_CACHE_SCHEMA_VERSION = 21
+# Version 22 tracks class attributes a stage reads (`Config.SCALE`) and the schema of a
+# pydantic class read as a global.
+_CACHE_SCHEMA_VERSION = 22
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -610,7 +612,8 @@ def _default_token(value: Any) -> str:
 
 # A walk step names one move from a visited object to a value it reads: `g:NAME` a global
 # (also recorded when absent), `c:NAME` a closure cell, `d:PARAM` a default, `a:ATTR` a module
-# attribute, `n:NAME` and `np:DOTTED` names in a class's module, `u` the function behind a
+# attribute, `ca:ATTR` a class attribute (`Config.SCALE`), `n:NAME` and `np:DOTTED` names in a
+# class's module, `u` the function behind a
 # C-level wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and
 # `s:INDEX` container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a
 # model's field annotations. `hints` and `schema` read the visited object itself.
@@ -628,7 +631,7 @@ def _read_step(owner: Any, step: str) -> Any:
                 return owner.__closure__[owner.__code__.co_freevars.index(arg)].cell_contents
             case "d":
                 return dict(_function_defaults(owner))[arg]
-            case "a":
+            case "a" | "ca":
                 return getattr(owner, arg)
             case "n":
                 return vars(sys.modules[owner.__module__])[arg]
@@ -677,6 +680,8 @@ def _read_token(owner: Any, step: str) -> str:
         return "absent"
     if step.startswith("d:"):
         return _default_token(value)
+    if step.startswith("ca:") and _is_user_enum_member(value):
+        return f"enum:{_enum_member_text(value)}"
     return _value_token(value)
 
 
@@ -1518,6 +1523,8 @@ def _process_captured_value(
             )
         case _ValueKind.USER:
             _process_callable_dependency(binding_ref, value, manifest, visited)
+            if isinstance(value, type):
+                _process_class_reads(parameter or name, value, func, manifest, visited, stage_name)
         case _ValueKind.MODULE:
             _process_module_dependency(parameter or name, value, func, manifest, visited)
         case _ValueKind.SCALAR:
@@ -1530,6 +1537,62 @@ def _process_captured_value(
             manifest[f"ext:{binding_ref}"] = _library_name(value)
         case _ValueKind.LOGGER:
             return
+
+
+def _process_class_reads(
+    name: str,
+    cls: type,
+    func: Callable[..., Any],
+    manifest: dict[str, str],
+    visited: set[int],
+    stage_name: str,
+) -> None:
+    """Track each attribute `func` reads from user class `cls` through `name` (`Config.SCALE`).
+
+    The class AST hash does not see a class attribute computed at import, so each attribute
+    `func` reads gets the rule a module-level value gets: a scalar is `const:<class>.<NAME>`,
+    a non-scalar is refused, a function or class is walked. A member of a user Enum is
+    recorded by name and value. A pydantic or StageParams class is covered by its schema hash,
+    field defaults included. A cache hit re-reads each attribute (`ca:NAME`).
+    """
+    if hasattr(cls, "model_fields"):
+        _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", cls), manifest, visited)
+        return
+    class_ref = _definition_ref(cls)
+    read = ast_utils.extract_module_attr_usage(func)
+    attributes = dict.fromkeys(path.split(".", 1)[0] for owner, path in read if owner == name)
+    for attribute in attributes:
+        if attribute.startswith("__"):
+            continue
+        step = f"ca:{attribute}"
+        _record_read(cls, step)
+        try:
+            value = getattr(cls, attribute)
+        except AttributeError:
+            continue
+        with _walking(step):
+            if _is_user_enum_member(value):
+                manifest[f"const:{class_ref}.{attribute}"] = _enum_member_text(value)
+            else:
+                _process_captured_value(
+                    f"{class_ref}.{attribute}",
+                    f"{class_ref}.{attribute}",
+                    value,
+                    func,
+                    manifest,
+                    visited,
+                    stage_name,
+                )
+
+
+def _is_user_enum_member(value: Any) -> bool:
+    """Whether `value` is a member of an Enum defined in user code."""
+    return isinstance(value, enum.Enum) and is_user_code(type(value))
+
+
+def _enum_member_text(member: enum.Enum) -> str:
+    """An Enum member as its class, name and canonical value: constants of the class body."""
+    return f"{type(member).__qualname__}.{member.name}={_serialize_value_for_hash(member.value)}"
 
 
 def _process_default_values(

@@ -67,6 +67,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Method bound to a Logger, a scalar, a class or a library module's own state (`np.random.normal`) | 🚫 | `test_safe_fingerprinting.py::test_methods_bound_to_a_logger_scalar_or_library_are_allowed`, `test_manifest_cache_cli.py::test_method_bound_to_a_scalar_class_or_library_is_allowed` |
 | Pydantic schema hash (model_json_schema)             | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                    |
 | Pydantic class in type hint                          | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                           |
+| Pydantic class read as a global (`Out().scale`), import-time field default | ✅ | `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
+| Class attribute read as `Config.SCALE` (scalar, Enum member, function) | ✅ | `test_fingerprint.py::test_class_attributes_a_stage_reads_are_tracked_one_by_one`, `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
+| Non-scalar class attribute read as `Config.COLUMNS` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_class_attribute_is_an_error` |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                  |
 | Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                         |
@@ -260,7 +263,7 @@ Tests in `test_callback_vulnerabilities.py` document edge cases where callback c
 | `functools.partial` arguments tracked              | ✅        | `test_functools.py::test_partial_args_change_triggers_fingerprint_change`               |
 | `functools.partial` wrapped function tracked       | ✅        | `test_functools.py::test_partial_underlying_func_change_triggers_fingerprint_change`    |
 | Instance/container state callbacks not tracked     | ❌        | `test_callback_vulnerabilities.py::test_container_callback_change_detected`             |
-| Class attribute callbacks (runtime modified)       | ❌        | `test_callback_vulnerabilities.py::test_class_attribute_callback_change_detected`       |
+| Class attribute callbacks (runtime modified)       | ✅        | `test_callback_vulnerabilities.py::test_class_attribute_callback_change_detected`       |
 
 ---
 
