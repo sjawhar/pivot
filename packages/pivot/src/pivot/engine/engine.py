@@ -193,9 +193,9 @@ class Engine:
 
     # Set once a watched engine's startup fingerprint snapshot has finished
     _startup_fingerprinted: anyio.Event
-    # Set when a watched engine's startup pipeline has a stage that fails to fingerprint;
-    # runs wait until a reload loads a pipeline whose every stage fingerprints
-    _pipeline_invalid: bool
+    # Why the loaded pipeline cannot run: set when a stage fails to fingerprint at startup,
+    # so no earlier good pipeline exists. Runs are refused until a reload loads a good one.
+    _pipeline_error: str | None
 
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
@@ -253,12 +253,17 @@ class Engine:
         self._dispatch_complete = anyio.Event()
 
         self._startup_fingerprinted = anyio.Event()
-        self._pipeline_invalid = False
+        self._pipeline_error = None
 
     @property
     def state(self) -> EngineState:
         """Current engine state."""
         return self._state
+
+    @property
+    def pipeline_error(self) -> str | None:
+        """Why the loaded pipeline cannot run, or None when it can."""
+        return self._pipeline_error
 
     @property
     def sources(self) -> list[EventSource]:
@@ -658,7 +663,7 @@ class Engine:
         self._stored_max_workers = event["max_workers"]
         self._stored_resource_capacity = dict(event["resource_capacity"])
 
-        if self._pipeline_invalid:
+        if self._pipeline_error is not None:
             _logger.debug("Pipeline invalid - ignoring run request until it is fixed")
             return
 
@@ -2186,7 +2191,22 @@ class Engine:
             for exc in errors:
                 _logger.warning(f"Pipeline invalid: {exc}")
             _logger.error("Pipeline invalid - waiting for fix")
-            self._pipeline_invalid = True
+            self._pipeline_error = "\n".join(str(exc) for exc in errors)
+            await self._emit_pipeline_error(self._pipeline_error)
+
+    async def _emit_pipeline_error(self, message: str) -> None:
+        """Report an invalid pipeline; the stage list stays the loaded pipeline's."""
+        stages = self._pipeline.list_stages() if self._pipeline is not None else list[str]()
+        await self.emit(
+            PipelineReloaded(
+                type="pipeline_reloaded",
+                stages=stages,
+                stages_added=list[str](),
+                stages_removed=list[str](),
+                stages_modified=list[str](),
+                error=message,
+            )
+        )
 
     def _snapshot_watch_output(self, path: pathlib.Path) -> _WatchOutputSnapshot:
         """Capture every currently visible path in one output's filesystem tree."""
@@ -2299,12 +2319,14 @@ class Engine:
             if path.endswith(".py"):
                 pathlib.Path(importlib.util.cache_from_source(path)).unlink(missing_ok=True)
 
-        # Reload registry - returns the old stages on success, None on failure
-        old_stages = self._reload_registry()
+        # Reload registry - returns the old stages on success, the error message on failure
+        reload_result = self._reload_registry()
 
-        if old_stages is None:
+        if isinstance(reload_result, str):
             _logger.error("Pipeline invalid - waiting for fix")
+            await self._emit_pipeline_error(reload_result)
             return
+        old_stages = reload_result
 
         # Emit reload event
         await self._emit_reload_event(old_stages)
@@ -2477,13 +2499,13 @@ class Engine:
         if self._pipeline is not None:
             self._pipeline.invalidate_dag_cache()
 
-    def _reload_registry(self) -> dict[str, RegistryStageInfo] | None:
+    def _reload_registry(self) -> dict[str, RegistryStageInfo] | str:
         """Reload the pipeline by re-importing pipeline definition.
 
-        Returns the old pipeline's stages if reload succeeded, None if the pipeline is invalid:
-        it fails to load, or one of its stages fails to fingerprint. The new fingerprints stay
-        cached for the reload event's diff. The caller should emit the reload event using the
-        returned stages.
+        Returns the old pipeline's stages if reload succeeded, or the error message if the
+        pipeline is invalid: it fails to load, or one of its stages fails to fingerprint. The
+        last good pipeline stays loaded on failure. The new fingerprints stay cached for the
+        reload event's diff. The caller should emit the reload event using the returned stages.
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
@@ -2498,29 +2520,32 @@ class Engine:
 
             new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
             if new_pipeline is None:
-                _logger.warning("No pipeline found during reload")
-                return None
+                return self._reject_reload(old_pipeline, ["No pipeline found during reload"])
 
-            errors = list[exceptions.PivotError]()
+            errors = list[str]()
             for stage_name in new_pipeline.list_stages():
                 try:
                     _ = new_pipeline.ensure_fingerprint(stage_name)
                 except exceptions.PivotError as exc:
-                    errors.append(exc)
+                    errors.append(str(exc))
             if errors:
-                for exc in errors:
-                    _logger.warning(f"Pipeline invalid: {exc}")
-                self._pipeline = old_pipeline
-                return None
+                return self._reject_reload(old_pipeline, errors)
 
             self._pipeline = new_pipeline
-            self._pipeline_invalid = False
+            self._pipeline_error = None
             return old_stages
         except Exception as e:
-            _logger.warning(f"Pipeline invalid: {e}")
-            # Restore old pipeline on failure
-            self._pipeline = old_pipeline
-            return None
+            return self._reject_reload(old_pipeline, [str(e)])
+
+    def _reject_reload(self, old_pipeline: registry.PipelineLike | None, errors: list[str]) -> str:
+        """Keep the last loaded pipeline after a failed reload; return the error message."""
+        for error in errors:
+            _logger.warning(f"Pipeline invalid: {error}")
+        self._pipeline = old_pipeline
+        message = "\n".join(errors)
+        if self._pipeline_error is not None:
+            self._pipeline_error = message
+        return message
 
     def _clear_project_modules(self, root: pathlib.Path) -> None:
         """Remove project modules from sys.modules."""

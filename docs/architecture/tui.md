@@ -64,14 +64,14 @@ All message types are defined in `src/pivot/types.py`:
 | `TuiStatusMessage` | Coordinator | Stage lifecycle (started, completed, failed, skipped) with timing |
 | `TuiLogMessage` | Worker | stdout/stderr lines from stage execution |
 | `TuiWatchMessage` | Watch engine | Watch status (waiting, detecting, restarting, error) |
-| `TuiReloadMessage` | Watch engine | Stage list changed after code reload (add/remove stages) |
+| `TuiReloadMessage` | Watch engine | Stage list changed after code reload, or why the edited pipeline is invalid |
 
 Key fields:
 
 - **TuiStatusMessage**: `type`, `stage`, `index`, `total`, `status`, `reason`, `elapsed` (seconds, or `None` if still running), `run_id`
 - **TuiLogMessage**: `type`, `stage`, `line`, `is_stderr`, `timestamp`
 - **TuiWatchMessage**: `type`, `status` (WatchStatus enum), `message`
-- **TuiReloadMessage**: `type`, `stages` (list of current stage names after reload)
+- **TuiReloadMessage**: `type`, `stages` (current stage names), `stages_added`, `stages_removed`, `stages_modified`, `error`. When `error` is set (a syntax error, a missing `pipeline` variable, or a stage that fails to fingerprint), the app keeps its stage list, titles itself `Pipeline invalid - waiting for fix`, and shows the error on a line under the header until a reload with `error` unset clears it.
 
 ## Execution History
 

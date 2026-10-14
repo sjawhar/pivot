@@ -266,6 +266,8 @@ class PivotApp(textual.app.App[None]):
         self._socket_path = socket_path
         self._event_poller: EventPoller | None = None
         self._log_file_lock: threading.Lock = threading.Lock()
+        # Why the watched pipeline is invalid, shown until a reload loads a good pipeline
+        self._pipeline_error: str | None = None
 
         # Open log file if configured
         if tui_log:
@@ -355,6 +357,7 @@ class PivotApp(textual.app.App[None]):
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
         yield textual.widgets.Header()
+        yield textual.widgets.Static(id="pipeline-error", markup=False)
 
         with textual.containers.Horizontal(id="main-split"):
             yield StageListPanel(list(self._stages.values()), id="stage-list")
@@ -564,7 +567,8 @@ class PivotApp(textual.app.App[None]):
         prefix = self._get_keep_going_prefix()
         match msg["status"]:
             case WatchStatus.WAITING:
-                self.title = f"{prefix}[●] Watching for changes..."
+                if self._pipeline_error is None:
+                    self.title = f"{prefix}[●] Watching for changes..."
             case WatchStatus.RESTARTING:
                 self.title = f"{prefix}[↻] Reloading code..."
             case WatchStatus.DETECTING:
@@ -572,9 +576,27 @@ class PivotApp(textual.app.App[None]):
             case WatchStatus.ERROR:
                 self.title = f"{prefix}[!] {rich.markup.escape(msg['message'])}"
 
+    def _show_pipeline_error(self) -> None:
+        """Show why the pipeline is invalid under the header, or hide the line once it is fixed."""
+        line = self.query_one("#pipeline-error", textual.widgets.Static)
+        prefix = self._get_keep_going_prefix()
+        if self._pipeline_error is None:
+            line.display = False
+            self.title = f"{prefix}[●] Watching for changes..."
+        else:
+            line.update(f"Pipeline invalid - waiting for fix\n{self._pipeline_error}")
+            line.display = True
+            self.title = f"{prefix}[!] Pipeline invalid - waiting for fix"
+
     def _handle_reload(self, msg: TuiReloadMessage) -> None:  # pragma: no cover
         """Handle registry reload (watch mode only)."""
         if not self._watch_mode:
+            return
+
+        self._pipeline_error = msg["error"]
+        self._show_pipeline_error()
+        if msg["error"] is not None:
+            # The engine kept the pipeline it had; the stage list is unchanged.
             return
 
         new_stages = msg["stages"]

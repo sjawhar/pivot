@@ -619,11 +619,11 @@ async def test_poller_converts_pipeline_reloaded_with_error(tmp_path: Path) -> N
     finally:
         await server.stop()
 
-    # Should still produce a reload message even when error is set
     assert len(messages) >= 1, "Should produce reload message even with error"
     msg = cast("TuiReloadMessage", messages[0])
     assert msg["type"] == TuiMessageType.RELOAD, "Message type should be RELOAD"
     assert msg["stages"] == ["train"], "stages should match"
+    assert msg["error"] == "SyntaxError in pipeline.py", "the TUI receives why the reload failed"
 
 
 # =============================================================================

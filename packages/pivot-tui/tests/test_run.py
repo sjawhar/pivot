@@ -607,6 +607,53 @@ async def test_watch_tui_app_with_tui_log(
     assert log_path.exists()
 
 
+@pytest.mark.asyncio
+async def test_watch_tui_shows_invalid_pipeline_until_next_good_reload() -> None:
+    """A reload error stays on screen until a reload loads a good pipeline."""
+    import textual.widgets
+
+    app = run_tui.PivotApp(stage_names=["demo/a"], watch_mode=True)
+    error = "Stage 'demo/a': captures non-scalar variable 'FACTORS' (type: tuple)."
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        banner = app.query_one("#pipeline-error", textual.widgets.Static)
+        assert not banner.display, "no error line while the pipeline is valid"
+
+        app.post_message(
+            run_tui.TuiUpdate(
+                TuiReloadMessage(
+                    type=TuiMessageType.RELOAD,
+                    stages=["demo/a"],
+                    stages_added=[],
+                    stages_removed=[],
+                    stages_modified=[],
+                    error=error,
+                )
+            )
+        )
+        await pilot.pause()
+        assert banner.display, "the invalid pipeline's error is shown"
+        assert error in str(banner.content)
+        assert "Pipeline invalid" in app.title
+
+        app.post_message(
+            run_tui.TuiUpdate(
+                TuiReloadMessage(
+                    type=TuiMessageType.RELOAD,
+                    stages=["demo/a"],
+                    stages_added=[],
+                    stages_removed=[],
+                    stages_modified=["demo/a"],
+                    error=None,
+                )
+            )
+        )
+        await pilot.pause()
+        assert not banner.display, "the next good reload clears the error"
+        assert "Pipeline invalid" not in app.title
+
+
 # =============================================================================
 # Reload Summary Message Formatting (Issue #289)
 # =============================================================================
@@ -662,6 +709,7 @@ def test_handle_reload_calls_notify_with_summary(mocker: MockerFixture) -> None:
     mocker.patch.object(app, "_rebuild_stage_list")
     mocker.patch.object(app, "_update_detail_panel")
     mock_notify = mocker.patch.object(app, "notify")
+    mocker.patch.object(app, "_show_pipeline_error")
 
     # Create reload message with changes
     reload_msg = TuiReloadMessage(
@@ -670,6 +718,7 @@ def test_handle_reload_calls_notify_with_summary(mocker: MockerFixture) -> None:
         stages_added=["stage_c"],
         stages_removed=["stage_b"],
         stages_modified=["stage_a"],
+        error=None,
     )
 
     # Call _handle_reload directly
@@ -691,6 +740,7 @@ def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
     mocker.patch.object(app, "_rebuild_stage_list")
     mocker.patch.object(app, "_update_detail_panel")
     mock_notify = mocker.patch.object(app, "notify")
+    mocker.patch.object(app, "_show_pipeline_error")
 
     # Reload message with no changes
     reload_msg = TuiReloadMessage(
@@ -699,6 +749,7 @@ def test_handle_reload_no_notify_when_no_changes(mocker: MockerFixture) -> None:
         stages_added=[],
         stages_removed=[],
         stages_modified=[],
+        error=None,
     )
 
     app._handle_reload(reload_msg)
@@ -904,6 +955,7 @@ def test_tui_update_with_reload_message() -> None:
         stages_added=["s2"],
         stages_removed=[],
         stages_modified=["s1"],
+        error=None,
     )
     update = run_tui.TuiUpdate(msg)
     assert update.msg["type"] == "reload"

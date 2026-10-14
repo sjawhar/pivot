@@ -700,13 +700,18 @@ class TuiWatchMessage(TypedDict):
 
 
 class TuiReloadMessage(TypedDict):
-    """Registry reload notification for TUI display."""
+    """Registry reload notification for TUI display.
+
+    ``error`` is set when the edited pipeline is invalid; ``stages`` then lists the stages of
+    the pipeline still loaded.
+    """
 
     type: Literal[TuiMessageType.RELOAD]
     stages: list[str]
     stages_added: list[str]
     stages_removed: list[str]
     stages_modified: list[str]
+    error: str | None
 
 
 # =============================================================================

@@ -1182,7 +1182,7 @@ async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
         engine._stored_parallel = True
 
         # Mock reload to FAIL
-        engine._reload_registry = lambda: None  # type: ignore[assignment] - test mock
+        engine._reload_registry = lambda: "Failed to load pipeline.py"  # type: ignore[assignment] - test mock
         engine._invalidate_caches = lambda: None  # type: ignore[assignment] - test mock
 
         event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])

@@ -294,13 +294,14 @@ def _make_reload_message(event: dict[str, object]) -> TuiReloadMessage | None:
         return None
     if not isinstance(stages_modified, list):
         return None
-    error = event.get("error")
-    if isinstance(error, str):
-        _logger.warning("Pipeline reload error: %s", error)
+    error = event["error"]
+    if error is not None and not isinstance(error, str):
+        raise RpcProtocolError("str | None (error)", type(error).__name__)
     return TuiReloadMessage(
         type=TuiMessageType.RELOAD,
         stages=cast("list[str]", stages),
         stages_added=cast("list[str]", stages_added),
         stages_removed=cast("list[str]", stages_removed),
         stages_modified=cast("list[str]", stages_modified),
+        error=error,
     )

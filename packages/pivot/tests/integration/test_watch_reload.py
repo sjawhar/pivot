@@ -111,7 +111,13 @@ def _helper_is_idle(event: OutputEvent) -> bool:
 
 
 def _helper_is_reload(event: OutputEvent) -> bool:
-    return event["type"] == "pipeline_reloaded"
+    """A reload that loaded a new pipeline."""
+    return event["type"] == "pipeline_reloaded" and event["error"] is None
+
+
+def _helper_is_invalid_pipeline(event: OutputEvent) -> bool:
+    """A reload or startup snapshot that found the pipeline invalid."""
+    return event["type"] == "pipeline_reloaded" and event["error"] is not None
 
 
 def _helper_completes(stage: str) -> Callable[[OutputEvent], bool]:
@@ -457,17 +463,18 @@ async def test_run_requested_during_startup_snapshot_is_not_replaced_by_startup_
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "broken_source",
+    ("broken_source", "expected_error"),
     [
-        pytest.param("def broken(:\n", id="syntax-error"),
-        pytest.param("value = 1\n", id="no-pipeline-variable"),
+        pytest.param("def broken(:\n", "Failed to load", id="syntax-error"),
+        pytest.param("value = 1\n", "No pipeline found during reload", id="no-pipeline-variable"),
     ],
 )
 async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
     watch_project: pathlib.Path,
     broken_source: str,
+    expected_error: str,
 ) -> None:
-    """A broken edit emits no reload; data changes still run the last good pipeline's stages."""
+    """A broken edit reports its error; data changes still run the last good pipeline's stages."""
     pipeline_py = watch_project / "pipeline.py"
     pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
     pipeline = _helper_discover(watch_project)
@@ -486,6 +493,15 @@ async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
             (watch_project / "data" / "raw" / "input.txt").write_text("y")
             removed_done = await recorder.wait_for(_helper_completes("reload/removed"))
             broken_idle = await recorder.wait_for(_helper_is_idle, start=removed_done)
+            invalid = recorder.events[await recorder.wait_for(_helper_is_invalid_pipeline)]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert expected_error in invalid["error"]
+            assert sorted(invalid["stages"]) == [
+                "reload/change",
+                "reload/keep",
+                "reload/removed",
+            ], "an invalid edit keeps the last good pipeline's stages"
             assert removed_output.read_text() == "y-removed", (
                 "the last good pipeline's stage ran on the changed input"
             )
@@ -498,7 +514,7 @@ async def test_broken_pipeline_edit_keeps_last_good_pipeline_until_fixed(
             await recorder.wait_for(_helper_is_idle, start=added_done)
 
             assert not any(_helper_is_reload(event) for event in recorder.events[:reload_index]), (
-                "a broken pipeline.py must not be reported as a reload"
+                "a broken pipeline.py must not be reported as a successful reload"
             )
             assert recorder.completed("reload/removed", start=0) == StageStatus.RAN
             reload_event = recorder.events[reload_index]
@@ -532,8 +548,11 @@ async def test_watch_started_on_refused_pipeline_waits_for_fix(
         async with anyio.create_task_group() as tg:
             tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
             await _helper_wait_until_watching(eng)
+            invalid = recorder.events[await recorder.wait_for(_helper_is_invalid_pipeline)]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert "captures non-scalar variable 'SUFFIXES'" in invalid["error"]
             assert "Pipeline invalid - waiting for fix" in caplog.text
-            assert "captures non-scalar variable 'SUFFIXES'" in caplog.text
             assert not any(event["type"] == "stage_completed" for event in recorder.events), (
                 "no stage runs while the pipeline is invalid"
             )
@@ -570,18 +589,20 @@ async def test_refusal_added_mid_session_waits_for_fix(
             first_idle = await recorder.wait_for(_helper_is_idle)
 
             pipeline_py.write_text(_helper_pipeline_source("-v2", third="other", refused=True))
-            with anyio.fail_after(30):
-                while "Pipeline invalid - waiting for fix" not in caplog.text:
-                    await anyio.sleep(0.05)
-            assert "captures non-scalar variable 'SUFFIXES'" in caplog.text
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            invalid = recorder.events[invalid_index]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert "captures non-scalar variable 'SUFFIXES'" in invalid["error"]
+            assert "Pipeline invalid - waiting for fix" in caplog.text
 
             pipeline_py.write_text(_helper_pipeline_source("-v3", third="other"))
-            reload_index = await recorder.wait_for(_helper_is_reload, start=first_idle)
+            reload_index = await recorder.wait_for(_helper_is_reload, start=invalid_index)
             done = await recorder.wait_for(_helper_completes("reload/change"), start=reload_index)
             await recorder.wait_for(_helper_is_idle, start=done)
 
             assert not any(_helper_is_reload(event) for event in recorder.events[:reload_index]), (
-                "a refused pipeline.py must not be reported as a reload"
+                "a refused pipeline.py must not be reported as a successful reload"
             )
             reload_event = recorder.events[reload_index]
             assert reload_event["type"] == "pipeline_reloaded"
