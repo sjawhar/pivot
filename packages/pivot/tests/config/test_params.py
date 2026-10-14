@@ -172,6 +172,41 @@ def test_load_params_yaml_checks_keys_of_included_pipelines(tmp_path: Path) -> N
         parameters.load_params_yaml(combined, params_file)
 
 
+def test_load_params_yaml_refuses_bad_values_naming_stage_field_and_value(tmp_path: Path) -> None:
+    """A value its field rejects is refused at load, with every bad key listed in one error."""
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text(
+        "p/_load_stage:\n  lr: fast\np/_load_stage@v:\n  lr: [1]\np/_load_stgae:\n  lr: 2\n"
+    )
+
+    with pytest.raises(exceptions.PipelineConfigError) as exc_info:
+        parameters.load_params_yaml(_pipeline(tmp_path), params_file)
+
+    assert str(exc_info.value).splitlines() == [
+        "params.yaml key 'p/_load_stage': field 'lr' value 'fast' is invalid for _LoadParams: "
+        + "Input should be a valid number, unable to parse string as a number",
+        "params.yaml key 'p/_load_stage@v': field 'lr' value [1] is invalid for _LoadParams: "
+        + "Input should be a valid number",
+        "params.yaml key 'p/_load_stgae' names no stage in pipeline 'p'; "
+        + "did you mean 'p/_load_stage' or 'p/_load_stage@v'?",
+    ]
+
+
+def test_load_params_yaml_accepts_a_bad_base_value_every_variant_replaces(
+    tmp_path: Path,
+) -> None:
+    """A key is checked as each stage sees it: base value merged under the variant's key."""
+    with Pipeline("q", root=tmp_path) as pipeline, pipeline.variant("v"):
+        _load_stage(params=_LoadParams())
+    params_file = tmp_path / "params.yaml"
+    params_file.write_text("q/_load_stage:\n  lr: fast\nq/_load_stage@v:\n  lr: 0.25\n")
+
+    assert parameters.load_params_yaml(pipeline, params_file) == {
+        "q/_load_stage": {"lr": "fast"},
+        "q/_load_stage@v": {"lr": 0.25},
+    }
+
+
 # -----------------------------------------------------------------------------
 # build_params_instance tests
 # -----------------------------------------------------------------------------

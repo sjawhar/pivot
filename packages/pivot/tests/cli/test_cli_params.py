@@ -541,6 +541,29 @@ def test_misspelled_params_key_is_refused_with_close_matches(
     assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
 
 
+@pytest.mark.parametrize(
+    "args",
+    [["repro"], ["status"], ["params", "show"], ["commit"]],
+    ids=["repro", "status", "params-show", "commit"],
+)
+def test_bad_params_value_is_refused_before_any_stage_runs(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, args: list[str]
+) -> None:
+    """A value its StageParams field rejects is refused at load, not when the stage runs."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_scale_project(cwd, "smoke/scale:\n  factor: not-an-int\n", "smoke")
+
+        result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code != 0, result.output
+    assert result.output.count("field 'factor' value 'not-an-int'") == 1, result.output
+    assert (
+        "params.yaml key 'smoke/scale': field 'factor' value 'not-an-int' is invalid for "
+        + "ScaleParams: Input should be a valid integer, unable to parse string as an integer"
+    ) in result.output, result.output
+    assert not (cwd / "data" / "smoke").exists(), "No stage may run with a refused params.yaml"
+
+
 def test_qualified_params_keys_apply_to_base_and_variant(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

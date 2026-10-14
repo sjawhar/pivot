@@ -38,7 +38,7 @@ ParamsOverrides = dict[str, dict[str, Any]]
 
 
 def load_params_yaml(pipeline: PipelineLike, path: Path | None = None) -> ParamsOverrides:
-    """Load params.yaml from the project root (or ``path``) and check its keys against ``pipeline``.
+    """Load params.yaml from the project root (or ``path``) and check it against ``pipeline``.
 
     Keys are qualified stage names (``<pipeline>/<stage>``); a key without ``@...`` applies to
     every variant of that stage. Returns stage_name -> param_dict, or an empty dict when the
@@ -47,8 +47,10 @@ def load_params_yaml(pipeline: PipelineLike, path: Path | None = None) -> Params
     Raises:
         ParamsError: The file cannot be read or parsed, or its root is not a mapping.
         PipelineConfigError: A key has no pipeline part, names no stage of a pipeline loaded
-            in this run, or maps to something other than parameter values. Every bad key is
-            listed. A key for a pipeline not loaded in this run is skipped and logged at debug.
+            in this run, or maps to something other than parameter values; or a stage's
+            params class rejects the values its keys give it. Every problem is listed, in
+            file order. A key for a pipeline not loaded in this run is skipped and logged at
+            debug.
     """
     if path is None:
         path = project.get_project_root() / "params.yaml"
@@ -74,21 +76,67 @@ def load_params_yaml(pipeline: PipelineLike, path: Path | None = None) -> Params
     # YAML dict has unknown key/value types from parsing arbitrary user input
     typed_data = cast("dict[Any, Any]", data)
     result = ParamsOverrides()
-    errors = list[str]()
+    errors_by_key = dict[str, list[str]]()
     for k, v in typed_data.items():
         key = str(k)
+        key_errors = errors_by_key.setdefault(key, list[str]())
         if not isinstance(v, dict):
-            errors.append(
+            key_errors.append(
                 f"params.yaml key '{key}' must map parameter names to values, "
                 + f"got {type(v).__name__}"
             )
             continue
         result[key] = v
         if key not in valid_keys and (error := _unmatched_key_error(key, valid_keys, loaded)):
-            errors.append(error)
+            key_errors.append(error)
+    for stage_name in stage_names:
+        params = pipeline.get_stage(stage_name)["params"]
+        if params is None:
+            continue
+        for key, message in _override_errors(params, stage_name, result):
+            if message not in errors_by_key[key]:
+                errors_by_key[key].append(message)
+    errors = [message for messages in errors_by_key.values() for message in messages]
     if errors:
         raise exceptions.PipelineConfigError("\n".join(errors))
     return result
+
+
+def _override_errors(
+    params: pydantic.BaseModel, stage_name: str, overrides: ParamsOverrides
+) -> list[tuple[str, str]]:
+    """Validate a stage's params with its overrides applied, as a run does.
+
+    Returns (params.yaml key, message) for each error, naming the key that gave the field:
+    the variant's own key when it sets the field, otherwise the base key.
+    """
+    try:
+        _ = apply_overrides(params, stage_name, overrides)
+    except pydantic.ValidationError as exc:
+        params_cls = type(params).__name__
+        found = list[tuple[str, str]]()
+        for error in exc.errors():
+            field = str(error["loc"][0]) if error["loc"] else None
+            key = _override_key(stage_name, field, overrides)
+            path = ".".join(str(part) for part in error["loc"])
+            found.append(
+                (
+                    key,
+                    f"params.yaml key '{key}': field '{path}' value {error['input']!r} "
+                    + f"is invalid for {params_cls}: {error['msg']}",
+                )
+            )
+        return found
+    return []
+
+
+def _override_key(stage_name: str, field: str | None, overrides: ParamsOverrides) -> str:
+    """Name the params.yaml key that sets ``field`` for ``stage_name``."""
+    base = stage_name.split("@")[0]
+    for key in (stage_name, base):
+        if key in overrides and (field is None or field in overrides[key]):
+            return key
+    return stage_name if stage_name in overrides else base
 
 
 def _unmatched_key_error(key: str, valid_keys: set[str], loaded: frozenset[str]) -> str | None:

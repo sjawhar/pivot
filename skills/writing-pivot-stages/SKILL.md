@@ -168,7 +168,7 @@ scores/scale@x10:
   factor: 100
 ```
 
-`pivot params show` prints the effective values. A key with no pipeline part, or one that names no stage of a loaded pipeline, is refused with the names it could mean.
+`pivot params show` prints the effective values. A key with no pipeline part, or one that names no stage of a loaded pipeline, is refused with the names it could mean; a value the field rejects is refused naming the field and value. In watch mode these errors make the pipeline invalid until `params.yaml` is fixed.
 
 ## Module-level constants
 

@@ -741,8 +741,13 @@ with Pipeline("reload") as pipeline:
             "params.yaml key 'reload/tga' names no stage in pipeline 'reload'; "
             + "did you mean 'reload/tag'?",
         ),
+        (
+            "reload/tag:\n  suffix: 3\n",
+            "params.yaml key 'reload/tag': field 'suffix' value 3 is invalid for SuffixParams: "
+            + "Input should be a valid string",
+        ),
     ],
-    ids=["unknown-key"],
+    ids=["unknown-key", "bad-value"],
 )
 async def test_watch_started_on_bad_params_yaml_waits_for_fix(
     watch_project: pathlib.Path,
