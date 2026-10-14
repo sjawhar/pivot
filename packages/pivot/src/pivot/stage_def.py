@@ -27,9 +27,13 @@ class StageParams(pydantic.BaseModel):
     For testing, call the function directly:
 
         result = train(TrainParams(learning_rate=0.5), test_df)
+
+    Unknown fields are refused, whether they come from code (``TrainParams(learnig_rate=1)``)
+    or from ``params.yaml``. A subclass's own ``model_config`` merges with this one, so it
+    keeps refusing them unless it sets ``extra`` itself.
     """
 
-    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict()
+    model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="forbid")
 
 
 def validate_directory_out_key(key: str, output_name: str) -> str:

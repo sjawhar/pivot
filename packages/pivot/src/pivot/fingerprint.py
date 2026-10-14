@@ -45,11 +45,13 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 13 hashes a function value by its name and code instead of its address-bearing repr.
 # Version 14 walks user functions and classes bound in functools.partial arguments.
 # Version 15 hashes an object with the default repr by its class and attributes, not its address.
-# Version 16 records the live values a walk read, which a cache hit reads again.
-# Version 17 keys manifests by the function's full identity (closure values and defaults
+# Version 16 invalidates manifests hashed before StageParams forbade extra fields, which adds
+# additionalProperties: false to a params schema; no project source edit would invalidate them.
+# Version 17 records the live values a walk read, which a cache hit reads again.
+# Version 18 keys manifests by the function's full identity (closure values and defaults
 # included) and keys closure values under the binding the closure was reached through.
-# Version 18 records each library function or class a stage reads by name (`ext:` entries).
-_CACHE_SCHEMA_VERSION = 18
+# Version 19 records each library function or class a stage reads by name (`ext:` entries).
+_CACHE_SCHEMA_VERSION = 19
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")

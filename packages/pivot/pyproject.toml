@@ -14,7 +14,7 @@ classifiers = [
 ]
 dependencies = [
   "aiohttp>=3.9",
-  "anyio>=4.0",
+  "anyio>=4.11",
   "click>=8.0",
   "cloudpickle>=3.0",
   "deepmerge>=2.0",
@@ -27,7 +27,7 @@ dependencies = [
   "networkx>=3.0",
   "pathspec>=0.12.0",
   "pandas>=2.0",
-  "pydantic>=2.0",
+  "pydantic>=2.13",
   "pygtrie>=2.5.0",
   "pyyaml>=6.0",
   "rich>=13.0",

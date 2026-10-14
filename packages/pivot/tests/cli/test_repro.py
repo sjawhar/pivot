@@ -18,6 +18,8 @@ from pivot import cli, compose, executor
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import click.testing
 
 # =============================================================================
@@ -1466,3 +1468,174 @@ def test_list_keeps_one_pipeline_included_three_times(
 
     assert result.exit_code == 0, result.output
     assert [s["name"] for s in json.loads(result.stdout)["stages"]] == ["prep/drop_low"]
+
+
+_WATCH_SCALE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, StageParams, stage
+
+
+class ScaleParams(StageParams):
+    factor: int = 10
+
+
+@stage
+def scale(numbers: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:
+    return numbers * params.factor
+
+
+with Pipeline("smoke") as pipeline:
+    scale(pipeline.input("numbers.csv"), params=ScaleParams())
+"""
+
+
+def _wait_for_watch(
+    proc: subprocess.Popen[bytes], log_path: pathlib.Path, done: Callable[[], bool]
+) -> None:
+    """Wait up to 60s for ``done``; fail at once, with the log, if watch exits."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if done():
+            return
+        assert proc.poll() is None, (
+            f"watch exited with rc {proc.returncode}:\n{log_path.read_text(errors='replace')}"
+        )
+        time.sleep(0.1)
+    raise AssertionError(f"timed out:\n{log_path.read_text(errors='replace')}")
+
+
+def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib.Path) -> None:
+    """A params.yaml error during watch is an invalid pipeline: watch stays up until it is fixed."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".pivot").mkdir()
+    (project / "data" / "raw").mkdir(parents=True)
+    (project / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
+    (project / "pipeline.py").write_text(_WATCH_SCALE_PIPELINE)
+    params_yaml = project / "params.yaml"
+    params_yaml.write_text("smoke/scale:\n  factor: 2\n")
+    output = project / "data" / "smoke" / "scale.jsonl"
+    log_path = tmp_path / "watch.log"
+    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    def scaled() -> list[int] | None:
+        if not output.exists():
+            return None
+        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--debounce", "100"],
+            cwd=project,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    try:
+        _wait_for_watch(proc, log_path, lambda: scaled() == [2, 4])
+
+        params_yaml.write_text("smoke/scael:\n  factor: 3\n")
+        _wait_for_watch(
+            proc,
+            log_path,
+            lambda: "Pipeline invalid - waiting for fix" in log_path.read_text(errors="replace"),
+        )
+        log_text = log_path.read_text(errors="replace")
+        assert (
+            "params.yaml key 'smoke/scael' names no stage in pipeline 'smoke'; "
+            + "did you mean 'smoke/scale'?"
+        ) in log_text, log_text
+        time.sleep(1)
+        assert proc.poll() is None, log_path.read_text(errors="replace")
+        assert scaled() == [2, 4], "nothing runs while params.yaml is invalid"
+
+        params_yaml.write_text("smoke/scale:\n  factor: 5\n")
+        _wait_for_watch(proc, log_path, lambda: scaled() == [5, 10])
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def test_repro_watch_ctrl_c_exits_while_a_reload_import_hangs(tmp_path: pathlib.Path) -> None:
+    """Ctrl-C stops plain watch at once even while an edited pipeline.py's import never returns."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".pivot").mkdir()
+    (project / "data" / "raw").mkdir(parents=True)
+    (project / "data" / "raw" / "input.txt").write_text("data")
+    source = """\
+from __future__ import annotations
+
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def process(input_file: str) -> str:
+    return input_file
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+    pipeline_py = project / "pipeline.py"
+    pipeline_py.write_text(source)
+    output_path = project / "data" / "test" / "process.txt"
+    # Outside the project, so neither the marker nor the logs are watch events
+    importing = tmp_path / "importing"
+    stdout_path = tmp_path / "watch.stdout"
+    stderr_path = tmp_path / "watch.stderr"
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch"],
+            cwd=project,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+
+    def _logs() -> str:
+        return (
+            f"stdout: {stdout_path.read_text(errors='replace')}\n"
+            + f"stderr: {stderr_path.read_text(errors='replace')}"
+        )
+
+    try:
+        for _ in range(300):
+            if output_path.exists():
+                break
+            time.sleep(0.1)
+        assert output_path.exists(), f"the startup run did not finish within 30s\n{_logs()}"
+
+        pipeline_py.write_text(
+            source
+            + f"\npathlib.Path({str(importing)!r}).write_text('importing')\n"
+            + "import time\ntime.sleep(600)\n"
+        )
+        for _ in range(300):
+            if importing.exists():
+                break
+            time.sleep(0.1)
+        assert importing.exists(), f"the reload did not import the edit within 30s\n{_logs()}"
+
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"watch was still running 2 s after Ctrl-C\n{_logs()}")
+        assert proc.returncode == 0, _logs()
+        assert "Watch mode stopped." in stdout_path.read_text(), _logs()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
