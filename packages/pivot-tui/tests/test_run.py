@@ -4,6 +4,7 @@ import collections
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 import textual.binding
 import textual.widgets
@@ -1273,6 +1274,7 @@ async def test_slow_rpc_reply_does_not_freeze_the_app(
     ("error", "expected"),
     [
         pytest.param(TimeoutError(), "Engine did not answer", id="timeout"),
+        pytest.param(anyio.EndOfStream(), "Engine closed the connection", id="connection-lost"),
         pytest.param(
             pivot_tui.rpc_client_impl.RpcError(
                 -32004, "Engine is starting: fingerprinting stages; try again when it is ready"

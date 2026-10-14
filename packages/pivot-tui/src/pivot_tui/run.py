@@ -17,6 +17,7 @@ from typing import (
     override,
 )
 
+import anyio
 import rich.markup
 import textual  # for textual.work decorator
 import textual.app
@@ -188,6 +189,9 @@ _logger = logging.getLogger(__name__)
 
 # Shown when an RPC reply times out in the client (the engine is busy or gone)
 _NO_REPLY = "Engine did not answer in time"
+# Shown when the engine closed the RPC connection (for example after a server-side error)
+_CONNECTION_LOST = "Engine closed the connection"
+_CONNECTION_ERRORS = (anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError)
 
 # Minimum terminal size for proper display
 _MIN_TERMINAL_WIDTH = 80
@@ -1181,6 +1185,9 @@ class PivotApp(textual.app.App[None]):
         except TimeoutError:
             self.notify(f"Commit failed: {_NO_REPLY}", severity="error")
             return
+        except _CONNECTION_ERRORS:
+            self.notify(f"Commit failed: {_CONNECTION_LOST}", severity="error")
+            return
         except RpcError as exc:
             self.notify(f"Commit failed: {exc.message}", severity="error")
             return
@@ -1244,6 +1251,9 @@ class PivotApp(textual.app.App[None]):
                 success = await client.run(stages=stages, force=True)
         except TimeoutError:
             self.notify(f"Re-run failed: {_NO_REPLY}", severity="error")
+            return
+        except _CONNECTION_ERRORS:
+            self.notify(f"Re-run failed: {_CONNECTION_LOST}", severity="error")
             return
         except RpcError as exc:
             self.notify(exc.message, severity="error")
