@@ -187,12 +187,24 @@ def _field_named(
     return None
 
 
+# What a secret is, for the record (``_encode``, from a value) and for errors
+# (``_holds_secret``, from an annotation).
 _SECRET_TYPES = (pydantic.SecretStr, pydantic.SecretBytes, pydantic.Secret)
 
 
-def _holds_secret(annotation: object, seen: set[type[pydantic.BaseModel]]) -> bool:
-    """Whether a value of ``annotation`` may contain a secret, at any depth."""
-    for candidate in (annotation, typing.get_origin(annotation)):
+def _holds_secret(annotation: object, seen: set[object]) -> bool:
+    """Whether a value of ``annotation`` may contain one of ``_SECRET_TYPES``, at any depth:
+    through unions, containers, ``Annotated``, nested models, and PEP 695 ``type`` aliases
+    (``type Tok = SecretStr``, ``type Box[T] = list[T]``), recursive ones included."""
+    if isinstance(annotation, typing.TypeAliasType):
+        if annotation in seen:
+            return False
+        seen.add(annotation)
+        return _holds_secret(annotation.__value__, seen)
+    origin = typing.get_origin(annotation)
+    if isinstance(origin, typing.TypeAliasType) and _holds_secret(origin, seen):
+        return True
+    for candidate in (annotation, origin):
         if isinstance(candidate, type) and issubclass(candidate, _SECRET_TYPES):
             return True
     if isinstance(annotation, type) and issubclass(annotation, pydantic.BaseModel):
@@ -627,9 +639,7 @@ def _encode(original: object, encoded: Any, digest: _Digest | None) -> Any:
     ``list[SecretStr]`` into one string, a ``model_serializer`` exposing a secret) reshapes
     the node, so its output, the value included, is recorded as written.
     """
-    if digest is not None and isinstance(
-        original, (pydantic.SecretStr, pydantic.SecretBytes, pydantic.Secret)
-    ):
+    if digest is not None and isinstance(original, _SECRET_TYPES):
         return digest(original)
     if isinstance(encoded, dict):
         encoded_dict = cast("dict[str, Any]", encoded)

@@ -1061,11 +1061,20 @@ class _PinHolder(BaseModel):
     label: str = "x"
 
 
+type _Token = pydantic.SecretStr
+type _Tokens = list[_Token]
+type _Box[T] = list[T]
+
+
 class _InvalidSecretParams(stage_def.StageParams):
     pin: pydantic.Secret[int] = pydantic.Secret[int](1)
     token: pydantic.SecretStr | None = None
     keys: list[pydantic.SecretStr] = []
     holder: _PinHolder = _PinHolder()
+    aliased: _Token = pydantic.SecretStr("a")
+    aliased_list: _Tokens = []
+    boxed: _Box[pydantic.SecretStr] = []
+    annotated: Annotated[_Token, pydantic.Field(description="x")] = pydantic.SecretStr("b")
     epochs: int = 3
 
 
@@ -1076,8 +1085,21 @@ class _InvalidSecretParams(stage_def.StageParams):
         ({"token": 424242}, "token", "424242"),
         ({"keys": [7777777]}, "keys.0", "7777777"),
         ({"holder": {"pin": "55y555"}}, "holder.pin", "55y555"),
+        ({"aliased": ["leak-4"]}, "aliased", "leak-4"),
+        ({"aliased_list": [8888888]}, "aliased_list.0", "8888888"),
+        ({"boxed": [6666666]}, "boxed.0", "6666666"),
+        ({"annotated": 3333333}, "annotated", "3333333"),
     ],
-    ids=["secret", "optional-secret", "list-of-secrets", "nested-secret"],
+    ids=[
+        "secret",
+        "optional-secret",
+        "list-of-secrets",
+        "nested-secret",
+        "type-alias",
+        "list-type-alias",
+        "generic-type-alias",
+        "annotated-type-alias",
+    ],
 )
 def test_an_invalid_secret_value_is_not_echoed_in_the_error(
     override: dict[str, object], path: str, plaintext: str
