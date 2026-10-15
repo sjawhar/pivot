@@ -7,7 +7,7 @@ import pathlib
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
-from pivot import compose, config, loaders, types
+from pivot import config, stage_def, types
 from pivot.storage import cache
 from pivot.storage import state as state_mod
 
@@ -58,7 +58,7 @@ class CacheStore:
             yield db
 
     def _ref_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        key = ref.identity.key or compose.SINGLE_OUTPUT_KEY
+        key = ref.identity.key or stage_def.SINGLE_OUTPUT_KEY
         return self._ref_dir / ref.identity.producer / key
 
     def checkout(self, ref: types.ArtifactRef) -> pathlib.Path:
@@ -299,6 +299,10 @@ def relative_output_path(ref: types.ArtifactRef) -> pathlib.Path:
         if key is None:
             return pathlib.Path(prefix) / stage_name
         return pathlib.Path(prefix) / stage_name / key
+
+    from pivot import (
+        loaders,
+    )  # loaders imports pandas; keep it off CLI paths that never place outputs
 
     ext = loaders.format_extension(ref.format)
     if key is None:
