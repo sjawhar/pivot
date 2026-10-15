@@ -111,7 +111,13 @@ def _displace_module(module_name: str, session: _ImportSession) -> None:
 
 
 def _module_is_under_root(module: _stdlib_types.ModuleType, root: pathlib.Path) -> bool:
-    """Whether a regular or namespace module is loaded from this project root."""
+    """Whether a regular or namespace project module is loaded from this project root.
+
+    Libraries are never project modules, even from a virtualenv inside the root: a session
+    removes the modules it owns, and some extensions (numpy's) cannot be imported twice.
+    """
+    if not fingerprint.is_user_code(module):
+        return False
     module_file = getattr(module, "__file__", None)
     if isinstance(module_file, str):
         try:

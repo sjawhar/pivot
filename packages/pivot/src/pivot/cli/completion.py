@@ -106,12 +106,6 @@ if TYPE_CHECKING:
     from pivot.registry import PipelineLike
 
 
-def _get_pipeline_for_targets() -> PipelineLike | None:
-    from pivot import discovery
-
-    return discovery.discover_pipeline()
-
-
 def complete_targets(
     _ctx: click.Context,
     _param: click.Parameter,
@@ -119,8 +113,10 @@ def complete_targets(
 ) -> list[str]:
     try:
         stages = _get_stages_fast()
+        discovered = stages is None
+        pipeline = _discover_pipeline() if discovered else None
         if stages is None:
-            stages = _get_stages_full()
+            stages = [] if pipeline is None else pipeline.list_stages()
 
         completions = [stage for stage in stages if stage.startswith(incomplete)]
         _add_bare_completions(stages, completions, incomplete)
@@ -129,7 +125,8 @@ def complete_targets(
         if ":" not in incomplete:
             return completions
 
-        pipeline = _get_pipeline_for_targets()
+        if not discovered:
+            pipeline = _discover_pipeline()
         if pipeline is None:
             return completions
 
@@ -245,9 +242,14 @@ def _get_stages_fast() -> list[str] | None:
 
 
 def _get_stages_full() -> list[str]:
-    """Fallback: get stage names via full discovery (~500ms).
+    """Fallback: get stage names via full discovery (~500ms), refreshing the cache."""
+    pipeline = _discover_pipeline()
+    return [] if pipeline is None else pipeline.list_stages()
 
-    Writes stage names to cache after discovery for future fast lookups.
+
+def _discover_pipeline() -> PipelineLike | None:
+    """Discover the pipeline and write its stage names to the cache for fast lookups.
+
     Cache is only written if config file mtime is unchanged during discovery
     (prevents race condition where config changes during slow discovery).
     """
@@ -259,9 +261,7 @@ def _get_stages_full() -> list[str]:
 
     pipeline = discovery.discover_pipeline()
     if pipeline is None:
-        return []
-
-    stages = pipeline.list_stages()
+        return None
 
     # Write cache only if config file unchanged during discovery
     if root and pre_discovery:
@@ -269,11 +269,11 @@ def _get_stages_full() -> list[str]:
         try:
             post_mtime = (root / config_file).stat().st_mtime
             if pre_mtime == post_mtime:
-                _write_stages_cache(root, config_file, pre_mtime, stages)
+                _write_stages_cache(root, config_file, pre_mtime, pipeline.list_stages())
         except OSError:
             pass  # Cache write failure is non-fatal
 
-    return stages
+    return pipeline
 
 
 def _find_project_root_fast() -> pathlib.Path | None:

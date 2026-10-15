@@ -481,3 +481,15 @@ with Pipeline("valid", root=pathlib.Path(__file__).parent) as pipeline:
     assert pipeline.list_stages() == ["valid/build"]
     assert "broken.broken_helper" not in sys.modules
     assert "broken.broken_helper" not in cloudpickle.list_registry_pickle_by_value()
+
+
+def test_second_discovery_keeps_libraries_from_venv_inside_root(
+    venv_inside_root_project: pathlib.Path,
+) -> None:
+    """Site-packages under the root are libraries, not project modules: discovery keeps them."""
+    first = discovery.discover_pipeline(project_root=venv_inside_root_project)
+    second = discovery.discover_pipeline(project_root=venv_inside_root_project)
+
+    assert first is not None
+    assert second is not None, "the second discovery should load pipeline.py again"
+    assert second.list_stages() == ["venv/train"]
