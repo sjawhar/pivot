@@ -411,7 +411,9 @@ def execute_stage(
                     project_root,
                 )
                 if no_commit:
-                    output_hashes = _hash_output_paths(output_paths)
+                    output_hashes = _hash_output_paths(
+                        output_paths, cache_dir=_store_cache_dir(store)
+                    )
                 else:
                     output_hashes = _commit_outputs_with_store(
                         output_paths, store, project_state_dir
@@ -556,7 +558,7 @@ def restore_outputs_to_hashes(
             if expected_hash is not None:
                 output_path = store.resolve_display_path(ref)
                 try:
-                    actual_hash = hash_output(output_path, state_db)
+                    actual_hash = hash_output(output_path, state_db, cache_dir=store.cache_dir)
                 except OSError:
                     actual_hash = None
                 if actual_hash == expected_hash:
@@ -613,10 +615,23 @@ def _check_skip_or_run(
     return "unchanged", "", input_hash, decision["run_cache_allowed"]
 
 
-def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:
-    """Compute output hash without saving to cache."""
+def _store_cache_dir(store: store_mod.Store) -> pathlib.Path | None:
+    """The cache object root whose symlinks count as directory content for ``store``."""
+    return store.cache_dir if isinstance(store, store_mod.WorkspaceStore) else None
+
+
+def hash_output(
+    path: pathlib.Path,
+    state_db: state.StateDB | None = None,
+    *,
+    cache_dir: pathlib.Path | None = None,
+) -> HashInfo:
+    """Compute output hash without saving to cache.
+
+    ``cache_dir`` is the cache object root whose symlinks count as directory content.
+    """
     if path.is_dir():
-        tree_hash, manifest = cache.hash_directory(path, state_db)
+        tree_hash, manifest = cache.hash_directory(path, state_db, cache_dir=cache_dir)
         return DirHash(hash=tree_hash, manifest=manifest)
     file_hash, _ = cache.hash_file(path, state_db)
     return FileHash(hash=file_hash)
@@ -1040,13 +1055,17 @@ def _run_stage_function_with_store(
 def _hash_output_paths(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     state_db: state.StateDB | None = None,
+    *,
+    cache_dir: pathlib.Path | None = None,
 ) -> dict[str, HashInfo]:
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if path.is_dir():
-            tree_hash, manifest = cache.hash_directory(path, state_db, warn_left_out_symlinks=True)
+            tree_hash, manifest = cache.hash_directory(
+                path, state_db, cache_dir=cache_dir, warn_left_out_symlinks=True
+            )
             output_hashes[types.identity_key(ref.identity)] = DirHash(
                 hash=tree_hash, manifest=manifest
             )

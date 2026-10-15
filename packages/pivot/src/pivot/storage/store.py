@@ -165,6 +165,11 @@ class WorkspaceStore:
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
         self._checkout_modes = checkout_modes
 
+    @property
+    def cache_dir(self) -> pathlib.Path | None:
+        """The cache object root (``<cache.dir>/files``), or None when this store has no cache."""
+        return self._cache_dir
+
     def _resolve_input_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         name = ref.identity.producer
         if name in self._input_bindings:
@@ -220,7 +225,9 @@ class WorkspaceStore:
         """Hash a written output once and, unless it is a metric, place it in the cache."""
         output_hash: types.HashInfo
         if path.is_dir():
-            tree_hash, manifest = cache.hash_directory(path, None, warn_left_out_symlinks=True)
+            tree_hash, manifest = cache.hash_directory(
+                path, None, cache_dir=self._cache_dir, warn_left_out_symlinks=True
+            )
             output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
         else:
             file_hash, _ = cache.hash_file(path, None)
@@ -261,7 +268,7 @@ class WorkspaceStore:
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir():
-            tree_hash, manifest = cache.hash_directory(path, state_db)
+            tree_hash, manifest = cache.hash_directory(path, state_db, cache_dir=self._cache_dir)
             return types.DirHash(hash=tree_hash, manifest=manifest)
         file_hash, _ = cache.hash_file(path, state_db)
         return types.FileHash(hash=file_hash)

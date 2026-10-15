@@ -246,10 +246,28 @@ def test_hash_directory_hashes_cache_object_links_by_target(
     (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, expected_manifest[0]["hash"]))
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
-        result = cache.hash_directory(linked, warn_left_out_symlinks=True)
+        result = cache.hash_directory(linked, cache_dir=cache_dir, warn_left_out_symlinks=True)
 
     assert result == (expected_hash, expected_manifest)
     assert caplog.records == []
+
+
+def test_hash_directory_leaves_out_links_to_hash_named_files_outside_the_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Only a link into the given cache root is content, however its target is named."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("keep")
+    cache_dir = tmp_path / "cache"
+    _, manifest = cache.hash_directory(source)
+    cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, manifest[0]["hash"]))
+
+    assert cache.hash_directory(linked, cache_dir=tmp_path / "other-cache")[1] == []
+    assert cache.hash_directory(linked)[1] == []
 
 
 def test_hash_directory_relative_paths(tmp_path: pathlib.Path) -> None:

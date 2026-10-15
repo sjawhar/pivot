@@ -134,8 +134,9 @@ or `pivot track` records it, Pivot logs one warning naming each symlink it
 left out, for example `Directory artifact data/p/bundle.dat leaves out symlink
 link.txt`; replace the link with a real file or directory. A later release
 refuses these symlinks. The one exception is a link Pivot made itself: a
-symlink-mode checkout links each file to its cache object, and that link counts
-as the file it points to.
+symlink-mode checkout links each file to an object in the configured cache
+(`cache.dir`), and that link counts as the file it points to. A link to a
+hash-named file anywhere else is a user symlink.
 
 The declarative `DirectoryOut` annotation for a variable set of files remains
 undecided; do not add that annotation to a compositional pipeline.

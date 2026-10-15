@@ -17,6 +17,7 @@ import uuid
 
 import boto3
 import pytest
+import xxhash
 import yaml
 
 from pivot import loaders
@@ -992,6 +993,45 @@ def test_tracked_directory_checked_out_as_symlinks_stays_clean(tmp_path: pathlib
 
     pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
     assert sorted(entry["relpath"] for entry in pvt["manifest"]) == ["keep.txt", "nested/f.txt"]
+
+
+def test_only_links_into_the_configured_cache_count_as_directory_content(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A link to a content-addressed file outside the cache is a user symlink, not content."""
+    foreign_content = b"seed bytes"
+    digest = xxhash.xxh64(foreign_content).hexdigest()
+    foreign_object = tmp_path / "foreign-content-store" / digest[:2] / digest[2:]
+    foreign_object.parent.mkdir(parents=True)
+    foreign_object.write_bytes(foreign_content)
+    real_cache = tmp_path / "real-cache"
+    real_cache.mkdir()
+    cache_link = tmp_path / "cache-link"
+    cache_link.symlink_to(real_cache)
+    root = tmp_path / "project"
+    root.mkdir()
+    _project(root, {"data/tracked/keep.txt": "keep", "data/tracked/nested/f.txt": "f"})
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_link)))
+    tracked = root / "data" / "tracked"
+    (tracked / "foreign.txt").symlink_to(foreign_object)
+
+    out = _ok(_pivot(root, "track", "data/tracked"))
+
+    assert "Directory artifact data/tracked leaves out symlink foreign.txt" in " ".join(
+        out.split()
+    ), out
+    pvt_path = root / "data" / "tracked.pvt"
+    manifest = yaml.safe_load(pvt_path.read_text())["manifest"]
+    assert sorted(entry["relpath"] for entry in manifest) == ["keep.txt", "nested/f.txt"]
+
+    # A real symlink checkout through the symlinked custom cache root is still content.
+    shutil.rmtree(tracked)
+    _ok(_pivot(root, "checkout", "--checkout-mode", "symlink", "data/tracked"))
+    assert (tracked / "keep.txt").resolve().is_relative_to((real_cache / "files").resolve())
+    assert "1 clean" in _ok(_pivot(root, "status", "--tracked-only"))
+    _ok(_pivot(root, "checkout", "data/tracked"))  # existing links match: skipped, not an error
+    assert "leaves out symlink" not in _ok(_pivot(root, "track", "--force", "data/tracked"))
+    assert yaml.safe_load(pvt_path.read_text())["manifest"] == manifest
 
 
 _PARAM_PIPELINE = """\

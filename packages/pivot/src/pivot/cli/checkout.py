@@ -67,11 +67,13 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
     return result
 
 
-def _on_disk_matches_expected(path: pathlib.Path, expected_hash: HashInfo) -> bool:
+def _on_disk_matches_expected(
+    path: pathlib.Path, expected_hash: HashInfo, cache_dir: pathlib.Path
+) -> bool:
     if is_dir_hash(expected_hash):
         if not path.is_dir():
             return False
-        actual_hash, _ = cache.hash_directory(path)
+        actual_hash, _ = cache.hash_directory(path, cache_dir=cache_dir)
     else:
         if not path.is_file():
             return False
@@ -119,7 +121,7 @@ def _restore_path_locked(
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
-                if _on_disk_matches_expected(path, output_hash):
+                if _on_disk_matches_expected(path, output_hash, cache_dir):
                     return ("skipped", path.name)
                 raise click.ClickException(
                     f"'{path.name}' already exists with different content. "
