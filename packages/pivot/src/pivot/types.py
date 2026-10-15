@@ -361,6 +361,7 @@ class LockData(TypedDict):
     output_hashes: dict[ArtifactIdentity, HashInfo]
     output_paths: NotRequired[dict[ArtifactIdentity, str]]
 
+
 class OutputMessageKind(enum.StrEnum):
     """Discriminant for worker→engine output messages."""
 
