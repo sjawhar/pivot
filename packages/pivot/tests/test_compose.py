@@ -1807,7 +1807,7 @@ def test_direct_foreign_input_binding_is_exposed_to_watch_paths(tmp_path: pathli
     with shared:
         source = shared.input("shared.txt", path="actual.txt", t=str)
     with Pipeline("consumer", root=tmp_path) as consumer:
-        _helper_consume(source)
+        _helper_join_direct_foreign_inputs(source, source)
 
     assert consumer.input_bindings["shared.txt"] == "actual.txt"
 
