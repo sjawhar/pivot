@@ -242,29 +242,29 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
                 yield from _scandir_recursive(pathlib.Path(entry.path))
 
 
-def hash_directory(
+def _scandir_artifact_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
+    """Yield every regular file in an artifact directory, rejecting symlinks."""
+    with os.scandir(path) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                raise exceptions.CacheError(f"Directory artifact contains symlink: {entry.path}")
+            if entry.is_file():
+                yield entry
+            elif entry.is_dir():
+                yield from _scandir_artifact_recursive(pathlib.Path(entry.path))
+
+
+def _hash_directory(
     path: pathlib.Path,
-    state_db: state_mod.StateDB | None = None,
+    state_db: state_mod.StateDB | None,
+    entries: Generator[os.DirEntry[str]],
 ) -> tuple[str, list[DirManifestEntry]]:
-    """Compute tree hash of directory, returning hash and manifest.
-
-    Symlink handling:
-    - Symlinks INSIDE directories are skipped (prevents infinite loops)
-    - Base path may be symlinked (resolved for consistency)
-    - Content-based hashing only (symlink metadata excluded from fingerprints)
-
-    Note: For portability, paths are stored as normalized (symlinks preserved)
-    in lock files, but resolved here for consistent hashing.
-
-    Args:
-        path: Directory to hash
-        state_db: Optional StateDB for caching file hashes
-    """
+    """Hash yielded regular files into a directory manifest."""
     _t = metrics.start()
     manifest = list[DirManifestEntry]()
     resolved_base = path.resolve()
 
-    for entry in sorted(_scandir_recursive(path), key=lambda e: e.path):
+    for entry in sorted(entries, key=lambda e: e.path):
         file_path = pathlib.Path(entry.path)
         # Verify file is still within the directory (paranoid check)
         if not file_path.resolve().is_relative_to(resolved_base):
@@ -288,6 +288,22 @@ def hash_directory(
 
     metrics.end("cache.hash_directory", _t)
     return tree_hash, manifest
+
+
+def hash_directory(
+    path: pathlib.Path,
+    state_db: state_mod.StateDB | None = None,
+) -> tuple[str, list[DirManifestEntry]]:
+    """Hash a project directory, excluding ignored paths and symlink descendants."""
+    return _hash_directory(path, state_db, _scandir_recursive(path))
+
+
+def hash_artifact_directory(
+    path: pathlib.Path,
+    state_db: state_mod.StateDB | None = None,
+) -> tuple[str, list[DirManifestEntry]]:
+    """Hash a directory artifact, keeping every regular descendant."""
+    return _hash_directory(path, state_db, _scandir_artifact_recursive(path))
 
 
 _VALID_HASH_CHARS = frozenset("0123456789abcdef")
@@ -664,10 +680,10 @@ def _save_directory_to_cache(
             cache_dir_path = get_cache_path(cache_dir, existing_hash)
             if cache_dir_path.exists():
                 # Already correctly linked - compute manifest from actual content
-                _, manifest = hash_directory(path, state_db)
+                _, manifest = hash_artifact_directory(path, state_db)
                 return DirHash(hash=existing_hash, manifest=manifest)
 
-    tree_hash, manifest = hash_directory(path, state_db)
+    tree_hash, manifest = hash_artifact_directory(path, state_db)
     output_hash = DirHash(hash=tree_hash, manifest=manifest)
     _store_directory(
         path,

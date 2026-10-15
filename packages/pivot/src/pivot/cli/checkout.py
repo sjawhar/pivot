@@ -72,6 +72,8 @@ def _on_disk_matches_expected(path: pathlib.Path, expected_hash: HashInfo) -> bo
         if not path.is_dir():
             return False
         actual_hash, _ = cache.hash_directory(path)
+        if actual_hash != expected_hash["hash"]:
+            actual_hash, _ = cache.hash_artifact_directory(path)
     else:
         if not path.is_file():
             return False

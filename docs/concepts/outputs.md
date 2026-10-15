@@ -121,7 +121,9 @@ Define the `TypedDict` at module level. The field name `_single` is reserved.
 
 A stage can return a `pathlib.Path` to a directory it created outside the
 project. `PathOnly()` moves that directory to Pivot's managed output path and
-Pivot caches it as an artifact.
+Pivot caches every regular-file descendant as part of the artifact. Names that
+project input tracking ignores, such as `build/` and `.venv/`, are still part of
+the directory artifact. A directory artifact containing a symlink is refused.
 
 The declarative `DirectoryOut` annotation for a variable set of files remains
 undecided; do not add that annotation to a compositional pipeline.

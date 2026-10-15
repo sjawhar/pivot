@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import uuid
@@ -118,6 +119,91 @@ def double(raw: pd.DataFrame) -> pd.DataFrame:
 with Pipeline("c") as pipeline:
     double(pipeline.input("t.csv"))
 """
+
+_DIRECTORY_ARTIFACT_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def assemble() -> pathlib.Path:
+    output = pathlib.Path(tempfile.mkdtemp(prefix="pivot-directory-artifact-"))
+    for directory in (".git", ".idea", ".venv", ".vscode", "build", "dist", "node_modules"):
+        path = output / directory
+        path.mkdir()
+        (path / "required.txt").write_text(directory)
+    (output / "editor.swp").write_text("editor state")
+    (output / "keep.txt").write_text("keep")
+    return output
+
+
+with Pipeline("directory") as pipeline:
+    assemble()
+"""
+
+
+_DIRECTORY_ARTIFACT_SYMLINK_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def assemble() -> pathlib.Path:
+    output = pathlib.Path(tempfile.mkdtemp(prefix="pivot-directory-artifact-"))
+    target = output / "target.txt"
+    target.write_text("target")
+    (output / "link.txt").symlink_to(target)
+    return output
+
+
+with Pipeline("directory") as pipeline:
+    assemble()
+"""
+
+
+def test_repro_preserves_every_regular_file_in_a_directory_artifact(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Directory artifacts retain ignored-looking descendants after cached restoration."""
+    root = _project(tmp_path, {"pipeline.py": _DIRECTORY_ARTIFACT_PIPELINE})
+    output = root / "data" / "directory" / "assemble.dat"
+    expected = {
+        ".git/required.txt": ".git",
+        ".idea/required.txt": ".idea",
+        ".venv/required.txt": ".venv",
+        ".vscode/required.txt": ".vscode",
+        "build/required.txt": "build",
+        "dist/required.txt": "dist",
+        "node_modules/required.txt": "node_modules",
+        "editor.swp": "editor state",
+        "keep.txt": "keep",
+    }
+
+    _ok(_pivot(root, "repro"))
+    assert {rel: (output / rel).read_text() for rel in expected} == expected
+
+    shutil.rmtree(output)
+    out = _ok(_pivot(root, "repro"))
+
+    assert "cached" in out
+    assert {rel: (output / rel).read_text() for rel in expected} == expected
+
+
+def test_repro_refuses_a_directory_artifact_that_contains_a_symlink(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory artifact cannot silently omit a symlinked descendant."""
+    root = _project(tmp_path, {"pipeline.py": _DIRECTORY_ARTIFACT_SYMLINK_PIPELINE})
+
+    proc = _pivot(root, "repro")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Directory artifact contains symlink" in out
 
 
 def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: pathlib.Path) -> None:

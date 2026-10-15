@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from pivot import exceptions
 from pivot.storage import cache, state
 from pivot.types import HashInfo
 
@@ -191,6 +192,44 @@ def test_hash_directory(tmp_path: pathlib.Path) -> None:
 
     assert len(tree_hash) == 16
     assert len(manifest) == 2
+
+
+def test_hash_artifact_directory_includes_ignored_named_descendants(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage directory is an artifact, not a project tree to filter."""
+    test_dir = tmp_path / "artifact"
+    expected = {
+        ".git/required.txt": ".git",
+        ".idea/required.txt": ".idea",
+        ".venv/required.txt": ".venv",
+        ".vscode/required.txt": ".vscode",
+        "build/required.txt": "build",
+        "dist/required.txt": "dist",
+        "node_modules/required.txt": "node_modules",
+        "editor.swp": "editor state",
+        "keep.txt": "keep",
+    }
+    for relpath, content in expected.items():
+        path = test_dir / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    _, manifest = cache.hash_artifact_directory(test_dir)
+
+    assert {entry["relpath"] for entry in manifest} == set(expected)
+
+
+def test_hash_artifact_directory_refuses_symlinked_descendants(tmp_path: pathlib.Path) -> None:
+    """A directory artifact reports a symlink rather than silently excluding it."""
+    test_dir = tmp_path / "artifact"
+    test_dir.mkdir()
+    target = test_dir / "target.txt"
+    target.write_text("target")
+    (test_dir / "link.txt").symlink_to(target)
+
+    with pytest.raises(exceptions.CacheError, match="Directory artifact contains symlink"):
+        cache.hash_artifact_directory(test_dir)
 
 
 def test_hash_directory_relative_paths(tmp_path: pathlib.Path) -> None:
