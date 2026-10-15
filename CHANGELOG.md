@@ -2,6 +2,894 @@
 
 <!-- version list -->
 
+## v0.2.4 (2026-10-15)
+
+### Bug Fixes
+
+- **cli**: Clear stage manifests in fingerprint reset
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **cli**: Exit non-zero when the TUI crashes ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **cli**: Fail `pivot repro --tui --watch` when the engine crashes
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **cli**: Stop the TUI event poller when the engine or TUI finishes
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **cli**: Suggest pivot repro, and pivot pull for a clone missing outputs (F1)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Carry stage resources on the stage node, not the shared function
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Compare a stage's closure and default values by canonical text
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Compare a stage's params by their canonical encoding
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Compare input and output formats when one stage is reached twice
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Name the return value in p.previous() and handle-lookup errors
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Name the return value, not '_single', in output errors (F11)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: One stage reached twice means same definition and wiring, not same object
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Refuse a non-integer resource request when the stage is declared
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Refuse a pipeline input bound to another stage's output path
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Refuse two pipelines with one name instead of sharing their stages
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Reject stage signatures workers cannot call
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Reject stage signatures workers cannot invoke
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Reject two input names bound to one file at load (F12)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Retain direct foreign input bindings
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Show a loader's function fields by closure values in a refusal
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **deps**: Require pydantic 2.13, whose by-value pickled models validate
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **discovery**: --all skips a pipeline.py that re-exports another file's pipeline
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **discovery**: Accept a symlinked project state directory
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **discovery**: Never own site-packages modules; reuse the completion pipeline
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **discovery**: Refuse a pipeline whose root= is not the project root
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: A params.yaml error during watch is an invalid pipeline
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: Finalize cancellation after final dispatch
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: Finalize cancellation before worker startup
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: Size the cpu resource by the worker count, not the stages in the run
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **explain**: Name an edited or missing metric instead of 'Outputs missing from cache' (F6)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Allow ArtifactHandle default arguments
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Allow library ufuncs that lack __module__
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Allow library-exported callable objects
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Apply the class attribute rule only to what a user class body wrote
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Bump the cache schema version for StageParams extra="forbid"
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Check default argument values like captured module values
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Check every live value a cached manifest read
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Drop bare @stage decorators from stage code hashes
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: End a self-referencing value in a stable cycle token
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Hash a dataclass instance field by field
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Hash a default-repr object by its class and attributes
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Hash a function value by its name and code
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Hash a pydantic model class as a class
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Hash a secret outside a stage's params by its keyed digest
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Hash and record set params in a canonical order
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Include call-site input wiring in every skip key
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Key the manifest cache by stage function identity
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: List each unsafe-capture refusal once
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Name a function by its closure values and defaults
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Read module.NAME through the classifier globals use
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Record library functions a stage reads by name
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Refuse a partial whose function is bound to an instance
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Refuse methods bound to an instance
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Refuse user callable instances bound in loader config and partials
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Satisfy type check for sys.modules scan
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Track the class attributes a stage reads
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Treat nonlocal modules as module dependencies
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Validate cached manifests against every project module
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Walk a custom loader's own load, save and empty
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Walk functions and classes bound in loader config and partials
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Walk the function behind functools.cache helpers
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **get**: Preserve keyed revision target selection
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **get**: Recover files after a root-refused pipeline
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **get**: Restore files while pipeline.py fails to import
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **get**: Restore revision outputs to paths recorded in their locks
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **import**: Recurse through typed GitHub directories named .lock
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **incremental**: Restore previous outputs as writable copies
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **init**: Ignore the runtime files pivot creates under .pivot (F2, F17, F19)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **lock**: Require every recorded hash to be a cache key
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **lock**: Treat a lock whose fields have the wrong type as missing
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: A params.yaml override reaches a field with a pydantic alias
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Key secret digests with a per-project HMAC key
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Mask secrets declared through a PEP 695 type alias in errors
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Match params.yaml keys to the validated value, not to annotations
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Never echo a secret's value in a params error
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Only the process that creates the secret key appends to .gitignore
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Preserve excluded fields during override validation
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Record a secret param by a digest of its value
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Refuse a params.yaml typo inside a nested plain BaseModel
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Refuse a params.yaml value its StageParams field rejects at load
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Refuse a symlinked .pivot/.gitignore when gitignoring the key
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Refuse a symlinked .pivot/secret.key instead of following it
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: Refuse params.yaml keys that name no loaded stage
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: StageParams refuses unknown fields, from code or params.yaml
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **plots**: Write the gallery relative to the project root, not cwd
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **plots**: Write the gallery under .pivot/ with relative image paths (F5)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **registry**: Refuse outputs that resolve to one workspace path (F9)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **rpc**: Commit the engine's pipeline instead of reading it from Click context
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **rpc**: Refuse commit while the pipeline is invalid or the engine is starting
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **rpc**: Refuse run with -32004 while the engine is starting instead of waiting
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **rpc**: Refuse run with an error while the watched pipeline is invalid
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **rpc**: Send every artifact identity as a {producer, key} object
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **rpc**: Wait for the startup snapshot before deciding a run request
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **run-cache**: Build every stage input hash with one per-identity builder
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skip**: Compare recorded and current params by canonical JSON text
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **state**: Skip oversized output file-hash cache keys
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Count downstream stages pull restores in a plain clone
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Count pullable stages from explain's reason, without re-hashing
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Don't suggest pivot pull for a metric-only output mismatch
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Don't suggest pivot pull for stages downstream of a stale stage
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Pull count passes through committed stages and keeps -q --json
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Write explain dep_changes identities as {producer, key}
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **storage**: Preserve lexical containment through data symlinks
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **storage**: Refuse absolute artifact output identities
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **store**: Give pipeline inputs their own tag instead of guessing from disk
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **store**: Key the dependency collision check on the logical path
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Read engine_state_changed's state field so watch status reaches the app
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Rebuild artifact identities in explanations received over RPC
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Send output_summary identities as {producer, key} objects
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Send run and commit from Textual workers so slow replies never freeze the app
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Show a closed engine connection as a notification, not a crash
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Signal socket readiness only once the RPC server listens
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **verify**: Resolve lock dependency paths through the workspace store
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: A restart replays the cancelled run's stages too
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: A run request while a run is cancelling waits for it
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: An explicit cancel after a queued restart keeps the run cancelled
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Avoid submitting after cancellation ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Ctrl-C stops plain watch at once, even mid-reload
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Drop stale bytecode for changed sources before a reload
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Keep redirected stderr log records in their file
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Listen on the RPC socket while the startup fingerprint snapshot runs
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Print log records above the live console area
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Queue the startup run ahead of RPC run requests made during the snapshot
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Reload the edited pipeline off the event loop
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Report each watch run on its own in the console
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Report pipeline edits made before any run as modified stages
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Report why the pipeline is invalid, and show it in the TUI
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Run stale stages when watch mode starts
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Treat a pipeline as invalid whenever a reload rejects it
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Treat a stage fingerprint error as an invalid pipeline and wait for a fix
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Warn and keep reloading when stale bytecode cannot be removed
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Run the stage outside the joblib ImportError handler (F3)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+### Chores
+
+- **compose**: Drop the file-level pyright pragma
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **pyright**: Remove 24 redundant #452 file pragmas
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+### Code Style
+
+- **status**: Format integrated source ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **types**: Format output path lock fields ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+### Continuous Integration
+
+- Measure coverage on the pivot test row so fail_under = 90 binds
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+### Documentation
+
+- State manifest cache validation rule ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **agents**: Structure listing matches the package (no pipeline/, dag/ renders, outputs.py holds
+  DirectoryOut) ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **caching**: State the stat-cache boundary for committed outputs
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: List module reads the walk does not follow
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Name current framework classes in the is_user_code note
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Say why the project-module scan is a memo
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprinting**: Name the current module-helper manifest key
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **outputs**: DirectoryOut docstring states that compose rejects it
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **params**: A container serializer can still put a secret in the record
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **pipelines**: Name fingerprint settings in the same-stage rule
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **readme**: Package README uses the compositional API
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **resources**: Guide joblib process pools ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **resources**: Identify internally parallel stages
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skill**: Quote the error messages users actually see (F10)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skills**: Point RC-3 at the current type-hint walk
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **stage_def**: A subclass keeps extra="forbid" unless it sets extra
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **stage_def**: Describe directory-output keys without DirectoryOut
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Describe the poller stop event and engine-crash shutdown
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Only RPC cancel is an explicit cancel in watch mode
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+### Performance Improvements
+
+- **commit**: Hash each output once and link it by the configured checkout mode
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **discovery**: Memoize the root check per module file for a session
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Cache loader method AST hashes
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Cache loader method AST hashes; document joblib process pools; fix a watch
+  cancellation race ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Name each function once per fingerprint pass
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Scan sys.modules once per fingerprint pass
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **state**: Record output file hashes in the StateDB when outputs are committed or restored
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Read each stage lock once, and only what RPC explain needs
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **store**: Stop importing pandas on every CLI path
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Decide each output root's own-write check once per event batch
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+### Refactoring
+
+- Delete stale stage-function type docs and StageReturn
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- Delete unused legacy output classes Out, Metric and Plot
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- Delete unused path_utils module ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **cli**: One shared --resources option for repro and run
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Drop test-only stage wrapper attributes; import loaders at module level
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: One output-spec lookup for handles, deps and p.previous
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: One output-tag mapping for deps and outs
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **core**: Build WorkerStageInfo with its constructor
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **core**: Drop core.py's last file-wide pyright suppressions
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: Delete the merkle IDs nothing reads
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: Let discovery's import session own reload module eviction
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **exceptions**: Delete unused DVC compatibility errors
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **graph**: Parse artifact node identities with types.identity_from_key
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **lock**: Drop the constant outs[].tag and the never-written display field
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **registry**: Require input paths in every stage record
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **store**: Drop the unreachable absolute input binding branch
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+### Testing
+
+- Adapt to the integrated head (82886c4) ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- Give three lock fixtures valid hashes so each fails for its own reason
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- Stop building the legacy output classes ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Cover direct foreign input binding metadata
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **compose**: Type direct foreign input binding guard
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **deps**: Add hypothesis and mutmut to the pivot dev extra
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: Assert cancelled skip is not submitted
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **engine**: Cover cancellation during coordinator skip
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **executor**: Run(checkout_missing=True) restores a deleted tracked input or reports it uncached
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Compare params as the run-cache key serializes them
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **fingerprint**: Hypothesis properties for fresh-process determinism, formatting insensitivity,
+  one-token sensitivity and param overrides in the run-cache key
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **import**: Pivot import/update end to end against a local git source and moto S3; red test for
+  Task 9 ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **import**: Truncation behaviour of the available list; red test for Task 9
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **integration**: Fresh-venv wheel install smoke of init/repro/status/dag (CI only)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **integration**: Rendezvous the disjoint concurrent-run stages
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **lock**: Red tests for malformed lock shapes (Task 27)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **properties**: Hypothesis round-trips for loaders, lock files, identities, DAG order and input
+  hash ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skill**: Match each Common errors quote against the message it stands for
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skip**: Kill surviving mutants for output-path, param add/remove and empty-reason cases
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skip**: Narrow optional param_changes before reading it (basedpyright error)
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skip**: Stateful model of the skip contract through executor.run
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **skip**: Type the stateful skip-contract machine
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **status**: Missing tracked files, real-remote push counts, unusable and absent remotes
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **storage**: Deterministic Task 8 red test; drop the racy restore stress test
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **storage**: Multi-process stress of shared StateDB writes and directory restores
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **storage**: Name the restore-race owner in the xfail reason
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **tui**: Wait for workers before asserting a rerun guard sent nothing
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **watch**: Pipeline.py edits reload a running Engine; red test for unreported edits before any run
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: A restore check lists every unavailable output and writes nothing
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: A restore keeps checking outputs after restoring one
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Assert what messages must say, not their exact wording
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Generation tier, output restore, dependency hashing, run-cache key and generation bump
+  against a real store ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Lock-comparison skip reason, stage without joblib; red test for split UTF-8 in
+  captured subprocess output ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Logs, captured output, lock waiting, params overrides, skip/run reasons, seeding,
+  nested parallelism and value plumbing ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Match the cache restore override signature
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Name Task 9 as owner of the split-UTF-8 red test; drop a duplicate reason test
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+- **worker**: Return-shape errors, missing outputs, early-failure input hash, project root reset,
+  author-facing messages and a leaked child holding stdout
+  ([#474](https://github.com/sjawhar/pivot/pull/474),
+  [`9219c81`](https://github.com/sjawhar/pivot/commit/9219c81fbb9447f22c3b2fa7d7dcfb975b259e3a))
+
+
 ## v0.2.3 (2026-10-15)
 
 ### Bug Fixes
