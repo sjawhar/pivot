@@ -41,7 +41,7 @@ Collections (tuple, list, dict, set, frozenset) containing only primitives are r
 
 Type aliases (`types.UnionType`, `typing.Union`, simple assignments) are transparent to `get_type_hints()` — the alias name is replaced with its resolved value. Changes that only add/remove builtin types produce identical manifest entries.
 
-**Where in code:** Three independent failures: (1) Under `from __future__ import annotations`, aliases in annotation strings don't generate `LOAD_GLOBAL` bytecode. (2) `get_type_hints` resolves aliases before `_process_type_hint` sees them. (3) Function source AST is unchanged since annotation strings are unchanged.
+**Where in code:** Three independent failures: (1) Under `from __future__ import annotations`, aliases in annotation strings don't generate `LOAD_GLOBAL` bytecode. (2) `get_type_hints` resolves aliases before `_process_type_hint_dependencies` (through `_hint_classes`) sees them. (3) Function source AST is unchanged since annotation strings are unchanged.
 
 **Scope:** Only affects aliases used exclusively in annotations (not in function bodies) in modules with `from __future__ import annotations`, where the change only adds/removes builtin or third-party types (not new user-defined types).
 
