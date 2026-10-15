@@ -2328,11 +2328,13 @@ class Engine:
         if pipeline is None:
             return
         errors = list[str]()
-        for stage_name in pipeline.list_stages():
-            try:
-                _ = await anyio.to_thread.run_sync(pipeline.ensure_fingerprint, stage_name)
-            except exceptions.PivotError as exc:
-                errors.append(str(exc))
+        # Each worker thread copies this context, so the stages share one fingerprint pass.
+        with fingerprint.fingerprint_pass():
+            for stage_name in pipeline.list_stages():
+                try:
+                    _ = await anyio.to_thread.run_sync(pipeline.ensure_fingerprint, stage_name)
+                except exceptions.PivotError as exc:
+                    errors.append(str(exc))
         try:
             _ = parameters.load_params_yaml(pipeline)
         except (exceptions.ParamsError, exceptions.PipelineConfigError) as exc:
@@ -2726,11 +2728,12 @@ class Engine:
         if new_pipeline is None:
             return None, list[str]()
         errors = list[str]()
-        for stage_name in new_pipeline.list_stages():
-            try:
-                _ = new_pipeline.ensure_fingerprint(stage_name)
-            except exceptions.PivotError as exc:
-                errors.append(str(exc))
+        with fingerprint.fingerprint_pass():
+            for stage_name in new_pipeline.list_stages():
+                try:
+                    _ = new_pipeline.ensure_fingerprint(stage_name)
+                except exceptions.PivotError as exc:
+                    errors.append(str(exc))
         try:
             _ = parameters.load_params_yaml(new_pipeline)
         except (exceptions.ParamsError, exceptions.PipelineConfigError) as exc:

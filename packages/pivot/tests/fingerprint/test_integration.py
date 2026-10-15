@@ -317,6 +317,12 @@ def run_stage():
             "CallableConfig",
             id="callable-instance",
         ),
+        pytest.param(
+            "class Scaler:\n    def __init__(self, factor):\n        self.factor = factor\n\n"
+            + "    def apply(self, x):\n        return x * self.factor\n\nVALUE = Scaler(3).apply",
+            "method",
+            id="bound-method",
+        ),
     ],
 )
 def test_non_scalar_module_attribute_raises(
