@@ -215,7 +215,13 @@ class WorkspaceStore:
         file_hash, _ = cache.hash_file(path, None)
         return file_hash
 
-    def backup_to_cache(self, ref: types.ArtifactRef, path: pathlib.Path) -> None:
+    def backup_to_cache(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        state_dir: pathlib.Path | None = None,
+    ) -> None:
         if self._cache_dir is None:
             return
         if ref.tag is types.ArtifactTag.METRIC:
@@ -225,6 +231,7 @@ class WorkspaceStore:
             self._cache_dir,
             state_db=None,
             checkout_mode=config.CheckoutMode.COPY,
+            state_dir=state_dir,
         )
 
     def restore_from_cache(

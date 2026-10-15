@@ -163,7 +163,11 @@ def commit_stages(
                 identity = types.identity_from_key(identity_key)
                 try:
                     hash_info = store.hash_artifact(out)
-                    store.backup_to_cache(out, store.resolve_display_path(out))
+                    store.backup_to_cache(
+                        out,
+                        store.resolve_display_path(out),
+                        state_dir=default_state_dir,
+                    )
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[identity] = hash_info
                 except FileNotFoundError:

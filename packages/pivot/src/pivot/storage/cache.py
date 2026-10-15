@@ -540,6 +540,7 @@ def save_to_cache(
     state_db: state_mod.StateDB | None = None,
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> HashInfo:
     """Save file or directory to cache, replace with link, return hash info.
 
@@ -549,12 +550,13 @@ def save_to_cache(
         state_db: Optional state database for hash caching
         checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
         checkout_modes: Ordered list of link modes to try with fallback on failure.
+        state_dir: State directory for the workspace target's restore lock.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
 
     if path.is_dir():
-        return _save_directory_to_cache(path, cache_dir, state_db, effective_modes)
-    return _save_file_to_cache(path, cache_dir, state_db, effective_modes)
+        return _save_directory_to_cache(path, cache_dir, state_db, effective_modes, state_dir)
+    return _save_file_to_cache(path, cache_dir, state_db, effective_modes, state_dir)
 
 
 def _save_file_to_cache(
@@ -562,6 +564,7 @@ def _save_file_to_cache(
     cache_dir: pathlib.Path,
     state_db: state_mod.StateDB | None,
     checkout_modes: list[CheckoutMode],
+    state_dir: pathlib.Path | None,
 ) -> FileHash:
     """Save single file to cache."""
     # Idempotency: check if already a valid cache symlink (cheap check first)
@@ -576,9 +579,10 @@ def _save_file_to_cache(
     cache_path = get_cache_path(cache_dir, file_hash)
 
     copy_to_cache(path, cache_path)
-    staging_path = _restore_staging_path(path)
-    _clear_path(staging_path)
-    _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
+    with restore_lock(path, state_dir) as lock_token:
+        staging_path = _restore_staging_path(path, lock_token)
+        _clear_path(staging_path)
+        _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
 
     return FileHash(hash=file_hash)
 
@@ -588,6 +592,7 @@ def _save_directory_to_cache(
     cache_dir: pathlib.Path,
     state_db: state_mod.StateDB | None,
     checkout_modes: list[CheckoutMode],
+    state_dir: pathlib.Path | None,
 ) -> DirHash:
     """Save directory to cache."""
     # Idempotency check for SYMLINK mode
@@ -608,34 +613,35 @@ def _save_directory_to_cache(
         cache_path = get_cache_path(cache_dir, entry["hash"])
         copy_to_cache(file_path, cache_path)
 
-    if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
-        # SYMLINK mode: cache entire directory, symlink to it
-        cache_dir_path = get_cache_path(cache_dir, tree_hash)
-        if not cache_dir_path.exists():
-            cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(path, cache_dir_path)
-            for f in cache_dir_path.rglob("*"):
-                # Skip symlinks to avoid changing permissions on target files outside cache
-                if f.is_file() and not f.is_symlink():
-                    os.chmod(f, 0o444)
-            os.chmod(cache_dir_path, 0o555)
+    with restore_lock(path, state_dir):
+        if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
+            # SYMLINK mode: cache entire directory, symlink to it
+            cache_dir_path = get_cache_path(cache_dir, tree_hash)
+            if not cache_dir_path.exists():
+                cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(path, cache_dir_path)
+                for f in cache_dir_path.rglob("*"):
+                    # Skip symlinks to avoid changing permissions on target files outside cache
+                    if f.is_file() and not f.is_symlink():
+                        os.chmod(f, 0o444)
+                os.chmod(cache_dir_path, 0o555)
 
-        _clear_path(path)
-        path.symlink_to(cache_dir_path.resolve())
-    else:
-        # HARDLINK/COPY modes: replace each file with link/copy from cache
-        for entry in manifest:
-            file_path = path / entry["relpath"]
-            cache_path = get_cache_path(cache_dir, entry["hash"])
-            staging_path = _restore_staging_path(file_path)
-            _clear_path(staging_path)
-            _checkout_with_fallback(
-                file_path,
-                cache_path,
-                checkout_modes,
-                executable=entry["isexec"],
-                staging_path=staging_path,
-            )
+            _clear_path(path)
+            path.symlink_to(cache_dir_path.resolve())
+        else:
+            # HARDLINK/COPY modes: replace each file with link/copy from cache
+            for entry in manifest:
+                file_path = path / entry["relpath"]
+                cache_path = get_cache_path(cache_dir, entry["hash"])
+                staging_path = _restore_staging_path(file_path)
+                _clear_path(staging_path)
+                _checkout_with_fallback(
+                    file_path,
+                    cache_path,
+                    checkout_modes,
+                    executable=entry["isexec"],
+                    staging_path=staging_path,
+                )
 
     return DirHash(hash=tree_hash, manifest=manifest)
 

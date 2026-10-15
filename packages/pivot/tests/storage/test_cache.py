@@ -5,6 +5,7 @@ import mmap
 import multiprocessing
 import os
 import pathlib
+import queue
 import stat
 import time
 from typing import TYPE_CHECKING, cast
@@ -771,6 +772,45 @@ def test_save_directory_uses_target_tagged_staging_paths(
         path.parent / f"{cache._RESTORE_TEMP_PREFIX}{cache._restore_target_token(path)}.file"
         for path in workspace_files
     ]
+
+
+def _save_file_while_restore_lock_is_held(
+    path: pathlib.Path,
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+    result_queue: multiprocessing.Queue[str],
+) -> None:
+    """Save one workspace file under the target's restore lock."""
+    _ = cache.save_to_cache(
+        path,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.COPY,
+        state_dir=state_dir,
+    )
+    result_queue.put("saved")
+
+
+def test_save_waits_for_target_restore_lock(tmp_path: pathlib.Path) -> None:
+    """A save cannot clear a checkout's staging file while that checkout holds the lock."""
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("stage output\n")
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    results = multiprocessing.get_context("spawn").Queue()
+    process = multiprocessing.get_context("spawn").Process(
+        target=_save_file_while_restore_lock_is_held,
+        args=(target, cache_dir, state_dir, results),
+    )
+
+    with cache.restore_lock(target, state_dir):
+        process.start()
+        with pytest.raises(queue.Empty):
+            results.get(timeout=0.5)
+
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    assert results.get(timeout=1) == "saved"
 
 
 def test_cleanup_preserves_recent_temps(tmp_path: pathlib.Path) -> None:

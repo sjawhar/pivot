@@ -407,7 +407,9 @@ def execute_stage(
                 if no_commit:
                     output_hashes = _hash_output_paths(output_paths)
                 else:
-                    output_hashes = _commit_outputs_with_store(output_paths, store)
+                    output_hashes = _commit_outputs_with_store(
+                        output_paths, store, project_state_dir
+                    )
 
                 # For --no-commit, skip lock/cache writes entirely
                 if no_commit:
@@ -986,6 +988,7 @@ def _hash_output_paths(
 def _commit_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
+    project_state_dir: pathlib.Path,
 ) -> dict[str, HashInfo]:
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
@@ -993,7 +996,7 @@ def _commit_outputs_with_store(
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         store.commit(ref, path)
         if isinstance(store, store_mod.WorkspaceStore):
-            store.backup_to_cache(ref, path)
+            store.backup_to_cache(ref, path, state_dir=project_state_dir)
         output_hashes[types.identity_key(ref.identity)] = store.hash_artifact(ref)
     return output_hashes
 
