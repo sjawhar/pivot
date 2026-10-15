@@ -160,8 +160,13 @@ class WatchCoordinator:
         """Get all stages affected by the changed paths, including downstream."""
         affected = set[str]()
         for path in paths:
-            identities = set(self._matching_identities(path))
-            identities.update(self._matching_resolved_input_identities(path))
+            logical_identities = set(self._matching_identities(path))
+            identities = logical_identities.copy()
+            if all(
+                engine_graph.get_producer(self._graph, identity) is None
+                for identity in logical_identities
+            ):
+                identities.update(self._matching_resolved_input_identities(path))
             for identity in identities:
                 consumers = engine_graph.get_consumers(self._graph, identity)
                 affected.update(consumers)

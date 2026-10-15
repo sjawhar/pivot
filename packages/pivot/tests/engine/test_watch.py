@@ -107,6 +107,26 @@ def test_affected_stages_deduplicates() -> None:
     assert affected == ["stage_a"], "should deduplicate"
 
 
+def test_affected_output_path_does_not_resolve_to_an_input(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An output symlink must not gain consumers of the input it resolves to."""
+    input_path = tmp_path / "input.txt"
+    input_path.write_text("input")
+    output_path = tmp_path / "output.txt"
+    output_path.symlink_to(input_path)
+    graph, artifact_paths = _helper_build_graph(
+        {
+            "source": {"outs": [str(output_path)]},
+            "consume_output": {"deps": [str(output_path)]},
+            "consume_input": {"deps": [str(input_path)]},
+        }
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+
+    assert coord.get_affected_stages([output_path]) == ["consume_output"]
+
+
 # =============================================================================
 # Path Filtering
 # =============================================================================
