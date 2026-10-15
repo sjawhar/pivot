@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false, reportImplicitRelativeImport=false
+
 from __future__ import annotations
 
 import contextlib
@@ -16,11 +18,10 @@ import click.testing
 import pytest
 
 from pivot import project
-from pivot.cli import console
+from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
-from pivot.pipeline import pipeline as pipeline_mod
-from pivot.registry import StageRegistry
+from pivot.registry import PipelineLike, StageRegistry
 
 # Add tests directory to sys.path so helpers.py can be imported
 _tests_dir = pathlib.Path(__file__).parent
@@ -51,35 +52,25 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
-    """Provide a fresh Pipeline for tests.
+def test_pipeline(tmp_path: pathlib.Path) -> PipelineLike:
+    """Provide a fresh Pipeline rooted at tmp_path.
 
-    Also sets up the module-level test pipeline in helpers.py so that
-    register_test_stage() works without explicit pipeline parameter.
-
-    Note: This fixture does NOT mock the project root. Tests that register
-    stages with path annotations should either:
-    1. Use mock_discovery fixture (which mocks project root)
-    2. Or explicitly mock project._project_root_cache themselves
+    This fixture does NOT mock the project root; use mock_discovery for tests that
+    need the pipeline discovered from its root.
     """
-    import helpers
-
-    pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
-    helpers.set_test_pipeline(pipeline)
-    yield pipeline
-    helpers.set_test_pipeline(None)
+    return Pipeline("test", root=tmp_path)
 
 
 @pytest.fixture
 def mock_discovery(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     mocker: MockerFixture,
     monkeypatch: pytest.MonkeyPatch,
-) -> pipeline_mod.Pipeline:
+) -> PipelineLike:
     """Mock discover_pipeline to return the test_pipeline.
 
     Use this fixture for CLI tests that need stages to be discovered
-    without creating actual pivot.yaml or pipeline.py files.
+    without creating a pipeline.py file.
 
     This fixture:
     - Creates .pivot and .git directories in the pipeline root
@@ -90,9 +81,6 @@ def mock_discovery(
 
     Tests using this fixture should NOT use isolated_filesystem() since
     this fixture already sets up the environment correctly.
-
-    Note: The test_pipeline fixture is automatically used, so stages
-    can be registered via register_test_stage().
     """
     from pivot import discovery
     from pivot.cli import decorators as cli_decorators
@@ -143,13 +131,11 @@ def _default_project_root(tmp_path_factory: pytest.TempPathFactory) -> pathlib.P
 
 
 @pytest.fixture(autouse=True)
-def reset_pivot_state(
-    mocker: MockerFixture, _default_project_root: pathlib.Path
-) -> Generator[None]:
+def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
     """Reset global pivot state between tests.
 
-    CliRunner can leave console singleton pointing to closed streams,
-    project root cache pointing to old directories, and merged config cached.
+    CliRunner can leave the project root cache pointing to old directories and merged
+    config cached.
 
     Sets project root to a default directory with .pivot to prevent
     ProjectNotInitializedError. Tests that need a specific project root
@@ -158,7 +144,6 @@ def reset_pivot_state(
     Tests using isolated_filesystem() that create their own .pivot should
     reset the cache: project._project_root_cache = None
     """
-    mocker.patch.object(console, "_console", None)
     # Direct assignment (not mocker.patch) so tests can override by setting to None
     project._project_root_cache = _default_project_root
     config_io.clear_config_cache()
@@ -392,7 +377,7 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
 
 
 @pytest.fixture
-async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
+async def test_engine(test_pipeline: PipelineLike) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.
 
     The engine is properly closed after each test to ensure sinks are cleaned up.
@@ -449,3 +434,30 @@ def send_rpc(
         sock.sendall(json.dumps(request).encode() + b"\n")
         response = sock.recv(4096).decode()
     return json.loads(response)
+
+
+def wait_for_engine_ready(sock_path: pathlib.Path, timeout: float = 30.0) -> None:
+    """Wait until a watched engine started with ``--force`` has finished its startup run.
+
+    The RPC socket answers while the startup fingerprint snapshot runs, and ``run`` is refused
+    with -32004 until it ends; the startup run's return to idle shows the engine takes runs.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = send_rpc(sock_path, "events_since", {"version": 0})
+        except (ConnectionRefusedError, FileNotFoundError):
+            response = {}
+        result = response.get("result")
+        if isinstance(result, dict):
+            events = cast("list[dict[str, dict[str, object]]]", result["events"])
+            if any(
+                entry["event"]["type"] == "engine_state_changed"
+                and entry["event"]["state"] == "idle"
+                for entry in events
+            ):
+                return
+        time.sleep(0.1)
+    raise TimeoutError(f"engine at {sock_path} did not finish its startup run in {timeout}s")

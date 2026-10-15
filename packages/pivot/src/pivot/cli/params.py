@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import click
 
-from pivot import config, exceptions
+from pivot import config
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -19,6 +19,13 @@ def params() -> None:
 @params.command("show")
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
+    "--all",
+    "all_pipelines",
+    is_flag=True,
+    default=False,
+    help="Run across all pipelines in the project.",
+)
+@click.option(
     "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
 )
 @click.option("--md", "output_format", flag_value=OutputFormat.MD, help="Output as Markdown table")
@@ -28,6 +35,7 @@ def params() -> None:
 @cli_decorators.with_error_handling
 def params_show(
     stages: tuple[str, ...],
+    all_pipelines: bool,
     output_format: OutputFormat | None,
     precision: int | None,
 ) -> None:
@@ -36,21 +44,24 @@ def params_show(
     If STAGES are specified, shows params for those stages only.
     Otherwise, shows params from all registered stages.
     """
-    ensure_stages_registered()
+    ensure_stages_registered(all_pipelines=all_pipelines)
     precision = precision if precision is not None else config.get_display_precision()
-    stages_list = list(stages) if stages else None
-    result = params_mod.collect_params_from_stages(stages_list)
+    stages_list = cli_helpers.resolve_stage_names(list(stages) if stages else None)
+    workspace_params = params_mod.collect_params_from_stages(stages_list)
 
-    if result["unknown_stages"]:
-        available = cli_helpers.list_stages()
-        raise exceptions.StageNotFoundError(result["unknown_stages"], available_stages=available)
-
-    output = params_mod.format_params_table(result["params"], output_format, precision)
+    output = params_mod.format_params_table(workspace_params, output_format, precision)
     click.echo(output)
 
 
 @params.command("diff")
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
+@click.option(
+    "--all",
+    "all_pipelines",
+    is_flag=True,
+    default=False,
+    help="Run across all pipelines in the project.",
+)
 @click.option(
     "--json", "output_format", flag_value=OutputFormat.JSON, default=None, help="Output as JSON"
 )
@@ -61,6 +72,7 @@ def params_show(
 @cli_decorators.with_error_handling
 def params_diff(
     stages: tuple[str, ...],
+    all_pipelines: bool,
     output_format: OutputFormat | None,
     precision: int | None,
 ) -> None:
@@ -69,24 +81,17 @@ def params_diff(
     If STAGES are specified, compares those stages only.
     Otherwise, compares all registered stages.
     """
-    ensure_stages_registered()
+    ensure_stages_registered(all_pipelines=all_pipelines)
     precision = precision if precision is not None else config.get_display_precision()
-    stages_list = list(stages) if stages else None
+    stages_list = cli_helpers.resolve_stage_names(list(stages) if stages else None)
 
     head_result = params_mod.get_params_from_head(stages_list)
-    workspace_result = params_mod.collect_params_from_stages(stages_list)
-
-    if workspace_result["unknown_stages"]:
-        available = cli_helpers.list_stages()
-        raise exceptions.StageNotFoundError(
-            workspace_result["unknown_stages"], available_stages=available
-        )
+    workspace_params = params_mod.collect_params_from_stages(stages_list)
 
     if not head_result["git_available"]:
         click.echo("Warning: Not in a git repository or no commits yet.", err=True)
 
     head_params = head_result["params"]
-    workspace_params = workspace_result["params"]
 
     if not head_params and not workspace_params:
         click.echo("No parameters found in registered stages.")

@@ -14,22 +14,23 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 ## Core Subsystems
 
-### Pipeline Discovery & Registration
+### Pipeline Definition & Discovery
 
 **Key files:**
 
-- `packages/pivot/src/pivot/discovery.py` - Auto-discovers `pivot.yaml`, `pipeline.py`
-- `packages/pivot/src/pivot/pipeline/yaml.py` - Parses `pivot.yaml` into internal structures
-- `packages/pivot/src/pivot/registry.py` - Stage metadata extraction (used internally by Pipeline)
-- `packages/pivot/src/pivot/stage_def.py` - Stage definition classes (`StageDef`, `StageParams`)
+- `packages/pivot/src/pivot/discovery.py` - Finds and loads `pipeline.py`
+- `packages/pivot/src/pivot/compose.py` - `@stage`, `Pipeline`, `ArtifactHandle`, output format inference
+- `packages/pivot/src/pivot/registry.py` - `StageRegistry` and `RegistryStageInfo` (built by `Pipeline` when its `with` block exits)
+- `packages/pivot/src/pivot/stage_def.py` - `StageParams` and output-writing helpers
 
 **How it works:**
 
-1. `discovery.discover_pipeline(project_root)` finds pipeline definition (defaults to current project root)
-2. For YAML: `pipeline.yaml.load_pipeline_from_yaml()` parses and registers stages
-3. For Python: module is imported, which calls `pipeline.register()`
+1. `discovery.discover_pipeline()` finds `pipeline.py` in the current directory or the project root
+2. It executes the file; each `@stage` call inside `with Pipeline(...)` records a node and returns an `ArtifactHandle`
+3. On exit, `Pipeline._materialize_stages()` turns the nodes into `RegistryStageInfo` entries with `ArtifactRef` deps and outs (identities, formats, tags)
+4. Discovery returns the module's `pipeline` variable
 
-**Start reading:** `packages/pivot/src/pivot/discovery.py:discover_pipeline()`
+**Start reading:** `packages/pivot/src/pivot/compose.py:Pipeline`
 
 ### DAG Construction
 
@@ -42,7 +43,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 
 1. `build_graph()` takes registered stages
 2. Creates artifact nodes and stage nodes (bipartite graph)
-3. Adds edges based on output→input path relationships
+3. Adds edges from each stage's output artifacts to the stages whose deps reference the same artifact identity
 4. Returns a NetworkX DiGraph (use `get_execution_order()` for sorted order)
 
 **Start reading:** `packages/pivot/src/pivot/engine/graph.py:build_graph()`
@@ -75,7 +76,7 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 - `packages/pivot/src/pivot/engine/sinks.py` - Event sinks (StaticConsoleSink, LiveConsoleSink, ResultCollectorSink)
 - `packages/pivot/src/pivot/executor/core.py` - Worker pool management
 - `packages/pivot/src/pivot/executor/worker.py` - Worker process code
-- `packages/pivot/src/pivot/outputs.py` - Output type definitions (`Out`, `Metric`, `Plot`, `IncrementalOut`)
+- `packages/pivot/src/pivot/storage/store.py` - `WorkspaceStore`: maps artifact identities to workspace paths (`data/<pipeline>/<stage>.<ext>`)
 
 **How it works:**
 
@@ -138,7 +139,6 @@ The TUI is a **pure RPC client** in a separate package (`pivot-tui`). It has zer
 - `packages/pivot-tui/src/pivot_tui/diff_panels.py` - Input/Output diff panel renderers
 - `packages/pivot-tui/src/pivot_tui/widgets/` - UI components (stage list, panels, logs, debug)
 - `packages/pivot-tui/src/pivot_tui/screens/` - Modal screens (help, history, confirm dialogs)
-- `packages/pivot-tui/src/pivot_tui/console.py` - Plain-text console output (non-TUI mode)
 - `packages/pivot-tui/src/pivot_tui/testing/fake_server.py` - FakeRpcServer test double
 - `packages/pivot/src/pivot/engine/agent_rpc.py` - JSON-RPC server (engine side)
 - `packages/pivot/src/pivot/cli/_run_common.py` - 3-thread TUI launch coordinator
@@ -179,7 +179,7 @@ CLI (run.py)
 Discovery (discovery.py)
     │
     ▼
-Pipeline (pipeline.py) ◄── YAML Parser (pipeline/yaml.py)
+Pipeline (compose.py, built by running the user's pipeline.py)
     │
     ▼
 Engine (engine/engine.py)

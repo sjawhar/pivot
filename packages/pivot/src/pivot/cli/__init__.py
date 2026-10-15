@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import TypedDict, override
+import sys
+from typing import TextIO, TypedDict, override
 
 import click
 
@@ -13,11 +14,8 @@ COMMAND_CATEGORIES = {
     "Inspection": ["dag", "diff", "history", "list", "metrics", "params", "plots", "show"],
     "Other": [
         "init",
-        "export",
-        "import-dvc",
         "config",
         "completion",
-        "schema",
         "check-ignore",
         "doctor",
         "fingerprint",
@@ -31,16 +29,10 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "repro": ("pivot.cli.repro", "repro", "Reproduce pipeline with full DAG resolution."),
     "dag": ("pivot.cli.dag", "dag_cmd", "Visualize pipeline DAG."),
     "list": ("pivot.cli.list", "list_cmd", "List registered stages."),
-    "export": ("pivot.cli.export", "export", "Export pipeline to DVC YAML format."),
     "import": (
         "pivot.cli.import_cmd",
         "import_cmd",
         "Import artifact from a remote Pivot repo.",
-    ),
-    "import-dvc": (
-        "pivot.cli.import_dvc",
-        "import_dvc",
-        "Import DVC pipeline and convert to Pivot format.",
     ),
     "track": ("pivot.cli.track", "track", "Track files/directories for caching."),
     "status": ("pivot.cli.status", "status", "Show pipeline, tracked files, and remote status."),
@@ -67,7 +59,6 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "config": ("pivot.cli.config", "config_cmd", "View and modify Pivot configuration."),
     "history": ("pivot.cli.history", "history", "List recent pipeline runs."),
     "show": ("pivot.cli.history", "show_cmd", "Show details of a specific run."),
-    "schema": ("pivot.cli.schema", "schema", "Output JSON Schema for pivot.yaml configuration."),
     "commit": ("pivot.cli.commit", "commit_command", "Commit current workspace state for stages."),
     "check-ignore": (
         "pivot.cli.check_ignore",
@@ -147,6 +138,23 @@ class PivotGroup(click.Group):
                 formatter.write_dl(uncategorized)
 
 
+class _StderrHandler(logging.StreamHandler[TextIO]):
+    """Log handler that writes to whatever ``sys.stderr`` is when a record is emitted.
+
+    ``logging.basicConfig`` binds the stderr object present at startup, so records bypass a
+    redirect installed later; rich's live console swaps ``sys.stderr`` to print stderr writes
+    above its pinned area.
+    """
+
+    def __init__(self) -> None:
+        logging.Handler.__init__(self)
+
+    @property
+    @override
+    def stream(self) -> TextIO:  # pyright: ignore[reportIncompatibleVariableOverride] - read-only view of the current sys.stderr
+        return sys.stderr
+
+
 def _setup_logging(verbose: bool, quiet: bool) -> None:
     """Configure logging for CLI output."""
     if quiet:
@@ -155,7 +163,9 @@ def _setup_logging(verbose: bool, quiet: bool) -> None:
         level = logging.DEBUG
     else:
         level = logging.INFO
-    logging.basicConfig(level=level, format="%(message)s", force=True)
+    handler = _StderrHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
 @click.group(cls=PivotGroup)

@@ -9,13 +9,14 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 
 from pivot import discovery, exceptions, metrics
+from pivot.cli import errors
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 
 # Context key for storing the discovered Pipeline
@@ -23,12 +24,15 @@ PIPELINE_CONTEXT_KEY = "_pivot_pipeline"
 ALL_PIPELINES_CONTEXT_KEY = "_pivot_all_pipelines"
 
 
-def _handle_pivot_error(e: exceptions.PivotError) -> click.ClickException:
-    """Convert PivotError to user-friendly ClickException."""
-    message = e.format_user_message()
-    if suggestion := e.get_suggestion():
-        message = f"{message}\n\nTip: {suggestion}"
-    return click.ClickException(message)
+def _pivot_errors(group: BaseExceptionGroup[BaseException]) -> list[exceptions.PivotError]:
+    """Flatten PivotErrors nested in async TaskGroup exception groups."""
+    result = list[exceptions.PivotError]()
+    for error in group.exceptions:
+        if isinstance(error, exceptions.PivotError):
+            result.append(error)
+        elif isinstance(error, BaseExceptionGroup):
+            result.extend(_pivot_errors(cast("BaseExceptionGroup[BaseException]", error)))
+    return result
 
 
 def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
@@ -49,14 +53,13 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         except click.ClickException:
             raise
         except exceptions.PivotError as e:
-            raise _handle_pivot_error(e) from e
+            raise errors.handle_pivot_error(e) from e
         except BaseExceptionGroup as eg:
             # Async TaskGroups wrap exceptions in ExceptionGroup.
-            # Unwrap to find PivotErrors for user-friendly formatting.
-            pivot_errors = eg.subgroup(exceptions.PivotError)
-            if pivot_errors is not None:
-                messages = [str(e) for e in pivot_errors.exceptions]
-                raise click.ClickException("\n".join(messages)) from eg
+            pivot_errors = _pivot_errors(eg)
+            if pivot_errors:
+                message = "\n".join(errors.format_pivot_error(error) for error in pivot_errors)
+                raise click.ClickException(message) from eg
             logger.debug("Unhandled ExceptionGroup in CLI command", exc_info=True)
             raise click.ClickException(repr(eg)) from eg
         except Exception as e:
@@ -142,7 +145,37 @@ def pivot_command(
     return decorator
 
 
-def store_pipeline_in_context(pipeline: Pipeline) -> None:
+def _parse_resource_capacities(
+    _ctx: click.Context, _param: click.Parameter, values: tuple[str, ...]
+) -> dict[str, int]:
+    """Parse repeatable ``NAME=CAPACITY`` resource overrides for run commands."""
+    capacities = dict[str, int]()
+    for value in values:
+        name, separator, capacity_text = value.partition("=")
+        normalized_name = name.strip().casefold()
+        if not separator or not normalized_name or not capacity_text.isdecimal():
+            raise click.BadParameter("must use NAME=POSITIVE_INTEGER")
+        capacity = int(capacity_text)
+        if capacity <= 0:
+            raise click.BadParameter("capacity must be a positive integer")
+        if normalized_name in capacities:
+            raise click.BadParameter(f"resource {normalized_name!r} was supplied more than once")
+        capacities[normalized_name] = capacity
+    return capacities
+
+
+resources_option = click.option(
+    "--resources",
+    "resource_capacity",
+    multiple=True,
+    callback=_parse_resource_capacities,
+    metavar="NAME=CAPACITY",
+    help="Set a scheduler resource capacity. May be repeated.",
+)
+"""The ``--resources`` option of every command that runs stages, parsed to ``dict[str, int]``."""
+
+
+def store_pipeline_in_context(pipeline: PipelineLike) -> None:
     """Store a Pipeline in the Click context."""
     ctx = click.get_current_context(silent=True)
     if ctx is None:
@@ -154,12 +187,12 @@ def store_pipeline_in_context(pipeline: Pipeline) -> None:
     ctx.obj[PIPELINE_CONTEXT_KEY] = pipeline  # type: ignore[literal-required]
 
 
-def get_pipeline_from_context() -> Pipeline | None:
+def get_pipeline_from_context() -> PipelineLike | None:
     """Get the discovered Pipeline from Click context, if any.
 
     Returns None if no Pipeline was discovered.
     """
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
     ctx = click.get_current_context(silent=True)
     if ctx is None:
@@ -169,7 +202,7 @@ def get_pipeline_from_context() -> Pipeline | None:
         return None
     # ctx.obj is typed as Any, so dict.get returns Unknown
     pipeline = cast("Any", obj).get(PIPELINE_CONTEXT_KEY)
-    if pipeline is None or not isinstance(pipeline, Pipeline):
+    if pipeline is None or not isinstance(pipeline, PipelineLike):
         return None
     return pipeline
 

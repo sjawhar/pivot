@@ -3,15 +3,24 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-import yaml
 
 from pivot import exceptions, project
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
 from pivot.storage import cache as cache_mod
+from pivot.storage import lock
 from pivot.storage import state as state_mod
-from pivot.types import RemoteStatus, TransferResult
+from pivot.types import (
+    ArtifactIdentity,
+    DirHash,
+    DirManifestEntry,
+    FileHash,
+    HashInfo,
+    LockData,
+    RemoteStatus,
+    TransferResult,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -20,7 +29,6 @@ if TYPE_CHECKING:
     from types_aiobotocore_s3 import S3Client
 
     from pivot.registry import RegistryStageInfo
-    from tests.conftest import ValidLockContentFactory
 
 
 def _helper_make_all_stages(*stage_names: str) -> dict[str, RegistryStageInfo]:
@@ -31,9 +39,38 @@ def _helper_make_all_stages(*stage_names: str) -> dict[str, RegistryStageInfo]:
         name: RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
             state_dir=None,
             outs=[],
+            input_paths={},
         )
         for name in stage_names
     }
+
+
+def _helper_write_lock(
+    state_dir: Path,
+    stage_name: str,
+    *,
+    outs: dict[str | None, HashInfo] | None = None,
+    deps: dict[str, HashInfo] | None = None,
+) -> None:
+    """Write a schema-v2 lock file: outputs keyed by output key, deps by input name."""
+    lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={ArtifactIdentity(name, None): h for name, h in (deps or {}).items()},
+            output_hashes={ArtifactIdentity(stage_name, key): h for key, h in (outs or {}).items()},
+        )
+    )
+
+
+def _helper_dir_hash(tree_hash: str, *files: tuple[str, str, int]) -> DirHash:
+    return DirHash(
+        hash=tree_hash,
+        manifest=[
+            DirManifestEntry(relpath=relpath, hash=h, size=size, isexec=False)
+            for relpath, h, size in files
+        ],
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -125,74 +162,46 @@ def test_get_stage_output_hashes_no_lock(lock_project: Path) -> None:
     assert result == set()
 
 
-def test_get_stage_output_hashes_file_output(
-    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+def test_get_stage_output_hashes_file_output(lock_project: Path) -> None:
     """Extracts hash from file output in lock file."""
     state_dir = lock_project / ".pivot"
 
-    lock_data = make_valid_lock_content(outs=[{"path": "output.csv", "hash": "abc123def45678"}])
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
+    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash="abc123def4567800")})
 
     result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
-    assert result == {"abc123def45678"}
+    assert result == {"abc123def4567800"}
 
 
-def test_get_stage_output_hashes_directory_output(
-    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+def test_get_stage_output_hashes_directory_output(lock_project: Path) -> None:
     """Extracts all hashes from directory output including manifest (tree hash excluded)."""
     state_dir = lock_project / ".pivot"
 
-    lock_data = make_valid_lock_content(
-        outs=[
-            {
-                "path": "output_dir",
-                "hash": "treehash1234567",
-                "manifest": [
-                    {
-                        "relpath": "file1.txt",
-                        "hash": "filehash1234567",
-                        "size": 100,
-                        "isexec": False,
-                    },
-                    {
-                        "relpath": "file2.txt",
-                        "hash": "filehash2345678",
-                        "size": 200,
-                        "isexec": False,
-                    },
-                ],
-            }
-        ]
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        outs={
+            "output_dir": _helper_dir_hash(
+                "7ee1a5b1234567aa",
+                ("file1.txt", "f11e1a5b12345670", 100),
+                ("file2.txt", "f11e2a5b23456780", 200),
+            )
+        },
     )
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
 
     result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
-    assert result == {"filehash1234567", "filehash2345678"}
+    assert result == {"f11e1a5b12345670", "f11e2a5b23456780"}
 
 
-def test_get_stage_output_hashes_multiple_stages(
-    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+def test_get_stage_output_hashes_multiple_stages(lock_project: Path) -> None:
     """Collects hashes from multiple stages."""
     state_dir = lock_project / ".pivot"
 
     for i, stage in enumerate(["stage_a", "stage_b"]):
-        lock_data = make_valid_lock_content(
-            outs=[{"path": f"out{i}.csv", "hash": f"hash{i}{'0' * 11}"}]
-        )
-        lock_path = lock_project / ".pivot" / "stages" / f"{stage}.lock"
-        with lock_path.open("w") as f:
-            yaml.dump(lock_data, f)
+        _helper_write_lock(state_dir, stage, outs={None: FileHash(hash=f"a{i}{'0' * 14}")})
 
     result = transfer.get_stage_output_hashes(state_dir, ["stage_a", "stage_b"])
-    assert "hash0" + "0" * 11 in result
-    assert "hash1" + "0" * 11 in result
+    assert "a0" + "0" * 14 in result
+    assert "a1" + "0" * 14 in result
 
 
 # -----------------------------------------------------------------------------
@@ -200,50 +209,41 @@ def test_get_stage_output_hashes_multiple_stages(
 # -----------------------------------------------------------------------------
 
 
-def test_get_stage_dep_hashes(
-    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+def test_get_stage_dep_hashes(lock_project: Path) -> None:
     """Extracts dependency hashes from lock file."""
     state_dir = lock_project / ".pivot"
 
-    lock_data = make_valid_lock_content(
-        deps=[
-            {"path": "input.csv", "hash": "dep1hash1234567"},
-            {"path": "config.yaml", "hash": "dep2hash1234567"},
-        ]
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        deps={
+            "input.csv": FileHash(hash="de01a5b123456700"),
+            "config.yaml": FileHash(hash="de02a5b123456700"),
+        },
     )
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
 
     result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
-    assert result == {"dep1hash1234567", "dep2hash1234567"}
+    assert result == {"de01a5b123456700", "de02a5b123456700"}
 
 
-def test_get_stage_dep_hashes_with_manifest(
-    lock_project: Path, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+def test_get_stage_dep_hashes_with_manifest(lock_project: Path) -> None:
     """Extracts all hashes from directory dependency including manifest (tree hash excluded)."""
     state_dir = lock_project / ".pivot"
 
-    lock_data = make_valid_lock_content(
-        deps=[
-            {
-                "path": "input_dir",
-                "hash": "dirtreehash1234",
-                "manifest": [
-                    {"relpath": "a.txt", "hash": "afilehash123456", "size": 10, "isexec": False},
-                    {"relpath": "b.txt", "hash": "bfilehash123456", "size": 20, "isexec": False},
-                ],
-            }
-        ]
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        deps={
+            "input_dir": _helper_dir_hash(
+                "d17ee1a5b1234560",
+                ("a.txt", "af11ea5b12345600", 10),
+                ("b.txt", "bf11ea5b12345600", 20),
+            )
+        },
     )
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
 
     result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
-    assert result == {"afilehash123456", "bfilehash123456"}
+    assert result == {"af11ea5b12345600", "bf11ea5b12345600"}
 
 
 def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:
@@ -401,9 +401,7 @@ async def test_push_async_handles_failures(lock_project: Path, mocker: MockerFix
     assert "Upload failed" in result["errors"]
 
 
-async def test_push_async_with_stages(
-    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+async def test_push_async_with_stages(lock_project: Path, mocker: MockerFixture) -> None:
     """Push with specific stages only pushes those stage outputs."""
 
     cache_dir = lock_project / ".pivot" / "cache"
@@ -414,11 +412,7 @@ async def test_push_async_with_stages(
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
+    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash=hash1)})
 
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -463,9 +457,7 @@ async def test_pull_async_no_needed_hashes(lock_project: Path, mocker: MockerFix
     assert result["failed"] == 0
 
 
-async def test_pull_async_all_already_local(
-    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+async def test_pull_async_all_already_local(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull when all files local returns skipped count."""
 
     cache_dir = lock_project / ".pivot" / "cache"
@@ -476,11 +468,7 @@ async def test_pull_async_all_already_local(
     (files_dir / "ab").mkdir(parents=True)
     (files_dir / "ab" / ("c" * 14)).write_text("content1")
 
-    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
+    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash=hash1)})
 
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -500,20 +488,14 @@ async def test_pull_async_all_already_local(
     assert result["failed"] == 0
 
 
-async def test_pull_async_downloads_missing(
-    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+async def test_pull_async_downloads_missing(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull downloads files not in local cache."""
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
 
     hash1 = "ab" + "c" * 14
-    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
+    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash=hash1)})
 
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -562,20 +544,14 @@ async def test_pull_async_without_stages_lists_remote(
     mock_remote.list_hashes.assert_called_once()
 
 
-async def test_pull_async_handles_failures(
-    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+async def test_pull_async_handles_failures(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull reports failures in summary."""
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
 
     hash1 = "ab" + "c" * 14
-    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
+    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash=hash1)})
 
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -598,9 +574,7 @@ async def test_pull_async_handles_failures(
     assert "Download failed" in result["errors"]
 
 
-async def test_pull_async_includes_deps(
-    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
-) -> None:
+async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixture) -> None:
     """Pull includes dependency hashes when stages specified."""
 
     cache_dir = lock_project / ".pivot" / "cache"
@@ -608,14 +582,12 @@ async def test_pull_async_includes_deps(
 
     out_hash = "ab" + "c" * 14
     dep_hash = "de" + "f" * 14
-    lock_data = make_valid_lock_content(
-        outs=[{"path": "out.csv", "hash": out_hash}],
-        deps=[{"path": "in.csv", "hash": dep_hash}],
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        outs={None: FileHash(hash=out_hash)},
+        deps={"in.csv": FileHash(hash=dep_hash)},
     )
-    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
 
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
@@ -839,7 +811,6 @@ async def test_pull_async_with_deps_integration(
     tmp_path: Path,
     s3_remote: remote_mod.S3Remote,
     aioboto3_s3_client: S3Client,
-    make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Integration: pull with dependency hashes."""
     out_hash = "ab" + "c" * 14
@@ -860,14 +831,12 @@ async def test_pull_async_with_deps_integration(
     cache_dir = state_dir / "cache"
     cache_dir.mkdir(parents=True)
 
-    lock_data = make_valid_lock_content(
-        outs=[{"path": "out.csv", "hash": out_hash}],
-        deps=[{"path": "in.csv", "hash": dep_hash}],
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        outs={None: FileHash(hash=out_hash)},
+        deps={"in.csv": FileHash(hash=dep_hash)},
     )
-    lock_path = state_dir / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
 
     state_db = state_mod.StateDB(state_dir)
 

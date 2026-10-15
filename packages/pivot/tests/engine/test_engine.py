@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict, cast
+import time
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
 import anyio
 import networkx as nx
 import pytest
 
-from pivot import loaders, outputs, parameters, project
+from pivot import exceptions, loaders, parameters, project, types
+from pivot.compose import Pipeline, stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import graph as engine_graph
 from pivot.engine.engine import Engine
 from pivot.engine.sinks import ResultCollectorSink
 from pivot.engine.sources import OneShotSource
 from pivot.engine.types import (
+    CancelRequested,
     CodeOrConfigChanged,
     DataArtifactChanged,
     EngineDiagnostic,
@@ -30,23 +33,101 @@ from pivot.engine.types import (
 from pivot.engine.worker_pool import WorkerPool
 from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
-from pivot.types import LockData, OnError
-from tests.helpers import register_test_stage
+from pivot.storage import store as store_mod
+from pivot.types import FileHash, LockData, OnError, StageStatus, identity_key
 
 if TYPE_CHECKING:
     from pivot.executor import core as executor_core
-    from pivot.pipeline.pipeline import Pipeline
     from pivot.registry import RegistryStageInfo
 
 
-class _CoordinatorSkipOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+@stage
+def _helper_watch_scale(raw: dict[str, int]) -> dict[str, int]:
+    return {key: value * 2 for key, value in raw.items()}
 
 
-def _helper_coordinator_skip_stage(
-    _input_path: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _CoordinatorSkipOutputs:
-    return {"output": pathlib.Path("output.txt")}
+@stage
+def _helper_watch_total(scaled: dict[str, int]) -> dict[str, int]:
+    return {"total": sum(scaled.values())}
+
+
+@stage
+def _helper_watch_merge(
+    first: dict[str, int],
+    second: dict[str, int],
+) -> dict[str, int]:
+    return {**first, **second}
+
+
+def _helper_watch_pipeline(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Pipeline:
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".git").mkdir()
+    raw_path = tmp_path / "data" / "raw" / "raw.json"
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_text('{"a": 1, "b": 2}')
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+
+    with Pipeline("watch", root=tmp_path) as pipeline:
+        raw = pipeline.input(
+            "raw.json",
+            path="data/raw/raw.json",
+            t=cast("type[dict[str, int]]", dict),
+        )
+        scaled = _helper_watch_scale(raw)
+        _helper_watch_total(scaled)
+
+    return pipeline
+
+
+def _helper_prepare_coordinator_skip(
+    tmp_path: pathlib.Path,
+    pipeline: Pipeline,
+    *,
+    record_generations: bool,
+) -> tuple[str, RegistryStageInfo]:
+    """Create a valid stage lock and optional generation record for the scale stage."""
+    from pivot.storage import store as store_mod
+
+    stage_name = "watch/_helper_watch_scale"
+    stage_info = pipeline.get_stage(stage_name)
+    dep = stage_info["deps"]["raw"]
+    out = stage_info["outs"][0]
+    store = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    )
+    output_path = store.resolve_display_path(out)
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("a: 2\nb: 4\n")
+    state_dir = stage_info["state_dir"] or tmp_path / ".pivot"
+    lock.get_stages_dir(state_dir).mkdir(parents=True, exist_ok=True)
+    params = parameters.get_effective_params(
+        stage_info["params"],
+        stage_name,
+        parameters.ParamsOverrides(),
+    )
+
+    with state_mod.StateDB(state_dir) as state_db:
+        dep_hash, _ = cache.hash_file(tmp_path / "data" / "raw" / "raw.json", state_db)
+        output_hash, _ = cache.hash_file(output_path, state_db)
+        lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).write(
+            LockData(
+                code_manifest=pipeline.ensure_fingerprint(stage_name),
+                params=params,
+                dep_hashes={dep.identity: FileHash(hash=dep_hash)},
+                output_hashes={out.identity: FileHash(hash=output_hash)},
+            )
+        )
+        if record_generations:
+            dep_key = identity_key(dep.identity)
+            generation = state_db.increment_generation(dep_key)
+            state_db.record_dep_generations(stage_name, {dep_key: generation})
+
+    return stage_name, stage_info
 
 
 class _MockAsyncSink:
@@ -199,51 +280,194 @@ async def test_engine_closes_sinks_even_when_one_fails() -> None:
 @pytest.mark.anyio
 async def test_engine_handle_data_artifact_changed_filters_executing_outputs(
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_handle_data_artifact_changed() filters events for executing stage outputs."""
+    """Watch defers an event for an output its producer is still writing."""
+    from pivot.storage import store as store_mod
 
-    sink = _MockAsyncSink()
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    scale_stage = "watch/_helper_watch_scale"
+    total_stage = "watch/_helper_watch_total"
+    scale_info = pipeline.get_stage(scale_stage)
+    output_path = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    ).resolve_display_path(scale_info["outs"][0])
 
-    async with Engine() as engine:
-        engine.add_sink(sink)
+    async with Engine(pipeline=pipeline) as engine:
+        engine._graph = engine_graph.build_graph(
+            {
+                scale_stage: scale_info,
+                total_stage: pipeline.get_stage(total_stage),
+            }
+        )
+        engine._scheduler.set_state(scale_stage, StageExecutionState.RUNNING)
+        executed = list[list[str]]()
 
-        # Build graph: stage_a -> output.csv -> stage_b
-        output_path = tmp_path / "output.csv"
+        async def _capture_execution(stages: list[str]) -> None:
+            executed.append(stages)
 
-        g: nx.DiGraph[str] = nx.DiGraph()
-        stage_a_node = engine_graph.stage_node("stage_a")
-        output_node = engine_graph.artifact_node(output_path)
-        stage_b_node = engine_graph.stage_node("stage_b")
-
-        g.add_node(stage_a_node, type=NodeType.STAGE)
-        g.add_node(output_node, type=NodeType.ARTIFACT)
-        g.add_node(stage_b_node, type=NodeType.STAGE)
-
-        g.add_edge(stage_a_node, output_node)  # stage_a produces output
-        g.add_edge(output_node, stage_b_node)  # stage_b consumes output
-
-        engine._graph = g
-
-        # stage_a is currently running
-        engine._scheduler.set_state("stage_a", StageExecutionState.RUNNING)
-
-        # Create event for output change
-        event = DataArtifactChanged(
-            type="data_artifact_changed",
-            paths=[str(output_path)],
+        engine._execute_affected_stages = _capture_execution
+        await engine._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(output_path)])
         )
 
-        # Handle the event
-        await engine._handle_data_artifact_changed(event)
+        assert list(engine._deferred_events[scale_stage]) == [
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(output_path)])
+        ]
+        assert executed == []
 
-        # Event should be deferred, not processed immediately
-        assert "stage_a" in engine._deferred_events
-        assert len(engine._deferred_events["stage_a"]) == 1
 
-        # No execution should have started (no ACTIVE state event)
-        state_events = [e for e in sink.events if e["type"] == "engine_state_changed"]
-        active_events = [e for e in state_events if e["state"] == EngineState.ACTIVE]
-        assert len(active_events) == 0
+@pytest.mark.anyio
+async def test_engine_handle_data_artifact_changed_runs_consumers_and_downstream(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watched raw input change executes its consumer and downstream stages."""
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    scale_stage = "watch/_helper_watch_scale"
+    total_stage = "watch/_helper_watch_total"
+    executed = list[list[str]]()
+
+    async def _capture_execution(stages: list[str]) -> None:
+        executed.append(stages)
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine._execute_affected_stages = _capture_execution
+        await engine._handle_data_artifact_changed(
+            DataArtifactChanged(
+                type="data_artifact_changed",
+                paths=[str(tmp_path / "data" / "raw" / "raw.json")],
+            )
+        )
+
+    assert executed == [[scale_stage, total_stage]]
+
+
+@pytest.mark.anyio
+async def test_engine_ignores_its_completed_output_write(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed event for an engine-written output must not restart consumers."""
+    from pivot.engine.sources import FilesystemSource
+    from pivot.storage import store as store_mod
+
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    scale_stage = "watch/_helper_watch_scale"
+    total_stage = "watch/_helper_watch_total"
+    scale_info = pipeline.get_stage(scale_stage)
+    output_path = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    ).resolve_display_path(scale_info["outs"][0])
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("a: 2\nb: 4\n")
+    executed = list[list[str]]()
+
+    async def _capture_execution(stages: list[str]) -> None:
+        executed.append(stages)
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine.add_source(FilesystemSource(watch_paths=[tmp_path]))
+        engine._graph = engine_graph.build_graph(
+            {
+                scale_stage: scale_info,
+                total_stage: pipeline.get_stage(total_stage),
+            }
+        )
+        await engine._initialize_orchestration([scale_stage, total_stage], max_workers=1)
+        await engine._set_stage_state(scale_stage, StageExecutionState.RUNNING)
+        await engine._handle_stage_completion(
+            scale_stage,
+            {
+                "status": StageStatus.RAN,
+                "reason": "ran",
+                "input_hash": "input",
+                "output_lines": [],
+            },
+            time.perf_counter(),
+            tmp_path / ".pivot",
+        )
+        engine._execute_affected_stages = _capture_execution
+        await engine._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(output_path)])
+        )
+
+    assert executed == []
+
+
+@pytest.mark.anyio
+async def test_engine_distinguishes_own_and_external_directory_output_writes(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Directory-output child writes are suppressed only when pivot wrote them."""
+    from pivot.engine.sources import FilesystemSource
+    from pivot.storage import store as store_mod
+
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    scale_stage = "watch/_helper_watch_scale"
+    total_stage = "watch/_helper_watch_total"
+    scale_info = pipeline.get_stage(scale_stage)
+    total_info = pipeline.get_stage(total_stage)
+    directory_ref = types.ArtifactRef(
+        identity=scale_info["outs"][0].identity,
+        format=loaders.Text(),
+        python_type=str,
+        tag=types.ArtifactTag.DIRECTORY,
+    )
+    scale_info["outs"] = [directory_ref]
+    total_info["deps"]["scaled"] = directory_ref
+    output_dir = store_mod.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    ).resolve_display_path(directory_ref)
+    child_path = output_dir / "results" / "sub" / "child.txt"
+    child_path.parent.mkdir(parents=True)
+    child_path.write_text("pivot write")
+    executed = list[list[str]]()
+
+    async def _capture_execution(stages: list[str]) -> None:
+        executed.append(stages)
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine.add_source(FilesystemSource(watch_paths=[tmp_path]))
+        engine._graph = engine_graph.build_graph(
+            {
+                scale_stage: scale_info,
+                total_stage: total_info,
+            }
+        )
+        await engine._initialize_orchestration([scale_stage, total_stage], max_workers=1)
+        await engine._set_stage_state(scale_stage, StageExecutionState.RUNNING)
+        await engine._handle_stage_completion(
+            scale_stage,
+            {
+                "status": StageStatus.RAN,
+                "reason": "ran",
+                "input_hash": "input",
+                "output_lines": [],
+            },
+            time.perf_counter(),
+            tmp_path / ".pivot",
+        )
+        engine._execute_affected_stages = _capture_execution
+        await engine._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(child_path)])
+        )
+        assert executed == []
+
+        new_external_path = output_dir / "results" / "sub" / "new.txt"
+        new_external_path.write_text("external nested write")
+        await engine._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=[str(new_external_path)])
+        )
+
+    assert executed == [[total_stage]]
 
 
 @pytest.mark.anyio
@@ -345,33 +569,39 @@ async def test_engine_get_affected_stages_for_paths_returns_empty_without_graph(
 @pytest.mark.anyio
 async def test_engine_get_affected_stages_for_paths_deduplicates(
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_get_affected_stages_for_paths() deduplicates affected stages."""
+    """Multiple changed inputs affecting one stage are returned once."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".git").mkdir()
+    raw_dir = tmp_path / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "first.json").write_text('{"first": 1}')
+    (raw_dir / "second.json").write_text('{"second": 2}')
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    async with Engine() as engine:
-        # Create paths
-        input1 = tmp_path / "input1.csv"
-        input2 = tmp_path / "input2.csv"
+    with Pipeline("watch", root=tmp_path) as pipeline:
+        first = pipeline.input(
+            "first.json",
+            path="data/raw/first.json",
+            t=cast("type[dict[str, int]]", dict),
+        )
+        second = pipeline.input(
+            "second.json",
+            path="data/raw/second.json",
+            t=cast("type[dict[str, int]]", dict),
+        )
+        _helper_watch_merge(first, second)
 
-        # Build graph: both inputs consumed by stage_a
-        g: nx.DiGraph[str] = nx.DiGraph()
-        stage_node = engine_graph.stage_node("stage_a")
-        input1_node = engine_graph.artifact_node(input1)
-        input2_node = engine_graph.artifact_node(input2)
+    async with Engine(pipeline=pipeline) as engine:
+        affected = engine._get_affected_stages_for_paths(
+            [
+                raw_dir / "first.json",
+                raw_dir / "second.json",
+            ]
+        )
 
-        g.add_node(stage_node, type=NodeType.STAGE)
-        g.add_node(input1_node, type=NodeType.ARTIFACT)
-        g.add_node(input2_node, type=NodeType.ARTIFACT)
-        g.add_edge(input1_node, stage_node)
-        g.add_edge(input2_node, stage_node)
-
-        engine._graph = g
-
-        # Both paths affect the same stage
-        affected = engine._get_affected_stages_for_paths([input1, input2])
-
-        # Should only return stage_a once
-        assert affected == ["stage_a"]
+    assert affected == ["watch/_helper_watch_merge"]
 
 
 @pytest.mark.anyio
@@ -523,6 +753,7 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
             single_stage=False,
             parallel=False,
             max_workers=4,
+            resource_capacity={"gpu": 2},
             no_commit=True,
             on_error=OnError.KEEP_GOING,
             cache_dir=None,
@@ -549,6 +780,7 @@ async def test_engine_stores_orchestration_params_on_run_requested() -> None:
         assert engine._stored_on_error == OnError.KEEP_GOING
         assert engine._stored_parallel is False
         assert engine._stored_max_workers == 4
+        assert engine._stored_resource_capacity == {"gpu": 2}
 
 
 @pytest.mark.anyio
@@ -561,6 +793,7 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
         engine._stored_on_error = OnError.KEEP_GOING
         engine._stored_parallel = True
         engine._stored_max_workers = 4
+        engine._stored_resource_capacity = {"gpu": 2}
 
         # Mock _orchestrate_execution to capture what params it receives
         captured_kwargs: dict[str, object] = {}
@@ -582,6 +815,7 @@ async def test_engine_execute_affected_stages_uses_stored_params() -> None:
         assert captured_kwargs["on_error"] == OnError.KEEP_GOING, "on_error should use stored value"
         assert captured_kwargs["parallel"] is True, "parallel should use stored value"
         assert captured_kwargs["max_workers"] == 4, "max_workers should use stored value"
+        assert captured_kwargs["resource_capacity"] == {"gpu": 2}
 
 
 @pytest.mark.anyio
@@ -593,6 +827,7 @@ async def test_engine_execute_affected_stages_propagates_non_parallel_mode() -> 
         engine._stored_max_workers = None
         engine._stored_no_commit = False
         engine._stored_on_error = OnError.FAIL
+        engine._stored_resource_capacity = {}
 
         captured_kwargs: dict[str, object] = {}
 
@@ -648,6 +883,7 @@ async def test_engine_cancel_during_active_execution() -> None:
             single_stage=False,
             parallel=True,
             max_workers=None,
+            resource_capacity={},
             no_commit=False,
             on_error=OnError.FAIL,
             cache_dir=None,
@@ -752,6 +988,7 @@ async def test_engine_concurrent_run_requests_coalesced() -> None:
             single_stage=False,
             parallel=True,
             max_workers=None,
+            resource_capacity={},
             no_commit=False,
             on_error=OnError.FAIL,
             cache_dir=None,
@@ -766,6 +1003,7 @@ async def test_engine_concurrent_run_requests_coalesced() -> None:
             single_stage=False,
             parallel=True,
             max_workers=None,
+            resource_capacity={},
             no_commit=False,
             on_error=OnError.FAIL,
             cache_dir=None,
@@ -793,6 +1031,172 @@ async def test_engine_concurrent_run_requests_coalesced() -> None:
         assert "run_2_end" in execution_order, (
             f"Second run should have completed: {execution_order}"
         )
+
+
+def _helper_run_request(stages: list[str] | None, *, force: bool = False) -> RunRequested:
+    return RunRequested(
+        type="run_requested",
+        stages=stages,
+        force=force,
+        reason="test",
+        single_stage=False,
+        parallel=True,
+        max_workers=None,
+        resource_capacity={},
+        no_commit=False,
+        on_error=OnError.FAIL,
+        cache_dir=None,
+        allow_uncached_incremental=False,
+        checkout_missing=False,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("first", "second", "replayed"),
+    [
+        pytest.param(
+            (["stage_a"], False), (["stage_b"], False), (["stage_a", "stage_b"], False), id="union"
+        ),
+        pytest.param((None, False), (["stage_b"], False), (None, False), id="all-stays-all"),
+        pytest.param(
+            (["stage_a"], True),
+            (["stage_b"], False),
+            (["stage_a", "stage_b"], True),
+            id="forced-stays-forced",
+        ),
+    ],
+)
+async def test_engine_restart_covers_the_cancelled_run_and_the_new_request(
+    first: tuple[list[str] | None, bool],
+    second: tuple[list[str] | None, bool],
+    replayed: tuple[list[str] | None, bool],
+) -> None:
+    """A request that cancels a run replays both: a restart never narrows what was going to run."""
+    calls = list[tuple[list[str] | None, bool]]()
+
+    async with Engine() as engine:
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            calls.append(
+                (cast("list[str] | None", kwargs["stages"]), cast("bool", kwargs["force"]))
+            )
+            if len(calls) == 1:
+                with anyio.fail_after(5):
+                    await engine._cancel_event.wait()
+            return {}
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(_helper_run_request(first[0], force=first[1]))
+            await anyio.wait_all_tasks_blocked()
+            await engine._handle_run_requested(_helper_run_request(second[0], force=second[1]))
+
+    assert calls == [first, replayed]
+
+
+@pytest.mark.anyio
+async def test_engine_restart_after_deferred_reload_skips_removed_stages() -> None:
+    """A restart replayed after a deferred reload drops the stages that reload removed."""
+    stage_list = ["stage_a", "stage_gone"]
+    calls = list[list[str] | None]()
+
+    async with Engine() as engine:
+        pipeline = MagicMock()
+        pipeline.list_stages.side_effect = lambda: list(stage_list)
+        engine._pipeline = pipeline
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            stages = cast("list[str] | None", kwargs["stages"])
+            unknown = [s for s in stages or [] if s not in stage_list]
+            if unknown:
+                raise exceptions.StageNotFoundError(unknown, available_stages=stage_list)
+            calls.append(stages)
+            if len(calls) == 1:
+                with anyio.fail_after(5):
+                    await engine._cancel_event.wait()
+            return {}
+
+        async def mock_code_changed(_event: CodeOrConfigChanged) -> None:
+            stage_list.remove("stage_gone")
+            await engine._execute_affected_stages(list(stage_list))
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._handle_code_or_config_changed = mock_code_changed  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_run_requested(_helper_run_request(["stage_a", "stage_gone"]))
+            await anyio.wait_all_tasks_blocked()
+            engine._reload_pending = {"pipeline.py"}
+            await engine._handle_run_requested(_helper_run_request(["stage_gone"]))
+
+    assert calls[0] == ["stage_a", "stage_gone"]
+    assert calls[-1] == ["stage_a"], "the replayed restart runs what still exists"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("steps", "replayed"),
+    [
+        pytest.param(["stage_b", "stage_c"], ["stage_a", "stage_b", "stage_c"], id="edits-only"),
+        pytest.param(["cancel", "stage_c"], ["stage_c"], id="cancel-then-edit"),
+        pytest.param(["stage_c", "cancel"], ["stage_c"], id="edit-then-cancel"),
+    ],
+)
+async def test_engine_run_request_while_cancelling_waits_for_the_run_to_end(
+    steps: list[str],
+    replayed: list[str],
+) -> None:
+    """A request made while a run is cancelling starts no second run alongside it.
+
+    Requests that cancel a run replay with its stages once it ends. An explicit cancel, made
+    before or after those requests, stops the run's own stages from replaying; the requests
+    still replay.
+    """
+    calls = list[list[str] | None]()
+    in_flight = 0
+    most_in_flight = 0
+    release = anyio.Event()
+
+    async with Engine() as engine:
+
+        async def mock_orchestrate(**kwargs: object) -> dict[str, object]:
+            nonlocal in_flight, most_in_flight
+            in_flight += 1
+            most_in_flight = max(most_in_flight, in_flight)
+            calls.append(cast("list[str] | None", kwargs["stages"]))
+            try:
+                if len(calls) == 1:
+                    # A stage still running keeps the cancelled run in CANCELLING
+                    with anyio.fail_after(5):
+                        await engine._cancel_event.wait()
+                        await release.wait()
+                return {}
+            finally:
+                in_flight -= 1
+
+        engine._orchestrate_execution = mock_orchestrate  # pyright: ignore[reportAttributeAccessIssue] - test mock
+        engine._require_pipeline = lambda: None  # pyright: ignore[reportAttributeAccessIssue] - test mock
+
+        async with anyio.create_task_group() as tg:
+            engine._run_task_group = tg
+            await engine._handle_input_event(_helper_run_request(["stage_a"]))
+            await anyio.wait_all_tasks_blocked()
+            for step in steps:
+                if step == "cancel":
+                    await engine._handle_input_event(CancelRequested(type="cancel_requested"))
+                else:
+                    await engine._handle_input_event(_helper_run_request([step]))
+                assert engine._run_state == engine_mod._RunState.CANCELLING
+            await anyio.wait_all_tasks_blocked()
+            release.set()
+
+    assert most_in_flight == 1, f"a second run started while the first was cancelling: {calls}"
+    assert calls == [["stage_a"], replayed]
 
 
 # =============================================================================
@@ -838,6 +1242,16 @@ async def test_engine_aexit_closes_sinks_when_source_raises() -> None:
 # =============================================================================
 
 
+async def _helper_reload_ok() -> dict[str, RegistryStageInfo]:
+    """Stand-in for Engine._reload_registry: a reload that succeeded with no old stages."""
+    return {}
+
+
+async def _helper_reload_failed() -> str:
+    """Stand-in for Engine._reload_registry: a reload that found the pipeline invalid."""
+    return "Failed to load pipeline.py"
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("parallel", "max_workers", "expected_restart_calls"),
@@ -853,7 +1267,6 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
     expected_restart_calls: list[tuple[int, int | None]],
 ) -> None:
     """_handle_code_or_config_changed restarts workers only in parallel mode."""
-
     restart_calls = list[tuple[int, int | None]]()
 
     def mock_restart_workers(stage_count: int, max_workers: int | None = None) -> int:
@@ -871,37 +1284,62 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
         mock_pipeline.snapshot.return_value = {}
         mock_pipeline._registry = None
         mock_pipeline.get.return_value = MagicMock()
-        mock_pipeline.resolve_external_dependencies.return_value = None
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
-
-        engine._reload_registry = lambda: ({}, None)  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass
 
-        engine._emit_reload_event = mock_emit_reload  # pyright: ignore[reportAttributeAccessIssue]
-
-        async def mock_execute_affected(stages: list[str]) -> None:
+        async def mock_execute_affected(_stages: list[str]) -> None:
             pass
 
-        engine._execute_affected_stages = mock_execute_affected  # type: ignore[assignment] - test mock
+        engine._emit_reload_event = mock_emit_reload  # pyright: ignore[reportAttributeAccessIssue] - test seam
+        engine._execute_affected_stages = mock_execute_affected  # pyright: ignore[reportAttributeAccessIssue] - test seam
 
-        def mock_build_graph(*_a: object) -> MagicMock:
-            return MagicMock()
-
-        def mock_get_watch_paths(*_a: object) -> set[str]:
-            return set[str]()
+        def mock_build_graph(*_args: object) -> nx.DiGraph[str]:
+            return nx.DiGraph()
 
         monkeypatch.setattr("pivot.engine.engine.engine_graph.build_graph", mock_build_graph)
-        monkeypatch.setattr(
-            "pivot.engine.engine.engine_graph.get_watch_paths", mock_get_watch_paths
+        await engine._handle_code_or_config_changed(
+            CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
         )
 
-        event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
-        await engine._handle_code_or_config_changed(event)
+    assert restart_calls == expected_restart_calls
 
-        assert restart_calls == expected_restart_calls
+
+@pytest.mark.anyio
+async def test_engine_code_reload_restores_project_watch_root(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reload keeps project Python files inside the filesystem watch scope."""
+    from pivot.engine.sources import FilesystemSource
+
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    source = FilesystemSource(watch_paths=[])
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine.add_source(source)
+        engine._stored_parallel = False
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test seam
+
+        async def _ignore_reload(*_args: object) -> None:
+            pass
+
+        async def _ignore_execution(_stages: list[str]) -> None:
+            pass
+
+        engine._emit_reload_event = _ignore_reload  # pyright: ignore[reportAttributeAccessIssue] - test seam
+        engine._execute_affected_stages = _ignore_execution  # pyright: ignore[reportAttributeAccessIssue] - test seam
+        await engine._handle_code_or_config_changed(
+            CodeOrConfigChanged(
+                type="code_or_config_changed",
+                paths=[str(tmp_path / "pipeline.py")],
+            )
+        )
+
+    assert source.watch_paths == [tmp_path]
 
 
 @pytest.mark.anyio
@@ -922,7 +1360,7 @@ async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
         engine._stored_parallel = True
 
         # Mock reload to FAIL
-        engine._reload_registry = lambda: None  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_failed  # type: ignore[assignment] - test mock
         engine._invalidate_caches = lambda: None  # type: ignore[assignment] - test mock
 
         event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
@@ -956,7 +1394,7 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
         mock_pipeline.invalidate_dag_cache.return_value = None
         engine._pipeline = mock_pipeline
 
-        engine._reload_registry = lambda: ({}, None)  # type: ignore[assignment] - test mock
+        engine._reload_registry = _helper_reload_ok  # type: ignore[assignment] - test mock
 
         async def mock_emit_reload(*_args: object) -> None:
             pass
@@ -970,14 +1408,6 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
 
         def mock_build_graph(*_a: object) -> MagicMock:
             return MagicMock()
-
-        def mock_get_watch_paths(*_a: object) -> set[str]:
-            return set[str]()
-
-        monkeypatch.setattr("pivot.engine.engine.engine_graph.build_graph", mock_build_graph)
-        monkeypatch.setattr(
-            "pivot.engine.engine.engine_graph.get_watch_paths", mock_get_watch_paths
-        )
 
         event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
         await engine._handle_code_or_config_changed(event)
@@ -1146,160 +1576,15 @@ async def test_deferred_events_multi_level_redeferral(
 # =============================================================================
 
 
-@pytest.mark.anyio
-async def test_coordinator_skip_avoids_worker_dispatch(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    test_pipeline: Pipeline,
-) -> None:
-    """Stages that can skip via generation check are completed inline,
-    never dispatched to the worker pool."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-
-    (tmp_path / ".pivot").mkdir(exist_ok=True)
-    (tmp_path / ".git").mkdir(exist_ok=True)
-
-    register_test_stage(
-        _helper_coordinator_skip_stage,
-        name="skip_stage",
-        pipeline=test_pipeline,
+def _helper_store_spec(cache_dir: pathlib.Path, project_root: pathlib.Path) -> store_mod.StoreSpec:
+    return store_mod.StoreSpec(
+        kind="workspace",
+        cache_dir=str(cache_dir / "files"),
+        project_root=str(project_root),
+        pipeline_name="watch",
+        input_bindings={"raw.json": "data/raw/raw.json"},
+        checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
     )
-    stage_info = test_pipeline.get("skip_stage")
-
-    input_path = tmp_path / "input.txt"
-    output_path = tmp_path / "output.txt"
-    _ = input_path.write_text("input")
-    _ = output_path.write_text("output")
-
-    state_dir = tmp_path / ".pivot"
-    cache_dir = state_dir / "cache"
-    (cache_dir / "files").mkdir(parents=True, exist_ok=True)
-    lock.get_stages_dir(state_dir).mkdir(parents=True, exist_ok=True)
-
-    fp = test_pipeline.ensure_fingerprint("skip_stage")
-    current_params = parameters.get_effective_params(
-        stage_info["params"], "skip_stage", parameters.ParamsOverrides()
-    )
-
-    with state_mod.StateDB(state_dir) as state_db:
-        dep_hash, _ = cache.hash_file(input_path, state_db)
-        out_hash, _ = cache.hash_file(output_path, state_db)
-
-        lock_data = LockData(
-            code_manifest=fp,
-            params=current_params,
-            dep_hashes={str(input_path): {"hash": dep_hash}},
-            output_hashes={str(output_path): {"hash": out_hash}},
-        )
-
-        stage_lock = lock.StageLock("skip_stage", lock.get_stages_dir(state_dir))
-        stage_lock.write(lock_data)
-
-        dep_generation = state_db.increment_generation(input_path)
-        normalized_dep = str(project.normalize_path(input_path))
-        state_db.record_dep_generations("skip_stage", {normalized_dep: dep_generation})
-
-    async with Engine(pipeline=test_pipeline) as engine:
-        await engine._initialize_orchestration(["skip_stage"], max_workers=1)
-        engine._scheduler.acquire_mutexes("skip_stage")
-        await engine._set_stage_state("skip_stage", StageExecutionState.PREPARING)
-
-        results: dict[str, executor_core.ExecutionSummary] = {}
-        engine._worker_pool = MagicMock()
-
-        skipped = await engine._try_skip_in_coordinator(
-            stage_name="skip_stage",
-            stage_info=stage_info,
-            overrides=parameters.ParamsOverrides(),
-            checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
-            force=False,
-            cache_dir=cache_dir,
-            state_dir=state_dir,
-            project_root=tmp_path,
-            results=results,
-            run_id="run-test",
-        )
-
-        assert skipped is True, "Coordinator should skip inline when generations match"
-        assert results["skip_stage"]["status"] == "cached"
-        engine._worker_pool.submit.assert_not_called()
-
-
-@pytest.mark.anyio
-async def test_all_cached_pipeline_skips_without_workers(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    test_pipeline: Pipeline,
-) -> None:
-    """When all stages are cached, _start_ready_stages completes them inline
-    without calling WorkerPool.submit."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-
-    (tmp_path / ".pivot").mkdir(exist_ok=True)
-    (tmp_path / ".git").mkdir(exist_ok=True)
-
-    register_test_stage(
-        _helper_coordinator_skip_stage,
-        name="cached_stage",
-        pipeline=test_pipeline,
-    )
-    stage_info = test_pipeline.get("cached_stage")
-
-    input_path = tmp_path / "input.txt"
-    output_path = tmp_path / "output.txt"
-    _ = input_path.write_text("input")
-    _ = output_path.write_text("output")
-
-    state_dir = tmp_path / ".pivot"
-    cache_dir = state_dir / "cache"
-    (cache_dir / "files").mkdir(parents=True, exist_ok=True)
-    lock.get_stages_dir(state_dir).mkdir(parents=True, exist_ok=True)
-
-    fp = test_pipeline.ensure_fingerprint("cached_stage")
-    current_params = parameters.get_effective_params(
-        stage_info["params"], "cached_stage", parameters.ParamsOverrides()
-    )
-
-    with state_mod.StateDB(state_dir) as state_db:
-        dep_hash, _ = cache.hash_file(input_path, state_db)
-        out_hash, _ = cache.hash_file(output_path, state_db)
-
-        lock_data = LockData(
-            code_manifest=fp,
-            params=current_params,
-            dep_hashes={str(input_path): {"hash": dep_hash}},
-            output_hashes={str(output_path): {"hash": out_hash}},
-        )
-
-        stage_lock = lock.StageLock("cached_stage", lock.get_stages_dir(state_dir))
-        stage_lock.write(lock_data)
-
-        dep_generation = state_db.increment_generation(input_path)
-        normalized_dep = str(project.normalize_path(input_path))
-        state_db.record_dep_generations("cached_stage", {normalized_dep: dep_generation})
-
-    async with Engine(pipeline=test_pipeline) as engine:
-        await engine._initialize_orchestration(["cached_stage"], max_workers=1)
-
-        results: dict[str, executor_core.ExecutionSummary] = {}
-        await engine._start_ready_stages(
-            cache_dir=cache_dir,
-            overrides=parameters.ParamsOverrides(),
-            checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
-            force=False,
-            no_commit=False,
-            stage_start_times={},
-            run_id="run-test",
-            project_root=tmp_path,
-            state_dir=state_dir,
-            results=results,
-        )
-
-        assert engine._worker_pool is None, "Pool should not be created when all stages skip"
-        assert "cached_stage" in results, "Skipped stage should be in results"
-        assert results["cached_stage"]["status"] == "cached"
 
 
 @pytest.mark.anyio
@@ -1314,9 +1599,8 @@ async def test_try_skip_returns_false_when_force(
             stage_name="any_stage",
             stage_info=stage_info,
             overrides={},
-            checkout_modes=[],
             force=True,
-            cache_dir=tmp_path,
+            store_spec=_helper_store_spec(tmp_path, tmp_path),
             state_dir=tmp_path,
             project_root=tmp_path,
             results=results,
@@ -1330,6 +1614,7 @@ async def test_try_skip_returns_false_when_force(
 async def test_try_skip_returns_false_when_no_lock(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: Pipeline,
 ) -> None:
     """_try_skip_in_coordinator returns False when no lock file exists."""
     monkeypatch.setattr(
@@ -1337,16 +1622,15 @@ async def test_try_skip_returns_false_when_no_lock(
         lambda _info, _default: tmp_path,  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType]
     )
 
-    async with Engine() as engine:
+    async with Engine(pipeline=test_pipeline) as engine:
         results: dict[str, executor_core.ExecutionSummary] = {}
         stage_info = cast("RegistryStageInfo", MagicMock())
         skipped = await engine._try_skip_in_coordinator(
             stage_name="no_lock_stage",
             stage_info=stage_info,
             overrides={},
-            checkout_modes=[],
             force=False,
-            cache_dir=tmp_path,
+            store_spec=_helper_store_spec(tmp_path, tmp_path),
             state_dir=tmp_path,
             project_root=tmp_path,
             results=results,
@@ -1356,89 +1640,117 @@ async def test_try_skip_returns_false_when_no_lock(
 
 
 @pytest.mark.anyio
-async def test_coordinator_tier2_skip_when_generation_unavailable(
+async def test_coordinator_skip_avoids_worker_dispatch(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    test_pipeline: Pipeline,
 ) -> None:
-    """When Tier 1 (generation) has no data, Tier 2 (lock file comparison) still
-    allows coordinator-side skip — verifying the full fallback path."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-
-    (tmp_path / ".pivot").mkdir(exist_ok=True)
-    (tmp_path / ".git").mkdir(exist_ok=True)
-
-    register_test_stage(
-        _helper_coordinator_skip_stage,
-        name="tier2_stage",
-        pipeline=test_pipeline,
+    """Generation-matched stages complete without submitting worker work."""
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    stage_name, stage_info = _helper_prepare_coordinator_skip(
+        tmp_path,
+        pipeline,
+        record_generations=True,
     )
-    stage_info = test_pipeline.get("tier2_stage")
+    cache_dir = tmp_path / ".pivot" / "cache"
+    (cache_dir / "files").mkdir(parents=True)
+    results: dict[str, executor_core.ExecutionSummary] = {}
 
-    input_path = tmp_path / "input.txt"
-    output_path = tmp_path / "output.txt"
-    _ = input_path.write_text("input")
-    _ = output_path.write_text("output")
-
-    state_dir = tmp_path / ".pivot"
-    cache_dir = state_dir / "cache"
-    (cache_dir / "files").mkdir(parents=True, exist_ok=True)
-    lock.get_stages_dir(state_dir).mkdir(parents=True, exist_ok=True)
-
-    fp = test_pipeline.ensure_fingerprint("tier2_stage")
-    current_params = parameters.get_effective_params(
-        stage_info["params"], "tier2_stage", parameters.ParamsOverrides()
-    )
-
-    # Write lock data and file hashes — but do NOT record dep generations.
-    # This makes Tier 1 (can_skip_via_generation) return False,
-    # forcing the code through Tier 2 (skip.check_stage).
-    with state_mod.StateDB(state_dir) as state_db:
-        dep_hash, _ = cache.hash_file(input_path, state_db)
-        out_hash, _ = cache.hash_file(output_path, state_db)
-
-        # Use normalized paths (absolute) as hash_dependencies does
-        normalized_dep = str(project.normalize_path(input_path))
-        normalized_out = str(project.normalize_path(output_path))
-
-        lock_data = LockData(
-            code_manifest=fp,
-            params=current_params,
-            dep_hashes={normalized_dep: {"hash": dep_hash}},
-            output_hashes={normalized_out: {"hash": out_hash}},
-        )
-
-        stage_lock = lock.StageLock("tier2_stage", lock.get_stages_dir(state_dir))
-        stage_lock.write(lock_data)
-
-        # Deliberately NOT calling state_db.record_dep_generations —
-        # this is what forces the Tier 2 path.
-
-    async with Engine(pipeline=test_pipeline) as engine:
-        await engine._initialize_orchestration(["tier2_stage"], max_workers=1)
-        engine._scheduler.acquire_mutexes("tier2_stage")
-        await engine._set_stage_state("tier2_stage", StageExecutionState.PREPARING)
-
-        results: dict[str, executor_core.ExecutionSummary] = {}
+    async with Engine(pipeline=pipeline) as engine:
+        engine._graph = engine_graph.build_graph({stage_name: stage_info})
+        await engine._initialize_orchestration([stage_name], max_workers=1)
+        engine._scheduler.acquire_resources(stage_name)
+        await engine._set_stage_state(stage_name, StageExecutionState.PREPARING)
         engine._worker_pool = MagicMock()
 
         skipped = await engine._try_skip_in_coordinator(
-            stage_name="tier2_stage",
+            stage_name=stage_name,
             stage_info=stage_info,
+            overrides=parameters.ParamsOverrides(),
+            force=False,
+            store_spec=_helper_store_spec(cache_dir, tmp_path),
+            state_dir=tmp_path / ".pivot",
+            project_root=tmp_path,
+            results=results,
+            run_id="run-test",
+        )
+
+    assert skipped is True
+    assert results[stage_name]["status"] == StageStatus.CACHED
+    engine._worker_pool.submit.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_all_cached_pipeline_skips_without_workers(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generation-matched pipeline completes without creating a worker pool."""
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    stage_name, stage_info = _helper_prepare_coordinator_skip(
+        tmp_path,
+        pipeline,
+        record_generations=True,
+    )
+    cache_dir = tmp_path / ".pivot" / "cache"
+    (cache_dir / "files").mkdir(parents=True)
+    results: dict[str, executor_core.ExecutionSummary] = {}
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine._graph = engine_graph.build_graph({stage_name: stage_info})
+        await engine._initialize_orchestration([stage_name], max_workers=1)
+        await engine._start_ready_stages(
+            cache_dir=cache_dir,
             overrides=parameters.ParamsOverrides(),
             checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
             force=False,
-            cache_dir=cache_dir,
-            state_dir=state_dir,
+            no_commit=False,
+            stage_start_times={},
+            run_id="run-test",
+            project_root=tmp_path,
+            state_dir=tmp_path / ".pivot",
+            results=results,
+        )
+
+    assert engine._worker_pool is None
+    assert results[stage_name]["status"] == StageStatus.CACHED
+
+
+@pytest.mark.anyio
+async def test_coordinator_tier2_skip_when_generation_unavailable(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock comparison skips unchanged outputs when generations are unavailable."""
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    stage_name, stage_info = _helper_prepare_coordinator_skip(
+        tmp_path,
+        pipeline,
+        record_generations=False,
+    )
+    cache_dir = tmp_path / ".pivot" / "cache"
+    (cache_dir / "files").mkdir(parents=True)
+    results: dict[str, executor_core.ExecutionSummary] = {}
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine._graph = engine_graph.build_graph({stage_name: stage_info})
+        await engine._initialize_orchestration([stage_name], max_workers=1)
+        engine._scheduler.acquire_resources(stage_name)
+        await engine._set_stage_state(stage_name, StageExecutionState.PREPARING)
+        engine._worker_pool = MagicMock()
+
+        skipped = await engine._try_skip_in_coordinator(
+            stage_name=stage_name,
+            stage_info=stage_info,
+            overrides=parameters.ParamsOverrides(),
+            force=False,
+            store_spec=_helper_store_spec(cache_dir, tmp_path),
+            state_dir=tmp_path / ".pivot",
             project_root=tmp_path,
             results=results,
             run_id="run-tier2-test",
         )
 
-        assert skipped is True, "Coordinator should skip via Tier 2 when generations unavailable"
-        assert results["tier2_stage"]["status"] == "cached"
-        assert results["tier2_stage"]["reason"] == "unchanged", (
-            "Tier 2 skip reason should be 'unchanged', not 'unchanged (generation)'"
-        )
-        engine._worker_pool.submit.assert_not_called()
+    assert skipped is True
+    assert results[stage_name]["status"] == StageStatus.CACHED
+    assert results[stage_name]["reason"] == "unchanged"
+    engine._worker_pool.submit.assert_not_called()

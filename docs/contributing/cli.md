@@ -21,7 +21,7 @@ Before submitting a PR with a new CLI command:
 
 This decorator provides:
 
-1. **Auto-discovery** - Automatically calls `discover_and_register()` before the command runs
+1. **Auto-discovery** - Discovers `pipeline.py` and stores the Pipeline in the Click context before the command runs
 2. **Error handling** - Converts `PivotError` exceptions to user-friendly `ClickException` messages
 
 ```python
@@ -50,11 +50,12 @@ Set `auto_discover=False` only for commands that don't need the pipeline:
 
 | Command | auto_discover | Reason |
 |---------|---------------|--------|
-| run, list, export | True (default) | Need pipeline to find stages |
+| run, list, status, dag | True (default) | Need pipeline to find stages |
 | checkout, track | True (default) | Need pipeline for validation |
-| init | False | Creates new project (no pipeline yet) |
-| schema | False | Outputs JSON schema only |
-| push, pull | False | Read from lock files, not pipeline |
+| push, pull, fetch | True (default) | Need pipeline for output cache filtering |
+| init, doctor, check-ignore | False | No stage data needed |
+| history, show | False | Read run history only |
+| get, import, update | False | Work from git revisions, lock files and `.pvt` files |
 
 ### Group Subcommands
 
@@ -135,6 +136,8 @@ Available completers:
 
 ### 4. Write Integration Tests
 
+Tests run the command through Click's `CliRunner` against a temporary project with a real `pipeline.py`. Use the `pipeline_dir` fixture from `tests/conftest.py`: it creates `.pivot/`, changes into the directory, and resets the cached project root (`project._project_root_cache` survives between tests in one process). Shown here for `pivot list`; substitute your command:
+
 ```python
 # tests/integration/test_cli_mycommand.py
 import pathlib
@@ -143,50 +146,39 @@ from click.testing import CliRunner
 
 from pivot.cli import cli
 
+PIPELINE = """
+import pandas as pd
 
-def test_mycommand_no_stages(tmp_path: pathlib.Path) -> None:
-    """Test mycommand with empty pipeline."""
-    runner = CliRunner()
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path("pivot.yaml").write_text("stages: {}")
-
-        result = runner.invoke(cli, ["mycommand"])
-
-        assert result.exit_code == 0
-        assert "No stages registered" in result.output
+from pivot import Pipeline, stage
 
 
-def test_mycommand_with_stages(tmp_path: pathlib.Path) -> None:
-    """Test mycommand lists stages."""
-    runner = CliRunner()
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path("pivot.yaml").write_text("""
-stages:
-  process:
-    python: stages.process
-    deps:
-      data: data.csv
-    outs:
-      output: output.csv
-""")
-        pathlib.Path("stages.py").write_text("""
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs
+@stage
+def process(data: pd.DataFrame) -> pd.DataFrame:
+    return data
 
-class ProcessOutputs(TypedDict):
-    output: Annotated[str, outputs.Out("output.csv", loaders.PathOnly())]
 
-def process(
-    data: Annotated[str, outputs.Dep("data.csv", loaders.PathOnly())],
-) -> ProcessOutputs:
-    return {"output": "output.csv"}
-""")
-        pathlib.Path("data.csv").write_text("a,b\n1,2\n")
+with Pipeline("demo") as pipeline:
+    process(pipeline.input("data.csv"))
+"""
 
-        result = runner.invoke(cli, ["mycommand"])
 
-        assert result.exit_code == 0
-        assert "process" in result.output
+def test_mycommand_no_pipeline(pipeline_dir: pathlib.Path) -> None:
+    """Without pipeline.py the command explains what is missing."""
+    result = CliRunner().invoke(cli, ["list"])
+
+    assert "pipeline.py" in result.output
+
+
+def test_mycommand_with_stages(pipeline_dir: pathlib.Path) -> None:
+    """With a pipeline the command lists its stages."""
+    (pipeline_dir / "pipeline.py").write_text(PIPELINE)
+    (pipeline_dir / "data" / "raw").mkdir(parents=True)
+    (pipeline_dir / "data" / "raw" / "data.csv").write_text("a,b\n1,2\n")
+
+    result = CliRunner().invoke(cli, ["list"])
+
+    assert result.exit_code == 0
+    assert "demo/process" in result.output
 ```
 
 ## Input Validation

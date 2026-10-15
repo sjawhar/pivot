@@ -1,190 +1,92 @@
 # Multi-Pipeline Projects
 
-Split large projects into multiple pipelines that Pivot automatically wires together through [artifact dependencies](../concepts/artifacts-and-dag.md). Each pipeline lives in its own directory with its own `pipeline.py`, and cross-pipeline dependencies are discovered at run time — no explicit configuration needed.
+Split a large project into several pipelines, each in its own directory with its own `pipeline.py`. One pipeline consumes another's output by importing the handle, and Pivot runs whatever upstream stages that handle needs.
 
 ## When to Split
 
-- **Team boundaries** — different teams own different parts of the workflow
-- **Reusable data prep** — one pipeline produces datasets consumed by several analysis pipelines
-- **Independent iteration** — each pipeline can run and test in isolation
-- **Large monorepos** — subdirectories that should feel like separate projects
+- **Team boundaries**: different teams own different parts of the workflow
+- **Reusable data prep**: one pipeline produces datasets consumed by several analysis pipelines
+- **Independent iteration**: each pipeline can run on its own
+- **Large monorepos**: subdirectories that should feel like separate projects
 
-## Project Root
+## Project Root and Imports
 
-Pivot identifies the project root by walking up from the current directory to find the top-most `.pivot/` directory. Every `pipeline.py` under that root is discoverable.
+The project root is the top-most directory containing `.pivot/`. Every `pipeline.py` under it is discoverable, and imports resolve from it: a root `pipeline.py` imports sibling modules directly (`from stages import clean`); a pipeline in a subdirectory imports with the full path (`from report.helpers import x`, `from prep.pipeline import kept`).
 
 ```
 my_project/
-├── .pivot/              # ← project root marker
-├── pipeline.py          # root pipeline
-├── shared/
-│   └── data.csv
-└── analysis/
-    └── pipeline.py      # child pipeline
+├── .pivot/              # project root marker
+├── data/raw/scores.csv
+├── prep/
+│   └── pipeline.py      # pipeline "prep"
+└── report/
+    └── pipeline.py      # pipeline "report", consumes prep's output
 ```
-
-Initialize once at the project root:
 
 ```bash
 mkdir my_project && cd my_project
-pivot init
+git init && pivot init
+mkdir -p data/raw prep report
+printf 'name,score\na,0.2\nb,0.7\nc,0.9\n' > data/raw/scores.csv
 ```
 
-## Parent/Child Pattern
-
-The most common layout: shared data preparation at the root, specialized analysis in subdirectories.
-
-### Root Pipeline — Produce Shared Data
+## Upstream Pipeline
 
 ```python
-# my_project/pipeline.py
-import pathlib
-from typing import Annotated, TypedDict
+# prep/pipeline.py
+import pandas as pd
 
-import pivot
-
-pipeline = pivot.Pipeline("data_prep")
+from pivot import Pipeline, StageParams, stage
 
 
-class PrepareOutputs(TypedDict):
-    data: Annotated[pathlib.Path, pivot.Out("shared/data.csv", pivot.loaders.PathOnly())]
+class DropLowParams(StageParams):
+    min_score: float = 0.5
 
 
-def prepare() -> PrepareOutputs:
-    out = pathlib.Path("shared/data.csv")
-    out.parent.mkdir(exist_ok=True)
-    out.write_text("id,value\n1,100\n2,200\n3,300\n")
-    return PrepareOutputs(data=out)
+@stage
+def drop_low(raw: pd.DataFrame, params: DropLowParams) -> pd.DataFrame:
+    return raw[raw["score"] >= params.min_score]
 
 
-pipeline.register(prepare)
+with Pipeline("prep") as pipeline:
+    kept = drop_low(pipeline.input("scores.csv"), params=DropLowParams())
 ```
 
-### Child Pipeline — Consume via Dep
+`kept` is a module-level variable (a `with` block does not create a scope), so other modules can import it.
+
+## Downstream Pipeline
 
 ```python
-# my_project/analysis/pipeline.py
-import pathlib
-from typing import Annotated, TypedDict
+# report/pipeline.py
+from typing import Annotated
 
-import pivot
+import pandas as pd
 
-pipeline = pivot.Pipeline("analysis")
-
-
-class AnalyzeOutputs(TypedDict):
-    report: Annotated[pathlib.Path, pivot.Out("report.txt", pivot.loaders.PathOnly())]
+from pivot import Pipeline, metric, stage
+from prep.pipeline import kept
 
 
-def analyze(
-    data: Annotated[pathlib.Path, pivot.Dep("../shared/data.csv", pivot.loaders.PathOnly())],
-) -> AnalyzeOutputs:
-    content = data.read_text()
-    lines = len(content.strip().split("\n")) - 1
-    out = pathlib.Path("report.txt")
-    out.write_text(f"Processed {lines} records\n")
-    return AnalyzeOutputs(report=out)
+@stage
+def count(rows: pd.DataFrame) -> Annotated[dict, metric]:
+    return {"rows": len(rows)}
 
 
-pipeline.register(analyze)
+with Pipeline("report") as pipeline:
+    count(kept)
 ```
 
-### Run from the Child Directory
+### Run from the Downstream Directory
 
 ```bash
-cd analysis
+cd report
 pivot repro
 ```
 
-**What Pivot does:**
-
-1. Walks up to `my_project/` (the project root with `.pivot/`)
-2. Sees `analyze` needs `../shared/data.csv`
-3. Searches from that path upward and finds `my_project/pipeline.py`
-4. Discovers that `prepare` produces `shared/data.csv`
-5. Runs `prepare` → `analyze` in dependency order
-
-No `include()` calls, no configuration — the [DAG](../concepts/artifacts-and-dag.md) emerges from artifact paths.
-
-## Sibling Pattern
-
-Pipelines at the same directory level that depend on each other.
-
-```
-my_project/
-├── .pivot/
-└── pipelines/
-    ├── features/
-    │   └── pipeline.py      # produces output.csv
-    └── model/
-        └── pipeline.py      # consumes ../features/output.csv
-```
-
-### Feature Pipeline
-
-```python
-# pipelines/features/pipeline.py
-import pathlib
-from typing import Annotated, TypedDict
-
-import pivot
-
-pipeline = pivot.Pipeline("features")
-
-
-class FeatureOutputs(TypedDict):
-    output: Annotated[pathlib.Path, pivot.Out("output.csv", pivot.loaders.PathOnly())]
-
-
-def compute_features() -> FeatureOutputs:
-    out = pathlib.Path("output.csv")
-    out.write_text("feature,value\nf1,10\nf2,20\n")
-    return FeatureOutputs(output=out)
-
-
-pipeline.register(compute_features)
-```
-
-### Model Pipeline
-
-```python
-# pipelines/model/pipeline.py
-import pathlib
-from typing import Annotated, TypedDict
-
-import pivot
-
-pipeline = pivot.Pipeline("model")
-
-
-class ModelOutputs(TypedDict):
-    result: Annotated[pathlib.Path, pivot.Out("predictions.csv", pivot.loaders.PathOnly())]
-
-
-def train_model(
-    features: Annotated[pathlib.Path, pivot.Dep("../features/output.csv", pivot.loaders.PathOnly())],
-) -> ModelOutputs:
-    data = features.read_text()
-    out = pathlib.Path("predictions.csv")
-    out.write_text(f"# Model trained on features\n{data}")
-    return ModelOutputs(result=out)
-
-
-pipeline.register(train_model)
-```
-
-### Run
-
-```bash
-cd pipelines/model
-pivot repro
-```
-
-Pivot discovers `features/pipeline.py` because the [dependency](../concepts/dependencies.md) `../features/output.csv` points into the `features/` directory.
+Pivot loads `report/pipeline.py`, sees that `count` consumes `prep/drop_low`'s output, adds `prep/drop_low` to the run, and executes `prep/drop_low` then `report/count`. Each stage keeps its own pipeline prefix and writes under its own pipeline's directories (`data/prep/drop_low.jsonl`, `metrics/report/count.yaml`).
 
 ## Running All Pipelines
 
-From any directory, use `--all` to discover and run every pipeline under the project root:
+From anywhere in the project, `--all` loads every `pipeline.py` under the root and runs them as one graph:
 
 ```bash
 pivot repro --all
@@ -192,34 +94,35 @@ pivot list --all
 pivot status --all
 ```
 
-This is useful for CI where you want to ensure the entire project is up to date.
+## One Root Pipeline with `include()`
 
-## How Discovery Works
+To make `pivot repro` at the root run everything without `--all`, give the root its own `pipeline.py` that includes the others:
 
-When a stage declares a `Dep` on a path outside its own pipeline directory, Pivot:
+```python
+# pipeline.py
+from pivot import Pipeline
+from prep.pipeline import pipeline as prep
+from report.pipeline import pipeline as report
 
-1. Resolves the path relative to the stage's working directory
-2. Walks from that path upward looking for `pipeline.py` (or `pivot.yaml`)
-3. Loads the discovered pipeline and checks if any stage produces the requested file
-4. Adds that stage to the execution graph
+with Pipeline("all") as pipeline:
+    pipeline.include(prep)
+    pipeline.include(report)
+```
 
-This happens recursively — if the discovered stage itself has cross-pipeline dependencies, those are resolved too.
+`include()` can be called inside the `with` block or after it. Included stages keep their names (`prep/drop_low`, `report/count`) and state; stages included twice (here `prep/drop_low`, which `report` already pulls in) are added once. Pipeline names must be unique within a project, so two stages under one name are refused unless they are one function (same file, name, code, closure values and default values) called with the same inputs and input formats, outputs and output formats, params, resources, variant and fingerprint settings. The error names the first difference and the source files.
 
 ## Guidelines
 
-**Split at natural boundaries.** Data prep, feature engineering, model training, and reporting are good candidates for separate pipelines.
+**Split at natural boundaries.** Data prep, feature engineering, model training and reporting are good candidates for separate pipelines.
 
-**Each pipeline should run independently.** For testing and CI, any pipeline should work when run in isolation (assuming its upstream dependencies are cached).
+**Share data through handles, not paths.** A downstream pipeline imports the handle; it never reads `data/prep/...` itself.
 
-**Use descriptive directory names.** `data_prep/`, `model_training/`, `reports/` — the directory name communicates intent. Pipeline names (the string passed to `Pipeline()`) should match purpose, not location.
+**Give each pipeline a distinct name.** The name prefixes every stage and output directory.
 
-**Commit lock files.** Lock files live under `.pivot/stages/` (the project-level state directory by default). Commit them so that `pivot pull` on another machine can restore outputs without re-running.
-
-**Keep dependencies explicit.** Cross-pipeline wiring happens through `Dep` paths. If you can't express the dependency as a file path, the stages probably belong in the same pipeline.
+**Commit lock files.** Lock files live under `.pivot/stages/<pipeline>/`. Commit them so that `pivot pull` on another machine can restore outputs without re-running.
 
 ## Related
 
-- [Artifacts & DAG](../concepts/artifacts-and-dag.md) — how the dependency graph emerges from artifacts
-- [Dependencies](../concepts/dependencies.md) — `Dep`, `Out`, and how stages connect
-- [Pipelines](../concepts/pipelines.md) — `Pipeline` class, registration, and discovery
-- [Watch Mode](./watch-mode.md) — auto-rerun across pipeline boundaries
+- [Artifacts & DAG](../concepts/artifacts-and-dag.md): how handles form the graph
+- [Pipelines](../concepts/pipelines.md): `Pipeline`, variants and `include()`
+- [Watch Mode](./watch-mode.md): auto-rerun during development

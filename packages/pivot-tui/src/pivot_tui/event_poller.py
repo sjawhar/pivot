@@ -21,7 +21,6 @@ import anyio
 from anyio import to_thread
 
 from pivot.types import (
-    StageExplanation,
     StageStatus,
     TuiLogMessage,
     TuiMessageType,
@@ -30,7 +29,11 @@ from pivot.types import (
     TuiWatchMessage,
     WatchStatus,
 )
-from pivot_tui.rpc_client_impl import RpcProtocolError
+from pivot_tui.rpc_client_impl import (
+    RpcProtocolError,
+    decode_output_summary,
+    decode_stage_explanation,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -194,7 +197,10 @@ def _make_started_message(event: dict[str, object]) -> TuiStatusMessage | None:
     )
     explanation: object = event.get("explanation")
     if isinstance(explanation, dict) and explanation.keys() >= _EXPLANATION_REQUIRED_KEYS:
-        msg["explanation"] = cast("StageExplanation", explanation)  # pyright: ignore[reportInvalidCast] - validated shape
+        try:
+            msg["explanation"] = decode_stage_explanation(explanation)
+        except (RpcProtocolError, KeyError, ValueError) as exc:
+            _logger.warning("Invalid explanation payload, skipping: %s", exc)
     elif explanation is not None:
         _logger.warning("Invalid explanation payload, skipping: %s", type(explanation).__name__)
     return msg
@@ -237,12 +243,10 @@ def _make_completed_message(event: dict[str, object]) -> TuiStatusMessage | None
         elapsed=duration_ms / 1000.0,
         run_id=run_id,
     )
-    output_summary = event.get("output_summary")
-    if isinstance(output_summary, list):
-        msg["output_summary"] = cast("list[dict[str, object]]", output_summary)
-    elif output_summary is not None:
-        _logger.warning(
-            "Invalid output_summary payload, skipping: %s", type(output_summary).__name__
+    if "output_summary" in event:
+        output_summary = event["output_summary"]
+        msg["output_summary"] = (
+            None if output_summary is None else decode_output_summary(output_summary)
         )
     return msg
 
@@ -267,9 +271,11 @@ def _make_log_message(event: dict[str, object]) -> TuiLogMessage | None:
 
 
 def _make_watch_message(event: dict[str, object]) -> TuiWatchMessage | None:
-    new_state = event.get("new_state")
-    if new_state != "idle":
+    state = event["state"]
+    if state == "active":
         return None
+    if state != "idle":
+        raise RpcProtocolError("'idle' or 'active' (state)", repr(state))
     return TuiWatchMessage(
         type=TuiMessageType.WATCH,
         status=WatchStatus.WAITING,
@@ -290,13 +296,14 @@ def _make_reload_message(event: dict[str, object]) -> TuiReloadMessage | None:
         return None
     if not isinstance(stages_modified, list):
         return None
-    error = event.get("error")
-    if isinstance(error, str):
-        _logger.warning("Pipeline reload error: %s", error)
+    error = event["error"]
+    if error is not None and not isinstance(error, str):
+        raise RpcProtocolError("str | None (error)", type(error).__name__)
     return TuiReloadMessage(
         type=TuiMessageType.RELOAD,
         stages=cast("list[str]", stages),
         stages_added=cast("list[str]", stages_added),
         stages_removed=cast("list[str]", stages_removed),
         stages_modified=cast("list[str]", stages_modified),
+        error=error,
     )

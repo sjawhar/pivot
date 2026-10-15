@@ -13,7 +13,7 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import config, outputs, project
+from pivot import config, loaders, project, types
 from pivot.show import common
 from pivot.storage import cache
 from pivot.types import (
@@ -28,6 +28,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from pivot.storage import store as store_mod
+
 # Status symbols for diff display (plain text)
 STATUS_SYMBOLS: dict[ChangeType, str] = {
     ChangeType.ADDED: "+",
@@ -36,6 +38,7 @@ STATUS_SYMBOLS: dict[ChangeType, str] = {
 }
 
 logger = logging.getLogger(__name__)
+
 
 _DATA_EXTENSIONS: dict[str, DataFileFormat] = {
     ".csv": DataFileFormat.CSV,
@@ -92,6 +95,30 @@ def detect_format(path: pathlib.Path) -> DataFileFormat:
     """Detect data file format from extension."""
     suffix = path.suffix.lower()
     return _DATA_EXTENSIONS.get(suffix, DataFileFormat.UNKNOWN)
+
+
+def _format_from_loader(
+    loader: loaders.Reader[object] | loaders.Writer[object] | loaders.Loader[object, object],
+) -> DataFileFormat | None:
+    if isinstance(loader, loaders.CSV):
+        return DataFileFormat.CSV
+    if isinstance(loader, loaders.JSON):
+        return DataFileFormat.JSON
+    if isinstance(loader, loaders.JSONL):
+        return DataFileFormat.JSONL
+    return None
+
+
+def _is_data_output(
+    out: types.ArtifactRef, store: store_mod.WorkspaceStore, project_root: pathlib.Path
+) -> bool:
+    """True for a stage output that `pivot diff` can compare (CSV, JSON or JSONL data)."""
+    if out.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
+        return False
+    if _format_from_loader(out.format) is not None:
+        return True
+    rel_path = project.to_relative_path(store.resolve_display_path(out), project_root)
+    return detect_format(pathlib.Path(rel_path)) != DataFileFormat.UNKNOWN
 
 
 def load_dataframe(path: pathlib.Path) -> pandas.DataFrame:
@@ -513,70 +540,22 @@ def diff_data_files(
     )
 
 
-def get_data_outputs_from_stages() -> dict[str, str]:
-    """Get all data outputs (Out, not Metric/Plot) from Pipeline in context.
-
-    Returns dict mapping stage_name -> relative_path for data outputs.
-    """
-    from pivot.cli import helpers as cli_helpers
-
-    result = dict[str, str]()
-    proj_root = project.get_project_root()
-
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        for out in info["outs"]:
-            # Only include Out types that are data files (not Metric, Plot, etc.)
-            if not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                # Check if it's a supported data format
-                fmt = detect_format(pathlib.Path(rel_path))
-                if fmt != DataFileFormat.UNKNOWN:
-                    result[stage_name] = rel_path
-
-    return result
-
-
 def get_data_hashes_from_head() -> dict[str, str | None]:
-    """Read data output hashes from lock files at git HEAD.
-
-    Returns relative paths mapping to hashes (or None if no hash).
-    """
+    """Map each data output's workspace path to its hash in the lock files at git HEAD."""
     from pivot.cli import helpers as cli_helpers
 
-    result = dict[str, str | None]()
+    store = cli_helpers.require_workspace_store()
     proj_root = project.get_project_root()
-
-    # Collect lock file paths and data paths per stage
-    stage_data_paths = dict[str, list[str]]()
+    outs_by_stage = dict[str, list[types.ArtifactRef]]()
     for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        for out in info["outs"]:
-            if not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                fmt = detect_format(pathlib.Path(rel_path))
-                if fmt != DataFileFormat.UNKNOWN:
-                    stage_data_paths.setdefault(stage_name, []).append(rel_path)
-                    result[rel_path] = None
-
-    # Read all lock files from HEAD in one batch
-    lock_data_map = common.read_lock_files_from_head(list(stage_data_paths.keys()))
-
-    # Extract hashes from lock files
-    for stage_name, data_paths in stage_data_paths.items():
-        lock_data = lock_data_map.get(stage_name)
-        if lock_data is None:
-            continue
-
-        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
-
-        for data_rel_path in data_paths:
-            if data_rel_path in path_to_hash:
-                result[data_rel_path] = path_to_hash[data_rel_path]
-
-    return result
+        data_outs = [
+            out
+            for out in cli_helpers.get_stage(stage_name)["outs"]
+            if _is_data_output(out, store, proj_root)
+        ]
+        if data_outs:
+            outs_by_stage[stage_name] = data_outs
+    return common.output_hashes_from_head(outs_by_stage, store)
 
 
 def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None]:

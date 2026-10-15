@@ -4,9 +4,10 @@ import datetime
 import hashlib
 import json
 import uuid
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from pivot.types import (
+    ArtifactTag,
     DepEntry,
     DirHash,
     DirManifestEntry,
@@ -14,8 +15,14 @@ from pivot.types import (
     HashInfo,
     StageStatus,
     ensure_completion_type,
+    identity_key,
     is_dir_hash,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from pivot.types import ArtifactIdentity, ArtifactRef
 
 
 class StageRunRecord(TypedDict):
@@ -97,11 +104,31 @@ def compute_input_hash(
     data = {
         "code_manifest": code_manifest,
         "params": params,
-        "deps": sorted([(d["path"], d["hash"]) for d in deps]),
+        "deps": sorted([(d["producer"], d["key"], d["hash"]) for d in deps]),
         "out_specs": sorted(out_specs),
     }
     content = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+def stage_input_hash(
+    code_manifest: dict[str, str],
+    params: dict[str, object],
+    deps: Iterable[ArtifactRef],
+    dep_hashes: Mapping[ArtifactIdentity, HashInfo],
+    outs: Iterable[ArtifactRef],
+) -> str:
+    """Compute a stage's run-cache key from its registered deps and outs.
+
+    One entry per distinct dependency artifact, so a stage that reads one artifact through
+    several parameters gets the same key from every caller (worker, coordinator, commit).
+    """
+    dep_entries = [
+        DepEntry(producer=identity.producer, key=identity.key, hash=dep_hashes[identity]["hash"])
+        for identity in {ref.identity for ref in deps}
+    ]
+    out_specs = [(identity_key(ref.identity), ref.tag is not ArtifactTag.METRIC) for ref in outs]
+    return compute_input_hash(code_manifest, params, dep_entries, out_specs)
 
 
 def serialize_to_bytes(data: RunManifest | RunCacheEntry) -> bytes:

@@ -3,17 +3,47 @@
 
 from __future__ import annotations
 
-import asyncio
+import time
+from typing import TYPE_CHECKING
 
 import pytest
+from textual.widgets import Input
 
 from pivot_tui.run import PivotApp
 from pivot_tui.widgets.logs import StageLogPanel
 from pivot_tui.widgets.panels import TabbedDetailPanel
 
+if TYPE_CHECKING:
+    from textual.pilot import Pilot
+
+
+async def _helper_wait_for_initial_render(
+    pilot: Pilot[None], log_panel: StageLogPanel, timeout: float = 10.0
+) -> None:
+    """Wait until the app's deferred initial stage render has cleared and redrawn the panel.
+
+    App.on_mount schedules the detail panel update after a refresh, and the log panel
+    defers its own render once more; that render calls clear(), so logs added before it
+    lands are wiped.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any("No stage selected" in line.text for line in log_panel.lines):
+            return
+        await pilot.pause(0.05)
+    pytest.fail("Log panel never rendered its initial 'No stage selected' state")
+
+
+async def _helper_wait_for_match_count(
+    pilot: Pilot[None], log_panel: StageLogPanel, expected: str, timeout: float = 10.0
+) -> None:
+    """Let the app process events until the debounced search shows `expected` matches."""
+    deadline = time.monotonic() + timeout
+    while log_panel.match_count != expected and time.monotonic() < deadline:
+        await pilot.pause(0.05)
+
 
 @pytest.mark.asyncio
-@pytest.mark.flaky(reruns=2)
 async def test_log_search_smoke() -> None:
     """E2E: Verify search bar opens, accepts input, and closes."""
     # Use empty stage_names to avoid triggering pipeline lookups
@@ -25,6 +55,7 @@ async def test_log_search_smoke() -> None:
         # Get the log panel directly (no stage selection needed)
         detail_panel = app.query_one("#detail-panel", TabbedDetailPanel)
         log_panel = detail_panel.query_one("#stage-logs", StageLogPanel)
+        await _helper_wait_for_initial_render(pilot, log_panel)
 
         # Add logs directly to the panel
         log_panel.add_log("First ERROR message", is_stderr=False, timestamp=1000.0)
@@ -45,11 +76,14 @@ async def test_log_search_smoke() -> None:
 
         # Type search query
         await pilot.press("e", "r", "r", "o", "r")
-        await asyncio.sleep(0.3)  # Wait for 200ms debounce + buffer
+        await _helper_wait_for_match_count(pilot, log_panel, "1/2")
 
         # Verify search is active with matches (check through log panel state)
         assert log_panel.is_search_active, "Search should be active after typing"
-        assert log_panel.match_count == "1/2", "Should have 2 matches, starting at first"
+        assert log_panel.match_count == "1/2", (
+            f"Should have 2 matches, starting at first; got {log_panel.match_count!r}, "
+            + f"input={app.query_one('#log-search-input', Input).value!r}, focused={app.focused!r}"
+        )
 
         # Close with Escape (while focus is still on search input)
         await pilot.press("escape")
@@ -59,7 +93,6 @@ async def test_log_search_smoke() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.flaky(reruns=2)
 async def test_log_search_navigation_keys() -> None:
     """E2E: Verify n/N navigation works after submitting search."""
     app = PivotApp(stage_names=[], watch_mode=True)
@@ -70,6 +103,7 @@ async def test_log_search_navigation_keys() -> None:
         # Get the log panel
         detail_panel = app.query_one("#detail-panel", TabbedDetailPanel)
         log_panel = detail_panel.query_one("#stage-logs", StageLogPanel)
+        await _helper_wait_for_initial_render(pilot, log_panel)
 
         # Add logs with multiple matches
         log_panel.add_log("error one", is_stderr=False, timestamp=1000.0)
@@ -85,9 +119,12 @@ async def test_log_search_navigation_keys() -> None:
         await pilot.press("ctrl+f")
         await pilot.pause()
         await pilot.press("e", "r", "r", "o", "r")
-        await asyncio.sleep(0.3)
+        await _helper_wait_for_match_count(pilot, log_panel, "1/3")
 
-        assert log_panel.match_count == "1/3", "Should start at first of 3 matches"
+        assert log_panel.match_count == "1/3", (
+            f"Should start at first of 3 matches; got {log_panel.match_count!r}, "
+            + f"input={app.query_one('#log-search-input', Input).value!r}, focused={app.focused!r}"
+        )
 
         # Submit with Enter to return focus to logs
         await pilot.press("enter")

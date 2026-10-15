@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING, TypedDict, TypeGuard
 import xxhash
 import yaml
 
-from pivot import exceptions, git, project, yaml_config
+from pivot import exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
-from pivot.types import DirHash, FileHash
+from pivot.types import DirHash, FileHash, HashInfo
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from pivot.storage.track import PvtData
-    from pivot.types import HashInfo, OutEntry, StorageLockData
+    from pivot.types import OutEntry, StorageLockData
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,15 @@ class TargetInfo(TypedDict):
     original_target: str
     paths: list[str]
     hashes: dict[str, HashInfo | None]
+
+
+class StageTarget(TypedDict):
+    """A CLI target naming a stage's outputs, resolved against the current pipeline."""
+
+    stage_name: str
+    state_dir: pathlib.Path
+    paths_by_key: dict[str | None, str]
+    """Fallback lock output key -> workspace path for older locks with no recorded path."""
 
 
 def _parse_yaml_bytes[T](
@@ -133,31 +142,51 @@ def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
 def resolve_targets(
     targets: Sequence[str],
     rev: str,
-    state_dir: pathlib.Path,
+    stage_targets: Mapping[str, StageTarget],
 ) -> list[TargetInfo]:
-    """Resolve targets to TargetInfo, determining if each is a file or stage."""
+    """Resolve targets to TargetInfo: a target in ``stage_targets`` is a stage, others are files."""
     proj_root = project.get_project_root()
     results = list[TargetInfo]()
 
     for target in targets:
-        # Try as stage name first (stage names don't have path separators)
-        if "/" not in target and "\\" not in target:
-            lock_data = get_lock_data_from_revision(target, rev, state_dir)
-            if lock_data is not None and "outs" in lock_data:
-                outs = lock_data["outs"]
-                paths = [entry["path"] for entry in outs]
-                hashes: dict[str, HashInfo | None] = {
-                    entry["path"]: _out_entry_to_output_hash(entry) for entry in outs
-                }
-                results.append(
-                    TargetInfo(
-                        target_type=TargetType.STAGE,
-                        original_target=target,
-                        paths=paths,
-                        hashes=hashes,
-                    )
+        if target in stage_targets:
+            stage_target = stage_targets[target]
+            stage_name = stage_target["stage_name"]
+            lock_data = get_lock_data_from_revision(stage_name, rev, stage_target["state_dir"])
+            if lock_data is None:
+                raise exceptions.TargetNotFoundError(
+                    f"Stage '{stage_name}' has no lock file at revision '{rev}'"
                 )
-                continue
+            paths_by_key = stage_target["paths_by_key"]
+            selected_key = types.identity_from_key(target).key
+            hashes = dict[str, HashInfo | None]()
+            for entry in lock_data["outs"]:
+                key = entry["key"]
+                if selected_key is not None and key != selected_key:
+                    continue
+                if "path" in entry:
+                    path = entry["path"]
+                elif key in paths_by_key:
+                    path = paths_by_key[key]
+                else:
+                    raise exceptions.TargetNotFoundError(
+                        f"Target '{target}' output key {key!r} at revision '{rev}' has no "
+                        + "recorded path and is not defined by the current pipeline"
+                    )
+                hashes[path] = _out_entry_to_output_hash(entry)
+            if not hashes:
+                raise exceptions.TargetNotFoundError(
+                    f"Target '{target}' recorded no outputs at revision '{rev}'"
+                )
+            results.append(
+                TargetInfo(
+                    target_type=TargetType.STAGE,
+                    original_target=target,
+                    paths=list(hashes),
+                    hashes=hashes,
+                )
+            )
+            continue
 
         # Normalize path (validates traversal and project bounds)
         rel_target = _normalize_target_path(target, proj_root)
@@ -337,7 +366,7 @@ def restore_targets_from_revision(
     rev: str,
     output: pathlib.Path | None,
     cache_dir: pathlib.Path,
-    state_dir: pathlib.Path,
+    stage_targets: Mapping[str, StageTarget],
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
 ) -> tuple[list[str], bool]:
@@ -354,18 +383,14 @@ def restore_targets_from_revision(
         raise exceptions.RevisionNotFoundError(f"Cannot resolve revision: '{rev}'")
 
     # Resolve targets
-    target_infos = resolve_targets(targets, rev, state_dir)
+    target_infos = resolve_targets(targets, rev, stage_targets)
 
     # Validate -o usage
     if output is not None:
         if len(target_infos) != 1:
             raise exceptions.GetError("--output/-o can only be used with a single target")
-        if target_infos[0]["target_type"] == TargetType.STAGE:
-            raise exceptions.GetError(
-                "--output/-o cannot be used with stage names (use file path instead)"
-            )
         if len(target_infos[0]["paths"]) != 1:
-            raise exceptions.GetError("--output/-o cannot be used with directory targets")
+            raise exceptions.GetError("--output/-o can only be used with a single output")
 
     results = list[RestoreResult]()
 

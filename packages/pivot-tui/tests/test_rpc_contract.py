@@ -12,28 +12,33 @@ from __future__ import annotations
 import contextlib
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING
 
 import anyio
 import pytest
 
+from pivot import compose
 from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, EventBuffer
 from pivot.engine.engine import Engine
 from pivot.engine.types import InputEvent, StageStarted
-from pivot.loaders import PathOnly
-from pivot.outputs import Dep, Out
 from pivot_tui.testing.fake_server import FakeRpcServer
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot.registry import PipelineLike
 
 
-def _helper_contract_stage(
-    data: Annotated[Path, Dep("input.txt", PathOnly())],
-) -> Annotated[Path, Out("output.txt", PathOnly())]:
+@compose.stage
+def contract_stage(data: Path) -> Path:
     return data
+
+
+def _build_contract_pipeline(root: Path) -> PipelineLike:
+    with compose.Pipeline("test", root=root) as pipeline:
+        input_handle = pipeline.input("input", path="input.txt", t=Path)
+        contract_stage(input_handle)
+    return pipeline
 
 
 def _helper_build_request(
@@ -151,10 +156,9 @@ def _helper_assert_response_shape_matches(
 @pytest.mark.anyio
 async def test_rpc_contract_status_and_stages(
     tmp_path: Path,
-    test_pipeline: pipeline_mod.Pipeline,
     set_project_root: Path,
 ) -> None:
-    test_pipeline.register(_helper_contract_stage, name="contract_stage")
+    pipeline = _build_contract_pipeline(set_project_root)
     (set_project_root / "input.txt").write_text("data")
 
     socket_path = tmp_path / "agent.sock"
@@ -162,7 +166,7 @@ async def test_rpc_contract_status_and_stages(
         server.set_status("idle", running=[], pending=[])
         server.set_stages(["contract_stage"])
 
-        async with Engine(pipeline=test_pipeline) as engine:
+        async with Engine(pipeline=pipeline) as engine:
             handler = AgentRpcHandler(engine=engine, event_buffer=EventBuffer())
 
             request = _helper_build_request("status")
@@ -179,16 +183,19 @@ async def test_rpc_contract_status_and_stages(
 @pytest.mark.anyio
 async def test_rpc_contract_stage_info_and_explain_success(
     tmp_path: Path,
-    test_pipeline: pipeline_mod.Pipeline,
     set_project_root: Path,
 ) -> None:
-    stage_name = "contract_stage"
-    test_pipeline.register(_helper_contract_stage, name=stage_name)
+    stage_name = "test/contract_stage"
+    pipeline = _build_contract_pipeline(set_project_root)
     (set_project_root / "input.txt").write_text("data")
 
     socket_path = tmp_path / "agent.sock"
     async with _helper_fake_server(socket_path) as server:
-        server.set_stage_info(stage_name, deps=["input.txt"], outs=["output.txt"])
+        server.set_stage_info(
+            stage_name,
+            deps=[{"producer": "input", "key": None}],
+            outs=[{"producer": "test/contract_stage", "key": None}],
+        )
         server.set_explanation(
             stage_name,
             {
@@ -203,7 +210,7 @@ async def test_rpc_contract_stage_info_and_explain_success(
             },
         )
 
-        async with Engine(pipeline=test_pipeline) as engine:
+        async with Engine(pipeline=pipeline) as engine:
             handler = AgentRpcHandler(engine=engine, event_buffer=EventBuffer())
 
             request = _helper_build_request("stage_info", {"stage": stage_name})
@@ -224,14 +231,13 @@ async def test_rpc_contract_stage_info_and_explain_success(
 @pytest.mark.anyio
 async def test_rpc_contract_stage_info_and_explain_unknown(
     tmp_path: Path,
-    test_pipeline: pipeline_mod.Pipeline,
     set_project_root: Path,
 ) -> None:
-    test_pipeline.register(_helper_contract_stage, name="contract_stage")
+    pipeline = _build_contract_pipeline(set_project_root)
     (set_project_root / "input.txt").write_text("data")
 
     socket_path = tmp_path / "agent.sock"
-    async with _helper_fake_server(socket_path), Engine(pipeline=test_pipeline) as engine:
+    async with _helper_fake_server(socket_path), Engine(pipeline=pipeline) as engine:
         handler = AgentRpcHandler(engine=engine, event_buffer=EventBuffer())
 
         request = _helper_build_request("stage_info", {"stage": "unknown"})
@@ -252,10 +258,9 @@ async def test_rpc_contract_stage_info_and_explain_unknown(
 @pytest.mark.anyio
 async def test_rpc_contract_events_since_valid_and_invalid(
     tmp_path: Path,
-    test_pipeline: pipeline_mod.Pipeline,
     set_project_root: Path,
 ) -> None:
-    test_pipeline.register(_helper_contract_stage, name="contract_stage")
+    pipeline = _build_contract_pipeline(set_project_root)
     (set_project_root / "input.txt").write_text("data")
 
     socket_path = tmp_path / "agent.sock"
@@ -276,7 +281,7 @@ async def test_rpc_contract_events_since_valid_and_invalid(
             StageStarted(type="stage_started", stage="contract_stage", index=1, total=1)
         )
 
-        async with Engine(pipeline=test_pipeline) as engine:
+        async with Engine(pipeline=pipeline) as engine:
             handler = AgentRpcHandler(engine=engine, event_buffer=event_buffer)
 
             request = _helper_build_request("events_since", {"version": 0})
@@ -299,14 +304,13 @@ async def test_rpc_contract_events_since_valid_and_invalid(
 @pytest.mark.anyio
 async def test_rpc_contract_run_and_cancel(
     tmp_path: Path,
-    test_pipeline: pipeline_mod.Pipeline,
     set_project_root: Path,
 ) -> None:
-    test_pipeline.register(_helper_contract_stage, name="contract_stage")
+    pipeline = _build_contract_pipeline(set_project_root)
     (set_project_root / "input.txt").write_text("data")
 
     socket_path = tmp_path / "agent.sock"
-    async with _helper_fake_server(socket_path), Engine(pipeline=test_pipeline) as engine:
+    async with _helper_fake_server(socket_path), Engine(pipeline=pipeline) as engine:
         handler = AgentRpcHandler(engine=engine, event_buffer=EventBuffer())
 
         request = _helper_build_request("run")

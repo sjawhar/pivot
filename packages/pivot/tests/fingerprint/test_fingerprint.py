@@ -2,7 +2,7 @@
 
 import ast
 import dataclasses
-import datetime
+import enum
 import importlib.util
 import inspect
 import json
@@ -18,11 +18,35 @@ import typing
 import networkx as nx
 import pydantic
 import pytest
-import xxhash
 from pydantic import BaseModel
 
 from pivot import ast_utils, exceptions, fingerprint
 from pivot.storage import state as state_mod
+
+
+def _const_key(name: str) -> str:
+    return f"const:{__name__}.{name}"
+
+
+def _definition_key(prefix: str, value: object) -> str:
+    typed_value: typing.Any = value
+    return f"{prefix}:{typed_value.__module__}.{typed_value.__qualname__}"
+
+
+def _owned_key(prefix: str, owner: object, name: str) -> str:
+    """Key of a closure cell or local closure helper, under the function that owns it."""
+    typed_owner: typing.Any = owner
+    return f"{prefix}:{typed_owner.__module__}.{typed_owner.__qualname__}.{name}"
+
+
+def _loader_key(loader: object, member: str) -> str:
+    return _definition_key("loader", type(loader)) + f":{member}"
+
+
+def _cached_stage() -> int:
+    """Function that hand-built manifest cache entries are keyed under."""
+    return 0
+
 
 # --- Module-level helper functions for testing ---
 # These must be at module level to properly capture imports in their closures
@@ -119,14 +143,6 @@ TEST_BYTES = b"binary data"
 TEST_NONE = None
 TEST_FLOAT = 3.14159
 TEST_BOOL = True
-TEST_DATETIME = datetime.datetime(2024, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)
-
-
-class _HelperReprError:
-    __module__ = "builtins"
-
-    def __repr__(self) -> str:
-        raise RuntimeError("repr failure")
 
 
 class _PydanticInnerModel(pydantic.BaseModel):
@@ -161,11 +177,6 @@ def _helper_uses_float():
 def _helper_uses_bool():
     """Helper that uses bool constant."""
     return TEST_BOOL
-
-
-def _helper_uses_datetime_constant():
-    """Helper that uses a datetime constant."""
-    return TEST_DATETIME
 
 
 def _helper_uses_stdlib_callable(x: object) -> str:
@@ -326,7 +337,7 @@ def test_helper_function_captured():
     fp = fingerprint.get_stage_fingerprint(main)
 
     assert "self:main" in fp
-    assert "func:helper" in fp
+    assert _definition_key("func", helper) in fp
     assert len(fp) == 2
 
 
@@ -340,8 +351,8 @@ def test_constant_captured():
     fp = fingerprint.get_stage_fingerprint(use_constant)
 
     assert "self:use_constant" in fp
-    assert "const:CONSTANT" in fp
-    assert fp["const:CONSTANT"] == "100"
+    assert _owned_key("const", use_constant, "CONSTANT") in fp
+    assert fp[_owned_key("const", use_constant, "CONSTANT")] == "100"
 
 
 def test_multiple_constants_captured():
@@ -357,9 +368,9 @@ def test_multiple_constants_captured():
 
     fp = fingerprint.get_stage_fingerprint(use_constants)
 
-    assert fp["const:PI"] == "3.14159"
-    assert fp["const:MAX_ITER"] == "100"
-    assert fp["const:DEBUG"] == "True"
+    assert fp[_owned_key("const", use_constants, "PI")] == "3.14159"
+    assert fp[_owned_key("const", use_constants, "MAX_ITER")] == "100"
+    assert fp[_owned_key("const", use_constants, "DEBUG")] == "True"
 
 
 def test_transitive_dependencies_captured():
@@ -377,8 +388,8 @@ def test_transitive_dependencies_captured():
     fp = fingerprint.get_stage_fingerprint(top)
 
     assert "self:top" in fp
-    assert "func:middle" in fp
-    assert "func:leaf" in fp
+    assert _owned_key("func", top, "middle") in fp
+    assert _definition_key("func", leaf) in fp
 
 
 def test_unchanged_function_same_fingerprint():
@@ -413,12 +424,10 @@ def test_stdlib_module_attrs_not_tracked():
     """Stdlib module attributes (math, os, json, etc.) are NOT tracked."""
     fp = fingerprint.get_stage_fingerprint(_helper_uses_math_pi)
     assert "self:_helper_uses_math_pi" in fp
-    assert "mod:math.pi" not in fp
+    assert not any("math" in key for key in fp if not key.startswith("self:")), fp
 
     fp2 = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
-    assert "mod:math.sqrt" not in fp2
-    assert "mod:math.sin" not in fp2
-    assert "mod:math.cos" not in fp2
+    assert not any("math" in key for key in fp2 if not key.startswith("self:")), fp2
 
 
 def test_aliased_function_captured():
@@ -434,7 +443,7 @@ def test_aliased_function_captured():
     fp = fingerprint.get_stage_fingerprint(main)
 
     assert "self:main" in fp
-    assert "func:helper" in fp
+    assert _definition_key("func", helper) in fp
 
 
 def test_circular_reference_handled():
@@ -453,7 +462,7 @@ def test_circular_reference_handled():
     fp = fingerprint.get_stage_fingerprint(func_a)
 
     assert "self:func_a" in fp
-    assert "func:func_b" in fp
+    assert _owned_key("func", func_a, "func_b") in fp
 
 
 def test_nested_function_not_in_globals():
@@ -587,11 +596,11 @@ def test_process_class_body_dependencies_tracks_bases_and_annotations():
 
     fingerprint._process_class_body_dependencies(_HelperAnnotatedClass, manifest, visited)
 
-    assert "class:_HelperBase" in manifest
-    assert "class:_HelperFieldType" in manifest
-    assert "class:Inner" in manifest
-    assert "class:_HelperPydanticModel" in manifest
-    assert "schema:_HelperPydanticModel" in manifest
+    assert _definition_key("class", _HelperBase) in manifest
+    assert _definition_key("class", _HelperFieldType) in manifest
+    assert _definition_key("class", _HelperContainer.Inner) in manifest
+    assert _definition_key("class", _HelperPydanticModel) in manifest
+    assert _definition_key("schema", _HelperPydanticModel) in manifest
 
 
 # --- hash_function_ast tests ---
@@ -921,8 +930,8 @@ def test_fingerprint_with_nonlocal():
     # Should have the function itself
     assert "self:inner" in fp
     # Nonlocal constant should be captured
-    assert "const:x" in fp
-    assert fp["const:x"] == "10"
+    assert _owned_key("const", inner_func, "x") in fp
+    assert fp[_owned_key("const", inner_func, "x")] == "10"
 
 
 def test_fingerprint_callable_nonlocal():
@@ -939,50 +948,7 @@ def test_fingerprint_callable_nonlocal():
 
     # Should have the function and the nonlocal
     assert "self:add" in fp
-    assert "const:n" in fp
-
-
-def test_hash_unrecognized_closure_value_deterministic_repr():
-    """Deterministic repr values should be hashed into the manifest."""
-    manifest: dict[str, str] = {}
-    fingerprint._hash_unrecognized_closure_value("TEST_DATETIME", TEST_DATETIME, manifest, "stage")
-
-    expected = xxhash.xxh64(repr(TEST_DATETIME).encode()).hexdigest()
-    assert manifest["const:TEST_DATETIME"] == expected
-
-
-def test_hash_unrecognized_closure_value_repr_error_raises(monkeypatch: pytest.MonkeyPatch):
-    """repr failures should surface as mutable capture errors."""
-    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
-    with pytest.raises(exceptions.StageDefinitionError):
-        fingerprint._hash_unrecognized_closure_value("bad_repr", _HelperReprError(), {}, "stage")
-
-
-def test_hash_unrecognized_closure_value_memory_address_raises(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Memory-address reprs should be rejected as non-deterministic."""
-    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
-    with pytest.raises(exceptions.StageDefinitionError):
-        fingerprint._hash_unrecognized_closure_value("addr", object(), {}, "stage")
-
-
-def test_hash_unrecognized_closure_value_large_repr_raises(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Large reprs should be rejected as lossy."""
-    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
-    large_value = types.SimpleNamespace(data="x" * 10_001)
-    with pytest.raises(exceptions.StageDefinitionError):
-        fingerprint._hash_unrecognized_closure_value("large", large_value, {}, "stage")
-
-
-def test_fingerprint_captures_unrecognized_closure_value():
-    """Unrecognized closure values should be hashed when deterministic."""
-    fp = fingerprint.get_stage_fingerprint(_helper_uses_datetime_constant)
-
-    expected = xxhash.xxh64(repr(TEST_DATETIME).encode()).hexdigest()
-    assert fp["const:TEST_DATETIME"] == expected
+    assert _owned_key("const", add_five, "n") in fp
 
 
 def test_stdlib_callable_in_closure_does_not_raise():
@@ -1010,115 +976,8 @@ def test_fingerprint_nonlocal_callable_function():
     inner_func = outer()
     fp = fingerprint.get_stage_fingerprint(inner_func)
 
-    # Should have both the inner function and the helper it references
     assert "self:inner" in fp
-    assert "func:helper_func" in fp
-
-
-# --- Nonlocals with collection types containing callables ---
-# Note: Collection processing scans for callable user code, not raw contents
-
-
-def _collection_helper_a(x):
-    """Helper function for collection tests."""
-    return x * 2
-
-
-def _collection_helper_b(x):
-    """Second helper function for collection tests."""
-    return x + 1
-
-
-def test_fingerprint_nonlocal_list_with_callable(monkeypatch: pytest.MonkeyPatch):
-    """Should capture callable functions within nonlocal list."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-
-    def outer():
-        transforms = [_collection_helper_a, _collection_helper_b]
-
-        def inner(x):
-            for t in transforms:
-                x = t(x)
-            return x
-
-        return inner
-
-    inner_func = outer()
-    fp = fingerprint.get_stage_fingerprint(inner_func)
-
-    assert "self:inner" in fp
-    # Callables in list are captured with index-based keys
-    assert "func:transforms[0]" in fp
-    assert "func:transforms[1]" in fp
-
-
-def test_fingerprint_nonlocal_dict_with_callable(monkeypatch: pytest.MonkeyPatch):
-    """Should capture callable functions within nonlocal dict."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-
-    def outer():
-        handlers = {
-            "double": _collection_helper_a,
-            "increment": _collection_helper_b,
-        }
-
-        def inner(x, op):
-            return handlers[op](x)
-
-        return inner
-
-    inner_func = outer()
-    fp = fingerprint.get_stage_fingerprint(inner_func)
-
-    assert "self:inner" in fp
-    # Dict values are captured with key-based names
-    assert "func:handlers['double']" in fp
-    assert "func:handlers['increment']" in fp
-
-
-def test_fingerprint_nonlocal_tuple_with_callable():
-    """Should capture callable functions within nonlocal tuple."""
-
-    def outer():
-        pipeline = (_collection_helper_a, _collection_helper_b)
-
-        def inner(x):
-            for t in pipeline:
-                x = t(x)
-            return x
-
-        return inner
-
-    inner_func = outer()
-    fp = fingerprint.get_stage_fingerprint(inner_func)
-
-    assert "self:inner" in fp
-    assert "func:pipeline[0]" in fp
-    assert "func:pipeline[1]" in fp
-
-
-def test_fingerprint_nonlocal_collection_callable_change_detected(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Changing callable in collection should change fingerprint."""
-    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-
-    def make_func(transform):
-        transforms = [transform]
-
-        def inner(x):
-            return transforms[0](x)
-
-        return inner
-
-    func1 = make_func(_collection_helper_a)
-    func2 = make_func(_collection_helper_b)
-
-    fp1 = fingerprint.get_stage_fingerprint(func1)
-    fp2 = fingerprint.get_stage_fingerprint(func2)
-
-    # The hash of the callable should differ
-    assert fp1["func:transforms[0]"] != fp2["func:transforms[0]"]
+    assert _definition_key("func", helper_func) in fp
 
 
 def test_hash_function_no_code_object():
@@ -1230,8 +1089,8 @@ def test_fingerprint_merges_child_manifest():
 
     # Should have all three functions
     assert "self:top_func" in fp
-    assert "func:middle_helper" in fp
-    assert "func:leaf_helper" in fp
+    assert _owned_key("func", top_func, "middle_helper") in fp
+    assert _definition_key("func", leaf_helper) in fp
 
     # Should NOT have self:middle_helper or self:leaf_helper
     # (child self entries should be excluded from merge)
@@ -1253,8 +1112,8 @@ def test_fingerprint_with_string_constant():
     fp = fingerprint.get_stage_fingerprint(_helper_uses_string)
 
     assert "self:_helper_uses_string" in fp
-    assert "const:TEST_STRING" in fp
-    assert fp["const:TEST_STRING"] == "'Hello, World!'"
+    assert _const_key("TEST_STRING") in fp
+    assert fp[_const_key("TEST_STRING")] == "'Hello, World!'"
 
 
 def test_fingerprint_with_bytes_constant():
@@ -1262,8 +1121,8 @@ def test_fingerprint_with_bytes_constant():
     fp = fingerprint.get_stage_fingerprint(_helper_uses_bytes)
 
     assert "self:_helper_uses_bytes" in fp
-    assert "const:TEST_BYTES" in fp
-    assert fp["const:TEST_BYTES"] == "b'binary data'"
+    assert _const_key("TEST_BYTES") in fp
+    assert fp[_const_key("TEST_BYTES")] == "b'binary data'"
 
 
 def test_fingerprint_with_none_constant():
@@ -1271,8 +1130,8 @@ def test_fingerprint_with_none_constant():
     fp = fingerprint.get_stage_fingerprint(_helper_uses_none)
 
     assert "self:_helper_uses_none" in fp
-    assert "const:TEST_NONE" in fp
-    assert fp["const:TEST_NONE"] == "None"
+    assert _const_key("TEST_NONE") in fp
+    assert fp[_const_key("TEST_NONE")] == "None"
 
 
 def test_fingerprint_skips_underscore_globals():
@@ -1314,8 +1173,8 @@ def test_fingerprint_with_float_constant():
     fp = fingerprint.get_stage_fingerprint(_helper_uses_float)
 
     assert "self:_helper_uses_float" in fp
-    assert "const:TEST_FLOAT" in fp
-    assert fp["const:TEST_FLOAT"] == "3.14159"
+    assert _const_key("TEST_FLOAT") in fp
+    assert fp[_const_key("TEST_FLOAT")] == "3.14159"
 
 
 def test_fingerprint_with_bool_constant():
@@ -1323,8 +1182,8 @@ def test_fingerprint_with_bool_constant():
     fp = fingerprint.get_stage_fingerprint(_helper_uses_bool)
 
     assert "self:_helper_uses_bool" in fp
-    assert "const:TEST_BOOL" in fp
-    assert fp["const:TEST_BOOL"] == "True"
+    assert _const_key("TEST_BOOL") in fp
+    assert fp[_const_key("TEST_BOOL")] == "True"
 
 
 # --- Pydantic schema hashing tests ---
@@ -1398,22 +1257,20 @@ def test_hash_pydantic_schema_adds_schema_and_nested_models():
         visited,
     )
 
-    assert "schema:_PydanticOuterModel" in manifest
-    assert "schema:_PydanticInnerModel" in manifest
-    assert "class:_PydanticInnerModel" in manifest
-    assert "class:_PydanticOuterModel" not in manifest
-    assert len(manifest["schema:_PydanticOuterModel"]) == 16
+    outer_schema = _definition_key("schema", _PydanticOuterModel)
+    assert outer_schema in manifest
+    assert _definition_key("schema", _PydanticInnerModel) in manifest
+    assert _definition_key("class", _PydanticInnerModel) in manifest
+    assert _definition_key("class", _PydanticOuterModel) not in manifest
+    assert len(manifest[outer_schema]) == 16
 
 
-def test_discover_pydantic_field_types_tracks_nested_models():
-    """Should walk annotations and capture nested Pydantic models."""
-    manifest = dict[str, str]()
-    visited = set[int]()
-
-    fingerprint._discover_pydantic_field_types(list[_PydanticInnerModel], manifest, visited)
-
-    assert "class:_PydanticInnerModel" in manifest
-    assert "schema:_PydanticInnerModel" in manifest
+def test_model_field_classes_tracks_nested_models():
+    """Field annotations are walked into generics, so nested Pydantic models are found."""
+    assert fingerprint._model_field_classes(_PydanticOuterModel) == [
+        _PydanticInnerModel,
+        _PydanticInnerModel,
+    ]
 
 
 # ==============================================================================
@@ -1439,9 +1296,10 @@ def test_loader_fingerprint_includes_load_method():
     loader = loaders.CSV()
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:CSV:load" in fp
-    assert isinstance(fp["loader:CSV:load"], str)
-    assert len(fp["loader:CSV:load"]) == 16  # xxhash64 hex
+    key = _loader_key(loader, "load")
+    assert key in fp
+    assert isinstance(fp[key], str)
+    assert len(fp[key]) == 16  # xxhash64 hex
 
 
 def test_loader_fingerprint_includes_save_method():
@@ -1451,9 +1309,10 @@ def test_loader_fingerprint_includes_save_method():
     loader = loaders.CSV()
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:CSV:save" in fp
-    assert isinstance(fp["loader:CSV:save"], str)
-    assert len(fp["loader:CSV:save"]) == 16
+    key = _loader_key(loader, "save")
+    assert key in fp
+    assert isinstance(fp[key], str)
+    assert len(fp[key]) == 16
 
 
 def test_loader_fingerprint_includes_config():
@@ -1463,8 +1322,9 @@ def test_loader_fingerprint_includes_config():
     loader = loaders.CSV(index_col="id", sep=";")
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:CSV:config" in fp
-    assert isinstance(fp["loader:CSV:config"], str)
+    key = _loader_key(loader, "config")
+    assert key in fp
+    assert isinstance(fp[key], str)
 
 
 def test_loader_config_change_changes_fingerprint():
@@ -1477,7 +1337,7 @@ def test_loader_config_change_changes_fingerprint():
     fp1 = fingerprint.get_loader_fingerprint(loader1)
     fp2 = fingerprint.get_loader_fingerprint(loader2)
 
-    assert fp1["loader:CSV:config"] != fp2["loader:CSV:config"]
+    assert fp1[_loader_key(loader1, "config")] != fp2[_loader_key(loader2, "config")]
 
 
 def test_loader_same_config_same_fingerprint():
@@ -1504,7 +1364,7 @@ def test_different_loader_types_different_fingerprint():
     fp_json = fingerprint.get_loader_fingerprint(json_loader)
 
     # Method hashes should differ
-    assert fp_csv["loader:CSV:load"] != fp_json["loader:JSON:load"]
+    assert fp_csv[_loader_key(csv_loader, "load")] != fp_json[_loader_key(json_loader, "load")]
 
 
 def test_json_loader_fingerprint():
@@ -1514,9 +1374,9 @@ def test_json_loader_fingerprint():
     loader = loaders.JSON(indent=4)
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:JSON:load" in fp
-    assert "loader:JSON:save" in fp
-    assert "loader:JSON:config" in fp
+    assert _loader_key(loader, "load") in fp
+    assert _loader_key(loader, "save") in fp
+    assert _loader_key(loader, "config") in fp
 
 
 def test_yaml_loader_fingerprint():
@@ -1526,9 +1386,9 @@ def test_yaml_loader_fingerprint():
     loader = loaders.YAML()
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:YAML:load" in fp
-    assert "loader:YAML:save" in fp
-    assert "loader:YAML:config" in fp
+    assert _loader_key(loader, "load") in fp
+    assert _loader_key(loader, "save") in fp
+    assert _loader_key(loader, "config") in fp
 
 
 def test_pickle_loader_fingerprint():
@@ -1538,9 +1398,9 @@ def test_pickle_loader_fingerprint():
     loader = loaders.Pickle()
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:Pickle:load" in fp
-    assert "loader:Pickle:save" in fp
-    assert "loader:Pickle:config" in fp
+    assert _loader_key(loader, "load") in fp
+    assert _loader_key(loader, "save") in fp
+    assert _loader_key(loader, "config") in fp
 
 
 def test_pathonly_loader_fingerprint():
@@ -1550,8 +1410,8 @@ def test_pathonly_loader_fingerprint():
     loader = loaders.PathOnly()
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:PathOnly:load" in fp
-    assert "loader:PathOnly:save" in fp
+    assert _loader_key(loader, "load") in fp
+    assert _loader_key(loader, "save") in fp
     # PathOnly has no dataclass fields, so no config to fingerprint
     # Config is only included when the loader has configurable fields
 
@@ -1581,9 +1441,9 @@ def test_custom_loader_fingerprint():
     loader = CustomTextLoader(prefix="TEST:")
     fp = fingerprint.get_loader_fingerprint(loader)
 
-    assert "loader:CustomTextLoader:load" in fp
-    assert "loader:CustomTextLoader:save" in fp
-    assert "loader:CustomTextLoader:config" in fp
+    assert _loader_key(loader, "load") in fp
+    assert _loader_key(loader, "save") in fp
+    assert _loader_key(loader, "config") in fp
 
 
 def test_custom_loader_code_change_detected():
@@ -1619,7 +1479,7 @@ def test_custom_loader_code_change_detected():
     fp2 = fingerprint.get_loader_fingerprint(LoaderV2())
 
     # Load method hash should differ
-    assert fp1["loader:LoaderV1:load"] != fp2["loader:LoaderV2:load"]
+    assert fp1[_loader_key(LoaderV1(), "load")] != fp2[_loader_key(LoaderV2(), "load")]
 
 
 def test_loader_fingerprint_stable():
@@ -1926,8 +1786,9 @@ def test_recursive_pydantic_model_no_infinite_recursion():
         manifest,
         visited,
     )
-    assert f"schema:{TreeNode.__name__}" in manifest
-    assert manifest[f"schema:{TreeNode.__name__}"] != "<pending>"
+    key = _definition_key("schema", TreeNode)
+    assert key in manifest
+    assert manifest[key] != "<pending>"
 
 
 def test_mutual_recursive_pydantic_models():
@@ -1952,8 +1813,9 @@ def test_mutual_recursive_pydantic_models():
         manifest,
         visited,
     )
-    assert "schema:Parent" in manifest
-    assert manifest["schema:Parent"] != "<pending>"
+    key = _definition_key("schema", Parent)
+    assert key in manifest
+    assert manifest[key] != "<pending>"
 
 
 # ==============================================================================
@@ -1970,13 +1832,14 @@ def test_user_defined_generic_origin_tracked():
     class MyContainer(typing.Generic[T]):
         pass
 
-    hint = MyContainer[int]
+    def stage(items: MyContainer[int]) -> None:
+        pass
 
     manifest = dict[str, str]()
     visited = set[int]()
-    fingerprint._process_type_hint(hint, manifest, visited)
+    fingerprint._process_type_hint_dependencies(stage, manifest, visited)
 
-    assert "class:MyContainer" in manifest
+    assert _definition_key("class", MyContainer) in manifest
 
 
 # ==============================================================================
@@ -2378,6 +2241,213 @@ def my_stage():
         sys.modules.pop("collected_stage", None)
 
 
+def test_cached_manifest_source_map_includes_module_attribute_source(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `module.NAME` read records that module's file, so editing it invalidates the cache."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "f8_settings.py").write_text("FACTOR = 10\n")
+    (tmp_path / "f8_stage.py").write_text(
+        "import f8_settings\n\n\ndef scale(x):\n    return x * f8_settings.FACTOR\n"
+    )
+    writes = list[tuple[bytes, bytes]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
+    try:
+        stage_module = importlib.import_module("f8_stage")
+        fingerprint.get_stage_fingerprint_cached("f8/scale", stage_module.scale)
+    finally:
+        sys.modules.pop("f8_stage", None)
+        sys.modules.pop("f8_settings", None)
+
+    ((_key, raw),) = writes
+    assert "f8_settings.py" in json.loads(raw)["s"]
+
+
+def test_project_module_scan_is_reused_until_loaded_modules_change(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cache misses reuse one scan of sys.modules; importing or reloading a module redoes it."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "scan_first.py").write_text("VALUE = 1\n")
+    (tmp_path / "scan_second.py").write_text("VALUE = 2\n")
+    classified = list[object]()
+    real_is_user_code = fingerprint.is_user_code
+
+    def counting_is_user_code(obj: object) -> bool:
+        classified.append(obj)
+        return real_is_user_code(obj)
+
+    try:
+        importlib.import_module("scan_first")
+        first = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(first)
+        assert "scan_first.py" in first
+
+        monkeypatch.setattr(fingerprint, "is_user_code", counting_is_user_code)
+        repeat = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(repeat)
+        assert repeat == first
+        assert classified == [], "an unchanged sys.modules must not be rescanned"
+
+        importlib.import_module("scan_second")
+        after_import = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(after_import)
+        assert "scan_second.py" in after_import
+
+        (tmp_path / "scan_first.py").write_text("VALUE = 100\n")
+        del sys.modules["scan_first"]
+        importlib.import_module("scan_first")
+        after_reload = dict[str, tuple[int, int, int]]()
+        fingerprint._record_project_modules(after_reload)
+        stat = (tmp_path / "scan_first.py").stat()
+        assert after_reload["scan_first.py"] == (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    finally:
+        sys.modules.pop("scan_first", None)
+        sys.modules.pop("scan_second", None)
+
+
+_READS_MODULE = """\
+import functools
+
+import pydantic
+
+import reads_settings
+
+FACTOR = reads_settings.SOURCE["factor"]
+
+
+class Model(pydantic.BaseModel):
+    width: int = reads_settings.SOURCE["width"]
+
+
+def helper(x, offset=reads_settings.SOURCE["offset"]):
+    return x + offset
+
+
+def apply(x, by):
+    return x * by
+
+
+BOUND = functools.partial(apply, by=reads_settings.SOURCE["by"])
+
+
+def make(scale):
+    def stage(x, model: Model = None):
+        return helper(BOUND(x)) * scale * reads_settings.ATTR + (lambda: FACTOR)()
+
+    return stage
+
+
+stage = make(reads_settings.SOURCE["scale"])
+"""
+
+
+@pytest.mark.parametrize("changed", ["factor", "width", "offset", "by", "scale", "attr"])
+def test_recorded_reads_detect_each_changed_live_value(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """Every value the walk read is checked on a hit: a global read by a nested lambda, a
+    closure cell, a helper's default, a `module.NAME` scalar, a partial argument and a schema
+    field default, each computed at import from a module that is not edited."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    source = {"factor": 1, "width": 2, "offset": 3, "by": 4, "scale": 5}
+    (tmp_path / "reads_settings.py").write_text(f"SOURCE = {source!r}\nATTR = 6\n")
+    (tmp_path / "reads_stage.py").write_text(_READS_MODULE)
+    writes = list[tuple[bytes, bytes]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
+    try:
+        settings = importlib.import_module("reads_settings")
+        module = importlib.import_module("reads_stage")
+        fingerprint.get_stage_fingerprint_cached("r/stage", module.stage)
+        ((_key, raw),) = writes
+        reads = json.loads(raw)["r"]
+        del sys.modules["reads_stage"]
+        module = importlib.import_module("reads_stage")
+        assert fingerprint._recorded_reads_hold(module.stage, reads), "re-import alone must hit"
+
+        if changed == "attr":
+            vars(settings)["ATTR"] += 100
+        else:
+            vars(settings)["SOURCE"][changed] += 100
+        del sys.modules["reads_stage"]
+        module = importlib.import_module("reads_stage")
+
+        assert fingerprint._recorded_reads_hold(module.stage, reads) is False
+    finally:
+        sys.modules.pop("reads_stage", None)
+        sys.modules.pop("reads_settings", None)
+
+
+def _helper_make_scaler(factor: int) -> typing.Callable[[int], int]:
+    def scaler(x: int) -> int:
+        return x * factor
+
+    return scaler
+
+
+def test_fingerprint_pass_names_each_function_once_and_ends_with_the_pass() -> None:
+    """Inside one pass a function's identity is computed once; the next pass sees a change."""
+    scaler = _helper_make_scaler(2)
+    before = fingerprint.function_identity(scaler)
+    cell = typing.cast("tuple[types.CellType, ...]", scaler.__closure__)[0]
+
+    with fingerprint.fingerprint_pass():
+        first = fingerprint.function_identity(scaler)
+        cell.cell_contents = 5
+        within = fingerprint.function_identity(scaler)
+    after = fingerprint.function_identity(scaler)
+
+    assert first == before and within is first, "one pass names the function once"
+    assert after["cells"] == [("factor", 5)], after
+    assert after != before, "a new pass reads the changed cell"
+
+
+class _ClassReadMode(enum.Enum):
+    FAST = "fast"
+
+
+def _helper_class_callback() -> int:
+    return 1
+
+
+class _ClassReadConfig:
+    SCALE: typing.ClassVar[int] = 3
+    MODE: typing.ClassVar[_ClassReadMode] = _ClassReadMode.FAST
+    CALLBACK: typing.ClassVar[typing.Callable[[], int]] = _helper_class_callback
+
+    @staticmethod
+    def static() -> int:
+        return 2
+
+
+def _helper_reads_class_attributes() -> int:
+    return (
+        _ClassReadConfig.SCALE
+        + _ClassReadConfig.CALLBACK()  # pyright: ignore[reportAttributeAccessIssue] - a function stored on the class
+        + _ClassReadConfig.static()
+        + len(_ClassReadConfig.MODE.value)
+    )
+
+
+def test_class_attributes_a_stage_reads_are_tracked_one_by_one() -> None:
+    """A scalar is `const:<class>.<NAME>`, an Enum member is name and value, a plain function
+    is walked; a staticmethod is left to the class AST hash."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_reads_class_attributes)
+    config = f"{__name__}._ClassReadConfig"
+
+    assert manifest[f"const:{config}.SCALE"] == "3", manifest
+    assert manifest[f"const:{config}.MODE"] == '_ClassReadMode.FAST="fast"', manifest
+    assert f"func:{__name__}._helper_class_callback" in manifest, manifest
+    assert not any(key.endswith(f"{config}.static") for key in manifest), manifest
+    assert f"class:{config}" in manifest, manifest
+    assert not any(key.startswith(f"const:{config}.__") for key in manifest), manifest
+
+
 # ==============================================================================
 # Stage manifest cache tests
 # ==============================================================================
@@ -2640,11 +2710,13 @@ def builtin_stage(items):
 
 
 def test_make_manifest_cache_key_format():
-    """_make_manifest_cache_key encodes stage name, python version, and schema version."""
-    key = fingerprint._make_manifest_cache_key("train")
+    """The key names the stage, the function, the python version, and the schema version."""
+    key = fingerprint._make_manifest_cache_key("train", _cached_stage)
     decoded = key.decode()
     assert decoded.startswith("sm:")
     assert "train" in decoded
+    assert _cached_stage.__module__ in decoded
+    assert _cached_stage.__qualname__ in decoded
     assert fingerprint._PYTHON_VERSION in decoded
     assert str(fingerprint._CACHE_SCHEMA_VERSION) in decoded
     # Null byte separators present
@@ -2653,9 +2725,25 @@ def test_make_manifest_cache_key_format():
 
 def test_make_manifest_cache_key_different_stages_differ():
     """Different stage names produce different keys."""
-    key1 = fingerprint._make_manifest_cache_key("train")
-    key2 = fingerprint._make_manifest_cache_key("evaluate")
+    key1 = fingerprint._make_manifest_cache_key("train", _cached_stage)
+    key2 = fingerprint._make_manifest_cache_key("evaluate", _cached_stage)
     assert key1 != key2
+
+
+def test_make_manifest_cache_key_different_functions_differ(tmp_path, monkeypatch):
+    """One stage name registered with functions from two files gets two keys."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    functions = list[typing.Callable[[], int]]()
+    for directory in ("a", "b"):
+        path = tmp_path / directory / "pipeline.py"
+        path.parent.mkdir()
+        path.write_text("def make():\n    return 1\n")
+        namespace = dict[str, typing.Any]()
+        exec(compile(path.read_text(), str(path), "exec"), namespace)  # noqa: S102 - test fixture
+        functions.append(namespace["make"])
+
+    first, second = (fingerprint._make_manifest_cache_key("rep/make", f) for f in functions)
+    assert first != second
 
 
 def test_flush_manifest_cache_empty():
@@ -2701,7 +2789,7 @@ def test_try_manifest_cache_hit_corrupted_json(tmp_path, monkeypatch):
 
     # Write corrupted data directly into the db
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("bad_stage")
+        key = fingerprint._make_manifest_cache_key("bad_stage", _cached_stage)
         db.put_raw(key, b"NOT VALID JSON {{{")
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2711,7 +2799,7 @@ def test_try_manifest_cache_hit_corrupted_json(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("bad_stage")
+        result = fingerprint._try_manifest_cache_hit("bad_stage", _cached_stage)
         assert result is None, "Corrupted JSON should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2726,7 +2814,7 @@ def test_try_manifest_cache_hit_no_db(monkeypatch):
     fingerprint._state_db_init_attempted = True  # Already failed
 
     try:
-        result = fingerprint._try_manifest_cache_hit("any_stage")
+        result = fingerprint._try_manifest_cache_hit("any_stage", _cached_stage)
         assert result is None
     finally:
         fingerprint._state_db_init_attempted = False
@@ -2829,7 +2917,7 @@ def test_try_manifest_cache_hit_non_dict_json(tmp_path, monkeypatch):
     db_path = state_dir
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("list_stage")
+        key = fingerprint._make_manifest_cache_key("list_stage", _cached_stage)
         db.put_raw(key, b"[1, 2, 3]")  # Valid JSON, but not a dict
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2839,7 +2927,7 @@ def test_try_manifest_cache_hit_non_dict_json(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("list_stage")
+        result = fingerprint._try_manifest_cache_hit("list_stage", _cached_stage)
         assert result is None, "Non-dict JSON should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2857,7 +2945,7 @@ def test_try_manifest_cache_hit_missing_m_or_s_keys(tmp_path, monkeypatch):
     db_path = state_dir
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("missing_keys")
+        key = fingerprint._make_manifest_cache_key("missing_keys", _cached_stage)
         db.put_raw(key, b'{"m": {"self:x": "hash"}}')  # Missing "s" key
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2867,7 +2955,7 @@ def test_try_manifest_cache_hit_missing_m_or_s_keys(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("missing_keys")
+        result = fingerprint._try_manifest_cache_hit("missing_keys", _cached_stage)
         assert result is None, "Missing 's' key should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2885,7 +2973,7 @@ def test_try_manifest_cache_hit_empty_sources_forces_recompute(tmp_path, monkeyp
     db_path = state_dir
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("empty_sources")
+        key = fingerprint._make_manifest_cache_key("empty_sources", _cached_stage)
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{}}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2895,7 +2983,7 @@ def test_try_manifest_cache_hit_empty_sources_forces_recompute(tmp_path, monkeyp
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("empty_sources")
+        result = fingerprint._try_manifest_cache_hit("empty_sources", _cached_stage)
         assert result is None, "Empty sources should force recompute"
     finally:
         if fingerprint._state_db is not None:
@@ -2917,7 +3005,7 @@ def test_try_manifest_cache_hit_corrupted_stats_length(tmp_path, monkeypatch):
     src_file.write_text("def stage(): pass\n")
 
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("bad_stats")
+        key = fingerprint._make_manifest_cache_key("bad_stats", _cached_stage)
         db.put_raw(key, b'{"m":{"self:stage":"hash"},"s":{"stage.py":[1000,200]}}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2927,7 +3015,7 @@ def test_try_manifest_cache_hit_corrupted_stats_length(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("bad_stats")
+        result = fingerprint._try_manifest_cache_hit("bad_stats", _cached_stage)
         assert result is None, "Stats array with wrong length should return None"
     finally:
         if fingerprint._state_db is not None:
@@ -2946,7 +3034,7 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
 
     # Test with absolute path
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("traversal_abs")
+        key = fingerprint._make_manifest_cache_key("traversal_abs", _cached_stage)
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"/etc/passwd":[1000,200,555]}}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
@@ -2956,7 +3044,7 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("traversal_abs")
+        result = fingerprint._try_manifest_cache_hit("traversal_abs", _cached_stage)
         assert result is None, "Absolute path in sources should be rejected"
     finally:
         if fingerprint._state_db is not None:
@@ -2966,14 +3054,14 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
 
     # Test with ../ traversal
     with state_mod.StateDB(db_path) as db:
-        key = fingerprint._make_manifest_cache_key("traversal_dotdot")
+        key = fingerprint._make_manifest_cache_key("traversal_dotdot", _cached_stage)
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"../../etc/passwd":[1000,200,555]}}')
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
 
     try:
-        result = fingerprint._try_manifest_cache_hit("traversal_dotdot")
+        result = fingerprint._try_manifest_cache_hit("traversal_dotdot", _cached_stage)
         assert result is None, "Path traversal with .. should be rejected"
     finally:
         if fingerprint._state_db is not None:
@@ -3040,7 +3128,7 @@ def test_stage():
 
         # Step 3: Verify manifest is in StateDB
         with state.StateDB(db_path, readonly=True) as db:
-            key = fingerprint._make_manifest_cache_key("test_stage")
+            key = fingerprint._make_manifest_cache_key("test_stage", func)
             raw = db.get_raw(key)
             assert raw is not None, "Manifest should be persisted in StateDB"
             data = json.loads(raw)
@@ -3068,9 +3156,9 @@ def test_invalidate_manifests_for_paths_selective(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
-    key_a = fingerprint._make_manifest_cache_key("stage_a")
-    key_b = fingerprint._make_manifest_cache_key("stage_b")
-    key_c = fingerprint._make_manifest_cache_key("stage_c")
+    key_a = fingerprint._make_manifest_cache_key("stage_a", _cached_stage)
+    key_b = fingerprint._make_manifest_cache_key("stage_b", _cached_stage)
+    key_c = fingerprint._make_manifest_cache_key("stage_c", _cached_stage)
 
     with state_mod.StateDB(db_path) as db:
         db.put_raw(
@@ -3149,7 +3237,7 @@ def invalidate_stage():
     try:
         spec.loader.exec_module(module)
 
-        key = fingerprint._make_manifest_cache_key("invalidate_stage")
+        key = fingerprint._make_manifest_cache_key("invalidate_stage", module.invalidate_stage)
         fingerprint.get_stage_fingerprint_cached("invalidate_stage", module.invalidate_stage)
         fingerprint.flush_manifest_cache()
 

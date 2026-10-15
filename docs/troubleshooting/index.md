@@ -21,14 +21,14 @@ Quick reference for common issues. Each links to detailed solutions in the relev
 # See all stages and their status
 pivot list
 
-# Detailed explanation for why a stage will/won't run
-pivot status --explain stage_name
+# Detailed explanation for why stages will/won't run
+pivot status --explain
 
 # Show what would run without executing
 pivot repro --dry-run
 
 # Force a stage to run regardless of cache
-pivot repro stage_name --force
+pivot repro demo/train --force
 
 # Verbose logging for more detail
 PIVOT_LOG_LEVEL=DEBUG pivot repro
@@ -39,30 +39,30 @@ PIVOT_LOG_LEVEL=DEBUG pivot repro
 Lock files are YAML and human-readable:
 
 ```bash
-cat .pivot/stages/train.lock
+cat .pivot/stages/demo/train.lock
 ```
 
-Contains: code fingerprint, parameter hash, dependency hashes, output hashes.
+Contains: code fingerprint manifest, parameter values, input hashes, output hashes.
 
 ## Common Patterns
 
 ### "Could not pickle the task to send it to the workers"
 
-Your stage function captures a variable from its enclosing scope. Move the function to module level and pass values through parameters.
+A stage or something it references (a loader, a `StageParams` field value) cannot be pickled. Define stages, loaders and `StageParams` classes at module level, and keep open handles and connections out of parameters.
 
 See: [Pipelines](../concepts/pipelines.md)
 
 ### Stage Re-runs Every Time
 
-1. Check if you're using lambdas (non-deterministic fingerprints)
+1. Check if a stage calls a dynamically created lambda (non-deterministic fingerprints)
 2. Check if a helper function changed
-3. Run `pivot status --explain stage_name` to see what changed
+3. Run `pivot status --explain` to see what changed
 
 See: [Fingerprinting](../concepts/fingerprinting.md) and [Caching](../concepts/caching.md)
 
 ### Cache Not Shared in CI
 
-1. Ensure lock files are committed: `git add .pivot/stages/*.lock`
+1. Ensure lock files are committed: `git add .pivot/stages`
 2. Ensure remote is configured: `pivot config list`
 3. Run `pivot pull` before `pivot repro` in CI
 

@@ -6,7 +6,7 @@
 
 The `pivot_command` decorator wraps Click commands with two essential behaviors:
 
-1. **Auto-discovery** - Automatically calls `discover_and_register()` before the command runs
+1. **Auto-discovery** - Discovers `pipeline.py` (`discovery.discover_pipeline()`) and stores the Pipeline in the Click context before the command runs
 2. **Error handling** - Converts `PivotError` exceptions to user-friendly `ClickException` messages
 
 ```python
@@ -34,16 +34,18 @@ Set `auto_discover=False` only for commands that don't use the stage registry:
 
 | Command | auto_discover | Reason |
 |---------|---------------|--------|
-| run, export | True (default) | Need registry to find stages |
+| run | True (default) | Need registry to find stages |
 | list, dag | True (default), allow_all=True | Need registry; --all for multi-pipeline |
 | checkout | True (default) | Need registry; handles None pipeline gracefully |
 | track | True (default) | Handles None pipeline gracefully (no overlap check) |
 | status | True (default), allow_all=True | Handles None pipeline gracefully (skips stages section) |
-| init | False | Creates new project (no pipeline yet) |
-| schema | False | Outputs JSON schema only |
+| init, doctor, check-ignore | False | No stage data needed |
+| history, show | False | Read run history only |
+| get | False | Restores files and `.pvt` targets from git; discovers the pipeline itself for stage targets, and a broken `pipeline.py` only stops stage targets |
+| import, update | False | Work from git revisions, lock files and `.pvt` files |
 | push, pull, fetch | True (default) | Need registry for output cache filtering |
 
-**Principle:** The pipeline registry is the canonical source of stage metadata. Commands that inspect stage properties (cache flags, dep/out paths) must use auto-discovery. Only commands that truly don't touch stage data (init, schema, history) should use `auto_discover=False`.
+**Principle:** The pipeline registry is the canonical source of stage metadata. Commands that inspect stage properties (outputs, tags, deps) must use auto-discovery. Only commands that truly don't touch stage data should use `auto_discover=False`.
 
 ### Why this matters
 
@@ -52,7 +54,7 @@ Without auto-discovery, commands fail if called before any other pivot command:
 ```bash
 # In a fresh shell, this would fail without auto-discovery:
 $ pivot list
-No stages registered.  # Wrong! Should discover pivot.yaml first
+No stages registered.  # Wrong! Should discover pipeline.py first
 ```
 
 The decorator ensures consistent behavior regardless of command order.

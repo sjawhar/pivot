@@ -27,7 +27,7 @@ Example::
     from pivot import status
 
     # Build bipartite graph from Pipeline
-    all_stages = {name: pipeline.get(name) for name in pipeline.list_stages()}
+    all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
     graph = engine_graph.build_graph(all_stages)
 
     # Use graph for status query
@@ -35,7 +35,7 @@ Example::
         ["train"],
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=pipeline._registry,
+        pipeline=pipeline,
         graph=graph,
     )
 """
@@ -49,6 +49,8 @@ import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
 
+import pygtrie
+
 from pivot import (
     config,
     exceptions,
@@ -59,11 +61,13 @@ from pivot import (
     project,
     registry,
 )
+from pivot import fingerprint as fingerprint_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, track
+from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
+from pivot.storage import store as store_mod
 from pivot.types import (
     CodeChange,
     DepChange,
@@ -80,13 +84,15 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     import networkx as nx
-    import pygtrie
     from networkx import DiGraph
 
     from pivot.registry import RegistryStageInfo
     from pivot.storage.track import PvtData
 
 logger = logging.getLogger(__name__)
+
+UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
+"""Reason prefix for a stage that is current on its own but has a stale upstream."""
 
 
 def _discover_tracked_files(
@@ -97,7 +103,9 @@ def _discover_tracked_files(
         return None, None
 
     tracked_files = track.discover_pvt_files(project.get_project_root())
-    tracked_trie = engine_graph.build_tracked_trie(tracked_files) if tracked_files else None
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
+    for path in tracked_files:
+        tracked_trie[pathlib.Path(path).parts] = path
     return tracked_files, tracked_trie
 
 
@@ -105,6 +113,7 @@ def _get_explanations_in_parallel(
     execution_order: list[str],
     overrides: parameters.ParamsOverrides | None,
     all_stages: dict[str, RegistryStageInfo],
+    store: store_mod.WorkspaceStore,
     force: bool = False,
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
@@ -113,6 +122,8 @@ def _get_explanations_in_parallel(
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
+    locks = explain.read_locks(execution_order, all_stages, default_state_dir)
+    producer_hashes = explain.producer_output_hashes(locks.values())
     explanations_by_name = dict[str, StageExplanation]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -125,15 +136,18 @@ def _get_explanations_in_parallel(
                 explain.get_stage_explanation,
                 stage_name,
                 fingerprint,
-                stage_info["deps_paths"],
-                stage_info["outs_paths"],
+                stage_info["deps"],
+                list(stage_info["outs"]),
                 stage_info["params"],
                 overrides,
                 stage_state_dir,
+                store,
+                lock_data=locks[stage_name],
                 force=force,
                 allow_missing=allow_missing,
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
+                producer_hashes=producer_hashes,
             )
             futures[future] = stage_name
 
@@ -157,31 +171,24 @@ def _get_explanations_in_parallel(
     return explanations_by_name
 
 
+def _make_workspace_store(pipeline: registry.PipelineLike) -> store_mod.WorkspaceStore:
+    return store_mod.WorkspaceStore(
+        project_root=project.get_project_root(),
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+        cache_dir=config.get_cache_dir() / "files",
+    )
+
+
 def get_pipeline_explanations(
     stages: list[str] | None,
     single_stage: bool,
     all_stages: dict[str, RegistryStageInfo],
-    stage_registry: registry.StageRegistry,
+    pipeline: registry.PipelineLike,
     force: bool = False,
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
 ) -> list[StageExplanation]:
-    """Get detailed explanations for all stages with upstream staleness populated.
-
-    Returns StageExplanation objects with the upstream_stale field populated based
-    on the DAG structure. Stages that would run due to upstream dependencies being
-    stale will have their upstream_stale field contain the list of stale upstream stages.
-
-    Args:
-        stages: List of stage names to explain, or None for all stages.
-        single_stage: If True, only explain the specified stages without dependencies.
-        all_stages: Dict mapping stage names to RegistryStageInfo.
-        stage_registry: Registry used to ensure fingerprints are computed.
-        force: If True, mark all stages as would run due to force flag.
-        allow_missing: If True, use .pvt hashes for missing dependency files.
-        graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
-            via get_stage_dag() instead of building a new one.
-    """
     _t = metrics.start()
     try:
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
@@ -195,10 +202,12 @@ def get_pipeline_explanations(
         if not execution_order:
             return []
 
-        for stage_name in execution_order:
-            stage_registry.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml()
+        with fingerprint_mod.fingerprint_pass():
+            for stage_name in execution_order:
+                pipeline.ensure_fingerprint(stage_name)
+        overrides = parameters.load_params_yaml(pipeline)
 
+        store = _make_workspace_store(pipeline)
         explanations_by_name = _get_explanations_in_parallel(
             execution_order,
             overrides,
@@ -207,6 +216,7 @@ def get_pipeline_explanations(
             allow_missing=allow_missing,
             tracked_files=tracked_files,
             tracked_trie=tracked_trie,
+            store=store,
         )
 
         # Preserve original order for staleness propagation
@@ -239,7 +249,11 @@ def _compute_explanations_with_upstream(
         reason = (
             exp["reason"]
             if exp["will_run"]
-            else (f"Upstream stale ({', '.join(upstream_stale)})" if upstream_stale else "")
+            else (
+                f"{UPSTREAM_STALE_REASON_PREFIX} ({', '.join(upstream_stale)})"
+                if upstream_stale
+                else ""
+            )
         )
 
         # Create new explanation with upstream_stale populated
@@ -263,21 +277,10 @@ def get_pipeline_status(
     stages: list[str] | None,
     single_stage: bool,
     all_stages: dict[str, RegistryStageInfo],
-    stage_registry: registry.StageRegistry,
+    pipeline: registry.PipelineLike,
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
-    """Get status for all stages, tracking upstream staleness.
-
-    Args:
-        stages: Stage names to check, or None for all stages.
-        single_stage: If True, check only specified stages without dependencies.
-        all_stages: Dict mapping stage names to RegistryStageInfo.
-        stage_registry: Registry used to ensure fingerprints are computed.
-        allow_missing: If True, use .pvt hashes for missing dependency files.
-        graph: Optional bipartite graph. If provided, extracts stage DAG
-            via get_stage_dag() instead of building a new one.
-    """
     _t = metrics.start()
     try:
         tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
@@ -291,10 +294,12 @@ def get_pipeline_status(
         if not execution_order:
             return [], stage_graph
 
-        for stage_name in execution_order:
-            stage_registry.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml()
+        with fingerprint_mod.fingerprint_pass():
+            for stage_name in execution_order:
+                pipeline.ensure_fingerprint(stage_name)
+        overrides = parameters.load_params_yaml(pipeline)
 
+        store = _make_workspace_store(pipeline)
         explanations_by_name = _get_explanations_in_parallel(
             execution_order,
             overrides,
@@ -302,6 +307,7 @@ def get_pipeline_status(
             allow_missing=allow_missing,
             tracked_files=tracked_files,
             tracked_trie=tracked_trie,
+            store=store,
         )
 
         # Preserve original order for staleness propagation
@@ -419,18 +425,42 @@ def _pluralize(count: int, singular: str) -> str:
     return singular if count == 1 else f"{singular}s"
 
 
+def find_orphaned_lock_files(all_stages: dict[str, RegistryStageInfo]) -> list[str]:
+    """Find lock files in the registered stages' state dirs that belong to no registered stage."""
+    default_state_dir = config.get_state_dir()
+    state_dirs = {default_state_dir} | {
+        registry.get_stage_state_dir(stage_info, default_state_dir)
+        for stage_info in all_stages.values()
+    }
+    registered = set(all_stages)
+    orphaned = set[str]()
+    for state_dir in state_dirs:
+        orphaned.update(lock.find_orphaned_locks(lock.get_stages_dir(state_dir), registered))
+    return sorted(orphaned)
+
+
 def get_suggestions(
     stale_count: int,
     modified_count: int,
     push_count: int,
     pull_count: int,
+    orphan_count: int = 0,
+    missing_outputs_count: int = 0,
+    remote_configured: bool = False,
 ) -> list[str]:
-    """Generate actionable suggestions based on current status."""
     suggestions = list[str]()
+
+    # A clone whose locks are current but whose outputs are absent: pulling restores them
+    # without recomputing, so it comes before the repro suggestion.
+    if missing_outputs_count > 0 and remote_configured:
+        suggestions.append(
+            f"Run `pivot pull` to restore outputs of {missing_outputs_count} "
+            + f"{_pluralize(missing_outputs_count, 'stage')} from the remote"
+        )
 
     if stale_count > 0:
         suggestions.append(
-            f"Run `pivot run` to execute {stale_count} stale {_pluralize(stale_count, 'stage')}"
+            f"Run `pivot repro` to execute {stale_count} stale {_pluralize(stale_count, 'stage')}"
         )
 
     if modified_count > 0:
@@ -448,37 +478,13 @@ def get_suggestions(
             f"Run `pivot pull` to download {pull_count} {_pluralize(pull_count, 'file')}"
         )
 
-    return suggestions
-
-
-def what_if_changed(
-    paths: list[pathlib.Path],
-    all_stages: dict[str, RegistryStageInfo],
-    graph: nx.DiGraph[str] | None = None,
-) -> list[str]:
-    """Determine which stages would run if these paths changed.
-
-    Args:
-        paths: Paths that hypothetically changed (relative or absolute).
-        all_stages: Dict mapping stage names to RegistryStageInfo.
-        graph: Optional bipartite graph from Engine.
-
-    Returns:
-        List of stage names that would be affected.
-    """
-    if graph is None:
-        graph = engine_graph.build_graph(all_stages)
-
-    affected = set[str]()
-    for path in paths:
-        # Normalize paths (graph stores normalized paths, not resolved)
-        normalized_path = project.normalize_path(path)
-        consumers = engine_graph.get_artifact_consumers(
-            graph, normalized_path, include_downstream=True
+    if orphan_count > 0:
+        suggestions.append(
+            f"{orphan_count} orphaned lock {_pluralize(orphan_count, 'file')} from "
+            + "renamed/removed stages. Old outputs may still exist on disk."
         )
-        affected.update(consumers)
 
-    return sorted(affected)
+    return suggestions
 
 
 class ImportCheckStatus(enum.Enum):

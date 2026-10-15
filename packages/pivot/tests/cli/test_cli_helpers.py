@@ -1,55 +1,39 @@
 from __future__ import annotations
 
 import json
-import pathlib
 import sys
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
 import click
 import click.testing
 import pytest
 
-from helpers import register_test_stage
-from pivot import exceptions, loaders, outputs
+from pivot import compose, exceptions
 from pivot.cli import CliContext
 from pivot.cli import helpers as cli_helpers
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.pipeline.pipeline import Pipeline
+
+@compose.stage
+def stage_a() -> str:
+    return "a"
 
 
-class _StageAOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+@compose.stage
+def stage_b() -> str:
+    return "b"
 
 
-class _StageBOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+@compose.stage
+def known_stage() -> str:
+    return "out"
 
 
-class _KnownStageOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("out.txt", loaders.PathOnly())]
-
-
-class _ValidStageOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("out.txt", loaders.PathOnly())]
-
-
-def _stage_a_func() -> _StageAOutputs:
-    return _StageAOutputs(output=pathlib.Path("a.txt"))
-
-
-def _stage_b_func() -> _StageBOutputs:
-    return _StageBOutputs(output=pathlib.Path("b.txt"))
-
-
-def _known_stage_func() -> _KnownStageOutputs:
-    return _KnownStageOutputs(output=pathlib.Path("out.txt"))
-
-
-def _valid_stage_func() -> _ValidStageOutputs:
-    return _ValidStageOutputs(output=pathlib.Path("out.txt"))
+@compose.stage
+def valid() -> str:
+    return "out"
 
 
 class _HelperDummyBar:
@@ -91,7 +75,7 @@ def _helper_make_dummy_tqdm(
 
 
 # =============================================================================
-# validate_stages_exist Tests
+# resolve_stage_names Tests
 # =============================================================================
 
 
@@ -102,17 +86,18 @@ def _helper_make_dummy_tqdm(
         pytest.param([], id="empty_list"),
     ],
 )
-def test_validate_stages_exist_returns_early_for_empty_input(stages: list[str] | None) -> None:
-    """validate_stages_exist returns early for None or empty list without raising."""
-    cli_helpers.validate_stages_exist(stages)  # Should not raise
+def test_resolve_stage_names_returns_early_for_empty_input(stages: list[str] | None) -> None:
+    """resolve_stage_names returns None or empty input unchanged without raising."""
+    assert cli_helpers.resolve_stage_names(stages) == stages
 
 
-def test_validate_stages_exist_with_valid_stages(mock_discovery: Pipeline) -> None:
-    """validate_stages_exist passes for registered stages."""
-    register_test_stage(_stage_a_func, name="stage_a")
-    register_test_stage(_stage_b_func, name="stage_b")
+def test_resolve_stage_names_with_valid_stages(mock_discovery: compose.Pipeline) -> None:
+    """resolve_stage_names returns registered stage names unchanged."""
+    with mock_discovery:
+        stage_a()
+        stage_b()
 
-    # validate_stages_exist requires a Click context with the pipeline
+    # resolve_stage_names requires a Click context with the pipeline
     @click.command()
     def _test_cmd() -> None:
         pass
@@ -120,12 +105,32 @@ def test_validate_stages_exist_with_valid_stages(mock_discovery: Pipeline) -> No
     ctx = click.Context(_test_cmd)
     ctx.obj = {"_pivot_pipeline": mock_discovery}
     with ctx:
-        cli_helpers.validate_stages_exist(["stage_a", "stage_b"])
+        resolved = cli_helpers.resolve_stage_names(["test/stage_a", "test/stage_b"])
+
+    assert resolved == ["test/stage_a", "test/stage_b"]
 
 
-def test_validate_stages_exist_raises_for_unknown_stage(mock_discovery: Pipeline) -> None:
-    """validate_stages_exist raises StageNotFoundError for unknown stages."""
-    register_test_stage(_known_stage_func, name="known_stage")
+def test_resolve_stage_names_resolves_bare_names(mock_discovery: compose.Pipeline) -> None:
+    """A bare name resolves to the pipeline-qualified stage it uniquely names."""
+    with mock_discovery:
+        stage_a()
+
+    @click.command()
+    def _test_cmd() -> None:
+        pass
+
+    ctx = click.Context(_test_cmd)
+    ctx.obj = {"_pivot_pipeline": mock_discovery}
+    with ctx:
+        resolved = cli_helpers.resolve_stage_names(["stage_a"])
+
+    assert resolved == ["test/stage_a"]
+
+
+def test_resolve_stage_names_raises_for_unknown_stage(mock_discovery: compose.Pipeline) -> None:
+    """resolve_stage_names raises StageNotFoundError for unknown stages."""
+    with mock_discovery:
+        known_stage()
 
     @click.command()
     def _test_cmd() -> None:
@@ -134,14 +139,20 @@ def test_validate_stages_exist_raises_for_unknown_stage(mock_discovery: Pipeline
     ctx = click.Context(_test_cmd)
     ctx.obj = {"_pivot_pipeline": mock_discovery}
     with ctx, pytest.raises(exceptions.StageNotFoundError) as exc_info:
-        cli_helpers.validate_stages_exist(["known_stage", "unknown_stage"])
+        cli_helpers.resolve_stage_names(["test/known_stage", "unknown_stage"])
 
     assert "unknown_stage" in str(exc_info.value)
+    assert "test/known_stage" not in str(exc_info.value), (
+        "Registered stage must not be reported as unknown"
+    )
 
 
-def test_validate_stages_exist_raises_for_multiple_unknown(mock_discovery: Pipeline) -> None:
-    """validate_stages_exist includes all unknown stages in error."""
-    register_test_stage(_valid_stage_func, name="valid")
+def test_resolve_stage_names_raises_for_multiple_unknown(
+    mock_discovery: compose.Pipeline,
+) -> None:
+    """resolve_stage_names includes all unknown stages in error."""
+    with mock_discovery:
+        valid()
 
     @click.command()
     def _test_cmd() -> None:
@@ -150,7 +161,7 @@ def test_validate_stages_exist_raises_for_multiple_unknown(mock_discovery: Pipel
     ctx = click.Context(_test_cmd)
     ctx.obj = {"_pivot_pipeline": mock_discovery}
     with ctx, pytest.raises(exceptions.StageNotFoundError) as exc_info:
-        cli_helpers.validate_stages_exist(["invalid1", "invalid2"])
+        cli_helpers.resolve_stage_names(["invalid1", "invalid2"])
 
     error_msg = str(exc_info.value)
     assert "invalid1" in error_msg
@@ -448,18 +459,16 @@ def test_stages_to_list_single_stage() -> None:
 
 
 # =============================================================================
-# validate_stages_exist Without Context Tests
+# resolve_stage_names Without Context Tests
 # =============================================================================
 
 
-def test_validate_stages_exist_no_context_raises_error() -> None:
-    """validate_stages_exist raises helpful error when called outside Click context.
+def test_resolve_stage_names_no_context_raises_error() -> None:
+    """resolve_stage_names raises helpful error when called outside Click context.
 
     Critical for debugging - if someone calls this function outside the CLI,
     should get clear error message (NoPipelineError), not AttributeError or NoneType error.
     """
-    from pivot.cli.helpers import NoPipelineError
-
     # Don't set up any Click context - just call directly
-    with pytest.raises(NoPipelineError):
-        cli_helpers.validate_stages_exist(["some_stage"])
+    with pytest.raises(cli_helpers.NoPipelineError):
+        cli_helpers.resolve_stage_names(["some_stage"])

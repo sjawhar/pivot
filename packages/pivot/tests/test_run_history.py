@@ -10,7 +10,7 @@ import pytest
 
 from pivot import run_history
 from pivot.storage import state
-from pivot.types import DepEntry, StageStatus
+from pivot.types import DeferredWrites, DepEntry, StageStatus
 
 if TYPE_CHECKING:
     import pathlib
@@ -38,8 +38,8 @@ def test_compute_input_hash_deterministic() -> None:
     """Input hash should be deterministic for same inputs."""
     code_manifest = {"self:func": "abc123"}
     params: dict[str, object] = {"lr": 0.01}
-    deps = [DepEntry(path="data.csv", hash="def456")]
-    out_specs = [("model.pkl", True)]
+    deps = [DepEntry(producer="data.csv", key=None, hash="def456")]
+    out_specs = [("train:model", True)]
 
     hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
     hash2 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
@@ -50,8 +50,8 @@ def test_compute_input_hash_different_for_different_inputs() -> None:
     """Input hash should differ when inputs change."""
     code_manifest = {"self:func": "abc123"}
     params: dict[str, object] = {"lr": 0.01}
-    deps = [DepEntry(path="data.csv", hash="def456")]
-    out_specs = [("model.pkl", True)]
+    deps = [DepEntry(producer="data.csv", key=None, hash="def456")]
+    out_specs = [("train:model", True)]
 
     hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
 
@@ -67,25 +67,25 @@ def test_compute_input_hash_different_for_different_inputs() -> None:
     hash4 = run_history.compute_input_hash(
         code_manifest,
         params,
-        [DepEntry(path="data.csv", hash="changed")],
+        [DepEntry(producer="data.csv", key=None, hash="changed")],
         out_specs,
     )
     assert hash1 != hash4
 
     # Change output cache flag (Out -> Metric conversion)
-    hash5 = run_history.compute_input_hash(code_manifest, params, deps, [("model.pkl", False)])
+    hash5 = run_history.compute_input_hash(code_manifest, params, deps, [("train:model", False)])
     assert hash1 != hash5, "Cache flag change should produce different hash"
 
 
 def test_compute_input_hash_order_independent_for_deps() -> None:
     """Input hash should be order-independent for deps and output specs."""
     deps_a = [
-        DepEntry(path="a.csv", hash="aaa"),
-        DepEntry(path="b.csv", hash="bbb"),
+        DepEntry(producer="a.csv", key=None, hash="aaa"),
+        DepEntry(producer="b.csv", key=None, hash="bbb"),
     ]
     deps_b = [
-        DepEntry(path="b.csv", hash="bbb"),
-        DepEntry(path="a.csv", hash="aaa"),
+        DepEntry(producer="b.csv", key=None, hash="bbb"),
+        DepEntry(producer="a.csv", key=None, hash="aaa"),
     ]
 
     hash_a = run_history.compute_input_hash({}, {}, deps_a, [])
@@ -319,6 +319,17 @@ def test_state_db_prune_runs_no_op_when_under_limit(tmp_path: pathlib.Path) -> N
 # =============================================================================
 
 
+def _seed_run_cache(
+    db: state.StateDB, stage_name: str, input_hash: str, entry: run_history.RunCacheEntry
+) -> None:
+    """Write a run cache entry through the coordinator's deferred-write path."""
+    db.apply_deferred_writes(
+        stage_name,
+        [],
+        DeferredWrites(run_cache_input_hash=input_hash, run_cache_entry=entry),
+    )
+
+
 def test_state_db_run_cache_write_lookup(tmp_path: pathlib.Path) -> None:
     """StateDB should write and lookup run cache entries."""
     with state.StateDB(tmp_path) as db:
@@ -326,7 +337,7 @@ def test_state_db_run_cache_write_lookup(tmp_path: pathlib.Path) -> None:
             run_id="20250110_143000_abc12345",
             output_hashes=[run_history.OutputHashEntry(path="out.txt", hash="abc")],
         )
-        db.write_run_cache("my_stage", "input_hash_123", entry)
+        _seed_run_cache(db, "my_stage", "input_hash_123", entry)
 
         result = db.lookup_run_cache("my_stage", "input_hash_123")
         assert result is not None
@@ -354,8 +365,8 @@ def test_state_db_run_cache_different_stages(tmp_path: pathlib.Path) -> None:
         )
 
         # Same input hash, different stages
-        db.write_run_cache("stage1", "same_input_hash", entry1)
-        db.write_run_cache("stage2", "same_input_hash", entry2)
+        _seed_run_cache(db, "stage1", "same_input_hash", entry1)
+        _seed_run_cache(db, "stage2", "same_input_hash", entry2)
 
         result1 = db.lookup_run_cache("stage1", "same_input_hash")
         result2 = db.lookup_run_cache("stage2", "same_input_hash")
@@ -372,8 +383,8 @@ def test_state_db_run_cache_overwrite(tmp_path: pathlib.Path) -> None:
         entry1 = run_history.RunCacheEntry(run_id="run1", output_hashes=[])
         entry2 = run_history.RunCacheEntry(run_id="run2", output_hashes=[])
 
-        db.write_run_cache("stage", "input_hash", entry1)
-        db.write_run_cache("stage", "input_hash", entry2)
+        _seed_run_cache(db, "stage", "input_hash", entry1)
+        _seed_run_cache(db, "stage", "input_hash", entry2)
 
         result = db.lookup_run_cache("stage", "input_hash")
         assert result is not None
@@ -387,8 +398,8 @@ def test_state_db_prune_run_cache(tmp_path: pathlib.Path) -> None:
         entry1 = run_history.RunCacheEntry(run_id="valid_run", output_hashes=[])
         entry2 = run_history.RunCacheEntry(run_id="orphan_run", output_hashes=[])
 
-        db.write_run_cache("stage1", "hash1", entry1)
-        db.write_run_cache("stage2", "hash2", entry2)
+        _seed_run_cache(db, "stage1", "hash1", entry1)
+        _seed_run_cache(db, "stage2", "hash2", entry2)
 
         # Prune with only valid_run as valid
         deleted = db.prune_run_cache({"valid_run"})
@@ -419,7 +430,7 @@ def test_state_db_prune_runs_also_prunes_cache(tmp_path: pathlib.Path) -> None:
                 run_id=f"2025011{i}_143000_abc12345",
                 output_hashes=[],
             )
-            db.write_run_cache(f"stage{i}", f"hash{i}", entry)
+            _seed_run_cache(db, f"stage{i}", f"hash{i}", entry)
 
         # Prune to keep only 1 run (most recent: 20250112_143000_abc12345)
         deleted = db.prune_runs(retention=1)

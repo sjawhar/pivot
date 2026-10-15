@@ -20,13 +20,10 @@ if TYPE_CHECKING:
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
-    data = {
-        "code_manifest": {"stage": "hash"},
-        "params": {},
-        "deps": [],
-        "outs": outs,
-    }
-    return yaml.safe_dump(data).encode()
+    """Build a schema-v2 remote lock with identity-addressed outputs."""
+    return yaml.safe_dump(
+        {"code_manifest": {"stage": "hash"}, "params": {}, "deps": [], "outs": outs}
+    ).encode()
 
 
 def _config_bytes(remote_url: str) -> bytes:
@@ -46,7 +43,7 @@ def _make_pvt_data(
     rev: str = "main",
     rev_lock: str = "oldsha",
     stage: str = "train",
-    source_path: str = "data/output.csv",
+    source_path: str = "train",
     remote: str = "s3://bucket/prefix",
 ) -> track.PvtData:
     source = track.ImportSource(
@@ -104,14 +101,15 @@ def _setup_resolve_mocks(
     remote_url: str,
     lock_outs: list[dict[str, object]],
     rev_lock: str = "newsha",
+    stage_name: str = "train",
 ) -> None:
-    """Set up standard mocks for resolve_remote_path used by update_import."""
+    """Set up standard identity-addressed lock mocks for update_import."""
     lock_bytes = _lock_bytes(outs=lock_outs)
 
     mocker.patch(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
-        return_value=["train.lock"],
+        return_value=[{"name": f"{stage_name}.lock", "type": "file"}],
     )
     mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
@@ -124,7 +122,7 @@ def _setup_resolve_mocks(
     ) -> bytes:
         if path == ".pivot/config.yaml":
             return _config_bytes(remote_url)
-        if path == ".pivot/stages/train.lock":
+        if path == f".pivot/stages/{stage_name}.lock":
             return lock_bytes
         raise AssertionError(f"Unexpected path: {path}")
 
@@ -156,7 +154,6 @@ async def test_update_import_changed_output(
         hash=old_hash,
         size=len(old_content),
         rev_lock="oldsha",
-        source_path="data/output.csv",
         remote=remote_url,
     )
     track.write_pvt_file(pvt_path, pvt_data)
@@ -165,7 +162,7 @@ async def test_update_import_changed_output(
     _setup_resolve_mocks(
         mocker,
         remote_url=remote_url,
-        lock_outs=[{"path": "data/output.csv", "hash": new_hash}],
+        lock_outs=[{"key": None, "tag": "data", "hash": new_hash}],
         rev_lock="newsha",
     )
 
@@ -200,6 +197,7 @@ def test_update_import_same_hash_no_redownload(
     content = b"unchanged"
     file_hash = xxhash.xxh64(content).hexdigest()
 
+    # Write existing pvt + data file
     data_path = tmp_path / "output.csv"
     data_path.write_bytes(content)
     pvt_path = track.get_pvt_path(data_path)
@@ -208,7 +206,6 @@ def test_update_import_same_hash_no_redownload(
         hash=file_hash,
         size=len(content),
         rev_lock="oldsha",
-        source_path="data/output.csv",
         remote=remote_url,
     )
     track.write_pvt_file(pvt_path, pvt_data)
@@ -217,7 +214,7 @@ def test_update_import_same_hash_no_redownload(
     _setup_resolve_mocks(
         mocker,
         remote_url=remote_url,
-        lock_outs=[{"path": "data/output.csv", "hash": file_hash}],
+        lock_outs=[{"key": None, "tag": "data", "hash": file_hash}],
         rev_lock="newsha",
     )
 
@@ -254,7 +251,6 @@ def test_update_import_with_rev_override(tmp_path: pathlib.Path, mocker: MockerF
         size=len(content),
         rev="main",
         rev_lock="oldsha",
-        source_path="data/output.csv",
         remote=remote_url,
     )
     track.write_pvt_file(pvt_path, pvt_data)
@@ -262,7 +258,7 @@ def test_update_import_with_rev_override(tmp_path: pathlib.Path, mocker: MockerF
     _setup_resolve_mocks(
         mocker,
         remote_url=remote_url,
-        lock_outs=[{"path": "data/output.csv", "hash": file_hash}],
+        lock_outs=[{"key": None, "tag": "data", "hash": file_hash}],
         rev_lock="v2sha",
     )
 
@@ -283,7 +279,7 @@ def test_update_import_with_rev_override(tmp_path: pathlib.Path, mocker: MockerF
     assert updated_pvt["source"]["rev_lock"] == "v2sha"  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
 
-def test_update_import_path_removed(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
+def test_update_import_artifact_removed(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     remote_url = "s3://bucket/prefix"
 
     data_path = tmp_path / "output.csv"
@@ -293,17 +289,17 @@ def test_update_import_path_removed(tmp_path: pathlib.Path, mocker: MockerFixtur
         path="output.csv",
         hash="aaa111",
         size=4,
-        source_path="data/output.csv",
         remote=remote_url,
     )
     track.write_pvt_file(pvt_path, pvt_data)
 
-    # Remote no longer has this path — lock file has different output
+    # The source identity disappeared when the remote pipeline removed its train stage.
     _setup_resolve_mocks(
         mocker,
         remote_url=remote_url,
-        lock_outs=[{"path": "data/other.csv", "hash": "bbb222"}],
+        lock_outs=[{"key": None, "tag": "data", "hash": "bbb2220000000000"}],
         rev_lock="newsha",
+        stage_name="eval",
     )
 
     with pytest.raises(exceptions.PivotError, match="not found in remote outputs"):

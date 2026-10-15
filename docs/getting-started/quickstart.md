@@ -1,108 +1,95 @@
 # Quick Start
 
-This guide walks you through creating and running your first Pivot pipeline.
+This guide builds and runs a two-stage pipeline.
 
 ## Mental Model
 
-Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies:
+Think **artifact-first**, not **stage-first**. A stage is a function from data to data; calling one stage with the result of another is what creates the dependency:
 
 - **Wrong:** "Stage A triggers Stage B"
 - **Right:** "This file changed. What needs to happen because of that?"
 
-Invalidation is content-addressed: same inputs + same code = same outputs.
+Invalidation is content-addressed: same inputs + same code + same parameters = same outputs.
 
 ## 1. Initialize the Project
 
+Pivot projects live in a git repository:
+
 ```bash
+mkdir quickstart && cd quickstart
+git init
 pivot init
 ```
 
-This creates:
-- `.pivot/` — Directory for cache and state
-- `.pivotignore` — Patterns for files to exclude from watching
+`pivot init` creates:
 
-Add to your `.gitignore`:
+- `.pivot/`: cache, state, and per-stage lock files (`.pivot/stages/`)
+- `.pivot/.gitignore`: keeps the cache, state database, artifact locks and agent socket out of git
+- `.pivotignore`: patterns for files watch mode ignores
 
+Commit the lock files under `.pivot/stages/`; they record what ran and what it produced.
+
+## 2. Add Input Data
+
+Raw inputs live under `data/raw/`:
+
+```bash
+mkdir -p data/raw
+cat > data/raw/records.csv << 'EOF'
+name,value
+Alice,100
+Bob,200
+Charlie,
+EOF
 ```
-.pivot/cache/
-.pivot/state.lmdb/
-```
 
-Commit the lock files — they track what ran and what outputs were produced:
-
-```
-# These go in git:
-.pivot/stages/*.lock
-```
-
-## 2. Create a Pipeline
+## 3. Create the Pipeline
 
 Create `pipeline.py`:
 
 ```python
 # pipeline.py
-import json
-import pathlib
-from typing import Annotated, TypedDict
+import pandas as pd
 
-import pivot
-
-pipeline = pivot.Pipeline("my_pipeline")
+from pivot import Pipeline, StageParams, stage
 
 
-class PreprocessOutputs(TypedDict):
-    clean: Annotated[pathlib.Path, pivot.Out("clean.json", pivot.loaders.PathOnly())]
+class CleanParams(StageParams):
+    min_value: float = 0.0
 
 
-def preprocess(
-    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
-) -> PreprocessOutputs:
-    """Remove entries with missing values."""
-    clean = [row for row in raw["records"] if all(row.values())]
-    out_path = pathlib.Path("clean.json")
-    out_path.write_text(json.dumps({"records": clean}, indent=2))
-    return PreprocessOutputs(clean=out_path)
+@stage
+def clean(records: pd.DataFrame, params: CleanParams) -> pd.DataFrame:
+    """Remove rows with missing values and values below the threshold."""
+    cleaned = records.dropna()
+    return cleaned[cleaned["value"] >= params.min_value]
 
 
-class SummarizeOutputs(TypedDict):
-    summary: Annotated[pathlib.Path, pivot.Out("summary.json", pivot.loaders.PathOnly())]
-
-
-def summarize(
-    data: Annotated[dict, pivot.Dep("clean.json", pivot.loaders.JSON())],
-) -> SummarizeOutputs:
+@stage
+def summarize(rows: pd.DataFrame) -> dict:
     """Compute summary statistics."""
-    records = data["records"]
-    values = [r["value"] for r in records]
-    summary = {
+    values = rows["value"]
+    return {
         "count": len(values),
-        "mean": sum(values) / len(values) if values else 0,
-        "min": min(values) if values else 0,
-        "max": max(values) if values else 0,
+        "mean": float(values.mean()),
+        "min": float(values.min()),
+        "max": float(values.max()),
     }
-    out_path = pathlib.Path("summary.json")
-    out_path.write_text(json.dumps(summary, indent=2))
-    return SummarizeOutputs(summary=out_path)
 
 
-# Register stages — Pivot discovers deps/outs from annotations
-pipeline.register(preprocess)
-pipeline.register(summarize)
+with Pipeline("quickstart") as pipeline:
+    records = pipeline.input("records.csv")
+    cleaned = clean(records, params=CleanParams(min_value=0.0))
+    summarize(cleaned)
 ```
 
-## 3. Create Sample Data
+What each part does:
 
-```bash
-cat > data.json << 'EOF'
-{
-  "records": [
-    {"name": "Alice", "value": 100},
-    {"name": "Bob", "value": 200},
-    {"name": "Charlie", "value": null}
-  ]
-}
-EOF
-```
+- `@stage` marks a function as a stage. Outside a pipeline block it is an ordinary function you can call in tests.
+- `CleanParams` is the stage's configuration, a Pydantic model. Each stage that needs configuration gets its own `StageParams` subclass.
+- `pipeline.input("records.csv")` declares the raw input `data/raw/records.csv`. Its `.csv` extension tells Pivot to load it as a DataFrame.
+- `clean(records, ...)` inside the `with` block does not run `clean`. It records a stage and returns a handle to its output; passing that handle to `summarize` makes `summarize` depend on `clean`.
+- The return type chooses the file format: a `DataFrame` is saved as JSON Lines, a `dict` as YAML.
 
 ## 4. Run the Pipeline
 
@@ -112,10 +99,14 @@ pivot repro
 
 Pivot will:
 
-1. Discover `pipeline.py` and import it (which registers stages)
-2. Build a dependency graph from the annotations
-3. Execute stages in the correct order
-4. Cache outputs for future runs
+1. Find `pipeline.py` and run it to build the DAG
+2. Run `quickstart/clean`, then `quickstart/summarize`
+3. Write `data/quickstart/clean.jsonl` and `data/quickstart/summarize.yaml`
+4. Record each stage's code, parameters and input hashes in `.pivot/stages/quickstart/`
+
+```bash
+cat data/quickstart/summarize.yaml
+```
 
 ## 5. Re-run (Cached)
 
@@ -123,54 +114,50 @@ Pivot will:
 pivot repro
 ```
 
-The second run completes instantly because nothing changed.
+Nothing changed, so both stages are reported as cached and nothing executes.
 
-## 6. Modify and Re-run
+## 6. Change Code and Re-run
 
-Edit `pipeline.py` to change the `preprocess` function:
+Edit `summarize` in `pipeline.py` to also report the total:
 
 ```python
-def preprocess(
-    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
-) -> PreprocessOutputs:
-    """Remove entries with missing values and add a 'processed' flag."""
-    clean = [
-        {**row, "processed": True}
-        for row in raw["records"]
-        if all(row.values())
-    ]
-    out_path = pathlib.Path("clean.json")
-    out_path.write_text(json.dumps({"records": clean}, indent=2))
-    return PreprocessOutputs(clean=out_path)
+@stage
+def summarize(rows: pd.DataFrame) -> dict:
+    """Compute summary statistics."""
+    values = rows["value"]
+    return {
+        "count": len(values),
+        "mean": float(values.mean()),
+        "min": float(values.min()),
+        "max": float(values.max()),
+        "total": float(values.sum()),
+    }
 ```
 
 ```bash
+pivot status
 pivot repro
 ```
 
-Pivot automatically detects the code change and re-runs both stages.
+`pivot status` reports `quickstart/summarize` as stale ("Code changed"); `clean` stays cached. `pivot repro` runs only `summarize`.
 
-## 7. See Why Stages Run
+## 7. Change a Parameter
+
+Parameters can be overridden per stage in `params.yaml` without touching code:
 
 ```bash
+cat > params.yaml << 'EOF'
+quickstart/clean:
+  min_value: 150
+EOF
 pivot status --explain
 ```
 
-Shows detailed breakdown of what changed and why each stage would run.
-
-## A Note on Loaders
-
-In the examples above, `Dep()` and `Out()` take a loader like `pivot.loaders.JSON()` or `pivot.loaders.PathOnly()`. Loaders implement the `Reader` and `Writer` protocols:
-
-- **`Reader`** — knows how to load a file into a Python object (used by `Dep`)
-- **`Writer`** — knows how to save a Python object to a file (used by `Out`)
-
-All built-in loaders implement both, so you can use them interchangeably. `PathOnly()` skips automatic I/O — you handle file reads/writes yourself and just return the path.
+The explanation shows the parameter change for `quickstart/clean` and marks `summarize` as stale because `clean` will produce different output bytes. Run `pivot repro` to apply it, or delete `params.yaml` to return to the values in code.
 
 ## Next Steps
 
-- [Watch Mode & Rapid Iteration](../guides/watch-mode.md) — Develop faster with auto-rerun
-- [Pipelines](../concepts/pipelines.md) — Deep dive into stage definition
-- [Outputs](../concepts/outputs.md) — Learn about outputs, metrics, and plots
-
-> **Project Structure**: For larger projects, consider using [Cookiecutter Data Science](https://cookiecutter-data-science.drivendata.org/) as a starting template. Its `data/raw/`, `data/processed/`, and `src/` layout works well with Pivot.
+- [Artifacts & the DAG](../concepts/artifacts-and-dag.md): how handles form the graph
+- [Pipelines](../concepts/pipelines.md): inputs, variants, and multiple pipelines
+- [Outputs](../concepts/outputs.md): multi-output stages, metrics, and plots
+- [Watch Mode](../guides/watch-mode.md): re-run automatically as you edit

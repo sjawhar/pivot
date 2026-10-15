@@ -4,7 +4,7 @@ import enum
 import os
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict
 from urllib.parse import urlparse, urlunparse
 
 import click
@@ -117,32 +117,9 @@ def _check_project_root() -> tuple[DoctorCheckEvent, pathlib.Path | None]:
 
 
 def _check_pipeline_config(project_root: pathlib.Path | None) -> DoctorCheckEvent:
-    """Check pivot.yaml/yml exists and is valid."""
+    """Check pipeline.py exists."""
     if project_root is None:
         return _skipped_check("pipeline_config")
-
-    import yaml
-
-    for name in ("pivot.yaml", "pivot.yml"):
-        config_path = project_root / name
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    config: object = yaml.safe_load(f)
-                # Handle scalar YAML (e.g., just a string) which isn't a valid config
-                if isinstance(config, dict):
-                    config_dict = cast("dict[str, Any]", config)
-                    stages_raw: object = config_dict.get("stages", {})
-                else:
-                    stages_raw = {}
-                stage_count = (
-                    len(cast("dict[str, Any]", stages_raw)) if isinstance(stages_raw, dict) else 0
-                )
-                return _check_event(
-                    "pipeline_config", CheckStatus.OK, name, {"stages": stage_count}
-                )
-            except Exception as e:
-                return _check_event("pipeline_config", CheckStatus.ERROR, name, {"error": str(e)})
 
     # Check for pipeline.py
     pipeline_py = project_root / "pipeline.py"
@@ -153,7 +130,7 @@ def _check_pipeline_config(project_root: pathlib.Path | None) -> DoctorCheckEven
         "pipeline_config",
         CheckStatus.WARN,
         "not found",
-        {"searched": ["pivot.yaml", "pivot.yml", "pipeline.py"]},
+        {"searched": ["pipeline.py"]},
     )
 
 

@@ -1,270 +1,175 @@
+"""Execution with tracked (.pvt) file and directory inputs."""
+
 from __future__ import annotations
 
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
+from typing import TYPE_CHECKING
 
 import pytest
 
-from helpers import register_test_stage
+from pivot import cli, exceptions, executor, project
+from pivot.storage import track
+from tests import helpers
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import click.testing
 
-    from pivot.pipeline.pipeline import Pipeline
-
-from pivot import cli, exceptions, executor, loaders, outputs, project
-from pivot.storage import track
+    from pivot.registry import PipelineLike as Pipeline
 
 
 @pytest.fixture
 def pipeline_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Override pipeline_dir to include pivot.yaml for CLI tests.
-
-    This fixture creates a minimal valid pivot.yaml because the `track` CLI
-    command triggers auto-discovery which requires a valid pipeline config.
-    """
+    """Set a real project root for CLI track/checkout plus direct executor calls."""
+    (tmp_path / ".git").mkdir()
     (tmp_path / ".pivot").mkdir()
-    (tmp_path / "pivot.yaml").write_text("stages: {}\n")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(project, "_project_root_cache", None)
+    monkeypatch.setattr(project, "get_project_root", lambda: tmp_path)
     return tmp_path
 
 
-# =============================================================================
-# Output TypedDicts for annotation-based stages
-# =============================================================================
+def _process_data(data: pathlib.Path) -> str:
+    return f"processed: {len(data.read_text())} bytes"
 
 
-class _OutputTxt(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-
-class _CountTxt(TypedDict):
-    count: Annotated[pathlib.Path, outputs.Out("count.txt", loaders.PathOnly())]
-
-
-# =============================================================================
-# Tracked File Verification Tests
-# =============================================================================
-
-
-def _process_data(
-    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
-) -> _OutputTxt:
-    content = data.read_text()
-    pathlib.Path("output.txt").write_text(f"processed: {len(content)} bytes")
-    return {"output": pathlib.Path("output.txt")}
-
-
-def _process_simple(
-    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
-) -> _OutputTxt:
+def _process_simple(data: pathlib.Path) -> str:
     _ = data
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
+    return "done"
 
 
-def _process_data_content(
-    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
-) -> _OutputTxt:
-    content = data.read_text()
-    pathlib.Path("output.txt").write_text(f"processed: {content}")
-    return {"output": pathlib.Path("output.txt")}
+def _process_data_content(data: pathlib.Path) -> str:
+    return f"processed: {data.read_text()}"
 
 
-def _count_images(
-    images: Annotated[pathlib.Path, outputs.Dep("images", loaders.PathOnly())],
-) -> _CountTxt:
-    image_list = list(images.iterdir())
-    pathlib.Path("count.txt").write_text(str(len(image_list)))
-    return {"count": pathlib.Path("count.txt")}
+def _count_images(images: pathlib.Path) -> str:
+    return str(len(list(images.iterdir())))
 
 
-def _process_images(
-    images: Annotated[pathlib.Path, outputs.Dep("images", loaders.PathOnly())],
-) -> _OutputTxt:
+def _process_images(images: pathlib.Path) -> str:
     _ = images
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
+    return "done"
 
 
-def _process_mixed(
-    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
-    config: Annotated[pathlib.Path, outputs.Dep("config.txt", loaders.PathOnly())],
-) -> _OutputTxt:
-    data_content = data.read_text()
-    config_content = config.read_text()
-    pathlib.Path("output.txt").write_text(f"{data_content}|{config_content}")
-    return {"output": pathlib.Path("output.txt")}
+def _process_mixed(data: pathlib.Path, config: pathlib.Path) -> str:
+    return f"{data.read_text()}|{config.read_text()}"
 
 
-def _process_uppercase(
-    data: Annotated[pathlib.Path, outputs.Dep("data.csv", loaders.PathOnly())],
-) -> _OutputTxt:
-    content = data.read_text()
-    pathlib.Path("output.txt").write_text(content.upper())
-    return {"output": pathlib.Path("output.txt")}
+def _process_uppercase(data: pathlib.Path) -> str:
+    return data.read_text().upper()
+
+
+def _output(stage: str) -> pathlib.Path:
+    return helpers.get_output_path(stage)
+
+
+def _register_data_stage(func: Callable[..., object], *, name: str = "process") -> None:
+    helpers.register_test_stage(func, name=name, deps={"data": "data.csv"})
 
 
 def test_run_succeeds_with_existing_tracked_file(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path
 ) -> None:
-    """Pipeline runs successfully when tracked file exists."""
-    # Create and track a data file
+    """Pipeline runs successfully when a tracked input exists."""
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("col1,col2\n1,2\n")
-
     track.write_pvt_file(
-        pipeline_dir / "data.csv.pvt",
-        {"path": "data.csv", "hash": "placeholder", "size": 100},
+        pipeline_dir / "data.csv.pvt", {"path": "data.csv", "hash": "placeholder", "size": 100}
     )
 
-    register_test_stage(_process_data, name="process")
-
+    _register_data_stage(_process_data)
     results = executor.run(pipeline=test_pipeline)
 
-    assert results["process"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").exists()
+    assert results["test/process"]["status"] == "ran"
+    assert _output("process").read_text() == "processed: 14 bytes"
 
 
 def test_run_fails_when_tracked_file_missing(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path
 ) -> None:
-    """Pipeline fails if tracked file is missing (with helpful error message)."""
-    # Create .pvt file but NOT the data file
+    """Pipeline fails with a helpful error if a tracked input is absent."""
     track.write_pvt_file(
-        pipeline_dir / "data.csv.pvt",
-        {"path": "data.csv", "hash": "abc123", "size": 100},
+        pipeline_dir / "data.csv.pvt", {"path": "data.csv", "hash": "abc123", "size": 100}
     )
+    _register_data_stage(_process_simple)
 
-    register_test_stage(_process_simple, name="process")
-
-    # Should fail with error message mentioning checkout
-    with pytest.raises(
-        exceptions.TrackedFileMissingError,
-        match=r"checkout|restore|missing",
-    ):
+    with pytest.raises(exceptions.TrackedFileMissingError, match=r"checkout|restore|missing"):
         executor.run(pipeline=test_pipeline)
 
 
 def test_run_succeeds_with_hash_mismatch(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
-    """Pipeline runs successfully when tracked file hash doesn't match .pvt."""
-    # Create data file with some content
+    """A tracked input hash mismatch warns but still permits execution."""
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("original content")
-
-    # Track it properly via CLI to get correct hash
-    result = runner.invoke(cli.cli, ["track", "data.csv"])
-    assert result.exit_code == 0
-
-    # Now modify the data file (hash mismatch)
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
     data_file.write_text("modified content that changes the hash")
 
-    register_test_stage(_process_simple, name="process")
-
-    # Should succeed (warning logged but execution continues)
+    _register_data_stage(_process_simple)
     results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").exists()
 
-
-# =============================================================================
-# Dependency Change Detection Tests
-# =============================================================================
+    assert results["test/process"]["status"] == "ran"
+    assert _output("process").read_text() == "done"
 
 
 def test_tracked_file_change_triggers_downstream_rerun(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
-    """Changing a tracked file triggers re-execution of dependent stages."""
-    # Create and track initial data
+    """Re-tracking a changed file re-executes its dependent stage."""
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("original")
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
+    _register_data_stage(_process_data_content)
 
-    result = runner.invoke(cli.cli, ["track", "data.csv"])
-    assert result.exit_code == 0
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
+    assert _output("process").read_text() == "processed: original"
 
-    register_test_stage(_process_data_content, name="process")
-
-    # First run
-    results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "processed: original"
-
-    # Modify tracked file and re-track
     data_file.write_text("modified")
-    result = runner.invoke(cli.cli, ["track", "--force", "data.csv"])
-    assert result.exit_code == 0
+    assert runner.invoke(cli.cli, ["track", "--force", "data.csv"]).exit_code == 0
 
-    # Second run - should re-execute due to tracked file change
-    results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "processed: modified"
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
+    assert _output("process").read_text() == "processed: modified"
 
 
 def test_unchanged_tracked_file_allows_skip(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
-    """Unchanged tracked file allows stage to be skipped."""
+    """An unchanged tracked input permits a cache skip."""
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("content")
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
+    _register_data_stage(_process_data_content)
 
-    result = runner.invoke(cli.cli, ["track", "data.csv"])
-    assert result.exit_code == 0
-
-    register_test_stage(_process_data_content, name="process")
-
-    # First run
-    results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "ran"
-
-    # Second run - should skip (nothing changed)
-    results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "cached"
-
-
-# =============================================================================
-# Directory Tracking Tests
-# =============================================================================
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "cached"
 
 
 def test_tracked_directory_change_triggers_rerun(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
-    """Changing a tracked directory triggers re-execution."""
-    # Create and track directory
+    """Re-tracking an added directory file re-executes the dependent stage."""
     data_dir = pipeline_dir / "images"
     data_dir.mkdir()
     (data_dir / "a.jpg").write_bytes(b"image1")
     (data_dir / "b.jpg").write_bytes(b"image2")
+    assert runner.invoke(cli.cli, ["track", "images"]).exit_code == 0
+    helpers.register_test_stage(_count_images, name="count_images", deps={"images": "images"})
 
-    result = runner.invoke(cli.cli, ["track", "images"])
-    assert result.exit_code == 0
+    assert executor.run(pipeline=test_pipeline)["test/count_images"]["status"] == "ran"
+    assert _output("count_images").read_text() == "2"
 
-    register_test_stage(_count_images, name="count_images")
-
-    # First run
-    results = executor.run(pipeline=test_pipeline)
-    assert results["count_images"]["status"] == "ran"
-    assert (pipeline_dir / "count.txt").read_text() == "2"
-
-    # Add file to directory and re-track
     (data_dir / "c.jpg").write_bytes(b"image3")
-    result = runner.invoke(cli.cli, ["track", "--force", "images"])
-    assert result.exit_code == 0
+    assert runner.invoke(cli.cli, ["track", "--force", "images"]).exit_code == 0
 
-    # Second run - should re-execute
-    results = executor.run(pipeline=test_pipeline)
-    assert results["count_images"]["status"] == "ran"
-    assert (pipeline_dir / "count.txt").read_text() == "3"
+    assert executor.run(pipeline=test_pipeline)["test/count_images"]["status"] == "ran"
+    assert _output("count_images").read_text() == "3"
 
 
 def test_run_fails_when_tracked_directory_missing(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path
 ) -> None:
-    """Pipeline fails if tracked directory is missing (with helpful error message)."""
+    """A missing tracked directory raises the tracked-file restore error."""
     track.write_pvt_file(
         pipeline_dir / "images.pvt",
         {
@@ -278,76 +183,79 @@ def test_run_fails_when_tracked_directory_missing(
             ],
         },
     )
+    helpers.register_test_stage(_process_images, name="process", deps={"images": "images"})
 
-    register_test_stage(_process_images, name="process")
-
-    # Should fail with error message mentioning checkout
-    with pytest.raises(
-        exceptions.TrackedFileMissingError,
-        match=r"checkout|restore|missing",
-    ):
+    with pytest.raises(exceptions.TrackedFileMissingError, match=r"checkout|restore|missing"):
         executor.run(pipeline=test_pipeline)
-
-
-# =============================================================================
-# Mixed Dependency Tests
-# =============================================================================
 
 
 def test_mixed_tracked_and_regular_dependencies(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
-    """Stages can depend on both tracked files and regular files."""
-    # Create tracked file
+    """A stage can depend on both a tracked and regular file."""
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("tracked data")
-    result = runner.invoke(cli.cli, ["track", "data.csv"])
-    assert result.exit_code == 0
-
-    # Create regular file
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
     config_file = pipeline_dir / "config.txt"
     config_file.write_text("setting=1")
 
-    register_test_stage(_process_mixed, name="process")
+    helpers.register_test_stage(
+        _process_mixed,
+        name="process",
+        deps={"data": "data.csv", "config": "config.txt"},
+    )
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
 
-    # First run
-    results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "ran"
-
-    # Change regular file - should trigger rerun
     config_file.write_text("setting=2")
-    results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "ran"
-
-
-# =============================================================================
-# Checkpoint and Restore Tests
-# =============================================================================
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
 
 
 def test_checkout_then_run_succeeds(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
-    """After checkout, pipeline can run successfully."""
-    # Create, track, then delete a file
+    """checkout restores a tracked input that a compositional stage then consumes."""
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("important data")
-
-    result = runner.invoke(cli.cli, ["track", "data.csv"])
-    assert result.exit_code == 0
-
-    # Delete the file
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
     data_file.unlink()
-    assert not data_file.exists()
-
-    # Checkout should restore it
-    result = runner.invoke(cli.cli, ["checkout", "data.csv"])
-    assert result.exit_code == 0
+    assert runner.invoke(cli.cli, ["checkout", "data.csv"]).exit_code == 0
     assert data_file.exists()
 
-    register_test_stage(_process_uppercase, name="process")
+    _register_data_stage(_process_uppercase)
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
+    assert _output("process").read_text() == "IMPORTANT DATA"
 
-    # Pipeline should run successfully
-    results = executor.run(pipeline=test_pipeline)
-    assert results["process"]["status"] == "ran"
-    assert (pipeline_dir / "output.txt").read_text() == "IMPORTANT DATA"
+
+def test_checkout_missing_restores_tracked_input_before_running(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+) -> None:
+    """run(checkout_missing=True) restores a deleted tracked input from cache, then uses it."""
+    data_file = pipeline_dir / "data.csv"
+    data_file.write_text("cached data")
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
+    data_file.unlink()
+    _register_data_stage(_process_uppercase)
+
+    results = executor.run(pipeline=test_pipeline, checkout_missing=True)
+
+    assert results["test/process"]["status"] == "ran"
+    assert data_file.read_text() == "cached data", "the tracked input is back in the workspace"
+    assert _output("process").read_text() == "CACHED DATA"
+
+
+def test_checkout_missing_reports_tracked_input_absent_from_cache(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path
+) -> None:
+    """A missing tracked input that is not cached fails, suggesting a pull, and nothing runs."""
+    track.write_pvt_file(
+        pipeline_dir / "data.csv.pvt",
+        {"path": "data.csv", "hash": "0123456789abcdef", "size": 10},
+    )
+    _register_data_stage(_process_simple)
+
+    with pytest.raises(exceptions.TrackedFileMissingError) as exc_info:
+        executor.run(pipeline=test_pipeline, checkout_missing=True)
+
+    assert "not in local cache" in str(exc_info.value)
+    assert exc_info.value.get_suggestion() == "Run 'pivot pull' to fetch from remote storage"
+    assert not _output("process").exists()

@@ -27,13 +27,18 @@ Pivot's fingerprinting system:
 | Module imports | Yes | AST scanning for attribute access |
 | Class definitions | Yes | Full class AST hashed |
 | StageParams subclasses | Yes | Type hint analysis + full class AST + Pydantic field defaults + `default_factory` functions |
-| Custom loaders | Yes | Loader class AST hashed via type hint analysis |
-| Global constants | Yes (value) | `getclosurevars()` + `repr()` |
-| Closure variables | Yes (structure) | `getclosurevars()` captures binding |
-| Default arguments | Yes | Captured in function signature |
-| `functools.partial` | Yes | Bound args + underlying function |
+| Custom loaders | Yes | Loader method ASTs hashed. A user loader's own `load()`, `save()` and `empty()`, and functions and classes in its config fields, are walked like stage helpers: module values they read are tracked or refused. Methods inherited from `pivot.loaders` are hashed only |
+| Module-level primitive values | Yes (value) | `getclosurevars()` + `repr()` |
+| Other module-level values | No — error | Use `StageParams` instead. This includes a method bound to an instance (`apply = Scaler(3).apply`, `normal = np.random.default_rng(SEED).normal`): the instance's state is not hashed. A method bound to a module, a class, a scalar or a `logging.Logger` is allowed |
+| Closure variables | Yes (value) | `getclosurevars()` nonlocals checked like module-level values, keyed under the binding the closure was reached through, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
+| Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
+| `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
+| Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
+| Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
+| Class attributes a stage reads | Yes (value) | `Cls.NAME` read directly on a user class that the function names (a global, cell or default holding the class), or reaches through a user module (`settings.Config.SCALE`). When `NAME` is written in a user class body, it follows the module-level rule: a scalar is `const:<module>.<Cls>.<NAME>`, a non-scalar is refused, a plain function is walked, and a member of a user Enum is recorded by name and value. A pydantic or StageParams class read this way is covered by its schema hash, field defaults included. Attributes a library base or the language defines (an inherited stdlib dict, `NamedTuple._fields`, an Enum's `_member_names_`), and descriptors (property, classmethod, staticmethod), are left to the class AST hash |
+| Other class-level and module reads | No | Not tracked: `cls.SCALE` inside a classmethod, a nested class (`Outer.Inner.X`), an attribute read through an instance (`Config().SCALE`), a `ClassVar` on a `StageParams` class, a module read through a local alias (`s = settings; s.SCALE`), a literal `getattr(settings, "SCALE")`, and a module held in a class attribute (`Holder.lib.SCALE`). Put such configuration in the stage's `StageParams` |
 
-**Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are not tracked unless they're Pydantic model field defaults.
+**Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are tracked only in the `Cls.NAME` and `module.Cls.NAME` shapes above, and for Pydantic model field defaults. A value read as `module.NAME` follows the rule it follows as a global: a library function is an `ext:` entry, a `functools.partial` is walked, a logger is ignored.
 
 For Pydantic models, both static defaults and `default_factory` functions are tracked:
 
@@ -139,47 +144,31 @@ result = eval("process(data)")     # String execution
 
 **Workaround:** Not supported; restructure code.
 
-### Runtime-Computed Values
+### Module-Level Values
 
-Global constants (primitives like `int`, `float`, `str`, `bool`, `bytes`, `None`) ARE tracked via `repr()`. However, values computed at runtime or by complex expressions are not:
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; its current value is recorded with `repr()`, so editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`), directly or as `module.NAME`, is a `StageDefinitionError` that names the variable and points to `StageParams`. A default argument such as `cols=COLUMNS` or `factor=settings.FACTOR` on the stage or on a helper it calls follows the same rule, because a default is evaluated once when the module loads and its value never appears in the AST:
 
 ```python
-# TRACKED - primitive constants captured via repr()
-THRESHOLD = 0.5  # Changing this value IS detected
-DEBUG = True     # Changing this IS detected
-
-# NOT TRACKED - runtime-computed values
-THRESHOLD = float(os.environ.get("THRESHOLD", "0.5"))  # Dynamic
-CONFIG = load_config()  # Function call result
-PATHS = [p for p in Path(".").glob("*.csv")]  # Computed at import
+THRESHOLD = 0.5            # allowed: tracked by value
+COLUMNS = ("a", "b")       # error when a stage reads it
+CONFIG = load_config()     # error when a stage reads it (a dict)
 ```
 
-The fingerprinting system uses `getclosurevars()` to capture referenced globals, then stores `repr(value)` for primitives. This works for literal constants but cannot track values that change based on environment or runtime state.
-
-**Workaround:** Use stage parameters for configurable values:
+Configuration belongs in the stage's `StageParams`:
 
 ```python
-# stages.py
-from pivot.stage_def import StageParams
-
-
 class ProcessParams(StageParams):
     threshold: float = 0.5
+    columns: list[str] = ["a", "b"]
 
 
-def process(params: ProcessParams):
-    if value > params.threshold:  # Changes tracked!
-        pass
+@stage
+def process(data: pd.DataFrame, params: ProcessParams) -> pd.DataFrame:
+    return data.loc[data["value"] > params.threshold, params.columns]
 ```
 
-```yaml
-# pivot.yaml
-stages:
-  process:
-    python: stages.process
-    params:
-      threshold: 0.5
-```
+For an explicitly unsafe migration path, `core.unsafe_fingerprinting=true` or
+`PIVOT_UNSAFE_FINGERPRINTING=1` downgrades the error to a warning.
 
 ## Why AST + getclosurevars?
 
@@ -218,14 +207,16 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 
 | Prefix | Purpose | Example |
 |--------|---------|---------|
-| `self:` | The stage function itself | `self:` |
-| `func:` | Helper functions (user code callables) | `func:process_data` |
-| `class:` | Class definitions | `class:MyModel` |
-| `const:` | Global constants (primitives via `repr()`) | `const:THRESHOLD` |
-| `mod:` | Module attribute access patterns | `mod:utils.helper` |
-| `partial:` | `functools.partial` bound arguments | `partial:0`, `partial:kwarg_name` |
-| `loader:` | Loader class methods and config | `loader:load`, `loader:save`, `loader:config` |
-| `schema:` | Pydantic model JSON schema | `schema:ModelName` |
+| `self:` | The stage function itself | `self:train` |
+| `func:` | Helper functions (user code callables) | `func:myproject.helpers.process_data` |
+| `class:` | Class definitions | `class:myproject.params.TrainParams` |
+| `const:` | Primitive values read as globals or as `module.NAME` | `const:myproject.settings.THRESHOLD` |
+| `default:` | Default argument values that the AST does not record | `default:myproject.stages.scale.factor` |
+| `wire:` | Call-site artifact wiring: parameter bindings, collection kind/order, input paths | `wire:left` → `raw-a`, `wire:items` → `{"kind":"list","identities":["a","b"]}`, `wire:file:path` → `old.txt` |
+| `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
+| `ext:` | A library function or class a stage reads, named by its definition (its code is not hashed) | `ext:myproject.stages.agg` → `numpy.mean` |
+| `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
+| `schema:` | Pydantic model JSON schema | `schema:myproject.params.TrainParams` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |
 
 ## Comparison with Other Tools
@@ -244,17 +235,16 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 Use explain mode to see what changed:
 
 ```bash
-$ pivot status --explain train
+$ pivot status --explain
 
-Stage: train
+Stage: demo/train
   Status: WILL RUN
-  Reason: Code dependency changed
+  Reason: Code changed
 
-  Code changes:
+  Code Changes:
     func:helper_a
       Old: 5995c853
       New: a1b2c3d4
-      File: src/utils.py:15
 ```
 
 ## Manual Invalidation
@@ -263,7 +253,7 @@ If automatic detection fails, manually invalidate:
 
 ```bash
 # Force re-run of specific stage
-pivot repro train --force
+pivot repro demo/train --force
 ```
 
 ## Further Reading

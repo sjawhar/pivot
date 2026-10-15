@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING, Literal
 
 import click
 
-from pivot import config, path_utils, project, registry
+from pivot import config, project, registry, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.cli import targets as cli_targets
 from pivot.storage import cache, lock, track
 from pivot.types import HashInfo, is_dir_hash
 
@@ -38,24 +39,29 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
     Uses per-stage state_dir from the registry for lock file lookup.
     """
     result = dict[str, HashInfo]()
+    store = cli_helpers.get_workspace_store()
+    if store is None:
+        return result
 
     for stage_name in cli_helpers.list_stages():
         stage_info = cli_helpers.get_stage(stage_name)
-        project_root = project.get_project_root()
-        cached_paths = {
-            path_utils.canonicalize_artifact_path(str(out.path), project_root)
-            for out in stage_info["outs"]
-            if out.cache
+        ref_by_identity = {out.identity: out for out in stage_info["outs"]}
+        cached_identities = {
+            out.identity for out in stage_info["outs"] if out.tag is not types.ArtifactTag.METRIC
         }
 
         stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
         if lock_data:
-            for out_path, out_hash in lock_data["output_hashes"].items():
-                norm_path = path_utils.canonicalize_artifact_path(out_path, project_root)
-                if norm_path in cached_paths:
-                    result[norm_path] = out_hash
+            for identity, out_hash in lock_data["output_hashes"].items():
+                if identity not in cached_identities:
+                    continue
+                ref = ref_by_identity.get(identity)
+                if ref is None:
+                    continue
+                resolved = store.resolve_display_path(ref)
+                result[str(resolved)] = out_hash
 
     return result
 
@@ -176,7 +182,7 @@ async def _checkout_files_async(
     try:
         async with asyncio.TaskGroup() as tg:
             for abs_path_str, output_hash in files.items():
-                tg.create_task(restore_one(abs_path_str, output_hash))
+                _ = tg.create_task(restore_one(abs_path_str, output_hash))
     except* Exception as eg:
         # Convert unexpected exceptions to friendly error message
         errors = [str(e) for e in eg.exceptions]
@@ -190,12 +196,18 @@ async def _checkout_files_async(
     return (failures, restored, skipped)
 
 
+def _all_stages_in_context() -> dict[str, registry.RegistryStageInfo]:
+    pipeline = cli_decorators.get_pipeline_from_context()
+    return {} if pipeline is None else cli_helpers.get_all_stages()
+
+
 def _dedupe_targets(targets: tuple[str, ...]) -> list[str]:
-    """Deduplicate targets by normalized absolute path.
+    """Deduplicate targets: stage outputs by resolved identity, files by normalized path.
 
     Handles both data paths (data.txt) and .pvt paths (data.txt.pvt) resolving
     to the same file.
     """
+    all_stages = _all_stages_in_context()
     seen = set[str]()
     unique = list[str]()
     for target in targets:
@@ -204,9 +216,13 @@ def _dedupe_targets(targets: tuple[str, ...]) -> list[str]:
         if target_path.suffix == ".pvt":
             target = str(track.get_data_path(target_path))
 
-        abs_path = str(project.normalize_path(target))
-        if abs_path not in seen:
-            seen.add(abs_path)
+        resolved = cli_targets.resolve_cli_target(target, all_stages)
+        if resolved is not None:
+            dedupe_key = types.identity_key(resolved["identity"])
+        else:
+            dedupe_key = str(project.normalize_path(target))
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
             unique.append(target)
     return unique
 
@@ -224,8 +240,27 @@ def _validate_and_build_files(
         click.ClickException: For path traversal or unknown targets.
     """
     files = dict[str, HashInfo]()
+    all_stages = _all_stages_in_context()
 
     for target in targets:
+        resolved = cli_targets.resolve_cli_target(target, all_stages)
+        if resolved is not None:
+            store = cli_helpers.require_workspace_store()
+            cached = {
+                path: stage_outputs[path]
+                for ref in resolved["refs"]
+                if ref.tag is not types.ArtifactTag.METRIC
+                and (path := str(store.resolve_display_path(ref))) in stage_outputs
+            }
+            if not cached:
+                stage_name = resolved["stage_name"]
+                raise click.ClickException(
+                    f"Stage '{stage_name}' has no cached outputs. "
+                    + f"Run 'pivot repro {stage_name}' first."
+                )
+            files.update(cached)
+            continue
+
         # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
         abs_path = project.normalize_path(target)
         # Validate path is within project root (replaces literal ".." check)

@@ -49,10 +49,15 @@ def _get_all_stage_outputs() -> dict[str, pathlib.Path]:
         Resolves all paths upfront and fails fast if any are problematic.
         This provides clear error messages showing ALL issues at once.
     """
+    store = cli_helpers.get_workspace_store()
+    if store is None:
+        return {}
+
+    # Workspace paths of every declared output (the same resolution checkout/verify use)
     outputs_normalized = set[str]()
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
-        outputs_normalized.update(info.get("outs_paths", []))
+        outputs_normalized.update(str(store.resolve_display_path(out)) for out in info["outs"])
 
     # Pre-resolve all stage outputs with explicit error handling
     outputs_resolved = dict[str, pathlib.Path]()

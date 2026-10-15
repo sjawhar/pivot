@@ -6,26 +6,24 @@ import functools
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import loky
 
-from pivot import config, discovery, exceptions, outputs, parameters, registry
+from pivot import config, discovery, exceptions, parameters, project, registry, types
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
+from pivot.storage import store as store_mod
 from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.engine import types as engine_types
     from pivot.registry import RegistryStageInfo
 
 logger = logging.getLogger(__name__)
-
-# Special mutex that means "run exclusively" - no other stages run concurrently
-EXCLUSIVE_MUTEX = "*"
 
 
 def _noop() -> None:
@@ -33,28 +31,22 @@ def _noop() -> None:
     pass
 
 
-def compute_max_workers(stage_count: int, override: int | None = None) -> int:
-    """Single source of truth for max_workers calculation.
+def configured_worker_count(override: int | None = None) -> int:
+    """The configured worker count: the CLI override, else ``core.max_workers``.
 
-    Args:
-        stage_count: Number of stages to run
-        override: CLI override for max_workers (takes precedence over config)
-
-    The effective max_workers is determined by:
-    1. CLI override (if provided)
-    2. Config value (core.max_workers)
-
-    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2).
-    The result is always clamped to [1, stage_count].
+    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2). The result is at
+    least 1. This is the ``cpu`` resource capacity.
     """
     cpu_count = loky.cpu_count() or 1
     max_workers = override if override is not None else config.get_max_workers()
-
-    # Negative values are relative to CPU count
     if max_workers < 0:
         max_workers = cpu_count + max_workers
+    return max(1, max_workers)
 
-    return max(1, min(max_workers, stage_count))
+
+def compute_max_workers(stage_count: int, override: int | None = None) -> int:
+    """Worker pool size: the configured worker count, clamped to the stages to run."""
+    return max(1, min(configured_worker_count(override), stage_count))
 
 
 def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
@@ -153,12 +145,13 @@ def run(
     cache_dir: pathlib.Path | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
+    resource_capacity: dict[str, int] | None = None,
     on_error: OnError | str = OnError.FAIL,
     allow_uncached_incremental: bool = False,
     force: bool = False,
     no_commit: bool = False,
     checkout_missing: bool = False,
-    pipeline: Pipeline | None = None,
+    pipeline: registry.PipelineLike | None = None,
 ) -> dict[str, ExecutionSummary]:
     """Execute pipeline stages via Engine.
 
@@ -172,8 +165,9 @@ def run(
         cache_dir: Directory for lock files. Defaults to .pivot/cache.
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Max concurrent stages (default: min(cpu_count, 8)).
+        resource_capacity: Per-run resource capacity overrides.
         on_error: Error handling mode - "fail" or "keep_going".
-        allow_uncached_incremental: If True, skip safety check for uncached IncrementalOut files.
+        allow_uncached_incremental: If True, skip the uncached incremental-output safety check.
         force: If True, bypass cache and force all stages to re-execute.
         no_commit: If True, skip writing lock files (faster iteration).
         checkout_missing: If True, restore missing tracked files from cache before running.
@@ -187,6 +181,7 @@ def run(
         cache_dir=cache_dir,
         parallel=parallel,
         max_workers=max_workers,
+        resource_capacity=resource_capacity,
         on_error=on_error,
         allow_uncached_incremental=allow_uncached_incremental,
         force=force,
@@ -202,12 +197,13 @@ def _run_inner(
     cache_dir: pathlib.Path | None,
     parallel: bool,
     max_workers: int | None,
+    resource_capacity: dict[str, int] | None,
     on_error: OnError | str,
     allow_uncached_incremental: bool,
     force: bool,
     no_commit: bool,
     checkout_missing: bool,
-    pipeline: Pipeline | None,
+    pipeline: registry.PipelineLike | None,
 ) -> dict[str, ExecutionSummary]:
     """Inner implementation of run(), called with lock already held if needed."""
     # Import here to avoid circular import (engine imports executor_core)
@@ -230,7 +226,7 @@ def _run_inner(
         pipeline = discovery.discover_pipeline()
         if pipeline is None:
             raise exceptions.PipelineNotFoundError(
-                "No pipeline found. Create pivot.yaml or pipeline.py to define stages."
+                "No pipeline found. Create pipeline.py to define stages."
             )
 
     # Run async execution
@@ -238,7 +234,7 @@ def _run_inner(
         async with Engine(pipeline=pipeline) as eng:
             # Add ResultCollectorSink to collect results
             result_sink = ResultCollectorSink()
-            eng.add_sink(result_sink)
+            eng.add_sink(cast("engine_types.EventSink", result_sink))
 
             # Create OneShotSource with all orchestration parameters
             source = OneShotSource(
@@ -248,6 +244,7 @@ def _run_inner(
                 single_stage=single_stage,
                 parallel=parallel,
                 max_workers=max_workers,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 cache_dir=cache_dir,
@@ -304,14 +301,14 @@ def create_executor(max_workers: int) -> concurrent.futures.Executor:
 
 def prepare_worker_info(
     stage_info: RegistryStageInfo,
-    stage_registry: registry.StageRegistry,
+    pipeline: registry.PipelineLike,
     overrides: parameters.ParamsOverrides,
-    checkout_modes: list[cache.CheckoutMode],
     run_id: str,
     force: bool,
     no_commit: bool,
     project_root: pathlib.Path,
     default_state_dir: pathlib.Path,
+    store_spec: store_mod.StoreSpec,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process.
 
@@ -325,22 +322,22 @@ def prepare_worker_info(
 
     return worker.WorkerStageInfo(
         func=stage_info["func"],
-        fingerprint=stage_registry.ensure_fingerprint(stage_info["name"]),
-        deps=stage_info["deps_paths"],
+        fingerprint=pipeline.ensure_fingerprint(stage_info["name"]),
+        deps=stage_info["deps"],
         outs=stage_info["outs"],
+        store_spec=store_spec,
+        incremental_inputs=stage_info["incremental_inputs"],
         signature=stage_info["signature"],
         params=stage_info["params"],
         variant=stage_info["variant"],
         overrides=overrides,
-        checkout_modes=checkout_modes,
         run_id=run_id,
         force=force,
         no_commit=no_commit,
-        dep_specs=stage_info["dep_specs"],
-        out_specs=stage_info["out_specs"],
         params_arg_name=stage_info["params_arg_name"],
         project_root=project_root,
         state_dir=state_dir,
+        collection_params=stage_info["collection_params"],
     )
 
 
@@ -442,30 +439,23 @@ def check_uncached_incremental_outputs(
     execution_order: list[str],
     all_stages: dict[str, RegistryStageInfo],
 ) -> list[tuple[str, str]]:
-    """Check for IncrementalOut files that exist but aren't cached.
-
-    Returns list of (stage_name, output_path) tuples for uncached files.
-    """
+    """Check for incremental artifacts that exist without a recorded cache hash."""
     uncached = list[tuple[str, str]]()
     default_state_dir = config.get_state_dir()
+    workspace = store_mod.WorkspaceStore(project.get_project_root(), "", {})
 
     for stage_name in execution_order:
         stage_info = all_stages[stage_name]
         stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-        stage_outs = stage_info["outs"]
-
-        # Read lock file from stage's state_dir
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
         output_hashes = lock_data["output_hashes"] if lock_data else {}
 
-        for out in stage_outs:
-            if isinstance(out, outputs.IncrementalOut):
-                # Registry always stores single-file outputs (multi-file are expanded)
-                out_path = str(out.path)
-                path = pathlib.Path(out_path)
-                # File exists on disk but has no cache entry
-                if path.exists() and out_path not in output_hashes:
-                    uncached.append((stage_name, out_path))
+        for out in stage_info["outs"]:
+            if out.tag is not types.ArtifactTag.INCREMENTAL:
+                continue
+            out_path = workspace.resolve_display_path(out)
+            if out_path.exists() and out.identity not in output_hashes:
+                uncached.append((stage_name, str(out_path)))
 
     return uncached

@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import pickle
+import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any, Literal, override
 
@@ -61,11 +62,12 @@ class Loader[W, R = W](Writer[W], Reader[R], abc.ABC):
     def empty(self) -> R:
         """Return an empty instance of the loaded type.
 
-        Used for IncrementalOut on first run when no previous output exists.
-        Override in loaders that support IncrementalOut (JSON, CSV, YAML).
+        Used by an incremental output on its first run.
+        Override in loaders that support an empty value (JSON, CSV, YAML).
         """
         raise NotImplementedError(
-            f"{type(self).__name__} cannot provide an empty instance. For IncrementalOut, use a loader with a known empty value (JSON, CSV, YAML)."
+            f"{type(self).__name__} cannot provide an empty instance. "
+            + "Use an incremental output loader with a known empty value (JSON, CSV, YAML)."
         )
 
 
@@ -83,6 +85,9 @@ class CSV[T](Loader[T, T]):
 
     @override
     def load(self, path: pathlib.Path) -> T:
+        # pandas writes a zero-column frame as a bare line break, which read_csv rejects.
+        if path.stat().st_size <= 2 and not path.read_bytes().strip():
+            return self.empty()
         result = pandas.read_csv(  # pyright: ignore[reportUnknownMemberType] - pandas read_csv has complex overloads
             path,
             index_col=self.index_col,
@@ -110,7 +115,7 @@ class JSON[T](Loader[T, T]):
 
     Args:
         indent: JSON indentation (default 2, None for compact).
-        empty_factory: Callable returning empty value for IncrementalOut first run.
+        empty_factory: Callable returning the first-run value for an incremental output.
             Defaults to dict. Use list for list types: JSON(empty_factory=list).
     """
 
@@ -139,7 +144,7 @@ class YAML[T](Loader[T, T]):
     Generic type parameter indicates the expected type for type checking.
 
     Args:
-        empty_factory: Callable returning empty value for IncrementalOut first run.
+        empty_factory: Callable returning the first-run value for an incremental output.
             Defaults to dict. Use list for list types: YAML(empty_factory=list).
     """
 
@@ -295,10 +300,13 @@ class Pickle[T](Loader[T, T]):
 
 @dataclasses.dataclass(frozen=True)
 class PathOnly(Loader[pathlib.Path, pathlib.Path]):
-    """No-op loader that returns the path itself for manual loading.
+    """Loader that hands paths to the stage instead of loading content.
 
-    Use when you need custom loading logic that doesn't fit standard loaders.
-    The save() method validates the file exists (user must create it manually).
+    On load, returns the artifact's path; it may be a file or a directory.
+    On save, takes ownership of the file or directory the stage returned by
+    moving it to the output path pivot chose. The stage writes its result
+    anywhere outside the project (e.g. under ``tempfile.mkdtemp()``) and
+    returns that path; it must not reuse the path afterwards.
     """
 
     @override
@@ -307,9 +315,16 @@ class PathOnly(Loader[pathlib.Path, pathlib.Path]):
 
     @override
     def save(self, data: pathlib.Path, path: pathlib.Path) -> None:
-        _ = data  # PathOnly doesn't save data; just validates file exists
-        if not path.exists():
-            raise FileNotFoundError(f"Output file not created: {path}")
+        if not data.exists():
+            raise FileNotFoundError(f"Stage returned path {data}, which does not exist")
+        if data.resolve() == path.resolve():
+            return
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(
+                f"Cannot move returned path {data} to {path}: the output path already exists"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(data, path)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -344,3 +359,31 @@ class MatplotlibFigure(Writer["Figure"]):
             )
         finally:
             plt.close(data)
+
+
+def format_extension(fmt: object) -> str:
+    """Map loader type to file extension.
+
+    Args:
+        fmt: A loader instance (CSV, JSON, YAML, etc.)
+
+    Returns:
+        File extension without the dot (e.g., "csv", "json", "pkl")
+    """
+    match fmt:
+        case DataFrameJSONL():
+            return "jsonl"
+        case CSV():
+            return "csv"
+        case YAML():
+            return "yaml"
+        case JSON():
+            return "json"
+        case Text():
+            return "txt"
+        case Pickle():
+            return "pkl"
+        case MatplotlibFigure():
+            return "png"
+        case _:
+            return "dat"

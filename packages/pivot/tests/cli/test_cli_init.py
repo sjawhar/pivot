@@ -31,9 +31,13 @@ def test_init_creates_gitignore(runner: click.testing.CliRunner, tmp_path: pathl
 @pytest.mark.parametrize(
     "expected_content",
     [
-        pytest.param("cache/", id="cache_dir"),
-        pytest.param("state.lmdb/", id="state_lmdb"),
-        pytest.param("config.yaml.lock", id="config_lock"),
+        pytest.param("/cache/", id="cache_dir"),
+        pytest.param("/state.lmdb/", id="state_lmdb"),
+        pytest.param("/config.yaml.lock", id="config_lock"),
+        pytest.param("/locks/", id="artifact_locks"),
+        pytest.param("/agent.sock", id="agent_socket"),
+        pytest.param("/plots/", id="plots_gallery"),
+        pytest.param("/secret.key", id="secret_key"),
     ],
 )
 def test_init_gitignore_contains_expected_entries(
@@ -222,7 +226,20 @@ def test_init_output_contains_expected_elements(
         assert "initialized" in result.output.lower()
         assert ".pivot/" in result.output
         assert ".gitignore" in result.output
-        assert "pivot.yaml" in result.output
+        assert "pipeline.py" in result.output
+
+
+def test_init_next_steps_suggest_repro(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The suggested run command must work without arguments (`pivot run` needs stage names)."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0
+        assert "'pivot repro'" in result.output
+        assert "'pivot run'" not in result.output
 
 
 # --- safety checks: symlink and file-not-dir ---

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import tempfile
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import click
 from click.shell_completion import CompletionItem
@@ -69,6 +69,20 @@ def _get_config_paths() -> list[pathlib.Path]:
     return paths
 
 
+def _add_bare_completions(stages: list[str], completions: list[str], incomplete: str) -> None:
+    """Add bare (unprefixed) stage names when there's a single pipeline prefix."""
+    prefixes = {s.split("/", 1)[0] for s in stages if "/" in s}
+    if len(prefixes) != 1:
+        return
+    prefix = next(iter(prefixes))
+    existing = set(completions)
+    for s in stages:
+        if s.startswith(f"{prefix}/"):
+            bare = s[len(prefix) + 1 :]
+            if bare.startswith(incomplete) and bare not in existing:
+                completions.append(bare)
+
+
 def complete_stages(
     _ctx: click.Context,
     _param: click.Parameter,
@@ -79,14 +93,63 @@ def complete_stages(
         stages = _get_stages_fast()
         if stages is None:
             stages = _get_stages_full()
-        return [s for s in stages if s.startswith(incomplete)]
+        completions = [s for s in stages if s.startswith(incomplete)]
+        _add_bare_completions(stages, completions, incomplete)
+        return completions
     except Exception:
         logger.debug("Completion failed", exc_info=True)
         return []
 
 
-# Alias for push/pull targets (currently stages only; expand if file path completion needed)
-complete_targets = complete_stages
+if TYPE_CHECKING:
+    from pivot.registry import PipelineLike
+
+
+def complete_targets(
+    _ctx: click.Context,
+    _param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    try:
+        stages = _get_stages_fast()
+        discovered = stages is None
+        pipeline = _discover_pipeline() if discovered else None
+        if stages is None:
+            stages = [] if pipeline is None else pipeline.list_stages()
+
+        completions = [stage for stage in stages if stage.startswith(incomplete)]
+        _add_bare_completions(stages, completions, incomplete)
+
+        # Only load full pipeline (expensive) when user is completing a stage:key target
+        if ":" not in incomplete:
+            return completions
+
+        if not discovered:
+            pipeline = _discover_pipeline()
+        if pipeline is None:
+            return completions
+
+        prefixes = {s.split("/", 1)[0] for s in stages if "/" in s}
+        single_prefix = next(iter(prefixes)) if len(prefixes) == 1 else None
+
+        for stage in stages:
+            info = pipeline.get_stage(stage)
+            keys = [ref.identity.key for ref in info["outs"] if ref.identity.key is not None]
+            if not keys:
+                continue
+            for key in keys:
+                target = f"{stage}:{key}"
+                if target.startswith(incomplete):
+                    completions.append(target)
+                # Also offer bare stage:key in single-pipeline mode
+                if single_prefix and stage.startswith(f"{single_prefix}/"):
+                    bare_target = f"{stage[len(single_prefix) + 1 :]}:{key}"
+                    if bare_target.startswith(incomplete) and bare_target not in completions:
+                        completions.append(bare_target)
+        return completions
+    except Exception:
+        logger.debug("Completion failed", exc_info=True)
+        return []
 
 
 def _detect_config_file(root: pathlib.Path) -> tuple[str, float] | None:
@@ -96,7 +159,7 @@ def _detect_config_file(root: pathlib.Path) -> tuple[str, float] | None:
     """
     from pivot import discovery
 
-    for name in (*discovery.PIVOT_YAML_NAMES, discovery.PIPELINE_PY_NAME):
+    for name in (discovery.PIPELINE_PY_NAME,):
         path = root / name
         if path.exists():
             return (name, path.stat().st_mtime)
@@ -169,48 +232,23 @@ def _get_stages_fast() -> list[str] | None:
 
     Returns None to trigger fallback when:
     - No project root found
-    - No pivot.yaml exists
-    - Config has 'variants' field (requires Python imports)
-    - YAML parse error
+    - Cache is missing or invalid
     """
     root = _find_project_root_fast()
     if root is None:
         return None
-
-    # Try cache first (works for both YAML and pipeline.py)
-    if (stages := _get_stages_from_cache(root)) is not None:
-        return stages
-
-    yaml_path = next(
-        (p for p in [root / "pivot.yaml", root / "pivot.yml"] if p.exists()),
-        None,
-    )
-    if yaml_path is None:
-        return None
-
-    # Lazy imports to avoid loading pivot package at CLI startup
-    import yaml
-
-    from pivot import matrix
-
-    try:
-        raw: object = yaml.safe_load(yaml_path.read_text())
-    except yaml.YAMLError:
-        logger.debug("YAML parse error in %s", yaml_path)
-        return None
-
-    config = cast("dict[str, Any]", raw) if isinstance(raw, dict) else None
-
-    if matrix.needs_fallback(config):
-        return None
-
-    return matrix.extract_stage_names(config)
+    return _get_stages_from_cache(root)
 
 
 def _get_stages_full() -> list[str]:
-    """Fallback: get stage names via full discovery (~500ms).
+    """Fallback: get stage names via full discovery (~500ms), refreshing the cache."""
+    pipeline = _discover_pipeline()
+    return [] if pipeline is None else pipeline.list_stages()
 
-    Writes stage names to cache after discovery for future fast lookups.
+
+def _discover_pipeline() -> PipelineLike | None:
+    """Discover the pipeline and write its stage names to the cache for fast lookups.
+
     Cache is only written if config file mtime is unchanged during discovery
     (prevents race condition where config changes during slow discovery).
     """
@@ -222,9 +260,7 @@ def _get_stages_full() -> list[str]:
 
     pipeline = discovery.discover_pipeline()
     if pipeline is None:
-        return []
-
-    stages = pipeline.list_stages()
+        return None
 
     # Write cache only if config file unchanged during discovery
     if root and pre_discovery:
@@ -232,11 +268,11 @@ def _get_stages_full() -> list[str]:
         try:
             post_mtime = (root / config_file).stat().st_mtime
             if pre_mtime == post_mtime:
-                _write_stages_cache(root, config_file, pre_mtime, stages)
+                _write_stages_cache(root, config_file, pre_mtime, pipeline.list_stages())
         except OSError:
             pass  # Cache write failure is non-fatal
 
-    return stages
+    return pipeline
 
 
 def _find_project_root_fast() -> pathlib.Path | None:

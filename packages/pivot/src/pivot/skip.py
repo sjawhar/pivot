@@ -7,10 +7,11 @@ is handled by callers after this function when changed=True.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from pivot import project
 from pivot.types import (
+    ArtifactIdentity,
     ChangeDecision,
     ChangeType,
     CodeChange,
@@ -25,11 +26,12 @@ def check_stage(
     lock_data: LockData | None,
     fingerprint: dict[str, str],
     params: dict[str, Any],
-    dep_hashes: dict[str, HashInfo],
-    out_paths: list[str],
+    dep_hashes: dict[ArtifactIdentity, HashInfo],
+    out_paths: list[ArtifactIdentity],
     *,
     explain: bool = False,
     force: bool = False,
+    run_cache_allowed: bool = True,
 ) -> ChangeDecision:
     """Single source of truth for Tier 2 skip detection.
 
@@ -41,22 +43,36 @@ def check_stage(
     - Tier 3 (run cache) after this returns changed=True
     """
     if force and not explain:
-        return ChangeDecision(changed=True, reason="forced")
+        return ChangeDecision(changed=True, reason="forced", run_cache_allowed=run_cache_allowed)
 
     if lock_data is None:
-        return ChangeDecision(changed=True, reason="No previous run")
+        return ChangeDecision(
+            changed=True, reason="No previous run", run_cache_allowed=run_cache_allowed
+        )
 
     # Fast path: cheap dict equality, no detailed diffs or path conversion.
     if not explain:
         if lock_data["code_manifest"] != fingerprint:
-            return ChangeDecision(changed=True, reason="Code changed")
-        if lock_data["params"] != params:
-            return ChangeDecision(changed=True, reason="Params changed")
-        if lock_data["dep_hashes"] != dep_hashes:
-            return ChangeDecision(changed=True, reason="Input dependencies changed")
+            return ChangeDecision(
+                changed=True, reason="Code changed", run_cache_allowed=run_cache_allowed
+            )
+        if not params_equal(lock_data["params"], params):
+            return ChangeDecision(
+                changed=True, reason="Params changed", run_cache_allowed=run_cache_allowed
+            )
+        if not _dep_hashes_match(lock_data["dep_hashes"], dep_hashes):
+            return ChangeDecision(
+                changed=True,
+                reason="Input dependencies changed",
+                run_cache_allowed=run_cache_allowed,
+            )
         if sorted(lock_data["output_hashes"].keys()) != sorted(out_paths):
-            return ChangeDecision(changed=True, reason="Output paths changed")
-        return ChangeDecision(changed=False, reason="")
+            return ChangeDecision(
+                changed=True,
+                reason="Output paths changed",
+                run_cache_allowed=run_cache_allowed,
+            )
+        return ChangeDecision(changed=False, reason="", run_cache_allowed=run_cache_allowed)
 
     # Explain path: full diffs for all categories.
     code_changes = diff_code_manifests(lock_data["code_manifest"], fingerprint)
@@ -75,6 +91,7 @@ def check_stage(
         code_changes=code_changes,
         param_changes=param_changes,
         dep_changes=dep_changes,
+        run_cache_allowed=run_cache_allowed,
     )
 
 
@@ -88,6 +105,15 @@ def _first_reason(
     # Actual changes take precedence over "forced" — force is the fallback
     # reason when nothing else changed.
     if code_changes:
+        rewired = sorted(
+            {
+                change["key"].removeprefix("wire:").split(":", 1)[0]
+                for change in code_changes
+                if change["key"].startswith("wire:")
+            }
+        )
+        if rewired:
+            return f"Inputs rewired: {', '.join(rewired)}"
         return "Code changed"
     if param_changes:
         return "Params changed"
@@ -148,7 +174,7 @@ def diff_params(old: dict[str, Any], new: dict[str, Any]) -> list[ParamChange]:
                     key=key, old_value=old[key], new_value=None, change_type=ChangeType.REMOVED
                 )
             )
-        elif old[key] != new[key]:
+        elif not params_equal(old[key], new[key]):
             changes.append(
                 ParamChange(
                     key=key, old_value=old[key], new_value=new[key], change_type=ChangeType.MODIFIED
@@ -157,40 +183,56 @@ def diff_params(old: dict[str, Any], new: dict[str, Any]) -> list[ParamChange]:
     return changes
 
 
-def diff_dep_hashes(old: dict[str, HashInfo], new: dict[str, HashInfo]) -> list[DepChange]:
+def params_equal(old: object, new: object) -> bool:
+    """Compare recorded and current params by their canonical JSON text.
+
+    Both sides are JSON-mode dumps with set members already sorted
+    (``parameters.get_effective_params``), so the text is the canonical encoding. Python
+    equality alone would call a NaN param changed on every run, because nan != nan.
+    """
+    return old == new or json.dumps(old, sort_keys=True) == json.dumps(new, sort_keys=True)
+
+
+def diff_dep_hashes(
+    old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
+) -> list[DepChange]:
     changes = list[DepChange]()
     all_keys = sorted(set(old.keys()) | set(new.keys()))
     for key in all_keys:
         in_old = key in old
         in_new = key in new
         if not in_old:
-            rel_path = project.to_relative_path(key)
             changes.append(
                 DepChange(
-                    path=rel_path,
+                    identity=key,
                     old_hash=None,
                     new_hash=new[key]["hash"],
                     change_type=ChangeType.ADDED,
                 )
             )
         elif not in_new:
-            rel_path = project.to_relative_path(key)
             changes.append(
                 DepChange(
-                    path=rel_path,
+                    identity=key,
                     old_hash=old[key]["hash"],
                     new_hash=None,
                     change_type=ChangeType.REMOVED,
                 )
             )
-        elif old[key] != new[key]:
-            rel_path = project.to_relative_path(key)
-            changes.append(
-                DepChange(
-                    path=rel_path,
-                    old_hash=old[key]["hash"],
-                    new_hash=new[key]["hash"],
-                    change_type=ChangeType.MODIFIED,
+        else:
+            if old[key] != new[key]:
+                changes.append(
+                    DepChange(
+                        identity=key,
+                        old_hash=old[key]["hash"],
+                        new_hash=new[key]["hash"],
+                        change_type=ChangeType.MODIFIED,
+                    )
                 )
-            )
     return changes
+
+
+def _dep_hashes_match(
+    old: dict[ArtifactIdentity, HashInfo], new: dict[ArtifactIdentity, HashInfo]
+) -> bool:
+    return old == new

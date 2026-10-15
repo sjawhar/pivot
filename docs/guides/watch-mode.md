@@ -8,7 +8,7 @@ Watch mode monitors your project for file changes and automatically re-runs affe
 pivot repro --watch
 ```
 
-Pivot runs the full pipeline once, then watches for changes. When you save a file, it re-runs only the stages affected by that change — the stage whose [dependency](../concepts/dependencies.md) changed, plus all downstream stages.
+Pivot first runs the pipeline once with normal [skip detection](../concepts/caching.md), so stale stages run and cached ones are skipped (`--force` re-runs every stage on this first run). It then watches for changes. When you save a file, it re-runs only the stages affected by that change — the stage whose [dependency](../concepts/dependencies.md) changed, plus all downstream stages.
 
 ### With the Interactive TUI
 
@@ -59,7 +59,7 @@ Watch mode reacts to **external** file changes — files you edit in your editor
 
 Changes that trigger re-runs:
 
-- Editing a source file that a stage depends on (via `Dep`)
+- Editing an input file declared with `pipeline.input()`
 - Editing a stage's Python source code (detected by [fingerprinting](../concepts/fingerprinting.md))
 - Editing parameter files
 
@@ -74,11 +74,11 @@ Changes that do **not** trigger re-runs:
 By default, watch mode runs the entire pipeline. Target specific stages to narrow the scope:
 
 ```bash
-# Watch and re-run only train and its dependencies
-pivot repro train --watch
+# Watch and re-run only demo/train and its dependencies
+pivot repro demo/train --watch
 
 # Watch multiple stages
-pivot repro train evaluate --watch
+pivot repro demo/train demo/evaluate --watch
 ```
 
 Only the targeted stages (and their upstream [dependencies](../concepts/dependencies.md)) are monitored and re-run.

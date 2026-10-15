@@ -69,36 +69,47 @@ def my_stage():
         f.write("ran\n")
 ```
 
-### Stage Functions Must Be Module-Level
+### Stage Functions Belong at Module Level
 
-Workers receive pickled functions. Lambdas, closures, and `__main__` definitions fail.
+Workers receive stage functions by pickling (loky uses cloudpickle). A `@stage` defined inside a factory function does pickle and run, and the values it captures are fingerprinted, but configuration passed that way bypasses `StageParams`: it is not shown by `pivot params`, cannot be overridden in `params.yaml`, and the stage name no longer says which configuration it ran with. Define stages at module level and pass configuration as `StageParams`.
 
 ```python
 # Good
-def process_data(): ...
+class ProcessParams(StageParams):
+    threshold: float = 0.5
 
-# Bad - closure captures variable
+
+@stage
+def process(data: pd.DataFrame, params: ProcessParams) -> pd.DataFrame: ...
+
+
+# Bad - configuration hidden in a closure
 def make_stage(threshold):
-    def process():
-        if value > threshold:  # Captures threshold!
-            ...
+    @stage
+    def process(data: pd.DataFrame) -> pd.DataFrame:
+        return data[data["value"] > threshold]
+
+    return process
 ```
 
 ## Types
 
-### Stage Functions and TypedDicts Must Be Module-Level
+### Return-Type TypedDicts Should Be Module-Level
 
-`get_type_hints()` needs importable `__module__` for type resolution.
+With postponed/string annotations (for example, `from __future__ import annotations`), Pivot resolves a stage's return annotation with `get_type_hints()`, which looks names up in the function's module namespace. A `TypedDict` defined inside a function is not there, and the pipeline fails to load with `name 'ProcessOutputs' is not defined`. Without postponed annotations Python 3.13 can preserve a function-local `TypedDict`, but module-level definitions work in both cases and are the project convention.
 
 ```python
 # Good - module level
 class ProcessOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("out.csv", loaders.PathOnly())]
+    rows: pd.DataFrame
+    summary: Annotated[dict, metric]
 
-def process(...) -> ProcessOutputs:
-    ...
 
-# Bad - inline
+@stage
+def process(data: pd.DataFrame) -> ProcessOutputs: ...
+
+
+# Bad with postponed annotations - inline
 def create_stage():
     class ProcessOutputs(TypedDict):  # Can't resolve type hints!
         ...
@@ -116,9 +127,11 @@ if not func_node.body:
 
 ## Storage
 
-### IncrementalOut Uses COPY Mode
+### Incremental Outputs Use COPY Mode
 
-`IncrementalOut` always copies from cache rather than hardlinking/symlinking. This is intentional - the stage modifies the file in-place, so hardlinks would corrupt the cache.
+An `Annotated[T, incremental]` output restores its previous cached artifact as a
+writable copy before the stage receives the value bound by `pipeline.previous()`.
+Copy mode prevents in-place changes from corrupting the cached version.
 
 ### Path Strategies in StateDB
 

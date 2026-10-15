@@ -26,10 +26,15 @@ if TYPE_CHECKING:
 
     from pivot.engine.types import OutputEvent, StageCompleted
     from pivot.executor import ExecutionSummary
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 
 logger = logging.getLogger(__name__)
+
+_POLLER_CONNECT_ATTEMPTS = 30
+_POLLER_CONNECT_RETRY_S = 1.0
+_POLLER_STOP_CHECK_S = 0.05
+POLLER_THREAD_NAME = "pivot-tui-event-poller"
 
 
 @contextlib.contextmanager
@@ -106,15 +111,20 @@ def sort_for_display(execution_order: list[str], graph: nx.DiGraph[str]) -> list
     return sorted(execution_order, key=display_sort_key)
 
 
-def ensure_stages_registered() -> None:
+def ensure_stages_registered(*, all_pipelines: bool = False) -> None:
     """Ensure a Pipeline is discovered and in context.
 
     If no Pipeline is in context, attempts discovery and stores the result.
+
+    Args:
+        all_pipelines: If True, discover all pipelines recursively.
     """
     if cli_decorators.get_pipeline_from_context() is not None:
         return
     try:
-        pipeline: Pipeline | None = discovery.discover_pipeline()
+        pipeline: PipelineLike | None = discovery.discover_pipeline(
+            all_pipelines=all_pipelines,
+        )
         if pipeline is not None:
             cli_decorators.store_pipeline_in_context(pipeline)
             logger.info(f"Loaded pipeline: {pipeline.name}")
@@ -344,21 +354,29 @@ def run_tui_with_engine(
     from pivot_tui.rpc_client_impl import RpcPivotClient
 
     socket_ready = threading.Event()
+    # Set when the engine finishes or the TUI exits; the poller thread stops on it.
+    poller_stop = threading.Event()
+    # The exception that ended the engine; raised once the TUI has exited.
+    engine_errors = list[BaseException]()
 
     def engine_thread_target() -> None:
         """Run the async Engine in a background thread with its own event loop."""
+        error_text: str | None = None
         try:
             result = anyio.run(engine_fn, socket_ready)
             if result_future is not None and not result_future.done():
                 result_future.set_result(result)
         except BaseException as e:
+            error_text = f"{type(e).__name__}: {e}"
+            engine_errors.append(e)
             if result_future is not None and not result_future.done():
                 result_future.set_exception(e)
         finally:
             socket_ready.set()  # Unblock main thread even on failure
+            poller_stop.set()
             # Signal TUI to exit when engine completes (success or failure)
             with contextlib.suppress(Exception):
-                app.post_message(tui_run.TuiShutdown())
+                app.post_message(tui_run.TuiShutdown(error=error_text))
 
     # Start engine in background thread
     engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
@@ -366,17 +384,32 @@ def run_tui_with_engine(
     if not socket_ready.wait(timeout=10.0):
         logger.warning("Engine socket not ready after 10s, poller will retry connect")
 
+    async def wait_for_poller_stop(timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for the stop signal; True once it is set."""
+        with anyio.move_on_after(timeout):
+            while not poller_stop.is_set():
+                await anyio.sleep(_POLLER_STOP_CHECK_S)
+        return poller_stop.is_set()
+
+    async def stop_poller_on_signal(poller: EventPoller) -> None:
+        while not poller_stop.is_set():
+            await anyio.sleep(_POLLER_STOP_CHECK_S)
+        poller.stop()
+
     def poller_thread_target() -> None:
         async def poller_main() -> None:
             poller_client = RpcPivotClient()
-            for _attempt in range(30):
+            for _attempt in range(_POLLER_CONNECT_ATTEMPTS):
                 try:
                     await poller_client.connect(socket_path)
                     break
                 except OSError:
-                    await anyio.sleep(1.0)
+                    if await wait_for_poller_stop(_POLLER_CONNECT_RETRY_S):
+                        # A one-shot engine can finish and remove its socket first.
+                        logger.debug("Engine finished before the event poller connected")
+                        return
             else:
-                logger.error("Poller failed to connect after 30 attempts")
+                logger.error("Poller failed to connect after %d attempts", _POLLER_CONNECT_ATTEMPTS)
                 return
             poller = EventPoller(
                 poller_client,
@@ -385,7 +418,10 @@ def run_tui_with_engine(
             )
             app.set_event_poller(poller)
             try:
-                await poller.run()
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(stop_poller_on_signal, poller)
+                    await poller.run()
+                    tg.cancel_scope.cancel()
             finally:
                 with contextlib.suppress(Exception):
                     await poller_client.disconnect()
@@ -395,18 +431,32 @@ def run_tui_with_engine(
         except Exception:
             logger.debug("Event poller stopped", exc_info=True)
 
-    poller_thread = threading.Thread(target=poller_thread_target, daemon=True)
+    poller_thread = threading.Thread(
+        target=poller_thread_target, name=POLLER_THREAD_NAME, daemon=True
+    )
     poller_thread.start()
 
     # Run TUI in main thread (required for signal handlers)
-    if suppress_keyboard_interrupt:
-        with contextlib.suppress(KeyboardInterrupt), suppress_stderr_logging():
-            app.run()
-    else:
-        with suppress_stderr_logging():
-            app.run()
+    try:
+        if suppress_keyboard_interrupt:
+            with contextlib.suppress(KeyboardInterrupt), suppress_stderr_logging():
+                app.run()
+        else:
+            with suppress_stderr_logging():
+                app.run()
+    finally:
+        poller_stop.set()
 
-    # For oneshot mode, wait for engine thread to finish
-    poller_thread.join(timeout=2.0)
+    poller_thread.join()
     if result_future is not None:
         engine_thread.join(timeout=5.0)
+
+    # A crashed engine fails the command with its own error, not the TUI's return code.
+    if engine_errors:
+        raise engine_errors[0]
+
+    # Textual sets a non-zero return code when the app exits on an unhandled exception;
+    # surface it so callers (scripts, agents) can tell the TUI died.
+    return_code = app.return_code
+    if return_code:
+        raise SystemExit(return_code)

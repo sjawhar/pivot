@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import click.testing
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 # =============================================================================
 # Metrics Show Tests
@@ -31,7 +31,7 @@ def test_metrics_show_help(runner: click.testing.CliRunner) -> None:
 
 
 def test_metrics_show_file(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show displays file contents."""
@@ -46,7 +46,7 @@ def test_metrics_show_file(
 
 
 def test_metrics_show_json_format(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show --json outputs valid JSON."""
@@ -61,7 +61,7 @@ def test_metrics_show_json_format(
 
 
 def test_metrics_show_markdown_format(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show --md outputs markdown table."""
@@ -76,7 +76,7 @@ def test_metrics_show_markdown_format(
 
 
 def test_metrics_show_precision(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show respects --precision flag."""
@@ -91,7 +91,7 @@ def test_metrics_show_precision(
 
 
 def test_metrics_show_yaml_file(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show handles YAML files."""
@@ -105,7 +105,7 @@ def test_metrics_show_yaml_file(
 
 
 def test_metrics_show_csv_file(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show handles CSV files."""
@@ -120,7 +120,7 @@ def test_metrics_show_csv_file(
 
 
 def test_metrics_show_directory(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show handles directory target."""
@@ -135,7 +135,7 @@ def test_metrics_show_directory(
 
 
 def test_metrics_show_recursive(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show -R searches recursively."""
@@ -162,7 +162,7 @@ def test_metrics_show_file_not_found(
 
 
 def test_metrics_show_no_targets_no_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics show with no targets and no stages shows no metrics."""
@@ -188,7 +188,7 @@ def test_metrics_diff_help(runner: click.testing.CliRunner) -> None:
 
 
 def test_metrics_diff_no_metrics(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Metrics diff with no registered stages should report empty."""
@@ -198,7 +198,7 @@ def test_metrics_diff_no_metrics(
 
 
 def test_metrics_diff_explicit_file_no_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
 ) -> None:
     """Issue #62: metrics diff TARGET should work with explicit file when no stages registered."""
@@ -278,7 +278,7 @@ def test_metrics_in_main_help(runner: click.testing.CliRunner) -> None:
     ],
 )
 def test_metrics_diff_integration(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     mocker: MockerFixture,
     head_metrics: dict[str, float],

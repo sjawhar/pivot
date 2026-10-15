@@ -26,8 +26,6 @@ _DEFAULT_DEBOUNCE_MS = 1600
 # File patterns that trigger code reload (same as watch/engine.py)
 _CODE_FILE_SUFFIXES = (".py",)
 _CONFIG_FILE_NAMES = (
-    "pivot.yaml",
-    "pivot.yml",
     "pipeline.py",
     "params.yaml",
     "params.yml",
@@ -44,6 +42,19 @@ def _is_code_or_config(path: str) -> bool:
     slash_idx = path.rfind("/")
     name = path[slash_idx + 1 :] if slash_idx >= 0 else path
     return name in _CONFIG_FILE_NAMES
+
+
+async def _set_when_cancelled(stop_event: anyio.Event) -> None:
+    """Set ``stop_event`` once this task is cancelled.
+
+    watchfiles waits for changes in a shielded worker thread that checks only its stop event, so
+    cancelling ``awatch`` alone takes effect at the thread's next 5 s timeout. Setting the event
+    stops the thread within one poll step.
+    """
+    try:
+        await anyio.sleep_forever()
+    finally:
+        stop_event.set()
 
 
 class OneShotSource:
@@ -64,6 +75,7 @@ class OneShotSource:
         single_stage: bool = False,
         parallel: bool = True,
         max_workers: int | None = None,
+        resource_capacity: dict[str, int] | None = None,
         no_commit: bool = False,
         on_error: OnError = OnError.FAIL,
         cache_dir: Path | None = None,
@@ -79,6 +91,7 @@ class OneShotSource:
             single_stage: If True, run only the specified stages.
             parallel: If True, run stages in parallel.
             max_workers: Maximum worker processes.
+            resource_capacity: CLI resource capacity overrides.
             no_commit: If True, don't update lockfiles.
             on_error: Error handling mode.
             cache_dir: Directory for lock files.
@@ -93,6 +106,7 @@ class OneShotSource:
             single_stage=single_stage,
             parallel=parallel,
             max_workers=max_workers,
+            resource_capacity=dict(resource_capacity or {}),
             no_commit=no_commit,
             on_error=on_error,
             cache_dir=cache_dir,
@@ -159,33 +173,37 @@ class FilesystemSource:
                     continue
 
                 # Create fresh stop event for this watch iteration
-                self._stop_event = anyio.Event()
+                stop_event = anyio.Event()
+                self._stop_event = stop_event
                 debounce = (
                     self._debounce_ms if self._debounce_ms is not None else _DEFAULT_DEBOUNCE_MS
                 )
 
-                async for changes in watchfiles.awatch(
-                    *self._watch_paths,
-                    debounce=debounce,
-                    stop_event=self._stop_event,
-                ):
-                    code_paths = list[str]()
-                    data_paths = list[str]()
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(_set_when_cancelled, stop_event)
+                    async for changes in watchfiles.awatch(
+                        *self._watch_paths,
+                        debounce=debounce,
+                        stop_event=stop_event,
+                    ):
+                        code_paths = list[str]()
+                        data_paths = list[str]()
 
-                    for _change_type, path_str in changes:
-                        if _is_code_or_config(path_str):
-                            code_paths.append(path_str)
-                        else:
-                            data_paths.append(path_str)
+                        for _change_type, path_str in changes:
+                            if _is_code_or_config(path_str):
+                                code_paths.append(path_str)
+                            else:
+                                data_paths.append(path_str)
 
-                    if code_paths:
-                        await send.send(
-                            CodeOrConfigChanged(type="code_or_config_changed", paths=code_paths)
-                        )
-                    if data_paths:
-                        await send.send(
-                            DataArtifactChanged(type="data_artifact_changed", paths=data_paths)
-                        )
+                        if code_paths:
+                            await send.send(
+                                CodeOrConfigChanged(type="code_or_config_changed", paths=code_paths)
+                            )
+                        if data_paths:
+                            await send.send(
+                                DataArtifactChanged(type="data_artifact_changed", paths=data_paths)
+                            )
+                    tg.cancel_scope.cancel()
 
                 # awatch() exited - either stop_event was set or paths changed
                 # Loop continues to restart with current paths

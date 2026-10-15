@@ -1,49 +1,39 @@
 ---
 tags: [python, refactoring, inheritance, isinstance]
 category: gotcha
-module: outputs
+module: type-system
 symptoms: ["tests failing after refactoring class hierarchy", "isinstance check silently missing types", "function returns None unexpectedly"]
 ---
 
-# isinstance Checks Break When Refactoring Subclass to Sibling
+# isinstance Checks Break When a Subclass Becomes a Sibling
 
 ## Problem
 
-When refactoring a class hierarchy from subclass relationships to sibling relationships, existing `isinstance` checks silently fail to match the new sibling classes.
+Changing a class hierarchy can make an existing `isinstance` check silently
+return `False` for a class that previously matched. This is especially easy to
+miss when the check chooses optional metadata or a serialization strategy.
 
-In this case, the Loader hierarchy was refactored from:
-```
-Before: Out <- IncrementalOut, DirectoryOut (subclasses)
-After:  BaseOut <- Out, IncrementalOut, DirectoryOut (siblings)
-```
-
-Code using `isinstance(obj, Out)` to detect any output spec stopped matching `IncrementalOut` and `DirectoryOut` after the refactor. The bug was silent - no exceptions, just incorrect behavior (returning `None` instead of the expected spec).
-
-## Solution
-
-After refactoring to sibling classes with a common base:
-1. Search for all `isinstance` checks against the old parent class
-2. Update to either:
-   - Check against the new common base: `isinstance(obj, BaseOut)`
-   - Check for all siblings: `isinstance(obj, (Out, IncrementalOut, DirectoryOut))`
-3. Run tests to verify - these bugs often only manifest in integration tests
-
-In `get_single_output_spec_from_return`:
 ```python
-# Before (broken after refactor)
-if isinstance(metadata, outputs.Out):
-    return cast("outputs.Out[Any]", metadata)
-
-# After (handles all output spec types)
-if isinstance(metadata, outputs.BaseOut):
+# Before the hierarchy change
+if isinstance(metadata, ParentMetadata):
     return metadata
 ```
 
+## Solution
+
+After the change, make the required cases explicit:
+
+```python
+if isinstance(metadata, (FileMetadata, DirectoryMetadata)):
+    return metadata
+```
+
+If the code depends only on a stable set of attributes, use a
+runtime-checkable protocol designed for that shared shape instead of relying
+on inheritance.
+
 ## Key Insight
 
-When changing a class hierarchy from inheritance to composition/siblings, `isinstance` checks are silent failure points. Unlike method calls (which raise `AttributeError` if missing), isinstance returns `False` for non-matching types without any indication that it used to match.
-
-Mitigation strategies:
-- Search for `isinstance(*, OldParent)` patterns before refactoring
-- Add explicit tests for each concrete type at API boundaries
-- Consider using structural typing (Protocols) instead of isinstance when the exact hierarchy might change
+`isinstance` failures are silent. When changing inheritance relationships,
+search for every parent-class check, decide which replacement cases are valid,
+and add a behavioral test for each affected boundary.

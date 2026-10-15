@@ -4,12 +4,12 @@ import pathlib
 
 import click
 
-from pivot import outputs, path_policy, project
+from pivot import path_policy, project
 from pivot.cli import _run_common
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
 from pivot.show import plots as plots_mod
-from pivot.types import OutputFormat
+from pivot.types import ArtifactTag, OutputFormat
 
 
 @click.group()
@@ -23,8 +23,8 @@ def plots() -> None:
     "-o",
     "--output",
     type=click.Path(path_type=pathlib.Path),
-    default="pivot_plots/index.html",
-    help="Output HTML path (default: pivot_plots/index.html)",
+    default=".pivot/plots/index.html",
+    help="Output HTML path (default: .pivot/plots/index.html)",
 )
 @click.option("--open", "open_browser", is_flag=True, help="Open browser after rendering")
 @cli_decorators.with_error_handling
@@ -62,8 +62,10 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path, open_browser: boo
         click.echo("No plots found.")
         return
 
-    output_path = plots_mod.render_plots_html(plot_list, output)
-    click.echo(f"Rendered {len(plot_list)} plot(s) to {output_path}")
+    # --output is project-relative (absolute paths are rejected above), so the gallery lands
+    # in the project's .pivot/ even when run from a subdirectory.
+    output_path = plots_mod.render_plots_html(plot_list, proj_root / output)
+    click.echo(f"Rendered {len(plot_list)} plot(s) to {output_path.relative_to(proj_root)}")
 
     if open_browser:
         import webbrowser
@@ -88,7 +90,7 @@ def plots_diff(targets: tuple[str, ...], json_output: bool, md: bool, no_path: b
     proj_root = project.get_project_root()
     _run_common.ensure_stages_registered()
 
-    paths = cli_targets.resolve_and_validate(targets, proj_root, outputs.Plot)
+    paths = cli_targets.resolve_and_validate(targets, proj_root, ArtifactTag.PLOT)
     if paths is not None:
         # Filter lock file hashes to only requested paths
         all_old_hashes = plots_mod.get_plot_hashes_from_head()

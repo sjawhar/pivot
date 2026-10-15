@@ -5,8 +5,10 @@ from typing import TypedDict
 
 import click
 
+from pivot import project, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
+from pivot.cli import targets as cli_targets
 
 
 class StageJsonOutput(TypedDict):
@@ -15,7 +17,7 @@ class StageJsonOutput(TypedDict):
     name: str
     deps: list[str]
     outs: list[str]
-    mutex: list[str]
+    resources: dict[str, int | str]
     variant: str | None
 
 
@@ -30,7 +32,9 @@ def _get_output_sources(stage_list: list[str]) -> dict[str, str]:
     return {
         out_path: name
         for name in stage_list
-        for out_path in cli_helpers.get_stage(name)["outs_paths"]
+        for out_path in [
+            types.identity_key(out.identity) for out in cli_helpers.get_stage(name)["outs"]
+        ]
     }
 
 
@@ -50,20 +54,22 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
             click.echo(json.dumps(ListJsonOutput(stages=[])))
         elif not quiet:
             click.echo("No stages registered.")
-            click.echo("Create a pipeline.py with stage functions, or a pivot.yaml file.")
+            click.echo("Create a pipeline.py with stage functions.")
         return
 
     if as_json:
-        stages = [
-            StageJsonOutput(
-                name=name,
-                deps=(info := cli_helpers.get_stage(name))["deps_paths"],
-                outs=info["outs_paths"],
-                mutex=info["mutex"],
-                variant=info["variant"],
+        stages = list[StageJsonOutput]()
+        for name in stage_list:
+            info = cli_helpers.get_stage(name)
+            stages.append(
+                StageJsonOutput(
+                    name=name,
+                    deps=[types.identity_key(dep.identity) for dep in info["deps"].values()],
+                    outs=[types.identity_key(out.identity) for out in info["outs"]],
+                    resources=info["resources"],
+                    variant=info["variant"],
+                )
             )
-            for name in stage_list
-        ]
         click.echo(json.dumps(ListJsonOutput(stages=stages), indent=2))
         return
 
@@ -75,11 +81,18 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
     output_sources = _get_output_sources(stage_list) if show_deps else {}
 
     click.echo(f"Registered stages ({len(stage_list)}):")
+    store = cli_helpers.require_workspace_store()
+    project_root = project.get_project_root()
     for name in stage_list:
         info = cli_helpers.get_stage(name)
-        deps = info["deps_paths"]
-        outs = info["outs_paths"]
+        deps = [types.identity_key(dep.identity) for dep in info["deps"].values()]
+        outs = info["outs"]
         click.echo(f"  {name}")
+        resources = info["resources"]
+        if resources:
+            click.echo(
+                "    resources: " + ", ".join(f"{key}={value}" for key, value in resources.items())
+            )
 
         if show_deps or verbose:
             if deps:
@@ -93,4 +106,9 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
             if outs:
                 click.echo("    outs:")
                 for out in outs:
-                    click.echo(f"      {out}")
+                    output_path = project.to_relative_path(
+                        store.resolve_display_path(out), project_root
+                    )
+                    click.echo(
+                        f"      {cli_targets.format_identity_display(out.identity, output_path)}"
+                    )

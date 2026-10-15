@@ -48,6 +48,7 @@ def _configure_oneshot_source(
     stages: list[str],
     *,
     force: bool,
+    resource_capacity: dict[str, int],
     no_commit: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
@@ -60,6 +61,7 @@ def _configure_oneshot_source(
             force=force,
             reason="cli",
             single_stage=True,  # Always single-stage for run command
+            resource_capacity=resource_capacity,
             no_commit=no_commit,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
@@ -74,6 +76,7 @@ def _run_with_tui(
     tui_log: pathlib.Path | None = None,
     no_commit: bool = False,
     on_error: OnError = OnError.FAIL,
+    resource_capacity: dict[str, int] | None = None,
     allow_uncached_incremental: bool = False,
     checkout_missing: bool = False,
 ) -> dict[str, ExecutionSummary] | None:
@@ -133,15 +136,16 @@ def _run_with_tui(
                 engine=eng,
                 event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
             )
-            eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+            eng.add_source(
+                AgentRpcSource(socket_path=socket_path, handler=rpc_handler, ready=socket_ready)
+            )
             eng.add_sink(BroadcastEventSink())
-
-            socket_ready.set()
 
             _configure_oneshot_source(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity or {},
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -170,6 +174,7 @@ def _run_json_mode(
     force: bool,
     no_commit: bool,
     on_error: OnError,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> dict[str, ExecutionSummary]:
@@ -198,6 +203,7 @@ def _run_json_mode(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -242,6 +248,7 @@ def _run_plain_mode(
     force: bool,
     no_commit: bool,
     on_error: OnError,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
     quiet: bool,
@@ -273,6 +280,7 @@ def _run_plain_mode(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -306,7 +314,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
     return stages_list
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("stages", nargs=-1, shell_complete=completion.complete_stages)
 @click.option(
     "--force",
@@ -337,6 +345,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
     type=click.Path(path_type=pathlib.Path),
     help="Write TUI messages to JSONL file for monitoring",
 )
+@cli_decorators.resources_option
 @click.option(
     "--no-commit",
     is_flag=True,
@@ -356,7 +365,7 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
 @click.option(
     "--allow-uncached-incremental",
     is_flag=True,
-    help="Allow running stages with IncrementalOut files that exist but aren't in cache.",
+    help="Allow running stages with incremental output files that exist but aren't in cache.",
 )
 @click.option(
     "--checkout-missing",
@@ -375,6 +384,7 @@ def run(
     no_commit: bool,
     fail_fast: bool,
     keep_going: bool,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> None:
@@ -389,11 +399,10 @@ def run(
     quiet = cli_ctx["quiet"]
     show_human_output = not as_json and not quiet
 
-    # Convert tuple to list and validate at least one stage provided
-    stages_list = _validate_stages_required(cli_helpers.stages_to_list(stages))
-
-    # Validate stages exist in registry
-    cli_helpers.validate_stages_exist(stages_list)
+    # Require at least one stage, then resolve bare names to registered stages
+    stages_list = _validate_stages_required(
+        cli_helpers.resolve_stage_names(cli_helpers.stages_to_list(stages))
+    )
 
     # Validate mutual exclusions
     _run_common.validate_display_mode(tui_flag, as_json)
@@ -408,6 +417,7 @@ def run(
             tui_log=tui_log,
             no_commit=no_commit,
             on_error=on_error,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
@@ -420,6 +430,7 @@ def run(
             force=force,
             no_commit=no_commit,
             on_error=on_error,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
@@ -429,6 +440,7 @@ def run(
             force=force,
             no_commit=no_commit,
             on_error=on_error,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
             quiet=quiet,
@@ -437,3 +449,11 @@ def run(
 
     if not results and show_human_output:
         click.echo("No stages to run")
+        return
+
+    if results:
+        from pivot.executor import core as executor_core
+
+        _, _, _, _, failed = executor_core.count_results(results)
+        if failed > 0:
+            raise SystemExit(1)

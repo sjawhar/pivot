@@ -136,10 +136,10 @@ pivot checkout --only-missing
 | Data | Pushed/Pulled | Version controlled |
 |------|---------------|-------------------|
 | Cache files (`.pivot/cache/files/`) | Yes | No (`.gitignore`) |
-| Lock files (`.pivot/stages/*.lock`) | No | Yes (commit these) |
+| Lock files (`.pivot/stages/<pipeline>/*.lock`) | No | Yes (commit these) |
 | Config (`.pivot/config.yaml`) | No | Yes (commit this) |
 
-**Lock files are the bridge.** They map output paths to content hashes. Push uploads the files referenced by those hashes; pull downloads them. Always commit lock files to version control so other machines know what to pull.
+**Lock files are the bridge.** They map each stage output to its content hash. Push uploads the files referenced by those hashes; pull downloads them. Always commit lock files to version control so other machines know what to pull.
 
 ## Multiple Remotes
 
@@ -192,7 +192,7 @@ pivot push
 # Iterate on a feature branch
 pivot repro
 pivot push
-git add .pivot/stages/*.lock
+git add .pivot/stages
 git commit -m "Update pipeline outputs"
 git push
 ```
@@ -224,10 +224,10 @@ aws s3 ls s3://your-bucket/     # Verify bucket access
 
 **Cache miss after pull — stages re-run unexpectedly:**
 
-Lock files may be out of sync. Ensure `.pivot/stages/*.lock` files are committed:
+Lock files may be out of sync. Ensure the lock files under `.pivot/stages/` are committed:
 
 ```bash
-git add .pivot/stages/*.lock
+git add .pivot/stages
 git commit -m "Sync lock files"
 ```
 

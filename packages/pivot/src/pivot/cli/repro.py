@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import anyio
 import click
 
-from pivot import config
+from pivot import config, project, registry
 from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -29,6 +29,7 @@ from pivot.cli import targets as cli_targets
 from pivot.engine import engine, sinks
 from pivot.engine import graph as engine_graph
 from pivot.engine import sources as engine_sources
+from pivot.engine import watch as engine_watch
 from pivot.executor import prepare_workers
 from pivot.types import (
     DisplayCategory,
@@ -60,21 +61,36 @@ def _configure_watch_sources(
     *,
     force: bool,
     stages: list[str] | None,
+    resource_capacity: dict[str, int],
     no_commit: bool,
     on_error: OnError,
 ) -> None:
-    """Configure sources for watch mode."""
+    """Configure sources for watch mode: one startup run, then filesystem changes.
+
+    The startup run uses normal skip detection, so only stale stages execute unless
+    ``force`` is set.
+    """
     eng.add_source(engine_sources.FilesystemSource(watch_paths=watch_paths, debounce_ms=debounce))
-    if force:
-        eng.add_source(
-            engine_sources.OneShotSource(
-                stages=stages,
-                force=True,
-                reason="watch:initial:forced",
-                no_commit=no_commit,
-                on_error=on_error,
-            )
+    eng.add_source(
+        engine_sources.OneShotSource(
+            stages=stages,
+            force=force,
+            reason="watch:initial:forced" if force else "watch:initial",
+            resource_capacity=resource_capacity,
+            no_commit=no_commit,
+            on_error=on_error,
         )
+    )
+
+
+def _watch_paths_from_registry(
+    all_stages: dict[str, registry.RegistryStageInfo],
+) -> list[pathlib.Path]:
+    store = cli_helpers.get_workspace_store()
+    if store is None:
+        return []
+    artifact_paths = engine_watch.build_artifact_paths(all_stages, store)
+    return engine_watch.get_watch_paths(project.get_project_root(), artifact_paths)
 
 
 def _configure_oneshot_source(
@@ -82,6 +98,7 @@ def _configure_oneshot_source(
     stages: list[str] | None,
     *,
     force: bool,
+    resource_capacity: dict[str, int],
     no_commit: bool,
     on_error: OnError,
     allow_uncached_incremental: bool,
@@ -94,6 +111,7 @@ def _configure_oneshot_source(
             force=force,
             reason="cli",
             single_stage=False,  # Always resolve deps for repro
+            resource_capacity=resource_capacity,
             no_commit=no_commit,
             on_error=on_error,
             allow_uncached_incremental=allow_uncached_incremental,
@@ -111,28 +129,28 @@ def _get_explanations(
 
     Shared by --explain and --dry-run modes.
     """
-    from pivot import project
     from pivot import status as status_mod
     from pivot.engine import graph as engine_graph
-    from pivot.storage import track
-
-    # Resolve cross-pipeline dependencies before getting stages
-    cli_helpers.resolve_external_dependencies()
 
     all_stages = cli_helpers.get_all_stages()
 
     # Build graph with validation when allow_missing is False
-    # When allow_missing=True, tracked files are used for validation
-    tracked_files = track.discover_pvt_files(project.get_project_root()) if allow_missing else None
-    graph = engine_graph.build_graph(
-        all_stages, validate=not allow_missing, tracked_files=tracked_files
-    )
+    graph = engine_graph.build_graph(all_stages)
+    if not allow_missing:
+        ws = cli_helpers.get_workspace_store()
+        dep_errors = engine_graph.validate_dependency_sources(all_stages, store=ws)
+        if dep_errors:
+            from pivot import exceptions
+
+            if len(dep_errors) == 1:
+                raise dep_errors[0]
+            raise exceptions.MultipleDependencyError(dep_errors)
 
     return status_mod.get_pipeline_explanations(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=cli_helpers.get_registry(),
+        pipeline=cli_helpers.get_pipeline(),
         force=force,
         allow_missing=allow_missing,
         graph=graph,
@@ -205,6 +223,7 @@ def _run_pipeline(
     no_commit: bool,
     on_error: OnError,
     serve: bool,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
 ) -> dict[str, ExecutionSummary] | None:
@@ -222,7 +241,7 @@ def _run_pipeline(
         )
 
     # Build DAG and get execution order for TUI display and worker pre-warming
-    graph = cli_helpers.build_dag(validate=True)
+    graph = cli_helpers.build_dag()
     execution_order = engine_graph.get_execution_order(graph, stages_list, single_stage=False)
 
     if not execution_order and not watch:
@@ -282,6 +301,7 @@ def _run_pipeline(
             console=console,
             jsonl_callback=jsonl_callback,
             no_commit=no_commit,
+            resource_capacity=resource_capacity,
         )
 
     return _run_oneshot_mode(
@@ -296,6 +316,7 @@ def _run_pipeline(
         force=force,
         no_commit=no_commit,
         on_error=on_error,
+        resource_capacity=resource_capacity,
         allow_uncached_incremental=allow_uncached_incremental,
         checkout_missing=checkout_missing,
         run_id=run_id,
@@ -323,6 +344,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
     console: tui_console.Console | None,
     jsonl_callback: Callable[[dict[str, object]], None] | None,
     no_commit: bool,
+    resource_capacity: dict[str, int],
 ) -> None:
     """Run watch mode with unified event-driven execution."""
 
@@ -338,12 +360,13 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             debounce=debounce,
             on_error=on_error,
             no_commit=no_commit,
+            resource_capacity=resource_capacity,
         )
 
     # Build bipartite graph for watch paths
     all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
-    watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+    engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
+    watch_paths = _watch_paths_from_registry(all_stages)
 
     # Sort for display: group matrix variants together while preserving DAG structure
     display_order = _run_common.sort_for_display(execution_order, graph) if execution_order else []
@@ -392,10 +415,10 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     engine=eng,
                     event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
                 )
-                eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                eng.add_source(
+                    AgentRpcSource(socket_path=socket_path, handler=rpc_handler, ready=socket_ready)
+                )
                 eng.add_sink(BroadcastEventSink())
-
-                socket_ready.set()
 
                 _configure_watch_sources(
                     eng,
@@ -403,6 +426,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     debounce,
                     force=force,
                     stages=stages_list,
+                    resource_capacity=resource_capacity,
                     no_commit=no_commit,
                     on_error=on_error,
                 )
@@ -438,6 +462,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
                     debounce,
                     force=force,
                     stages=stages_list,
+                    resource_capacity=resource_capacity,
                     no_commit=no_commit,
                     on_error=on_error,
                 )
@@ -457,6 +482,7 @@ def _run_serve_mode(
     debounce: int,
     on_error: OnError,
     no_commit: bool,
+    resource_capacity: dict[str, int],
 ) -> None:
     """Run serve mode with Engine and agent RPC.
 
@@ -484,36 +510,33 @@ def _run_serve_mode(
     async def serve_main() -> None:
         # Build watch paths
         all_stages = cli_helpers.get_all_stages()
-        bipartite_graph = engine_graph.build_graph(all_stages)
-        watch_paths = engine_graph.get_watch_paths(bipartite_graph)
+        engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
+        watch_paths = _watch_paths_from_registry(all_stages)
 
         async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
-            # Add filesystem watch source
-            eng.add_source(
-                engine_sources.FilesystemSource(
-                    watch_paths=watch_paths,
-                    debounce_ms=debounce,
-                )
+            _configure_watch_sources(
+                eng,
+                watch_paths,
+                debounce,
+                force=force,
+                stages=stages_list,
+                resource_capacity=resource_capacity,
+                no_commit=no_commit,
+                on_error=on_error,
             )
-
-            # Add initial run source if force specified
-            if force:
-                eng.add_source(
-                    engine_sources.OneShotSource(
-                        stages=stages_list,
-                        force=True,
-                        reason="serve:initial",
-                        no_commit=no_commit,
-                        on_error=on_error,
-                    )
-                )
 
             # Add event buffer as sink so it captures events
             eng.add_sink(eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
 
             # Add agent RPC source with handler for status/stages queries
             rpc_handler = AgentRpcHandler(engine=eng, event_buffer=eng._event_buffer)  # pyright: ignore[reportPrivateUsage]
-            eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+            eng.add_source(
+                AgentRpcSource(
+                    socket_path=socket_path,
+                    handler=rpc_handler,
+                    resource_capacity=resource_capacity,
+                )
+            )
 
             # Add sinks
             if not quiet:
@@ -550,6 +573,7 @@ def _run_oneshot_mode(
     force: bool,
     no_commit: bool,
     on_error: OnError,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
     run_id: str | None,
@@ -609,15 +633,16 @@ def _run_oneshot_mode(
                     engine=eng,
                     event_buffer=eng._event_buffer,  # pyright: ignore[reportPrivateUsage]
                 )
-                eng.add_source(AgentRpcSource(socket_path=socket_path, handler=rpc_handler))
+                eng.add_source(
+                    AgentRpcSource(socket_path=socket_path, handler=rpc_handler, ready=socket_ready)
+                )
                 eng.add_sink(BroadcastEventSink())
-
-                socket_ready.set()
 
                 _configure_oneshot_source(
                     eng,
                     stages_list,
                     force=force,
+                    resource_capacity=resource_capacity,
                     no_commit=no_commit,
                     on_error=on_error,
                     allow_uncached_incremental=allow_uncached_incremental,
@@ -657,6 +682,7 @@ def _run_oneshot_mode(
                 eng,
                 stages_list,
                 force=force,
+                resource_capacity=resource_capacity,
                 no_commit=no_commit,
                 on_error=on_error,
                 allow_uncached_incremental=allow_uncached_incremental,
@@ -756,6 +782,7 @@ def _run_oneshot_mode(
     type=click.Path(path_type=pathlib.Path),
     help="Write TUI messages to JSONL file for monitoring",
 )
+@cli_decorators.resources_option
 @click.option(
     "--no-commit",
     is_flag=True,
@@ -780,7 +807,7 @@ def _run_oneshot_mode(
 @click.option(
     "--allow-uncached-incremental",
     is_flag=True,
-    help="Allow running stages with IncrementalOut files that exist but aren't in cache.",
+    help="Allow running stages with incremental output files that exist but aren't in cache.",
 )
 @click.option(
     "--checkout-missing",
@@ -809,6 +836,7 @@ def repro(
     fail_fast: bool,
     keep_going: bool,
     serve: bool,
+    resource_capacity: dict[str, int],
     allow_uncached_incremental: bool,
     checkout_missing: bool,
     allow_missing: bool,
@@ -819,7 +847,7 @@ def repro(
     STAGES can be stage names or output file paths — file paths are resolved
     to the stage that produces them. Without arguments, runs the entire pipeline.
 
-    Auto-discovers pivot.yaml or pipeline.py if no stages are registered.
+    Auto-discovers pipeline.py if no stages are registered.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
@@ -843,9 +871,9 @@ def repro(
                 for pipeline in loaded_pipelines:
                     context_pipeline.include(pipeline)
             else:
-                from pivot.pipeline import pipeline as pipeline_mod
+                from pivot.compose import Pipeline
 
-                combined = pipeline_mod.Pipeline("cli", root=loaded_pipelines[0].root)
+                combined = Pipeline("cli", root=loaded_pipelines[0].root)
                 for pipeline in loaded_pipelines:
                     combined.include(pipeline)
                 cli_decorators.store_pipeline_in_context(combined)
@@ -912,7 +940,7 @@ def repro(
     pipeline = cli_decorators.get_pipeline_from_context()
     has_stages = pipeline is not None and bool(pipeline.list_stages())
     if not has_stages and not dry_run and not as_json:
-        raise click.ClickException("No pipeline found (pivot.yaml or pipeline.py)")
+        raise click.ClickException("No pipeline found (pipeline.py)")
 
     # Handle explain mode
     if explain:
@@ -940,6 +968,7 @@ def repro(
             no_commit=no_commit,
             on_error=on_error,
             serve=serve,
+            resource_capacity=resource_capacity,
             allow_uncached_incremental=allow_uncached_incremental,
             checkout_missing=checkout_missing,
         )
@@ -956,3 +985,11 @@ def repro(
 
     if not results and show_human_output and not tui_flag:
         click.echo("No stages to run")
+        return
+
+    if results:
+        from pivot.executor import core as executor_core
+
+        _, _, _, _, failed = executor_core.count_results(results)
+        if failed > 0:
+            raise SystemExit(1)

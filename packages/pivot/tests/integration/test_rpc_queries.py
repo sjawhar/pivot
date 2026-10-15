@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from conftest import send_rpc
+from tests.conftest import send_rpc
 
 if TYPE_CHECKING:
     import pathlib
@@ -32,32 +32,43 @@ def serve_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / ".pivot").mkdir()
 
-    # Use pipeline.py only (not pivot.yaml) to avoid ambiguity error
+    # Use a real compositional pipeline, and keep subprocess output in files:
+    # agent_rpc currently logs one traceback per one-shot connection, so unread
+    # stderr PIPEs can fill and block the server during query-heavy tests.
     pipeline_code = """\
 import pathlib
-from pivot.pipeline.pipeline import Pipeline
+
+from pivot.compose import Pipeline, stage
+
 
 pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
 
+
+@stage
 def hello() -> None:
     print("Hello!")
 
-pipeline.register(hello, name="hello")
+
+with pipeline:
+    hello()
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
     sock_path = tmp_path / ".pivot" / "agent.sock"
+    stdout_path = tmp_path / "serve.stdout"
+    stderr_path = tmp_path / "serve.stderr"
 
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
 
-    proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
+            cwd=tmp_path,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
 
     try:
         # Wait for socket
@@ -66,10 +77,10 @@ pipeline.register(hello, name="hello")
                 break
             time.sleep(0.1)
         else:
-            stdout, stderr = proc.communicate(timeout=1)
             pytest.fail(
                 "Socket not created within 10s.\n"
-                + f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+                + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+                + f"stderr: {stderr_path.read_text(errors='replace')}"
             )
 
         # Poll until status query succeeds (server is ready)
@@ -116,8 +127,8 @@ def test_events_since_query(serve_pipeline: pathlib.Path) -> None:
 
 
 def test_explain_query(serve_pipeline: pathlib.Path) -> None:
-    """explain should return staleness info."""
-    response = send_rpc(serve_pipeline, "explain", {"stage": "hello"})
+    """explain returns staleness information for a qualified stage identity."""
+    response = send_rpc(serve_pipeline, "explain", {"stage": "test/hello"})
     assert "result" in response, f"Expected result, got: {response}"
     result = response["result"]
     assert isinstance(result, dict), f"Expected dict result, got: {type(result)}"
@@ -126,12 +137,12 @@ def test_explain_query(serve_pipeline: pathlib.Path) -> None:
 
 
 def test_stage_info_query(serve_pipeline: pathlib.Path) -> None:
-    """stage_info should return stage metadata."""
-    response = send_rpc(serve_pipeline, "stage_info", {"stage": "hello"})
+    """stage_info returns metadata for a qualified stage identity."""
+    response = send_rpc(serve_pipeline, "stage_info", {"stage": "test/hello"})
     assert "result" in response, f"Expected result, got: {response}"
     result = response["result"]
     assert isinstance(result, dict), f"Expected dict result, got: {type(result)}"
-    assert result["name"] == "hello", f"Expected name='hello', got: {result.get('name')}"
+    assert result["name"] == "test/hello", f"Expected name='test/hello', got: {result.get('name')}"
     assert "deps" in result, "Expected deps field in result"
     assert "outs" in result, "Expected outs field in result"
 

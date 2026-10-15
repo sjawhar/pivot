@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
     import click.testing
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 # =============================================================================
 # plots group Tests
@@ -49,7 +49,7 @@ def test_plots_show_help(runner: click.testing.CliRunner) -> None:
 
 
 def test_plots_show_no_plots(
-    mock_discovery: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """plots show with no registered plots should report empty."""
     _ = mock_discovery
@@ -59,7 +59,7 @@ def test_plots_show_no_plots(
 
 
 def test_plots_show_explicit_file_no_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -79,7 +79,7 @@ def test_plots_show_explicit_file_no_stages(
 
 
 def test_plots_show_creates_html(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -95,7 +95,7 @@ def test_plots_show_creates_html(
 
 
 def test_plots_show_custom_output_path(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -125,7 +125,7 @@ def test_plots_diff_help(runner: click.testing.CliRunner) -> None:
 
 
 def test_plots_diff_no_plots(
-    mock_discovery: Pipeline, runner: click.testing.CliRunner, tmp_path: pathlib.Path
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """plots diff with no registered plots should report empty."""
     _ = mock_discovery
@@ -135,7 +135,7 @@ def test_plots_diff_no_plots(
 
 
 def test_plots_diff_explicit_file_no_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -155,7 +155,7 @@ def test_plots_diff_explicit_file_no_stages(
 
 
 def test_plots_diff_json_format(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
     monkeypatch: pytest.MonkeyPatch,
@@ -185,7 +185,7 @@ def test_plots_diff_json_format(
 
 
 def test_plots_diff_md_format(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
     monkeypatch: pytest.MonkeyPatch,
@@ -210,7 +210,7 @@ def test_plots_diff_md_format(
 
 
 def test_plots_diff_no_path_flag(
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
     monkeypatch: pytest.MonkeyPatch,

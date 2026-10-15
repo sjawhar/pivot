@@ -30,7 +30,7 @@ def test_doctor_shows_all_checks_passing(
     runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor shows all checks passing when environment is correct."""
-    (set_project_root / "pivot.yaml").write_text("stages:\n  test:\n    cmd: echo hi\n")
+    (set_project_root / "pipeline.py").write_text("pipeline = None\n")
 
     result = runner.invoke(cli, ["doctor"])
 
@@ -53,8 +53,10 @@ def test_doctor_exits_1_on_error(
     runner: click.testing.CliRunner, set_project_root: pathlib.Path
 ) -> None:
     """pivot doctor exits 1 when errors are found."""
-    # Create a malformed pivot.yaml to trigger a parse error
-    (set_project_root / "pivot.yaml").write_text("stages:\n  - invalid: yaml: content\n")
+    # A cache directory that exists but is not writable is an ERROR-level check
+    cache_dir = set_project_root / ".pivot" / "cache"
+    cache_dir.mkdir(parents=True)
+    cache_dir.chmod(0o500)
 
     result = runner.invoke(cli, ["doctor"])
 
@@ -175,20 +177,6 @@ def test_check_project_root_returns_path_when_found(
     assert str(tmp_path) in event["value"]
 
 
-def test_check_pipeline_config_ok_with_yaml(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """_check_pipeline_config returns OK when pivot.yaml exists."""
-    (tmp_path / "pivot.yaml").write_text("stages:\n  test:\n    cmd: echo\n")
-
-    result = doctor_module._check_pipeline_config(tmp_path)
-
-    assert result["status"] == doctor_module.CheckStatus.OK
-    assert result["value"] == "pivot.yaml"
-    assert result["details"] is not None
-    assert result["details"]["stages"] == 1
-
-
 def test_check_pipeline_config_ok_with_pipeline_py(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -210,20 +198,6 @@ def test_check_pipeline_config_warn_when_missing(
 
     assert result["status"] == doctor_module.CheckStatus.WARN
     assert result["value"] == "not found"
-
-
-def test_check_pipeline_config_handles_scalar_yaml(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """_check_pipeline_config handles scalar YAML (not a dict)."""
-    (tmp_path / "pivot.yaml").write_text("just a string")
-
-    result = doctor_module._check_pipeline_config(tmp_path)
-
-    # Should not crash - should return OK with 0 stages
-    assert result["status"] == doctor_module.CheckStatus.OK
-    assert result["details"] is not None
-    assert result["details"]["stages"] == 0
 
 
 def test_check_cache_directory_ok_when_exists_and_writable(

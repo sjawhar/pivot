@@ -10,23 +10,18 @@ from __future__ import annotations
 import logging
 import pathlib
 
-from pivot import config, exceptions, parameters, path_utils, project, registry, run_history
+from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot.executor import worker
-from pivot.storage import cache, lock
+from pivot.storage import lock
 from pivot.storage import state as state_mod
-from pivot.types import DeferredWrites, DepEntry, HashInfo, LockData
+from pivot.storage import store as store_mod
+from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
 
 logger = logging.getLogger(__name__)
 
 
-def _get_registry() -> registry.StageRegistry:
-    """Get StageRegistry via CLI helpers (lazy import to avoid circular imports)."""
-    from pivot.cli import helpers as cli_helpers
-
-    return cli_helpers.get_registry()
-
-
 def commit_stages(
+    pipeline: registry.PipelineLike,
     stage_names: list[str] | None = None,
     force: bool = False,
 ) -> tuple[list[str], list[str]]:
@@ -39,14 +34,14 @@ def commit_stages(
     stages' lock files and cache entries remain written.
 
     Args:
+        pipeline: The pipeline whose stages are committed.
         stage_names: Specific stages to commit. None means all stale stages.
         force: If True, commit even if lock file is unchanged.
 
     Returns:
         Tuple of (committed, failed) stage name lists.
     """
-    stage_registry = _get_registry()
-    all_stage_names = stage_registry.list_stages()
+    all_stage_names = pipeline.list_stages()
 
     # Resolve target stages
     if stage_names is not None:
@@ -59,13 +54,18 @@ def commit_stages(
         targets = all_stage_names
 
     default_state_dir = config.get_state_dir()
-    cache_dir = config.get_cache_dir()
-    files_cache_dir = cache_dir / "files"
-    checkout_modes = config.get_checkout_mode_order()
+    project_root = project.get_project_root()
+    store = store_mod.WorkspaceStore(
+        project_root=project_root,
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+        cache_dir=config.get_cache_dir() / "files",
+        checkout_modes=config.get_checkout_mode_order(),
+    )
 
     committed = list[str]()
     failed = list[str]()
-    overrides = parameters.load_params_yaml()
+    overrides = parameters.load_params_yaml(pipeline)
 
     state_dbs = dict[pathlib.Path, state_mod.StateDB]()
 
@@ -77,13 +77,13 @@ def commit_stages(
 
     try:
         for stage_name in targets:
-            stage_info = stage_registry.get(stage_name)
+            stage_info = pipeline.get_stage(stage_name)
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
             stage_db = _get_state_db(stage_state_dir)
             stages_dir = lock.get_stages_dir(stage_state_dir)
 
             # 1. Get fingerprint
-            fingerprint = stage_registry.ensure_fingerprint(stage_name)
+            fingerprint = pipeline.ensure_fingerprint(stage_name)
 
             # 2. Get effective params
             current_params = parameters.get_effective_params(
@@ -92,7 +92,7 @@ def commit_stages(
 
             # 3. Hash deps (pass state_db for hash caching)
             dep_hashes, missing, unreadable, _ = worker.hash_dependencies(
-                stage_info["deps_paths"], stage_db
+                stage_info["deps"], store, stage_db
             )
             if missing:
                 logger.error(
@@ -110,53 +110,67 @@ def commit_stages(
                 continue
 
             # 4. Compute input_hash
+            dep_hashes_by_identity = {
+                types.identity_from_key(key): info for key, info in dep_hashes.items()
+            }
             stage_outs = stage_info["outs"]
-            project_root = project.get_project_root()
-            out_specs = [
-                (path_utils.canonicalize_artifact_path(str(out.path), project_root), out.cache)
-                for out in stage_outs
-            ]
-            deps_list = [
-                DepEntry(path=dep_path, hash=info["hash"]) for dep_path, info in dep_hashes.items()
-            ]
-            input_hash = run_history.compute_input_hash(
-                fingerprint, current_params, deps_list, out_specs
+            input_hash = run_history.stage_input_hash(
+                fingerprint,
+                current_params,
+                stage_info["deps"].values(),
+                dep_hashes_by_identity,
+                stage_outs,
             )
 
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
-            out_paths = [
-                path_utils.canonicalize_artifact_path(str(out.path), project_root)
-                for out in stage_outs
-            ]
+            out_paths = [types.identity_key(out.identity) for out in stage_outs]
             production_lock = lock.StageLock(stage_name, stages_dir)
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
             if not force and stage_names is None:
                 lock_data = production_lock.read()
                 if lock_data is not None:
-                    changed, _ = production_lock.is_changed_with_lock_data(
-                        lock_data, fingerprint, current_params, dep_hashes, out_paths
+                    decision = skip.check_stage(
+                        lock_data=lock_data,
+                        fingerprint=fingerprint,
+                        params=current_params,
+                        dep_hashes=dep_hashes_by_identity,
+                        out_paths=[out.identity for out in stage_outs],
                     )
-                    if not changed:
+                    if not decision["changed"]:
                         continue
 
             # 6. Hash and cache outputs
-            output_hashes = dict[str, HashInfo]()
+            output_hashes_by_key = dict[str, HashInfo]()
+            output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
+            output_paths_by_identity = dict[types.ArtifactIdentity, str]()
+            file_hash_entries = list[tuple[str, int, int, int, str]]()
             outputs_missing = False
-
             for out in stage_outs:
-                out_path = pathlib.Path(out.path)
-                if not out_path.exists():
-                    logger.error("Stage '%s': output missing: %s — skipping", stage_name, out.path)
+                identity_key = types.identity_key(out.identity)
+                try:
+                    out_path = store.resolve_display_path(out)
+                    hash_info = store.commit(out, out_path)
+                    file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
+                    output_hashes_by_key[identity_key] = hash_info
+                    output_hashes_by_identity[out.identity] = hash_info
+                    output_paths_by_identity[out.identity] = out_path.relative_to(
+                        project_root
+                    ).as_posix()
+                except FileNotFoundError:
+                    logger.error(
+                        "Stage '%s': output missing: %s — skipping", stage_name, identity_key
+                    )
                     outputs_missing = True
                     break
-
-                if out.cache:
-                    output_hashes[str(out.path)] = cache.save_to_cache(
-                        out_path, files_cache_dir, checkout_modes=checkout_modes
+                except OSError:
+                    logger.error(
+                        "Stage '%s': output unreadable: %s — skipping",
+                        stage_name,
+                        identity_key,
                     )
-                else:
-                    output_hashes[str(out.path)] = worker.hash_output(out_path, stage_db)
+                    outputs_missing = True
+                    break
 
             if outputs_missing:
                 failed.append(stage_name)
@@ -166,20 +180,25 @@ def commit_stages(
             new_lock_data = LockData(
                 code_manifest=fingerprint,
                 params=current_params,
-                dep_hashes=dict(sorted(dep_hashes.items())),
-                output_hashes=dict(sorted(output_hashes.items())),
+                dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
+                output_hashes=dict(sorted(output_hashes_by_identity.items())),
+                output_paths=output_paths_by_identity,
             )
             production_lock.write(new_lock_data)
 
             # 8. Update StateDB: dep generations, output generations, run cache entry
             run_id = run_history.generate_run_id()
 
-            dep_gen_map = worker.compute_dep_generation_map(stage_info["deps_paths"], stage_db)
+            dep_gen_map = worker.compute_dep_generation_map(stage_info["deps"], stage_db)
 
             # Only cached outputs belong in run cache
-            cached_paths = {out.path for out in stage_outs if out.cache}
+            cached_paths = {
+                types.identity_key(out.identity)
+                for out in stage_outs
+                if out.tag is not ArtifactTag.METRIC
+            }
             cached_output_hashes = {
-                path: oh for path, oh in output_hashes.items() if path in cached_paths
+                path: oh for path, oh in output_hashes_by_key.items() if path in cached_paths
             }
 
             output_entries = [
@@ -196,6 +215,8 @@ def commit_stages(
                     run_id=run_id,
                     output_hashes=output_entries,
                 )
+            if file_hash_entries:
+                deferred["file_hash_entries"] = file_hash_entries
 
             stage_db.apply_deferred_writes(stage_name, out_paths, deferred)
 

@@ -2,96 +2,71 @@
 
 from __future__ import annotations
 
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
-from helpers import register_test_stage
-from pivot import cli, loaders, outputs
+from pivot import cli, compose
 
 if TYPE_CHECKING:
     import click.testing
-    import pytest
-
-    from pivot.pipeline.pipeline import Pipeline
 
 # =============================================================================
-# Output TypedDicts for annotation-based stages
+# Module-level stage functions (required for pickling)
 # =============================================================================
 
 
-class _ExtractOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("raw.csv", loaders.PathOnly())]
+@compose.stage
+def extract(source: str) -> str:
+    return "raw"
 
 
-class _TransformOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("clean.csv", loaders.PathOnly())]
+@compose.stage
+def transform(raw: str) -> str:
+    return "clean"
 
 
-class _LoadOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+@compose.stage
+def load(clean: str) -> str:
+    return "output"
 
 
-class _BranchAOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("branch_a.csv", loaders.PathOnly())]
+@compose.stage
+def branch_a(raw: str) -> str:
+    return "a"
 
 
-class _BranchBOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("branch_b.csv", loaders.PathOnly())]
+@compose.stage
+def branch_b(raw: str) -> str:
+    return "b"
 
 
-class _MergeOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("merged.csv", loaders.PathOnly())]
+@compose.stage
+def merge(a: str, b: str) -> str:
+    return "merged"
 
 
-# =============================================================================
-# Module-level helper functions for stage registration
-# =============================================================================
+# The raw input "source.csv" appears as an artifact node in the default view only.
+_SOURCE = "source.csv"
 
 
-def _helper_extract() -> _ExtractOutputs:
-    pathlib.Path("raw.csv").write_text("raw")
-    return {"output": pathlib.Path("raw.csv")}
+def _register_extract(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        extract(pipeline.input(_SOURCE, t=str))
 
 
-def _helper_transform(
-    raw: Annotated[pathlib.Path, outputs.Dep("raw.csv", loaders.PathOnly())],
-) -> _TransformOutputs:
-    _ = raw
-    pathlib.Path("clean.csv").write_text("clean")
-    return {"output": pathlib.Path("clean.csv")}
+def _register_extract_transform(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        transform(extract(pipeline.input(_SOURCE, t=str)))
 
 
-def _helper_load(
-    clean: Annotated[pathlib.Path, outputs.Dep("clean.csv", loaders.PathOnly())],
-) -> _LoadOutputs:
-    _ = clean
-    pathlib.Path("output.csv").write_text("output")
-    return {"output": pathlib.Path("output.csv")}
+def _register_linear(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        load(transform(extract(pipeline.input(_SOURCE, t=str))))
 
 
-def _helper_branch_a(
-    raw: Annotated[pathlib.Path, outputs.Dep("raw.csv", loaders.PathOnly())],
-) -> _BranchAOutputs:
-    _ = raw
-    pathlib.Path("branch_a.csv").write_text("a")
-    return {"output": pathlib.Path("branch_a.csv")}
-
-
-def _helper_branch_b(
-    raw: Annotated[pathlib.Path, outputs.Dep("raw.csv", loaders.PathOnly())],
-) -> _BranchBOutputs:
-    _ = raw
-    pathlib.Path("branch_b.csv").write_text("b")
-    return {"output": pathlib.Path("branch_b.csv")}
-
-
-def _helper_merge(
-    a: Annotated[pathlib.Path, outputs.Dep("branch_a.csv", loaders.PathOnly())],
-    b: Annotated[pathlib.Path, outputs.Dep("branch_b.csv", loaders.PathOnly())],
-) -> _MergeOutputs:
-    _ = a, b
-    pathlib.Path("merged.csv").write_text("merged")
-    return {"output": pathlib.Path("merged.csv")}
+def _register_diamond(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        raw = extract(pipeline.input(_SOURCE, t=str))
+        merge(branch_a(raw), branch_b(raw))
 
 
 # =============================================================================
@@ -100,59 +75,47 @@ def _helper_merge(
 
 
 def test_dag_empty_pipeline_ascii(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows empty graph placeholder in ASCII (default) format."""
-
     result = runner.invoke(cli.cli, ["dag"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "(empty graph)" in result.output
 
 
 def test_dag_empty_pipeline_mermaid(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows valid empty Mermaid flowchart."""
-
     result = runner.invoke(cli.cli, ["dag", "--mermaid"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert result.output.strip() == "flowchart TD"
 
 
 def test_dag_empty_pipeline_dot(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows minimal DOT graph."""
-
     result = runner.invoke(cli.cli, ["dag", "--dot"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "digraph {" in result.output
     assert "}" in result.output
 
 
 def test_dag_empty_pipeline_md(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Empty pipeline shows Mermaid wrapped in markdown code block."""
-
     result = runner.invoke(cli.cli, ["dag", "--md"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "```mermaid" in result.output
     assert "```" in result.output
     assert "flowchart TD" in result.output
@@ -164,36 +127,30 @@ def test_dag_empty_pipeline_md(
 
 
 def test_dag_single_stage_ascii(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Single stage shows output artifact in ASCII."""
-
-    register_test_stage(_helper_extract, name="extract")
+    """Single stage shows its input and output artifacts in ASCII."""
+    _register_extract(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag"])
 
-    assert result.exit_code == 0
-    # Should show the artifact path
-    assert "raw.csv" in result.output
+    assert result.exit_code == 0, result.output
+    assert _SOURCE in result.output
+    assert "test/extract" in result.output
 
 
 def test_dag_single_stage_stages_flag(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Single stage shows stage name with --stages flag."""
-
-    register_test_stage(_helper_extract, name="extract")
+    _register_extract(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--stages"])
 
-    assert result.exit_code == 0
-    assert "extract" in result.output
+    assert result.exit_code == 0, result.output
+    assert "test/extract" in result.output
 
 
 # =============================================================================
@@ -202,87 +159,66 @@ def test_dag_single_stage_stages_flag(
 
 
 def test_dag_linear_chain_ascii(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows all artifacts in ASCII."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
-    register_test_stage(_helper_load, name="load")
+    _register_linear(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag"])
 
-    assert result.exit_code == 0
-    assert "raw.csv" in result.output
-    assert "clean.csv" in result.output
-    assert "output.csv" in result.output
+    assert result.exit_code == 0, result.output
+    assert _SOURCE in result.output
+    assert "test/extract" in result.output
+    assert "test/transform" in result.output
+    assert "test/load" in result.output
 
 
 def test_dag_linear_chain_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows all stages with --stages flag."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
-    register_test_stage(_helper_load, name="load")
+    _register_linear(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--stages"])
 
-    assert result.exit_code == 0
-    assert "extract" in result.output
-    assert "transform" in result.output
-    assert "load" in result.output
+    assert result.exit_code == 0, result.output
+    assert "test/extract" in result.output
+    assert "test/transform" in result.output
+    assert "test/load" in result.output
 
 
 def test_dag_linear_chain_mermaid(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows edges in Mermaid format."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
-    register_test_stage(_helper_load, name="load")
+    _register_linear(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--mermaid", "--stages"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "flowchart TD" in result.output
-    assert "extract" in result.output
-    assert "transform" in result.output
-    assert "load" in result.output
-    assert "-->" in result.output
+    assert "test/extract" in result.output
+    assert "test/transform" in result.output
+    assert "test/load" in result.output
+    assert result.output.count("-->") == 2, "Linear chain of 3 stages has 2 edges"
 
 
 def test_dag_linear_chain_dot(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Linear pipeline shows edges in DOT format."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
-    register_test_stage(_helper_load, name="load")
+    _register_linear(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--dot", "--stages"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "digraph {" in result.output
-    assert "extract" in result.output
-    assert "transform" in result.output
-    assert "load" in result.output
-    assert "->" in result.output
+    assert '"test/extract" -> "test/transform"' in result.output
+    assert '"test/transform" -> "test/load"' in result.output
 
 
 # =============================================================================
@@ -291,45 +227,33 @@ def test_dag_linear_chain_dot(
 
 
 def test_dag_diamond_pattern_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Diamond pattern shows all stages."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_branch_a, name="branch_a")
-    register_test_stage(_helper_branch_b, name="branch_b")
-    register_test_stage(_helper_merge, name="merge")
+    _register_diamond(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--stages"])
 
-    assert result.exit_code == 0
-    assert "extract" in result.output
-    assert "branch_a" in result.output
-    assert "branch_b" in result.output
-    assert "merge" in result.output
+    assert result.exit_code == 0, result.output
+    assert "test/extract" in result.output
+    assert "test/branch_a" in result.output
+    assert "test/branch_b" in result.output
+    assert "test/merge" in result.output
 
 
 def test_dag_diamond_pattern_mermaid(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Diamond pattern shows correct edges in Mermaid."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_branch_a, name="branch_a")
-    register_test_stage(_helper_branch_b, name="branch_b")
-    register_test_stage(_helper_merge, name="merge")
+    _register_diamond(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--mermaid", "--stages"])
 
-    assert result.exit_code == 0
-    # Should have multiple edges (fan-out and fan-in)
-    assert result.output.count("-->") >= 4
+    assert result.exit_code == 0, result.output
+    # Fan-out (2) and fan-in (2)
+    assert result.output.count("-->") == 4
 
 
 # =============================================================================
@@ -338,81 +262,78 @@ def test_dag_diamond_pattern_mermaid(
 
 
 def test_dag_target_single_stage(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Target filtering by stage name shows stage and its upstream."""
+    _register_linear(mock_discovery)
 
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
-    register_test_stage(_helper_load, name="load")
+    result = runner.invoke(cli.cli, ["dag", "--stages", "test/transform"])
+
+    assert result.exit_code == 0, result.output
+    # Should include extract (upstream) and transform
+    assert "test/extract" in result.output
+    assert "test/transform" in result.output
+    # Should NOT include load (downstream of transform)
+    assert "test/load" not in result.output
+
+
+def test_dag_target_bare_stage_name(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """dag resolves a bare stage name to its qualified form (names.resolve_stage_name)."""
+    _register_linear(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--stages", "transform"])
 
-    assert result.exit_code == 0
-    # Should include extract (upstream) and transform
-    assert "extract" in result.output
-    assert "transform" in result.output
-    # Should NOT include load (downstream of transform)
-    assert "load" not in result.output
+    assert result.exit_code == 0, result.output
+    assert "test/extract" in result.output
+    assert "test/transform" in result.output
+    assert "test/load" not in result.output
 
 
 def test_dag_target_artifact_path(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Target filtering by artifact path resolves to producing stage and upstream."""
+    _register_linear(mock_discovery)
 
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
-    register_test_stage(_helper_load, name="load")
+    # transform's output lives at data/test/transform.txt (WorkspaceStore layout)
+    result = runner.invoke(cli.cli, ["dag", "--stages", "data/test/transform.txt"])
 
-    # Artifact path resolves to the stage that produces it and its upstream deps
-    result = runner.invoke(cli.cli, ["dag", "--stages", "clean.csv"])
-
-    assert result.exit_code == 0
-    # Should include transform (produces clean.csv) and extract (upstream)
-    assert "transform" in result.output
-    assert "extract" in result.output
+    assert result.exit_code == 0, result.output
+    # Should include transform (produces the file) and extract (upstream)
+    assert "test/transform" in result.output
+    assert "test/extract" in result.output
     # Should NOT include load (downstream)
-    assert "load" not in result.output
+    assert "test/load" not in result.output
 
 
 def test_dag_target_multiple_targets(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Multiple targets includes all specified stages and their upstreams."""
+    _register_diamond(mock_discovery)
 
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_branch_a, name="branch_a")
-    register_test_stage(_helper_branch_b, name="branch_b")
-    register_test_stage(_helper_merge, name="merge")
+    result = runner.invoke(cli.cli, ["dag", "--stages", "test/branch_a", "test/branch_b"])
 
-    result = runner.invoke(cli.cli, ["dag", "--stages", "branch_a", "branch_b"])
-
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # Should include extract (upstream of both)
-    assert "extract" in result.output
-    assert "branch_a" in result.output
-    assert "branch_b" in result.output
+    assert "test/extract" in result.output
+    assert "test/branch_a" in result.output
+    assert "test/branch_b" in result.output
+    assert "test/merge" not in result.output
 
 
 def test_dag_target_invalid_stage_error(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Invalid target that doesn't match any stage or artifact shows error."""
-
-    register_test_stage(_helper_extract, name="extract")
+    _register_extract(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "nonexistent_stage"])
 
@@ -427,19 +348,15 @@ def test_dag_target_invalid_stage_error(
 
 
 def test_dag_md_format_wraps_mermaid(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--md flag wraps Mermaid output in markdown code block."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
+    _register_extract_transform(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--md", "--stages"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # Should have opening code fence
     assert "```mermaid" in result.output
     # Should have closing code fence
@@ -450,21 +367,19 @@ def test_dag_md_format_wraps_mermaid(
 
 
 def test_dag_ascii_default_format(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Default output format is ASCII."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
+    _register_extract_transform(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag"])
 
-    assert result.exit_code == 0
-    # ASCII format has box characters
-    assert "+" in result.output or "(empty graph)" in result.output
+    assert result.exit_code == 0, result.output
+    # ASCII format draws boxes
+    assert "+" in result.output
+    assert "flowchart" not in result.output
+    assert "digraph" not in result.output
 
 
 # =============================================================================
@@ -473,95 +388,78 @@ def test_dag_ascii_default_format(
 
 
 def test_dag_artifact_view_default(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default view shows artifacts, not stage names."""
-
-    register_test_stage(_helper_extract, name="extract")
+    """Default view shows artifacts (including raw inputs), not just stages."""
+    _register_extract(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag"])
 
-    assert result.exit_code == 0
-    # Should show artifact, not stage name
-    assert "raw.csv" in result.output
+    assert result.exit_code == 0, result.output
+    assert _SOURCE in result.output
 
 
 def test_dag_stage_view_with_flag(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--stages flag shows stage names instead of artifacts."""
-
-    register_test_stage(_helper_extract, name="extract")
+    _register_extract(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--stages"])
 
-    assert result.exit_code == 0
-    assert "extract" in result.output
+    assert result.exit_code == 0, result.output
+    assert "test/extract" in result.output
+    assert _SOURCE not in result.output
 
 
 def test_dag_stages_flag_with_mermaid(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--stages flag works with --mermaid format."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
+    _register_extract_transform(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--stages", "--mermaid"])
 
-    assert result.exit_code == 0
-    assert "extract" in result.output
-    assert "transform" in result.output
+    assert result.exit_code == 0, result.output
+    assert "test/extract" in result.output
+    assert "test/transform" in result.output
     # Should not show artifacts in stage view
-    assert "raw.csv" not in result.output
+    assert _SOURCE not in result.output
 
 
 def test_dag_stages_flag_with_dot(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--stages flag works with --dot format."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
+    _register_extract_transform(mock_discovery)
 
     result = runner.invoke(cli.cli, ["dag", "--stages", "--dot"])
 
-    assert result.exit_code == 0
-    assert "extract" in result.output
-    assert "transform" in result.output
+    assert result.exit_code == 0, result.output
+    assert "test/extract" in result.output
+    assert "test/transform" in result.output
+    assert _SOURCE not in result.output
 
 
 def test_dag_target_partial_resolution(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Command succeeds with partial target resolution (valid + invalid targets)."""
-
-    register_test_stage(_helper_extract, name="extract")
-    register_test_stage(_helper_transform, name="transform")
+    _register_extract_transform(mock_discovery)
 
     # Mix of valid and invalid targets - should succeed with valid targets
-    result = runner.invoke(cli.cli, ["dag", "extract", "nonexistent_stage", "--stages"])
+    result = runner.invoke(cli.cli, ["dag", "test/extract", "nonexistent_stage", "--stages"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # Valid target should be in output
-    assert "extract" in result.output
+    assert "test/extract" in result.output
     # transform not requested, should not appear in filtered output
-    assert "transform" not in result.output
+    assert "test/transform" not in result.output
 
 
 # =============================================================================

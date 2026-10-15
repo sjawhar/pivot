@@ -42,16 +42,16 @@ class SecurityValidationError(PivotError):
     """
 
 
-class OutputDuplicationError(ValidationError):
-    """Raised when two stages produce the same output."""
-
-
-class OverlappingOutputPathsError(ValidationError):
-    """Raised when output paths overlap (one is parent/child of another)."""
-
-
 class InvalidPathError(ValidationError):
     """Raised when a path is invalid (e.g., resolves outside project root)."""
+
+
+class OutputPathConflictError(ValidationError):
+    """Raised when two outputs resolve to the same workspace path, or one lies inside another."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Rename a stage, pipeline or output so each output has its own path"
 
 
 class DAGError(PivotError):
@@ -72,19 +72,34 @@ class DependencyNotFoundError(DAGError):
     _stage: str
     _dep: str
     _available: list[str]
+    _input_path: str | None
 
     def __init__(
         self,
         stage: str,
         dep: str,
         available_outputs: list[str] | None = None,
+        input_path: str | None = None,
     ) -> None:
         self._stage = stage
         self._dep = dep
         self._available = available_outputs or []
-        super().__init__(
-            f"Stage '{stage}' depends on '{dep}' which is not produced by any stage and does not exist on disk"
-        )
+        self._input_path = input_path
+        if input_path is None:
+            message = (
+                f"Stage '{stage}' depends on '{dep}' which is not produced by any stage "
+                + "and does not exist on disk"
+            )
+        else:
+            message = (
+                f"Stage '{stage}' depends on input '{dep}' (path {input_path}), "
+                + "which does not exist"
+            )
+        super().__init__(message)
+
+    @property
+    def stage(self) -> str:
+        return self._stage
 
     @override
     def format_user_message(self) -> str:
@@ -98,8 +113,37 @@ class DependencyNotFoundError(DAGError):
         return "Ensure the file exists or is produced by another stage"
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[str, str, list[str]]]:
-        return (self.__class__, (self._stage, self._dep, self._available))
+    def __reduce__(self) -> tuple[type, tuple[str, str, list[str], str | None]]:
+        return (self.__class__, (self._stage, self._dep, self._available, self._input_path))
+
+
+class MultipleDependencyError(DAGError):
+    """Raised when multiple dependencies are missing."""
+
+    _errors: list[DependencyNotFoundError]
+
+    def __init__(self, errors: list[DependencyNotFoundError]) -> None:
+        self._errors = errors
+        super().__init__(f"{len(errors)} missing dependency error(s)")
+
+    @property
+    def errors(self) -> list[DependencyNotFoundError]:
+        return self._errors
+
+    @override
+    def format_user_message(self) -> str:
+        lines = [f"{len(self._errors)} missing dependency error(s):"]
+        for err in self._errors:
+            lines.append(f"  - {err.format_user_message()}")
+        return "\n".join(lines)
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Ensure all dependency files exist or are produced by other stages"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[list[DependencyNotFoundError]]]:
+        return (self.__class__, (self._errors,))
 
 
 class StageNotFoundError(DAGError):
@@ -154,18 +198,6 @@ class ExecutionError(PivotError):
     """Raised when pipeline execution fails."""
 
 
-class DVCCompatError(PivotError):
-    """Base class for DVC compatibility errors."""
-
-
-class ExportError(DVCCompatError):
-    """Raised when stage export to DVC format fails."""
-
-
-class DVCImportError(DVCCompatError):
-    """Raised when dvc.yaml import fails."""
-
-
 class CacheError(PivotError):
     """Base class for cache-related errors."""
 
@@ -179,7 +211,7 @@ class CacheRestoreError(CacheError):
 
 
 class UncachedIncrementalOutputError(CacheError):
-    """Raised when an IncrementalOut file exists but is not in cache."""
+    """Raised when an incremental output exists without a cache entry."""
 
 
 class ParamsError(PivotError):
@@ -334,9 +366,13 @@ class ProjectNotInitializedError(InitError):
         return "Run 'pivot init' in your project root to initialize Pivot"
 
 
+class PipelineConfigError(PivotError):
+    """Raised when pipeline configuration is invalid."""
+
+
 class PipelineNotFoundError(PivotError):
-    """Raised when no pipeline is found (no pivot.yaml or pipeline.py)."""
+    """Raised when no pipeline is found (no pipeline.py)."""
 
     @override
     def get_suggestion(self) -> str:
-        return "Create pivot.yaml or pipeline.py to define your pipeline"
+        return "Create pipeline.py to define your pipeline"

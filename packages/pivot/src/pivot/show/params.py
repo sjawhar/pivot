@@ -30,38 +30,23 @@ class ParamDiff(TypedDict):
     change_type: ChangeType
 
 
-class CollectResult(TypedDict):
-    """Result from collect_params_from_stages."""
-
-    params: dict[str, StageParams]
-    unknown_stages: list[str]
-
-
 def collect_params_from_stages(
     stages: Sequence[str] | None = None,
-) -> CollectResult:
-    """Collect current effective params for stages.
-
-    Returns CollectResult with params dict and list of unknown stage names.
-    """
+) -> dict[str, StageParams]:
+    """Collect current effective params for registered stages (all stages when None)."""
     from pivot.cli import helpers as cli_helpers
 
     result = dict[str, StageParams]()
-    unknown_stages = list[str]()
-    overrides = parameters.load_params_yaml()
+    overrides = parameters.load_params_yaml(cli_helpers.get_pipeline())
 
-    available_stages = set(cli_helpers.list_stages())
-    stage_list = list(stages) if stages else list(available_stages)
+    stage_list = list(stages) if stages else cli_helpers.list_stages()
     for stage_name in stage_list:
-        if stage_name not in available_stages:
-            unknown_stages.append(stage_name)
-            continue
         stage_info = cli_helpers.get_stage(stage_name)
         effective = parameters.get_effective_params(stage_info["params"], stage_name, overrides)
         if effective:
             result[stage_name] = cast("StageParams", effective)
 
-    return CollectResult(params=result, unknown_stages=unknown_stages)
+    return result
 
 
 class HeadResult(TypedDict):

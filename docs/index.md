@@ -2,7 +2,7 @@
 
 **Change your code. Pivot knows what to run.**
 
-Pivot is a Python pipeline tool with automatic code change detection. Define stages with typed Python functions and annotations, and Pivot figures out what needs to re-run—no manual dependency declarations, no stale caches.
+Pivot is a Python pipeline tool with automatic code change detection. Stages are plain Python functions; you wire them together by calling them inside a `Pipeline` block, and Pivot works out what needs to re-run.
 
 ```bash
 pivot repro      # Run your pipeline
@@ -14,44 +14,29 @@ pivot repro      # Pivot detects the change and re-runs affected stages
 
 ```python
 # pipeline.py
-import json
-import pathlib
-from typing import Annotated, TypedDict
+import pandas as pd
 
-import pivot
+from pivot import Pipeline, stage
 
 
-class PreprocessOutputs(TypedDict):
-    clean: Annotated[pathlib.Path, pivot.Out("clean.json", pivot.loaders.PathOnly())]
+def normalize(values: pd.Series) -> pd.Series:
+    return values / values.max()
 
 
-def preprocess(
-    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
-) -> PreprocessOutputs:
-    clean = [row for row in raw["records"] if all(row.values())]
-    out_path = pathlib.Path("clean.json")
-    out_path.write_text(json.dumps({"records": clean}, indent=2))
-    return PreprocessOutputs(clean=out_path)
+@stage
+def preprocess(records: pd.DataFrame) -> pd.DataFrame:
+    clean = records.dropna()
+    return clean.assign(value=normalize(clean["value"]))
 
 
-class SummarizeOutputs(TypedDict):
-    summary: Annotated[pathlib.Path, pivot.Out("summary.json", pivot.loaders.PathOnly())]
+@stage
+def summarize(rows: pd.DataFrame) -> dict:
+    return {"count": len(rows), "mean": float(rows["value"].mean())}
 
 
-def summarize(
-    data: Annotated[dict, pivot.Dep("clean.json", pivot.loaders.JSON())],
-) -> SummarizeOutputs:
-    records = data["records"]
-    values = [r["value"] for r in records]
-    summary = {"count": len(values), "mean": sum(values) / len(values)}
-    out_path = pathlib.Path("summary.json")
-    out_path.write_text(json.dumps(summary, indent=2))
-    return SummarizeOutputs(summary=out_path)
-
-
-pipeline = pivot.Pipeline("my_pipeline")
-pipeline.register(preprocess)
-pipeline.register(summarize)
+with Pipeline("example") as pipeline:
+    records = pipeline.input("records.csv")  # reads data/raw/records.csv
+    summarize(preprocess(records))
 ```
 
 ```bash
@@ -59,41 +44,22 @@ pivot repro  # Runs both stages
 pivot repro  # Instant - nothing changed
 ```
 
-Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
+Edit `normalize` and `preprocess` re-runs. `summarize` runs only when `preprocess` produces different output bytes. Edit `summarize` and only `summarize` re-runs.
 
 ## What Makes Pivot Different
 
 ### Automatic Code Change Detection
 
-Change a helper function, and Pivot knows to re-run stages that call it:
+Pivot fingerprints each stage function and every helper it calls, so a change to `normalize` above re-runs `preprocess` without any declaration. No YAML to update, no list of source files to maintain. Downstream execution remains content-addressed: when `preprocess` writes the same bytes, its consumers stay cached.
 
-```python
-def normalize(records):
-    max_val = max(r["value"] for r in records)
-    return [{"name": r["name"], "value": r["value"] / max_val} for r in records]
+### No Paths in Pipeline Code
 
-def process(
-    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
-) -> ProcessOutputs:
-    return ProcessOutputs(result=normalize(raw["records"]))  # ...and Pivot re-runs process
-```
-
-No YAML to update. No manual declarations. Pivot parses your Python and tracks what each stage actually calls.
+Stages take data and return data. Pivot loads each input, saves each output under `data/<pipeline>/`, and builds the dependency graph from the handles you pass between stage calls.
 
 ### See Why Stages Run
 
 ```bash
-$ pivot status --explain train
-
-Stage: train
-  Status: WILL RUN
-  Reason: Code dependency changed
-
-  Changes:
-    func:normalize
-      Old: 5995c853
-      New: a1b2c3d4
-      File: src/utils.py:15
+pivot status --explain
 ```
 
 ### Watch Mode
@@ -119,16 +85,17 @@ See the [Quick Start](getting-started/quickstart.md) to build your first pipelin
 
 ## Learn More
 
-**Start here:** Follow the [Concepts](concepts/index.md) guide — a linear learning path from
-first principles to advanced caching.
+**Start here:** Follow the [Concepts](concepts/index.md) guide, a linear path from the first stage to caching.
 
 Then explore task-oriented [Guides](guides/watch-mode.md) for specific workflows:
-- [Watch Mode](guides/watch-mode.md) — Rapid iteration
-- [Multi-Pipeline Projects](guides/multi-pipeline.md) — Large project organization
-- [Remote Storage](guides/remote-storage.md) — Share cache across machines
-- [CI Integration](guides/ci-integration.md) — Pipeline verification in CI
+
+- [Watch Mode](guides/watch-mode.md): rapid iteration
+- [Multi-Pipeline Projects](guides/multi-pipeline.md): large project organization
+- [Remote Storage](guides/remote-storage.md): share cache across machines
+- [CI Integration](guides/ci-integration.md): pipeline verification in CI
 
 **Reference:**
-- [CLI Reference](cli/index.md) — All commands and options
-- [Architecture](architecture/overview.md) — For contributors
-- [Comparison with DVC](comparison.md) — Feature comparison
+
+- [CLI Reference](cli/index.md): all commands and options
+- [Architecture](architecture/overview.md): for contributors
+- [Comparison with DVC](comparison.md): feature comparison

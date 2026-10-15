@@ -6,7 +6,7 @@ Pivot is designed for high-performance pipeline execution with automatic code ch
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (pipeline.py or pivot.yaml)             │
+│  User Pipeline Code (pipeline.py: @stage + Pipeline)        │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -69,19 +69,9 @@ preprocess (produces data/clean.csv)
   train (consumes data/clean.csv)
 ```
 
-#### Path Resolution
+#### Dependency Resolution
 
-The graph builder uses two strategies to match dependencies to outputs:
-
-1. **Exact match (O(1)):** Dictionary lookup via `_build_outputs_map()`
-   - Maps each output path to its producing stage
-   - Handles the common case of explicit path dependencies
-
-2. **Directory overlap (O(log n)):** pygtrie prefix tree for parent/child relationships
-   - `has_subtrie()`: Dependency is parent of outputs (`data/` depends on `data/file.csv`)
-   - `shortest_prefix()`: Dependency is child of output (`data/file.csv` depends on `data/`)
-
-This handles cases where a stage declares a directory output and another stage depends on a file within that directory (or vice versa).
+The graph builder matches each dependency to its producer by artifact identity: `_build_outputs_map()` maps every output's `ArtifactIdentity` (producing stage plus output key) to that stage, and a dependency handle carries the identity of the output it was created from. A dependency with no producer is a pipeline input, resolved to its bound workspace path by the store. Paths play no part in matching, so two stages can never be linked by an accidental path prefix. Paths still decide where outputs land, so `StageRegistry.add_existing` refuses an output whose workspace path (`storage/store.py` `relative_output_path`) equals, contains, or lies inside another registered output's path.
 
 ### Scheduler
 
@@ -89,10 +79,12 @@ Coordinates deterministic scheduling (sync, no IO):
 
 - Maintains per-stage execution state
 - Tracks upstream/downstream completion
-- Enforces mutex groups (including exclusive `*`)
+- Holds per-stage resource permits until completion
 - Decides which stages are eligible to start
 
-Implemented in `packages/pivot/src/pivot/engine/scheduler.py` and owned by the Engine.
+Each stage holds one CPU unit by default. A decorator can request additional resources with
+`@stage(resources={"gpu": 1})`; non-CPU resources default to capacity 1 and can be configured
+per run. Implemented in `packages/pivot/src/pivot/engine/scheduler.py` and owned by the Engine.
 
 ### WatchCoordinator
 
@@ -156,8 +148,8 @@ Lock files use relative paths for portability across machines.
 
 ## Data Flow
 
-1. **Discovery** - CLI discovers pipeline (pipeline.py or pivot.yaml)
-2. **Registration** - Stages registered from Python code (or YAML config)
+1. **Discovery** - CLI finds and runs `pipeline.py`
+2. **Construction** - `@stage` calls inside `with Pipeline(...)` record stages; the block's exit builds the `StageRegistry`
 3. **DAG Construction** - Build dependency graph from outputs/inputs
 4. **Fingerprinting** - Hash code, params, and dependency content
 5. **Comparison** - Compare fingerprints with lock files
@@ -175,9 +167,10 @@ Lock files use relative paths for portability across machines.
 │       ├── ab/
 │       │   └── cdef...  # Files keyed by xxhash64
 │       └── ...
-├── stages/              # Per-stage lock files
-│   ├── preprocess.lock
-│   └── train.lock
+├── stages/              # Per-stage lock files, one directory per pipeline
+│   └── demo/
+│       ├── preprocess.lock
+│       └── train.lock
 ├── config.yaml          # Remote configuration
 └── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)
 ```

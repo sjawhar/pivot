@@ -13,8 +13,8 @@ pivot repro --watch
 The Engine monitors:
 
 - **Stage function code** - Python files (`.py`) defining stages
-- **Input data files** - Files declared as `deps`
-- **Configuration files** - `pivot.yaml`, `pivot.yml`, `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore`
+- **Input data files** - Files declared with `pipeline.input()`
+- **Configuration files** - `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore` (`engine/sources.py` `_CONFIG_FILE_NAMES`)
 
 When changes are detected, only affected stages and their downstream dependencies re-run.
 
@@ -55,11 +55,15 @@ The same Engine code handles both batch and watch mode:
 | Mode | Entry Point | Event Source |
 |------|-------------|--------------|
 | Batch (`pivot repro`) | `engine.run(exit_on_completion=True)` | OneShotSource |
-| Watch (`pivot repro --watch`) | `engine.run(exit_on_completion=False)` | FilesystemSource |
+| Watch (`pivot repro --watch`) | `engine.run(exit_on_completion=False)` | OneShotSource (startup run) + FilesystemSource |
 
 This unified architecture eliminates divergent code paths between batch and watch modes. Both modes use identical sink configuration, ensuring flags like `--quiet` work consistently.
 
 ## Event Flow
+
+### Startup
+
+A watched engine fingerprints every stage before it starts any other source or handles any input event, because a later reload diffs the edited pipeline against those fingerprints. Only the RPC server starts first, so a TUI or agent connects at once. While the snapshot runs, `run` and `commit` are refused at once with error `-32004` ("Engine is starting"), and `explain`, which fingerprints its stage, waits for it. The startup run and the file watcher start after it.
 
 ### Data Artifact Changes
 
@@ -70,15 +74,21 @@ When a dependency file changes:
 3. Engine executes affected stages and their downstream dependencies
 4. StageStarted/StageCompleted events emitted to sinks
 
+A change that arrives while a run is in progress cancels that run and queues one restart. The restart covers the cancelled run's stages and the new change's stages (all stages if either was all), so it never narrows what was going to run. A change that arrives while a run is still cancelling (a running stage has not finished) starts nothing alongside it: it joins the queued restart. An explicit RPC `cancel`, whether it comes before or after those changes, keeps the cancelled run's own stages out of the restart, so only the changes replay. If a code reload was deferred to the end of that run, the restart is folded into the reload's re-run, without stages the reload removed.
+
 ### Code or Config Changes
 
-When Python files or `pivot.yaml` change:
+When Python files or `pipeline.py` change:
 
 1. FilesystemSource emits `CodeOrConfigChanged(paths=[...])`
 2. Engine invalidates caches and reloads registry
 3. Engine rebuilds bipartite graph and updates WatchCoordinator
 4. Engine updates FilesystemSource watch paths
 5. Engine re-runs all stages
+
+A reload re-imports `pipeline.py`, fingerprints every stage and checks `params.yaml` in one daemon thread, so the RPC server, the TUI's event polling and cancellation keep running. That thread does every `sys.modules` change the reload makes (dropping project modules, importing the edited ones); the event loop then swaps in the new pipeline, emits `PipelineReloaded` and starts the re-run. Until the re-run has started, `run` and `commit` are refused at once with error `-32004` ("Engine is reloading"), and `explain` waits for the new pipeline. Reloads run one at a time. Ctrl-C stops watch mode at once, even while an import is slow or never returns: the engine abandons the reload thread, and interpreter shutdown does not wait for a daemon thread. Cancelling the `FilesystemSource` also sets its watcher's stop event, so the watch thread ends within one poll step instead of at its 5 s timeout.
+
+A pipeline is invalid when it fails to load (a syntax error, no `pipeline` variable), a stage fails to fingerprint, or `params.yaml` fails its checks (it does not parse, a key names no stage, a field is not one of the stage's params, or a value is one its params field rejects), whether the startup snapshot finds it or an edit introduces it. A run that loads a broken `params.yaml` before the watcher reports the edit marks the pipeline invalid too, without running anything. The Engine then logs `Pipeline invalid: <error>` and `Pipeline invalid - waiting for fix`, and emits `PipelineReloaded` with `error` set and the stages of the pipeline it still holds. While the pipeline is invalid, nothing runs and nothing is committed: RPC `run` and `commit` are refused with error `-32003`, and data changes and the startup run are dropped with a debug log. Data edited meanwhile therefore still differs from the stage locks, so the next edit that loads a good pipeline clears the error, reloads and reruns those stages.
 
 ### Output Filtering
 
