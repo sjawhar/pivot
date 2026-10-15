@@ -20,7 +20,7 @@ import pydantic
 import pytest
 from pydantic import BaseModel
 
-from pivot import ast_utils, exceptions, fingerprint
+from pivot import ast_utils, exceptions, fingerprint, loaders
 from pivot.storage import state as state_mod
 
 
@@ -684,6 +684,13 @@ def test_hash_is_stable():
     hashes = [fingerprint.hash_function_ast(func) for _ in range(10)]
 
     assert len(set(hashes)) == 1
+
+
+def test_loader_fingerprint_caches_underlying_methods(reset_fingerprint_cache_state):
+    """Loader methods remain cached after their temporary bound method is released."""
+    fingerprint.get_loader_fingerprint(loaders.CSV())
+
+    assert len(fingerprint._hash_function_ast_cache) == 3
 
 
 def test_hash_format():

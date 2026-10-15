@@ -1215,6 +1215,11 @@ def _resolve_dotted_path(parts: tuple[str, ...], ns: dict[str, Any]) -> Any:
     return obj
 
 
+def _method_function(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Return the underlying function behind a bound method."""
+    return cast("Callable[..., Any]", getattr(method, "__func__", method))
+
+
 def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
     """Generate fingerprint manifest for a loader instance.
 
@@ -1242,13 +1247,14 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
         if method is not None:
             _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
 
-    # Fingerprint save() if this is a Writer
+    # Use each method definition rather than a temporary bound method so the
+    # weak AST hash cache retains the entry across loader fingerprint calls.
     if isinstance(loader, loaders_module.Writer):
-        manifest[f"loader:{class_name}:save"] = hash_function_ast(loader.save)
+        manifest[f"loader:{class_name}:save"] = hash_function_ast(_method_function(loader.save))
 
     # Fingerprint load() if this is a Reader
     if isinstance(loader, loaders_module.Reader):
-        manifest[f"loader:{class_name}:load"] = hash_function_ast(loader.load)
+        manifest[f"loader:{class_name}:load"] = hash_function_ast(_method_function(loader.load))
 
         # Only fingerprint empty() if it's overridden in a Loader subclass
         if isinstance(loader, loaders_module.Loader):
@@ -1260,7 +1266,9 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
                     break
                 if "empty" in cls.__dict__:
                     # Found override in a subclass
-                    manifest[f"loader:{class_name}:empty"] = hash_function_ast(typed_loader.empty)
+                    manifest[f"loader:{class_name}:empty"] = hash_function_ast(
+                        _method_function(typed_loader.empty)
+                    )
                     break
 
     loader_any = cast("Any", loader)
