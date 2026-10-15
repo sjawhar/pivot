@@ -464,6 +464,110 @@ def test_list_names_a_single_output_as_the_return_value(
     assert expected in result.output, result.output
 
 
+_SUB_ROOTED_PIPELINE = """
+import pathlib
+
+import pandas as pd
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def double(x: pd.DataFrame) -> pd.DataFrame:
+    return x * 2
+
+
+with Pipeline("sub", root=pathlib.Path(__file__).parent) as pipeline:
+    double(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "raw_dir",
+    [
+        pytest.param("sub/data/raw", id="input-under-the-pipeline-root"),
+        pytest.param("data/raw", id="input-under-the-project-root"),
+    ],
+)
+def test_repro_refuses_a_pipeline_rooted_below_the_project(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_dir: str,
+) -> None:
+    """root= that is not the project root would split locks, StateDB and outputs: refuse it."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / raw_dir).mkdir(parents=True)
+        (cwd / raw_dir / "x.csv").write_text("a\n1\n")
+        (cwd / "sub").mkdir(exist_ok=True)
+        (cwd / "sub" / "pipeline.py").write_text(_SUB_ROOTED_PIPELINE)
+        monkeypatch.chdir(cwd / "sub")
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 1, result.output
+        assert "Pipeline 'sub' sets root=" in result.output, result.output
+        assert "always uses the project's .pivot and data/" in result.output, result.output
+        assert "remove root=" in result.output, result.output
+        assert not list(cwd.rglob("*.lock")), "no stage may run, so no lock is written"
+        assert not (cwd / "data" / "sub").exists(), "no output is written"
+        assert not (cwd / "sub" / "data" / "sub").exists(), "no output is written"
+
+
+def test_repro_of_a_pipeline_file_refuses_a_root_below_the_project(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`pivot repro sub/pipeline.py` loads the file directly; it is refused the same way."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a\n1\n")
+        (cwd / "sub").mkdir()
+        (cwd / "sub" / "pipeline.py").write_text(_SUB_ROOTED_PIPELINE)
+        (cwd / "pipeline.py").write_text(
+            "from pivot.compose import Pipeline\n\nwith Pipeline('top') as pipeline:\n    pass\n"
+        )
+
+        result = runner.invoke(cli.cli, ["repro", "sub/pipeline.py"])
+
+        assert result.exit_code == 1, result.output
+        assert "Pipeline 'sub' sets root=" in result.output, result.output
+        assert not list(cwd.rglob("*.lock")), "no stage may run, so no lock is written"
+
+
+_SYMLINKED_STATE_PIPELINE = """
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def copy(value: str) -> str:
+    return value
+
+
+with Pipeline("symlinked") as pipeline:
+    copy(pipeline.input("value.txt", t=str))
+"""
+
+
+def test_repro_and_status_accept_a_symlinked_project_state_dir(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A `.pivot` symlink is a supported project-state layout."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "value.txt").write_text("value")
+        (cwd / "pipeline.py").write_text(_SYMLINKED_STATE_PIPELINE)
+        state_dir = cwd.parent / f"{cwd.name}-state"
+        (cwd / ".pivot").rename(state_dir)
+        (cwd / ".pivot").symlink_to(state_dir, target_is_directory=True)
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        status = runner.invoke(cli.cli, ["status"])
+
+    assert repro.exit_code == 0, repro.output
+    assert status.exit_code == 0, status.output
+    assert (cwd / "data" / "symlinked" / "copy.txt").read_text() == "value"
+
+
 # =============================================================================
 # Explain Mode Tests
 # =============================================================================

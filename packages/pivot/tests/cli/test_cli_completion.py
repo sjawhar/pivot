@@ -253,13 +253,24 @@ def test_complete_targets_matches_complete_stages_without_key(
     complete_stages and does not load the pipeline."""
     _write_fresh_cache(tmp_path, ["test/train", "test/eval"])
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
-    load = mocker.patch.object(completion, "_get_pipeline_for_targets", autospec=True)
+    load = mocker.patch.object(completion, "_discover_pipeline", autospec=True)
 
     targets = completion.complete_targets(mock_ctx, mock_param, "tr")
     stages = completion.complete_stages(mock_ctx, mock_param, "tr")
 
     assert targets == stages == ["train"]
     load.assert_not_called()
+
+
+@pytest.mark.usefixtures("venv_inside_root_project")
+def test_complete_targets_offers_keys_on_cold_cache_with_venv_inside_root(
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
+) -> None:
+    """`stage:<TAB>` with no stage-name cache completes the output keys."""
+    result = completion.complete_targets(mock_ctx, mock_param, "train:")
+
+    assert result == ["train:model", "train:score"]
 
 
 # =============================================================================

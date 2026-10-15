@@ -12,7 +12,6 @@ import linecache
 import logging
 import pathlib
 import queue
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -2354,21 +2353,23 @@ class Engine:
             if engine_graph.get_producer(coordinator.graph, identity) == stage_name:
                 self._watch_output_stats[path] = self._snapshot_watch_output(path)
 
-    def _is_own_watch_output_write(self, path: pathlib.Path) -> bool:
-        """Return whether a changed output still matches the engine's own write."""
+    def _is_own_watch_output_write(
+        self, path: pathlib.Path, verdicts: dict[pathlib.Path, bool]
+    ) -> bool:
+        """Return whether a changed output still matches the engine's own write.
+
+        The deepest recorded root that is the path itself, or a directory output holding it,
+        decides. ``verdicts`` memoizes each root's answer for one event batch, so a batch of K
+        files in one directory output snapshots and compares that directory once.
+        """
         changed_path = project.normalize_path(path)
-        roots = sorted(
-            self._watch_output_stats,
-            key=lambda root: len(root.parts),
-            reverse=True,
-        )
-        for root in roots:
-            snapshot = self._watch_output_stats[root]
-            if changed_path != root and (
-                not snapshot.is_directory or not changed_path.is_relative_to(root)
-            ):
+        for root in (changed_path, *changed_path.parents):
+            recorded = self._watch_output_stats.get(root)
+            if recorded is None or (root != changed_path and not recorded.is_directory):
                 continue
-            return self._snapshot_watch_output(root) == snapshot
+            if root not in verdicts:
+                verdicts[root] = self._snapshot_watch_output(root) == recorded
+            return verdicts[root]
         return False
 
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
@@ -2381,6 +2382,7 @@ class Engine:
         paths = [pathlib.Path(path) for path in event["paths"]]
         filtered_paths = list[pathlib.Path]()
         deferred_paths = list[tuple[str, pathlib.Path]]()
+        own_write_verdicts = dict[pathlib.Path, bool]()
 
         for path in paths:
             if self._should_filter_path(path):
@@ -2389,7 +2391,7 @@ class Engine:
                 if producer is not None:
                     deferred_paths.append((producer, path))
                     continue
-            if self._is_own_watch_output_write(path):
+            if self._is_own_watch_output_write(path, own_write_verdicts):
                 continue
             filtered_paths.append(path)
 
@@ -2677,13 +2679,13 @@ class Engine:
     def _load_pipeline(self, root: pathlib.Path) -> tuple[registry.PipelineLike | None, list[str]]:
         """Re-import the project's pipeline, fingerprint every stage and check ``params.yaml``.
 
-        Runs in a daemon thread. All of a reload's ``sys.modules`` changes (dropping project
-        modules, importing the edited ones) happen in this one call, on one thread. Returns the
-        new pipeline, or None if the project defines none, and the errors that make it invalid.
+        Runs in a daemon thread. All of a reload's ``sys.modules`` changes happen in this one
+        call, on one thread: discovery's import session drops the project modules the previous
+        load imported, then imports the edited ones. Returns the new pipeline, or None if the
+        project defines none, and the errors that make it invalid.
         """
         from pivot import discovery
 
-        self._clear_project_modules(root)
         new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
         if new_pipeline is None:
             return None, list[str]()
@@ -2707,26 +2709,6 @@ class Engine:
         self._pipeline = old_pipeline
         self._pipeline_error = "\n".join(errors)
         return self._pipeline_error
-
-    def _clear_project_modules(self, root: pathlib.Path) -> None:
-        """Remove project modules from sys.modules."""
-        to_remove = list[str]()
-
-        for name, module in list(sys.modules.items()):
-            if module is None:  # pyright: ignore[reportUnnecessaryComparison] - sys.modules values can be None
-                continue
-            module_file = getattr(module, "__file__", None)
-            if module_file is None:
-                continue
-            try:
-                module_path = pathlib.Path(module_file)
-                if module_path.is_relative_to(root):
-                    to_remove.append(name)
-            except (TypeError, ValueError):
-                continue
-
-        for name in to_remove:
-            del sys.modules[name]
 
     async def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
         """Emit PipelineReloaded event with diff information.

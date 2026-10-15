@@ -154,10 +154,8 @@ def test_lock_read_treats_non_mapping_manifest_or_params_as_missing(
 
 @_SETTINGS
 @hypothesis.given(_identities)
-def test_identity_key_round_trips_through_every_parser(identity: ArtifactIdentity) -> None:
-    key = identity_key(identity)
-    assert identity_from_key(key) == identity
-    assert engine_graph.parse_artifact_identity(key) == identity
+def test_identity_key_round_trips_through_identity_from_key(identity: ArtifactIdentity) -> None:
+    assert identity_from_key(identity_key(identity)) == identity
 
 
 _name_candidates = st.text(

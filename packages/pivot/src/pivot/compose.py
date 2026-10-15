@@ -1,4 +1,3 @@
-# pyright: reportPrivateUsage=false, reportUnusedFunction=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false, reportImportCycles=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib
@@ -30,6 +29,7 @@ from . import (
     stage_def,
     types,
 )
+from . import loaders as loaders_mod
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -39,14 +39,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from networkx import DiGraph
-
-    from . import loaders as loaders_mod
-
-
-def _get_loaders():  # type: ignore[return-value]
-    from . import loaders
-
-    return loaders
 
 
 class _MetricTag:
@@ -92,19 +84,30 @@ __all__ = [
 ]
 
 
+def _artifact_tag(tag: _MetricTag | _PlotTag | _IncrementalTag | None) -> types.ArtifactTag:
+    """The engine tag for an output's compose tag; a dep and an out of one output share it."""
+    if isinstance(tag, _MetricTag):
+        return types.ArtifactTag.METRIC
+    if isinstance(tag, _PlotTag):
+        return types.ArtifactTag.PLOT
+    if isinstance(tag, _IncrementalTag):
+        return types.ArtifactTag.INCREMENTAL
+    return types.ArtifactTag.DATA
+
+
 def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types.ArtifactRef:
-    if isinstance(handle._source, _InputNode):
-        identity = types.ArtifactIdentity(producer=handle._source.name, key=None)
+    if isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle; public names would shadow output keys
+        identity = types.ArtifactIdentity(producer=handle._source.name, key=None)  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         types.validate_artifact_identity(identity)
         return types.ArtifactRef(
             identity=identity,
-            format=handle._source.format,
-            python_type=handle._python_type,
+            format=handle._source.format,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            python_type=handle._python_type,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
             tag=types.ArtifactTag.INPUT,
         )
 
-    source = handle._source
-    qualified_name = f"{handle._pipeline._name}/{source.name}"
+    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+    qualified_name = f"{handle._pipeline._name}/{source.name}"  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle and Pipeline
     if not source.output_specs:
         raise TypeError(
             f"Stage '{consumer_name}' depends on '{qualified_name}' which has no outputs "
@@ -114,9 +117,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         output_spec = source.output_specs[0]
         output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
     else:
-        matched = next(
-            (spec for spec in source.output_specs if spec.key == handle._output_key), None
-        )
+        matched = _select_output(source.output_specs, handle._output_key)  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         if matched is None:
             available = [spec.key for spec in source.output_specs]
             raise TypeError(
@@ -127,33 +128,24 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         output_spec = matched
         output_key = output_spec.key
 
-    if isinstance(output_spec.tag, _MetricTag):
-        dep_tag = types.ArtifactTag.METRIC
-    elif isinstance(output_spec.tag, _PlotTag):
-        dep_tag = types.ArtifactTag.PLOT
-    elif isinstance(output_spec.tag, _IncrementalTag):
-        dep_tag = types.ArtifactTag.INCREMENTAL
-    else:
-        dep_tag = types.ArtifactTag.DATA
-
     identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
     types.validate_artifact_identity(identity)
     return types.ArtifactRef(
         identity=identity,
         format=output_spec.format,
-        python_type=handle._python_type,
-        tag=dep_tag,
+        python_type=handle._python_type,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+        tag=_artifact_tag(output_spec.tag),
     )
 
 
 def _iter_stage_handles(node: _StageNode) -> list[ArtifactHandle]:
     result = list[ArtifactHandle]()
     for handle in node.input_handles.values():
-        if isinstance(handle._source, _StageNode):
+        if isinstance(handle._source, _StageNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
             result.append(handle)
     for handles in node.list_input_handles.values():
         for handle in handles:
-            if isinstance(handle._source, _StageNode):
+            if isinstance(handle._source, _StageNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                 result.append(handle)
     return result
 
@@ -193,14 +185,14 @@ def _cell_values(func: Callable[..., Any]) -> dict[str, object]:
     func = inspect.unwrap(func)
     names = func.__code__.co_freevars
     return {
-        name: fingerprint._cell_value(cell)
+        name: fingerprint._cell_value(cell)  # pyright: ignore[reportPrivateUsage] - the cell reader fingerprinting uses, so sameness matches it
         for name, cell in zip(names, func.__closure__ or (), strict=True)
     }
 
 
 def _default_values(func: Callable[..., Any]) -> dict[str, object]:
     """The live default values of `func`, by parameter name."""
-    return dict(fingerprint._function_defaults(inspect.unwrap(func)))
+    return dict(fingerprint._function_defaults(inspect.unwrap(func)))  # pyright: ignore[reportPrivateUsage] - the defaults reader fingerprinting uses
 
 
 def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
@@ -375,8 +367,6 @@ def _emit_stage_info(
     state_dir: pathlib.Path,
 ) -> registry.RegistryStageInfo:
     func = node.original_func
-    assert not hasattr(func, "_is_stage")
-
     deps = dict[str, types.ArtifactRef]()
 
     for param_name, handle in node.input_handles.items():
@@ -390,15 +380,6 @@ def _emit_stage_info(
 
     for output_spec in node.output_specs:
         output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
-        if isinstance(output_spec.tag, _MetricTag):
-            out_tag = types.ArtifactTag.METRIC
-        elif isinstance(output_spec.tag, _PlotTag):
-            out_tag = types.ArtifactTag.PLOT
-        elif isinstance(output_spec.tag, _IncrementalTag):
-            out_tag = types.ArtifactTag.INCREMENTAL
-        else:
-            out_tag = types.ArtifactTag.DATA
-
         identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
         types.validate_artifact_identity(identity)
         outs.append(
@@ -406,7 +387,7 @@ def _emit_stage_info(
                 identity=identity,
                 format=output_spec.format,
                 python_type=output_spec.python_type,
-                tag=out_tag,
+                tag=_artifact_tag(output_spec.tag),
             )
         )
 
@@ -594,7 +575,7 @@ class Pipeline:
                         name=name,
                         python_type=None,
                         path=path,
-                        format=_get_loaders().PathOnly(),
+                        format=loaders_mod.PathOnly(),
                         inherited=True,
                     )
                 )
@@ -826,7 +807,7 @@ class Pipeline:
                 name="__error__",
                 python_type=None,
                 path="__error__",
-                format=_get_loaders().PathOnly(),
+                format=loaders_mod.PathOnly(),
             )
             return ArtifactHandle(self, dummy_input, None, object)
 
@@ -859,9 +840,7 @@ class Pipeline:
                         continue
                     output_spec = output_specs[0]
                 else:
-                    output_spec = next(
-                        (spec for spec in output_specs if spec.key == value.key), None
-                    )
+                    output_spec = _select_output(output_specs, value.key)
                     if output_spec is None:
                         self._validation_errors.append(
                             f"{stage_name}: parameter '{param_name}' uses p.previous({value.key!r}) "
@@ -894,16 +873,19 @@ class Pipeline:
             elif isinstance(value, ArtifactHandle):
                 input_handles[param_name] = value
             elif isinstance(value, (list, tuple)):
-                items = list[Any](value)
-                if all(isinstance(v, ArtifactHandle) for v in items):
-                    list_input_handles[param_name] = items
+                collection = typing.cast("list[object] | tuple[object, ...]", value)
+                handles = [v for v in collection if isinstance(v, ArtifactHandle)]
+                if len(handles) == len(collection):
+                    list_input_handles[param_name] = handles
                     collection_params[param_name] = (
-                        CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
+                        CollectionKind.TUPLE
+                        if isinstance(collection, tuple)
+                        else CollectionKind.LIST
                     )
                 elif param_name in explicit_params:
                     self._validation_errors.append(
                         f"{stage_name}: parameter '{param_name}' has unsupported type "
-                        + f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                        + f"'{type(collection).__name__}'. Use ArtifactHandle (dependency), "
                         + "StageParams (config), or list/tuple of ArtifactHandle."
                     )
             elif isinstance(value, stage_def.StageParams):
@@ -981,10 +963,10 @@ class Pipeline:
 
         for node in self._stages:
             for handle in _iter_stage_handles(node):
-                if handle._pipeline is not self:
-                    source = handle._source
+                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                     assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))
+                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
 
         while stack:
             foreign_pipeline, stage_node = stack.pop()
@@ -995,10 +977,10 @@ class Pipeline:
             result.append((foreign_pipeline, stage_node))
 
             for handle in _iter_stage_handles(stage_node):
-                if handle._pipeline is not self:
-                    source = handle._source
+                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                     assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))
+                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
 
         return result
 
@@ -1009,8 +991,8 @@ class Pipeline:
         foreign_bindings = dict[str, str]()
         for _foreign_pipeline, foreign_node in closure:
             for handle in _iter_all_handles(foreign_node):
-                if isinstance(handle._source, _InputNode):
-                    inp = handle._source
+                if isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    inp = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                     if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
                         raise ValueError(
                             f"Input binding conflict: input '{inp.name}' is bound to "
@@ -1032,7 +1014,7 @@ class Pipeline:
                         name=name,
                         python_type=None,
                         path=path,
-                        format=_get_loaders().PathOnly(),
+                        format=loaders_mod.PathOnly(),
                         inherited=True,
                     )
                 )
@@ -1074,7 +1056,6 @@ def _resolve_default_formats() -> dict[type, str]:
 def _infer_format(
     python_type: type,
 ) -> loaders_mod.Writer[object]:
-    loaders = _get_loaders()
     defaults = _resolve_default_formats()
 
     # Unwrap generic aliases (e.g. dict[str, Any] → dict) for lookup and issubclass
@@ -1084,14 +1065,14 @@ def _infer_format(
     loader_name = defaults.get(lookup_type)
     if loader_name is not None:
         loader_class = typing.cast(
-            "type[loaders_mod.Writer[object]]", getattr(loaders, loader_name)
+            "type[loaders_mod.Writer[object]]", getattr(loaders_mod, loader_name)
         )
         return loader_class()
 
     for registered_type, registered_loader in defaults.items():
         if isinstance(lookup_type, type) and issubclass(lookup_type, registered_type):
             loader_class = typing.cast(
-                "type[loaders_mod.Writer[object]]", getattr(loaders, registered_loader)
+                "type[loaders_mod.Writer[object]]", getattr(loaders_mod, registered_loader)
             )
             return loader_class()
 
@@ -1105,38 +1086,35 @@ def _infer_format(
 def _format_extension(
     fmt: object,
 ) -> str:
-    loaders = _get_loaders()
-    return loaders.format_extension(fmt)
+    return loaders_mod.format_extension(fmt)
 
 
 def _infer_input_format_from_type(t: type) -> loaders_mod.Reader[object] | None:
-    loaders = _get_loaders()
     if t is pathlib.Path:
-        return loaders.PathOnly()  # type: ignore[return-value]
+        return loaders_mod.PathOnly()  # type: ignore[return-value]
     if t is str:
-        return loaders.Text()  # type: ignore[return-value]
+        return loaders_mod.Text()  # type: ignore[return-value]
     return None
 
 
 def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
     """Infer loader from file extension for p.input() declarations."""
-    loaders = _get_loaders()
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     match ext:
         case "yaml" | "yml":
-            return loaders.YAML()  # type: ignore[return-value]
+            return loaders_mod.YAML()  # type: ignore[return-value]
         case "csv":
-            return loaders.CSV()  # type: ignore[return-value]
+            return loaders_mod.CSV()  # type: ignore[return-value]
         case "jsonl":
-            return loaders.DataFrameJSONL()  # type: ignore[return-value]
+            return loaders_mod.DataFrameJSONL()  # type: ignore[return-value]
         case "json":
-            return loaders.JSON()  # type: ignore[return-value]
+            return loaders_mod.JSON()  # type: ignore[return-value]
         case "txt" | "sql" | "jinja":
-            return loaders.Text()  # type: ignore[return-value]
+            return loaders_mod.Text()  # type: ignore[return-value]
         case "pkl" | "pickle":
-            return loaders.Pickle()  # type: ignore[return-value]
+            return loaders_mod.Pickle()  # type: ignore[return-value]
         case _:
-            return loaders.PathOnly()  # type: ignore[return-value]
+            return loaders_mod.PathOnly()  # type: ignore[return-value]
 
 
 # --- Return type analysis ---
@@ -1175,7 +1153,6 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
     base_type = args[0]
     tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
     fmt: loaders_mod.Writer[object] | None = None
-    loaders = _get_loaders()
     label = _output_label(key)
     for metadata in args[1:]:
         if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
@@ -1186,7 +1163,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
                     + f"with {type(metadata).__name__.removeprefix('_').removesuffix('Tag').lower()}."
                 )
             tag = metadata
-        elif isinstance(metadata, loaders.Writer):
+        elif isinstance(metadata, loaders_mod.Writer):
             if fmt is not None:
                 raise exceptions.StageDefinitionError(
                     f"Stage '{stage_name}': {label} has more than one loader."
@@ -1209,20 +1186,26 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
 
     if fmt is None:
         if isinstance(tag, _PlotTag):
-            fmt = typing.cast("loaders_mod.Writer[object]", loaders.MatplotlibFigure())
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders_mod.MatplotlibFigure())
         elif isinstance(tag, _MetricTag):
-            fmt = typing.cast("loaders_mod.Writer[object]", loaders.YAML())
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders_mod.YAML())
         else:
             fmt = _infer_format(base_type)
 
-    if isinstance(tag, _IncrementalTag) and (
-        not isinstance(fmt, loaders.Loader) or type(fmt).empty is loaders.Loader.empty
-    ):
+    if isinstance(tag, _IncrementalTag) and not _implements_empty(fmt):
         raise exceptions.StageDefinitionError(
             f"Stage '{stage_name}': {label} is incremental but loader "
             + f"'{type(fmt).__name__}' does not implement empty()."
         )
     return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
+
+
+def _implements_empty(fmt: object) -> bool:
+    """Whether a loader can give an incremental output's first-run value (overrides empty())."""
+    base: object = loaders_mod.Loader
+    return isinstance(fmt, loaders_mod.Loader) and inspect.getattr_static(
+        type(fmt), "empty"
+    ) is not inspect.getattr_static(base, "empty")
 
 
 def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
@@ -1321,12 +1304,10 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(
+        return pipeline._record_stage(  # pyright: ignore[reportPrivateUsage] - the @stage wrapper is Pipeline's recording entry point
             func, wrapper, _get_output_specs(), normalized_resources, args, kwargs
         )
 
-    wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
-    wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
     return wrapper
 
 
@@ -1394,28 +1375,23 @@ class ArtifactHandle:
             raise AttributeError(name)
         if not isinstance(self._source, _StageNode):
             raise AttributeError(f"Input '{self._source.name}' has no sub-outputs")
-        for spec in self._source.output_specs:
-            if spec.key == name:
-                return ArtifactHandle(
-                    pipeline=self._pipeline,
-                    source=self._source,
-                    output_key=name,
-                    python_type=spec.python_type,
-                )
-        raise AttributeError(_no_such_output_message(self._source, name))
+        spec = _select_output(self._source.output_specs, name)
+        if spec is None:
+            raise AttributeError(_no_such_output_message(self._source, name))
+        return ArtifactHandle(self._pipeline, self._source, name, spec.python_type)
 
     def __getitem__(self, key: str) -> ArtifactHandle:
         if not isinstance(self._source, _StageNode):
             raise KeyError(f"Input '{self._source.name}' has no sub-outputs")
-        for spec in self._source.output_specs:
-            if spec.key == key:
-                return ArtifactHandle(
-                    pipeline=self._pipeline,
-                    source=self._source,
-                    output_key=key,
-                    python_type=spec.python_type,
-                )
-        raise KeyError(_no_such_output_message(self._source, key))
+        spec = _select_output(self._source.output_specs, key)
+        if spec is None:
+            raise KeyError(_no_such_output_message(self._source, key))
+        return ArtifactHandle(self._pipeline, self._source, key, spec.python_type)
+
+
+def _select_output(output_specs: list[_OutputSpec], key: str | None) -> _OutputSpec | None:
+    """The output spec named ``key``, or None when the stage has no such output."""
+    return next((spec for spec in output_specs if spec.key == key), None)
 
 
 def _no_such_output_message(source: _StageNode, key: str) -> str:
