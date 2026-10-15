@@ -24,6 +24,8 @@ def commit_stages(
     pipeline: registry.PipelineLike,
     stage_names: list[str] | None = None,
     force: bool = False,
+    *,
+    warn_left_out_symlinks: bool = True,
 ) -> tuple[list[str], list[str]]:
     """Commit current workspace state for stages.
 
@@ -37,6 +39,8 @@ def commit_stages(
         pipeline: The pipeline whose stages are committed.
         stage_names: Specific stages to commit. None means all stale stages.
         force: If True, commit even if lock file is unchanged.
+        warn_left_out_symlinks: Log the warning naming symlinks a directory output leaves
+            out. A quiet command turns it off.
 
     Returns:
         Tuple of (committed, failed) stage name lists.
@@ -150,7 +154,12 @@ def commit_stages(
                 identity_key = types.identity_key(out.identity)
                 try:
                     out_path = store.resolve_display_path(out)
-                    hash_info = store.commit(out, out_path, state_dir=default_state_dir)
+                    hash_info = store.commit(
+                        out,
+                        out_path,
+                        state_dir=default_state_dir,
+                        warn_left_out_symlinks=warn_left_out_symlinks,
+                    )
                     file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[out.identity] = hash_info

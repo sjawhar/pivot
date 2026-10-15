@@ -86,8 +86,13 @@ def _track_single_path(
     stage_outputs_resolved: dict[str, pathlib.Path],
     existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
+    *,
+    warn_left_out_symlinks: bool,
 ) -> TrackResult:
     """Track a single file or directory.
+
+    ``warn_left_out_symlinks`` logs the warning naming the symlinks a tracked directory leaves
+    out; the caller turns it off under ``--quiet``, like this command's other warning.
 
     Returns:
         TrackResult with optional warning and the tracked path for the caller to handle output.
@@ -150,7 +155,7 @@ def _track_single_path(
     # Hash and cache
     if path.is_dir():
         tree_hash, manifest = cache.hash_directory(
-            path, cache_dir=cache_dir, warn_left_out_symlinks=True
+            path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
         )
         total_size = sum(e["size"] for e in manifest)
         num_files = len(manifest)
@@ -214,7 +219,14 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     existing_tracked = track_mod.discover_pvt_files(project_root)
 
     for path_str in paths:
-        result = _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)
+        result = _track_single_path(
+            path_str,
+            cache_dir,
+            stage_outputs,
+            existing_tracked,
+            force,
+            warn_left_out_symlinks=not quiet,
+        )
         if not quiet:
             if result["warning"]:
                 click.echo(result["warning"], err=True)

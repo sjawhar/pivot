@@ -221,12 +221,20 @@ class WorkspaceStore:
         path: pathlib.Path,
         *,
         state_dir: pathlib.Path | None = None,
+        warn_left_out_symlinks: bool = True,
     ) -> types.HashInfo:
-        """Hash a written output once and, unless it is a metric, place it in the cache."""
+        """Hash a written output once and, unless it is a metric, place it in the cache.
+
+        ``warn_left_out_symlinks`` logs the warning naming the symlinks a directory output
+        leaves out; a quiet command turns it off.
+        """
         output_hash: types.HashInfo
         if path.is_dir():
             tree_hash, manifest = cache.hash_directory(
-                path, None, cache_dir=self._cache_dir, warn_left_out_symlinks=True
+                path,
+                None,
+                cache_dir=self._cache_dir,
+                warn_left_out_symlinks=warn_left_out_symlinks,
             )
             output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
         else:

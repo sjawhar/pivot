@@ -189,6 +189,27 @@ def test_track_warns_about_a_symlink_left_out_of_a_tracked_directory(
     assert [entry["relpath"] for entry in pvt["manifest"]] == ["keep.txt"]
 
 
+def test_quiet_track_and_commit_do_not_print_the_left_out_symlink_warning(
+    tmp_path: pathlib.Path,
+) -> None:
+    """-q silences the record-time warning for track and commit, as it does for repro."""
+    root = _project(
+        tmp_path,
+        {"pipeline.py": _DIRECTORY_ARTIFACT_SYMLINK_PIPELINE, "data/tracked/keep.txt": "keep"},
+    )
+    (root / "data" / "tracked" / "link.txt").symlink_to(root / "data" / "tracked" / "keep.txt")
+    _ok(_pivot(root, "track", "data/tracked"))
+    _ok(_pivot(root, "repro"))
+
+    for args in (("track", "--force", "data/tracked"), ("commit", "directory/assemble")):
+        quiet = _pivot(root, "-q", *args)
+        assert quiet.returncode == 0, quiet.stdout + quiet.stderr
+        assert quiet.stderr == "", args
+
+        loud = _ok(_pivot(root, *args))
+        assert "leaves out symlink link.txt" in " ".join(loud.split()), args
+
+
 _FORCE_CHECKOUT_PIPELINE = """\
 from pivot import Pipeline, stage
 
