@@ -1104,3 +1104,18 @@ with Pipeline("p") as pipeline:
 
     assert "Old: 10" in explanation, explanation
     assert "New: 0" in explanation, explanation
+
+
+def test_doctor_reports_invalid_remote_with_one_actionable_line(tmp_path: pathlib.Path) -> None:
+    """An invalid remote is a concise doctor diagnostic rather than a Pydantic traceback."""
+    root = _project(tmp_path, {})
+    (root / ".pivot/config.yaml").write_text("remotes:\n  broken: not-a-remote\n")
+
+    result = _pivot(root, "doctor", "--remote")
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert output.strip() == (
+        "Error: Invalid config remotes.broken: 'not-a-remote'; "
+        + "expected an S3 URL (s3://bucket/prefix)"
+    )
