@@ -20,13 +20,7 @@ class Store(Protocol):
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path: ...
 
-    def commit(
-        self,
-        ref: types.ArtifactRef,
-        path: pathlib.Path,
-        *,
-        state_dir: pathlib.Path | None = None,
-    ) -> types.HashInfo: ...
+    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo: ...
 
     def hash_artifact(
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None

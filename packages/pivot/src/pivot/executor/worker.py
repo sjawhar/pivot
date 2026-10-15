@@ -1001,9 +1001,11 @@ def _commit_outputs_with_store(
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
-        output_hashes[types.identity_key(ref.identity)] = store.commit(
-            ref, path, state_dir=project_state_dir
-        )
+        if isinstance(store, store_mod.WorkspaceStore):
+            output_hash = store.commit(ref, path, state_dir=project_state_dir)
+        else:
+            output_hash = store.commit(ref, path)
+        output_hashes[types.identity_key(ref.identity)] = output_hash
     return output_hashes
 
 
