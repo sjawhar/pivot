@@ -2,6 +2,7 @@
 
 import ast
 import dataclasses
+import enum
 import importlib.util
 import inspect
 import json
@@ -30,6 +31,12 @@ def _const_key(name: str) -> str:
 def _definition_key(prefix: str, value: object) -> str:
     typed_value: typing.Any = value
     return f"{prefix}:{typed_value.__module__}.{typed_value.__qualname__}"
+
+
+def _owned_key(prefix: str, owner: object, name: str) -> str:
+    """Key of a closure cell or local closure helper, under the function that owns it."""
+    typed_owner: typing.Any = owner
+    return f"{prefix}:{typed_owner.__module__}.{typed_owner.__qualname__}.{name}"
 
 
 def _loader_key(loader: object, member: str) -> str:
@@ -344,8 +351,8 @@ def test_constant_captured():
     fp = fingerprint.get_stage_fingerprint(use_constant)
 
     assert "self:use_constant" in fp
-    assert _const_key("CONSTANT") in fp
-    assert fp[_const_key("CONSTANT")] == "100"
+    assert _owned_key("const", use_constant, "CONSTANT") in fp
+    assert fp[_owned_key("const", use_constant, "CONSTANT")] == "100"
 
 
 def test_multiple_constants_captured():
@@ -361,9 +368,9 @@ def test_multiple_constants_captured():
 
     fp = fingerprint.get_stage_fingerprint(use_constants)
 
-    assert fp[_const_key("PI")] == "3.14159"
-    assert fp[_const_key("MAX_ITER")] == "100"
-    assert fp[_const_key("DEBUG")] == "True"
+    assert fp[_owned_key("const", use_constants, "PI")] == "3.14159"
+    assert fp[_owned_key("const", use_constants, "MAX_ITER")] == "100"
+    assert fp[_owned_key("const", use_constants, "DEBUG")] == "True"
 
 
 def test_transitive_dependencies_captured():
@@ -381,7 +388,7 @@ def test_transitive_dependencies_captured():
     fp = fingerprint.get_stage_fingerprint(top)
 
     assert "self:top" in fp
-    assert _definition_key("func", middle) in fp
+    assert _owned_key("func", top, "middle") in fp
     assert _definition_key("func", leaf) in fp
 
 
@@ -457,7 +464,7 @@ def test_circular_reference_handled():
     fp = fingerprint.get_stage_fingerprint(func_a)
 
     assert "self:func_a" in fp
-    assert _definition_key("func", func_b) in fp
+    assert _owned_key("func", func_a, "func_b") in fp
 
 
 def test_nested_function_not_in_globals():
@@ -925,8 +932,8 @@ def test_fingerprint_with_nonlocal():
     # Should have the function itself
     assert "self:inner" in fp
     # Nonlocal constant should be captured
-    assert _const_key("x") in fp
-    assert fp[_const_key("x")] == "10"
+    assert _owned_key("const", inner_func, "x") in fp
+    assert fp[_owned_key("const", inner_func, "x")] == "10"
 
 
 def test_fingerprint_callable_nonlocal():
@@ -943,7 +950,7 @@ def test_fingerprint_callable_nonlocal():
 
     # Should have the function and the nonlocal
     assert "self:add" in fp
-    assert _const_key("n") in fp
+    assert _owned_key("const", add_five, "n") in fp
 
 
 def test_stdlib_callable_in_closure_does_not_raise():
@@ -1084,7 +1091,7 @@ def test_fingerprint_merges_child_manifest():
 
     # Should have all three functions
     assert "self:top_func" in fp
-    assert _definition_key("func", middle_helper) in fp
+    assert _owned_key("func", top_func, "middle_helper") in fp
     assert _definition_key("func", leaf_helper) in fp
 
     # Should NOT have self:middle_helper or self:leaf_helper
@@ -1260,15 +1267,12 @@ def test_hash_pydantic_schema_adds_schema_and_nested_models():
     assert len(manifest[outer_schema]) == 16
 
 
-def test_discover_pydantic_field_types_tracks_nested_models():
-    """Should walk annotations and capture nested Pydantic models."""
-    manifest = dict[str, str]()
-    visited = set[int]()
-
-    fingerprint._discover_pydantic_field_types(list[_PydanticInnerModel], manifest, visited)
-
-    assert _definition_key("class", _PydanticInnerModel) in manifest
-    assert _definition_key("schema", _PydanticInnerModel) in manifest
+def test_model_field_classes_tracks_nested_models():
+    """Field annotations are walked into generics, so nested Pydantic models are found."""
+    assert fingerprint._model_field_classes(_PydanticOuterModel) == [
+        _PydanticInnerModel,
+        _PydanticInnerModel,
+    ]
 
 
 # ==============================================================================
@@ -1830,11 +1834,12 @@ def test_user_defined_generic_origin_tracked():
     class MyContainer(typing.Generic[T]):
         pass
 
-    hint = MyContainer[int]
+    def stage(items: MyContainer[int]) -> None:
+        pass
 
     manifest = dict[str, str]()
     visited = set[int]()
-    fingerprint._process_type_hint(hint, manifest, visited)
+    fingerprint._process_type_hint_dependencies(stage, manifest, visited)
 
     assert _definition_key("class", MyContainer) in manifest
 
@@ -2304,6 +2309,145 @@ def test_project_module_scan_is_reused_until_loaded_modules_change(
     finally:
         sys.modules.pop("scan_first", None)
         sys.modules.pop("scan_second", None)
+
+
+_READS_MODULE = """\
+import functools
+
+import pydantic
+
+import reads_settings
+
+FACTOR = reads_settings.SOURCE["factor"]
+
+
+class Model(pydantic.BaseModel):
+    width: int = reads_settings.SOURCE["width"]
+
+
+def helper(x, offset=reads_settings.SOURCE["offset"]):
+    return x + offset
+
+
+def apply(x, by):
+    return x * by
+
+
+BOUND = functools.partial(apply, by=reads_settings.SOURCE["by"])
+
+
+def make(scale):
+    def stage(x, model: Model = None):
+        return helper(BOUND(x)) * scale * reads_settings.ATTR + (lambda: FACTOR)()
+
+    return stage
+
+
+stage = make(reads_settings.SOURCE["scale"])
+"""
+
+
+@pytest.mark.parametrize("changed", ["factor", "width", "offset", "by", "scale", "attr"])
+def test_recorded_reads_detect_each_changed_live_value(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """Every value the walk read is checked on a hit: a global read by a nested lambda, a
+    closure cell, a helper's default, a `module.NAME` scalar, a partial argument and a schema
+    field default, each computed at import from a module that is not edited."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    source = {"factor": 1, "width": 2, "offset": 3, "by": 4, "scale": 5}
+    (tmp_path / "reads_settings.py").write_text(f"SOURCE = {source!r}\nATTR = 6\n")
+    (tmp_path / "reads_stage.py").write_text(_READS_MODULE)
+    writes = list[tuple[bytes, bytes]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
+    try:
+        settings = importlib.import_module("reads_settings")
+        module = importlib.import_module("reads_stage")
+        fingerprint.get_stage_fingerprint_cached("r/stage", module.stage)
+        ((_key, raw),) = writes
+        reads = json.loads(raw)["r"]
+        del sys.modules["reads_stage"]
+        module = importlib.import_module("reads_stage")
+        assert fingerprint._recorded_reads_hold(module.stage, reads), "re-import alone must hit"
+
+        if changed == "attr":
+            vars(settings)["ATTR"] += 100
+        else:
+            vars(settings)["SOURCE"][changed] += 100
+        del sys.modules["reads_stage"]
+        module = importlib.import_module("reads_stage")
+
+        assert fingerprint._recorded_reads_hold(module.stage, reads) is False
+    finally:
+        sys.modules.pop("reads_stage", None)
+        sys.modules.pop("reads_settings", None)
+
+
+def _helper_make_scaler(factor: int) -> typing.Callable[[int], int]:
+    def scaler(x: int) -> int:
+        return x * factor
+
+    return scaler
+
+
+def test_fingerprint_pass_names_each_function_once_and_ends_with_the_pass() -> None:
+    """Inside one pass a function's identity is computed once; the next pass sees a change."""
+    scaler = _helper_make_scaler(2)
+    before = fingerprint.function_identity(scaler)
+    cell = typing.cast("tuple[types.CellType, ...]", scaler.__closure__)[0]
+
+    with fingerprint.fingerprint_pass():
+        first = fingerprint.function_identity(scaler)
+        cell.cell_contents = 5
+        within = fingerprint.function_identity(scaler)
+    after = fingerprint.function_identity(scaler)
+
+    assert first == before and within is first, "one pass names the function once"
+    assert after["cells"] == [("factor", 5)], after
+    assert after != before, "a new pass reads the changed cell"
+
+
+class _ClassReadMode(enum.Enum):
+    FAST = "fast"
+
+
+def _helper_class_callback() -> int:
+    return 1
+
+
+class _ClassReadConfig:
+    SCALE: typing.ClassVar[int] = 3
+    MODE: typing.ClassVar[_ClassReadMode] = _ClassReadMode.FAST
+    CALLBACK: typing.ClassVar[typing.Callable[[], int]] = _helper_class_callback
+
+    @staticmethod
+    def static() -> int:
+        return 2
+
+
+def _helper_reads_class_attributes() -> int:
+    return (
+        _ClassReadConfig.SCALE
+        + _ClassReadConfig.CALLBACK()  # pyright: ignore[reportAttributeAccessIssue] - a function stored on the class
+        + _ClassReadConfig.static()
+        + len(_ClassReadConfig.MODE.value)
+    )
+
+
+def test_class_attributes_a_stage_reads_are_tracked_one_by_one() -> None:
+    """A scalar is `const:<class>.<NAME>`, an Enum member is name and value, a plain function
+    is walked; a staticmethod is left to the class AST hash."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_reads_class_attributes)
+    config = f"{__name__}._ClassReadConfig"
+
+    assert manifest[f"const:{config}.SCALE"] == "3", manifest
+    assert manifest[f"const:{config}.MODE"] == '_ClassReadMode.FAST="fast"', manifest
+    assert f"func:{__name__}._helper_class_callback" in manifest, manifest
+    assert not any(key.endswith(f"{config}.static") for key in manifest), manifest
+    assert f"class:{config}" in manifest, manifest
+    assert not any(key.startswith(f"const:{config}.__") for key in manifest), manifest
 
 
 # ==============================================================================

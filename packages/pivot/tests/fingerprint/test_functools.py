@@ -1,18 +1,25 @@
 # pyright: reportUnusedFunction=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownArgumentType=false
 """Tests for fingerprinting functools.partial and functools.wraps."""
 
+import dataclasses
 import functools
 import inspect
+import json
+import pathlib
 
-from pivot import fingerprint
+import pydantic
+import pytest
+
+from pivot import fingerprint, project
 
 
 def _definition_key(prefix: str, value: object) -> str:
     return f"{prefix}:{value.__module__}.{value.__qualname__}"  # type: ignore[attr-defined] - test types
 
 
-def _partial_key(name: str, member: str) -> str:
-    return f"partial:{__name__}.{name}.{member}"
+def _partial_key(owner: object, name: str, member: str) -> str:
+    """Key of a partial read through a closure cell of `owner`."""
+    return f"partial:{owner.__module__}.{owner.__qualname__}.{name}.{member}"  # type: ignore[attr-defined] - test types
 
 
 # --- Test helpers for functools.partial ---
@@ -75,8 +82,10 @@ def test_partial_is_detected():
 
     fp = fingerprint.get_stage_fingerprint(stage_with_partial)
 
-    assert _partial_key("bound", "args") in fp, f"partial args not tracked. Got: {list(fp.keys())}"
-    assert _partial_key("bound", "kwargs") in fp, (
+    assert _partial_key(stage_with_partial, "bound", "args") in fp, (
+        f"partial args not tracked. Got: {list(fp.keys())}"
+    )
+    assert _partial_key(stage_with_partial, "bound", "kwargs") in fp, (
         f"partial kwargs not tracked. Got: {list(fp.keys())}"
     )
     assert _definition_key("func", _helper_func) in fp, (
@@ -98,9 +107,10 @@ def test_partial_args_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    assert fp1[_partial_key("bound_v1", "args")] != fp2[_partial_key("bound_v2", "args")], (
-        "Different bound args should produce different hashes"
-    )
+    assert (
+        fp1[_partial_key(stage_v1, "bound_v1", "args")]
+        != fp2[_partial_key(stage_v2, "bound_v2", "args")]
+    ), "Different bound args should produce different hashes"
 
 
 def test_partial_kwargs_change_triggers_fingerprint_change():
@@ -117,9 +127,10 @@ def test_partial_kwargs_change_triggers_fingerprint_change():
     fp1 = fingerprint.get_stage_fingerprint(stage_v1)
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
-    assert fp1[_partial_key("bound_v1", "kwargs")] != fp2[_partial_key("bound_v2", "kwargs")], (
-        "Different bound kwargs should produce different hashes"
-    )
+    assert (
+        fp1[_partial_key(stage_v1, "bound_v1", "kwargs")]
+        != fp2[_partial_key(stage_v2, "bound_v2", "kwargs")]
+    ), "Different bound kwargs should produce different hashes"
 
 
 def test_partial_underlying_func_change_triggers_fingerprint_change():
@@ -156,9 +167,69 @@ def test_partial_in_closure():
     fp = fingerprint.get_stage_fingerprint(stage)
 
     # Should track partial from nonlocals
-    assert _partial_key("bound", "args") in fp, (
+    assert _partial_key(stage, "bound", "args") in fp, (
         f"partial args from closure not tracked. Got: {list(fp.keys())}"
     )
+
+
+def _helper_with_token(token: pydantic.SecretStr) -> int:
+    return len(token.get_secret_value())
+
+
+def test_secret_partial_argument_hashes_by_keyed_digest(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secret bound in a partial changes the hash, and no manifest entry holds its value."""
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    manifests = list[dict[str, str]]()
+    for value in ("first-secret", "second-secret"):
+        bound = functools.partial(_helper_with_token, token=pydantic.SecretStr(value))
+
+        def stage(bound: functools.partial[int] = bound) -> int:
+            return bound()
+
+        manifests.append(fingerprint.get_stage_fingerprint(stage))
+
+    first, second = (
+        {key: value for key, value in manifest.items() if key.startswith("partial:")}
+        for manifest in manifests
+    )
+    assert first.keys() == second.keys(), (first, second)
+    assert first != second, "a changed secret must change the partial hash"
+    text = json.dumps(manifests)
+    assert "first-secret" not in text and "second-secret" not in text
+    assert (tmp_path / ".pivot" / "secret.key").exists()
+
+
+@dataclasses.dataclass(frozen=True)
+class _Auth:
+    token: pydantic.SecretStr
+    user: str = "u"
+
+
+def _helper_with_auth(auth: _Auth) -> int:
+    return len(auth.token.get_secret_value())
+
+
+def test_secret_in_a_dataclass_partial_argument_hashes_by_keyed_digest(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataclass is canonicalised field by field, so its secret reaches the digest."""
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    hashes = [
+        fingerprint._serialize_value_for_hash(
+            functools.partial(_helper_with_auth, _Auth(pydantic.SecretStr(value)))
+        )
+        for value in ("first-secret", "second-secret")
+    ]
+
+    assert hashes[0] != hashes[1], "a changed secret must change the hash"
+    assert "first-secret" not in hashes[0] and "**********" not in hashes[0], hashes[0]
+    assert '"secret", "hmac:' in hashes[0], hashes[0]
 
 
 # --- Tests for functools.wraps ---

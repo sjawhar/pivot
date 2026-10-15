@@ -140,10 +140,11 @@ pipeline.include(report)
 Included stages keep their names (`prep/...`, `report/...`) and their own state
 directories. A stage reached twice (two included pipelines that share an
 upstream stage, or one pipeline included twice) is added once. Two stages under
-one name are refused unless they are one function (same file and name) called
-with the same inputs and input formats, outputs and output formats, params,
-resources, variant and fingerprint settings; the error names the first
-difference and the source files. A pipeline cannot include itself.
+one name are refused unless they are one function (same file, name, code, closure
+values and default values) called with the same inputs and input formats, outputs
+and output formats, params, resources, variant and fingerprint settings; the
+error names the first difference and the source files. A pipeline cannot include
+itself.
 
 ## State and Cache Layout
 
