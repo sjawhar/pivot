@@ -73,6 +73,13 @@ class _ExternalCallable:
 
 EXTERNAL_CALLABLE = _ExternalCallable()
 COMPILED_PATTERN = re.compile("x")
+BYTES_PATTERN = re.compile(rb"\x00+", re.MULTILINE)
+LONG_PATTERN = re.compile("a" * 300)
+STR_TUPLE = ("patchable", "squash")
+STR_FROZENSET = frozenset({"tasks", "runs", "models"})
+TUPLE_OF_TUPLE = (("a",),)
+FROZENSET_OF_TUPLE = frozenset({("a",)})
+TUPLE_OF_OBJECT = (FROZEN_DATACLASS,)
 NUMPY_LOG = np.log  # What `from numpy import log` binds: a ufunc, a callable instance.
 
 
@@ -154,7 +161,7 @@ def _stage_uses_callable_instance() -> int:
 
 
 def _stage_uses_three_non_scalar_values() -> int:
-    return len(IMMUTABLE_TUPLE) + len(IMMUTABLE_FROZENSET) + FROZEN_DATACLASS.value
+    return len(MUTABLE_LIST) + len(MUTABLE_SET) + FROZEN_DATACLASS.value
 
 
 CHILD_BAD: list[int] = []
@@ -165,7 +172,7 @@ def _child_with_non_scalar_capture() -> int:
 
 
 def _make_parent_with_nested_non_scalar_capture() -> Callable[[], int]:
-    PARENT_BAD = ()
+    PARENT_BAD = list[int]()
 
     def parent() -> int:
         return _child_with_non_scalar_capture() + len(PARENT_BAD)
@@ -204,6 +211,34 @@ def _stage_uses_external_callable() -> int:
 
 def _stage_uses_compiled_pattern() -> bool:
     return COMPILED_PATTERN.search("x") is not None
+
+
+def _stage_uses_bytes_pattern() -> bool:
+    return BYTES_PATTERN.search(b"\x00") is not None
+
+
+def _stage_uses_long_pattern() -> bool:
+    return LONG_PATTERN.search("a") is not None
+
+
+def _stage_uses_str_tuple() -> int:
+    return len(STR_TUPLE)
+
+
+def _stage_uses_str_frozenset() -> int:
+    return len(STR_FROZENSET)
+
+
+def _stage_uses_tuple_of_tuple() -> int:
+    return len(TUPLE_OF_TUPLE)
+
+
+def _stage_uses_frozenset_of_tuple() -> int:
+    return len(FROZENSET_OF_TUPLE)
+
+
+def _stage_uses_tuple_of_object() -> int:
+    return len(TUPLE_OF_OBJECT)
 
 
 @pytest.mark.parametrize(
@@ -251,8 +286,14 @@ def _stage_uses_compiled_pattern() -> bool:
             "FrozenModel",
             id="frozen-pydantic",
         ),
-        pytest.param(_stage_uses_tuple, "IMMUTABLE_TUPLE", "tuple", id="tuple"),
-        pytest.param(_stage_uses_frozenset, "IMMUTABLE_FROZENSET", "frozenset", id="frozenset"),
+        pytest.param(_stage_uses_tuple_of_tuple, "TUPLE_OF_TUPLE", "tuple", id="tuple-of-tuple"),
+        pytest.param(
+            _stage_uses_frozenset_of_tuple,
+            "FROZENSET_OF_TUPLE",
+            "frozenset",
+            id="frozenset-of-tuple",
+        ),
+        pytest.param(_stage_uses_tuple_of_object, "TUPLE_OF_OBJECT", "tuple", id="tuple-of-object"),
         pytest.param(_stage_uses_enum_member, "ENUM_MEMBER", "CapturedMode", id="enum-member"),
         pytest.param(
             _stage_uses_callable_instance,
@@ -285,7 +326,7 @@ def test_non_scalar_capture_errors_are_aggregated() -> None:
         fingerprint.get_stage_fingerprint_cached("train", _stage_uses_three_non_scalar_values)
 
     message = str(exc.value)
-    for variable in ("IMMUTABLE_TUPLE", "IMMUTABLE_FROZENSET", "FROZEN_DATACLASS"):
+    for variable in ("MUTABLE_LIST", "MUTABLE_SET", "FROZEN_DATACLASS"):
         assert variable in message
 
 
@@ -310,6 +351,113 @@ def test_nested_non_scalar_capture_errors_are_aggregated() -> None:
 )
 def test_scalar_and_callable_closure_capture_allows_fingerprint(func: Callable[[], object]) -> None:
     fingerprint.get_stage_fingerprint_cached("train", func)
+
+
+@pytest.mark.parametrize(
+    ("func", "variable", "expected"),
+    [
+        pytest.param(_stage_uses_str_tuple, "STR_TUPLE", ["tuple", ["patchable", "squash"]]),
+        pytest.param(_stage_uses_tuple, "IMMUTABLE_TUPLE", ["tuple", [1, 2]], id="int-tuple"),
+        pytest.param(
+            _stage_uses_str_frozenset,
+            "STR_FROZENSET",
+            ["frozenset", ["models", "runs", "tasks"]],
+            id="str-frozenset",
+        ),
+        pytest.param(
+            _stage_uses_compiled_pattern,
+            "COMPILED_PATTERN",
+            ["re.Pattern", "x", re.UNICODE],
+            id="str-pattern",
+        ),
+        pytest.param(
+            _stage_uses_bytes_pattern,
+            "BYTES_PATTERN",
+            ["re.Pattern", ["bytes", repr(rb"\x00+")], re.MULTILINE],
+            id="bytes-pattern",
+        ),
+    ],
+)
+def test_immutable_capture_is_tracked_by_value(
+    func: Callable[[], object], variable: str, expected: object
+) -> None:
+    manifest = fingerprint.get_stage_fingerprint_cached("train", func)
+
+    assert manifest[f"const:{__name__}.{variable}"] == json.dumps(expected)
+
+
+@pytest.mark.parametrize(
+    ("func", "variable", "same", "edited"),
+    [
+        pytest.param(
+            _stage_uses_str_tuple,
+            "STR_TUPLE",
+            ("patchable", "squash"),
+            ("patchable", "squash", "extra"),
+            id="tuple-member-added",
+        ),
+        pytest.param(
+            _stage_uses_str_tuple,
+            "STR_TUPLE",
+            ("patchable", "squash"),
+            ("squash", "patchable"),
+            id="tuple-reordered",
+        ),
+        pytest.param(
+            _stage_uses_str_frozenset,
+            "STR_FROZENSET",
+            frozenset({"runs", "models", "tasks"}),
+            frozenset({"runs", "models", "jobs"}),
+            id="frozenset-member-changed",
+        ),
+        pytest.param(
+            _stage_uses_compiled_pattern,
+            "COMPILED_PATTERN",
+            re.compile("x"),
+            re.compile("y"),
+            id="pattern-text",
+        ),
+        pytest.param(
+            _stage_uses_compiled_pattern,
+            "COMPILED_PATTERN",
+            re.compile("x"),
+            re.compile("x", re.IGNORECASE),
+            id="pattern-flags",
+        ),
+        pytest.param(
+            _stage_uses_bytes_pattern,
+            "BYTES_PATTERN",
+            re.compile(rb"\x00+", re.MULTILINE),
+            re.compile(rb"\x01+", re.MULTILINE),
+            id="bytes-pattern-text",
+        ),
+        pytest.param(
+            _stage_uses_long_pattern,
+            "LONG_PATTERN",
+            re.compile("a" * 300),
+            re.compile("a" * 299 + "b"),
+            id="pattern-past-repr-truncation",
+        ),
+    ],
+)
+def test_editing_immutable_capture_changes_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+    func: Callable[[], object],
+    variable: str,
+    same: object,
+    edited: object,
+) -> None:
+    # getclosurevars results are cached per function; a reloaded module has new functions.
+    fingerprint._getclosurevars_cache.clear()
+    original = fingerprint.get_stage_fingerprint(func)
+
+    monkeypatch.setattr(sys.modules[__name__], variable, same)
+    fingerprint._getclosurevars_cache.clear()
+    assert fingerprint.get_stage_fingerprint(func) == original, "an equal value is not a change"
+
+    monkeypatch.setattr(sys.modules[__name__], variable, edited)
+    fingerprint._getclosurevars_cache.clear()
+    assert fingerprint.get_stage_fingerprint(func) != original
 
 
 def test_common_function_and_class_references_are_allowed() -> None:
@@ -354,12 +502,6 @@ def test_moduleless_ufunc_bound_under_another_name_is_refused(
             id="external-callable-instance",
         ),
         pytest.param(
-            _stage_uses_compiled_pattern,
-            "COMPILED_PATTERN",
-            "Pattern",
-            id="compiled-regex",
-        ),
-        pytest.param(
             _stage_uses_moduleless_ufunc,
             "MODULELESS_UFUNC",
             "ufunc",
@@ -386,7 +528,7 @@ def test_unsafe_env_allows_non_scalar_capture(
 ) -> None:
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     with caplog.at_level(logging.WARNING):
-        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_tuple)
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_mutable_list)
 
     assert any("non-scalar variable" in record.message for record in caplog.records), (
         "Should warn when unsafe fingerprinting is enabled"
@@ -409,13 +551,13 @@ def test_unsafe_capture_does_not_populate_manifest_cache(
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", ManifestWrites())
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", cache_hit)
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
-    fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_tuple)
+    fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_mutable_list)
 
     assert "unsafe-cache" not in cached
 
     monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING")
     with pytest.raises(exceptions.StageDefinitionError):
-        fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_tuple)
+        fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_mutable_list)
 
 
 NESTED_MUTABLE_TUPLE = (1, [2, 3])
@@ -440,7 +582,7 @@ def test_unsafe_config_allows_non_scalar_capture(
         mock.patch("pivot.config.io.get_merged_config", autospec=True, return_value=unsafe_config),
         caplog.at_level(logging.WARNING),
     ):
-        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_frozenset)
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_mutable_set)
 
     assert any("non-scalar variable" in record.message for record in caplog.records), (
         "Should warn when unsafe fingerprinting via config is enabled"
@@ -474,6 +616,10 @@ def _stage_with_scalar_module_default(factor: int = DEFAULT_FACTOR) -> int:
     return factor
 
 
+def _stage_with_tuple_module_default(keys: tuple[str, ...] = STR_TUPLE) -> int:
+    return len(keys)
+
+
 @pytest.mark.parametrize(
     "func",
     [
@@ -505,12 +651,19 @@ def test_scalar_module_default_is_tracked_by_value() -> None:
     assert manifest[f"default:{__name__}._stage_with_scalar_module_default.factor"] == "2"
 
 
+def test_tuple_module_default_is_tracked_by_value() -> None:
+    manifest = fingerprint.get_stage_fingerprint(_stage_with_tuple_module_default)
+
+    key = f"default:{__name__}._stage_with_tuple_module_default.keys"
+    assert manifest[key] == json.dumps(["tuple", ["patchable", "squash"]])
+
+
 def test_wrapped_function_default_is_checked_by_value() -> None:
     """A `functools.wraps` wrapper is hashed as bytecode, which holds no default values."""
 
     def _wrap(func: Callable[..., object]) -> Callable[..., object]:
         @functools.wraps(func)
-        def wrapper(keys: tuple[int, ...] = (1, 2)) -> object:
+        def wrapper(keys: list[str] = DEFAULT_COLUMNS) -> object:
             return func(keys)
 
         return wrapper

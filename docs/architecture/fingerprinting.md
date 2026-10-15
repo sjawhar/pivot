@@ -142,11 +142,13 @@ result = eval("process(data)")     # String execution
 
 ### Module-Level Values
 
-A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; its current value is recorded with `repr()`, so editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance), directly or as `module.NAME`, is a `StageDefinitionError` that names the variable and points to `StageParams`. A default argument such as `cols=COLUMNS` or `factor=settings.FACTOR` on the stage or on a helper it calls follows the same rule, because a default is evaluated once when the module loads and its value never appears in the AST:
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; its current value is recorded with `repr()`, so editing it re-runs the stage. A `tuple` or `frozenset` whose members are all such scalars, and a compiled regular expression, are recorded by value too: the tuple as its members in order, the frozenset as its members sorted by their canonical JSON text (so the record does not depend on `PYTHONHASHSEED`), and the regex as its full pattern and flags. Members are checked one level deep only. Reading any other module-level value (list, dict, set, a tuple or frozenset holding a tuple, list, dict or object, enum member, class instance), directly or as `module.NAME`, is a `StageDefinitionError` that names the variable and points to `StageParams`. A default argument such as `cols=COLUMNS` or `factor=settings.FACTOR` on the stage or on a helper it calls follows the same rule, because a default is evaluated once when the module loads and its value never appears in the AST:
 
 ```python
 THRESHOLD = 0.5            # allowed: tracked by value
-COLUMNS = ("a", "b")       # error when a stage reads it
+COLUMNS = ("a", "b")       # allowed: tracked by value
+STMT = re.compile(r"\s+")  # allowed: tracked by pattern and flags
+PAIRS = (("a", 1),)        # error when a stage reads it (a tuple holding a tuple)
 CONFIG = load_config()     # error when a stage reads it (a dict)
 ```
 

@@ -61,7 +61,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Transitive helper (helper's helper)                  | ✅        | `test_fingerprint.py::test_transitive_dependencies_captured`                                                                        |
 | Global primitive constant                            | ✅        | `test_fingerprint.py::test_constant_captured`, `test_fingerprint.py::test_multiple_constants_captured`                              |
 | Global primitive constant change                     | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
-| Global collection, enum, or class instance           | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`                                                              |
+| Global tuple, frozenset of scalars, or compiled regex | ✅        | `test_safe_fingerprinting.py::test_immutable_capture_is_tracked_by_value`, `test_safe_fingerprinting.py::test_editing_immutable_capture_changes_fingerprint`, `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage` |
+| Frozenset capture across `PYTHONHASHSEED` values      | ✅        | `test_determinism.py::test_frozenset_capture_is_deterministic_across_hash_seeds`                                                   |
+| Global list, dict, set, nested tuple, enum, or instance | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`                                                            |
 | Non-scalar module attribute                          | ✅ (error) | `test_integration.py::test_non_scalar_module_attribute_raises`                                                                      |
 | Pydantic schema hash (model_json_schema)             | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                    |
 | Pydantic class in type hint                          | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                           |
@@ -299,8 +301,10 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 5. **Lazy imports not tracked**: Imports inside function bodies are not detected. Recommended pattern: use module-level imports.
 
 6. **Non-scalar module values are refused**: A stage may capture module-level `bool`, `int`,
-   `float`, `str`, `bytes`, and `None` values. Any other module-level value—including a
-   collection, enum member, frozen model, or class instance—raises `StageDefinitionError`.
+   `float`, `str`, `bytes`, and `None` values, a `tuple` or `frozenset` whose members are all
+   such scalars (one level deep), and a compiled regex (recorded by full pattern and flags).
+   Any other module-level value—including a list, dict, set, a tuple holding a collection or
+   object, enum member, frozen model, or class instance—raises `StageDefinitionError`.
    `core.unsafe_fingerprinting=true` or `PIVOT_UNSAFE_FINGERPRINTING=1` downgrades that error
    to a warning.
 
@@ -388,8 +392,9 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`
 
-18. **Non-scalar closure values are refused**: Values outside the permitted primitive set raise
-    `StageDefinitionError` rather than being hashed via `repr()`.
+18. **Non-scalar closure values are refused**: Values outside the permitted set (scalars,
+    tuples and frozensets of scalars, compiled regexes) raise `StageDefinitionError` rather
+    than being hashed via `repr()`.
 
 19. **Per-annotation type hint fallback**: When `typing.get_type_hints()` fails (e.g., one unresolvable `TYPE_CHECKING` import kills resolution for all annotations), each annotation string is evaluated individually via `eval()` in the function's global namespace. Resolvable annotations are still tracked; unresolvable ones are skipped.
 

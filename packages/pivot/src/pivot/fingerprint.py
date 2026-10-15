@@ -10,6 +10,7 @@ import logging
 import marshal
 import os
 import pathlib
+import re
 import sys
 import textwrap
 import types
@@ -46,8 +47,11 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 15 hashes an object with the default repr by its class and attributes, not its address.
 # Version 16 invalidates manifests hashed before StageParams forbade extra fields, which adds
 # additionalProperties: false to a params schema; no project source edit would invalidate them.
-_CACHE_SCHEMA_VERSION = 16
+# Version 17 hashes a compiled regex by its full pattern and flags, not its truncated repr.
+_CACHE_SCHEMA_VERSION = 17
 _REPR_SIZE_LIMIT = 10_000
+
+_SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
@@ -947,7 +951,8 @@ def _check_non_scalar_capture(
         subject += f" as the default of parameter '{parameter}'"
     message = (
         f"Stage '{stage_name}': {subject} (type: {type(value).__name__}).\n"
-        + "Pivot tracks only module-level bool, int, float, str, bytes, and None values. "
+        + "Pivot tracks module-level bool, int, float, str, bytes, and None values, tuples and "
+        + "frozensets of them, and compiled regexes. "
         + "Other values may change without a reliable fingerprint, which can cause silent wrong "
         + "outputs.\n"
         + "Fix: move this value into the stage's StageParams, or read it from a pipeline input.\n"
@@ -1073,10 +1078,32 @@ def _process_captured_value(
         _process_module_dependency(parameter or name, value, func, manifest, visited)
     elif isinstance(value, logging.Logger):
         return
-    elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-        manifest[f"const:{binding_ref}"] = repr(value)
     else:
-        _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+        text = _immutable_value_text(value)
+        if text is None:
+            _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+        else:
+            manifest[f"const:{binding_ref}"] = text
+
+
+def _immutable_value_text(value: Any) -> str | None:
+    """Return the manifest text that records an immutable value, or None when it has none.
+
+    A scalar is recorded by `repr`. A tuple or frozenset whose members are all scalars, and a
+    compiled regex, are recorded by their canonical form: frozenset members are sorted by
+    canonical JSON text, so the text does not depend on PYTHONHASHSEED, and a regex by its full
+    pattern and flags. Members are checked one level deep: a tuple holding a tuple, list, dict
+    or object has no text. Exact types are required, so a tuple subclass has no text either.
+    """
+    if isinstance(value, _SCALAR_TYPES):
+        return repr(value)
+    if type(value) in (tuple, frozenset) and all(
+        type(item) in _SCALAR_TYPES for item in cast("tuple[Any, ...] | frozenset[Any]", value)
+    ):
+        return _serialize_value_for_hash(value)
+    if isinstance(value, re.Pattern):
+        return _serialize_value_for_hash(value)
+    return None
 
 
 def _process_default_values(
@@ -1088,9 +1115,10 @@ def _process_default_values(
     `COLUMNS` in the AST and never its value. A scalar or a StageParams instance is tracked by
     value: a stage's own params hash does not cover a StageParams default on a helper. An
     ArtifactHandle default, or a list or tuple of them, is skipped: the pipeline wires it as a
-    real input, which is hashed as a dependency. Any other value is treated like a captured
-    module value, unless its default is a literal that the function's AST hash already
-    records, such as `keys=("a", "b")`.
+    real input, which is hashed as a dependency. A default that is a literal the function's AST
+    hash already records, such as `keys=("a", "b")`, is skipped too. Any other tuple, frozenset
+    or compiled regex that has a manifest text (`_immutable_value_text`) is tracked by value;
+    the rest is treated like a captured module value.
     """
     defaults = _function_defaults(func)
     if not defaults:
@@ -1102,7 +1130,7 @@ def _process_default_values(
     expressions: dict[str, ast.expr] | None = None
     for parameter, value in defaults:
         binding_ref = f"{func_ref}.{parameter}"
-        if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        if isinstance(value, _SCALAR_TYPES):
             manifest[f"default:{binding_ref}"] = repr(value)
             continue
         if isinstance(value, stage_def.StageParams):
@@ -1115,6 +1143,10 @@ def _process_default_values(
             expressions = _default_expressions(func)
         expression = expressions.get(parameter)
         if expression is not None and _is_literal(expression):
+            continue
+        text = _immutable_value_text(value)
+        if text is not None:
+            manifest[f"default:{binding_ref}"] = text
             continue
         source = ast.unparse(expression) if expression is not None else parameter
         _process_captured_value(
@@ -1458,8 +1490,10 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
     it is user code, because its `repr` holds a memory address; a `functools.partial` is
     canonicalised through its function and arguments for the same reason. An object whose
     class keeps `object.__repr__` (which holds the address) and that has a `__dict__` becomes
-    `[module.qualname, canonical(vars(obj))]`. Other leaves keep their `repr`, tagged with their
-    type. A class is a leaf, even a pydantic model class: only an instance is dumped.
+    `[module.qualname, canonical(vars(obj))]`. A compiled regex becomes
+    `["re.Pattern", canonical(pattern), flags]`: its `repr` cuts the pattern at 200 characters.
+    Other leaves keep their `repr`, tagged with their type. A class is a leaf, even a pydantic
+    model class: only an instance is dumped.
     """
     if hasattr(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump())
@@ -1489,6 +1523,9 @@ def _canonicalize_value_for_hash(value: Any) -> Any:
         return [type(collection).__name__, items]
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, re.Pattern):
+        pattern = cast("re.Pattern[Any]", value)
+        return ["re.Pattern", _canonicalize_value_for_hash(pattern.pattern), pattern.flags]
     if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value))]
     return [type(value).__name__, repr(value)]
@@ -1544,8 +1581,8 @@ def _process_module_dependency(
             )
         elif callable(attr_value) and is_user_code(attr_value):
             _add_callable_to_manifest(key, attr_value, manifest, visited)
-        elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
-            manifest[key] = repr(attr_value)
+        elif (text := _immutable_value_text(attr_value)) is not None:
+            manifest[key] = text
         else:
             _check_non_scalar_capture(
                 f"{module_name}.{attr_name}",

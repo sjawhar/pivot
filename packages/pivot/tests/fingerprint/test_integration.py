@@ -285,8 +285,8 @@ def run_stage():
 @pytest.mark.parametrize(
     ("module_source", "type_name"),
     [
-        pytest.param("VALUE = (1, 2)", "tuple", id="tuple"),
-        pytest.param("VALUE = frozenset({1, 2})", "frozenset", id="frozenset"),
+        pytest.param("VALUE = (1, [2])", "tuple", id="tuple-of-list"),
+        pytest.param("VALUE = frozenset({(1,)})", "frozenset", id="frozenset-of-tuple"),
         pytest.param("VALUE = [1, 2]", "list", id="list"),
         pytest.param("VALUE = {1, 2}", "set", id="set"),
         pytest.param("VALUE = {'one': 1}", "dict", id="dict"),
@@ -349,7 +349,7 @@ def test_unsafe_fingerprinting_warns_for_non_scalar_module_attribute(
 ) -> None:
     helper_name = "test_mod_d2_unsafe_helpers"
     stage_name = "test_mod_d2_unsafe_stage"
-    (module_dir / f"{helper_name}.py").write_text("VALUE = (1, 2)\n")
+    (module_dir / f"{helper_name}.py").write_text("VALUE = [1, 2]\n")
     (module_dir / f"{stage_name}.py").write_text(
         f"import {helper_name} as helpers\n\ndef run_stage():\n    return helpers.VALUE\n"
     )

@@ -89,9 +89,11 @@ def normalize(df):
 ### Module-Level Values
 
 A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or
-`None`; editing it re-runs the stage. Reading any other module-level value
-(tuple, list, dict, set, frozenset, enum member, class instance), directly or
-as `module.NAME`, is a `StageDefinitionError` that names the variable:
+`None`, a `tuple` or `frozenset` of such values, or a compiled regular
+expression; editing it re-runs the stage. A regex is tracked by its pattern and
+flags. Reading any other module-level value (list, dict, set, a tuple holding a
+tuple, list or object, enum member, class instance), directly or as
+`module.NAME`, is a `StageDefinitionError` that names the variable:
 
 ```python
 COLUMNS = {"score": float}  # Module-level dict
@@ -104,8 +106,9 @@ def process(data: pd.DataFrame) -> pd.DataFrame:
 
 The same rule covers a default argument that reads a module value, such as
 `def process(data, cols=COLUMNS)`, on the stage or on a helper it calls. A
-default is evaluated when the module loads, so Pivot checks its value: a scalar
-is tracked, and anything else is refused. A literal default such as
+default is evaluated when the module loads, so Pivot checks its value: a scalar,
+a tuple or frozenset of scalars, or a compiled regex is tracked, and anything
+else is refused. A literal default such as
 `cols=("a", "b")` is part of the function's code and is tracked with it. A
 default that is a pipeline input handle (`raw=RAW` with
 `RAW = pipeline.input("t.csv")`) is wired as an input and tracked by its content.
