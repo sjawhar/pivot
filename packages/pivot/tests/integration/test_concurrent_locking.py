@@ -82,6 +82,9 @@ from pivot.compose import Pipeline, stage
 
 @stage
 def stage_a() -> str:
+    # The worker holds stage_a's write lock while the stage runs; the marker tells the test
+    # the lock is held, so a consumer started after it must wait for this run.
+    pathlib.Path("a_started").touch()
     time.sleep(float(os.environ.get("STAGE_A_SLEEP", "3")))
     return "hello from a"
 
@@ -167,6 +170,22 @@ def _helper_run_pivot(
 
 def _helper_output(project: pathlib.Path, stage: str) -> pathlib.Path:
     return project / "data" / "test" / f"{stage}.txt"
+
+
+def _helper_wait_for_marker(
+    marker: pathlib.Path, process: subprocess.Popen[bytes], timeout: float = 60
+) -> None:
+    """Wait until a stage creates ``marker``; fail if its run exits or the deadline passes."""
+    deadline = time.monotonic() + timeout
+    while not marker.exists():
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"run exited before {marker.name}:\nstdout={stdout.decode()}\nstderr={stderr.decode()}"
+            )
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{marker.name} never appeared")
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +285,9 @@ def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
     env = _helper_make_env(STAGE_A_SLEEP="4")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    time.sleep(1.0)
+    # Start the consumer only once stage_a holds its write lock, not after a fixed delay:
+    # under load a 1s head start can expire before stage_a reaches its lock.
+    _helper_wait_for_marker(tmp_path / "a_started", proc_a)
     proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)
