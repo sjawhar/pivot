@@ -1117,5 +1117,37 @@ def test_doctor_reports_invalid_remote_with_one_actionable_line(tmp_path: pathli
     assert result.returncode == 1, output
     assert output.strip() == (
         "Error: Invalid config remotes.broken: 'not-a-remote'; "
-        + "expected an S3 URL (s3://bucket/prefix)"
+        + "Remote 'broken' must be a valid S3 URL (s3://bucket/prefix), got: not-a-remote"
+    )
+
+
+def test_doctor_identifies_invalid_remote_after_valid_remote(tmp_path: pathlib.Path) -> None:
+    """Doctor names the invalid remote rather than the mapping's first entry."""
+    root = _project(tmp_path, {})
+    (root / ".pivot/config.yaml").write_text(
+        "remotes:\n  good: s3://valid-bucket/prefix\n  broken: not-a-remote\n"
+    )
+
+    result = _pivot(root, "doctor", "--remote")
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert output.strip() == (
+        "Error: Invalid config remotes.broken: 'not-a-remote'; "
+        + "Remote 'broken' must be a valid S3 URL (s3://bucket/prefix), got: not-a-remote"
+    )
+
+
+def test_doctor_reports_remote_name_validation_rule(tmp_path: pathlib.Path) -> None:
+    """Doctor preserves the remote-name rule for an invalid remote name."""
+    root = _project(tmp_path, {})
+    (root / ".pivot/config.yaml").write_text("remotes:\n  'bad name': s3://valid-bucket/prefix\n")
+
+    result = _pivot(root, "doctor", "--remote")
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert output.strip() == (
+        "Error: Invalid config remotes.bad name: 's3://valid-bucket/prefix'; "
+        + "Invalid remote name 'bad name': must be alphanumeric, hyphens, or underscores"
     )
