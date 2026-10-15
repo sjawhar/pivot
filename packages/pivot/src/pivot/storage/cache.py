@@ -122,39 +122,12 @@ def hash_file(
     return file_hash, file_stat
 
 
-# Hardcoded ignore patterns for hot path - O(1) lookups only.
-# For full .pivotignore support, see pivot.ignore module.
-_IGNORE_DIRS: frozenset[str] = frozenset(
-    {
-        "__pycache__",
-        ".venv",
-        "venv",
-        ".git",
-        ".hg",
-        ".svn",
-        ".idea",
-        ".vscode",
-        "node_modules",
-        ".pivot",
-        "dist",
-        "build",
-    }
-)
-_IGNORE_SUFFIXES: tuple[str, ...] = (".pyc", ".pyo", ".swp", ".swo")
-
-
-def _should_skip_entry(entry: os.DirEntry[str]) -> bool:
-    """Fast ignore check for hot path. O(1) lookups only."""
-    name = entry.name
-    if entry.is_dir(follow_symlinks=False):
-        return name in _IGNORE_DIRS
-    # File checks: suffix and special patterns
-    return name.endswith(_IGNORE_SUFFIXES) or name.endswith("~") or name.startswith(".#")
-
-
 def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
-    """Yield all files recursively using os.scandir() for efficiency.
+    """Yield every file under `path` recursively, using os.scandir() for efficiency.
 
+    A declared directory artifact is hashed and cached whole: no name is ignored, so a change
+    to any file in a directory input reruns its consumers, and every file in a directory output
+    survives cache and restore. Ignore rules belong to code fingerprinting and watch mode.
     DirEntry objects cache stat results, avoiding redundant syscalls.
     Symlinks are skipped to prevent loops.
     PermissionError propagates to caller - partial hashes would be incorrect.
@@ -165,8 +138,6 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
     with os.scandir(path) as entries:
         for entry in entries:
             if entry.is_symlink():
-                continue
-            if _should_skip_entry(entry):
                 continue
             if entry.is_file():
                 yield entry
