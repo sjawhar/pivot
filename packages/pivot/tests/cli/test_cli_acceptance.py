@@ -11,6 +11,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 import uuid
 
 import boto3
@@ -1010,3 +1011,68 @@ with Pipeline("p") as pipeline:
     assert "value" in explanation, explanation
     assert "1 ran" in repro, repro
     assert (root / "data/p/show.txt").read_text() == "bool:True"
+
+
+def test_cached_run_uses_lock_committed_by_concurrent_incremental_run(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A queued restore must use the lock written by the run that held the artifact lock."""
+    gate = tmp_path / "entered"
+    pipeline = f"""\
+import pathlib
+import time
+from typing import Annotated
+
+from pivot import Pipeline, StageParams, incremental, stage
+
+
+class Params(StageParams):
+    gate: str = {str(gate)!r}
+
+
+@stage
+def grow(previous: str, params: Params) -> Annotated[str, incremental]:
+    pathlib.Path(params.gate).write_text("entered")
+    time.sleep(8)
+    return previous + "a"
+
+
+with Pipeline("p") as pipeline:
+    grow(pipeline.previous(), params=Params())
+"""
+    root = _project(tmp_path, {"pipeline.py": pipeline})
+    _ok(_pivot(root, "repro"))
+    gate.unlink()
+
+    first = subprocess.Popen(
+        [_PIVOT, "repro", "--json", "--force"],
+        cwd=root,
+        env=_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not gate.exists():
+            assert first.poll() is None and time.monotonic() < deadline
+            time.sleep(0.01)
+
+        second = subprocess.Popen(
+            [_PIVOT, "repro", "--json"],
+            cwd=root,
+            env=_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=60)
+        second_stdout, second_stderr = second.communicate(timeout=60)
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait()
+
+    assert first.returncode == 0, first_stdout + first_stderr
+    assert second.returncode == 0, second_stdout + second_stderr
+    assert (root / "data/p/grow.txt").read_text() == "aa"

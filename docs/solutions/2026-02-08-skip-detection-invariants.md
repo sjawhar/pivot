@@ -39,6 +39,8 @@ If **any** of these fail, the generation check returns `False` and execution fal
 - Output path list (detect added/removed outputs)
 
 This requires hashing all dependency files, hence O(n) in the number/size of dependencies.
+The coordinator reads the stage lock only after holding the stage's artifact locks, so a waiting
+run evaluates the state committed by the writer ahead of it.
 
 ### Tier 3: Run Cache Lookup
 
