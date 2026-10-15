@@ -540,6 +540,68 @@ with Pipeline("chains") as pipeline:
 """
 
 
+def _helper_nested_input_source() -> str:
+    """pipeline.py with a directory input and a file inside that directory."""
+    return """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def directory(folder: pathlib.Path) -> str:
+    return (folder / "a.txt").read_text()
+
+
+@stage
+def file(data: str) -> str:
+    return data
+
+
+with Pipeline("nested") as pipeline:
+    directory(pipeline.input("folder", path="inputs", t=pathlib.Path))
+    file(pipeline.input("file", path="inputs/a.txt", t=str))
+"""
+
+
+@pytest.mark.anyio
+async def test_child_input_edit_reruns_directory_and_file_consumers(
+    watch_project: pathlib.Path,
+) -> None:
+    """Changing a child input runs consumers of both the file and its directory."""
+    inputs = watch_project / "inputs"
+    inputs.mkdir()
+    child = inputs / "a.txt"
+    child.write_text("one")
+    (watch_project / "pipeline.py").write_text(_helper_nested_input_source())
+    pipeline = _helper_discover(watch_project)
+    directory_output = _helper_output_path(watch_project, pipeline, "nested/directory")
+    file_output = _helper_output_path(watch_project, pipeline, "nested/file")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=2)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert (directory_output.read_text(), file_output.read_text()) == ("one", "one")
+
+            child.write_text("two")
+            directory_done = await recorder.wait_for(
+                _helper_completes("nested/directory"), start=first_idle, timeout=10
+            )
+            file_done = await recorder.wait_for(
+                _helper_completes("nested/file"), start=first_idle, timeout=10
+            )
+            await recorder.wait_for(_helper_is_idle, start=max(directory_done, file_done), timeout=10)
+            assert (directory_output.read_text(), file_output.read_text()) == ("two", "two")
+            tg.cancel_scope.cancel()
+
+
 @pytest.mark.anyio
 async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
     watch_project: pathlib.Path,

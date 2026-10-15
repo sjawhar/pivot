@@ -114,6 +114,19 @@ class WatchCoordinator:
                 return None
             current = parent
 
+    def _matching_identities(self, path: pathlib.Path) -> list[pivot_types.ArtifactIdentity]:
+        """Return identities whose resolved paths contain a filesystem event path."""
+        current = project.normalize_path(path)
+        identities = list[pivot_types.ArtifactIdentity]()
+        while True:
+            identity = self._artifact_paths.get(current)
+            if identity is not None:
+                identities.append(identity)
+            parent = current.parent
+            if parent == current:
+                return identities
+            current = parent
+
     def should_filter_path(
         self,
         path: pathlib.Path,
@@ -134,13 +147,11 @@ class WatchCoordinator:
         """Get all stages affected by the changed paths, including downstream."""
         affected = set[str]()
         for path in paths:
-            identity = self.resolve_identity(path)
-            if identity is None:
-                continue
-            consumers = engine_graph.get_consumers(self._graph, identity)
-            affected.update(consumers)
-            for stage in consumers:
-                affected.update(engine_graph.get_downstream_stages(self._graph, stage))
+            for identity in self._matching_identities(path):
+                consumers = engine_graph.get_consumers(self._graph, identity)
+                affected.update(consumers)
+                for stage in consumers:
+                    affected.update(engine_graph.get_downstream_stages(self._graph, stage))
         return sorted(affected)
 
     def get_producer(self, path: pathlib.Path) -> str | None:
