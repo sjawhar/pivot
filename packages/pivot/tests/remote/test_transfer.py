@@ -576,7 +576,7 @@ async def test_pull_async_handles_failures(lock_project: Path, mocker: MockerFix
 
 
 async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixture) -> None:
-    """Pull includes dependency hashes when stages specified."""
+    """Pull includes the hashes of upstream stage outputs a target stage depends on."""
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
@@ -587,7 +587,7 @@ async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixtur
         state_dir,
         "my_stage",
         outs={None: FileHash(hash=out_hash)},
-        deps={"in.csv": FileHash(hash=dep_hash)},
+        deps={"upstream": FileHash(hash=dep_hash)},
     )
 
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
@@ -606,9 +606,11 @@ async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixtur
         mock_state,
         "origin",
         targets=["my_stage"],
-        all_stages=_helper_make_all_stages("my_stage"),
+        all_stages=_helper_make_all_stages("my_stage", "upstream"),
     )
 
+    requested = {hash_ for hash_, _ in mock_remote.download_batch.call_args.args[0]}
+    assert requested == {out_hash, dep_hash}, "Should request the output and the upstream dep"
     assert result["transferred"] == 2
 
 
@@ -836,7 +838,7 @@ async def test_pull_async_with_deps_integration(
         state_dir,
         "my_stage",
         outs={None: FileHash(hash=out_hash)},
-        deps={"in.csv": FileHash(hash=dep_hash)},
+        deps={"upstream": FileHash(hash=dep_hash)},
     )
 
     state_db = state_mod.StateDB(state_dir)
@@ -848,7 +850,7 @@ async def test_pull_async_with_deps_integration(
         state_db,
         "origin",
         targets=["my_stage"],
-        all_stages=_helper_make_all_stages("my_stage"),
+        all_stages=_helper_make_all_stages("my_stage", "upstream"),
     )
 
     files_dir = cache_dir / "files"

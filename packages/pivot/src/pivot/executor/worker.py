@@ -6,6 +6,7 @@ Must be module-level and picklable.
 
 from __future__ import annotations
 
+import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
@@ -1108,14 +1109,19 @@ class _QueueWriter:
 
     def _pipe_reader(self) -> None:
         assert self._read_fd is not None  # Guaranteed by _ensure_pipe() before thread starts
+        # One incremental decoder per pipe: a multi-byte character split across two reads
+        # is held until its remaining bytes arrive instead of becoming U+FFFD.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
             while True:
                 data = os.read(self._read_fd, 8192)
                 if not data:
                     break
-                self.write(data.decode("utf-8", errors="replace"))
+                self.write(decoder.decode(data))
         except OSError:
             pass
+        # Flush a truncated trailing character so it is reported rather than dropped.
+        self.write(decoder.decode(b"", final=True))
 
     def _ensure_pipe(self) -> None:
         if self._read_fd is not None:

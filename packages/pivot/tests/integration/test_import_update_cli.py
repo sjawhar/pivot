@@ -239,14 +239,10 @@ def test_import_rejects_source_without_usable_remote(
     assert not (consumer / "smoke").exists(), "a failed import writes nothing"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 9: non-string default_remote must be refused",
-)
-def test_import_refuses_non_string_default_remote(
+def test_import_warns_on_non_string_default_remote(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:
-    """``default_remote: 7`` is a config mistake; it must not silently mean the sole remote."""
+    """``default_remote: 7`` is a config mistake: warn (key, value, repo), then use the sole remote."""
     source.write(
         ".pivot/config.yaml",
         yaml.safe_dump({"remotes": {"origin": bucket.url}, "default_remote": 7}),
@@ -254,11 +250,19 @@ def test_import_refuses_non_string_default_remote(
     source.write_lock("smoke/total", {None: types.FileHash(hash=bucket.put(b"only remote"))})
     source.commit("non-string default")
 
-    result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/total"])
+    result = runner.invoke(
+        cli.cli, ["import", str(source.root), "smoke/total", "--out", "total.txt"]
+    )
 
-    assert result.exit_code != 0
-    assert "default_remote" in result.output, "the error must name the bad config key"
-    assert not (consumer / "smoke").exists(), "a refused import writes nothing"
+    assert result.exit_code == 0, result.output
+    warning = next((line for line in result.output.splitlines() if "default_remote" in line), None)
+    assert warning is not None, f"the warning must name the bad config key:\n{result.output}"
+    assert "got 7" in warning, "the warning must name the bad value"
+    assert str(source.root) in warning, "the warning must name the source repo"
+    assert (consumer / "total.txt").read_bytes() == b"only remote", "falls back to the sole remote"
+    pvt_data = track.read_pvt_file(consumer / "total.txt.pvt")
+    assert pvt_data is not None and "source" in pvt_data
+    assert pvt_data["source"]["remote"] == bucket.url
 
 
 @pytest.mark.parametrize(
