@@ -783,14 +783,7 @@ def _run_oneshot_mode(
     type=click.Path(path_type=pathlib.Path),
     help="Write TUI messages to JSONL file for monitoring",
 )
-@click.option(
-    "--resources",
-    "resource_capacity",
-    multiple=True,
-    callback=cli_helpers.parse_resource_capacities,
-    metavar="NAME=CAPACITY",
-    help="Set a scheduler resource capacity. May be repeated.",
-)
+@cli_decorators.resources_option
 @click.option(
     "--no-commit",
     is_flag=True,
