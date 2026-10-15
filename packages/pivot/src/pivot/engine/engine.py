@@ -1554,21 +1554,10 @@ class Engine:
         requests = dict[str, dict[str, int]]()
         for stage_name in execution_order:
             request = {"cpu": 1}
+            # compose validated each request: a positive int, or "all" for cpu only.
             for resource, amount in self._get_stage(stage_name)["resources"].items():
-                normalized_resource = resource.casefold()
-                capacity = capacities.setdefault(normalized_resource, 1)
-                if amount == "all":
-                    if normalized_resource != "cpu":
-                        raise exceptions.ValidationError(
-                            f"Stage {stage_name!r} requests 'all' for non-CPU resource {resource!r}"
-                        )
-                    request[normalized_resource] = capacity
-                elif isinstance(amount, int) and not isinstance(amount, bool) and amount > 0:
-                    request[normalized_resource] = amount
-                else:
-                    raise exceptions.ValidationError(
-                        f"Stage {stage_name!r} has an invalid request {amount!r} for resource {resource!r}"
-                    )
+                capacity = capacities.setdefault(resource, 1)
+                request[resource] = capacity if amount == "all" else int(amount)
             for resource, amount in request.items():
                 capacity = capacities[resource]
                 if amount > capacity:

@@ -712,3 +712,15 @@ def test_status_explain_json_writes_dep_identity_as_an_object(tmp_path: pathlib.
 
     stages = {stage["name"]: stage for stage in json.loads(out)["stages"]}
     assert stages["k/scale"]["dep_changes"][0]["identity"] == {"producer": "t.csv", "key": None}
+
+
+def test_list_refuses_a_fractional_resource_request(tmp_path: pathlib.Path) -> None:
+    """The decorator refuses what the scheduler cannot run, so the error comes at load."""
+    pipeline = _CPU_PIPELINE.replace('"cpu": 2', '"gpu": 0.5')
+    root = _project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+
+    proc = _pivot(root, "list")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Stage resource 'gpu' must request a positive integer or 'all'" in out, out

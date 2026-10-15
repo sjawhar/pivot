@@ -1240,8 +1240,14 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
 # --- @stage decorator ---
 
 
-def _normalize_stage_resources(resources: dict[str, int | str] | None) -> dict[str, int | str]:
-    """Normalize and validate a stage's scheduler resource requests."""
+def _normalize_stage_resources(
+    resources: collections.abc.Mapping[str, object] | None,
+) -> dict[str, int | str]:
+    """Normalize and validate a stage's scheduler resource requests.
+
+    Values are checked at runtime, since a decorator argument can be anything: a positive
+    int (not bool), or ``"all"`` for cpu only.
+    """
     if resources is None:
         return dict[str, int | str]()
 
@@ -1260,7 +1266,7 @@ def _normalize_stage_resources(resources: dict[str, int | str] | None) -> dict[s
             if normalized_name != "cpu":
                 raise ValueError("Only the 'cpu' resource supports an 'all' request")
             normalized[normalized_name] = "all"
-        elif not isinstance(request, bool) and request > 0:
+        elif isinstance(request, int) and not isinstance(request, bool) and request > 0:
             normalized[normalized_name] = request
         else:
             raise ValueError(
