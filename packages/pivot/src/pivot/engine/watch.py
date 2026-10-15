@@ -85,6 +85,7 @@ class WatchCoordinator:
     _graph: nx.DiGraph[str]
     _artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity]
     _resolved_output_paths: dict[tuple[pathlib.Path, str], list[pivot_types.ArtifactIdentity]]
+    _resolved_input_paths: dict[pathlib.Path, list[pivot_types.ArtifactIdentity]]
 
     def __init__(
         self,
@@ -93,16 +94,29 @@ class WatchCoordinator:
     ) -> None:
         self._graph = graph
         self._artifact_paths = artifact_paths
+        self._rebuild_resolved_path_indexes()
+
+    def _rebuild_resolved_path_indexes(self) -> None:
+        """Rebuild the input and output aliases used for physical watch paths."""
+        self._resolved_input_paths = dict[pathlib.Path, list[pivot_types.ArtifactIdentity]]()
         self._resolved_output_paths = dict[
             tuple[pathlib.Path, str], list[pivot_types.ArtifactIdentity]
         ]()
-        for output_path, identity in artifact_paths.items():
-            if engine_graph.get_producer(graph, identity) is None:
+        for artifact_path, identity in self._artifact_paths.items():
+            if engine_graph.get_producer(self._graph, identity) is None:
+                self._resolved_input_paths.setdefault(
+                    artifact_path.resolve(), list[pivot_types.ArtifactIdentity]()
+                ).append(identity)
                 continue
-            key = (output_path.parent.resolve(), output_path.name)
+            key = (artifact_path.parent.resolve(), artifact_path.name)
             self._resolved_output_paths.setdefault(
                 key, list[pivot_types.ArtifactIdentity]()
             ).append(identity)
+
+    def _refresh_resolved_path_indexes_for(self, path: pathlib.Path) -> None:
+        """Refresh aliases after a symlink or watched directory changes."""
+        if path.is_symlink() or path.is_dir():
+            self._rebuild_resolved_path_indexes()
 
     @property
     def graph(self) -> nx.DiGraph[str]:
@@ -115,6 +129,7 @@ class WatchCoordinator:
 
     def resolve_identity(self, path: pathlib.Path) -> pivot_types.ArtifactIdentity | None:
         """Resolve a filesystem event path to the matching artifact identity."""
+        self._refresh_resolved_path_indexes_for(path)
         outputs = self._matching_resolved_output_identities(path)
         if outputs:
             return outputs[0]
@@ -144,15 +159,15 @@ class WatchCoordinator:
     def _matching_resolved_input_identities(
         self, path: pathlib.Path
     ) -> list[pivot_types.ArtifactIdentity]:
-        """Return input identities whose resolved paths contain a resolved event path."""
         resolved_path = path.resolve()
         identities = list[pivot_types.ArtifactIdentity]()
-        for input_path, identity in self._artifact_paths.items():
-            if engine_graph.get_producer(self._graph, identity) is not None:
-                continue
-            if resolved_path.is_relative_to(input_path.resolve()):
-                identities.append(identity)
-        return identities
+        current = resolved_path
+        while True:
+            identities.extend(self._resolved_input_paths.get(current, []))
+            parent = current.parent
+            if parent == current:
+                return identities
+            current = parent
 
     def _matching_resolved_output_identities(
         self, path: pathlib.Path
@@ -180,6 +195,7 @@ class WatchCoordinator:
         """Get all stages affected by the changed paths, including downstream."""
         affected = set[str]()
         for path in paths:
+            self._refresh_resolved_path_indexes_for(path)
             output_identities = set(self._matching_resolved_output_identities(path))
             if output_identities:
                 identities = output_identities

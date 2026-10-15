@@ -160,6 +160,34 @@ def test_physical_output_event_uses_symlinked_output_identity(
     assert coord.get_affected_stages([physical_output]) == ["consume_output"]
 
 
+def test_symlink_event_refreshes_retargeted_input_alias(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A symlink event refreshes aliases before an edit arrives through its new target."""
+    first_target = tmp_path / "first"
+    second_target = tmp_path / "second"
+    first_target.mkdir()
+    second_target.mkdir()
+    first_input = first_target / "a.txt"
+    second_input = second_target / "a.txt"
+    first_input.write_text("first")
+    second_input.write_text("second")
+    alias = tmp_path / "alias"
+    alias.symlink_to(first_target, target_is_directory=True)
+    graph, artifact_paths = _helper_build_graph(
+        {"aliasdir": {"deps": [str(alias)], "outs": [str(tmp_path / "output.txt")]}}
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+
+    assert coord.get_affected_stages([first_input]) == ["aliasdir"]
+
+    alias.unlink()
+    alias.symlink_to(second_target, target_is_directory=True)
+    assert coord.get_affected_stages([alias]) == ["aliasdir"]
+
+    assert coord.get_affected_stages([second_input]) == ["aliasdir"]
+
+
 # =============================================================================
 # Path Filtering
 # =============================================================================
