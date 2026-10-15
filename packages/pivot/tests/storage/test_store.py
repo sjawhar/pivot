@@ -303,7 +303,7 @@ def test_workspace_store_refuses_an_output_resolving_outside_project(
         loaders.Text(),
     )
 
-    with pytest.raises(ValueError, match="resolves outside project root"):
+    with pytest.raises(ValueError, match="outside project root"):
         workspace_store.prepare_output(ref)
 
     assert sentinel.read_text() == "PRESERVE"

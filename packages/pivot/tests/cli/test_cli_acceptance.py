@@ -209,6 +209,39 @@ def test_repro_refuses_an_absolute_output_key_before_writing_outside_project(
     assert not (root / "data" / "demo").exists(), "definition rejection prevents execution"
 
 
+_SYMLINKED_DATA_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def copy(value: str) -> str:
+    return value
+
+
+with Pipeline("symlinked-data") as pipeline:
+    copy(pipeline.input("value.txt", t=str))
+"""
+
+
+def test_repro_allows_data_symlinked_outside_the_project(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    external_data = tmp_path / "big-data"
+    external_data.mkdir()
+    (root / "data").symlink_to(external_data, target_is_directory=True)
+    _project(
+        root,
+        {
+            "pipeline.py": _SYMLINKED_DATA_PIPELINE,
+            "data/raw/value.txt": "VALUE",
+        },
+    )
+
+    _ok(_pivot(root, "repro"))
+
+    assert (external_data / "symlinked-data" / "copy.txt").read_text() == "VALUE"
+
+
 def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> None:
     """Config lock, artifact locks and the agent socket must not show up as untracked files."""
     root = _project(tmp_path, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
