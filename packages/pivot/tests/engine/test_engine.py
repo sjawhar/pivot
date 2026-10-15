@@ -912,6 +912,52 @@ async def test_engine_cancel_during_active_execution() -> None:
 
 
 @pytest.mark.anyio
+async def test_engine_cancel_during_coordinator_skip_releases_resources_without_submit(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during a coordinator skip check leaves no stage to submit."""
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    stage_name = "watch/_helper_watch_scale"
+    stage_info = pipeline.get_stage(stage_name)
+    cache_dir = tmp_path / ".pivot" / "cache"
+    cache_dir.mkdir()
+    results: dict[str, executor_core.ExecutionSummary] = {}
+    pool = MagicMock(spec=WorkerPool)
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine._graph = engine_graph.build_graph({stage_name: stage_info})
+        await engine._initialize_orchestration([stage_name], max_workers=1)
+        engine._worker_pool = pool
+        engine._run_state = engine_mod._RunState.RUNNING
+
+        async def _cancel_during_skip(*_args: object, **_kwargs: object) -> bool:
+            await engine._handle_cancel_requested()
+            return False
+
+        monkeypatch.setattr(engine, "_try_skip_in_coordinator", _cancel_during_skip)
+
+        await engine._start_ready_stages(
+            cache_dir=cache_dir,
+            overrides=parameters.ParamsOverrides(),
+            checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
+            force=False,
+            no_commit=False,
+            stage_start_times={},
+            run_id="cancel-during-skip",
+            project_root=tmp_path,
+            state_dir=tmp_path / ".pivot",
+            results=results,
+        )
+
+        assert results[stage_name]["status"] == StageStatus.CANCELLED
+        pool.submit.assert_not_called()
+        assert engine._scheduler.get_state(stage_name) == StageExecutionState.COMPLETED
+        engine._scheduler.set_state(stage_name, StageExecutionState.READY)
+        assert engine._scheduler.can_start(stage_name), "Cancellation must release CPU capacity"
+
+
+@pytest.mark.anyio
 async def test_engine_cancel_requested_noop_when_idle() -> None:
     async with Engine() as engine:
         engine._run_state = engine_mod._RunState.IDLE
