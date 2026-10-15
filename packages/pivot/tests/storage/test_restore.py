@@ -31,20 +31,29 @@ def _hold_checkout_restore(
 ) -> None:
     """Pause checkout after it has acquired its restore lock."""
     project._project_root_cache = project_root
-    original_stage_checkout = cache._stage_checkout
+    original_checkout = cache._checkout_with_fallback
 
-    def _stage_after_release(
-        tmp_path: pathlib.Path,
+    def _checkout_after_release(
+        target: pathlib.Path,
         source: pathlib.Path,
-        checkout_mode: cache.CheckoutMode,
+        checkout_modes: list[cache.CheckoutMode],
         *,
-        executable: bool,
+        executable: bool = False,
+        staging_path: pathlib.Path | None = None,
+        keep_existing_copy: bool = False,
     ) -> None:
+        _ = staging_path
         started.set()
         assert release.wait(10)
-        original_stage_checkout(tmp_path, source, checkout_mode, executable=executable)
+        original_checkout(
+            target,
+            source,
+            checkout_modes,
+            executable=executable,
+            keep_existing_copy=keep_existing_copy,
+        )
 
-    cache._stage_checkout = _stage_after_release
+    cache._checkout_with_fallback = _checkout_after_release
     try:
         result, _ = checkout._restore_path_sync(
             path,
@@ -56,7 +65,7 @@ def _hold_checkout_restore(
         )
         result_queue.put(("checkout", result))
     finally:
-        cache._stage_checkout = original_stage_checkout
+        cache._checkout_with_fallback = original_checkout
 
 
 def _get_while_checkout_restores(
@@ -630,6 +639,7 @@ def test_get_waits_for_checkout_restore_on_shared_cache(tmp_path: pathlib.Path) 
         ("get", restore.RestoreStatus.RESTORED),
     }
     assert target.read_text() == "cached content"
+    assert cache._get_lock_path(target, state_dir).exists()
 
 
 def test_restore_file_force_keeps_existing_output_until_cache_swap(
