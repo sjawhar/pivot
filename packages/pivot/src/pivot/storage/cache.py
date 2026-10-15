@@ -45,6 +45,11 @@ def _restore_target_token(target_path: pathlib.Path) -> str:
     return hashlib.sha256(str(logical_path).encode()).hexdigest()[:32]
 
 
+def _restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathlib.Path:
+    """Return the deterministic staging path for a file checkout."""
+    return path.parent / f"{_RESTORE_TEMP_PREFIX}{token or _restore_target_token(path)}.file"
+
+
 def _get_lock_path_from_token(token: str, state_dir: pathlib.Path) -> pathlib.Path:
     """Get a restore lock path from a previously resolved target token."""
     lock_dir = state_dir / "locks"
@@ -337,14 +342,14 @@ def _clear_path(path: pathlib.Path) -> None:
 
 
 def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
-    """Remove restore temp and backup directories older than max age."""
+    """Remove stale restore and backup artifacts older than max age."""
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
     if not parent_dir.exists():
         return
 
     for entry in os.scandir(parent_dir):
-        if not entry.is_dir(follow_symlinks=False):
+        if entry.name.startswith(_RESTORE_LOCK_PREFIX):
             continue
         if not (
             entry.name.startswith(_RESTORE_TEMP_PREFIX)
@@ -352,7 +357,14 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
         ):
             continue
         try:
-            if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            entry_stat = entry.stat(follow_symlinks=False)
+            if entry.is_dir(follow_symlinks=False):
+                age = entry_stat.st_mtime
+            elif stat.S_ISREG(entry_stat.st_mode):
+                age = entry_stat.st_ctime
+            else:
+                continue
+            if age < cutoff:
                 logger.debug(f"Cleaning up stale temp: {entry.path}")
                 _clear_path(pathlib.Path(entry.path))
         except OSError as e:
@@ -562,7 +574,9 @@ def _save_file_to_cache(
     cache_path = get_cache_path(cache_dir, file_hash)
 
     copy_to_cache(path, cache_path)
-    _checkout_with_fallback(path, cache_path, checkout_modes)
+    staging_path = _restore_staging_path(path)
+    _clear_path(staging_path)
+    _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
 
     return FileHash(hash=file_hash)
 
@@ -611,8 +625,14 @@ def _save_directory_to_cache(
         for entry in manifest:
             file_path = path / entry["relpath"]
             cache_path = get_cache_path(cache_dir, entry["hash"])
+            staging_path = _restore_staging_path(file_path)
+            _clear_path(staging_path)
             _checkout_with_fallback(
-                file_path, cache_path, checkout_modes, executable=entry["isexec"]
+                file_path,
+                cache_path,
+                checkout_modes,
+                executable=entry["isexec"],
+                staging_path=staging_path,
             )
 
     return DirHash(hash=tree_hash, manifest=manifest)
@@ -686,7 +706,7 @@ def _restore_file_from_cache(
                 lock_token=held_token,
             )
 
-    staging_path = path.parent / f"{_RESTORE_TEMP_PREFIX}{lock_token}.file"
+    staging_path = _restore_staging_path(path, lock_token)
     _clear_path(staging_path)
     _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
     return True

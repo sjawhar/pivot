@@ -682,6 +682,97 @@ def test_cleanup_removes_old_temps(tmp_path: pathlib.Path) -> None:
     assert not old_temp.exists()
 
 
+def test_cleanup_removes_stale_prefixed_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale file staged for restore is cleaned up like a stale directory."""
+    stale_file = tmp_path / f"{cache._RESTORE_TEMP_PREFIX}old.file"
+    stale_file.write_text("orphan")
+    monkeypatch.setattr(cache, "_RESTORE_TEMP_MAX_AGE", -1)
+
+    cache._cleanup_stale_restore_temps(tmp_path)
+
+    assert not stale_file.exists()
+
+
+def _crash_save_after_staging(path: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    """Exit after save staged its workspace replacement, before its atomic rename."""
+
+    def _replace_and_crash(self: pathlib.Path, destination: pathlib.Path) -> pathlib.Path:
+        os._exit(73)
+
+    pathlib.Path.replace = _replace_and_crash  # pyright: ignore[reportAttributeAccessIssue]
+    _ = cache.save_to_cache(path, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+
+def test_save_file_cleans_staging_left_by_killed_save(tmp_path: pathlib.Path) -> None:
+    """A later save clears the deterministic file staging path an interrupted save left."""
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("stage output\n")
+    cache_dir = tmp_path / "cache"
+    _ = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    target.unlink()
+    target.write_text("stage output\n")
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_crash_save_after_staging, args=(target, cache_dir)
+    )
+    process.start()
+    process.join(timeout=60)
+
+    staging_path = target.parent / (
+        f"{cache._RESTORE_TEMP_PREFIX}{cache._restore_target_token(target)}.file"
+    )
+    assert process.exitcode == 73
+    assert staging_path.exists()
+
+    _ = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+    assert not staging_path.exists()
+    assert target.read_text() == "stage output\n"
+
+
+def test_save_directory_uses_target_tagged_staging_paths(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directory saves use deterministic staging names for each workspace file."""
+    target = tmp_path / "data" / "out"
+    target.mkdir(parents=True)
+    (target / "root.txt").write_text("root")
+    (target / "sub").mkdir()
+    (target / "sub" / "nested.txt").write_text("nested")
+    staging_paths = list[pathlib.Path | None]()
+    original_checkout = cache._checkout_with_fallback
+
+    def _record_staging(
+        path: pathlib.Path,
+        cache_path: pathlib.Path,
+        checkout_modes: list[cache.CheckoutMode],
+        *,
+        executable: bool = False,
+        staging_path: pathlib.Path | None = None,
+    ) -> None:
+        staging_paths.append(staging_path)
+        original_checkout(
+            path,
+            cache_path,
+            checkout_modes,
+            executable=executable,
+            staging_path=staging_path,
+        )
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", _record_staging)
+
+    _ = cache.save_to_cache(target, tmp_path / "cache", checkout_mode=cache.CheckoutMode.COPY)
+
+    workspace_files = [target / "root.txt", target / "sub" / "nested.txt"]
+    assert staging_paths == [
+        path.parent / f"{cache._RESTORE_TEMP_PREFIX}{cache._restore_target_token(path)}.file"
+        for path in workspace_files
+    ]
+
+
 def test_cleanup_preserves_recent_temps(tmp_path: pathlib.Path) -> None:
     """Recent temps are preserved."""
     # Create a recent temp directory
