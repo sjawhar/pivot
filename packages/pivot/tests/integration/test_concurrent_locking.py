@@ -7,6 +7,8 @@ user-selected output paths.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -82,9 +84,6 @@ from pivot.compose import Pipeline, stage
 
 @stage
 def stage_a() -> str:
-    # The worker holds stage_a's write lock while the stage runs; the marker tells the test
-    # the lock is held, so a consumer started after it must wait for this run.
-    pathlib.Path("a_started").touch()
     time.sleep(float(os.environ.get("STAGE_A_SLEEP", "3")))
     return "hello from a"
 
@@ -168,24 +167,39 @@ def _helper_run_pivot(
     )
 
 
+def _helper_wait_for_write_lock(lock_path: pathlib.Path) -> None:
+    """Wait until another process owns lock_path exclusively, instead of sleeping by guess."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if lock_path.exists():
+            fd = os.open(lock_path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        time.sleep(0.01)
+    raise TimeoutError(f"writer never acquired artifact lock {lock_path}")
+
+
 def _helper_output(project: pathlib.Path, stage: str) -> pathlib.Path:
     return project / "data" / "test" / f"{stage}.txt"
 
 
-def _helper_wait_for_marker(
-    marker: pathlib.Path, process: subprocess.Popen[bytes], timeout: float = 60
-) -> None:
-    """Wait until a stage creates ``marker``; fail if its run exits or the deadline passes."""
-    deadline = time.monotonic() + timeout
-    while not marker.exists():
-        if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            raise AssertionError(
-                f"run exited before {marker.name}:\nstdout={stdout.decode()}\nstderr={stderr.decode()}"
-            )
-        if time.monotonic() > deadline:
-            raise AssertionError(f"{marker.name} never appeared")
-        time.sleep(0.05)
+def test_wait_for_write_lock_waits_until_lock_is_held(tmp_path: pathlib.Path) -> None:
+    """Contention tests start their reader only after the writer owns the artifact lock."""
+    lock_path = tmp_path / "lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _helper_wait_for_write_lock(lock_path)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +299,8 @@ def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
     env = _helper_make_env(STAGE_A_SLEEP="4")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    # Start the consumer only once stage_a holds its write lock, not after a fixed delay:
-    # under load a 1s head start can expire before stage_a reaches its lock.
-    _helper_wait_for_marker(tmp_path / "a_started", proc_a)
+    stage_a_lock = tmp_path / ".pivot" / "locks" / hashlib.sha256(b"test/stage_a").hexdigest()
+    _helper_wait_for_write_lock(stage_a_lock)
     proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)

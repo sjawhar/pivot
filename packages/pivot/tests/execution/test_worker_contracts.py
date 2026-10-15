@@ -950,11 +950,6 @@ def test_queue_writer_reads_subprocess_bytes_until_end_of_file(
     assert elapsed < 4.0, "the reader thread must stop at end of file"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 9 (cli-fixes Slice 2 PR): worker pipe reader decodes each read "
-    + "separately",
-)
 def test_queue_writer_keeps_a_character_split_across_pipe_reads(
     output_queue: mp.Queue[OutputMessage],
 ) -> None:
@@ -980,6 +975,21 @@ def test_queue_writer_keeps_a_character_split_across_pipe_reads(
 
     assert _log_lines(_drain(output_queue)) == [(_STAGE, "abc€", False)]
     assert ring.snapshot() == [("abc€", False)]
+
+
+def test_queue_writer_reports_a_truncated_character_at_eof(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
+    """Output that ends mid-character is still logged (as U+FFFD), not silently dropped."""
+    ring = worker._OutputRingBuffer()
+    writer = worker._QueueWriter(_STAGE, output_queue, is_stderr=False, ring_buffer=ring)
+    writer.__enter__()
+    try:
+        _ = os.write(writer.fileno(), b"abc" + "€".encode()[:1])
+    finally:
+        writer.__exit__(None, None, None)
+
+    assert _log_lines(_drain(output_queue)) == [(_STAGE, "abc\ufffd", False)]
 
 
 _LEAKED_CHILD_SCRIPT = textwrap.dedent(

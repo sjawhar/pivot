@@ -188,7 +188,7 @@ Restore tracked files and stage outputs from cache:
 ```
 $ pivot checkout                   # restore all
 $ pivot checkout demo/train        # restore specific stage outputs
-$ pivot checkout --only-missing    # skip files that already exist
+$ pivot checkout --only-missing    # restore only missing files; never overwrite edits
 $ pivot checkout --force           # overwrite existing files
 ```
 
