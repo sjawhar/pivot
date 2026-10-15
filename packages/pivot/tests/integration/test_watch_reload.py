@@ -689,7 +689,7 @@ async def test_input_edits_reach_consumers_through_symlinked_paths(
         )
         async with anyio.create_task_group() as tg:
             tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
-            first_idle = await recorder.wait_for(_helper_is_idle)
+            await recorder.wait_for(_helper_is_idle)
             assert {outputs[stage].read_text() for stage in affected_stages} == {"one"}
             assert outputs["aliases/unrelated"].read_text() == "other"
 
@@ -704,13 +704,13 @@ async def test_input_edits_reach_consumers_through_symlinked_paths(
                     done = await recorder.wait_for(
                         _helper_completes(stage), start=start, timeout=10
                     )
-                    completed.add(recorder.events[done]["stage"])
+                    event = recorder.events[done]
+                    assert event["type"] == "stage_completed"
+                    completed.add(event["stage"])
                 idle = await recorder.wait_for(_helper_is_idle, start=start, timeout=10)
-                completed.update(
-                    event["stage"]
-                    for event in recorder.events[start:idle]
-                    if event["type"] == "stage_completed"
-                )
+                for event in recorder.events[start:idle]:
+                    if event["type"] == "stage_completed":
+                        completed.add(event["stage"])
                 assert completed == affected_stages
                 assert {outputs[stage].read_text() for stage in affected_stages} == {expected}
                 assert outputs["aliases/unrelated"].read_text() == "other"
