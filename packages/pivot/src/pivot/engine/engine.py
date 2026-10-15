@@ -1682,6 +1682,19 @@ class Engine:
                     skipped = False
                 if skipped:
                     continue
+                # A watch event may cancel this run while its coordinator skip check awaited.
+                # Do not submit a stage to the pool after cancellation stopped admissions.
+                if self._cancel_event.is_set():
+                    self._scheduler.release_resources(stage_name)
+                    await self._set_stage_state(stage_name, StageExecutionState.COMPLETED)
+                    await self._emit_terminal_stage(
+                        stage_name,
+                        StageStatus.CANCELLED,
+                        "cancelled",
+                        results,
+                        run_id=run_id,
+                    )
+                    continue
 
                 # Stage must run — lazily create pool on first dispatch
                 started += 1
