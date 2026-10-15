@@ -534,6 +534,40 @@ def test_repro_of_a_pipeline_file_refuses_a_root_below_the_project(
         assert not list(cwd.rglob("*.lock")), "no stage may run, so no lock is written"
 
 
+_SYMLINKED_STATE_PIPELINE = """
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def copy(value: str) -> str:
+    return value
+
+
+with Pipeline("symlinked") as pipeline:
+    copy(pipeline.input("value.txt", t=str))
+"""
+
+
+def test_repro_and_status_accept_a_symlinked_project_state_dir(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A `.pivot` symlink is a supported project-state layout."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "value.txt").write_text("value")
+        (cwd / "pipeline.py").write_text(_SYMLINKED_STATE_PIPELINE)
+        state_dir = cwd.parent / f"{cwd.name}-state"
+        (cwd / ".pivot").rename(state_dir)
+        (cwd / ".pivot").symlink_to(state_dir, target_is_directory=True)
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        status = runner.invoke(cli.cli, ["status"])
+
+    assert repro.exit_code == 0, repro.output
+    assert status.exit_code == 0, status.output
+    assert (cwd / "data" / "symlinked" / "copy.txt").read_text() == "value"
+
+
 # =============================================================================
 # Explain Mode Tests
 # =============================================================================

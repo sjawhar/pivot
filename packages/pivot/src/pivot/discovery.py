@@ -255,7 +255,7 @@ def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -
         )
     for stage_name in pipeline.list_stages():
         state_dir = pipeline.get_stage(stage_name)["state_dir"]
-        if state_dir is not None and state_dir.resolve() != project_root / ".pivot":
+        if state_dir is not None and state_dir.resolve() != (project_root / ".pivot").resolve():
             raise exceptions.PipelineConfigError(
                 f"Stage '{stage_name}' comes from a pipeline that sets root={state_dir.parent}, "
                 + advice
