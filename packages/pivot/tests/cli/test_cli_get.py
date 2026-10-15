@@ -121,6 +121,32 @@ def test_get_git_tracked_file_with_force(
     assert output_path.read_text() == "original"
 
 
+def test_get_restores_files_while_pipeline_is_broken(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
+    """A pipeline.py that fails to import does not stop get restoring files, itself included."""
+    repo_path, commit = git_repo
+    good_pipeline = (
+        "from pivot.compose import Pipeline\n\nwith Pipeline('p') as pipeline:\n    pass\n"
+    )
+    (repo_path / "pipeline.py").write_text(good_pipeline)
+    (repo_path / "notes.txt").write_text("notes")
+    sha = commit("initial")
+    (repo_path / "pipeline.py").write_text(good_pipeline + "import nonexistent_module_xyz\n")
+    (repo_path / "notes.txt").unlink()
+    (repo_path / ".pivot" / "cache").mkdir(parents=True)
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    result = runner.invoke(
+        cli.cli, ["get", "--rev", sha[:7], "--force", "pipeline.py", "notes.txt"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (repo_path / "pipeline.py").read_text() == good_pipeline
+    assert (repo_path / "notes.txt").read_text() == "notes"
+
+
 def test_get_skip_existing_without_force(
     runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
 ) -> None:

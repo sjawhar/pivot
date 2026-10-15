@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import pathlib
 
 import click
 
-from pivot import config, project, registry, types
+from pivot import config, discovery, project, registry, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
 from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
+
+logger = logging.getLogger(__name__)
 
 
 @cli_decorators.pivot_command(allow_all=True)
@@ -180,7 +183,7 @@ def diff(
                     temp_file.unlink(missing_ok=True)
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(auto_discover=False)
 @click.argument("targets", nargs=-1, required=True)
 @click.option(
     "--rev",
@@ -225,7 +228,17 @@ def get(
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
     )
 
+    # Stage targets need the pipeline; files and `.pvt` targets work from the revision alone,
+    # so a pipeline.py that fails to import (pipeline.py itself is a target to restore) only
+    # stops targets from resolving as stages.
     pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is None:
+        try:
+            pipeline = discovery.discover_pipeline()
+        except discovery.DiscoveryError as e:
+            logger.warning(f"Pipeline not loaded, so every target is read as a file: {e}")
+        if pipeline is not None:
+            cli_decorators.store_pipeline_in_context(pipeline)
     all_stages = {} if pipeline is None else cli_helpers.get_all_stages()
     proj_root = project.get_project_root()
     default_state_dir = config.get_state_dir()
