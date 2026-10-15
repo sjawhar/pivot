@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import pathlib
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import xxhash
 from botocore import exceptions as botocore_exc
 
 from pivot import exceptions
@@ -26,6 +28,11 @@ def _helper_patch_s3_client(
     mock_client_cm = mocker.AsyncMock()
     mock_client_cm.__aenter__.return_value = client
     mocker.patch.object(s3_remote._session, "client", return_value=mock_client_cm)
+
+
+def _helper_hash(content: bytes) -> str:
+    """Content-addressed key for content, as pivot's cache computes it."""
+    return xxhash.xxh64(content).hexdigest()
 
 
 # -----------------------------------------------------------------------------
@@ -447,7 +454,7 @@ async def test_download_file(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file gets object from S3."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"downloaded content")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -467,7 +474,7 @@ async def test_download_file_streaming_body_api_regression(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Regression test: StreamingBody.read() works without async-with."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"test content for regression")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -487,7 +494,7 @@ async def test_download_file_readonly(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file with readonly=True sets 0o444 permissions (for cache files)."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"cached content")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -715,22 +722,22 @@ async def test_download_batch(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch downloads multiple files in parallel."""
-    items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
+    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"dest{i}.txt") for i in range(3)]
 
-    for cache_hash, _ in items:
+    for i, (cache_hash, _) in enumerate(items):
         await aioboto3_s3_client.put_object(
             Bucket=s3_remote.bucket,
             Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
-            Body=b"content",
+            Body=f"content {i}".encode(),
         )
 
     results = await s3_remote.download_batch(items, concurrency=10)
 
     assert len(results) == 3
     assert all(r["success"] for r in results)
-    for _, path in items:
+    for i, (_, path) in enumerate(items):
         assert path.exists()
-        assert path.read_bytes() == b"content"
+        assert path.read_bytes() == f"content {i}".encode()
 
 
 async def test_download_batch_empty() -> None:
@@ -932,13 +939,13 @@ async def test_download_batch_with_callback(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch calls callback for each completed download."""
-    items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
+    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"dest{i}.txt") for i in range(3)]
 
-    for cache_hash, _ in items:
+    for i, (cache_hash, _) in enumerate(items):
         await aioboto3_s3_client.put_object(
             Bucket=s3_remote.bucket,
             Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
-            Body=b"content",
+            Body=f"content {i}".encode(),
         )
 
     callback_values = list[int]()
@@ -958,7 +965,7 @@ async def test_download_file_default_permissions(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_file without readonly flag creates file with default permissions."""
-    cache_hash = "abc123def4567890"
+    cache_hash = _helper_hash(b"writable content")
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
         Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
@@ -983,13 +990,13 @@ async def test_download_batch_readonly(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """download_batch with readonly=True sets 0o444 permissions on all files."""
-    items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"cached{i}.txt") for i in range(3)]
+    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"cached{i}.txt") for i in range(3)]
 
-    for cache_hash, _ in items:
+    for i, (cache_hash, _) in enumerate(items):
         await aioboto3_s3_client.put_object(
             Bucket=s3_remote.bucket,
             Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
-            Body=b"content",
+            Body=f"content {i}".encode(),
         )
 
     results = await s3_remote.download_batch(items, concurrency=10, readonly=True)
@@ -1002,6 +1009,73 @@ async def test_download_batch_readonly(
         assert path.exists()
         mode = path.stat().st_mode & 0o777
         assert mode == 0o444, f"Expected 0o444 for {path}, got {oct(mode)}"
+
+
+async def test_download_batch_keeps_existing_destination(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """download_batch never replaces a destination that already exists.
+
+    Destinations are content-addressed cache entries. Replacing one while another process
+    hardlinks it from the cache makes that link fail with ENOENT (#461).
+    """
+    content = b"content"
+    cache_hash = _helper_hash(content)
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=content,
+    )
+    dest = tmp_path / "entry"
+    dest.write_bytes(content)
+    inode = dest.stat().st_ino
+
+    results = await s3_remote.download_batch([(cache_hash, dest)], readonly=True)
+
+    assert [r["success"] for r in results] == [True]
+    assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
+    assert [p.name for p in tmp_path.iterdir()] == ["entry"], "no download temp file left"
+
+
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
+@pytest.mark.parametrize("exists", [False, True])
+async def test_download_batch_without_hard_links(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+    monkeypatch: pytest.MonkeyPatch,
+    link_errno: int,
+    exists: bool,
+) -> None:
+    """On a filesystem that refuses link() (vfat, many SMB and FUSE mounts), download still
+    promotes the verified file, and still keeps an existing entry."""
+    content = b"content"
+    cache_hash = _helper_hash(content)
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=content,
+    )
+    dest = tmp_path / "entry"
+    inode = None
+    if exists:
+        dest.write_bytes(content)
+        inode = dest.stat().st_ino
+
+    def _refuse_link(src: object, dst: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    results = await s3_remote.download_batch([(cache_hash, dest)], readonly=True)
+
+    assert [r["success"] for r in results] == [True], results
+    assert dest.read_bytes() == content
+    if inode is not None:
+        assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
+    assert [p.name for p in tmp_path.iterdir()] == ["entry"], "no download temp file left"
 
 
 # -----------------------------------------------------------------------------

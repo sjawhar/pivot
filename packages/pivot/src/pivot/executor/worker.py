@@ -154,6 +154,7 @@ class WorkerStageInfo(TypedDict):
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
+    project_state_dir: pathlib.Path
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
 
@@ -194,6 +195,7 @@ def execute_stage(
     _ = cache_dir
     ring_buffer = _OutputRingBuffer()
     state_dir = stage_info["state_dir"]
+    project_state_dir = stage_info["project_state_dir"]
     project_root = stage_info["project_root"]
     store = store_mod.store_from_spec(stage_info["store_spec"])
 
@@ -276,7 +278,7 @@ def execute_stage(
                                 stage_outs,
                                 lock_data["output_hashes"],
                                 state_db,
-                                state_dir=stage_info["state_dir"],
+                                state_dir=project_state_dir,
                                 file_hash_entries=restored_entries,
                             )
                             if restored:
@@ -331,7 +333,7 @@ def execute_stage(
                             stage_outs,
                             lock_data["output_hashes"],
                             state_db,
-                            state_dir=stage_info["state_dir"],
+                            state_dir=project_state_dir,
                             file_hash_entries=restored_entries,
                         )
                         if restored:
@@ -352,7 +354,7 @@ def execute_stage(
                             stage_outs,
                             store,
                             state_db,
-                            state_dir=stage_info["state_dir"],
+                            state_dir=project_state_dir,
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -405,12 +407,15 @@ def execute_stage(
                     stage_info["incremental_inputs"],
                     lock_data,
                     state_dir,
+                    project_state_dir,
                     project_root,
                 )
                 if no_commit:
                     output_hashes = _hash_output_paths(output_paths)
                 else:
-                    output_hashes = _commit_outputs_with_store(output_paths, store)
+                    output_hashes = _commit_outputs_with_store(
+                        output_paths, store, project_state_dir
+                    )
                     for ref, path in output_paths.items():
                         file_hash_entries.extend(
                             output_file_hash_entries(
@@ -922,7 +927,8 @@ def _prepare_incremental_inputs(
     incremental_inputs: dict[str, types.ArtifactIdentity],
     lock_data: LockData | None,
     store: store_mod.Store,
-    state_dir: pathlib.Path,
+    stage_state_dir: pathlib.Path,
+    project_state_dir: pathlib.Path,
 ) -> dict[str, Any]:
     """Restore previous incremental outputs and load them for the stage call."""
     if not incremental_inputs:
@@ -940,7 +946,7 @@ def _prepare_incremental_inputs(
             continue
 
         output_hash = lock_data["output_hashes"].get(identity)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         if output_hash is None:
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
@@ -952,7 +958,7 @@ def _prepare_incremental_inputs(
         if not store.restore_from_cache(
             ref,
             output_hash,
-            state_dir=state_dir,
+            state_dir=project_state_dir,
             checkout_modes=[config.CheckoutMode.COPY],
         ):
             raise exceptions.CacheRestoreError(
@@ -978,6 +984,7 @@ def _run_stage_function_with_store(
     incremental_inputs: dict[str, types.ArtifactIdentity],
     lock_data: LockData | None,
     state_dir: pathlib.Path,
+    project_state_dir: pathlib.Path,
     project_root: pathlib.Path,
 ) -> dict[types.ArtifactRef, pathlib.Path]:
     with (
@@ -1006,6 +1013,7 @@ def _run_stage_function_with_store(
                 lock_data,
                 store,
                 state_dir,
+                project_state_dir,
             )
         )
 
@@ -1051,12 +1059,17 @@ def _hash_output_paths(
 def _commit_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
+    project_state_dir: pathlib.Path,
 ) -> dict[str, HashInfo]:
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
-        output_hashes[types.identity_key(ref.identity)] = store.commit(ref, path)
+        if isinstance(store, store_mod.WorkspaceStore):
+            output_hash = store.commit(ref, path, state_dir=project_state_dir)
+        else:
+            output_hash = store.commit(ref, path)
+        output_hashes[types.identity_key(ref.identity)] = output_hash
     return output_hashes
 
 

@@ -89,6 +89,9 @@ def _restore_path_sync(
 ) -> tuple[RestoreResult, str]:
     """Restore a file or directory from cache (sync version).
 
+    Holds the restore lock for path across the existence check and the restore, so a
+    concurrent checkout never compares against, or deletes, a half-restored output.
+
     Returns:
         Tuple of (result, path_name) for the caller to handle output.
 
@@ -97,6 +100,22 @@ def _restore_path_sync(
             "already exists" without --force). Cache misses return ("missing", name)
             instead of raising.
     """
+    with cache.restore_lock(path, state_dir) as lock_token:
+        return _restore_path_locked(
+            path, output_hash, cache_dir, checkout_modes, behavior, state_dir, lock_token
+        )
+
+
+def _restore_path_locked(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+    behavior: CheckoutBehavior,
+    state_dir: pathlib.Path | None,
+    lock_token: str | None,
+) -> tuple[RestoreResult, str]:
+    """Body of _restore_path_sync; the caller holds the restore lock for path."""
     keep_ignored = False
     if path.exists():
         match behavior:
@@ -146,6 +165,7 @@ def _restore_path_sync(
         cache_dir,
         checkout_modes=checkout_modes,
         state_dir=state_dir,
+        lock_token=lock_token,
         keep_ignored=keep_ignored,
     )
     if not success:

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import pathlib
 import time
 from typing import TYPE_CHECKING
 
+import lmdb
 import pytest
 
 from pivot import run_history
 from pivot.storage import cache, state
 
 if TYPE_CHECKING:
+    from threading import Barrier
+
     from pivot.types import DeferredWrites
 
 
@@ -834,6 +838,57 @@ def test_readonly_blocks_remote_set_url(tmp_path: pathlib.Path) -> None:
         pytest.raises(RuntimeError, match="readonly StateDB"),
     ):
         db.remote_set_url("origin", "s3://bucket")
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        pytest.param({}, id="empty-dir"),
+        pytest.param({"lock.mdb": b""}, id="lock-only"),
+        pytest.param({"data.mdb": b"", "lock.mdb": b""}, id="empty-data"),
+    ],
+)
+def test_readonly_open_bootstraps_incomplete_lmdb_dir(
+    tmp_path: pathlib.Path, files: dict[str, bytes]
+) -> None:
+    """Readonly open succeeds when state.lmdb/ exists without a usable data.mdb (#454)."""
+    lmdb_dir = tmp_path / "state.lmdb"
+    lmdb_dir.mkdir()
+    for name, content in files.items():
+        (lmdb_dir / name).write_bytes(content)
+
+    with state.StateDB(tmp_path, readonly=True) as db:
+        assert db.get_generation("stage:output") is None
+
+
+def _helper_open_readonly_at_barrier(state_dir: str, barrier: Barrier) -> str:
+    barrier.wait()
+    try:
+        with state.StateDB(pathlib.Path(state_dir), readonly=True):
+            return "ok"
+    except lmdb.Error as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def test_concurrent_readonly_opens_of_new_state_dir(tmp_path: pathlib.Path) -> None:
+    """Processes that readonly-open a fresh state dir at the same instant all succeed.
+
+    The first opener creates state.lmdb/ before data.mdb, so a check on the directory
+    alone sends the others into a readonly open of an incomplete environment (#228, #454).
+    """
+    n_procs = 8
+    ctx = multiprocessing.get_context("spawn")
+    failures = list[str]()
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        for i in range(10):
+            barrier = manager.Barrier(n_procs, timeout=60)
+            state_dir = str(tmp_path / f"round{i}" / ".pivot")
+            results = pool.starmap(
+                _helper_open_readonly_at_barrier, [(state_dir, barrier)] * n_procs
+            )
+            failures.extend(r for r in results if r != "ok")
+
+    assert failures == []
 
 
 # -----------------------------------------------------------------------------

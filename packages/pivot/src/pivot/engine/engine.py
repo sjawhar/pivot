@@ -1839,7 +1839,7 @@ class Engine:
                 stage_info["outs"],
                 lock_data["output_hashes"],
                 state_db,
-                state_dir=stage_state_dir,
+                state_dir=state_dir,
                 file_hash_entries=restored_entries,
             )
             if restored and restored_entries:
