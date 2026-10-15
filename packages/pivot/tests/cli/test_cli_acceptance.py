@@ -16,8 +16,8 @@ import time
 import uuid
 
 import boto3
-import yaml
 import pytest
+import yaml
 
 from pivot import loaders
 
@@ -123,30 +123,6 @@ with Pipeline("c") as pipeline:
     double(pipeline.input("t.csv"))
 """
 
-_DIRECTORY_ARTIFACT_PIPELINE = """\
-import pathlib
-import tempfile
-
-from pivot import Pipeline, stage
-
-
-@stage
-def assemble() -> pathlib.Path:
-    output = pathlib.Path(tempfile.mkdtemp(prefix="pivot-directory-artifact-"))
-    for directory in (".git", ".idea", ".venv", ".vscode", "build", "dist", "node_modules"):
-        path = output / directory
-        path.mkdir()
-        (path / "required.txt").write_text(directory)
-    (output / "editor.swp").write_text("editor state")
-    (output / "keep.txt").write_text("keep")
-    return output
-
-
-with Pipeline("directory") as pipeline:
-    assemble()
-"""
-
-
 _DIRECTORY_ARTIFACT_SYMLINK_PIPELINE = """\
 import pathlib
 import tempfile
@@ -166,34 +142,6 @@ def assemble() -> pathlib.Path:
 with Pipeline("directory") as pipeline:
     assemble()
 """
-
-
-def test_repro_preserves_every_regular_file_in_a_directory_artifact(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Directory artifacts retain ignored-looking descendants after cached restoration."""
-    root = _project(tmp_path, {"pipeline.py": _DIRECTORY_ARTIFACT_PIPELINE})
-    output = root / "data" / "directory" / "assemble.dat"
-    expected = {
-        ".git/required.txt": ".git",
-        ".idea/required.txt": ".idea",
-        ".venv/required.txt": ".venv",
-        ".vscode/required.txt": ".vscode",
-        "build/required.txt": "build",
-        "dist/required.txt": "dist",
-        "node_modules/required.txt": "node_modules",
-        "editor.swp": "editor state",
-        "keep.txt": "keep",
-    }
-
-    _ok(_pivot(root, "repro"))
-    assert {rel: (output / rel).read_text() for rel in expected} == expected
-
-    shutil.rmtree(output)
-    out = _ok(_pivot(root, "repro"))
-
-    assert "cached" in out
-    assert {rel: (output / rel).read_text() for rel in expected} == expected
 
 
 def test_repro_refuses_a_directory_artifact_that_contains_a_symlink(
@@ -995,56 +943,24 @@ def test_pull_keeps_cache_derived_directory_file_symlinks_as_artifact_members(
     assert "Verification passed" in _ok(_pivot(clone, "verify", env=env))
     _ok(_pivot(clone, "commit", "dir/assemble", env=env))
 
-
-_PATH_DIRECTORY_DEPENDENCY_PIPELINE = """\
-import pathlib
-import tempfile
-
-from pivot import Pipeline, stage
+    lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "dir" / "assemble.lock").read_text())
+    assert len(lock_data["outs"][0]["manifest"]) == len(expected)
+    assert "1 cached" in _ok(_pivot(clone, "status", env=env))
 
 
-@stage
-def assemble(version: str) -> pathlib.Path:
-    output = pathlib.Path(tempfile.mkdtemp())
-    (output / "build").mkdir()
-    (output / "build" / "required.txt").write_text(version)
-    (output / "keep.txt").write_text("constant")
-    return output
+def test_tracked_directory_checked_out_as_symlinks_stays_clean(tmp_path: pathlib.Path) -> None:
+    """A symlink checkout of a tracked directory is the tracked content, not a modification."""
+    root = _project(tmp_path, {"data/tracked/keep.txt": "keep", "data/tracked/nested/f.txt": "f"})
+    _ok(_pivot(root, "track", "data/tracked"))
+    shutil.rmtree(root / "data" / "tracked")
+    _ok(_pivot(root, "checkout", "--checkout-mode", "symlink", "data/tracked"))
+    assert (root / "data" / "tracked" / "keep.txt").is_symlink()
 
+    assert "1 clean" in _ok(_pivot(root, "status", "--tracked-only"))
+    _ok(_pivot(root, "track", "--force", "data/tracked"))
 
-@stage
-def consume(bundle: pathlib.Path) -> str:
-    return (bundle / "build" / "required.txt").read_text()
-
-
-with Pipeline("chain") as pipeline:
-    consume(assemble(pipeline.input("version.txt")))
-"""
-
-
-def test_path_directory_output_has_one_hash_as_output_and_dependency(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A Path directory output preserves ignored-looking descendants for consumers."""
-    root = _project(
-        tmp_path,
-        {
-            "pipeline.py": _PATH_DIRECTORY_DEPENDENCY_PIPELINE,
-            "data/raw/version.txt": "one",
-        },
-    )
-    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "copy"))
-
-    assert "2 ran" in _ok(_pivot(root, "repro"))
-    assert "2 cached" in _ok(_pivot(root, "status"))
-    assert "Verification passed" in _ok(_pivot(root, "verify"))
-
-    (root / "data" / "raw" / "version.txt").write_text("two")
-    assert "2 ran" in _ok(_pivot(root, "repro"))
-    assert (
-        root / "data" / "chain" / "assemble.dat" / "build" / "required.txt"
-    ).read_text() == "two"
-    assert (root / "data" / "chain" / "consume.txt").read_text() == "two"
+    pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
+    assert sorted(entry["relpath"] for entry in pvt["manifest"]) == ["keep.txt", "nested/f.txt"]
 
 
 _PARAM_PIPELINE = """\

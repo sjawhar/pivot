@@ -69,23 +69,6 @@ def _helper_track_directory(root: pathlib.Path) -> pathlib.Path:
     return data_dir
 
 
-def test_tracked_directory_hash_ignores_symlinks_after_a_regular_file_changes(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A tracked directory keeps its project-tree symlink filter during mismatch checks."""
-    directory = tmp_path / "tracked"
-    directory.mkdir()
-    tracked_file = directory / "tracked.txt"
-    tracked_file.write_text("original")
-    tree_hash, manifest = cache.hash_directory(directory)
-    expected = types.DirHash(hash=tree_hash, manifest=manifest)
-
-    (directory / "ignored-link.txt").symlink_to(tracked_file)
-    tracked_file.write_text("changed")
-
-    assert not checkout_mod._on_disk_matches_expected(directory, expected)
-
-
 def _helper_cache_directory(
     path: pathlib.Path,
     contents: dict[str, str],

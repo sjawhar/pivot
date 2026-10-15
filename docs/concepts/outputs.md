@@ -121,15 +121,17 @@ Define the `TypedDict` at module level. The field name `_single` is reserved.
 
 A stage can return a `pathlib.Path` to a directory it created outside the
 project. `PathOnly()` moves that directory to Pivot's managed output path and
-Pivot caches every regular-file descendant as part of the artifact. Names that
-project input tracking ignores, such as `build/` and `.venv/`, are still part of
-the directory artifact. Pivot accepts a descendant symlink only when it is a
-cache-derived checkout link; any other directory-artifact symlink is refused.
+Pivot caches it as an artifact.
 
 A directory artifact, input or output, is hashed and cached whole. Every file
 under it counts, including names that code fingerprinting or watch mode may
 ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
 them changes the directory hash, and all of them return on restore.
+
+A symlink inside a directory artifact cannot be cached, so Pivot refuses it
+with `Directory artifact contains symlink`. The one exception is a link Pivot
+made itself: a symlink-mode checkout links each file to its cache object, and
+that link counts as the file it points to.
 
 The declarative `DirectoryOut` annotation for a variable set of files remains
 undecided; do not add that annotation to a compositional pipeline.

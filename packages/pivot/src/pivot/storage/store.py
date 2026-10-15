@@ -67,7 +67,7 @@ class CacheStore:
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                ref_hash, _ = cache.hash_artifact_directory(ref_path, db, cache_dir=self._cache_dir)
+                ref_hash, _ = cache.hash_directory(ref_path, db)
             else:
                 ref_hash, _ = cache.hash_file(ref_path, db)
 
@@ -117,18 +117,14 @@ class CacheStore:
 
         if state_db is not None:
             if ref_path.is_dir():
-                tree_hash, manifest = cache.hash_artifact_directory(
-                    ref_path, state_db, cache_dir=self._cache_dir
-                )
+                tree_hash, manifest = cache.hash_directory(ref_path, state_db)
                 return types.DirHash(hash=tree_hash, manifest=manifest)
             file_hash, _ = cache.hash_file(ref_path, state_db)
             return types.FileHash(hash=file_hash)
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                tree_hash, manifest = cache.hash_artifact_directory(
-                    ref_path, db, cache_dir=self._cache_dir
-                )
+                tree_hash, manifest = cache.hash_directory(ref_path, db)
                 return types.DirHash(hash=tree_hash, manifest=manifest)
 
             file_hash, _ = cache.hash_file(ref_path, db)
@@ -214,21 +210,6 @@ class WorkspaceStore:
         cache.remove_output(path)
         return path
 
-    def _hash_directory_for_ref(
-        self,
-        ref: types.ArtifactRef,
-        path: pathlib.Path,
-        state_db: state_mod.StateDB | None = None,
-    ) -> types.DirHash:
-        """Hash inputs as project trees and every produced directory as an artifact."""
-        if ref.tag is types.ArtifactTag.INPUT:
-            tree_hash, manifest = cache.hash_directory(path, state_db)
-        else:
-            tree_hash, manifest = cache.hash_artifact_directory(
-                path, state_db, cache_dir=self._cache_dir
-            )
-        return types.DirHash(hash=tree_hash, manifest=manifest)
-
     def commit(
         self,
         ref: types.ArtifactRef,
@@ -239,7 +220,8 @@ class WorkspaceStore:
         """Hash a written output once and, unless it is a metric, place it in the cache."""
         output_hash: types.HashInfo
         if path.is_dir():
-            output_hash = self._hash_directory_for_ref(ref, path)
+            tree_hash, manifest = cache.hash_directory(path, None)
+            output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
         else:
             file_hash, _ = cache.hash_file(path, None)
             output_hash = types.FileHash(hash=file_hash)
@@ -278,8 +260,9 @@ class WorkspaceStore:
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
-        if path.is_dir():
-            return self._hash_directory_for_ref(ref, path, state_db)
+        if ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir():
+            tree_hash, manifest = cache.hash_directory(path, state_db)
+            return types.DirHash(hash=tree_hash, manifest=manifest)
         file_hash, _ = cache.hash_file(path, state_db)
         return types.FileHash(hash=file_hash)
 

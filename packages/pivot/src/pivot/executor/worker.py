@@ -616,9 +616,7 @@ def _check_skip_or_run(
 def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> HashInfo:
     """Compute output hash without saving to cache."""
     if path.is_dir():
-        tree_hash, manifest = cache.hash_artifact_directory(
-            path, state_db, cache_dir=config.get_cache_dir() / "files"
-        )
+        tree_hash, manifest = cache.hash_directory(path, state_db)
         return DirHash(hash=tree_hash, manifest=manifest)
     file_hash, _ = cache.hash_file(path, state_db)
     return FileHash(hash=file_hash)
@@ -1048,7 +1046,7 @@ def _hash_output_paths(
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if path.is_dir():
-            tree_hash, manifest = cache.hash_artifact_directory(path, state_db)
+            tree_hash, manifest = cache.hash_directory(path, state_db)
             output_hashes[types.identity_key(ref.identity)] = DirHash(
                 hash=tree_hash, manifest=manifest
             )

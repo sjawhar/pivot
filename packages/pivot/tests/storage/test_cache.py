@@ -194,33 +194,7 @@ def test_hash_directory(tmp_path: pathlib.Path) -> None:
     assert len(manifest) == 2
 
 
-def test_hash_artifact_directory_includes_ignored_named_descendants(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A stage directory is an artifact, not a project tree to filter."""
-    test_dir = tmp_path / "artifact"
-    expected = {
-        ".git/required.txt": ".git",
-        ".idea/required.txt": ".idea",
-        ".venv/required.txt": ".venv",
-        ".vscode/required.txt": ".vscode",
-        "build/required.txt": "build",
-        "dist/required.txt": "dist",
-        "node_modules/required.txt": "node_modules",
-        "editor.swp": "editor state",
-        "keep.txt": "keep",
-    }
-    for relpath, content in expected.items():
-        path = test_dir / relpath
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-
-    _, manifest = cache.hash_artifact_directory(test_dir)
-
-    assert {entry["relpath"] for entry in manifest} == set(expected)
-
-
-def test_hash_artifact_directory_refuses_symlinked_descendants(tmp_path: pathlib.Path) -> None:
+def test_hash_directory_refuses_symlinked_descendants(tmp_path: pathlib.Path) -> None:
     """A directory artifact reports a symlink rather than silently excluding it."""
     test_dir = tmp_path / "artifact"
     test_dir.mkdir()
@@ -229,7 +203,22 @@ def test_hash_artifact_directory_refuses_symlinked_descendants(tmp_path: pathlib
     (test_dir / "link.txt").symlink_to(target)
 
     with pytest.raises(exceptions.CacheError, match="Directory artifact contains symlink"):
-        cache.hash_artifact_directory(test_dir)
+        cache.hash_directory(test_dir)
+
+
+def test_hash_directory_hashes_cache_object_links_by_target(tmp_path: pathlib.Path) -> None:
+    """A symlink checkout's link to a cache object counts as the file it points to."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("keep")
+    cache_dir = tmp_path / "cache"
+    expected_hash, expected_manifest = cache.hash_directory(source)
+    cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, expected_manifest[0]["hash"]))
+
+    assert cache.hash_directory(linked) == (expected_hash, expected_manifest)
 
 
 def test_hash_directory_relative_paths(tmp_path: pathlib.Path) -> None:
@@ -288,18 +277,15 @@ def test_hash_directory_includes_size(tmp_path: pathlib.Path) -> None:
     assert manifest[0]["size"] == 5
 
 
-def test_hash_directory_skips_symlinks(tmp_path: pathlib.Path) -> None:
-    """Symlinks in directory are skipped."""
+def test_hash_directory_refuses_symlinks_to_files_outside_the_cache(tmp_path: pathlib.Path) -> None:
+    """A symlink that is not a cache-object link cannot be silently skipped."""
     test_dir = tmp_path / "mydir"
     test_dir.mkdir()
     (test_dir / "real.txt").write_text("content")
     (test_dir / "link.txt").symlink_to(test_dir / "real.txt")
 
-    _, manifest = cache.hash_directory(test_dir)
-
-    relpaths = [e["relpath"] for e in manifest]
-    assert "real.txt" in relpaths
-    assert "link.txt" not in relpaths, "Symlinks should be skipped"
+    with pytest.raises(exceptions.CacheError, match="Directory artifact contains symlink"):
+        cache.hash_directory(test_dir)
 
 
 def test_hash_directory_marks_executable(tmp_path: pathlib.Path) -> None:

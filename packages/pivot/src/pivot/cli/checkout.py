@@ -67,20 +67,11 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
     return result
 
 
-def _on_disk_matches_expected(
-    path: pathlib.Path,
-    expected_hash: HashInfo,
-    *,
-    artifact_directory: bool = False,
-    cache_dir: pathlib.Path | None = None,
-) -> bool:
+def _on_disk_matches_expected(path: pathlib.Path, expected_hash: HashInfo) -> bool:
     if is_dir_hash(expected_hash):
         if not path.is_dir():
             return False
-        if artifact_directory:
-            actual_hash, _ = cache.hash_artifact_directory(path, cache_dir=cache_dir)
-        else:
-            actual_hash, _ = cache.hash_directory(path)
+        actual_hash, _ = cache.hash_directory(path)
     else:
         if not path.is_file():
             return False
@@ -95,8 +86,6 @@ def _restore_path_sync(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None = None,
-    *,
-    artifact_directory: bool = False,
 ) -> tuple[RestoreResult, str]:
     """Restore a file or directory from cache (sync version).
 
@@ -113,14 +102,7 @@ def _restore_path_sync(
     """
     with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
-            path,
-            output_hash,
-            cache_dir,
-            checkout_modes,
-            behavior,
-            state_dir,
-            lock_token,
-            artifact_directory=artifact_directory,
+            path, output_hash, cache_dir, checkout_modes, behavior, state_dir, lock_token
         )
 
 
@@ -132,19 +114,12 @@ def _restore_path_locked(
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None,
     lock_token: str | None,
-    *,
-    artifact_directory: bool = False,
 ) -> tuple[RestoreResult, str]:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
-                if _on_disk_matches_expected(
-                    path,
-                    output_hash,
-                    artifact_directory=artifact_directory,
-                    cache_dir=cache_dir,
-                ):
+                if _on_disk_matches_expected(path, output_hash):
                     return ("skipped", path.name)
                 raise click.ClickException(
                     f"'{path.name}' already exists with different content. "
@@ -205,8 +180,6 @@ async def _checkout_files_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
-    *,
-    stage_outputs: Mapping[str, HashInfo] | None = None,
 ) -> tuple[list[str], int, int]:
     """Restore files in parallel.
 
@@ -236,7 +209,6 @@ async def _checkout_files_async(
                     checkout_modes,
                     behavior,
                     state_dir,
-                    artifact_directory=stage_outputs is not None and abs_path_str in stage_outputs,
                 )
             match result:
                 case "missing":
@@ -384,7 +356,6 @@ async def _checkout_main_async(
             behavior,
             callback,
             state_dir=state_dir,
-            stage_outputs=stage_outputs,
         )
     else:
         # Checkout all tracked files and stage outputs
@@ -420,7 +391,6 @@ async def _checkout_main_async(
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
-                stage_outputs=stage_outputs,
             )
         )
         (f1, r1, s1), (f2, r2, s2) = await asyncio.gather(t1, t2)

@@ -45,8 +45,8 @@ def _restore_target_token(target_path: pathlib.Path) -> str:
     return hashlib.sha256(str(logical_path).encode()).hexdigest()[:32]
 
 
-def _restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathlib.Path:
-    """Return the deterministic staging path for a file checkout."""
+def restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathlib.Path:
+    """Return the deterministic staging path for a file restore."""
     return path.parent / f"{_RESTORE_TEMP_PREFIX}{token or _restore_target_token(path)}.file"
 
 
@@ -170,14 +170,29 @@ def hash_file(
     return file_hash, file_stat
 
 
+def _cache_object_key(path: pathlib.Path) -> str | None:
+    """Return the cache key a symlink's target is stored under, if it resolves to a cache object.
+
+    Cache objects live at ``<cache>/XX/YYYY...`` named by their content hash; a file-by-file
+    symlink checkout restores each directory member as a link to one.
+    """
+    try:
+        target = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    key = target.parent.name + target.name
+    return key if is_valid_hash(key) and target.is_file() else None
+
+
 def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
     """Yield every file under `path` recursively, using os.scandir() for efficiency.
 
     A declared directory artifact is hashed and cached whole: no name is ignored, so a change
     to any file in a directory input reruns its consumers, and every file in a directory output
     survives cache and restore. Ignore rules belong to code fingerprinting and watch mode.
+    A symlink to a cache object (left by a symlink checkout) counts as the file it points to;
+    any other symlink is refused rather than silently left out of the artifact.
     DirEntry objects cache stat results, avoiding redundant syscalls.
-    Symlinks are skipped to prevent loops.
     PermissionError propagates to caller - partial hashes would be incorrect.
 
     Args:
@@ -186,68 +201,51 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
     with os.scandir(path) as entries:
         for entry in entries:
             if entry.is_symlink():
-                continue
-            if entry.is_file():
-                yield entry
-            elif entry.is_dir():
-                yield from _scandir_recursive(pathlib.Path(entry.path))
-
-
-def _scandir_artifact_recursive(
-    path: pathlib.Path, cache_dir: pathlib.Path | None
-) -> Generator[os.DirEntry[str]]:
-    """Yield artifact files, allowing only descendants linked to cache objects."""
-    resolved_cache = cache_dir.resolve() if cache_dir is not None else None
-    with os.scandir(path) as entries:
-        for entry in entries:
-            entry_path = pathlib.Path(entry.path)
-            if entry.is_symlink():
-                try:
-                    cache_derived = (
-                        resolved_cache is not None
-                        and entry_path.resolve().is_relative_to(resolved_cache)
-                        and entry_path.is_file()
-                    )
-                except OSError:
-                    cache_derived = False
-                if cache_derived:
+                if _cache_object_key(pathlib.Path(entry.path)) is not None:
                     yield entry
                     continue
                 raise exceptions.CacheError(f"Directory artifact contains symlink: {entry.path}")
             if entry.is_file():
                 yield entry
             elif entry.is_dir():
-                yield from _scandir_artifact_recursive(entry_path, cache_dir)
+                yield from _scandir_recursive(pathlib.Path(entry.path))
 
 
-def _hash_directory(
+def hash_directory(
     path: pathlib.Path,
-    state_db: state_mod.StateDB | None,
-    entries: Generator[os.DirEntry[str]],
-    *,
-    cache_dir: pathlib.Path | None = None,
+    state_db: state_mod.StateDB | None = None,
 ) -> tuple[str, list[DirManifestEntry]]:
-    """Hash yielded regular files into a directory manifest."""
+    """Compute tree hash of directory, returning hash and manifest.
+
+    Symlink handling:
+    - A symlink to a cache object is hashed by its target's content under its own relpath;
+      the content must match the object's name
+    - Any other symlink inside the directory raises CacheError
+    - Base path may be symlinked (resolved for consistency)
+
+    Note: For portability, paths are stored as normalized (symlinks preserved)
+    in lock files, but resolved here for consistent hashing.
+
+    Args:
+        path: Directory to hash
+        state_db: Optional StateDB for caching file hashes
+    """
     _t = metrics.start()
     manifest = list[DirManifestEntry]()
     resolved_base = path.resolve()
-    resolved_cache = cache_dir.resolve() if cache_dir is not None else None
 
-    for entry in sorted(entries, key=lambda e: e.path):
+    for entry in sorted(_scandir_recursive(path), key=lambda e: e.path):
         file_path = pathlib.Path(entry.path)
+        # Verify a regular file is still within the directory (paranoid check). A cache-object
+        # link resolves into the cache by design.
+        if not entry.is_symlink() and not file_path.resolve().is_relative_to(resolved_base):
+            continue
         try:
-            resolved_file = file_path.resolve()
-            cache_derived = (
-                resolved_cache is not None
-                and file_path.is_symlink()
-                and resolved_file.is_relative_to(resolved_cache)
-            )
-            # Verify files stay in the artifact, except cache-derived checkout links.
-            if not cache_derived and not resolved_file.is_relative_to(resolved_base):
-                continue
             rel = file_path.relative_to(path)
             file_stat = entry.stat(follow_symlinks=True)
             file_hash, _ = hash_file(file_path, state_db)
+            if entry.is_symlink() and file_hash != _cache_object_key(file_path):
+                raise exceptions.CacheError(f"Directory artifact contains symlink: {entry.path}")
             manifest_entry: DirManifestEntry = {
                 "relpath": str(rel),
                 "hash": file_hash,
@@ -263,29 +261,6 @@ def _hash_directory(
 
     metrics.end("cache.hash_directory", _t)
     return tree_hash, manifest
-
-
-def hash_directory(
-    path: pathlib.Path,
-    state_db: state_mod.StateDB | None = None,
-) -> tuple[str, list[DirManifestEntry]]:
-    """Hash a project directory, excluding ignored paths and symlink descendants."""
-    return _hash_directory(path, state_db, _scandir_recursive(path))
-
-
-def hash_artifact_directory(
-    path: pathlib.Path,
-    state_db: state_mod.StateDB | None = None,
-    *,
-    cache_dir: pathlib.Path | None = None,
-) -> tuple[str, list[DirManifestEntry]]:
-    """Hash a directory artifact, keeping regular and cache-derived descendants."""
-    return _hash_directory(
-        path,
-        state_db,
-        _scandir_artifact_recursive(path, cache_dir),
-        cache_dir=cache_dir,
-    )
 
 
 _VALID_HASH_CHARS = frozenset("0123456789abcdef")
@@ -676,10 +651,10 @@ def _save_directory_to_cache(
             cache_dir_path = get_cache_path(cache_dir, existing_hash)
             if cache_dir_path.exists():
                 # Already correctly linked - compute manifest from actual content
-                _, manifest = hash_artifact_directory(path, state_db, cache_dir=cache_dir)
+                _, manifest = hash_directory(path, state_db)
                 return DirHash(hash=existing_hash, manifest=manifest)
 
-    tree_hash, manifest = hash_artifact_directory(path, state_db, cache_dir=cache_dir)
+    tree_hash, manifest = hash_directory(path, state_db)
     output_hash = DirHash(hash=tree_hash, manifest=manifest)
     _store_directory(
         path,
