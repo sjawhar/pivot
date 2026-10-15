@@ -950,8 +950,8 @@ async def test_engine_cancel_during_coordinator_skip_releases_resources_without_
             results=results,
         )
 
-        assert results[stage_name]["status"] == StageStatus.CANCELLED
         pool.submit.assert_not_called()
+        assert results[stage_name]["status"] == StageStatus.CANCELLED
         assert engine._scheduler.get_state(stage_name) == StageExecutionState.COMPLETED
         engine._scheduler.set_state(stage_name, StageExecutionState.READY)
         assert engine._scheduler.can_start(stage_name), "Cancellation must release CPU capacity"
