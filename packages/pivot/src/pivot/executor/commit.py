@@ -150,7 +150,7 @@ def commit_stages(
                 identity_key = types.identity_key(out.identity)
                 try:
                     out_path = store.resolve_display_path(out)
-                    hash_info = store.commit(out, out_path)
+                    hash_info = store.commit(out, out_path, state_dir=default_state_dir)
                     file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[out.identity] = hash_info

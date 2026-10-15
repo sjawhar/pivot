@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, TypedDict, TypeGuard
 import xxhash
 import yaml
 
-from pivot import exceptions, git, project, types, yaml_config
+from pivot import config, exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
 from pivot.types import DirHash, FileHash, HashInfo
@@ -237,6 +237,14 @@ def _verify_content_hash(content: bytes, expected_hash: str) -> bool:
     return actual_hash == expected_hash
 
 
+def _write_fallback_content(dest_path: pathlib.Path, content: bytes, force: bool) -> None:
+    """Replace a cache-miss target while holding the same lock as cache restores."""
+    with cache.restore_lock(dest_path, config.get_state_dir()):
+        if (force or dest_path.is_symlink()) and (dest_path.exists() or dest_path.is_symlink()):
+            cache.remove_output(dest_path)
+        dest_path.write_bytes(content)
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -254,16 +262,6 @@ def restore_file(
             status=RestoreStatus.SKIPPED,
             path=path_str,
             message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
-        )
-
-    try:
-        if force and dest_path.exists():
-            cache.remove_output(dest_path)
-    except OSError as e:
-        return RestoreResult(
-            status=RestoreStatus.ERROR,
-            path=path_str,
-            message=f"Error: {dest_path} - failed to remove existing file: {e}",
         )
 
     # Ensure parent directory exists before any restore strategy
@@ -286,7 +284,7 @@ def restore_file(
                     output_hash,
                     cache_dir / "files",
                     checkout_modes=checkout_modes,
-                    state_dir=cache_dir.parent,
+                    state_dir=config.get_state_dir(),
                 )
                 if success:
                     return RestoreResult(
@@ -301,7 +299,7 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            dest_path.write_bytes(content)
+            _write_fallback_content(dest_path, content, force)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -330,7 +328,7 @@ def restore_file(
                     ),
                 )
             try:
-                dest_path.write_bytes(remote_content)
+                _write_fallback_content(dest_path, remote_content, force)
             except OSError as e:
                 return RestoreResult(
                     status=RestoreStatus.ERROR,

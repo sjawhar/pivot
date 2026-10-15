@@ -76,11 +76,6 @@ def test_concurrent_writers_lose_no_generation_increments_or_hash_entries(
                 assert db.get(path, path.stat()) == f"{worker:08x}{i:08x}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 8 (storage-fixes Slice 2 PR): "
-    + "directory restore lock is unlinked while a waiter holds it",
-)
 def test_directory_restore_keeps_the_lock_file_a_waiter_holds(tmp_path: pathlib.Path) -> None:
     """Restores of one directory exclude each other through one lock file.
 

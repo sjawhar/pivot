@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+import xxhash
 
 from pivot import exceptions, project
 from pivot.remote import config as remote_config
@@ -716,7 +717,7 @@ async def test_pull_async_integration(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Integration: pull files from real moto S3."""
-    hash1 = "ab" + "c" * 14
+    hash1 = xxhash.xxh64(b"content1").hexdigest()
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
@@ -744,7 +745,7 @@ async def test_push_pull_roundtrip_integration(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Integration: push then pull to verify roundtrip."""
-    hash1 = "ab" + "c" * 14
+    hash1 = xxhash.xxh64(b"original").hexdigest()
 
     state_dir1 = tmp_path / ".pivot1"
     cache_dir1 = state_dir1 / "cache"
@@ -815,8 +816,8 @@ async def test_pull_async_with_deps_integration(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Integration: pull with dependency hashes."""
-    out_hash = "ab" + "c" * 14
-    dep_hash = "de" + "f" * 14
+    out_hash = xxhash.xxh64(b"main_file").hexdigest()
+    dep_hash = xxhash.xxh64(b"dependency_file").hexdigest()
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,

@@ -85,7 +85,14 @@ class CacheStore:
         os.close(fd)
         return pathlib.Path(tmp_path)
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo:
+    def commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        state_dir: pathlib.Path | None = None,
+    ) -> types.HashInfo:
+        _ = state_dir
         with self._state_db() as db:
             output_hash = cache.save_to_cache(
                 path,
@@ -203,7 +210,13 @@ class WorkspaceStore:
         cache.remove_output(path)
         return path
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo:
+    def commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        state_dir: pathlib.Path | None = None,
+    ) -> types.HashInfo:
         """Hash a written output once and, unless it is a metric, place it in the cache."""
         output_hash: types.HashInfo
         if path.is_dir():
@@ -213,7 +226,13 @@ class WorkspaceStore:
             file_hash, _ = cache.hash_file(path, None)
             output_hash = types.FileHash(hash=file_hash)
         if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
-            cache.store_hashed_output(path, output_hash, self._cache_dir, self._checkout_modes)
+            cache.store_hashed_output(
+                path,
+                output_hash,
+                self._cache_dir,
+                self._checkout_modes,
+                state_dir=state_dir,
+            )
         return output_hash
 
     def restore_from_cache(
