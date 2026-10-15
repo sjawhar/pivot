@@ -237,12 +237,15 @@ def _verify_content_hash(content: bytes, expected_hash: str) -> bool:
     return actual_hash == expected_hash
 
 
-def _write_fallback_content(dest_path: pathlib.Path, content: bytes, force: bool) -> None:
-    """Replace a cache-miss target while holding the same lock as cache restores."""
+def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> None:
+    """Atomically replace a cache-miss target under the cache restore lock."""
+
+    def write_content(fd: int) -> None:
+        with os.fdopen(fd, "wb") as file:
+            file.write(content)
+
     with cache.restore_lock(dest_path, config.get_state_dir()):
-        if (force or dest_path.is_symlink()) and (dest_path.exists() or dest_path.is_symlink()):
-            cache.remove_output(dest_path)
-        dest_path.write_bytes(content)
+        cache.atomic_write_file(dest_path, write_content)
 
 
 def restore_file(
@@ -299,7 +302,7 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            _write_fallback_content(dest_path, content, force)
+            _write_fallback_content(dest_path, content)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -328,7 +331,7 @@ def restore_file(
                     ),
                 )
             try:
-                _write_fallback_content(dest_path, remote_content, force)
+                _write_fallback_content(dest_path, remote_content)
             except OSError as e:
                 return RestoreResult(
                     status=RestoreStatus.ERROR,

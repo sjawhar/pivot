@@ -12,6 +12,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 import boto3
@@ -244,6 +245,76 @@ def test_checkout_force_preserves_existing_output_when_its_cache_object_is_missi
     assert output_hash in out
     assert "cache object" in out.lower()
     assert output.read_text() == "workspace edit"
+
+
+def test_get_killed_before_fallback_replacement_preserves_existing_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A killed cache-miss get leaves the prior target intact until atomic replacement."""
+    root = _project(tmp_path, {"source.txt": "revision content"})
+    subprocess.run(["git", "add", "source.txt"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial"],
+        cwd=root,
+        check=True,
+    )
+    target = root / "source.txt"
+    target.write_text("workspace content")
+    hook_dir = root / "hook"
+    hook_dir.mkdir()
+    ready = root / "ready"
+    hook_dir.joinpath("sitecustomize.py").write_text("""\
+import os
+import pathlib
+import time
+
+_target = pathlib.Path(os.environ["PIVOT_TEST_BLOCK_TARGET"])
+_ready = pathlib.Path(os.environ["PIVOT_TEST_READY"])
+_write_bytes = pathlib.Path.write_bytes
+_replace = pathlib.Path.replace
+
+def _pause() -> None:
+    _ready.write_text("ready")
+    while True:
+        time.sleep(1)
+
+def write_bytes(self: pathlib.Path, data: bytes) -> int:
+    if self == _target:
+        _pause()
+    return _write_bytes(self, data)
+
+def replace(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+    if pathlib.Path(target) == _target:
+        _pause()
+    return _replace(self, target)
+
+pathlib.Path.write_bytes = write_bytes
+pathlib.Path.replace = replace
+""")
+    env = _env(
+        PIVOT_TEST_BLOCK_TARGET=str(target),
+        PIVOT_TEST_READY=str(ready),
+    )
+    env["PYTHONPATH"] = str(hook_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [_PIVOT, "get", "--force", "--rev", "HEAD", "source.txt"],
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "pivot get did not reach the fallback replacement"
+    finally:
+        if process.poll() is None:
+            process.kill()
+    process.communicate(timeout=30)
+
+    assert target.read_text() == "workspace content"
 
 
 def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: pathlib.Path) -> None:
