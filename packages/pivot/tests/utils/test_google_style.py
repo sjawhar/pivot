@@ -16,9 +16,9 @@ def test_google_style_captures_module_attrs() -> None:
     assert "self:stage_google_style" in manifest, "Should capture stage function"
 
     # Should capture module attribute usage via AST analysis
-    helper_key = "mod:tests.user_utils.helper_b"
+    helper_key = "func:tests.user_utils.helper_b"
     assert helper_key in manifest, "Should capture user_utils.helper_b"
-    assert "mod:tests.user_utils.CONSTANT_A" in manifest, "Should capture user_utils.CONSTANT_A"
+    assert "const:tests.user_utils.CONSTANT_A" in manifest, "Should capture user_utils.CONSTANT_A"
 
     # Verify helper_b is hashed (user code gets hash, not "callable" marker)
     helper_b_hash = manifest[helper_key]

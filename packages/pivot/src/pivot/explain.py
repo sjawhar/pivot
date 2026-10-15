@@ -19,11 +19,13 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactIdentity,
     HashInfo,
+    LockData,
     StageExplanation,
     identity_from_key,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
     import pygtrie
@@ -57,18 +59,25 @@ def _unavailable_outputs_reason(
     return "; ".join(reasons)
 
 
-def producer_output_hashes(
-    stage_names: list[str],
+def read_locks(
+    stage_names: Iterable[str],
     all_stages: dict[str, registry.RegistryStageInfo],
     default_state_dir: pathlib.Path,
-) -> dict[ArtifactIdentity, HashInfo]:
-    """Read locked output hashes for producer stages in an execution order."""
-    hashes = dict[ArtifactIdentity, HashInfo]()
+) -> dict[str, LockData | None]:
+    """Read each named stage's lock once; None for a stage that has not run."""
+    locks = dict[str, LockData | None]()
     for stage_name in stage_names:
-        stage_info = all_stages[stage_name]
-        state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
+        state_dir = registry.get_stage_state_dir(all_stages[stage_name], default_state_dir)
+        locks[stage_name] = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
+    return locks
+
+
+def producer_output_hashes(
+    locks: Iterable[LockData | None],
+) -> dict[ArtifactIdentity, HashInfo]:
+    """Merge the locked output hashes of already-read producer locks."""
+    hashes = dict[ArtifactIdentity, HashInfo]()
+    for lock_data in locks:
         if lock_data is not None:
             hashes.update(lock_data["output_hashes"])
     return hashes
@@ -143,6 +152,7 @@ def get_stage_explanation(
     state_dir: pathlib.Path,
     store: store_mod.WorkspaceStore,
     *,
+    lock_data: LockData | None,
     force: bool = False,
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
@@ -151,12 +161,11 @@ def get_stage_explanation(
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
-    A stage is stale when repro will rewrite its lock by running it or restoring
-    from the run cache; it is cached when its lock already matches and repro at
-    most restores outputs.
+    ``lock_data`` is the stage's lock, already read by the caller (None when the stage has
+    not run). A stage is stale when repro will rewrite its lock by running it or restoring
+    from the run cache; it is cached when its lock already matches and repro at most
+    restores outputs.
     """
-    stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-    lock_data = stage_lock.read()
     if lock_data is None:
         return StageExplanation(
             stage_name=stage_name,
@@ -199,9 +208,9 @@ def get_stage_explanation(
             state_db,
         )
         dep_hashes = _to_identity_keyed(str_hashes)
-        for identity, hash_info in known_hashes.items():
-            if any(ref.identity == identity for ref in deps.values()):
-                dep_hashes[identity] = hash_info
+        for ref in deps.values():
+            if ref.identity in known_hashes:
+                dep_hashes[ref.identity] = known_hashes[ref.identity]
 
         if allow_missing:
             unresolved = list[str]()

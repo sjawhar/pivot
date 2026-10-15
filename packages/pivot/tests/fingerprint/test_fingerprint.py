@@ -424,12 +424,10 @@ def test_stdlib_module_attrs_not_tracked():
     """Stdlib module attributes (math, os, json, etc.) are NOT tracked."""
     fp = fingerprint.get_stage_fingerprint(_helper_uses_math_pi)
     assert "self:_helper_uses_math_pi" in fp
-    assert "mod:math.pi" not in fp
+    assert not any("math" in key for key in fp if not key.startswith("self:")), fp
 
     fp2 = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
-    assert "mod:math.sqrt" not in fp2
-    assert "mod:math.sin" not in fp2
-    assert "mod:math.cos" not in fp2
+    assert not any("math" in key for key in fp2 if not key.startswith("self:")), fp2
 
 
 def test_aliased_function_captured():

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 import pivot_tui.event_poller
 import pivot_tui.rpc_client_impl
 from conftest import isolated_pivot_dir
-from pivot import compose
+from pivot import cli, compose
 from pivot.cli import _run_common
 
 # =============================================================================
@@ -710,6 +710,41 @@ def test_resolve_on_error_both_flags_raises() -> None:
     """resolve_on_error raises when both flags are set."""
     with pytest.raises(click.ClickException, match="mutually exclusive"):
         _run_common.resolve_on_error(fail_fast=True, keep_going=True)
+
+
+@pytest.mark.parametrize("command", ["repro", "run"])
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        pytest.param(["gpu"], "must use NAME=POSITIVE_INTEGER", id="missing-capacity"),
+        pytest.param(["gpu=0"], "capacity must be a positive integer", id="zero"),
+        pytest.param(["gpu=1", "GPU=2"], "'gpu' was supplied more than once", id="repeated"),
+    ],
+)
+def test_resources_option_refuses_bad_capacity(
+    runner: click.testing.CliRunner, command: str, values: list[str], message: str
+) -> None:
+    """repro and run share one --resources option with the same parsing."""
+    args = [command]
+    for value in values:
+        args += ["--resources", value]
+
+    result = runner.invoke(cli.cli, args)
+
+    assert result.exit_code == 2, result.output
+    assert "--resources" in result.output, result.output
+    assert message in result.output, result.output
+
+
+@pytest.mark.parametrize("command", ["repro", "run"])
+def test_resources_option_documented_on_run_commands(
+    runner: click.testing.CliRunner, command: str
+) -> None:
+    result = runner.invoke(cli.cli, [command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--resources NAME=CAPACITY" in result.output, result.output
+    assert "Set a scheduler resource" in result.output, result.output
 
 
 def test_run_tui_with_engine_retries_poller_connect(

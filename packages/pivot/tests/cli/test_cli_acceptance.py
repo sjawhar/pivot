@@ -354,6 +354,100 @@ def test_status_pull_count_passes_through_committed_metric_stage(tmp_path: pathl
     assert "Run `pivot pull` to restore outputs of 2 stages from the remote" in out, out
 
 
+_SHARED_DEP_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * 2
+
+
+@stage
+def both(a: pd.DataFrame, b: pd.DataFrame) -> dict:
+    return {"sum": int(a["a"].sum() + b["a"].sum())}
+
+
+with Pipeline("dup") as pipeline:
+    made = make(pipeline.input("x.csv"))
+    both(made, made)
+"""
+
+
+def test_commit_run_cache_entry_is_hit_for_stage_reading_one_artifact_twice(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot commit` and the worker must file a stage's run-cache entry under one key."""
+    root = _project(tmp_path, {"pipeline.py": _SHARED_DEP_PIPELINE, "data/raw/x.csv": "a\n1\n"})
+    _ok(_pivot(root, "repro", "--no-commit"))
+    _ok(_pivot(root, "commit"))
+    raw = root / "data" / "raw" / "x.csv"
+    raw.write_text("a\n5\n")
+    _ok(_pivot(root, "repro"))
+    raw.write_text("a\n1\n")
+
+    out = _ok(_pivot(root, "repro"))
+
+    assert "0 ran, 2 cached" in out, out
+    assert (root / "data" / "dup" / "both.yaml").read_text() == "sum: 4\n"
+
+
+def test_repro_hardlinks_stage_outputs_into_cache_by_default(tmp_path: pathlib.Path) -> None:
+    """The default checkout order starts with hardlink, so an output is not stored twice."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+
+    output = root / "data" / "k" / "scale.jsonl"
+    cached = [p for p in (root / ".pivot" / "cache" / "files").rglob("*") if p.is_file()]
+
+    assert output.stat().st_nlink == 2
+    assert output.stat().st_ino in {p.stat().st_ino for p in cached}
+
+
+def test_symlink_checkout_mode_applies_when_repro_writes_and_restores_outputs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`cache.checkout_mode` governs stage outputs on run and on skip-restore, as for checkout."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    output = root / "data" / "k" / "scale.jsonl"
+
+    _ok(_pivot(root, "repro"))
+    assert output.is_symlink()
+
+    output.unlink()
+    out = _ok(_pivot(root, "repro"))
+
+    assert "0 ran, 2 cached" in out, out
+    assert output.is_symlink()
+    assert output.read_text() == '{"a":2}\n{"a":4}\n'
+
+
+def test_noop_status_reads_no_output_bytes_after_repro(tmp_path: pathlib.Path) -> None:
+    """Committed outputs are in the StateDB file-hash cache, so status hashes nothing."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "2 cached" in out, out
+    assert "cache.hash_file" not in out, out
+
+
+def test_noop_status_reads_no_output_bytes_after_pivot_commit(tmp_path: pathlib.Path) -> None:
+    """`pivot commit` records the output hashes it computes, as a run does."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro", "--no-commit"))
+    _ok(_pivot(root, "commit"))
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "2 cached" in out, out
+    assert "cache.hash_file" not in out, out
+
+
 _DIROUT_PIPELINE = """\
 import pathlib
 import tempfile
@@ -496,3 +590,284 @@ def test_pull_keeps_build_dir_the_stage_writes_inside_its_directory_output(
     assert sorted(p.name for p in shards.iterdir()) == ["0.txt", "1.txt", "build"]
     assert (shards / "0.txt").read_text() == "11"
     assert (shards / "build" / "log.txt").read_text() == "built 2 rows"
+
+
+_PARAM_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, StageParams, stage
+
+
+class ScaleParams(StageParams):
+    factor: int = 10
+
+
+@stage
+def scale(raw: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:
+    return raw * params.factor
+
+
+with Pipeline("p") as pipeline:
+    scale(pipeline.input("t.csv"), params=ScaleParams())
+"""
+
+
+def test_noop_status_reads_no_output_bytes_after_run_cache_restore(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A run-cache restore records the restored outputs' hashes."""
+    root = _project(tmp_path, {"pipeline.py": _PARAM_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("p/scale:\n  factor: 20\n")
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").unlink()
+    restored = _ok(_pivot(root, "repro"))
+    assert "0 ran, 1 cached" in restored, restored
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "1 cached" in out, out
+    assert "cache.hash_file" not in out, out
+
+
+def test_noop_status_reads_no_output_bytes_after_skip_restore(tmp_path: pathlib.Path) -> None:
+    """A skipped stage that copies a deleted output back records the copy's hash."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "copy"))
+    _ok(_pivot(root, "repro"))
+    (root / "data" / "k" / "scale.jsonl").unlink()
+    restored = _ok(_pivot(root, "repro"))
+    assert "0 ran, 2 cached" in restored, restored
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "2 cached" in out, out
+    assert "cache.hash_file" not in out, out
+
+
+_INPUT_NAMED_LIKE_STAGE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def summary(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 7
+
+
+@stage
+def report(prior: pd.DataFrame) -> dict:
+    return {"prior_sum": int(prior.to_numpy().sum())}
+
+
+with Pipeline("rep") as pipeline:
+    summary(pipeline.input("numbers.csv"))
+    report(pipeline.input("rep/summary", path="data/raw/prior.jsonl"))
+"""
+
+
+def test_input_named_like_a_stage_is_refused(tmp_path: pathlib.Path) -> None:
+    """An input and a stage share one identity namespace, so one name cannot be both."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _INPUT_NAMED_LIKE_STAGE_PIPELINE,
+            "data/raw/numbers.csv": "a\n1\n2\n",
+            "data/raw/prior.jsonl": '{"a":100}\n',
+        },
+    )
+
+    proc = _pivot(root, "list")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Input 'rep/summary'" in out and "stage 'rep/summary'" in out, out
+
+
+_OTHER_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def report(prior: pd.DataFrame) -> dict:
+    return {"prior_sum": int(prior.to_numpy().sum())}
+
+
+with Pipeline("other") as pipeline:
+    report(pipeline.input("k/scale", path="data/raw/prior.jsonl"))
+"""
+
+
+def test_input_reads_its_own_file_when_another_pipelines_output_has_its_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Whether a dependency is an input is decided by the pipeline, never by what is on disk."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _CHAIN_PIPELINE,
+            "data/raw/t.csv": "a\n1\n2\n",
+            "data/raw/prior.jsonl": '{"a":100}\n',
+            "other/pipeline.py": _OTHER_PIPELINE,
+        },
+    )
+    other = root / "other"
+    _ok(_pivot(other, "repro"))
+    _ok(_pivot(root, "repro"))
+    assert (root / "data" / "k" / "scale.jsonl").is_file()
+
+    status = _ok(_pivot(other, "status"))
+    rerun = _ok(_pivot(other, "repro"))
+
+    assert "1 cached, 0 stale" in status, status
+    assert "0 ran, 1 cached" in rerun, rerun
+    assert (root / "data" / "other" / "report.yaml").read_text() == "prior_sum: 100\n"
+
+
+_TWO_INPUTS_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def rows(train: pd.DataFrame, test: pd.DataFrame) -> dict:
+    return {"rows": int(len(train) + len(test))}
+
+
+with Pipeline("sym") as pipeline:
+    rows(pipeline.input("train.csv"), pipeline.input("test.csv"))
+"""
+
+
+def test_two_inputs_symlinked_to_one_file_run(tmp_path: pathlib.Path) -> None:
+    """Inputs are told apart by their declared paths, not by the files the paths point to."""
+    root = _project(tmp_path, {"pipeline.py": _TWO_INPUTS_PIPELINE, "shared/base.csv": "a\n1\n2\n"})
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "train.csv").symlink_to("../../shared/base.csv")
+    (root / "data" / "raw" / "test.csv").symlink_to("../../shared/base.csv")
+
+    out = _ok(_pivot(root, "repro"))
+
+    assert "1 ran" in out, out
+    assert (root / "data" / "sym" / "rows.yaml").read_text() == "rows: 4\n"
+
+
+_SAME_CONTENT_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def left(numbers: pd.DataFrame) -> dict:
+    return {"rows": int(len(numbers))}
+
+
+@stage
+def right(numbers: pd.DataFrame) -> dict:
+    return {"rows": int(len(numbers))}
+
+
+@stage
+def both(a: dict, b: dict) -> dict:
+    return {"total": a["rows"] + b["rows"]}
+
+
+with Pipeline("sym") as pipeline:
+    numbers = pipeline.input("numbers.csv")
+    both(left(numbers), right(numbers))
+"""
+
+
+def test_outputs_symlinked_to_one_cache_object_feed_one_stage(tmp_path: pathlib.Path) -> None:
+    """Two equal outputs checked out as symlinks share a cache object; their consumer still runs."""
+    root = _project(
+        tmp_path, {"pipeline.py": _SAME_CONTENT_PIPELINE, "data/raw/numbers.csv": "a\n1\n2\n"}
+    )
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    _ok(_pivot(root, "repro"))
+    left, right = root / "data" / "sym" / "left.yaml", root / "data" / "sym" / "right.yaml"
+    assert left.resolve() == right.resolve()
+
+    out = _ok(_pivot(root, "run", "sym/both", "--force"))
+
+    assert "1 ran" in out, out
+    assert (root / "data" / "sym" / "both.yaml").read_text() == "total: 4\n"
+
+
+_CPU_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage(resources={"cpu": 2})
+def scale(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * 2
+
+
+@stage
+def total(scaled: pd.DataFrame) -> dict:
+    return {"sum": int(scaled["a"].sum())}
+
+
+with Pipeline("res") as pipeline:
+    total(scale(pipeline.input("t.csv")))
+"""
+
+
+def test_cpu_request_runs_when_fewer_stages_than_it_requests_are_scheduled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The cpu capacity is the worker count, not the number of stages in this run."""
+    root = _project(tmp_path, {"pipeline.py": _CPU_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "core.max_workers", "4"))
+
+    repro = _ok(_pivot(root, "repro", "res/scale", "--force"))
+    run = _ok(_pivot(root, "run", "res/scale", "--force"))
+
+    assert "1 ran" in repro, repro
+    assert "1 ran" in run, run
+
+
+def test_resources_cpu_option_sets_the_cpu_capacity(tmp_path: pathlib.Path) -> None:
+    """`--resources cpu=N` is the cpu capacity for the run; it is not replaced by the worker count."""
+    root = _project(tmp_path, {"pipeline.py": _CPU_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "core.max_workers", "1"))
+
+    refused = _pivot(root, "repro", "res/scale")
+    out = _ok(_pivot(root, "repro", "res/scale", "--resources", "cpu=2"))
+
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "requests 2 units of resource 'cpu', but its capacity is 1" in (
+        refused.stdout + refused.stderr
+    )
+    assert "1 ran" in out, out
+
+
+def test_status_explain_json_writes_dep_identity_as_an_object(tmp_path: pathlib.Path) -> None:
+    """`dep_changes[].identity` is `{producer, key}`, the same shape the RPC sends."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+    (root / "data" / "raw" / "t.csv").write_text("a\n5\n")
+
+    out = _ok(_pivot(root, "--quiet", "status", "--explain", "--json"))
+
+    stages = {stage["name"]: stage for stage in json.loads(out)["stages"]}
+    assert stages["k/scale"]["dep_changes"][0]["identity"] == {"producer": "t.csv", "key": None}
+
+
+def test_list_refuses_a_fractional_resource_request(tmp_path: pathlib.Path) -> None:
+    """The decorator refuses what the scheduler cannot run, so the error comes at load."""
+    pipeline = _CPU_PIPELINE.replace('"cpu": 2', '"gpu": 0.5')
+    root = _project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+
+    proc = _pivot(root, "list")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Stage resource 'gpu' must request a positive integer or 'all'" in out, out

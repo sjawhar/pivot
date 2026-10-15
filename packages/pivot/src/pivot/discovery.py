@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib
@@ -14,7 +13,7 @@ from typing import Final
 
 import cloudpickle
 
-from pivot import fingerprint, metrics, project, types
+from pivot import exceptions, fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
 
 logger = logging.getLogger(__name__)
@@ -38,6 +37,8 @@ class _ImportSession:
     path_entry: str
     caller_path_entries: list[tuple[int, str]]
     preexisting_root_modules: dict[str, _stdlib_types.ModuleType]
+    # Whether each module file lies under root; every scan of sys.modules shares one resolve.
+    file_under_root: dict[str, bool] = dataclasses.field(default_factory=dict)
     owned_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(default_factory=dict)
     displaced_modules: dict[str, object] = dataclasses.field(default_factory=dict)
     preexisting_pickle_by_value_modules: set[str] = dataclasses.field(default_factory=set)
@@ -77,12 +78,13 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     if _import_session is not None:
         _end_import_session(_import_session)
     root = root.resolve()
+    file_under_root = dict[str, bool]()
     preexisting_root_modules = {
         module_name: module
         for module_name, module in sys.modules.items()
         if module_name != "pivot"
         and not module_name.startswith("pivot.")
-        and _module_is_under_root(module, root)
+        and _module_is_under_root(module, root, file_under_root)
     }
     root_str = str(root)
     caller_path_entries = [
@@ -96,6 +98,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         root_str,
         caller_path_entries,
         preexisting_root_modules,
+        file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
     )
     importlib.invalidate_caches()
@@ -110,14 +113,26 @@ def _displace_module(module_name: str, session: _ImportSession) -> None:
     sys.modules.pop(module_name, None)
 
 
-def _module_is_under_root(module: _stdlib_types.ModuleType, root: pathlib.Path) -> bool:
-    """Whether a regular or namespace module is loaded from this project root."""
+def _module_is_under_root(
+    module: _stdlib_types.ModuleType, root: pathlib.Path, file_under_root: dict[str, bool]
+) -> bool:
+    """Whether a regular or namespace project module is loaded from this project root.
+
+    Libraries are never project modules, even from a virtualenv inside the root: a session
+    removes the modules it owns, and some extensions (numpy's) cannot be imported twice.
+    ``file_under_root`` memoizes the verdict per module file for this root.
+    """
+    if not fingerprint.is_user_code(module):
+        return False
     module_file = getattr(module, "__file__", None)
     if isinstance(module_file, str):
-        try:
-            return pathlib.Path(module_file).resolve().is_relative_to(root)
-        except (OSError, ValueError):
-            return False
+        if (verdict := file_under_root.get(module_file)) is None:
+            try:
+                verdict = pathlib.Path(module_file).resolve().is_relative_to(root)
+            except (OSError, ValueError):
+                verdict = False
+            file_under_root[module_file] = verdict
+        return verdict
     module_paths = getattr(module, "__path__", ())
     try:
         return any(pathlib.Path(path).resolve().is_relative_to(root) for path in module_paths)
@@ -148,7 +163,7 @@ def _track_root_modules(session: _ImportSession) -> None:
     for module_name, module in list(sys.modules.items()):
         if module_name == "pivot" or module_name.startswith("pivot."):
             continue
-        if not _module_is_under_root(module, session.root):
+        if not _module_is_under_root(module, session.root, session.file_under_root):
             continue
         if session.preexisting_root_modules.get(module_name) is not module:
             session.owned_modules[module_name] = module
@@ -178,7 +193,7 @@ def _ensure_parent_modules(module_name: str, session: _ImportSession) -> None:
         parent_dir = session.root.joinpath(*parts[:index])
         existing = sys.modules.get(parent_name)
         if isinstance(existing, _stdlib_types.ModuleType) and _module_is_under_root(
-            existing, session.root
+            existing, session.root, session.file_under_root
         ):
             continue
         if existing is not None:
@@ -220,6 +235,30 @@ def _rollback_import_attempt(
             sys.modules[module_name] = previous
         else:
             sys.modules.pop(module_name, None)
+
+
+def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -> None:
+    """Refuse a pipeline whose stages would keep state outside the project's ``.pivot``.
+
+    Inputs and outputs resolve against the project root, but ``root=`` moves a stage's lock
+    files and half its StateDB, so a ``root=`` other than the project root splits one stage's
+    state across two directories. Stages from another pipeline carry that pipeline's root.
+    """
+    advice = (
+        f"but a pipeline always uses the project's .pivot and data/ ({project_root}); "
+        + "remove root="
+    )
+    if pipeline.root.resolve() != project_root:
+        raise exceptions.PipelineConfigError(
+            f"Pipeline '{pipeline.name}' sets root={pipeline.root}, {advice}"
+        )
+    for stage_name in pipeline.list_stages():
+        state_dir = pipeline.get_stage(stage_name)["state_dir"]
+        if state_dir is not None and state_dir.resolve() != (project_root / ".pivot").resolve():
+            raise exceptions.PipelineConfigError(
+                f"Stage '{stage_name}' comes from a pipeline that sets root={state_dir.parent}, "
+                + advice
+            )
 
 
 def find_config_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
@@ -276,6 +315,8 @@ def discover_pipeline(
 
         if all_pipelines:
             result = _discover_all_pipelines(root, session)
+            if result is not None:
+                _require_project_state(result, root)
             loaded = result is not None
             return result
         # Check cwd first if it's within project root but not the root itself
@@ -295,8 +336,6 @@ def discover_pipeline(
         _t_module = metrics.start()
         try:
             result = _load_pipeline_from_module(config_path, session)
-            loaded = result is not None
-            return result
         except SystemExit as e:
             raise DiscoveryError(f"Pipeline {config_path} called sys.exit({e.code})") from e
         except DiscoveryError:
@@ -307,6 +346,10 @@ def discover_pipeline(
             metrics.end("discovery.load_module", _t_module)
             fingerprint.flush_ast_hash_cache()
             fingerprint.flush_manifest_cache()
+        if result is not None:
+            _require_project_state(result, root)
+        loaded = result is not None
+        return result
     finally:
         if session is not None and not loaded:
             _end_import_session(session)
@@ -532,14 +575,17 @@ def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:
     loaded = False
     try:
         pipeline = _load_pipeline_from_module(resolved_path, session)
-        loaded = pipeline is not None
-        return pipeline
     except DiscoveryError as e:
         logger.warning(f"Pipeline discovery issue in {path}: {e}")
-        return None
+        pipeline = None
     except Exception as e:
         logger.debug(f"Failed to load pipeline from {path}: {e}")
-        return None
+        pipeline = None
+    try:
+        if pipeline is not None:
+            _require_project_state(pipeline, project_root)
+        loaded = pipeline is not None
+        return pipeline
     finally:
         if not loaded:
             _end_import_session(session)

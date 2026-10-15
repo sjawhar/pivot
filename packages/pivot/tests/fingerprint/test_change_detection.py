@@ -138,13 +138,13 @@ def test_helper_via_module_attr_change_causes_miss(module_dir: pathlib.Path) -> 
 
     mod = _import_fresh("test_change_stage_mod")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["mod:test_change_helpers_mod.helper"]
+    hash1 = fp1["func:test_change_helpers_mod.helper"]
 
     helpers_py.write_text("def helper(x):\n    return x * 3\n")
     _import_fresh("test_change_helpers_mod")
     mod = _import_fresh("test_change_stage_mod")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["mod:test_change_helpers_mod.helper"]
+    hash2 = fp2["func:test_change_helpers_mod.helper"]
 
     assert hash1 != hash2, "Module attr helper change must cause cache miss"
 
@@ -166,14 +166,14 @@ def test_transitive_dependency_change_causes_miss(module_dir: pathlib.Path) -> N
 
     mod = _import_fresh("test_change_stage_trans")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["mod:test_change_leaf.leaf"]
+    hash1 = fp1["func:test_change_leaf.leaf"]
 
     leaf_py.write_text("def leaf(x):\n    return x + 100\n")
     for m in ["test_change_leaf", "test_change_middle", "test_change_stage_trans"]:
         _import_fresh(m)
     mod = _import_fresh("test_change_stage_trans")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["mod:test_change_leaf.leaf"]
+    hash2 = fp2["func:test_change_leaf.leaf"]
 
     assert hash1 != hash2, "Transitive dependency change must cause cache miss"
 
@@ -191,7 +191,7 @@ def test_module_constant_captured_via_module_attr(module_dir: pathlib.Path) -> N
     mod = _import_fresh("test_change_stage_const")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    key = "mod:test_change_config.THRESHOLD"
+    key = "const:test_change_config.THRESHOLD"
     assert key in fp, "Module constant should be captured"
     assert fp[key] == "0.5", "Constant value should be repr"
 
@@ -338,7 +338,7 @@ def test_stdlib_module_attrs_not_tracked(module_dir: pathlib.Path) -> None:
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
     # json is stdlib - should NOT be in fingerprint
-    assert "mod:json_mod.dumps" not in fp
+    assert not any("json" in key for key in fp if not key.startswith("self:")), fp
 
 
 # =============================================================================

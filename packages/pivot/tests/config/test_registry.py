@@ -399,7 +399,7 @@ def test_stage_captures_user_code_helpers() -> None:
     # Should capture the helper (user code)
     assert f"func:{__name__}.helper_uses_math" in fp
     # math.pi is stdlib - should NOT be in fingerprint
-    assert "mod:math.pi" not in fp
+    assert not any(key.endswith((".pi", "math.pi")) for key in fp), fp
 
 
 def test_register_captures_constants(test_pipeline: PipelineLike) -> None:
