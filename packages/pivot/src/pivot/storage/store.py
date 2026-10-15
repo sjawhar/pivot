@@ -162,10 +162,7 @@ class WorkspaceStore:
     def _resolve_input_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         name = ref.identity.producer
         if name in self._input_bindings:
-            binding = pathlib.Path(self._input_bindings[name])
-            if binding.is_absolute():
-                return binding
-            return self._project_root / binding
+            return self._project_root / self._input_bindings[name]
         return self._project_root / "data" / "raw" / name
 
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
