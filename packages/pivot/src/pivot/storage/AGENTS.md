@@ -61,9 +61,10 @@ When multiple `pivot` processes share the same StateDB:
 - Restores with a `state_dir` take an exclusive per-target `flock` in `state_dir/locks/`.
 - Restore lock files persist. Do not unlink or age-delete them: a waiter can hold the
   old inode while a new opener locks a replacement inode, defeating mutual exclusion.
-- File checkouts stage their link or copy beside the target and atomically replace it.
-  Directory checkouts build in a private temporary directory and swap it while holding
-  the target's restore lock.
+- File restores stage their link or copy beside the target, under a name tagged with the
+  target's token, and atomically replace it. Directory restores build in a private
+  temporary directory and swap it. Both run under the target's restore lock, and each
+  first removes the token-tagged entries a killed restore of the same target left.
 
 ## Path Storage
 

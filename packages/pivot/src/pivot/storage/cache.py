@@ -434,8 +434,14 @@ def _checkout_from_cache(
     checkout_mode: CheckoutMode,
     *,
     executable: bool = False,
+    staging_path: pathlib.Path | None = None,
 ) -> None:
-    """Create link or copy at path atomically, so readers never see a partial file."""
+    """Create link or copy at path atomically, so readers never see a partial file.
+
+    Args:
+        staging_path: Where to build the link or copy before renaming it over path.
+            Defaults to a fresh random name beside path.
+    """
     # Idempotency: skip if already correctly linked
     if checkout_mode == CheckoutMode.SYMLINK and path.is_symlink():
         with contextlib.suppress(OSError):
@@ -446,7 +452,7 @@ def _checkout_from_cache(
             if path.stat().st_ino == cache_path.stat().st_ino:
                 return
 
-    tmp_path = path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
+    tmp_path = staging_path or path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
     try:
         try:
             _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
@@ -476,13 +482,16 @@ def _checkout_with_fallback(
     checkout_modes: list[CheckoutMode],
     *,
     executable: bool = False,
+    staging_path: pathlib.Path | None = None,
 ) -> None:
     """Try each link mode in order until one succeeds."""
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
     for i, mode in enumerate(checkout_modes):
         try:
-            _checkout_from_cache(path, cache_path, mode, executable=executable)
+            _checkout_from_cache(
+                path, cache_path, mode, executable=executable, staging_path=staging_path
+            )
             return
         except OSError as e:
             if e.errno not in FALLBACK_ERRNO or i == len(checkout_modes) - 1:
@@ -623,19 +632,21 @@ def restore_from_cache(
         cache_dir: Cache directory
         checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
         checkout_modes: Ordered list of link modes to try with fallback on failure.
-        state_dir: State directory for directory restore locks and crash cleanup.
+        state_dir: State directory for restore locks and crash cleanup.
         lock_held: Caller already holds restore_lock(path, state_dir). state_dir remains
             required so fresh crash artifacts can be cleaned without re-acquiring it.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
+    if lock_held and state_dir is None:
+        raise ValueError("state_dir is required when lock_held is True")
 
     if is_dir_hash(output_hash):
-        if lock_held and state_dir is None:
-            raise ValueError("state_dir is required when lock_held is True")
         return _restore_directory_from_cache(
             path, output_hash, cache_dir, effective_modes, state_dir, lock_held=lock_held
         )
-    return _restore_file_from_cache(path, output_hash, cache_dir, effective_modes)
+    return _restore_file_from_cache(
+        path, output_hash, cache_dir, effective_modes, state_dir, lock_held=lock_held
+    )
 
 
 def _restore_file_from_cache(
@@ -643,14 +654,29 @@ def _restore_file_from_cache(
     output_hash: FileHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
+    state_dir: pathlib.Path | None = None,
+    *,
+    lock_held: bool = False,
 ) -> bool:
-    """Restore single file from cache."""
+    """Restore single file from cache.
+
+    With a state_dir, holds path's restore lock and stages the file under one name
+    tagged with path's token, so the next restore removes what a killed one left.
+    """
     cache_path = get_cache_path(cache_dir, output_hash["hash"])
     if not cache_path.exists():
         return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    _checkout_with_fallback(path, cache_path, checkout_modes)
+    if state_dir is None:
+        _checkout_with_fallback(path, cache_path, checkout_modes)
+        return True
+
+    lock_context = contextlib.nullcontext() if lock_held else restore_lock(path, state_dir)
+    with lock_context:
+        staging_path = path.parent / f"{_RESTORE_TEMP_PREFIX}{_restore_target_token(path)}.file"
+        _clear_path(staging_path)
+        _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
     return True
 
 

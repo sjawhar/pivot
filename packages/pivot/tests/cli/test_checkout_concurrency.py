@@ -140,6 +140,63 @@ def test_checkout_recovers_fresh_crash_orphans_under_outer_lock(tmp_path: pathli
     assert not [p.name for p in target.parent.iterdir() if p.name.startswith(".pivot_")]
 
 
+def _helper_checkout_file_crash_before_replace(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+) -> None:
+    """Simulate a file checkout killed after it staged its temp file, before the rename."""
+
+    def _replace_and_crash(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        os._exit(73)
+
+    pathlib.Path.replace = _replace_and_crash  # pyright: ignore[reportAttributeAccessIssue]
+    _ = checkout_mod._restore_path_sync(
+        path,
+        output_hash,
+        cache_dir,
+        [cache.CheckoutMode.COPY],
+        checkout_mod.CheckoutBehavior.FORCE,
+        state_dir,
+    )
+
+
+def test_file_checkout_removes_staging_file_left_by_killed_checkout(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A retry of a killed file checkout removes the temp file it staged (#228)."""
+    data = tmp_path / "data"
+    data.mkdir()
+    target = data / "out.txt"
+    target.write_text("cached content\n")
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_helper_checkout_file_crash_before_replace,
+        args=(target, output_hash, cache_dir, state_dir),
+    )
+    process.start()
+    process.join(timeout=60)
+
+    assert process.exitcode == 73
+    assert [p.name for p in data.iterdir() if p.name.startswith(".pivot_")], "nothing staged"
+
+    assert checkout_mod._restore_path_sync(
+        target,
+        output_hash,
+        cache_dir,
+        [cache.CheckoutMode.COPY],
+        checkout_mod.CheckoutBehavior.FORCE,
+        state_dir,
+    ) == ("restored", "out.txt")
+
+    assert sorted(p.name for p in data.iterdir()) == ["out.txt"]
+    assert target.read_text() == "cached content\n"
+
+
 @pytest.mark.parametrize(
     "behavior",
     [checkout_mod.CheckoutBehavior.ERROR, checkout_mod.CheckoutBehavior.FORCE],
