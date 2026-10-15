@@ -635,6 +635,41 @@ def test_get_waits_for_checkout_restore_on_shared_cache(tmp_path: pathlib.Path) 
     assert target.read_text() == "cached content"
 
 
+def test_restore_file_force_keeps_existing_output_until_cache_swap(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forced cache restore replaces an existing output atomically under its lock."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    cache_dir = tmp_path / "cache"
+    file_hash = "0123456789abcdef"
+    cache_path = cache.get_cache_path(cache_dir / "files", file_hash)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("cached content")
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir()
+    target.write_text("existing content")
+
+    def _unexpected_remove(path: pathlib.Path) -> None:
+        raise AssertionError(f"cache restore removed {path} before its atomic swap")
+
+    monkeypatch.setattr(cache, "remove_output", _unexpected_remove)
+
+    result = restore.restore_file(
+        rel_path="data/out.txt",
+        output_hash=FileHash(hash=file_hash),
+        rev="HEAD",
+        dest_path=target,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=True,
+    )
+
+    assert result["status"] is restore.RestoreStatus.RESTORED
+    assert target.read_text() == "cached content"
+
+
 def test_parse_pvt_data_with_manifest() -> None:
     """Parses pvt file with manifest field."""
     content = b"""
