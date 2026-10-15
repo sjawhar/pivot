@@ -23,6 +23,7 @@ from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast,
 import pydantic
 
 from pivot import (
+    config,
     exceptions,
     loaders,
     metrics,
@@ -367,6 +368,7 @@ def execute_stage(
                                 output_hashes=_to_identity_hashes(
                                     dict(sorted(run_cache_skip["output_hashes"].items()))
                                 ),
+                                output_paths=lock_output_paths(stage_outs, store, project_root),
                             )
                             deferred = _commit_lock_and_build_deferred(
                                 stage_info,
@@ -430,6 +432,7 @@ def execute_stage(
                     params=current_params,
                     dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
                     output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
+                    output_paths=lock_output_paths(stage_outs, store, project_root),
                 )
 
                 # Single StateDB open for post-execution work
@@ -620,7 +623,8 @@ def output_file_hash_entries(
 
     Stats each file (each manifest entry, for a directory) and pairs it with its known hash;
     nothing is read. Call it once the output has its final inode: a hardlink checkout
-    replaces the file the stage wrote.
+    replaces the file the stage wrote. An output whose file-hash StateDB key exceeds LMDB's
+    limit is omitted: this cache only avoids a later hash and must not fail the stage.
     """
     if is_dir_hash(output_hash):
         files = [(path / entry["relpath"], entry["hash"]) for entry in output_hash["manifest"]]
@@ -628,11 +632,28 @@ def output_file_hash_entries(
         files = [(path, output_hash["hash"])]
     entries = list[tuple[str, int, int, int, str]]()
     for file_path, file_hash in files:
+        if not state.file_hash_key_fits(file_path):
+            logger.debug("Skipping oversized output file-hash cache entry: %s", file_path)
+            continue
         fs_stat = file_path.stat()
         entries.append(
             (str(file_path), fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
         )
     return entries
+
+
+def lock_output_paths(
+    outs: list[types.ArtifactRef],
+    store: store_mod.Store,
+    project_root: pathlib.Path,
+) -> dict[types.ArtifactIdentity, str]:
+    """Project-relative, POSIX output paths for a production workspace lock."""
+    if not isinstance(store, store_mod.WorkspaceStore):
+        return {}
+    root = project_root.resolve()
+    return {
+        ref.identity: store.resolve_display_path(ref).relative_to(root).as_posix() for ref in outs
+    }
 
 
 def _set_deterministic_seeds() -> None:
@@ -891,7 +912,12 @@ def _prepare_incremental_inputs(
             )
         output_path = store.resolve_display_path(ref)
         cache.remove_output(output_path)
-        if not store.restore_from_cache(ref, output_hash, state_dir=state_dir):
+        if not store.restore_from_cache(
+            ref,
+            output_hash,
+            state_dir=state_dir,
+            checkout_modes=[config.CheckoutMode.COPY],
+        ):
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
                 + f"Run 'pivot pull' to restore it, or remove '{stage_lock.path}' and rerun "

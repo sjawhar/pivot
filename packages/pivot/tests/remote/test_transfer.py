@@ -39,6 +39,7 @@ def _helper_make_all_stages(*stage_names: str) -> dict[str, RegistryStageInfo]:
         name: RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
             state_dir=None,
             outs=[],
+            input_paths={},
         )
         for name in stage_names
     }

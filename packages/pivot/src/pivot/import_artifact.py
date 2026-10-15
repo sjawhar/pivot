@@ -178,8 +178,12 @@ async def _list_github_lock_paths(
     entries = await github.list_directory(owner, repo, directory, rev, token, session=session)
     if entries is None:
         return None
-    lock_paths = [name for name in entries if name.endswith(".lock")]
-    subdirs = [name for name in entries if not name.endswith(".lock")]
+    lock_paths = [
+        entry["name"]
+        for entry in entries
+        if entry["type"] == "file" and entry["name"].endswith(".lock")
+    ]
+    subdirs = [entry["name"] for entry in entries if entry["type"] == "dir"]
     nested = await asyncio.gather(
         *[
             _list_github_lock_paths(owner, repo, f"{directory}/{d}", rev, token, session)

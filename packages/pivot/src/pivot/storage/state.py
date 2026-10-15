@@ -244,6 +244,11 @@ def _make_key_file_hash(path: pathlib.Path) -> bytes:
     return _HASH_PREFIX + str(path.resolve()).encode()
 
 
+def file_hash_key_fits(path: pathlib.Path) -> bool:
+    """Whether ``path`` fits the LMDB key reserved for a file-hash entry."""
+    return len(_make_key_file_hash(path)) <= _MAX_KEY_SIZE
+
+
 def _make_key_output_generation(identity: str) -> bytes:
     return _GEN_PREFIX + identity.encode()
 

@@ -48,6 +48,7 @@ def _make_stage_info(
         "collection_params": {},
         "no_fingerprint": False,
         "code_deps": [],
+        "input_paths": {},
     }
     return info
 

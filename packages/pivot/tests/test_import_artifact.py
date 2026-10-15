@@ -37,6 +37,10 @@ def _config_bytes(remote_url: str) -> bytes:
     return yaml.safe_dump(data).encode()
 
 
+def _github_files(*names: str) -> list[dict[str, str]]:
+    return [{"name": name, "type": "file"} for name in names]
+
+
 def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
     repo_url = "https://github.com/org/repo"
     remote_url = "s3://bucket/prefix"
@@ -54,7 +58,7 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -103,7 +107,7 @@ def test_resolve_remote_path_identity_disambiguates_stages(mocker: MockerFixture
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock", "eval.lock"]
+    list_directory.return_value = _github_files("train.lock", "eval.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -150,7 +154,7 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -215,7 +219,7 @@ async def test_import_artifact_creates_pvt(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -288,7 +292,7 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -362,7 +366,7 @@ async def test_import_artifact_force_overwrites(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,

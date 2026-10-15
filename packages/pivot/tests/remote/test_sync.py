@@ -155,6 +155,7 @@ def test_get_target_hashes_excludes_noncached_outputs(set_project_root: pathlib.
             state_dir=None,
             outs=[cached_ref, metric_ref],
             incremental_inputs={},
+            input_paths={},
         )
     }
     lock.StageLock("my_stage", lock.get_stages_dir(state_dir)).write(
@@ -187,6 +188,7 @@ def test_get_target_hashes_file_target_excludes_noncached(
             state_dir=None,
             outs=[cached_ref, metric_ref],
             incremental_inputs={},
+            input_paths={},
         )
     }
     lock.StageLock("my_stage", lock.get_stages_dir(state_dir)).write(

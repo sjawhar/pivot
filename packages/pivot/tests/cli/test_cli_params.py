@@ -868,3 +868,52 @@ def test_params_keys_for_an_upstream_pipeline_reached_through_handles(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {"prep/scale": {"factor": 2}, "report/total": {"factor": 3}}
+
+
+def _write_excluded_field_project(cwd: pathlib.Path, params_yaml: str) -> None:
+    """Create two parameterized stages, one with an excluded required field."""
+    (cwd / "params.yaml").write_text(params_yaml)
+    (cwd / "pipeline.py").write_text(
+        "import pydantic\n\nfrom pivot import Pipeline, StageParams, stage\n\n\n"
+        + "class P(StageParams):\n"
+        + "    hidden: str = pydantic.Field(exclude=True)\n"
+        + "    visible: int = 0\n\n\n"
+        + "class Q(StageParams):\n"
+        + "    n: int = 0\n\n\n"
+        + "@stage\ndef alpha(params: P) -> str:\n"
+        + '    return f"{params.hidden}:{params.visible}"\n\n\n'
+        + "@stage\ndef beta(params: Q) -> str:\n"
+        + "    return str(params.n)\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n'
+        + '    alpha(params=P(hidden="present"))\n'
+        + "    beta(params=Q())\n"
+    )
+
+
+def test_override_for_one_stage_does_not_revalidate_an_unrelated_excluded_field(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An override for beta must not validate alpha's excluded required field."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_excluded_field_project(cwd, "p/beta:\n  n: 1\n")
+
+        shown = runner.invoke(cli.cli, ["params", "show", "--json"])
+        repro = runner.invoke(cli.cli, ["repro"])
+
+    assert shown.exit_code == 0, shown.output
+    assert json.loads(shown.stdout)["p/beta"] == {"n": 1}
+    assert repro.exit_code == 0, repro.output
+    assert (cwd / "data" / "p" / "beta.txt").read_text() == "1"
+
+
+def test_override_for_excluded_field_stage_keeps_the_registered_value(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An alpha override merges onto its registered P instance instead of an excluded-field dump."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _write_excluded_field_project(cwd, "p/alpha:\n  visible: 7\n")
+
+        repro = runner.invoke(cli.cli, ["repro"])
+
+    assert repro.exit_code == 0, repro.output
+    assert (cwd / "data" / "p" / "alpha.txt").read_text() == "present:7"

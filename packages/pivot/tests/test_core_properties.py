@@ -212,6 +212,7 @@ def _stage(name: str, deps: list[str], out: str) -> RegistryStageInfo:
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 
