@@ -1,4 +1,4 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnusedCallResult=false
+# pyright: reportImplicitRelativeImport=false, reportMissingImports=false
 from __future__ import annotations
 
 import atexit
@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 import loky
 
 from pivot import config, discovery, exceptions, parameters, project, registry, types
+from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
     import concurrent.futures
 
     from pivot.engine import types as engine_types
-    from pivot.executor import worker
     from pivot.registry import RegistryStageInfo
 
 logger = logging.getLogger(__name__)
@@ -321,26 +321,25 @@ def prepare_worker_info(
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    worker_info: dict[str, object] = {
-        "func": stage_info["func"],
-        "fingerprint": pipeline.ensure_fingerprint(stage_info["name"]),
-        "deps": stage_info["deps"],
-        "outs": stage_info["outs"],
-        "store_spec": store_spec,
-        "incremental_inputs": stage_info["incremental_inputs"],
-        "signature": stage_info["signature"],
-        "params": stage_info["params"],
-        "variant": stage_info["variant"],
-        "overrides": overrides,
-        "run_id": run_id,
-        "force": force,
-        "no_commit": no_commit,
-        "params_arg_name": stage_info["params_arg_name"],
-        "project_root": project_root,
-        "state_dir": state_dir,
-        "collection_params": stage_info["collection_params"],
-    }
-    return cast("worker.WorkerStageInfo", cast("object", worker_info))
+    return worker.WorkerStageInfo(
+        func=stage_info["func"],
+        fingerprint=pipeline.ensure_fingerprint(stage_info["name"]),
+        deps=stage_info["deps"],
+        outs=stage_info["outs"],
+        store_spec=store_spec,
+        incremental_inputs=stage_info["incremental_inputs"],
+        signature=stage_info["signature"],
+        params=stage_info["params"],
+        variant=stage_info["variant"],
+        overrides=overrides,
+        run_id=run_id,
+        force=force,
+        no_commit=no_commit,
+        params_arg_name=stage_info["params_arg_name"],
+        project_root=project_root,
+        state_dir=state_dir,
+        collection_params=stage_info["collection_params"],
+    )
 
 
 def apply_deferred_writes(
