@@ -32,28 +32,22 @@ def _noop() -> None:
     pass
 
 
-def compute_max_workers(stage_count: int, override: int | None = None) -> int:
-    """Single source of truth for max_workers calculation.
+def configured_worker_count(override: int | None = None) -> int:
+    """The configured worker count: the CLI override, else ``core.max_workers``.
 
-    Args:
-        stage_count: Number of stages to run
-        override: CLI override for max_workers (takes precedence over config)
-
-    The effective max_workers is determined by:
-    1. CLI override (if provided)
-    2. Config value (core.max_workers)
-
-    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2).
-    The result is always clamped to [1, stage_count].
+    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2). The result is at
+    least 1. This is the ``cpu`` resource capacity.
     """
     cpu_count = loky.cpu_count() or 1
     max_workers = override if override is not None else config.get_max_workers()
-
-    # Negative values are relative to CPU count
     if max_workers < 0:
         max_workers = cpu_count + max_workers
+    return max(1, max_workers)
 
-    return max(1, min(max_workers, stage_count))
+
+def compute_max_workers(stage_count: int, override: int | None = None) -> int:
+    """Worker pool size: the configured worker count, clamped to the stages to run."""
+    return max(1, min(configured_worker_count(override), stage_count))
 
 
 def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:

@@ -1096,18 +1096,26 @@ class Engine:
                     + "files first."
                 )
 
-        # Compute max workers
+        # Compute max workers: the pool never needs more workers than stages, but the cpu
+        # resource capacity is the configured worker count, whatever this run schedules.
         effective_max_workers = (
             1
             if not parallel
             else executor_core.compute_max_workers(len(execution_order), max_workers)
         )
+        cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1
 
-        stage_resources, capacities = self._resolve_stage_resources(
-            execution_order,
-            effective_max_workers,
-            resource_capacity,
-        )
+        try:
+            stage_resources, capacities = self._resolve_stage_resources(
+                execution_order,
+                cpu_capacity,
+                resource_capacity,
+            )
+        except exceptions.ValidationError as exc:
+            if not self._watches_filesystem():
+                raise
+            await self._invalidate_pipeline([str(exc)])
+            return {}
 
         # Load config. Startup and every reload check params.yaml, so in watch mode an error
         # here is an edit the watcher has not reported yet: the pipeline becomes invalid.
@@ -1527,17 +1535,21 @@ class Engine:
     def _resolve_stage_resources(
         self,
         execution_order: list[str],
-        max_workers: int,
+        cpu_capacity: int,
         cli_resource_capacity: dict[str, int],
     ) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
-        """Resolve configured and CLI resource capacities for a scheduler run."""
+        """Resolve configured and CLI resource capacities for a scheduler run.
+
+        ``cpu`` defaults to ``cpu_capacity`` (the worker count) unless config or
+        ``--resources`` sets it.
+        """
         capacities = {
             name.casefold(): capacity for name, capacity in config.get_resource_capacities().items()
         }
         capacities.update(
             {name.casefold(): capacity for name, capacity in cli_resource_capacity.items()}
         )
-        capacities["cpu"] = max_workers
+        capacities.setdefault("cpu", cpu_capacity)
 
         requests = dict[str, dict[str, int]]()
         for stage_name in execution_order:

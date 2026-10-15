@@ -650,3 +650,53 @@ def test_outputs_symlinked_to_one_cache_object_feed_one_stage(tmp_path: pathlib.
 
     assert "1 ran" in out, out
     assert (root / "data" / "sym" / "both.yaml").read_text() == "total: 4\n"
+
+
+_CPU_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage(resources={"cpu": 2})
+def scale(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * 2
+
+
+@stage
+def total(scaled: pd.DataFrame) -> dict:
+    return {"sum": int(scaled["a"].sum())}
+
+
+with Pipeline("res") as pipeline:
+    total(scale(pipeline.input("t.csv")))
+"""
+
+
+def test_cpu_request_runs_when_fewer_stages_than_it_requests_are_scheduled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The cpu capacity is the worker count, not the number of stages in this run."""
+    root = _project(tmp_path, {"pipeline.py": _CPU_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "core.max_workers", "4"))
+
+    repro = _ok(_pivot(root, "repro", "res/scale", "--force"))
+    run = _ok(_pivot(root, "run", "res/scale", "--force"))
+
+    assert "1 ran" in repro, repro
+    assert "1 ran" in run, run
+
+
+def test_resources_cpu_option_sets_the_cpu_capacity(tmp_path: pathlib.Path) -> None:
+    """`--resources cpu=N` is the cpu capacity for the run; it is not replaced by the worker count."""
+    root = _project(tmp_path, {"pipeline.py": _CPU_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "core.max_workers", "1"))
+
+    refused = _pivot(root, "repro", "res/scale")
+    out = _ok(_pivot(root, "repro", "res/scale", "--resources", "cpu=2"))
+
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "requests 2 units of resource 'cpu', but its capacity is 1" in (
+        refused.stdout + refused.stderr
+    )
+    assert "1 ran" in out, out
