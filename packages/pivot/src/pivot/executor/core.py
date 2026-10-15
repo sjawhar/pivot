@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnusedCallResult=false
 from __future__ import annotations
 
 import atexit
@@ -12,6 +11,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 import loky
 
 from pivot import config, discovery, exceptions, parameters, project, registry, types
+from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     import concurrent.futures
 
     from pivot.engine import types as engine_types
-    from pivot.executor import worker
     from pivot.registry import RegistryStageInfo
 
 logger = logging.getLogger(__name__)
@@ -32,28 +31,22 @@ def _noop() -> None:
     pass
 
 
-def compute_max_workers(stage_count: int, override: int | None = None) -> int:
-    """Single source of truth for max_workers calculation.
+def configured_worker_count(override: int | None = None) -> int:
+    """The configured worker count: the CLI override, else ``core.max_workers``.
 
-    Args:
-        stage_count: Number of stages to run
-        override: CLI override for max_workers (takes precedence over config)
-
-    The effective max_workers is determined by:
-    1. CLI override (if provided)
-    2. Config value (core.max_workers)
-
-    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2).
-    The result is always clamped to [1, stage_count].
+    Negative values mean "cpu_count + value" (e.g., -2 means cpu_count - 2). The result is at
+    least 1. This is the ``cpu`` resource capacity.
     """
     cpu_count = loky.cpu_count() or 1
     max_workers = override if override is not None else config.get_max_workers()
-
-    # Negative values are relative to CPU count
     if max_workers < 0:
         max_workers = cpu_count + max_workers
+    return max(1, max_workers)
 
-    return max(1, min(max_workers, stage_count))
+
+def compute_max_workers(stage_count: int, override: int | None = None) -> int:
+    """Worker pool size: the configured worker count, clamped to the stages to run."""
+    return max(1, min(configured_worker_count(override), stage_count))
 
 
 def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
@@ -310,7 +303,6 @@ def prepare_worker_info(
     stage_info: RegistryStageInfo,
     pipeline: registry.PipelineLike,
     overrides: parameters.ParamsOverrides,
-    checkout_modes: list[cache.CheckoutMode],
     run_id: str,
     force: bool,
     no_commit: bool,
@@ -328,27 +320,25 @@ def prepare_worker_info(
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    worker_info: dict[str, object] = {
-        "func": stage_info["func"],
-        "fingerprint": pipeline.ensure_fingerprint(stage_info["name"]),
-        "deps": stage_info["deps"],
-        "outs": stage_info["outs"],
-        "store_spec": store_spec,
-        "incremental_inputs": stage_info["incremental_inputs"],
-        "signature": stage_info["signature"],
-        "params": stage_info["params"],
-        "variant": stage_info["variant"],
-        "overrides": overrides,
-        "checkout_modes": checkout_modes,
-        "run_id": run_id,
-        "force": force,
-        "no_commit": no_commit,
-        "params_arg_name": stage_info["params_arg_name"],
-        "project_root": project_root,
-        "state_dir": state_dir,
-        "collection_params": stage_info["collection_params"],
-    }
-    return cast("worker.WorkerStageInfo", cast("object", worker_info))
+    return worker.WorkerStageInfo(
+        func=stage_info["func"],
+        fingerprint=pipeline.ensure_fingerprint(stage_info["name"]),
+        deps=stage_info["deps"],
+        outs=stage_info["outs"],
+        store_spec=store_spec,
+        incremental_inputs=stage_info["incremental_inputs"],
+        signature=stage_info["signature"],
+        params=stage_info["params"],
+        variant=stage_info["variant"],
+        overrides=overrides,
+        run_id=run_id,
+        force=force,
+        no_commit=no_commit,
+        params_arg_name=stage_info["params_arg_name"],
+        project_root=project_root,
+        state_dir=state_dir,
+        collection_params=stage_info["collection_params"],
+    )
 
 
 def apply_deferred_writes(

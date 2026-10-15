@@ -29,8 +29,6 @@ def _helper_write_pipeline(
     pipeline_path = directory / "pipeline.py"
     pipeline_path.write_text(
         f'''\
-import pathlib
-
 from pivot.compose import Pipeline, stage
 
 
@@ -39,11 +37,17 @@ def {stage_name}({parameter}) -> {"str" if input_name is not None else "dict[str
     {body}
 
 
-with Pipeline("{pipeline_name}", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("{pipeline_name}") as pipeline:
     {stage_name}({input_expr})
 '''
     )
     return pipeline_path
+
+
+@pytest.fixture(autouse=True)
+def _project_root_is_tmp_path(set_project_root: pathlib.Path) -> pathlib.Path:
+    """Every pipeline here belongs to the project at tmp_path."""
+    return set_project_root
 
 
 def _helper_with_cwd(monkeypatch: pytest.MonkeyPatch, cwd: pathlib.Path) -> None:
@@ -336,18 +340,18 @@ def test_discover_all_pipelines_combines_stages(tmp_path: pathlib.Path) -> None:
     assert set(combined.list_stages()) == {"alpha/stage_a", "beta/stage_b"}
 
 
-def test_discover_all_pipelines_preserves_state_dir(tmp_path: pathlib.Path) -> None:
-    """Included stages retain the .pivot directory of their source pipeline."""
-    alpha = tmp_path / "alpha"
-    beta = tmp_path / "beta"
-    _helper_write_pipeline(alpha, "alpha", "stage")
-    _helper_write_pipeline(beta, "beta", "stage")
+def test_discover_all_pipelines_keeps_every_stage_in_the_project_state_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Stages from every discovered pipeline keep their state in the project's .pivot."""
+    _helper_write_pipeline(tmp_path / "alpha", "alpha", "stage")
+    _helper_write_pipeline(tmp_path / "beta", "beta", "stage")
 
     combined = discovery.discover_pipeline(project_root=tmp_path, all_pipelines=True)
 
     assert combined is not None
-    assert combined.get_stage("alpha/stage")["state_dir"] == alpha.resolve() / ".pivot"
-    assert combined.get_stage("beta/stage")["state_dir"] == beta.resolve() / ".pivot"
+    assert combined.get_stage("alpha/stage")["state_dir"] == tmp_path.resolve() / ".pivot"
+    assert combined.get_stage("beta/stage")["state_dir"] == tmp_path.resolve() / ".pivot"
 
 
 def test_discover_all_pipelines_returns_none_when_empty(tmp_path: pathlib.Path) -> None:

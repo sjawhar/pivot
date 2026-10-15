@@ -24,6 +24,7 @@ from pivot.types import (
     StatusOutput,
     TrackedFileInfo,
     TrackedFileStatus,
+    dep_change_to_json,
 )
 
 
@@ -283,7 +284,7 @@ def _output_explain_json(
                 is_forced=exp["is_forced"],
                 code_changes=exp["code_changes"],
                 param_changes=exp["param_changes"],
-                dep_changes=exp["dep_changes"],
+                dep_changes=[dep_change_to_json(change) for change in exp["dep_changes"]],
                 upstream_stale=exp["upstream_stale"],
             )
             stages.append(stage_data)

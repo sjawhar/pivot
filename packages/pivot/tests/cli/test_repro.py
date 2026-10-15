@@ -501,6 +501,110 @@ def test_list_names_a_single_output_as_the_return_value(
     assert expected in result.output, result.output
 
 
+_SUB_ROOTED_PIPELINE = """
+import pathlib
+
+import pandas as pd
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def double(x: pd.DataFrame) -> pd.DataFrame:
+    return x * 2
+
+
+with Pipeline("sub", root=pathlib.Path(__file__).parent) as pipeline:
+    double(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "raw_dir",
+    [
+        pytest.param("sub/data/raw", id="input-under-the-pipeline-root"),
+        pytest.param("data/raw", id="input-under-the-project-root"),
+    ],
+)
+def test_repro_refuses_a_pipeline_rooted_below_the_project(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_dir: str,
+) -> None:
+    """root= that is not the project root would split locks, StateDB and outputs: refuse it."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / raw_dir).mkdir(parents=True)
+        (cwd / raw_dir / "x.csv").write_text("a\n1\n")
+        (cwd / "sub").mkdir(exist_ok=True)
+        (cwd / "sub" / "pipeline.py").write_text(_SUB_ROOTED_PIPELINE)
+        monkeypatch.chdir(cwd / "sub")
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 1, result.output
+        assert "Pipeline 'sub' sets root=" in result.output, result.output
+        assert "always uses the project's .pivot and data/" in result.output, result.output
+        assert "remove root=" in result.output, result.output
+        assert not list(cwd.rglob("*.lock")), "no stage may run, so no lock is written"
+        assert not (cwd / "data" / "sub").exists(), "no output is written"
+        assert not (cwd / "sub" / "data" / "sub").exists(), "no output is written"
+
+
+def test_repro_of_a_pipeline_file_refuses_a_root_below_the_project(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`pivot repro sub/pipeline.py` loads the file directly; it is refused the same way."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a\n1\n")
+        (cwd / "sub").mkdir()
+        (cwd / "sub" / "pipeline.py").write_text(_SUB_ROOTED_PIPELINE)
+        (cwd / "pipeline.py").write_text(
+            "from pivot.compose import Pipeline\n\nwith Pipeline('top') as pipeline:\n    pass\n"
+        )
+
+        result = runner.invoke(cli.cli, ["repro", "sub/pipeline.py"])
+
+        assert result.exit_code == 1, result.output
+        assert "Pipeline 'sub' sets root=" in result.output, result.output
+        assert not list(cwd.rglob("*.lock")), "no stage may run, so no lock is written"
+
+
+_SYMLINKED_STATE_PIPELINE = """
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def copy(value: str) -> str:
+    return value
+
+
+with Pipeline("symlinked") as pipeline:
+    copy(pipeline.input("value.txt", t=str))
+"""
+
+
+def test_repro_and_status_accept_a_symlinked_project_state_dir(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A `.pivot` symlink is a supported project-state layout."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "value.txt").write_text("value")
+        (cwd / "pipeline.py").write_text(_SYMLINKED_STATE_PIPELINE)
+        state_dir = cwd.parent / f"{cwd.name}-state"
+        (cwd / ".pivot").rename(state_dir)
+        (cwd / ".pivot").symlink_to(state_dir, target_is_directory=True)
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        status = runner.invoke(cli.cli, ["status"])
+
+    assert repro.exit_code == 0, repro.output
+    assert status.exit_code == 0, status.output
+    assert (cwd / "data" / "symlinked" / "copy.txt").read_text() == "value"
+
+
 # =============================================================================
 # Explain Mode Tests
 # =============================================================================
@@ -1686,6 +1790,87 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
 
         params_yaml.write_text("smoke/scale:\n  factor: 5\n")
         _wait_for_watch(proc, log_path, lambda: scaled() == [5, 10])
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+_WATCH_CPU_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage(resources={"cpu": 2})
+def solo(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 2
+
+
+@stage
+def other(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 3
+
+
+with Pipeline("w") as pipeline:
+    solo(pipeline.input("solo.csv"))
+    other(pipeline.input("other.csv"))
+"""
+
+
+def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A watch run of one `cpu: 2` stage fits the worker count; an over-capacity request is an
+    invalid pipeline, not the end of the watch."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".pivot").mkdir()
+    (project / "data" / "raw").mkdir(parents=True)
+    (project / "data" / "raw" / "solo.csv").write_text("n\n1\n")
+    (project / "data" / "raw" / "other.csv").write_text("n\n1\n")
+    (project / ".pivot" / "config.yaml").write_text("core:\n  max_workers: 2\n")
+    pipeline_py = project / "pipeline.py"
+    pipeline_py.write_text(_WATCH_CPU_PIPELINE)
+    output = project / "data" / "w" / "solo.jsonl"
+    log_path = tmp_path / "watch.log"
+    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    def doubled() -> list[int] | None:
+        if not output.exists():
+            return None
+        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--debounce", "100"],
+            cwd=project,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    try:
+        _wait_for_watch(proc, log_path, lambda: doubled() == [2])
+
+        # Only `solo` is scheduled now: one stage, but the cpu capacity is still 2 workers.
+        (project / "data" / "raw" / "solo.csv").write_text("n\n5\n")
+        _wait_for_watch(proc, log_path, lambda: doubled() == [10])
+
+        pipeline_py.write_text(_WATCH_CPU_PIPELINE.replace('"cpu": 2', '"gpu": 2'))
+        _wait_for_watch(
+            proc,
+            log_path,
+            lambda: "Pipeline invalid - waiting for fix" in log_path.read_text(errors="replace"),
+        )
+        assert "requests 2 units of resource 'gpu', but its capacity is 1" in log_path.read_text(
+            errors="replace"
+        )
+        time.sleep(1)
+        assert proc.poll() is None, log_path.read_text(errors="replace")
     finally:
         proc.send_signal(signal.SIGTERM)
         try:

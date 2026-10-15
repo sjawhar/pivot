@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false
 """Per-stage lock files for tracking pipeline state.
 
 StageLock provides persistent lock files (.lock) for change detection,
@@ -148,10 +147,6 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | None:
         return f"{field}.producer"
     if "key" not in entry or not (entry["key"] is None or isinstance(entry["key"], str)):
         return f"{field}.key"
-    if list_key == "outs" and not isinstance(entry.get("tag"), str):
-        return f"{field}.tag"
-    if "display" in entry and not isinstance(entry["display"], str):
-        return f"{field}.display"
     if "size" in entry and not _is_int(entry["size"]):
         return f"{field}.size"
     if "manifest" in entry:
@@ -184,18 +179,7 @@ def _lock_shape_error(data: object) -> str | None:
                 return error
     if "schema_version" in document and not _is_int(document["schema_version"]):
         return "schema_version"
-    merkle_id = document.get("merkle_id")
-    if merkle_id is not None and not isinstance(merkle_id, str):
-        return "merkle_id"
     return None
-
-
-def _get_output_tag(hash_info: HashInfo) -> str:
-    raw: dict[str, object] = cast("dict[str, object]", cast("object", hash_info))
-    value = raw.get("tag")
-    if isinstance(value, str):
-        return value
-    return "data"
 
 
 def _convert_to_storage_format(data: LockData) -> StorageLockData:
@@ -213,7 +197,7 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     outs_list = list[OutEntry]()
     for identity, hash_info in normalized_outs.items():
-        entry = OutEntry(key=identity.key, hash=hash_info["hash"], tag=_get_output_tag(hash_info))
+        entry = OutEntry(key=identity.key, hash=hash_info["hash"])
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
         outs_list.append(entry)
@@ -221,18 +205,13 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
 
-    storage = StorageLockData(
+    return StorageLockData(
         schema_version=2,
         code_manifest=sorted_code_manifest,
         params=data["params"],
         deps=deps_list,
         outs=outs_list,
     )
-    if "merkle_id" in data:
-        mid = data["merkle_id"]
-        if mid is not None:
-            storage["merkle_id"] = mid
-    return storage
 
 
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
@@ -259,7 +238,6 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
         params=data["params"],
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
-        merkle_id=data.get("merkle_id"),
     )
 
 

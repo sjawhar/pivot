@@ -71,7 +71,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Class attribute read as `Config.SCALE` (scalar, Enum member, function) | ✅ | `test_fingerprint.py::test_class_attributes_a_stage_reads_are_tracked_one_by_one`, `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
 | Non-scalar class attribute read as `Config.COLUMNS` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_class_attribute_is_an_error` |
 | Class attribute the language or a library defines (`NamedTuple._fields`, `Enum._member_names_`, an inherited stdlib dict, a property object) | 🚫 (class AST only) | `test_manifest_cache_cli.py::test_class_attribute_the_language_or_a_library_defines_is_not_refused` |
-| `settings.Config.SCALE`, `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
+| `settings.Config.SCALE` (class reached through a user module) | ✅ | `test_manifest_cache_cli.py::test_class_attribute_read_through_a_module_at_import_reruns_stage`, `test_manifest_cache_cli.py::test_class_attribute_through_a_module_follows_the_class_rule`, `test_manifest_cache_cli.py::test_non_scalar_class_attribute_through_a_module_is_an_error` |
+| `settings.log`, `settings.ROUND` (a partial), `settings.AGG` (`np.mean`) | ✅ (same rule as the global form) | `test_manifest_cache_cli.py::test_logger_partial_and_library_function_read_through_a_module_are_accepted`, `test_manifest_cache_cli.py::test_library_function_rebound_in_a_module_reruns_stage` |
+| `pkg.sub.helper`, `pkg.sub.SCALE` (submodule through its package) | ✅ | `test_manifest_cache_cli.py::test_submodule_read_through_its_package_is_tracked` |
+| `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                  |
 | Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                         |
@@ -325,7 +328,9 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
    across checkout paths.
 
 8. **Module-qualified manifest keys**: `func:`, `class:`, `const:`, `schema:`, `partial:`,
-   `mod:`, and `loader:` keys use the definition or binding module. A manifest can therefore
+   `ext:` and `loader:` keys use the definition or binding module. A value read as
+   `settings.NAME` gets the key it would get as a global (`const:settings.FACTOR`,
+   `func:settings.helper`, `ext:settings.AGG`). A manifest can therefore
    contain `func:project.alpha.helper` and `func:project.beta.helper` without one overwriting
    the other. A closure cell is keyed under the function that holds it: the stage function's
    own cells under its definition (`const:project.make_stage.<locals>.make.factor`), a local
