@@ -700,3 +700,15 @@ def test_resources_cpu_option_sets_the_cpu_capacity(tmp_path: pathlib.Path) -> N
         refused.stdout + refused.stderr
     )
     assert "1 ran" in out, out
+
+
+def test_status_explain_json_writes_dep_identity_as_an_object(tmp_path: pathlib.Path) -> None:
+    """`dep_changes[].identity` is `{producer, key}`, the same shape the RPC sends."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+    (root / "data" / "raw" / "t.csv").write_text("a\n5\n")
+
+    out = _ok(_pivot(root, "--quiet", "status", "--explain", "--json"))
+
+    stages = {stage["name"]: stage for stage in json.loads(out)["stages"]}
+    assert stages["k/scale"]["dep_changes"][0]["identity"] == {"producer": "t.csv", "key": None}

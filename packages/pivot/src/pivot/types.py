@@ -567,6 +567,24 @@ class StatusOutput(TypedDict, total=False):
     suggestions: list[str]
 
 
+class DepChangeJson(TypedDict):
+    """A DepChange as JSON: the identity as ``{producer, key}``, as the RPC sends it."""
+
+    identity: ArtifactIdentityJson
+    old_hash: str | None
+    new_hash: str | None
+    change_type: ChangeType
+
+
+def dep_change_to_json(change: DepChange) -> DepChangeJson:
+    return DepChangeJson(
+        identity=identity_to_json(change["identity"]),
+        old_hash=change["old_hash"],
+        new_hash=change["new_hash"],
+        change_type=change["change_type"],
+    )
+
+
 class ExplainStageJson(TypedDict):
     """JSON-serializable stage explanation for status --explain --json output."""
 
@@ -577,7 +595,7 @@ class ExplainStageJson(TypedDict):
     is_forced: bool
     code_changes: list[CodeChange]
     param_changes: list[ParamChange]
-    dep_changes: list[DepChange]
+    dep_changes: list[DepChangeJson]
     upstream_stale: list[str]
 
 
