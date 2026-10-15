@@ -389,3 +389,34 @@ def test_commit_run_cache_entry_is_hit_for_stage_reading_one_artifact_twice(
 
     assert "0 ran, 2 cached" in out, out
     assert (root / "data" / "dup" / "both.yaml").read_text() == "sum: 4\n"
+
+
+def test_repro_hardlinks_stage_outputs_into_cache_by_default(tmp_path: pathlib.Path) -> None:
+    """The default checkout order starts with hardlink, so an output is not stored twice."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+
+    output = root / "data" / "k" / "scale.jsonl"
+    cached = [p for p in (root / ".pivot" / "cache" / "files").rglob("*") if p.is_file()]
+
+    assert output.stat().st_nlink == 2
+    assert output.stat().st_ino in {p.stat().st_ino for p in cached}
+
+
+def test_symlink_checkout_mode_applies_when_repro_writes_and_restores_outputs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`cache.checkout_mode` governs stage outputs on run and on skip-restore, as for checkout."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    output = root / "data" / "k" / "scale.jsonl"
+
+    _ok(_pivot(root, "repro"))
+    assert output.is_symlink()
+
+    output.unlink()
+    out = _ok(_pivot(root, "repro"))
+
+    assert "0 ran, 2 cached" in out, out
+    assert output.is_symlink()
+    assert output.read_text() == '{"a":2}\n{"a":4}\n'

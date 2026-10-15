@@ -87,15 +87,15 @@ def _make_stage_info(
             "input_bindings": {
                 ref.identity.producer: ref.identity.producer for ref in deps.values()
             },
+            "checkout_modes": [
+                cache.CheckoutMode.HARDLINK,
+                cache.CheckoutMode.SYMLINK,
+                cache.CheckoutMode.COPY,
+            ],
         },
         "params": None,
         "variant": None,
         "overrides": {},
-        "checkout_modes": [
-            cache.CheckoutMode.HARDLINK,
-            cache.CheckoutMode.SYMLINK,
-            cache.CheckoutMode.COPY,
-        ],
         "run_id": run_id,
         "force": False,
         "no_commit": False,

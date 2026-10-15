@@ -7,6 +7,7 @@ import pytest
 
 from pivot import exceptions, loaders, types
 from pivot.executor import worker
+from pivot.storage import cache
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
@@ -139,12 +140,12 @@ def test_stage_returning_external_path_dependency_does_not_move_user_file(
             "project_root": str(tmp_path),
             "pipeline_name": "pathret",
             "input_bindings": {"external": str(external)},
+            "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
         },
         signature=None,
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[],
         run_id="test_run",
         force=False,
         no_commit=True,

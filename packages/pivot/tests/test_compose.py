@@ -1961,12 +1961,12 @@ def _helper_execute_compose_stage(
         project_root=str(tmp_path),
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
+        checkout_modes=[cache.CheckoutMode.COPY],
     )
     stage_info = executor_core.prepare_worker_info(
         pipeline.get_stage(stage_name),
         pipeline,
         overrides={},
-        checkout_modes=[cache.CheckoutMode.COPY],
         run_id="test_run",
         force=False,
         no_commit=False,

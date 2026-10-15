@@ -1634,6 +1634,7 @@ class Engine:
             project_root=str(project_root),
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
+            checkout_modes=checkout_modes,
         )
         started = 0
         max_to_start = self._effective_max_workers - len(self._futures)
@@ -1668,7 +1669,7 @@ class Engine:
                         stage_info,
                         overrides,
                         force,
-                        cache_dir,
+                        store_spec,
                         state_dir,
                         project_root,
                         results,
@@ -1692,7 +1693,6 @@ class Engine:
                     stage_info,
                     pipeline,
                     overrides,
-                    checkout_modes,
                     run_id,
                     force,
                     no_commit,
@@ -1743,7 +1743,7 @@ class Engine:
         stage_info: RegistryStageInfo,
         overrides: parameters.ParamsOverrides,
         force: bool,
-        cache_dir: pathlib.Path,
+        store_spec: store_mod.StoreSpec,
         state_dir: pathlib.Path,
         project_root: pathlib.Path,
         results: dict[str, executor_core.ExecutionSummary],
@@ -1756,15 +1756,6 @@ class Engine:
             return False
 
         stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
-        files_cache_dir = cache_dir / "files"
-        pipeline = self._require_pipeline()
-        store_spec = store_mod.StoreSpec(
-            kind="workspace",
-            cache_dir=str(files_cache_dir),
-            project_root=str(project_root),
-            pipeline_name=pipeline.name,
-            input_bindings=pipeline.input_bindings,
-        )
         store = store_mod.store_from_spec(store_spec)
 
         def _read_lock() -> LockData | None:

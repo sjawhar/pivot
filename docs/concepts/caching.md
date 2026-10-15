@@ -138,7 +138,8 @@ correct when files do change (content hash is the source of truth).
 ## Checkout Modes
 
 When restoring outputs from cache, Pivot supports three strategies,
-tried in order of preference:
+tried in order of preference. The same order links each stage output to
+its cache entry after the stage runs, and when a skipped stage restores it:
 
 | Mode | How it works | Trade-off |
 |------|-------------|-----------|

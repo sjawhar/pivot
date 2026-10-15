@@ -21,7 +21,7 @@ class Store(Protocol):
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path: ...
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str: ...
+    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo: ...
 
     def hash_artifact(
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
@@ -36,6 +36,7 @@ class StoreSpec(TypedDict):
     project_root: str
     pipeline_name: str
     input_bindings: dict[str, str]
+    checkout_modes: list[config.CheckoutMode]
 
 
 class CacheStore:
@@ -85,7 +86,7 @@ class CacheStore:
         os.close(fd)
         return pathlib.Path(tmp_path)
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str:
+    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo:
         with self._state_db() as db:
             output_hash = cache.save_to_cache(
                 path,
@@ -99,7 +100,7 @@ class CacheStore:
         cache.remove_output(ref_path)
         ref_path.parent.mkdir(parents=True, exist_ok=True)
         ref_path.symlink_to(cache_path.resolve())
-        return output_hash["hash"]
+        return output_hash
 
     def hash_artifact(
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
@@ -141,6 +142,7 @@ class WorkspaceStore:
     _path_map: dict[str, types.ArtifactIdentity]
     _output_producers: set[str]
     _cache_dir: pathlib.Path | None
+    _checkout_modes: list[config.CheckoutMode] | None
 
     def __init__(
         self,
@@ -148,13 +150,16 @@ class WorkspaceStore:
         pipeline_name: str,
         input_bindings: dict[str, str],
         cache_dir: pathlib.Path | None = None,
+        checkout_modes: list[config.CheckoutMode] | None = None,
     ) -> None:
+        """``checkout_modes`` orders how outputs are linked to the cache; None means the default."""
         self._project_root = project_root.resolve()
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
         self._path_map = {}
         self._output_producers = set[str]()
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
+        self._checkout_modes = checkout_modes
 
     def _is_input_ref(self, ref: types.ArtifactRef) -> bool:
         if ref.tag != types.ArtifactTag.DATA:
@@ -207,25 +212,19 @@ class WorkspaceStore:
         cache.remove_output(path)
         return path
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str:
+    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo:
+        """Hash a written output once and, unless it is a metric, place it in the cache."""
         self._output_producers.add(ref.identity.producer)
+        output_hash: types.HashInfo
         if path.is_dir():
-            tree_hash, _ = cache.hash_directory(path, None)
-            return tree_hash
-        file_hash, _ = cache.hash_file(path, None)
-        return file_hash
-
-    def backup_to_cache(self, ref: types.ArtifactRef, path: pathlib.Path) -> None:
-        if self._cache_dir is None:
-            return
-        if ref.tag is types.ArtifactTag.METRIC:
-            return
-        _ = cache.save_to_cache(
-            path,
-            self._cache_dir,
-            state_db=None,
-            checkout_mode=config.CheckoutMode.COPY,
-        )
+            tree_hash, manifest = cache.hash_directory(path, None)
+            output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
+        else:
+            file_hash, _ = cache.hash_file(path, None)
+            output_hash = types.FileHash(hash=file_hash)
+        if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
+            cache.store_hashed_output(path, output_hash, self._cache_dir, self._checkout_modes)
+        return output_hash
 
     def restore_from_cache(
         self,
@@ -243,7 +242,7 @@ class WorkspaceStore:
             output_path,
             output_hash,
             self._cache_dir,
-            checkout_mode=config.CheckoutMode.COPY,
+            checkout_modes=self._checkout_modes,
             state_dir=state_dir,
         )
 
@@ -336,5 +335,6 @@ def store_from_spec(spec: StoreSpec) -> Store:
             pipeline_name=spec["pipeline_name"],
             input_bindings=spec["input_bindings"],
             cache_dir=pathlib.Path(cache_dir_str) if cache_dir_str else None,
+            checkout_modes=spec["checkout_modes"],
         )
     raise ValueError(f"Unknown store kind: {kind}")

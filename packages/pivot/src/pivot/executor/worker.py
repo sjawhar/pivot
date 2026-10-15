@@ -146,7 +146,6 @@ class WorkerStageInfo(TypedDict):
     params: stage_def.StageParams | None
     variant: str | None
     overrides: parameters.ParamsOverrides
-    checkout_modes: list[cache.CheckoutMode]
     run_id: str
     force: bool
     no_commit: bool
@@ -950,10 +949,7 @@ def _commit_outputs_with_store(
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
-        store.commit(ref, path)
-        if isinstance(store, store_mod.WorkspaceStore):
-            store.backup_to_cache(ref, path)
-        output_hashes[types.identity_key(ref.identity)] = store.hash_artifact(ref)
+        output_hashes[types.identity_key(ref.identity)] = store.commit(ref, path)
     return output_hashes
 
 

@@ -235,12 +235,12 @@ def _restore(
 def _cached_output(
     project: pathlib.Path, store: store_mod.WorkspaceStore, ref: types.ArtifactRef, content: str
 ) -> tuple[pathlib.Path, FileHash]:
-    """Write an output, back it up to the cache, and return its path and hash."""
+    """Write an output, commit it to the cache, and return its path and hash."""
     path = store.prepare_output(ref)
     path.write_text(content)
-    store.backup_to_cache(ref, path)
-    file_hash, _ = cache.hash_file(path, None)
-    return path, FileHash(hash=file_hash)
+    output_hash = store.commit(ref, path)
+    assert not types.is_dir_hash(output_hash)
+    return path, output_hash
 
 
 def test_restore_reports_matching_outputs_available_without_writing(
@@ -488,6 +488,7 @@ def _stage_info(
                     "project_root": str(project),
                     "pipeline_name": "skip",
                     "input_bindings": {"raw": "raw.txt"},
+                    "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
                 },
             ),
         ),
@@ -495,7 +496,6 @@ def _stage_info(
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[],
         run_id="test_run",
         force=False,
         no_commit=no_commit,

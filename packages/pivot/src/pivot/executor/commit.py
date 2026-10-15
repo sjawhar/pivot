@@ -60,6 +60,7 @@ def commit_stages(
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
         cache_dir=config.get_cache_dir() / "files",
+        checkout_modes=config.get_checkout_mode_order(),
     )
 
     committed = list[str]()
@@ -146,12 +147,10 @@ def commit_stages(
 
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)
-                identity = types.identity_from_key(identity_key)
                 try:
-                    hash_info = store.hash_artifact(out)
-                    store.backup_to_cache(out, store.resolve_display_path(out))
+                    hash_info = store.commit(out, store.resolve_display_path(out))
                     output_hashes_by_key[identity_key] = hash_info
-                    output_hashes_by_identity[identity] = hash_info
+                    output_hashes_by_identity[out.identity] = hash_info
                 except FileNotFoundError:
                     logger.error(
                         "Stage '%s': output missing: %s — skipping", stage_name, identity_key

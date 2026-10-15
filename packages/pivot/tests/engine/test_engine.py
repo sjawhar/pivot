@@ -33,6 +33,7 @@ from pivot.engine.types import (
 from pivot.engine.worker_pool import WorkerPool
 from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
+from pivot.storage import store as store_mod
 from pivot.types import FileHash, LockData, OnError, StageStatus, identity_key
 
 if TYPE_CHECKING:
@@ -1575,6 +1576,17 @@ async def test_deferred_events_multi_level_redeferral(
 # =============================================================================
 
 
+def _helper_store_spec(cache_dir: pathlib.Path, project_root: pathlib.Path) -> store_mod.StoreSpec:
+    return store_mod.StoreSpec(
+        kind="workspace",
+        cache_dir=str(cache_dir / "files"),
+        project_root=str(project_root),
+        pipeline_name="watch",
+        input_bindings={"raw.json": "data/raw/raw.json"},
+        checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
+    )
+
+
 @pytest.mark.anyio
 async def test_try_skip_returns_false_when_force(
     tmp_path: pathlib.Path,
@@ -1588,7 +1600,7 @@ async def test_try_skip_returns_false_when_force(
             stage_info=stage_info,
             overrides={},
             force=True,
-            cache_dir=tmp_path,
+            store_spec=_helper_store_spec(tmp_path, tmp_path),
             state_dir=tmp_path,
             project_root=tmp_path,
             results=results,
@@ -1618,7 +1630,7 @@ async def test_try_skip_returns_false_when_no_lock(
             stage_info=stage_info,
             overrides={},
             force=False,
-            cache_dir=tmp_path,
+            store_spec=_helper_store_spec(tmp_path, tmp_path),
             state_dir=tmp_path,
             project_root=tmp_path,
             results=results,
@@ -1655,7 +1667,7 @@ async def test_coordinator_skip_avoids_worker_dispatch(
             stage_info=stage_info,
             overrides=parameters.ParamsOverrides(),
             force=False,
-            cache_dir=cache_dir,
+            store_spec=_helper_store_spec(cache_dir, tmp_path),
             state_dir=tmp_path / ".pivot",
             project_root=tmp_path,
             results=results,
@@ -1731,7 +1743,7 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
             stage_info=stage_info,
             overrides=parameters.ParamsOverrides(),
             force=False,
-            cache_dir=cache_dir,
+            store_spec=_helper_store_spec(cache_dir, tmp_path),
             state_dir=tmp_path / ".pivot",
             project_root=tmp_path,
             results=results,
