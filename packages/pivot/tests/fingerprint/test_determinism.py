@@ -223,6 +223,46 @@ def test_set_valued_params_are_deterministic_across_hash_seeds(tmp_path: pathlib
     assert results[0]["params"]["tags"] == ["alpha", "beta", "delta", "eps", "gamma"]
 
 
+_FROZENSET_CAPTURE_SCRIPT = """\
+import json
+
+from pivot import fingerprint
+
+NAMES = frozenset({"tasks", "runs", "models", "jobs", "evals", "agents", "scores", "logs"})
+
+
+def stage() -> int:
+    return len(NAMES)
+
+
+print(json.dumps({"manifest": fingerprint.get_stage_fingerprint(stage), "repr": repr(NAMES)}))
+"""
+
+
+def test_frozenset_capture_is_deterministic_across_hash_seeds(tmp_path: pathlib.Path) -> None:
+    """A captured frozenset of str fingerprints the same whatever order the hash seed gives it."""
+    (tmp_path / ".pivot").mkdir()
+    script = tmp_path / "frozenset_capture_stage.py"
+    script.write_text(_FROZENSET_CAPTURE_SCRIPT)
+    results = [
+        json.loads(
+            subprocess.run(
+                [sys.executable, str(script)],
+                cwd=tmp_path,
+                env={**os.environ, "PYTHONHASHSEED": str(seed)},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+        for seed in range(4)
+    ]
+
+    assert len({result["repr"] for result in results}) > 1, "the seeds must reorder the set"
+    assert "const:__main__.NAMES" in results[0]["manifest"], results[0]
+    assert all(result["manifest"] == results[0]["manifest"] for result in results), results
+
+
 @pytest.mark.parametrize(
     ("first", "second"),
     [

@@ -11,6 +11,7 @@ import logging
 import marshal
 import os
 import pathlib
+import re
 import sys
 import textwrap
 import types
@@ -60,8 +61,11 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # `ext:`), not `mod:`, and follows `settings.Config.SCALE` and `pkg.sub.helper`.
 # Version 25 records call-site artifact wiring (parameter bindings, collection kind/order,
 # and project-relative input paths) in the code manifest.
-_CACHE_SCHEMA_VERSION = 25
+# Version 26 records tuples and frozensets of scalars and compiled regexes by value.
+_CACHE_SCHEMA_VERSION = 26
 _REPR_SIZE_LIMIT = 10_000
+
+_SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
@@ -563,6 +567,24 @@ class _ValueKind(enum.Enum):
     SCALAR = "scalar"
 
 
+def _immutable_value_text(value: Any) -> str | None:
+    """Return the manifest text for a safely trackable immutable value, if any.
+
+    Scalars keep their existing repr. Exact tuples and frozensets are tracked only when every
+    member is an exact scalar type, one level deep. Compiled regexes record their full pattern
+    and flags because their repr truncates long patterns.
+    """
+    if isinstance(value, _SCALAR_TYPES):
+        return repr(value)
+    if type(value) in (tuple, frozenset) and all(
+        type(item) in _SCALAR_TYPES for item in cast("tuple[Any, ...] | frozenset[Any]", value)
+    ):
+        return _serialize_value_for_hash(value)
+    if isinstance(value, re.Pattern):
+        return _serialize_value_for_hash(value)
+    return None
+
+
 def _value_kind(value: Any) -> _ValueKind:
     """Classify a value a walked function reads; the walk and a cache hit share this."""
     # functools.partial fails is_user_code() (module is functools/stdlib).
@@ -576,7 +598,7 @@ def _value_kind(value: Any) -> _ValueKind:
         return _ValueKind.MODULE
     if isinstance(value, logging.Logger):
         return _ValueKind.LOGGER
-    if isinstance(value, (bool, int, float, str, bytes, type(None))):
+    if _immutable_value_text(value) is not None:
         return _ValueKind.SCALAR
     return _ValueKind.REFUSED
 
@@ -598,7 +620,7 @@ def _value_token(value: Any) -> str:
     if kind is _ValueKind.MODULE:
         return f"module:{value.__name__}"
     if kind is _ValueKind.SCALAR:
-        return f"{type(value).__name__}:{value!r}"
+        return f"{type(value).__name__}:{_immutable_value_text(value)}"
     if kind is _ValueKind.EXTERNAL:
         return f"external:{_library_name(value)}"
     return kind.value
@@ -1335,9 +1357,9 @@ def _check_non_scalar_capture(
         subject += f" as the default of parameter '{parameter}'"
     message = (
         f"Stage '{stage_name}': {subject} (type: {type(value).__name__}).\n"
-        + "Pivot tracks only module-level bool, int, float, str, bytes, and None values. "
-        + "Other values may change without a reliable fingerprint, which can cause silent wrong "
-        + "outputs.\n"
+        + "Pivot tracks module-level bool, int, float, str, bytes, and None values, tuples and "
+        + "frozensets of them, and compiled regexes. Other values may change without a reliable "
+        + "fingerprint, which can cause silent wrong outputs.\n"
         + "Fix: move this value into the stage's StageParams, or read it from a pipeline input.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
@@ -1548,7 +1570,9 @@ def _process_captured_value(
             if chain is not None:
                 _process_module_dependency(chain, value, func, manifest, visited)
         case _ValueKind.SCALAR:
-            manifest[f"const:{binding_ref}"] = repr(value)
+            text = _immutable_value_text(value)
+            assert text is not None
+            manifest[f"const:{binding_ref}"] = text
         case _ValueKind.REFUSED:
             _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
         case _ValueKind.EXTERNAL:
@@ -1681,7 +1705,7 @@ def _process_default_values(
         binding_ref = f"{func_ref}.{parameter}"
         step = f"d:{parameter}"
         _record_read(func, step)
-        if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        if isinstance(value, _SCALAR_TYPES):
             manifest[f"default:{binding_ref}"] = repr(value)
             continue
         if isinstance(value, stage_def.StageParams):
@@ -1694,6 +1718,10 @@ def _process_default_values(
             expressions = _default_expressions(func)
         expression = expressions.get(parameter)
         if expression is not None and _is_literal(expression):
+            continue
+        text = _immutable_value_text(value)
+        if text is not None:
+            manifest[f"default:{binding_ref}"] = text
             continue
         source = ast.unparse(expression) if expression is not None else parameter
         with _walking(step):
@@ -2140,12 +2168,16 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     canonical({field: value})]`, field by field, so a secret inside one reaches that leaf
     rather than the generated repr's mask. An object whose class keeps `object.__repr__`
     (which holds the address) and that has a `__dict__` becomes
-    `[module.qualname, canonical(vars(obj))]`.
-    Other leaves keep their `repr`, tagged with their type. A class is a leaf, even a pydantic
-    model class: only an instance is dumped.
+    `[module.qualname, canonical(vars(obj))]`. A compiled regex becomes
+    `["re.Pattern", canonical(pattern), flags]`, so its full pattern is recorded. Other leaves
+    keep their `repr`, tagged with their type. A class is a leaf, even a pydantic model class:
+    only an instance is dumped.
     """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, re.Pattern):
+        pattern = cast("re.Pattern[Any]", value)
+        return ["re.Pattern", _canonicalize_value_for_hash(pattern.pattern), pattern.flags]
     if id(value) in active:
         return ["cycle", len(active) - active.index(id(value))]
     if hasattr(value, "model_dump") and not isinstance(value, type):

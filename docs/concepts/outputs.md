@@ -126,6 +126,11 @@ project input tracking ignores, such as `build/` and `.venv/`, are still part of
 the directory artifact. Pivot accepts a descendant symlink only when it is a
 cache-derived checkout link; any other directory-artifact symlink is refused.
 
+A directory artifact, input or output, is hashed and cached whole. Every file
+under it counts, including names that code fingerprinting or watch mode may
+ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
+them changes the directory hash, and all of them return on restore.
+
 The declarative `DirectoryOut` annotation for a variable set of files remains
 undecided; do not add that annotation to a compositional pipeline.
 

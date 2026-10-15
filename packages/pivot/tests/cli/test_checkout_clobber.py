@@ -204,10 +204,10 @@ def test_checkout_only_missing_refuses_update_when_a_file_holds_an_uncached_edit
     assert not (data_dir / "c.txt").exists(), "A refused checkout must not restore anything"
 
 
-def test_checkout_only_missing_keeps_ignored_entries_when_replacing_directory(
+def test_checkout_only_missing_refuses_untracked_entries_when_replacing_directory(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
-    """Entries the directory hash skips are not part of the output: the replaced tree keeps them."""
+    """Every directory entry is part of an artifact; untracked extras block replacement."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
     new_pvt_data = _helper_cache_directory(
@@ -222,24 +222,19 @@ def test_checkout_only_missing_keeps_ignored_entries_when_replacing_directory(
 
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
 
-    assert result.exit_code == 0, result.output
-    assert sorted(p.name for p in data_dir.iterdir()) == [
-        ".a.txt.swp",
-        "a.txt",
-        "build",
-        "c.txt",
-        "draft.txt~",
-    ]
-    assert (data_dir / "a.txt").read_text() == "one updated\n"
+    assert result.exit_code != 0
+    assert "local changes that are not in the cache" in result.output
+    for relpath in (".a.txt.swp", "build/x.o", "draft.txt~"):
+        assert relpath in result.output
+    assert (data_dir / "a.txt").read_text() == "one\n"
     assert (data_dir / "build" / "x.o").read_text() == "object\n"
-    assert (data_dir / ".a.txt.swp").read_text() == "swap\n"
-    assert (data_dir / "draft.txt~").read_text() == "backup\n"
+    assert not (data_dir / "c.txt").exists()
 
 
-def test_checkout_only_missing_symlink_mode_keeps_editor_swap_file(
+def test_checkout_only_missing_symlink_mode_refuses_untracked_editor_swap_file(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
-    """With a cached tree to link to, the swap still keeps an open editor's swap file."""
+    """An editor swap file is an untracked directory entry, not a file to carry forward."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
     new_pvt_data = _helper_cache_directory(
@@ -254,16 +249,16 @@ def test_checkout_only_missing_symlink_mode_keeps_editor_swap_file(
         cli.cli, ["checkout", "--only-missing", "--checkout-mode", "symlink", "data/ext"]
     )
 
-    assert result.exit_code == 0, result.output
-    assert not data_dir.is_symlink(), "a directory that keeps local entries cannot link the cache"
+    assert result.exit_code != 0
+    assert ".a.txt.swp" in result.output
+    assert not data_dir.is_symlink()
     assert (data_dir / ".a.txt.swp").read_text() == "swap\n"
-    assert (data_dir / "a.txt").read_text() == "one updated\n"
-    assert (data_dir / "c.txt").read_text() == "three\n"
-    assert not (data_dir / "b.txt").exists()
+    assert (data_dir / "a.txt").read_text() == "one\n"
+    assert not (data_dir / "c.txt").exists()
 
 
-def _helper_kept_entries_layout(root: pathlib.Path) -> tuple[pathlib.Path, types.DirHash]:
-    """data/ext at v1 plus build/x.o and .a.txt.swp (skipped by the hash); v2 in the cache."""
+def _helper_restore_layout(root: pathlib.Path) -> tuple[pathlib.Path, types.DirHash]:
+    """data/ext at v1; v2 lives in the cache."""
     cache_dir = root / ".pivot" / "cache" / "files"
     v2 = root / "v2src"
     v2.mkdir(parents=True)
@@ -276,9 +271,6 @@ def _helper_kept_entries_layout(root: pathlib.Path) -> tuple[pathlib.Path, types
     (ext / "a.txt").write_text("one\n")
     (ext / "b.txt").write_text("two\n")
     _ = cache.save_to_cache(ext, cache_dir, checkout_mode=config.CheckoutMode.COPY)
-    (ext / "build").mkdir()
-    (ext / "build" / "x.o").write_text("object\n")
-    (ext / ".a.txt.swp").write_text("swap\n")
     return ext, v2_hash
 
 
@@ -320,14 +312,13 @@ def _helper_crash_at_rename(root: pathlib.Path, v2_hash: types.DirHash, crash_at
     _ = _helper_restore_only_missing(root, v2_hash)
 
 
-def test_restore_killed_at_any_rename_loses_no_kept_entry(tmp_path: pathlib.Path) -> None:
-    """A kill between any two renames of the swap leaves kept entries where the next restore
-    finds them, even after leftovers age past the stale-temp cutoff."""
+def test_restore_killed_at_any_rename_restores_complete_directory(tmp_path: pathlib.Path) -> None:
+    """A killed directory swap leaves a complete target after the next restore."""
     ctx = multiprocessing.get_context("spawn")
     crashes = 0
     for crash_at in range(20):
         root = tmp_path / f"crash-{crash_at}"
-        _, v2_hash = _helper_kept_entries_layout(root)
+        _, v2_hash = _helper_restore_layout(root)
         child = ctx.Process(target=_helper_crash_at_rename, args=(root, v2_hash, crash_at))
         child.start()
         child.join(timeout=120)
@@ -343,36 +334,23 @@ def test_restore_killed_at_any_rename_loses_no_kept_entry(tmp_path: pathlib.Path
         _ = _helper_restore_only_missing(root, v2_hash)
 
         ext = root / "data" / "ext"
-        where = sorted(
-            str(p.relative_to(root)) for p in root.rglob("*") if p.name in ("x.o", ".a.txt.swp")
-        )
-        assert (ext / "build" / "x.o").read_text() == "object\n", (
-            f"rename {crash_at}: x.o at {where}"
-        )
-        assert (ext / ".a.txt.swp").read_text() == "swap\n", f"rename {crash_at}: .swp at {where}"
         assert (ext / "a.txt").read_text() == "one updated\n", f"rename {crash_at}"
+        assert (ext / "c.txt").read_text() == "three\n", f"rename {crash_at}"
         assert not (ext / "b.txt").exists(), f"rename {crash_at}"
-        assert [
-            p.name for p in (root / "data").iterdir() if p.name.startswith(".pivot_keep_")
-        ] == []
     else:
         raise AssertionError("the restore never completed without a crash")
-    assert crashes >= 4, f"only {crashes} crash points exercised"
+    assert crashes >= 2, f"only {crashes} crash points exercised"
 
 
-def test_restore_without_carrying_puts_entries_staged_by_a_killed_checkout_into_the_new_tree(
-    tmp_path: pathlib.Path,
-) -> None:
-    """After a killed `checkout --only-missing`, a restore that carries nothing (as `pivot repro`
-    restores a stale output) still puts the staged entries into the tree it writes."""
-    ext, v2_hash = _helper_kept_entries_layout(tmp_path)
+def test_restore_after_killed_checkout_cleans_stale_restore_staging(tmp_path: pathlib.Path) -> None:
+    """A later restore cleans the temporary paths a killed checkout left behind."""
+    ext, v2_hash = _helper_restore_layout(tmp_path)
     child = multiprocessing.get_context("spawn").Process(
-        target=_helper_crash_at_rename, args=(tmp_path, v2_hash, 2)
+        target=_helper_crash_at_rename, args=(tmp_path, v2_hash, 1)
     )
     child.start()
     child.join(timeout=120)
     assert child.exitcode == _CRASH_EXIT
-    assert cache.staged_kept_entries(ext) is not None, "the kill must leave entries staged"
 
     restored = cache.restore_from_cache(
         ext,
@@ -383,11 +361,9 @@ def test_restore_without_carrying_puts_entries_staged_by_a_killed_checkout_into_
     )
 
     assert restored
-    assert sorted(p.name for p in ext.iterdir()) == [".a.txt.swp", "a.txt", "build", "c.txt"]
-    assert (ext / "build" / "x.o").read_text() == "object\n"
-    assert (ext / ".a.txt.swp").read_text() == "swap\n"
+    assert sorted(p.name for p in ext.iterdir()) == ["a.txt", "c.txt"]
     assert (ext / "a.txt").read_text() == "one updated\n"
-    assert cache.staged_kept_entries(ext) is None
+    assert not any(p.name.startswith(".pivot_") for p in (tmp_path / "data").iterdir())
 
 
 def test_checkout_only_missing_reads_no_content_of_unchanged_hardlinked_directory(
