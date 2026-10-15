@@ -221,6 +221,30 @@ def _format_key(fmt: loaders_mod.Reader[Any] | loaders_mod.Writer[Any]) -> tuple
     return (type(fmt).__module__, type(fmt).__qualname__, fingerprint.loader_config_text(fmt))
 
 
+def _show_format(fmt: loaders_mod.Reader[Any] | loaders_mod.Writer[Any]) -> str:
+    """A loader for an error message: its ``repr``, with each function field shown by qualname
+    plus closure and default values (``transform=make_scaler.<locals>.scaler(factor=2)``).
+
+    A function's ``repr`` holds a memory address, so two loaders that differ only in the
+    closure values of a field would read the same apart from that address.
+    """
+    fields = dataclasses.fields(typing.cast("Any", fmt))
+    if not any(inspect.isfunction(getattr(fmt, field.name)) for field in fields):
+        return repr(fmt)
+    shown = list[str]()
+    for field in fields:
+        value = getattr(fmt, field.name)
+        if not field.repr:
+            continue
+        if inspect.isfunction(value):
+            bound = {**_cell_values(value), **_default_values(value)}
+            values = ", ".join(f"{name}={item!r}" for name, item in bound.items())
+            shown.append(f"{field.name}={value.__qualname__}({values})")
+        else:
+            shown.append(f"{field.name}={value!r}")
+    return f"{type(fmt).__qualname__}({', '.join(shown)})"
+
+
 def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, str]]:
     """Each part of a stage besides its function, as (label, comparison key, display).
 
@@ -252,11 +276,15 @@ def _stage_wiring(info: registry.RegistryStageInfo) -> list[tuple[str, object, s
         (
             "input formats",
             dep_formats,
-            _show_items({name: repr(ref.format) for name, ref in info["deps"].items()}),
+            _show_items({name: _show_format(ref.format) for name, ref in info["deps"].items()}),
         ),
         ("input collections", info["collection_params"], _show_items(info["collection_params"])),
         ("outputs", outs, ", ".join(_show_ref(*ref) for ref in outs) or "none"),
-        ("output formats", out_formats, ", ".join(repr(ref.format) for ref in info["outs"])),
+        (
+            "output formats",
+            out_formats,
+            ", ".join(_show_format(ref.format) for ref in info["outs"]),
+        ),
         (
             "incremental inputs",
             incremental,

@@ -1193,6 +1193,9 @@ def test_include_refuses_one_stage_reading_through_two_factory_loaders(
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert "Stage 'rep/make' is defined twice with different input formats" in output, output
+    assert "transform=make_scaler.<locals>.scaler(factor=2)" in output, output
+    assert "transform=make_scaler.<locals>.scaler(factor=5)" in output, output
+    assert " at 0x" not in output, output
 
 
 def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
