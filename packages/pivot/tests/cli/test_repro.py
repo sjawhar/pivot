@@ -1843,7 +1843,7 @@ def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
     def doubled() -> list[int] | None:
         if not output.exists():
             return None
-        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+        return [int(value) for value in loaders.DataFrameJSONL().load(output)["n"].tolist()]
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(

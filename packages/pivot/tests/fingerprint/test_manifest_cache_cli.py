@@ -1989,7 +1989,7 @@ def test_logger_partial_and_library_function_read_through_a_module_are_accepted(
 
     assert "1 ran" in first, first
     assert "0 ran, 1 cached" in second, second
-    assert (root / "data/mod/via_module.jsonl").read_text() == '{"a":6.0}\n'
+    assert _helper_rows(root / "data/mod/via_module.jsonl") == [{"a": 6.0}]
 
 
 def test_library_function_rebound_in_a_module_reruns_stage(tmp_path: pathlib.Path) -> None:
@@ -2001,7 +2001,7 @@ def test_library_function_rebound_in_a_module_reruns_stage(tmp_path: pathlib.Pat
     output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
 
     assert "1 ran" in output, output
-    assert (root / "data/mod/via_module.jsonl").read_text() == '{"a":4.0}\n', output
+    assert _helper_rows(root / "data/mod/via_module.jsonl") == [{"a": 4.0}], output
 
 
 def test_class_attribute_read_through_a_module_at_import_reruns_stage(
@@ -2030,7 +2030,7 @@ def test_class_attribute_read_through_a_module_at_import_reruns_stage(
 
     assert "1 cached, 0 stale" in cached, cached
     assert "1 stale" in status, status
-    assert (root / "data/mod/via_module.jsonl").read_text() == '{"a":63.0}\n', output
+    assert _helper_rows(root / "data/mod/via_module.jsonl") == [{"a": 63.0}], output
 
 
 _LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS = """\
@@ -2143,10 +2143,10 @@ def test_submodule_read_through_its_package_is_tracked(tmp_path: pathlib.Path) -
         },
     )
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/sub/scale.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/sub/scale.jsonl") == [{"a": 2}]
 
     (root / "pkg/sub.py").write_text("SCALE = 50\n\n\ndef helper(x):\n    return x + 1\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
 
     assert "1 ran" in output, output
-    assert (root / "data/sub/scale.jsonl").read_text() == '{"a":100}\n', output
+    assert _helper_rows(root / "data/sub/scale.jsonl") == [{"a": 100}], output
