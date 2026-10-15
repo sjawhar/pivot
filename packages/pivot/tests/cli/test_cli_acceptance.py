@@ -15,6 +15,8 @@ import uuid
 
 import boto3
 
+from pivot import loaders
+
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
@@ -525,7 +527,10 @@ def test_symlink_checkout_mode_applies_when_repro_writes_and_restores_outputs(
 
     assert "0 ran, 2 cached" in out, out
     assert output.is_symlink()
-    assert output.read_text() == '{"a":2}\n{"a":4}\n'
+    assert loaders.DataFrameJSONL().load(output).to_dict(orient="records") == [
+        {"a": 2},
+        {"a": 4},
+    ]
 
 
 def test_noop_status_reads_no_output_bytes_after_repro(tmp_path: pathlib.Path) -> None:
