@@ -841,11 +841,22 @@ def _scan_entries(path: pathlib.Path, expected_paths: set[str]) -> tuple[list[st
     return files, ignored
 
 
+def _is_same_file(file_stat: os.stat_result, cache_path: pathlib.Path) -> bool:
+    """Whether file_stat is the cache blob itself (a hardlink checkout). Cache blobs are
+    read-only and never rewritten, so sharing the inode proves the content without a read."""
+    try:
+        blob_stat = cache_path.stat()
+    except FileNotFoundError:
+        return False
+    return (file_stat.st_dev, file_stat.st_ino) == (blob_stat.st_dev, blob_stat.st_ino)
+
+
 def restore_missing_in_directory(
     path: pathlib.Path,
     output_hash: DirHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
+    state_db: state_mod.StateDB | None = None,
 ) -> MissingRestore:
     """Restore a directory's missing target files without overwriting local changes.
 
@@ -856,6 +867,10 @@ def restore_missing_in_directory(
     ``replace`` asks the caller to swap with ``restore_from_cache(..., keep_ignored=True)``,
     which carries over the entries the directory hash skips (build/, *.swp, ...). Otherwise
     nothing is written, and the files the cache lacks (local edits, extra files) are returned.
+
+    A retained file is read only when nothing else proves its content: a symlink to the
+    target's cache path, a hardlink to the target's cache blob, or a matching ``state_db``
+    entry each settle it without a read.
     """
     lexical_base = pathlib.Path(os.path.abspath(path))
     resolved_base = path.resolve()
@@ -890,7 +905,9 @@ def restore_missing_in_directory(
             if not file_path.is_file():
                 changed[relpath] = None
                 continue
-            file_hash, _ = hash_file(file_path)
+            if _is_same_file(file_path.stat(), file_cache_path):
+                continue
+            file_hash, _ = hash_file(file_path, state_db)
             if file_hash != entry["hash"]:
                 changed[relpath] = file_hash
             continue
@@ -908,7 +925,7 @@ def restore_missing_in_directory(
         if extra_path.is_symlink():
             changed[relpath] = _get_symlink_cache_hash(extra_path, cache_dir)
         else:
-            changed[relpath], _ = hash_file(extra_path)
+            changed[relpath], _ = hash_file(extra_path, state_db)
 
     if changed:
         # Replacing the directory deletes every file it holds; refuse if any is not cached.

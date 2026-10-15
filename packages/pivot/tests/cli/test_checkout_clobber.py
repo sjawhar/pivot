@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from pivot import cli, config, project, types
 from pivot.remote import storage as remote_storage
-from pivot.storage import cache, track
+from pivot.storage import cache, state, track
 
 if TYPE_CHECKING:
     import pathlib
@@ -238,6 +238,41 @@ def test_checkout_only_missing_symlink_mode_keeps_editor_swap_file(
     assert (data_dir / "a.txt").read_text() == "one updated\n"
     assert (data_dir / "c.txt").read_text() == "three\n"
     assert not (data_dir / "b.txt").exists()
+
+
+def test_checkout_only_missing_reads_no_content_of_unchanged_hardlinked_directory(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    """A workspace file that is a hardlink to its target blob is unchanged without a read."""
+    data_dir = project.get_project_root() / "data" / "ext"
+    pvt_data = _helper_cache_directory(
+        data_dir, {"a.txt": "one\n", "b.txt": "two\n"}, checkout_mode=config.CheckoutMode.HARDLINK
+    )
+    track.write_pvt_file(track.get_pvt_path(data_dir), pvt_data)
+    assert (data_dir / "a.txt").stat().st_nlink == 2
+    hash_file = mocker.spy(cache, "hash_file")
+
+    result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
+
+    assert result.exit_code == 0, result.output
+    assert "Skipped 1 file(s)" in result.output
+    assert hash_file.call_count == 0
+
+
+def test_checkout_only_missing_takes_unchanged_hashes_from_state_db(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner, mocker: MockerFixture
+) -> None:
+    """Copied files whose StateDB entry still matches (as after `pivot status`) are not read."""
+    data_dir = _helper_track_directory(project.get_project_root())
+    with state.StateDB(config.get_state_dir()) as db:
+        _ = cache.hash_directory(data_dir, db)
+    opened = mocker.patch.object(cache, "open", create=True, side_effect=open)
+
+    result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
+
+    assert result.exit_code == 0, result.output
+    assert "Skipped 1 file(s)" in result.output
+    assert opened.call_count == 0
 
 
 def test_checkout_only_missing_reports_edited_file_in_directory(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import pathlib
 from typing import TYPE_CHECKING, Literal
@@ -13,7 +14,7 @@ from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -114,9 +115,15 @@ def _restore_path_sync(
                 # cache lacks (a local change).
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return ("skipped", path.name)
-                outcome = cache.restore_missing_in_directory(
-                    path, output_hash, cache_dir, checkout_modes
-                )
+                # Reuse hashes `pivot status` and `pivot track` recorded; never create the DB.
+                with (
+                    state.StateDB(state_dir, readonly=True)
+                    if state_dir is not None and (state_dir / "state.lmdb").exists()
+                    else contextlib.nullcontext(None)
+                ) as state_db:
+                    outcome = cache.restore_missing_in_directory(
+                        path, output_hash, cache_dir, checkout_modes, state_db
+                    )
                 if outcome["local_changes"]:
                     raise click.ClickException(
                         f"'{path.name}' has local changes that are not in the cache: "
