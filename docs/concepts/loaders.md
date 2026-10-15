@@ -59,12 +59,59 @@ Defaults Pivot chooses without an annotation: `DataFrame` → `DataFrameJSONL()`
 `dict`/`list` → `YAML()`, `str` → `Text()`, `plot` tag → `MatplotlibFigure()`,
 `metric` tag → `YAML()`.
 
+### DataFrameJSONL metadata header
+
+A `DataFrameJSONL()` output starts with one metadata record, then ordinary row
+records:
+
+```json
+{"__pivot_dataframe_metadata__":{"version":1,"columns":[{"name":"name","dtype":"object"},{"name":"created_at","dtype":"datetime64[ns, UTC]"}],"temporal_columns":{"created_at":{"kind":"datetime","timezone":"UTC"}}}}
+{"name":"alice","created_at":"2026-10-13T12:00:00.000000000Z"}
+```
+
+`columns` lists every column's name and dtype in order, so a zero-row frame
+keeps its columns and dtypes. An integer column label, such as the `0` and `1`
+of a frame built from a numpy array, is written as its JSON key with
+`"label":"int"` in its entry and comes back as an integer, so `m[0]` still works
+in the next stage. Pivot uses `temporal_columns` to restore only the
+columns it marked as temporal, retain the original timezone names, and preserve
+all-null `datetime` and `timedelta` dtypes. It never guesses that an ISO-shaped
+string column is temporal.
+
+Non-Pivot JSONL readers see the explicit first record and must skip it before
+reading data rows. Pivot treats the first line as the header only when it has
+exactly this shape, so a column may have any name, including
+`__pivot_dataframe_metadata__`.
+
+A `.jsonl` file without the header, such as a raw input under `data/raw/` or a
+file written by an earlier Pivot release, loads exactly as
+`pd.read_json(path, lines=True, orient="records", convert_dates=False)` reads
+it, so a stage gets the same values from an external file that it always did.
+That includes pandas' inexact float parsing (`0.3` reads as
+`0.30000000000000004`). Exact floats and restored dtypes apply to files Pivot
+writes with the header.
+
+Some frames cannot be written exactly. In that case Pivot writes the whole frame
+in its previous headerless pandas form, with dates as epoch milliseconds, and
+prints a warning under the stage naming the column. The cases are:
+
+- `Decimal`, `set`, `bytes` or other object cells
+- a timezone that cannot be rebuilt from its name, such as a `dateutil` offset
+- datetimes with mixed UTC offsets in one column
+- a date outside the nanosecond range (1677 to 2262), such as a `9999-12-31` sentinel
+- a column label that is neither str nor int, or an int and a str label with the same text
+
+Convert the column, or choose another format such as
+`Annotated[pd.DataFrame, loaders.Pickle()]`; a later release will fail the stage
+instead.
+
 ### Pickle is a trusted-code boundary
 
 Loading a pickle can execute arbitrary code. Only load Pickle artifacts written
 by code you trust. A cache or remote that can supply pickle bytes is a
 trusted-code boundary: content hashes identify bytes, but they do not make
-those bytes safe.
+those bytes safe. `Pickle()` emits a `RuntimeWarning` when it loads as a
+reminder; it is not a security control.
 
 `PathOnly()` hands a stage an input path without loading content. For an output,
 it takes ownership of a file or directory created outside the project and moves

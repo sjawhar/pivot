@@ -71,7 +71,6 @@ def test_text_round_trips_strings_without_carriage_returns(value: str) -> None:
     assert _round_trip(loaders.Text(), value, "out.txt") == value
 
 
-@pytest.mark.xfail(strict=True, reason="red test for Task 10: Text.load translates newlines")
 @pytest.mark.parametrize("value", ["line\r\nnext", "trailing\r"])
 def test_text_round_trips_carriage_returns(value: str) -> None:
     assert _round_trip(loaders.Text(), value, "out.txt") == value
@@ -95,11 +94,6 @@ def test_yaml_round_trips_plain_values_dates_and_aware_datetimes(value: object) 
     assert _round_trip(loaders.YAML(), value, "out.yaml") == value
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 10 (loader-fixes Slice 2 PR): "
-    + "YAML.save writes python/* tags that YAML.load (safe_load) refuses",
-)
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -148,11 +142,6 @@ def test_dataframe_jsonl_round_trips_int_bool_and_text_columns(frame: pandas.Dat
     pandas.testing.assert_frame_equal(loaded, frame)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 10 (loader-fixes Slice 2 PR): "
-    + "DataFrameJSONL.save rounds floats to 10 digits and int-like floats load as int64",
-)
 @_SETTINGS
 @hypothesis.given(
     hpd.data_frames(
@@ -172,11 +161,6 @@ def test_dataframe_jsonl_round_trips_float_columns(frame: pandas.DataFrame) -> N
     pandas.testing.assert_frame_equal(loaded, frame)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 10 (loader-fixes Slice 2 PR): "
-    + "DataFrameJSONL writes datetimes as epoch milliseconds (#451)",
-)
 @_SETTINGS
 @hypothesis.given(
     hpd.data_frames(
@@ -199,11 +183,6 @@ def test_dataframe_jsonl_round_trips_datetime_columns(frame: pandas.DataFrame) -
     pandas.testing.assert_frame_equal(loaded, frame)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 10 (loader-fixes Slice 2 PR): "
-    + "DataFrameJSONL drops the columns of a zero-row frame",
-)
 def test_dataframe_jsonl_keeps_columns_of_zero_row_frame() -> None:
     frame = pandas.DataFrame(
         {"count": pandas.Series([], dtype="int64"), "label": pandas.Series([], dtype=object)}

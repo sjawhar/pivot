@@ -18,6 +18,7 @@ import random
 import sys
 import threading
 import traceback
+import warnings
 from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast, overload, override
 
 import pydantic
@@ -824,6 +825,42 @@ def _write_output_with_store(
         _reject_path_inside_project(ref, value, project_root, dependency_paths)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
+
+    output_label = (
+        f"its {type(writer).__name__} output"
+        if ref.identity.key is None
+        else f"output {ref.identity.key!r}"
+    )
+
+    def save_output(output_value: Any, destination: pathlib.Path) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", loaders.LossyOutputWarning)
+            try:
+                writer.save(output_value, destination)
+            except TypeError as e:
+                if isinstance(writer, loaders.YAML):
+                    raise TypeError(
+                        f"Stage '{ref.identity.producer}' cannot write {output_label}: {e}"
+                    ) from e
+                raise
+        for caught_warning in caught:
+            if issubclass(caught_warning.category, loaders.LossyOutputWarning):
+                logger.warning(
+                    "Stage '%s' wrote %s %s: %s",
+                    ref.identity.producer,
+                    output_label,
+                    types.LOSSY_OUTPUT_PHRASE,
+                    caught_warning.message,
+                )
+            else:
+                warnings.warn_explicit(
+                    caught_warning.message,
+                    caught_warning.category,
+                    caught_warning.filename,
+                    caught_warning.lineno,
+                    source=caught_warning.source,
+                )
+
     if ref.tag is types.ArtifactTag.DIRECTORY:
         if not isinstance(value, dict):
             raise RuntimeError(
@@ -850,11 +887,11 @@ def _write_output_with_store(
             members.append((output_path / normalized, item_value))
         for full_path, item_value in members:
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            writer.save(item_value, full_path)
+            save_output(item_value, full_path)
         return output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer.save(value, output_path)
+    save_output(value, output_path)
     return output_path
 
 
