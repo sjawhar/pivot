@@ -1017,13 +1017,13 @@ def test_scalar_read_from_environment_at_import_reruns_stage(tmp_path: pathlib.P
         tmp_path, {"pipeline.py": _ENV_SCALE_PIPELINE, "data/raw/x.csv": "a\n1\n"}
     )
     _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
-    assert (root / "data/env/scale.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/env/scale.jsonl") == [{"a": 2}]
 
     status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
     output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
 
     assert "1 stale" in status, status
-    assert (root / "data/env/scale.jsonl").read_text() == '{"a":7}\n', output
+    assert _helper_rows(root / "data/env/scale.jsonl") == [{"a": 7}], output
 
 
 _SETTINGS_FILE_PIPELINE = """\
@@ -1070,16 +1070,16 @@ def test_scalar_read_from_settings_file_at_import_reruns_stages(tmp_path: pathli
         },
     )
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":2}\n'
-    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/cfg/made.jsonl") == [{"a": 2}]
+    assert _helper_rows(root / "data/cfg/plain.jsonl") == [{"a": 2}]
 
     (root / "settings.json").write_text('{"factor": 7}\n')
     status = _helper_ok(_helper_pivot(root, "status"))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
     assert "2 stale" in status, status
-    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":7}\n', output
-    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":7}\n', output
+    assert _helper_rows(root / "data/cfg/made.jsonl") == [{"a": 7}], output
+    assert _helper_rows(root / "data/cfg/plain.jsonl") == [{"a": 7}], output
 
 
 _FACTORY_STAGES = """\
@@ -1218,11 +1218,11 @@ def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
     )
 
     left = _helper_ok(_helper_pivot(root / "left", "repro"))
-    assert (root / "data/rep/make.jsonl").read_text() == '{"a":2}\n', left
+    assert _helper_rows(root / "data/rep/make.jsonl") == [{"a": 2}], left
     right = _helper_ok(_helper_pivot(root / "right", "repro"))
 
     assert "1 ran" in right, right
-    assert (root / "data/rep/make.jsonl").read_text() == '{"a":5}\n', right
+    assert _helper_rows(root / "data/rep/make.jsonl") == [{"a": 5}], right
 
 
 _NAN_PREP_DEFAULT = """\
@@ -1362,7 +1362,7 @@ def test_self_referencing_object_is_refused_not_a_crash(
     assert "(type: Node)" in refused_output, refused_output
     unsafe_output = _helper_ok(unsafe)
     assert "1 ran" in unsafe_output, unsafe_output
-    assert (root / "data/cyc/scale.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/cyc/scale.jsonl") == [{"a": 2}]
 
 
 _TWO_CLOSURES_MODULE = """\
@@ -1443,7 +1443,10 @@ with Pipeline("lib") as pipeline:
 
 
 def _helper_summary(root: pathlib.Path) -> float:
-    return json.loads((root / "data/lib/summarise.jsonl").read_text())["a"]
+    (row,) = _helper_rows(root / "data/lib/summarise.jsonl")
+    value = row["a"]
+    assert isinstance(value, float), row
+    return value
 
 
 @pytest.mark.parametrize(
@@ -1769,13 +1772,13 @@ def test_changing_a_secret_read_by_a_stage_reruns_it(tmp_path: pathlib.Path, pip
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
     env = {"TOKEN": "first-secret"}
     _helper_ok(_helper_pivot(root, "repro", env=env))
-    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":12}\n'
+    assert _helper_rows(root / "data/sec/measure.jsonl") == [{"a": 12}]
 
     status = _helper_ok(_helper_pivot(root, "status", env={"TOKEN": "second-secret-x"}))
     output = _helper_ok(_helper_pivot(root, "repro", env={"TOKEN": "second-secret-x"}))
 
     assert "1 stale" in status, status
-    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":15}\n', output
+    assert _helper_rows(root / "data/sec/measure.jsonl") == [{"a": 15}], output
     lock = (root / ".pivot/stages/sec/measure.lock").read_text()
     assert "first-secret" not in lock and "second-secret-x" not in lock, lock
     key_file = root / ".pivot/secret.key"
@@ -1839,7 +1842,7 @@ def test_value_read_through_a_class_at_import_reruns_stage(
         },
     )
     _helper_ok(_helper_pivot(root, "repro", env={variable: "2"}))
-    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/cls/scale.jsonl") == [{"a": 2}]
     cached = _helper_ok(_helper_pivot(root, "status", env={variable: "2"}))
 
     status = _helper_ok(_helper_pivot(root, "status", env={variable: "7"}))
@@ -1847,7 +1850,7 @@ def test_value_read_through_a_class_at_import_reruns_stage(
 
     assert "1 cached, 0 stale" in cached, cached
     assert "1 stale" in status, status
-    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":7}\n', output
+    assert _helper_rows(root / "data/cls/scale.jsonl") == [{"a": 7}], output
 
 
 def test_non_scalar_class_attribute_is_an_error(tmp_path: pathlib.Path) -> None:
