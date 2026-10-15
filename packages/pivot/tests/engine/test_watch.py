@@ -127,6 +127,39 @@ def test_affected_output_path_does_not_resolve_to_an_input(
     assert coord.get_affected_stages([output_path]) == ["consume_output"]
 
 
+def test_physical_output_event_uses_symlinked_output_identity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A physical output event retains its producer and does not route through raw aliases."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    linked_dir = tmp_path / "linked"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    output_path = linked_dir / "out.txt"
+    physical_output = real_dir / "out.txt"
+    physical_output.write_text("output")
+    raw_alias = tmp_path / "raw-alias.txt"
+    raw_alias.symlink_to(physical_output)
+    graph, artifact_paths = _helper_build_graph(
+        {
+            "source": {"outs": [str(output_path)]},
+            "consume_output": {"deps": [str(output_path)]},
+            "consume_input": {"deps": [str(raw_alias)]},
+        }
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+
+    assert coord.get_producer(physical_output) == "source"
+    assert (
+        coord.should_filter_path(
+            physical_output,
+            get_stage_state=_helper_state_map(StageExecutionState.RUNNING).__getitem__,
+        )
+        is True
+    )
+    assert coord.get_affected_stages([physical_output]) == ["consume_output"]
+
+
 # =============================================================================
 # Path Filtering
 # =============================================================================

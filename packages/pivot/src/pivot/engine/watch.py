@@ -84,6 +84,7 @@ class WatchCoordinator:
 
     _graph: nx.DiGraph[str]
     _artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity]
+    _resolved_output_paths: dict[tuple[pathlib.Path, str], list[pivot_types.ArtifactIdentity]]
 
     def __init__(
         self,
@@ -92,6 +93,16 @@ class WatchCoordinator:
     ) -> None:
         self._graph = graph
         self._artifact_paths = artifact_paths
+        self._resolved_output_paths = dict[
+            tuple[pathlib.Path, str], list[pivot_types.ArtifactIdentity]
+        ]()
+        for output_path, identity in artifact_paths.items():
+            if engine_graph.get_producer(graph, identity) is None:
+                continue
+            key = (output_path.parent.resolve(), output_path.name)
+            self._resolved_output_paths.setdefault(
+                key, list[pivot_types.ArtifactIdentity]()
+            ).append(identity)
 
     @property
     def graph(self) -> nx.DiGraph[str]:
@@ -104,6 +115,9 @@ class WatchCoordinator:
 
     def resolve_identity(self, path: pathlib.Path) -> pivot_types.ArtifactIdentity | None:
         """Resolve a filesystem event path to the matching artifact identity."""
+        outputs = self._matching_resolved_output_identities(path)
+        if outputs:
+            return outputs[0]
         current = project.normalize_path(path)
         while True:
             identity = self._artifact_paths.get(current)
@@ -140,6 +154,12 @@ class WatchCoordinator:
                 identities.append(identity)
         return identities
 
+    def _matching_resolved_output_identities(
+        self, path: pathlib.Path
+    ) -> list[pivot_types.ArtifactIdentity]:
+        """Return output identities by resolved parent directory and logical leaf name."""
+        return self._resolved_output_paths.get((path.parent.resolve(), path.name), [])
+
     def should_filter_path(
         self,
         path: pathlib.Path,
@@ -160,13 +180,17 @@ class WatchCoordinator:
         """Get all stages affected by the changed paths, including downstream."""
         affected = set[str]()
         for path in paths:
-            logical_identities = set(self._matching_identities(path))
-            identities = logical_identities.copy()
-            if all(
-                engine_graph.get_producer(self._graph, identity) is None
-                for identity in logical_identities
-            ):
-                identities.update(self._matching_resolved_input_identities(path))
+            output_identities = set(self._matching_resolved_output_identities(path))
+            if output_identities:
+                identities = output_identities
+            else:
+                logical_identities = set(self._matching_identities(path))
+                identities = logical_identities.copy()
+                if all(
+                    engine_graph.get_producer(self._graph, identity) is None
+                    for identity in logical_identities
+                ):
+                    identities.update(self._matching_resolved_input_identities(path))
             for identity in identities:
                 consumers = engine_graph.get_consumers(self._graph, identity)
                 affected.update(consumers)
