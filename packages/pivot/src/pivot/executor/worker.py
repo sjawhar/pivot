@@ -620,7 +620,8 @@ def output_file_hash_entries(
 
     Stats each file (each manifest entry, for a directory) and pairs it with its known hash;
     nothing is read. Call it once the output has its final inode: a hardlink checkout
-    replaces the file the stage wrote.
+    replaces the file the stage wrote. An output whose file-hash StateDB key exceeds LMDB's
+    limit is omitted: this cache only avoids a later hash and must not fail the stage.
     """
     if is_dir_hash(output_hash):
         files = [(path / entry["relpath"], entry["hash"]) for entry in output_hash["manifest"]]
@@ -628,6 +629,9 @@ def output_file_hash_entries(
         files = [(path, output_hash["hash"])]
     entries = list[tuple[str, int, int, int, str]]()
     for file_path, file_hash in files:
+        if not state.file_hash_key_fits(file_path):
+            logger.debug("Skipping oversized output file-hash cache entry: %s", file_path)
+            continue
         fs_stat = file_path.stat()
         entries.append(
             (str(file_path), fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
