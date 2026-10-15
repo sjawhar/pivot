@@ -197,6 +197,36 @@ def test_file_checkout_removes_staging_file_left_by_killed_checkout(
     assert target.read_text() == "cached content\n"
 
 
+def test_file_checkout_computes_restore_token_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkout reuses the token from its held restore lock."""
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("cached content\n")
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    calls = list[pathlib.Path]()
+    original_token = cache._restore_target_token
+
+    def _counted_token(path: pathlib.Path) -> str:
+        calls.append(path)
+        return original_token(path)
+
+    monkeypatch.setattr(cache, "_restore_target_token", _counted_token)
+
+    assert checkout_mod._restore_path_sync(
+        target,
+        output_hash,
+        cache_dir,
+        [cache.CheckoutMode.COPY],
+        checkout_mod.CheckoutBehavior.FORCE,
+        state_dir,
+    ) == ("restored", "out.txt")
+    assert calls == [target]
+
+
 @pytest.mark.parametrize(
     "behavior",
     [checkout_mod.CheckoutBehavior.ERROR, checkout_mod.CheckoutBehavior.FORCE],

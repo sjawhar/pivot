@@ -100,9 +100,9 @@ def _restore_path_sync(
             "already exists" without --force). Cache misses return ("missing", name)
             instead of raising.
     """
-    with cache.restore_lock(path, state_dir):
+    with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
-            path, output_hash, cache_dir, checkout_modes, behavior, state_dir
+            path, output_hash, cache_dir, checkout_modes, behavior, state_dir, lock_token
         )
 
 
@@ -113,6 +113,7 @@ def _restore_path_locked(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None,
+    lock_token: str | None,
 ) -> tuple[RestoreResult, str]:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
     if path.exists():
@@ -142,7 +143,7 @@ def _restore_path_locked(
         cache_dir,
         checkout_modes=checkout_modes,
         state_dir=state_dir,
-        lock_held=True,
+        lock_token=lock_token,
     )
     if not success:
         return ("missing", path.name)
