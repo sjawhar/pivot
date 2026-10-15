@@ -4,7 +4,7 @@ import enum
 import os
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 import click
@@ -94,7 +94,7 @@ def _format_config_validation_error(error: pydantic.ValidationError) -> str:
     location = ".".join(str(part) for part in detail["loc"])
     value = detail["input"]
     if location == "remotes" and isinstance(value, dict) and value:
-        name, remote = next(iter(value.items()))
+        name, remote = next(iter(cast("dict[str, str]", value).items()))
         return (
             f"Invalid config remotes.{name}: {remote!r}; "
             + "expected an S3 URL (s3://bucket/prefix)"

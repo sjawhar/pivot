@@ -597,7 +597,9 @@ async def test_child_input_edit_reruns_directory_and_file_consumers(
             file_done = await recorder.wait_for(
                 _helper_completes("nested/file"), start=first_idle, timeout=10
             )
-            await recorder.wait_for(_helper_is_idle, start=max(directory_done, file_done), timeout=10)
+            await recorder.wait_for(
+                _helper_is_idle, start=max(directory_done, file_done), timeout=10
+            )
             assert (directory_output.read_text(), file_output.read_text()) == ("two", "two")
             tg.cancel_scope.cancel()
 
