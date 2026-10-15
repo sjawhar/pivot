@@ -158,6 +158,22 @@ def test_artifact_handle_input_no_suboutputs() -> None:
         _ = handle.anything
 
 
+def test_handle_output_lookup_keeps_each_dunders_exception(tmp_path: pathlib.Path) -> None:
+    """Attribute access raises AttributeError and item access KeyError, naming the outputs."""
+    with Pipeline("lookup", root=tmp_path) as pipeline:
+        built = _helper_build_tagged()
+        source = pipeline.input("raw.txt", t=str)
+
+    with pytest.raises(AttributeError, match=r"has no output 'missing'\. Available: \["):
+        _ = built.missing
+    with pytest.raises(KeyError, match=r"has no output 'missing'\. Available: \["):
+        _ = built["missing"]  # pyright: ignore[reportGeneralTypeIssues] - the error under test
+    with pytest.raises(AttributeError, match="has no sub-outputs"):
+        _ = source.missing
+    with pytest.raises(KeyError, match="has no sub-outputs"):
+        _ = source["missing"]  # pyright: ignore[reportArgumentType] - the error under test
+
+
 # --- @stage decorator ---
 
 
@@ -174,11 +190,9 @@ def test_stage_preserves_metadata() -> None:
     def my_func(x: pd.DataFrame) -> pd.DataFrame:
         return x
 
-    stage_func = typing.cast("typing.Any", my_func)
-
     assert my_func.__name__ == "my_func"
-    assert stage_func._is_stage is True
-    assert stage_func._original_func is not my_func
+    assert inspect.unwrap(my_func) is not my_func, "the wrapper wraps the original function"
+    assert inspect.unwrap(my_func).__name__ == "my_func"
 
 
 # --- Return type analysis ---
@@ -596,11 +610,11 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     stage_b = legacy.get_stage("compose_build/_helper_build_stage_b")
 
     assert stage_a["func"] is inspect.unwrap(_helper_build_stage_a)
-    assert not hasattr(stage_a["func"], "_is_stage")
+    assert not hasattr(stage_a["func"], "__wrapped__"), "stage info holds the original function"
     assert stage_a["name"] == "compose_build/_helper_build_stage_a"
     assert stage_a["deps"]["raw"].identity == types.ArtifactIdentity(producer="raw", key=None)
     assert isinstance(stage_a["deps"]["raw"].format, loaders.YAML)
-    assert stage_a["deps"]["raw"].tag is types.ArtifactTag.DATA
+    assert stage_a["deps"]["raw"].tag is types.ArtifactTag.INPUT
     assert stage_a["params"] is not None
     assert isinstance(stage_a["params"], stage_def.StageParams)
     assert stage_a["params_arg_name"] == "params"
@@ -703,6 +717,25 @@ def test_pipeline_build_artifact_refs_and_tags(tmp_path: pathlib.Path) -> None:
     assert tags["data"] is types.ArtifactTag.DATA
     assert tags["metrics"] is types.ArtifactTag.METRIC
     assert tags["chart"] is types.ArtifactTag.PLOT
+
+
+@stage
+def _helper_read_tagged(metrics: dict, chart: pd.DataFrame) -> dict:
+    return {"rows": metrics["rows"], "chart_rows": len(chart)}
+
+
+def test_consumer_dep_carries_the_producer_out_tag(tmp_path: pathlib.Path) -> None:
+    """One output carries one tag, whether read as the producer's out or a consumer's dep."""
+    with Pipeline("compose_tagged", root=tmp_path) as pipeline:
+        built = _helper_build_tagged()
+        _helper_read_tagged(built.metrics, built["chart"])
+
+    outs = pipeline.get_stage("compose_tagged/_helper_build_tagged")["outs"]
+    deps = pipeline.get_stage("compose_tagged/_helper_read_tagged")["deps"]
+    out_tags = {out.identity.key: out.tag for out in outs}
+
+    assert deps["metrics"].tag is out_tags["metrics"] is types.ArtifactTag.METRIC
+    assert deps["chart"].tag is out_tags["chart"] is types.ArtifactTag.PLOT
 
 
 def test_validate_artifact_identity_rejects_path_separators() -> None:
@@ -1961,12 +1994,12 @@ def _helper_execute_compose_stage(
         project_root=str(tmp_path),
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
+        checkout_modes=[cache.CheckoutMode.COPY],
     )
     stage_info = executor_core.prepare_worker_info(
         pipeline.get_stage(stage_name),
         pipeline,
         overrides={},
-        checkout_modes=[cache.CheckoutMode.COPY],
         run_id="test_run",
         force=False,
         no_commit=False,

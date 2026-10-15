@@ -85,7 +85,7 @@ def _stage_info(
     return worker.WorkerStageInfo(
         func=func,
         fingerprint={"self:consume": "0123456789abcdef"},
-        deps={"data": _ref("raw")} if deps is None else deps,
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)} if deps is None else deps,
         outs=[_ref(_STAGE)] if outs is None else outs,
         store_spec=cast(
             "store_mod.StoreSpec",
@@ -97,6 +97,7 @@ def _stage_info(
                     "project_root": str(project),
                     "pipeline_name": "skip",
                     "input_bindings": {"raw": "raw.txt"} if bindings is None else bindings,
+                    "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
                 },
             ),
         ),
@@ -104,7 +105,6 @@ def _stage_info(
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[],
         run_id="test_run",
         force=force,
         no_commit=no_commit,
@@ -451,7 +451,10 @@ def test_unchanged_stage_with_unrestorable_output_reruns(
 def test_missing_and_unreadable_dependencies_are_named(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    deps = {"a": _ref("raw"), "b": _ref("other")}
+    deps = {
+        "a": _ref("raw", tag=types.ArtifactTag.INPUT),
+        "b": _ref("other", tag=types.ArtifactTag.INPUT),
+    }
     bindings = {"raw": "raw.txt", "other": "other.txt"}
     (project / "raw.txt").unlink()
 
@@ -616,7 +619,10 @@ def test_unreadable_state_database_fails_the_stage_without_a_run_cache_key(
 def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    """Workers open StateDB read-only; the coordinator applies their file-hash entries."""
+    """Workers open StateDB read-only; the coordinator applies their file-hash entries.
+
+    Entries cover the dependency the worker hashed and the output it committed.
+    """
     raw = project.resolve() / "raw.txt"
 
     result = worker.execute_stage(
@@ -629,7 +635,8 @@ def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     assert "deferred_writes" in result
     deferred = result["deferred_writes"]
     assert "file_hash_entries" in deferred
-    assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw)]
+    output = project.resolve() / "data" / "skip" / "consume.txt"
+    assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw), str(output)]
 
 
 # =============================================================================

@@ -39,7 +39,7 @@ def _input_ref(name: str) -> ArtifactRef:
         identity=ArtifactIdentity(name, None),
         format=loaders.Text(),
         python_type=str,
-        tag=ArtifactTag.DATA,
+        tag=ArtifactTag.INPUT,
     )
 
 
@@ -87,15 +87,15 @@ def _make_stage_info(
             "input_bindings": {
                 ref.identity.producer: ref.identity.producer for ref in deps.values()
             },
+            "checkout_modes": [
+                cache.CheckoutMode.HARDLINK,
+                cache.CheckoutMode.SYMLINK,
+                cache.CheckoutMode.COPY,
+            ],
         },
         "params": None,
         "variant": None,
         "overrides": {},
-        "checkout_modes": [
-            cache.CheckoutMode.HARDLINK,
-            cache.CheckoutMode.SYMLINK,
-            cache.CheckoutMode.COPY,
-        ],
         "run_id": run_id,
         "force": False,
         "no_commit": False,
@@ -346,6 +346,7 @@ def test_explain_shows_cached_after_run_cache_skip(
             input_bindings={"input.txt": "input.txt"},
             cache_dir=worker_env,
         ),
+        lock_data=lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot")).read(),
         force=False,
     )
 
@@ -414,6 +415,7 @@ def test_explain_uses_generation_tracking_when_state_db_exists(
         overrides=None,
         state_dir=state_dir,
         store=workspace,
+        lock_data=lock.StageLock("consumer", lock.get_stages_dir(state_dir)).read(),
         producer_hashes=producer_lock["output_hashes"],
     )
 
@@ -449,6 +451,7 @@ def test_explain_does_not_create_state_db(tmp_path: pathlib.Path) -> None:
             input_bindings={},
             cache_dir=state_dir / "cache",
         ),
+        lock_data=lock.StageLock("test_stage", lock.get_stages_dir(state_dir)).read(),
     )
 
     assert explanation["will_run"] is False

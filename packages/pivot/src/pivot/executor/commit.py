@@ -15,18 +15,9 @@ from pivot.executor import worker
 from pivot.storage import lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
-from pivot.types import ArtifactTag, DeferredWrites, DepEntry, HashInfo, LockData
+from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
 
 logger = logging.getLogger(__name__)
-
-
-def _split_identity(identity: str) -> tuple[str, str | None]:
-    if ":" in identity:
-        producer, key = identity.split(":", 1)
-        if key == "":
-            return producer, None
-        return producer, key
-    return identity, None
 
 
 def commit_stages(
@@ -69,6 +60,7 @@ def commit_stages(
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
         cache_dir=config.get_cache_dir() / "files",
+        checkout_modes=config.get_checkout_mode_order(),
     )
 
     committed = list[str]()
@@ -122,17 +114,12 @@ def commit_stages(
                 types.identity_from_key(key): info for key, info in dep_hashes.items()
             }
             stage_outs = stage_info["outs"]
-            out_specs = [
-                (types.identity_key(out.identity), out.tag is not ArtifactTag.METRIC)
-                for out in stage_outs
-            ]
-            deps_list = [
-                DepEntry(producer=producer, key=key, hash=info["hash"])
-                for identity, info in dep_hashes.items()
-                for producer, key in [_split_identity(identity)]
-            ]
-            input_hash = run_history.compute_input_hash(
-                fingerprint, current_params, deps_list, out_specs
+            input_hash = run_history.stage_input_hash(
+                fingerprint,
+                current_params,
+                stage_info["deps"].values(),
+                dep_hashes_by_identity,
+                stage_outs,
             )
 
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
@@ -156,20 +143,17 @@ def commit_stages(
             # 6. Hash and cache outputs
             output_hashes_by_key = dict[str, HashInfo]()
             output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
+            file_hash_entries = list[tuple[str, int, int, int, str]]()
             outputs_missing = False
 
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)
-                identity = types.identity_from_key(identity_key)
                 try:
-                    hash_info = store.hash_artifact(out)
-                    store.backup_to_cache(
-                        out,
-                        store.resolve_display_path(out),
-                        state_dir=default_state_dir,
-                    )
+                    out_path = store.resolve_display_path(out)
+                    hash_info = store.commit(out, out_path, state_dir=default_state_dir)
+                    file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
                     output_hashes_by_key[identity_key] = hash_info
-                    output_hashes_by_identity[identity] = hash_info
+                    output_hashes_by_identity[out.identity] = hash_info
                 except FileNotFoundError:
                     logger.error(
                         "Stage '%s': output missing: %s — skipping", stage_name, identity_key
@@ -227,6 +211,8 @@ def commit_stages(
                     run_id=run_id,
                     output_hashes=output_entries,
                 )
+            if file_hash_entries:
+                deferred["file_hash_entries"] = file_hash_entries
 
             stage_db.apply_deferred_writes(stage_name, out_paths, deferred)
 

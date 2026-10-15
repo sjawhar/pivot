@@ -40,8 +40,6 @@ Example::
     )
 """
 
-# pyright: reportMissingImports=false, reportMissingModuleSource=false, reportImplicitRelativeImport=false
-
 from __future__ import annotations
 
 import asyncio
@@ -124,11 +122,8 @@ def _get_explanations_in_parallel(
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
-    producer_hashes = explain.producer_output_hashes(
-        execution_order,
-        all_stages,
-        default_state_dir,
-    )
+    locks = explain.read_locks(execution_order, all_stages, default_state_dir)
+    producer_hashes = explain.producer_output_hashes(locks.values())
     explanations_by_name = dict[str, StageExplanation]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -147,6 +142,7 @@ def _get_explanations_in_parallel(
                 overrides,
                 stage_state_dir,
                 store,
+                lock_data=locks[stage_name],
                 force=force,
                 allow_missing=allow_missing,
                 tracked_files=tracked_files,

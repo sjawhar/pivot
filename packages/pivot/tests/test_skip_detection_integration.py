@@ -51,7 +51,7 @@ def _input_ref(name: str) -> ArtifactRef:
         identity=ArtifactIdentity(name, None),
         format=loaders.Text(),
         python_type=str,
-        tag=ArtifactTag.DATA,
+        tag=ArtifactTag.INPUT,
     )
 
 
@@ -96,12 +96,12 @@ def _make_stage_info(
             "input_bindings": {
                 ref.identity.producer: ref.identity.producer for ref in deps.values()
             },
+            "checkout_modes": checkout_modes
+            or [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
         },
         "params": params,
         "variant": None,
         "overrides": {},
-        "checkout_modes": checkout_modes
-        or [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
         "run_id": run_id,
         "force": force,
         "no_commit": no_commit,
@@ -537,6 +537,8 @@ def test_generation_skip_rejects_modified_producer_output(
         input_bindings={},
     )
     producer_path = workspace.resolve_display_path(producer_out)
+    # The output is a read-only hardlink into the cache; an edit replaces the file.
+    producer_path.unlink()
     producer_path.write_text("TAMPERED")
 
     rerun = executor.execute_stage("consumer", consumer_info, worker_env, output_queue)
@@ -575,6 +577,8 @@ def test_hash_skip_restores_modified_output(
         input_bindings={},
     )
     output_path = workspace.resolve_display_path(output_ref)
+    # The output is a read-only hardlink into the cache; an edit replaces the file.
+    output_path.unlink()
     output_path.write_text("TAMPERED")
 
     restored = executor.execute_stage("producer", stage_info, worker_env, output_queue)

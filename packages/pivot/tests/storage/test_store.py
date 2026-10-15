@@ -9,7 +9,7 @@ from typing import cast
 
 import pytest
 
-from pivot import loaders, types
+from pivot import config, loaders, types
 from pivot.storage import store
 
 
@@ -52,7 +52,7 @@ def test_cache_store_prepare_output_commit_pattern(tmp_path: pathlib.Path) -> No
     output_path.write_text("content")
 
     output_hash = cache_store.commit(ref, output_path)
-    assert len(output_hash) == 16
+    assert len(output_hash["hash"]) == 16
     assert cache_store.checkout(ref).read_text() == "content"
 
 
@@ -115,11 +115,11 @@ def test_workspace_store_prepare_output_commit_pattern(tmp_path: pathlib.Path) -
     output_path.write_text("content")
 
     output_hash = workspace_store.commit(ref, output_path)
-    assert len(output_hash) == 16
+    assert len(output_hash["hash"]) == 16
     assert workspace_store.checkout(ref).read_text() == "content"
 
 
-def test_workspace_store_backup_and_restore(tmp_path: pathlib.Path) -> None:
+def test_workspace_store_commit_and_restore(tmp_path: pathlib.Path) -> None:
     cache_dir = tmp_path / "cache" / "files"
     workspace_store = store.WorkspaceStore(
         project_root=tmp_path,
@@ -131,9 +131,7 @@ def test_workspace_store_backup_and_restore(tmp_path: pathlib.Path) -> None:
     output_path = workspace_store.prepare_output(ref)
     output_path.write_text("hello cache")
 
-    workspace_store.commit(ref, output_path)
-    output_hash = workspace_store.hash_artifact(ref)
-    workspace_store.backup_to_cache(ref, output_path)
+    output_hash = workspace_store.commit(ref, output_path)
 
     output_path.unlink()
     assert not output_path.exists()
@@ -222,8 +220,8 @@ def test_workspace_store_input_bindings(tmp_path: pathlib.Path) -> None:
         pipeline_name="pipe",
         input_bindings={"custom": "data/external/custom.csv"},
     )
-    custom_ref = _helper_ref("custom", None, types.ArtifactTag.DATA, loaders.Text())
-    default_ref = _helper_ref("rawdata", None, types.ArtifactTag.DATA, loaders.Text())
+    custom_ref = _helper_ref("custom", None, types.ArtifactTag.INPUT, loaders.Text())
+    default_ref = _helper_ref("rawdata", None, types.ArtifactTag.INPUT, loaders.Text())
 
     assert workspace_store.checkout(custom_ref) == tmp_path / "data/external/custom.csv"
     assert workspace_store.checkout(default_ref) == tmp_path / "data/raw/rawdata"
@@ -235,8 +233,8 @@ def test_workspace_store_collision_detection(tmp_path: pathlib.Path) -> None:
         pipeline_name="pipe",
         input_bindings={"foo": "data/raw/bar"},
     )
-    foo_ref = _helper_ref("foo", None, types.ArtifactTag.DATA, loaders.Text())
-    bar_ref = _helper_ref("bar", None, types.ArtifactTag.DATA, loaders.Text())
+    foo_ref = _helper_ref("foo", None, types.ArtifactTag.INPUT, loaders.Text())
+    bar_ref = _helper_ref("bar", None, types.ArtifactTag.INPUT, loaders.Text())
 
     _ = workspace_store.checkout(foo_ref)
     with pytest.raises(ValueError, match="Collision"):
@@ -256,7 +254,7 @@ def test_workspace_store_resolves_external_input(tmp_path: pathlib.Path) -> None
         identity=types.ArtifactIdentity("ext.jsonl", None),
         format=loaders.DataFrameJSONL(),
         python_type=list,
-        tag=types.ArtifactTag.DATA,
+        tag=types.ArtifactTag.INPUT,
     )
 
     assert workspace_store.exists(ref)
@@ -269,6 +267,7 @@ def test_store_spec_round_trip(tmp_path: pathlib.Path) -> None:
         "project_root": str(tmp_path),
         "pipeline_name": "pipe",
         "input_bindings": {"raw": "data/raw/raw"},
+        "checkout_modes": [config.CheckoutMode.COPY],
     }
 
     round_trip = pickle.loads(pickle.dumps(spec))
@@ -328,6 +327,7 @@ def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:
         "project_root": str(tmp_path),
         "pipeline_name": "pipe",
         "input_bindings": {},
+        "checkout_modes": [config.CheckoutMode.SYMLINK],
     }
 
     round_trip = pickle.loads(pickle.dumps(spec))

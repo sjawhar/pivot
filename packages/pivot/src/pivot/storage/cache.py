@@ -501,11 +501,19 @@ def _checkout_with_fallback(
     *,
     executable: bool = False,
     staging_path: pathlib.Path | None = None,
+    keep_existing_copy: bool = False,
 ) -> None:
-    """Try each link mode in order until one succeeds."""
+    """Try each link mode in order until one succeeds.
+
+    With ``keep_existing_copy``, reaching COPY while ``path`` still exists leaves it in place:
+    the caller guarantees it already holds the cached bytes. A failed link attempt clears
+    ``path`` first, so COPY then copies from the cache as usual.
+    """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
     for i, mode in enumerate(checkout_modes):
+        if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
+            return
         try:
             _checkout_from_cache(
                 path, cache_path, mode, executable=executable, staging_path=staging_path
@@ -576,15 +584,38 @@ def _save_file_to_cache(
                 return FileHash(hash=existing_hash)
 
     file_hash, _ = hash_file(path, state_db)
-    cache_path = get_cache_path(cache_dir, file_hash)
+    _store_file(
+        path,
+        file_hash,
+        cache_dir,
+        checkout_modes,
+        keep_existing_copy=False,
+        state_dir=state_dir,
+    )
+    return FileHash(hash=file_hash)
 
+
+def _store_file(
+    path: pathlib.Path,
+    file_hash: str,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+    *,
+    keep_existing_copy: bool,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    cache_path = get_cache_path(cache_dir, file_hash)
     copy_to_cache(path, cache_path)
     with restore_lock(path, state_dir) as lock_token:
         staging_path = _restore_staging_path(path, lock_token)
         _clear_path(staging_path)
-        _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
-
-    return FileHash(hash=file_hash)
+        _checkout_with_fallback(
+            path,
+            cache_path,
+            checkout_modes,
+            staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
+        )
 
 
 def _save_directory_to_cache(
@@ -606,7 +637,28 @@ def _save_directory_to_cache(
                 return DirHash(hash=existing_hash, manifest=manifest)
 
     tree_hash, manifest = hash_directory(path, state_db)
+    output_hash = DirHash(hash=tree_hash, manifest=manifest)
+    _store_directory(
+        path,
+        output_hash,
+        cache_dir,
+        checkout_modes,
+        keep_existing_copy=False,
+        state_dir=state_dir,
+    )
+    return output_hash
 
+
+def _store_directory(
+    path: pathlib.Path,
+    output_hash: DirHash,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+    *,
+    keep_existing_copy: bool,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    manifest = output_hash["manifest"]
     # Cache individual files first
     for entry in manifest:
         file_path = path / entry["relpath"]
@@ -616,7 +668,7 @@ def _save_directory_to_cache(
     with restore_lock(path, state_dir):
         if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
             # SYMLINK mode: cache entire directory, symlink to it
-            cache_dir_path = get_cache_path(cache_dir, tree_hash)
+            cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
             if not cache_dir_path.exists():
                 cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(path, cache_dir_path)
@@ -641,9 +693,44 @@ def _save_directory_to_cache(
                     checkout_modes,
                     executable=entry["isexec"],
                     staging_path=staging_path,
+                    keep_existing_copy=keep_existing_copy,
                 )
 
-    return DirHash(hash=tree_hash, manifest=manifest)
+
+def store_hashed_output(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode] | None = None,
+    *,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    """Put an output whose hash is already known into the cache, then link it per mode.
+
+    ``output_hash`` must be the hash of ``path``'s current contents; nothing is hashed again.
+    Each file is copied into the cache once and the workspace path is linked to the cache entry
+    with the first checkout mode that works. Reaching COPY leaves the workspace file as it is,
+    since it already holds the cached bytes.
+    """
+    effective_modes = _resolve_checkout_modes(None, checkout_modes)
+    if is_dir_hash(output_hash):
+        _store_directory(
+            path,
+            output_hash,
+            cache_dir,
+            effective_modes,
+            keep_existing_copy=True,
+            state_dir=state_dir,
+        )
+    else:
+        _store_file(
+            path,
+            output_hash["hash"],
+            cache_dir,
+            effective_modes,
+            keep_existing_copy=True,
+            state_dir=state_dir,
+        )
 
 
 def restore_from_cache(

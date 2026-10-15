@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false
 """Bipartite artifact-stage graph built on NetworkX."""
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "artifact_node",
-    "parse_artifact_identity",
     "stage_node",
     "build_graph",
     "validate_dependency_sources",
@@ -80,13 +78,6 @@ def parse_node(node: str) -> tuple[NodeType, str]:
     """
     prefix, value = node.split(":", 1)
     return NodeType(prefix), value
-
-
-def parse_artifact_identity(value: str) -> pivot_types.ArtifactIdentity:
-    if ":" not in value:
-        return pivot_types.ArtifactIdentity(value, None)
-    producer, key = value.split(":", 1)
-    return pivot_types.ArtifactIdentity(producer, key)
 
 
 def _path_identity(path: str) -> pivot_types.ArtifactIdentity:
@@ -311,12 +302,12 @@ def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInf
 
     # Get current deps and outs from graph
     current_deps = {
-        parse_artifact_identity(parse_node(n)[1])
+        pivot_types.identity_from_key(parse_node(n)[1])
         for n in g.predecessors(stage)
         if g.nodes[n]["type"] == NodeType.ARTIFACT
     }
     current_outs = {
-        parse_artifact_identity(parse_node(n)[1])
+        pivot_types.identity_from_key(parse_node(n)[1])
         for n in g.successors(stage)
         if g.nodes[n]["type"] == NodeType.ARTIFACT
     }

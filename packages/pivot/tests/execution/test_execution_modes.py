@@ -64,15 +64,15 @@ def _make_stage_info(
             "project_root": str(tmp_path),
             "pipeline_name": "test",
             "input_bindings": input_bindings or {},
+            "checkout_modes": [
+                cache.CheckoutMode.HARDLINK,
+                cache.CheckoutMode.SYMLINK,
+                cache.CheckoutMode.COPY,
+            ],
         },
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[
-            cache.CheckoutMode.HARDLINK,
-            cache.CheckoutMode.SYMLINK,
-            cache.CheckoutMode.COPY,
-        ],
         run_id=run_id,
         force=force,
         no_commit=no_commit,
@@ -101,7 +101,7 @@ def test_no_commit_produces_outputs_without_production_lock(
         return "output data"
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
@@ -142,7 +142,7 @@ def test_no_commit_does_not_write_to_cache(
         return "output data"
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
@@ -187,7 +187,7 @@ def test_normal_run_after_no_commit_reruns_and_commits(
         return "output data"
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
@@ -249,7 +249,7 @@ def test_run_cache_restores_directory_output(
         return {"file1.txt": "content1", "file2.txt": "content2"}
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage",
@@ -312,7 +312,7 @@ def test_run_cache_reruns_when_noncached_output_missing(
         return {"output": "output data", "metrics": {"accuracy": 0.95}}
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage", "output", tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str

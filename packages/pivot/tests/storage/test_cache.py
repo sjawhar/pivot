@@ -753,6 +753,7 @@ def test_save_directory_uses_target_tagged_staging_paths(
         *,
         executable: bool = False,
         staging_path: pathlib.Path | None = None,
+        keep_existing_copy: bool = False,
     ) -> None:
         staging_paths.append(staging_path)
         original_checkout(
@@ -761,6 +762,7 @@ def test_save_directory_uses_target_tagged_staging_paths(
             checkout_modes,
             executable=executable,
             staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
         )
 
     monkeypatch.setattr(cache, "_checkout_with_fallback", _record_staging)

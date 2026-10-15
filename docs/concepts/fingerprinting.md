@@ -15,8 +15,7 @@ logical keys to hashes:
 | `self:<name>` | The stage function's own AST |
 | `func:<module>.<qualname>` | Helper functions called by the stage |
 | `class:<module>.<qualname>` | User-defined classes referenced by the stage |
-| `mod:<module>.<attr>` | Attributes accessed on imported user modules |
-| `const:<module>.<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`) |
+| `const:<module>.<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`), read as a global or as `module.NAME`; a helper read as `module.helper` is a `func:` entry, a library function an `ext:` entry |
 | `const:<module>.<qualname>.<name>` | Scalars in a closure cell, keyed under the function that holds the cell, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | `default:<module>.<qualname>.<parameter>` | Default argument values (scalars and `StageParams`) |
 | `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); library code is not hashed |

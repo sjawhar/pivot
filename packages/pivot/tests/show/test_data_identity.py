@@ -104,8 +104,8 @@ def test_extract_output_hashes_from_lock_uses_identity_keys() -> None:
         "params": {},
         "deps": [],
         "outs": [
-            {"key": None, "hash": "deadbeef", "tag": "data"},
-            {"key": "model", "hash": "beadfeed", "tag": "data"},
+            {"key": None, "hash": "deadbeef"},
+            {"key": "model", "hash": "beadfeed"},
         ],
     }
 

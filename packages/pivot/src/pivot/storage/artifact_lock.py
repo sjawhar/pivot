@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false
 """Artifact lock request modeling for concurrent execution."""
 
 from __future__ import annotations

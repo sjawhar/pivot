@@ -1193,6 +1193,9 @@ def test_include_refuses_one_stage_reading_through_two_factory_loaders(
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert "Stage 'rep/make' is defined twice with different input formats" in output, output
+    assert "transform=make_scaler.<locals>.scaler(factor=2)" in output, output
+    assert "transform=make_scaler.<locals>.scaler(factor=5)" in output, output
+    assert " at 0x" not in output, output
 
 
 def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
@@ -1916,3 +1919,223 @@ def test_class_attribute_the_language_or_a_library_defines_is_not_refused(
 
     assert "1 ran" in first, first
     assert "0 ran, 1 cached" in second, second
+
+
+_MODULE_READ_SETTINGS = """\
+import functools
+import logging
+import os
+
+import numpy as np
+
+AGG = np.{agg}
+log = logging.getLogger("settings")
+ROUND = functools.partial(round, ndigits=1)
+
+
+class Config:
+    SCALE = int(os.environ.get("SCALE", "2"))
+"""
+
+_MODULE_READ_PIPELINE = """\
+import pandas as pd
+
+import settings
+from pivot import Pipeline, stage
+
+
+@stage
+def via_module(x: pd.DataFrame) -> pd.DataFrame:
+    settings.log.info("hi")
+    value = settings.ROUND(float(settings.AGG(x["a"]))) * settings.Config.SCALE
+    return pd.DataFrame({"a": [value]})
+
+
+with Pipeline("mod") as pipeline:
+    via_module(pipeline.input("x.csv"))
+"""
+
+
+def _helper_module_read_project(tmp_path: pathlib.Path) -> pathlib.Path:
+    return _helper_project(
+        tmp_path,
+        {
+            "settings.py": _MODULE_READ_SETTINGS.format(agg="mean"),
+            "pipeline.py": _MODULE_READ_PIPELINE,
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+
+
+def test_logger_partial_and_library_function_read_through_a_module_are_accepted(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`settings.log`, `settings.ROUND` and `settings.AGG` follow the rule their global forms do."""
+    root = _helper_module_read_project(tmp_path)
+
+    first = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    second = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+
+    assert "1 ran" in first, first
+    assert "0 ran, 1 cached" in second, second
+    assert (root / "data/mod/via_module.jsonl").read_text() == '{"a":6.0}\n'
+
+
+def test_library_function_rebound_in_a_module_reruns_stage(tmp_path: pathlib.Path) -> None:
+    """`settings.AGG = np.mean` → `np.median` is recorded by name, as `AGG` would be."""
+    root = _helper_module_read_project(tmp_path)
+    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+
+    (root / "settings.py").write_text(_MODULE_READ_SETTINGS.format(agg="median"))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+
+    assert "1 ran" in output, output
+    assert (root / "data/mod/via_module.jsonl").read_text() == '{"a":4.0}\n', output
+
+
+def test_class_attribute_read_through_a_module_at_import_reruns_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`settings.Config.SCALE` computed at import is re-read like `Config.SCALE`."""
+    pipeline = _MODULE_READ_PIPELINE.replace(
+        '    settings.log.info("hi")\n'
+        + '    value = settings.ROUND(float(settings.AGG(x["a"]))) * settings.Config.SCALE\n',
+        '    value = float(x["a"].sum()) * settings.Config.SCALE\n',
+    )
+    assert "settings.AGG" not in pipeline
+    root = _helper_project(
+        tmp_path,
+        {
+            "settings.py": _MODULE_READ_SETTINGS.format(agg="mean"),
+            "pipeline.py": pipeline,
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    cached = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "2"}))
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
+
+    assert "1 cached, 0 stale" in cached, cached
+    assert "1 stale" in status, status
+    assert (root / "data/mod/via_module.jsonl").read_text() == '{"a":63.0}\n', output
+
+
+_LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS = """\
+import enum
+import typing
+
+
+class Opts(typing.NamedTuple):
+    x: int = 1
+
+
+class Color(enum.IntEnum):
+    RED = 1
+
+
+class Config:
+    COLUMNS = ("a",)
+"""
+
+_LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE = """\
+import pandas as pd
+
+import settings
+from pivot import Pipeline, stage
+
+
+@stage
+def count(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [{read}]}})
+
+
+with Pipeline("lib") as pipeline:
+    count(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        pytest.param("len(settings.Opts._fields)", id="namedtuple-fields"),
+        pytest.param("len(settings.Color._member_names_)", id="enum-member-names"),
+        pytest.param("int(settings.Color.RED)", id="enum-member"),
+    ],
+)
+def test_class_attribute_through_a_module_follows_the_class_rule(
+    tmp_path: pathlib.Path, read: str
+) -> None:
+    """`settings.Opts._fields` is left to the class AST hash, as `Opts._fields` is."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "settings.py": _LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS,
+            "pipeline.py": _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE.format(read=read),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in first, first
+    assert "0 ran, 1 cached" in second, second
+
+
+def test_non_scalar_class_attribute_through_a_module_is_an_error(tmp_path: pathlib.Path) -> None:
+    """`settings.Config.COLUMNS` is refused, as `Config.COLUMNS` is."""
+    pipeline = _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE.format(read="len(settings.Config.COLUMNS)")
+    root = _helper_project(
+        tmp_path,
+        {
+            "settings.py": _LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS,
+            "pipeline.py": pipeline,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "captures non-scalar variable 'settings.Config.COLUMNS' (type: tuple)" in output, output
+
+
+_SUBMODULE_PIPELINE = """\
+import pandas as pd
+
+import pkg.sub
+from pivot import Pipeline, stage
+
+
+@stage
+def scale(x: pd.DataFrame) -> pd.DataFrame:
+    return pkg.sub.helper(x) * pkg.sub.SCALE
+
+
+with Pipeline("sub") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+
+def test_submodule_read_through_its_package_is_tracked(tmp_path: pathlib.Path) -> None:
+    """`pkg.sub.helper` and `pkg.sub.SCALE` are walked like `sub.helper` and `sub.SCALE`."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pkg/__init__.py": "",
+            "pkg/sub.py": "SCALE = 2\n\n\ndef helper(x):\n    return x\n",
+            "pipeline.py": _SUBMODULE_PIPELINE,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/sub/scale.jsonl").read_text() == '{"a":2}\n'
+
+    (root / "pkg/sub.py").write_text("SCALE = 50\n\n\ndef helper(x):\n    return x + 1\n")
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in output, output
+    assert (root / "data/sub/scale.jsonl").read_text() == '{"a":100}\n', output

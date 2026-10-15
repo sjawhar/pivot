@@ -87,7 +87,7 @@ class _GenerationCase:
         self.state_db = state_db
         self.raw = project / "raw.txt"
         self.raw.write_text("input-v1")
-        self.dep = _ref("raw")
+        self.dep = _ref("raw", tag=types.ArtifactTag.INPUT)
         self.out = _ref(_STAGE)
         dep_hash, _ = cache.hash_file(self.raw, state_db)
         generation = state_db.increment_generation("raw")
@@ -235,12 +235,12 @@ def _restore(
 def _cached_output(
     project: pathlib.Path, store: store_mod.WorkspaceStore, ref: types.ArtifactRef, content: str
 ) -> tuple[pathlib.Path, FileHash]:
-    """Write an output, back it up to the cache, and return its path and hash."""
+    """Write an output, commit it to the cache, and return its path and hash."""
     path = store.prepare_output(ref)
     path.write_text(content)
-    store.backup_to_cache(ref, path)
-    file_hash, _ = cache.hash_file(path, None)
-    return path, FileHash(hash=file_hash)
+    output_hash = store.commit(ref, path)
+    assert not types.is_dir_hash(output_hash)
+    return path, output_hash
 
 
 def test_restore_reports_matching_outputs_available_without_writing(
@@ -432,7 +432,7 @@ def test_hash_dependencies_reports_unreadable_dependency(
     raw.chmod(0)
     try:
         hashes, missing, unreadable, entries = worker.hash_dependencies(
-            {"data": _ref("raw")}, store, state_db
+            {"data": _ref("raw", tag=types.ArtifactTag.INPUT)}, store, state_db
         )
     finally:
         raw.chmod(0o644)
@@ -449,7 +449,12 @@ def test_hash_dependencies_records_stat_write_backs_for_files_only(
     (project / "tree" / "a.txt").write_text("a")
 
     hashes, missing, unreadable, entries = worker.hash_dependencies(
-        {"data": _ref("raw"), "tree": _ref("tree")}, store, state_db
+        {
+            "data": _ref("raw", tag=types.ArtifactTag.INPUT),
+            "tree": _ref("tree", tag=types.ArtifactTag.INPUT),
+        },
+        store,
+        state_db,
     )
 
     assert (missing, unreadable) == ([], [])
@@ -488,6 +493,7 @@ def _stage_info(
                     "project_root": str(project),
                     "pipeline_name": "skip",
                     "input_bindings": {"raw": "raw.txt"},
+                    "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
                 },
             ),
         ),
@@ -495,7 +501,6 @@ def _stage_info(
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[],
         run_id="test_run",
         force=False,
         no_commit=no_commit,
@@ -522,7 +527,7 @@ def test_run_cache_key_marks_metric_outputs_uncacheable(
         _upper,
         project,
         worker_env,
-        deps={"data": _ref("raw")},
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)},
         outs=[data_out, metric_out],
         no_commit=True,
     )
@@ -547,7 +552,7 @@ def test_completed_run_asks_coordinator_to_bump_output_generations(
         _upper,
         project,
         worker_env,
-        deps={"data": _ref("raw")},
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)},
         outs=[_ref(_STAGE)],
         no_commit=False,
     )

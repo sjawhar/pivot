@@ -61,7 +61,7 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify helper is captured with a hash (not "callable")
-    helper_key = "mod:test_mod_helpers_v1.process"
+    helper_key = "func:test_mod_helpers_v1.process"
     assert helper_key in fp1, f"Should capture helper.process, got: {fp1.keys()}"
     hash1 = fp1[helper_key]
     assert len(hash1) == 16, f"Should be 16-char hash, got: {hash1}"
@@ -139,7 +139,7 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify transitive dep is captured
-    assert "mod:test_mod_leaf_v3.leaf_func" in fp1, (
+    assert "func:test_mod_leaf_v3.leaf_func" in fp1, (
         f"Should capture transitive dep, got: {fp1.keys()}"
     )
 
@@ -157,7 +157,7 @@ def leaf_func(x):
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
 
     # Transitive fingerprint must change
-    assert fp1["mod:test_mod_leaf_v3.leaf_func"] != fp2["mod:test_mod_leaf_v3.leaf_func"], (
+    assert fp1["func:test_mod_leaf_v3.leaf_func"] != fp2["func:test_mod_leaf_v3.leaf_func"], (
         "Transitive dep fingerprint must change"
     )
 
@@ -176,7 +176,7 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # json is stdlib - should NOT be in fingerprint
-    assert "mod:json_mod.dumps" not in fp, (
+    assert not any("json" in key for key in fp if not key.startswith("self:")), (
         f"Stdlib module attrs should not be tracked, got: {list(fp.keys())}"
     )
 
@@ -246,7 +246,7 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Constant should be captured with repr value
-    key = "mod:test_mod_helpers_v6.THRESHOLD"
+    key = "const:test_mod_helpers_v6.THRESHOLD"
     assert key in fp, f"Should capture constant, got: {fp.keys()}"
     assert fp[key] == "0.5", f"Constant value should be repr, got: {fp[key]}"
 
@@ -276,10 +276,10 @@ def run_stage():
 
     # Both should be captured
     assert "func:test_mod_helpers_v7.func_a" in fp, "Should capture direct import"
-    assert "mod:test_mod_helpers_v7.func_b" in fp, "Should capture module attr"
+    assert "func:test_mod_helpers_v7.func_b" in fp, "Should capture module attr"
 
     assert len(fp["func:test_mod_helpers_v7.func_a"]) == 16, "Direct import should be hashed"
-    assert len(fp["mod:test_mod_helpers_v7.func_b"]) == 16, "Module attr should be hashed"
+    assert len(fp["func:test_mod_helpers_v7.func_b"]) == 16, "Module attr should be hashed"
 
 
 @pytest.mark.parametrize(

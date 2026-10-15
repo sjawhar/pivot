@@ -99,7 +99,7 @@ pivot status --json --remote
 pivot status --json --explain
 ```
 
-The JSON output includes a `stages` array with status (`cached` or `stale`), a `tracked_files` array, and a `suggestions` list. With `--explain`, each stage entry includes `will_run`, `code_changes`, `param_changes`, `dep_changes`, and `upstream_stale` fields.
+The JSON output includes a `stages` array with status (`cached` or `stale`), a `tracked_files` array, and a `suggestions` list. With `--explain`, each stage entry includes `will_run`, `code_changes`, `param_changes`, `dep_changes`, and `upstream_stale` fields. Each `dep_changes` entry names its artifact as `"identity": {"producer": ..., "key": ...}`, with `key` null for an input or a single-output stage.
 
 ### Quiet Mode
 

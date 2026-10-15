@@ -99,16 +99,13 @@ deps:
 outs:
   - key: null
     hash: 0789000000000000
-    tag: data
 """
     result = restore._parse_lock_data_from_bytes(content)
 
     assert result is not None
     assert "outs" in result
     out_entry = cast("dict[str, object]", cast("object", result["outs"][0]))
-    # V2 entries identify outputs by identity key and tag rather than a display path.
-    assert out_entry["key"] is None
-    assert out_entry["tag"] == "data"
+    assert out_entry == {"key": None, "hash": "0789000000000000"}
 
 
 def test_parse_lock_data_from_bytes_invalid() -> None:

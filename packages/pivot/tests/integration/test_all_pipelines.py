@@ -17,8 +17,6 @@ if TYPE_CHECKING:
 def _helper_pipeline_code(name: str, stage_name: str) -> str:
     """Return a complete compositional pipeline.py with one value-returning stage."""
     return f'''\
-import pathlib
-
 from pivot.compose import Pipeline, stage
 
 
@@ -27,20 +25,19 @@ def {stage_name}() -> str:
     return "{stage_name} output"
 
 
-with Pipeline("{name}", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("{name}") as pipeline:
     {stage_name}()
 '''
 
 
 def _setup_multi_pipeline_project(root: pathlib.Path) -> None:
-    """Create alpha and beta compositional pipelines with independent state dirs."""
+    """Create alpha and beta compositional pipelines in subdirectories of one project."""
     alpha = root / "alpha"
     alpha.mkdir()
     (alpha / "pipeline.py").write_text(_helper_pipeline_code("alpha", "stage_a"))
 
     beta = root / "beta"
     beta.mkdir()
-    (beta / ".pivot").mkdir()
     (beta / "pipeline.py").write_text(_helper_pipeline_code("beta", "stage_b"))
 
 
@@ -74,18 +71,20 @@ def test_repro_all_executes_stages_from_all_pipelines(
         assert (cwd / "data" / "beta" / "stage_b.txt").read_text() == "stage_b output"
 
 
-def test_repro_all_writes_locks_to_correct_state_dir(
+def test_repro_all_writes_every_lock_to_the_project_state_dir(
     runner: CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Lock files are written to each source pipeline's own .pivot/stages/ directory."""
+    """Lock files of every pipeline go to the project's .pivot/stages/ directory."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _setup_multi_pipeline_project(cwd)
 
         result = runner.invoke(cli.cli, ["repro", "--all"])
         assert result.exit_code == 0, f"Expected success, got: {result.output}"
 
-        beta_lock = lock.StageLock("beta/stage_b", lock.get_stages_dir(cwd / "beta" / ".pivot"))
-        assert beta_lock.read() is not None, "Lock file not found in beta's state_dir"
+        stages_dir = lock.get_stages_dir(cwd / ".pivot")
+        assert lock.StageLock("alpha/stage_a", stages_dir).read() is not None
+        assert lock.StageLock("beta/stage_b", stages_dir).read() is not None
+        assert not (cwd / "beta" / ".pivot").exists(), "no sub-pipeline state directory"
 
 
 def test_status_all_shows_all_pipelines(runner: CliRunner, tmp_path: pathlib.Path) -> None:
@@ -100,8 +99,10 @@ def test_status_all_shows_all_pipelines(runner: CliRunner, tmp_path: pathlib.Pat
         assert "beta/stage_b" in result.output
 
 
-def test_verify_all_with_mixed_state_dirs(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """verify --all reads lock files from each stage's state directory."""
+def test_verify_all_reads_locks_of_every_pipeline(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """verify --all reads the lock files of every discovered pipeline."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _setup_multi_pipeline_project(cwd)
 
@@ -116,7 +117,7 @@ def test_verify_all_with_mixed_state_dirs(runner: CliRunner, tmp_path: pathlib.P
 
 
 def test_commit_all_after_no_commit_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
-    """commit --all promotes pending locks into each source state directory."""
+    """commit --all promotes pending locks of every pipeline into the project state dir."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _setup_multi_pipeline_project(cwd)
 
@@ -126,8 +127,8 @@ def test_commit_all_after_no_commit_run(runner: CliRunner, tmp_path: pathlib.Pat
         commit_result = runner.invoke(cli.cli, ["commit", "--all"])
         assert commit_result.exit_code == 0, f"commit failed: {commit_result.output}"
 
-        beta_lock = lock.StageLock("beta/stage_b", lock.get_stages_dir(cwd / "beta" / ".pivot"))
-        assert beta_lock.read() is not None, "Production lock not in beta's state_dir after commit"
+        beta_lock = lock.StageLock("beta/stage_b", lock.get_stages_dir(cwd / ".pivot"))
+        assert beta_lock.read() is not None, "Production lock not in the project state dir"
 
 
 def test_all_flag_with_single_pipeline(runner: CliRunner, tmp_path: pathlib.Path) -> None:
