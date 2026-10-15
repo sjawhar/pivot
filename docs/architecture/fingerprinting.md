@@ -35,10 +35,10 @@ Pivot's fingerprinting system:
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
 | Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
 | Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
-| Class attributes a stage reads | Yes (value), one shape | `Cls.NAME` read directly on a user class that the function names (a global, cell or default holding the class). When `NAME` is written in a user class body, it follows the module-level rule: a scalar is `const:<module>.<Cls>.<NAME>`, a non-scalar is refused, a plain function is walked, and a member of a user Enum is recorded by name and value. A pydantic or StageParams class read this way is covered by its schema hash, field defaults included. Attributes a library base or the language defines (an inherited stdlib dict, `NamedTuple._fields`, an Enum's `_member_names_`), and descriptors (property, classmethod, staticmethod), are left to the class AST hash |
-| Other class-level reads | No | Not tracked: a class reached through a module (`settings.Config.SCALE`), `cls.SCALE` inside a classmethod, a nested class (`Outer.Inner.X`), an attribute read through an instance (`Config().SCALE`), and a `ClassVar` on a `StageParams` class. Put such configuration in the stage's `StageParams` |
+| Class attributes a stage reads | Yes (value) | `Cls.NAME` read directly on a user class that the function names (a global, cell or default holding the class), or reaches through a user module (`settings.Config.SCALE`). When `NAME` is written in a user class body, it follows the module-level rule: a scalar is `const:<module>.<Cls>.<NAME>`, a non-scalar is refused, a plain function is walked, and a member of a user Enum is recorded by name and value. A pydantic or StageParams class read this way is covered by its schema hash, field defaults included. Attributes a library base or the language defines (an inherited stdlib dict, `NamedTuple._fields`, an Enum's `_member_names_`), and descriptors (property, classmethod, staticmethod), are left to the class AST hash |
+| Other class-level reads | No | Not tracked: `cls.SCALE` inside a classmethod, a nested class (`Outer.Inner.X`), an attribute read through an instance (`Config().SCALE`), and a `ClassVar` on a `StageParams` class. Put such configuration in the stage's `StageParams` |
 
-**Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are tracked only in the `Cls.NAME` shape above, and for Pydantic model field defaults.
+**Note:** While class AST is hashed (capturing method bodies and structure), *runtime values* of class-level variables are tracked only in the `Cls.NAME` and `module.Cls.NAME` shapes above, and for Pydantic model field defaults. A value read as `module.NAME` follows the rule it follows as a global: a library function is an `ext:` entry, a `functools.partial` is walked, a logger is ignored.
 
 For Pydantic models, both static defaults and `default_factory` functions are tracked:
 
@@ -210,9 +210,8 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `self:` | The stage function itself | `self:train` |
 | `func:` | Helper functions (user code callables) | `func:myproject.helpers.process_data` |
 | `class:` | Class definitions | `class:myproject.params.TrainParams` |
-| `const:` | Module-level primitive values | `const:myproject.settings.THRESHOLD` |
+| `const:` | Primitive values read as globals or as `module.NAME` | `const:myproject.settings.THRESHOLD` |
 | `default:` | Default argument values that the AST does not record | `default:myproject.stages.scale.factor` |
-| `mod:` | Module attribute access patterns | `mod:myproject.helpers.process_data` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
 | `ext:` | A library function or class a stage reads, named by its definition (its code is not hashed) | `ext:myproject.stages.agg` → `numpy.mean` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |

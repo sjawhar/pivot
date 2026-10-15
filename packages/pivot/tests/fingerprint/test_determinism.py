@@ -80,10 +80,10 @@ def stage_using_numpy():
     return combined
 
 manifest = fingerprint.get_stage_fingerprint(stage_using_numpy)
-mod_keys = [k for k in manifest if k.startswith("mod:")]
-print(f"mod_keys: {mod_keys}")
-if mod_keys:
-    print(f"ERROR: Unexpected stdlib module attributes in fingerprint: {mod_keys}")
+numpy_keys = [k for k in manifest if not k.startswith("self:")]
+print(f"numpy_keys: {numpy_keys}")
+if numpy_keys:
+    print(f"ERROR: Unexpected library module attributes in fingerprint: {numpy_keys}")
     exit(1)
 """
     result = subprocess.run(

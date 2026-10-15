@@ -412,7 +412,7 @@ class ChangeType(enum.StrEnum):
 class CodeChange(TypedDict):
     """Change info for a code component in the fingerprint."""
 
-    key: str  # e.g., "func:helper_a", "mod:utils.helper"
+    key: str  # e.g., "func:helper_a", "const:settings.FACTOR"
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType
