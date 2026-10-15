@@ -1192,6 +1192,29 @@ def test_dataframe_jsonl_refuses_columns_the_old_writer_also_refused(
 
 
 @pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param([datetime.date(9999, 12, 31), datetime.date(2024, 1, 1)], id="date"),
+        pytest.param(
+            [datetime.datetime(9999, 12, 31), datetime.datetime(2024, 1, 1)], id="datetime"
+        ),
+        pytest.param([datetime.date(1500, 6, 1), datetime.date(2024, 1, 1)], id="date-1500"),
+    ],
+)
+def test_dataframe_jsonl_names_the_range_for_out_of_range_date_objects(
+    tmp_path: pathlib.Path, values: list[datetime.date]
+) -> None:
+    """Base raised for these too; the refusal must name the nanosecond range, not timezones."""
+    df = pandas.DataFrame({"d": values})
+
+    with pytest.raises(TypeError, match="column 'd'") as raised:
+        loaders.DataFrameJSONL().save(df, tmp_path / "range.jsonl")
+
+    assert "value outside the nanosecond range" in str(raised.value)
+    assert "timezone" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
     "timezone",
     [
         pytest.param(dateutil_tz.tzoffset(None, 5 * 3600), id="dateutil-offset"),

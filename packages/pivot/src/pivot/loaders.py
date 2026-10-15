@@ -371,6 +371,9 @@ def _replace_nonfinite(value: object) -> object:
     return value
 
 
+_OUT_OF_NANOSECOND_RANGE = "value outside the nanosecond range"
+
+
 def _as_nanoseconds(series: pandas.Series[Any]) -> pandas.Series[Any]:
     """Convert a datetime or timedelta column to nanosecond resolution, or raise TypeError.
 
@@ -380,7 +383,7 @@ def _as_nanoseconds(series: pandas.Series[Any]) -> pandas.Series[Any]:
     try:
         return series.dt.as_unit("ns")
     except (pandas.errors.OutOfBoundsDatetime, pandas.errors.OutOfBoundsTimedelta) as e:
-        raise TypeError(f"value outside the nanosecond range: {e}") from e
+        raise TypeError(f"{_OUT_OF_NANOSECOND_RANGE}: {e}") from e
 
 
 def _iso_datetime_texts(series: pandas.Series[Any], suffix: str = "") -> list[str]:
@@ -414,6 +417,9 @@ def _encode_jsonl_column(
     ) in ("date", "datetime"):
         try:
             series = pandas.Series(pandas.to_datetime(series))
+        except pandas.errors.OutOfBoundsDatetime as e:
+            # A subclass of ValueError: catch it first so a 9999-12-31 names its real cause.
+            raise TypeError(f"{_OUT_OF_NANOSECOND_RANGE}: {e}") from e
         except ValueError as e:
             # Mixed UTC offsets, or naive and aware values together, have no single dtype.
             raise TypeError(f"datetime values with no single timezone: {e}") from e
