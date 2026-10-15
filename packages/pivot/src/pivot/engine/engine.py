@@ -1177,9 +1177,6 @@ class Engine:
                 results=results,
             )
 
-            if self._cancel_event.is_set():
-                await self._finalize_cancelled_stages(results, run_id)
-
             # Only start drain thread and main loop if workers were dispatched.
             # When all stages skip in the coordinator, the pool is never created.
             if self._worker_pool is not None:
@@ -1309,11 +1306,6 @@ class Engine:
                                                 run_id=run_id,
                                             )
 
-                            # A run can be cancelled before the first worker is submitted.
-                            # Finalize here as well as after the initial dispatch attempt.
-                            if self._cancel_event.is_set():
-                                await self._finalize_cancelled_stages(results, run_id)
-
                             # Start more stages if slots available
                             if not self._scheduler.stop_starting_new:
                                 await self._start_ready_stages(
@@ -1376,6 +1368,9 @@ class Engine:
                             _logger.debug(
                                 "Sentinel send failed (will rely on shutdown_event): %s", exc
                             )
+
+            if self._cancel_event.is_set():
+                await self._finalize_cancelled_stages(results, run_id)
 
         finally:
             # Close StateDBs first (lightweight), then shut down worker pool.

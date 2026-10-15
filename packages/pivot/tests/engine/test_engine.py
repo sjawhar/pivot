@@ -70,6 +70,11 @@ def _helper_cancel_second(value: str) -> str:
 
 
 @stage
+def _helper_cancel_third(value: str) -> str:
+    return f"{value} third"
+
+
+@stage
 def _helper_cancel_other() -> str:
     return "other"
 
@@ -1001,6 +1006,82 @@ async def test_engine_cancel_during_coordinator_skip_releases_resources_without_
         pool.submit.assert_not_called()
         engine._scheduler.set_state("cancel/_helper_cancel_first", StageExecutionState.READY)
         assert engine._scheduler.can_start("cancel/_helper_cancel_first")
+
+
+@pytest.mark.anyio
+async def test_engine_cancel_after_worker_completion_finalizes_second_dispatch_wave(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation while the second stage prepares finalizes all later stages."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    with Pipeline("cancel_late", root=tmp_path) as pipeline:
+        first = _helper_cancel_first()
+        second = _helper_cancel_second(first)
+        _helper_cancel_third(second)
+        _helper_cancel_other()
+
+    first_stage = "cancel_late/_helper_cancel_first"
+    cancelled_stages = {
+        "cancel_late/_helper_cancel_second",
+        "cancel_late/_helper_cancel_third",
+        "cancel_late/_helper_cancel_other",
+    }
+    all_stages = {first_stage, *cancelled_stages}
+    cache_dir = tmp_path / ".pivot" / "cache"
+    cache_dir.mkdir()
+    events = list[OutputEvent]()
+    results = dict[str, executor_core.ExecutionSummary]()
+
+    async with Engine(pipeline=pipeline) as engine:
+        engine._run_state = engine_mod._RunState.RUNNING
+        output_recv = engine._output_recv
+        output_send = engine._output_send
+        assert output_recv is not None
+        assert output_send is not None
+
+        async def _cancel_on_second_preparing() -> None:
+            async for event in output_recv:
+                events.append(event)
+                if (
+                    event["type"] == "stage_state_changed"
+                    and event["stage"] == "cancel_late/_helper_cancel_second"
+                    and event["state"] == StageExecutionState.PREPARING
+                ):
+                    await engine._handle_cancel_requested()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_cancel_on_second_preparing)
+            results = await engine._orchestrate_execution(
+                stages=None,
+                force=False,
+                single_stage=False,
+                parallel=True,
+                max_workers=1,
+                resource_capacity={},
+                no_commit=True,
+                on_error=OnError.FAIL,
+                cache_dir=cache_dir,
+            )
+            await output_send.aclose()
+
+        assert set(results) == all_stages
+        assert results[first_stage]["status"] == StageStatus.RAN
+        assert all(
+            results[stage_name]["status"] == StageStatus.CANCELLED
+            for stage_name in cancelled_stages
+        )
+        assert all(
+            engine._scheduler.get_state(stage_name) == StageExecutionState.COMPLETED
+            for stage_name in all_stages
+        )
+        terminal_stages = [event["stage"] for event in events if event["type"] == "stage_completed"]
+        assert sorted(terminal_stages) == sorted(all_stages)
+        assert len(terminal_stages) == len(set(terminal_stages))
+        engine._scheduler.set_state(first_stage, StageExecutionState.READY)
+        assert engine._scheduler.can_start(first_stage)
 
 
 @pytest.mark.anyio
