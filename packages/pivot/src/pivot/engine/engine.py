@@ -1306,26 +1306,6 @@ class Engine:
                                                 run_id=run_id,
                                             )
 
-                            # Check cancellation
-                            if self._cancel_event.is_set():
-                                cancelled = self._scheduler.apply_cancel()
-                                for name, old_state in cancelled:
-                                    await self.emit(
-                                        StageStateChanged(
-                                            type="stage_state_changed",
-                                            stage=name,
-                                            state=StageExecutionState.COMPLETED,
-                                            previous_state=old_state,
-                                        )
-                                    )
-                                    await self._emit_terminal_stage(
-                                        name,
-                                        StageStatus.CANCELLED,
-                                        "cancelled",
-                                        results,
-                                        run_id=run_id,
-                                    )
-
                             # Start more stages if slots available
                             if not self._scheduler.stop_starting_new:
                                 await self._start_ready_stages(
@@ -1388,6 +1368,9 @@ class Engine:
                             _logger.debug(
                                 "Sentinel send failed (will rely on shutdown_event): %s", exc
                             )
+
+            if self._cancel_event.is_set():
+                await self._finalize_cancelled_stages(results, run_id)
 
         finally:
             # Close StateDBs first (lightweight), then shut down worker pool.
@@ -1681,6 +1664,19 @@ class Engine:
                     )
                     skipped = False
                 if skipped:
+                    continue
+                # A watch event may cancel this run while its coordinator skip check awaited.
+                # Do not submit a stage to the pool after cancellation stopped admissions.
+                if self._cancel_event.is_set():
+                    self._scheduler.release_resources(stage_name)
+                    await self._set_stage_state(stage_name, StageExecutionState.COMPLETED)
+                    await self._emit_terminal_stage(
+                        stage_name,
+                        StageStatus.CANCELLED,
+                        "cancelled",
+                        results,
+                        run_id=run_id,
+                    )
                     continue
 
                 # Stage must run — lazily create pool on first dispatch
@@ -2161,6 +2157,29 @@ class Engine:
         await self._process_deferred_events(stage_name)
 
         return duration_ms
+
+    async def _finalize_cancelled_stages(
+        self,
+        results: dict[str, executor_core.ExecutionSummary],
+        run_id: str,
+    ) -> None:
+        """Mark every ready or pending stage cancelled exactly once."""
+        for stage_name, old_state in self._scheduler.apply_cancel():
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=stage_name,
+                    state=StageExecutionState.COMPLETED,
+                    previous_state=old_state,
+                )
+            )
+            await self._emit_terminal_stage(
+                stage_name,
+                StageStatus.CANCELLED,
+                "cancelled",
+                results,
+                run_id=run_id,
+            )
 
     async def _emit_terminal_stage(
         self,
