@@ -33,10 +33,14 @@ If **any** of these fail, the generation check returns `False` and execution fal
 `StageLock.is_changed_with_lock_data()` compares the full lock file state:
 - Code manifest (fingerprint of stage function + helper functions)
 - Parameters (effective params after overrides)
+- Parameters compare by canonical JSON encoding, so values with different serialized types invalidate
+  a stage even when Python considers them equal.
 - Dependency hashes (content hashes of all input files/directories)
 - Output path list (detect added/removed outputs)
 
 This requires hashing all dependency files, hence O(n) in the number/size of dependencies.
+The coordinator reads the stage lock only after holding the stage's artifact locks, so a waiting
+run evaluates the state committed by the writer ahead of it.
 
 ### Tier 3: Run Cache Lookup
 

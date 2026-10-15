@@ -12,6 +12,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 import boto3
@@ -981,6 +982,177 @@ def test_list_refuses_a_fractional_resource_request(tmp_path: pathlib.Path) -> N
 
     assert proc.returncode == 1, out
     assert "Stage resource 'gpu' must request a positive integer or 'all'" in out, out
+
+
+def test_repro_reruns_for_distinct_equal_union_params(tmp_path: pathlib.Path) -> None:
+    """A bool override must not reuse an int run just because Python equates their values."""
+    pipeline = """\
+from pivot import Pipeline, StageParams, stage
+
+
+class Params(StageParams):
+    value: int | bool = 1
+
+
+@stage
+def show(params: Params) -> str:
+    return type(params.value).__name__ + ":" + str(params.value)
+
+
+with Pipeline("p") as pipeline:
+    show(params=Params())
+"""
+    root = _project(tmp_path, {"pipeline.py": pipeline})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("p/show:\n  value: true\n")
+
+    explanation = _ok(_pivot(root, "status", "--explain"))
+    repro = _ok(_pivot(root, "repro"))
+
+    assert "Param Changes:" in explanation, explanation
+    assert "value" in explanation, explanation
+    assert "1 ran" in repro, repro
+    assert (root / "data/p/show.txt").read_text() == "bool:True"
+
+
+def test_cached_run_uses_lock_committed_by_concurrent_incremental_run(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A queued restore must use the lock written by the run that held the artifact lock."""
+    gate = tmp_path / "entered"
+    pipeline = f"""\
+import pathlib
+import time
+from typing import Annotated
+
+from pivot import Pipeline, StageParams, incremental, stage
+
+
+class Params(StageParams):
+    gate: str = {str(gate)!r}
+
+
+@stage
+def grow(previous: str, params: Params) -> Annotated[str, incremental]:
+    pathlib.Path(params.gate).write_text("entered")
+    time.sleep(8)
+    return previous + "a"
+
+
+with Pipeline("p") as pipeline:
+    grow(pipeline.previous(), params=Params())
+"""
+    root = _project(tmp_path, {"pipeline.py": pipeline})
+    _ok(_pivot(root, "repro"))
+    gate.unlink()
+
+    first = subprocess.Popen(
+        [_PIVOT, "repro", "--json", "--force"],
+        cwd=root,
+        env=_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not gate.exists():
+            assert first.poll() is None and time.monotonic() < deadline
+            time.sleep(0.01)
+
+        second = subprocess.Popen(
+            [_PIVOT, "repro", "--json"],
+            cwd=root,
+            env=_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=60)
+        second_stdout, second_stderr = second.communicate(timeout=60)
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait()
+
+    assert first.returncode == 0, first_stdout + first_stderr
+    assert second.returncode == 0, second_stdout + second_stderr
+    assert (root / "data/p/grow.txt").read_text() == "aa"
+
+
+def test_status_explain_displays_falsy_new_param_values(tmp_path: pathlib.Path) -> None:
+    """A changed parameter value of zero is displayed instead of an unavailable marker."""
+    pipeline = """\
+from pivot import Pipeline, StageParams, stage
+
+
+class Params(StageParams):
+    factor: int = 10
+
+
+@stage
+def scale(params: Params) -> str:
+    return str(params.factor)
+
+
+with Pipeline("p") as pipeline:
+    scale(params=Params())
+"""
+    root = _project(tmp_path, {"pipeline.py": pipeline})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("p/scale:\n  factor: 0\n")
+
+    explanation = _ok(_pivot(root, "status", "--explain"))
+
+    assert "Old: 10" in explanation, explanation
+    assert "New: 0" in explanation, explanation
+
+
+def test_doctor_reports_invalid_remote_with_one_actionable_line(tmp_path: pathlib.Path) -> None:
+    """An invalid remote is a concise doctor diagnostic rather than a Pydantic traceback."""
+    root = _project(tmp_path, {})
+    (root / ".pivot/config.yaml").write_text("remotes:\n  broken: not-a-remote\n")
+
+    result = _pivot(root, "doctor", "--remote")
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert output.strip() == (
+        "Error: Invalid config remotes.broken: 'not-a-remote'; "
+        + "Remote 'broken' must be a valid S3 URL (s3://bucket/prefix), got: not-a-remote"
+    )
+
+
+def test_doctor_identifies_invalid_remote_after_valid_remote(tmp_path: pathlib.Path) -> None:
+    """Doctor names the invalid remote rather than the mapping's first entry."""
+    root = _project(tmp_path, {})
+    (root / ".pivot/config.yaml").write_text(
+        "remotes:\n  good: s3://valid-bucket/prefix\n  broken: not-a-remote\n"
+    )
+
+    result = _pivot(root, "doctor", "--remote")
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert output.strip() == (
+        "Error: Invalid config remotes.broken: 'not-a-remote'; "
+        + "Remote 'broken' must be a valid S3 URL (s3://bucket/prefix), got: not-a-remote"
+    )
+
+
+def test_doctor_reports_remote_name_validation_rule(tmp_path: pathlib.Path) -> None:
+    """Doctor preserves the remote-name rule for an invalid remote name."""
+    root = _project(tmp_path, {})
+    (root / ".pivot/config.yaml").write_text("remotes:\n  'bad name': s3://valid-bucket/prefix\n")
+
+    result = _pivot(root, "doctor", "--remote")
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert output.strip() == (
+        "Error: Invalid config remotes.bad name: 's3://valid-bucket/prefix'; "
+        + "Invalid remote name 'bad name': must be alphanumeric, hyphens, or underscores"
+    )
 
 
 _DIRECTORY_INPUT_PIPELINE = """\
