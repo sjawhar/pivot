@@ -246,7 +246,7 @@ pipeline.include(report)
 |---|---|
 | One shared `params.py` (or config module) holding every stage's settings | One `StageParams` subclass beside each stage |
 | A half-migration from DVC: `dvc.api.params_show()`, reading `params.yaml` in a stage, `dvc.yaml` or a YAML stage list next to `pipeline.py`, path strings passed between stages, `pd.read_csv`/`to_csv` inside stages | Port every stage to `@stage`, every input to `pipeline.input()`, every edge to a handle, every setting to `StageParams`; delete the DVC files |
-| Configuration in module-level constants (dicts of settings, lists of variants, tuples of columns) | `StageParams` fields; loop over values inside the `with` block |
+| Mutable configuration in module-level constants (dicts of settings, lists of variants) | `StageParams` fields; loop over values inside the `with` block |
 | Loader annotations on parameters, `Dep(...)`/`Out(...)` markers, path overrides, a `register` call | The function signature above: handles in, data out |
 
 ## Running
@@ -287,5 +287,5 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock fil
 - [ ] No file paths, `open()`, `read_csv`, or `to_csv` in stages; no `dvc` imports
 - [ ] Inputs come from `pipeline.input()`; edges are handles
 - [ ] `Annotated[...]` appears only on return types and `TypedDict` fields
-- [ ] Module-level values read by stages are plain scalars only
+- [ ] Module-level values read by stages are scalars, tuples or frozensets of scalars, or compiled regexes
 - [ ] `pivot list` shows the expected stages, then `pivot repro` passes twice (second run: all cached)

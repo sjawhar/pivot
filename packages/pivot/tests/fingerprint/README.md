@@ -116,9 +116,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Module immutable tuple, frozenset, or compiled regex | ✅ | `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage` |
 | Module constant                     | ✅        | `test_integration.py::test_constant_via_module_attr_captured`                           |
 | Module constant captured            | ✅        | `test_change_detection.py::test_module_constant_captured_via_module_attr`               |
-| Module primitive collection         | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
 | Nested attribute (`X.sub.func`)     | ⚠️        | `test_fingerprint.py::test_extract_nested_attr_access` (extracted but not fully tested) |
-| Multiple attrs from same module     | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
+| Multiple attrs from same module     | ✅ | `test_fingerprint.py::test_extract_multiple_attrs_same_module` |
 | Both import styles in same stage    | ✅        | `test_integration.py::test_both_import_styles_in_same_stage`                            |
 
 ---
@@ -397,9 +396,11 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
     Tests: `test_determinism.py::test_set_valued_params_are_deterministic_across_hash_seeds`,
     `test_manifest_cache_cli.py::test_set_valued_params_stay_cached_across_processes`
 
-15. **Module collections are refused**: A stage reading a module-level collection raises
-    `StageDefinitionError` unless unsafe fingerprinting is explicitly enabled, in which case
-    Pivot warns instead of pretending to track its contents.
+15. **Mutable and nested module collections are refused**: A stage reading a list, dict,
+    set, or a tuple or frozenset containing a non-scalar raises `StageDefinitionError` unless
+    unsafe fingerprinting is explicitly enabled, in which case Pivot warns instead of
+    pretending to track its contents. Exact tuples and frozensets of scalars and compiled
+    regexes are recorded by canonical value.
 
     A method bound to an instance is refused the same way (`apply = Scaler(3).apply`,
     `normal = np.random.default_rng(SEED).normal`): the instance it carries is state no code
@@ -407,6 +408,7 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
     library module's own export such as `np.random.normal`, is recorded by name instead.
 
     Tests: `test_integration.py::test_non_scalar_module_attribute_raises`,
+    `test_safe_fingerprinting.py::test_immutable_capture_is_tracked_by_value`,
     `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`
 
 16. **Manifest cache invalidation is path-scoped**: Watch-mode reloads invalidate only the cached manifests whose source maps include changed paths, leaving unaffected stage manifests intact. Affected stages are recomputed on next fingerprint access and re-cached.
@@ -417,8 +419,8 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`
 
-18. **Non-scalar closure values are refused**: Values outside the permitted primitive set raise
-    `StageDefinitionError` rather than being hashed via `repr()`.
+18. **Non-scalar closure values are refused**: Values outside the permitted scalar,
+    one-level immutable collection, and compiled-regex set raise `StageDefinitionError`.
 
 19. **Per-annotation type hint fallback**: When `typing.get_type_hints()` fails (e.g., one unresolvable `TYPE_CHECKING` import kills resolution for all annotations), each annotation string is evaluated individually via `eval()` in the function's global namespace. Resolvable annotations are still tracked; unresolvable ones are skipped.
 
