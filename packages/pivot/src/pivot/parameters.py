@@ -124,12 +124,14 @@ def _override_errors(
     ``_merge_overrides`` finds them, so values are then checked with ``extra="ignore"``. When
     that check passes, the walk saw every mapping's model, so it saw every unknown key.
     """
+    if not any(key in overrides for key in _override_keys(stage_name)):
+        return []
     params_cls = type(params)
     unknown: _UnknownKeys = []
     set_twice = list[tuple[str, str]]()
     data = _merge_overrides(
         params_cls,
-        params.model_dump(round_trip=True, by_alias=False),
+        _field_values(params),
         params,
         stage_name,
         overrides,
@@ -354,12 +356,10 @@ def apply_overrides[T: pydantic.BaseModel](
 
     params_cls = type(params_instance)
     set_twice = list[tuple[str, str]]()
-    # The round-trip dump is keyed by field name (by_alias=False holds even when the model
-    # serializes by alias) and leaves out computed fields, which a model that forbids extra
-    # fields would refuse.
+    # Field values, unlike model_dump(), retain fields declared with exclude=True.
     data = _merge_overrides(
         params_cls,
-        params_instance.model_dump(round_trip=True, by_alias=False),
+        _field_values(params_instance),
         params_instance,
         stage_name,
         overrides,
@@ -369,6 +369,14 @@ def apply_overrides[T: pydantic.BaseModel](
     if set_twice:
         raise exceptions.ParamsError("; ".join(message for _, message in set_twice))
     return params_cls.model_validate(data, by_alias=True, by_name=True)
+
+
+def _field_values(params: pydantic.BaseModel) -> dict[str, Any]:
+    """Return every declared field and allowed extra value without serialization exclusions."""
+    values = {name: getattr(params, name) for name in type(params).model_fields}
+    if params.model_extra:
+        values.update(params.model_extra)
+    return values
 
 
 # (params.yaml key, path of field names, list indexes and dict keys, model the key was given to)
