@@ -158,6 +158,22 @@ def test_artifact_handle_input_no_suboutputs() -> None:
         _ = handle.anything
 
 
+def test_handle_output_lookup_keeps_each_dunders_exception(tmp_path: pathlib.Path) -> None:
+    """Attribute access raises AttributeError and item access KeyError, naming the outputs."""
+    with Pipeline("lookup", root=tmp_path) as pipeline:
+        built = _helper_build_tagged()
+        source = pipeline.input("raw.txt", t=str)
+
+    with pytest.raises(AttributeError, match=r"has no output 'missing'\. Available: \["):
+        _ = built.missing
+    with pytest.raises(KeyError, match=r"has no output 'missing'\. Available: \["):
+        _ = built["missing"]  # pyright: ignore[reportGeneralTypeIssues] - the error under test
+    with pytest.raises(AttributeError, match="has no sub-outputs"):
+        _ = source.missing
+    with pytest.raises(KeyError, match="has no sub-outputs"):
+        _ = source["missing"]  # pyright: ignore[reportArgumentType] - the error under test
+
+
 # --- @stage decorator ---
 
 

@@ -125,9 +125,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         output_spec = source.output_specs[0]
         output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
     else:
-        matched = next(
-            (spec for spec in source.output_specs if spec.key == handle._output_key), None
-        )
+        matched = _select_output(source.output_specs, handle._output_key)
         if matched is None:
             available = [spec.key for spec in source.output_specs]
             raise TypeError(
@@ -842,9 +840,7 @@ class Pipeline:
                         continue
                     output_spec = output_specs[0]
                 else:
-                    output_spec = next(
-                        (spec for spec in output_specs if spec.key == value.key), None
-                    )
+                    output_spec = _select_output(output_specs, value.key)
                     if output_spec is None:
                         self._validation_errors.append(
                             f"{stage_name}: parameter '{param_name}' uses p.previous({value.key!r}) "
@@ -1368,28 +1364,23 @@ class ArtifactHandle:
             raise AttributeError(name)
         if not isinstance(self._source, _StageNode):
             raise AttributeError(f"Input '{self._source.name}' has no sub-outputs")
-        for spec in self._source.output_specs:
-            if spec.key == name:
-                return ArtifactHandle(
-                    pipeline=self._pipeline,
-                    source=self._source,
-                    output_key=name,
-                    python_type=spec.python_type,
-                )
-        raise AttributeError(_no_such_output_message(self._source, name))
+        spec = _select_output(self._source.output_specs, name)
+        if spec is None:
+            raise AttributeError(_no_such_output_message(self._source, name))
+        return ArtifactHandle(self._pipeline, self._source, name, spec.python_type)
 
     def __getitem__(self, key: str) -> ArtifactHandle:
         if not isinstance(self._source, _StageNode):
             raise KeyError(f"Input '{self._source.name}' has no sub-outputs")
-        for spec in self._source.output_specs:
-            if spec.key == key:
-                return ArtifactHandle(
-                    pipeline=self._pipeline,
-                    source=self._source,
-                    output_key=key,
-                    python_type=spec.python_type,
-                )
-        raise KeyError(_no_such_output_message(self._source, key))
+        spec = _select_output(self._source.output_specs, key)
+        if spec is None:
+            raise KeyError(_no_such_output_message(self._source, key))
+        return ArtifactHandle(self._pipeline, self._source, key, spec.python_type)
+
+
+def _select_output(output_specs: list[_OutputSpec], key: str | None) -> _OutputSpec | None:
+    """The output spec named ``key``, or None when the stage has no such output."""
+    return next((spec for spec in output_specs if spec.key == key), None)
 
 
 def _no_such_output_message(source: _StageNode, key: str) -> str:
