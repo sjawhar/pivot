@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from pivot import cli, compose, discovery, executor, loaders, project
-from pivot.storage import cache
+from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
     import pathlib
@@ -53,6 +53,184 @@ def _run_csv_stage(
     assert output.read_text() == initial, "CSV round-trip should reproduce the input"
     commit_fn("Initial CSV output")
     return output
+
+
+_OLD_RENDER_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class Old(TypedDict):
+    old: Annotated[str, loaders.Text()]
+
+
+@stage
+def render() -> Old:
+    return {"old": "old revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+_REMOVED_KEY_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class New(TypedDict):
+    new: Annotated[str, loaders.Text()]
+
+
+@stage
+def render() -> New:
+    return {"new": "new revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+_OLD_FORMAT_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class Old(TypedDict):
+    value: Annotated[str, loaders.Text()]
+
+
+@stage
+def render() -> Old:
+    return {"value": "old revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+_NEW_FORMAT_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class New(TypedDict):
+    value: Annotated[str, loaders.JSON()]
+
+
+@stage
+def render() -> New:
+    return {"value": "new revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+
+def _commit_old_render_revision(
+    runner: click.testing.CliRunner,
+    repo_path: pathlib.Path,
+    commit: Callable[[str], str],
+    pipeline_source: str,
+) -> tuple[str, pathlib.Path]:
+    repo_path.joinpath("pipeline.py").write_text(pipeline_source)
+    initialized = runner.invoke(cli.cli, ["init"])
+    assert initialized.exit_code == 0, initialized.output
+    repro = runner.invoke(cli.cli, ["repro"])
+    assert repro.exit_code == 0, repro.output
+    sha = commit("old render output")
+    return sha, repo_path / "data" / "rev" / "render"
+
+
+def test_get_stage_from_old_revision_after_output_key_removed(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A v2 revision lock restores an old output even after the live pipeline removes its key."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    sha, output_dir = _commit_old_render_revision(runner, repo_path, commit, _OLD_RENDER_PIPELINE)
+    old_path = output_dir / "old.txt"
+    old_path.unlink()
+    repo_path.joinpath("pipeline.py").write_text(_REMOVED_KEY_PIPELINE)
+    live = discovery.discover_pipeline(repo_path)
+    assert live is not None
+    assert [ref.identity.key for ref in live.get_stage("rev/render")["outs"]] == ["new"]
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha, "rev/render"])
+
+    assert result.exit_code == 0, result.output
+    assert old_path.read_text() == "old revision"
+    assert not (output_dir / "new.txt").exists()
+
+    old_path.unlink()
+    redirected = repo_path / "from-old-revision.txt"
+    redirected_result = runner.invoke(
+        cli.cli, ["get", "--rev", sha, "--output", str(redirected), "rev/render"]
+    )
+
+    assert redirected_result.exit_code == 0, redirected_result.output
+    assert redirected.read_text() == "old revision"
+
+
+def test_get_pathless_old_lock_names_removed_key_and_revision(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An older pathless lock cannot restore a key the current pipeline no longer defines."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    _sha, output_dir = _commit_old_render_revision(runner, repo_path, commit, _OLD_RENDER_PIPELINE)
+    stage_lock = lock.StageLock("rev/render", repo_path / ".pivot" / "stages")
+    lock_data = stage_lock.read()
+    assert lock_data is not None
+    assert "output_paths" in lock_data
+    del lock_data["output_paths"]
+    stage_lock.write(lock_data)
+    pathless_sha = commit("pathless older lock")
+    (output_dir / "old.txt").unlink()
+    repo_path.joinpath("pipeline.py").write_text(_REMOVED_KEY_PIPELINE)
+    live = discovery.discover_pipeline(repo_path)
+    assert live is not None
+
+    result = runner.invoke(cli.cli, ["get", "--rev", pathless_sha, "rev/render"])
+
+    assert result.exit_code == 1, result.output
+    assert "output key 'old'" in result.output
+    assert pathless_sha in result.output
+
+
+def test_get_stage_from_old_revision_uses_the_revisions_output_format(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A v2 revision lock restores old bytes to its old extension, not the live format's path."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    sha, output_dir = _commit_old_render_revision(runner, repo_path, commit, _OLD_FORMAT_PIPELINE)
+    old_path = output_dir / "value.txt"
+    old_path.unlink()
+    repo_path.joinpath("pipeline.py").write_text(_NEW_FORMAT_PIPELINE)
+    live = discovery.discover_pipeline(repo_path)
+    assert live is not None
+    assert [ref.identity.key for ref in live.get_stage("rev/render")["outs"]] == ["value"]
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha, "rev/render"])
+
+    assert result.exit_code == 0, result.output
+    assert old_path.read_text() == "old revision"
+    assert not (output_dir / "value.json").exists()
 
 
 def _rewrite(path: pathlib.Path, content: str) -> None:

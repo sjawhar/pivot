@@ -157,8 +157,12 @@ async def test_resolve_remote_path_walks_nested_github_lock_dirs(
         if path.is_file()
     }
     listings = {
-        ".pivot/stages": ["smoke"],
-        ".pivot/stages/smoke": ["scale.lock", "total.lock", "train.lock"],
+        ".pivot/stages": [github.DirectoryEntry(name="smoke", type="dir")],
+        ".pivot/stages/smoke": [
+            github.DirectoryEntry(name="scale.lock", type="file"),
+            github.DirectoryEntry(name="total.lock", type="file"),
+            github.DirectoryEntry(name="train.lock", type="file"),
+        ],
     }
 
     async def _list_directory(
@@ -169,7 +173,7 @@ async def test_resolve_remote_path_walks_nested_github_lock_dirs(
         token: str | None = None,
         *,
         session: object = None,
-    ) -> list[str] | None:
+    ) -> list[github.DirectoryEntry] | None:
         return listings.get(path)
 
     async def _read_file(
@@ -192,4 +196,61 @@ async def test_resolve_remote_path_walks_nested_github_lock_dirs(
     )
 
     assert resolved["stage"] == "smoke/total"
+    assert resolved["hash"] == _TOTAL_HASH
+
+
+async def test_resolve_remote_path_walks_github_directory_named_lock(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """A GitHub Contents directory named `*.lock` is descended into, not read as a lock file."""
+    pivot_dir = tmp_path / ".pivot"
+    pivot_dir.mkdir()
+    (pivot_dir / "config.yaml").write_text(
+        yaml.safe_dump({"remotes": {"origin": _REMOTE_URL}, "default_remote": "origin"})
+    )
+    stages_dir = lock.get_stages_dir(pivot_dir)
+    lock.StageLock("foo.lock/render", stages_dir).write(
+        _helper_lock_data("foo.lock/render", {None: _TOTAL_HASH})
+    )
+    repo_files = {
+        str(path.relative_to(tmp_path)): path.read_bytes()
+        for path in pivot_dir.rglob("*")
+        if path.is_file()
+    }
+    listings = {
+        ".pivot/stages": [github.DirectoryEntry(name="foo.lock", type="dir")],
+        ".pivot/stages/foo.lock": [github.DirectoryEntry(name="render.lock", type="file")],
+    }
+
+    async def _list_directory(
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str,
+        token: str | None = None,
+        *,
+        session: object = None,
+    ) -> list[github.DirectoryEntry] | None:
+        return listings.get(path)
+
+    async def _read_file(
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str,
+        token: str | None = None,
+        *,
+        session: object = None,
+    ) -> bytes | None:
+        return repo_files.get(path)
+
+    mocker.patch.object(github, "resolve_ref", autospec=True, return_value="f" * 40)
+    mocker.patch.object(github, "list_directory", autospec=True, side_effect=_list_directory)
+    mocker.patch.object(github, "read_file", autospec=True, side_effect=_read_file)
+
+    resolved = await import_artifact.resolve_remote_path(
+        "https://github.com/org/source", "foo.lock/render", "main", None
+    )
+
+    assert resolved["stage"] == "foo.lock/render"
     assert resolved["hash"] == _TOTAL_HASH
