@@ -123,6 +123,11 @@ A stage can return a `pathlib.Path` to a directory it created outside the
 project. `PathOnly()` moves that directory to Pivot's managed output path and
 Pivot caches it as an artifact.
 
+A directory artifact, input or output, is hashed and cached whole. Every file
+under it counts, including names that code fingerprinting or watch mode may
+ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
+them changes the directory hash, and all of them return on restore.
+
 The declarative `DirectoryOut` annotation for a variable set of files remains
 undecided; do not add that annotation to a compositional pipeline.
 

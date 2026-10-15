@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
 import uuid
 
 import boto3
+import pytest
 
 from pivot import loaders
 
@@ -578,11 +580,11 @@ with Pipeline("d") as pipeline:
     shards(pipeline.input("t.csv"))
 """
 
-# The same stage, also writing a build/ directory, a name the directory hash skips.
+# The same stage also writes a build/ directory, which is part of its directory artifact.
 _DIROUT_BUILD_PIPELINE = _DIROUT_PIPELINE.replace(
     "    return out\n",
     '    (out / "build").mkdir()\n'
-    + '    (out / "build" / "log.txt").write_text(f"built {len(raw)} rows")\n'
+    + '    (out / "build" / "log.txt").write_text(f"built {int(raw.sum().sum())}")\n'
     + "    return out\n",
 )
 
@@ -684,21 +686,21 @@ def test_pull_refuses_directory_output_with_hand_edited_file(
     assert (shards / "1.txt").read_text() == "7", "a refused pull must not restore anything"
 
 
-def test_pull_keeps_build_dir_the_stage_writes_inside_its_directory_output(
+def test_pull_restores_build_dir_inside_directory_output(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ) -> None:
-    """build/ is skipped by the directory hash, so it is not part of the output: pull keeps it."""
+    """A build directory is cached and restored with the rest of its artifact."""
     clone, env = _dirout_clone_after_teammate_rerun(
         tmp_path, moto_services["s3"], _DIROUT_BUILD_PIPELINE
     )
     shards = clone / "data" / "d" / "shards.dat"
-    assert (shards / "build" / "log.txt").read_text() == "built 2 rows"
+    assert (shards / "build" / "log.txt").read_text() == "built 10"
 
     _ok(_pivot(clone, "pull", "d/shards", env=env))
 
     assert sorted(p.name for p in shards.iterdir()) == ["0.txt", "1.txt", "build"]
     assert (shards / "0.txt").read_text() == "11"
-    assert (shards / "build" / "log.txt").read_text() == "built 2 rows"
+    assert (shards / "build" / "log.txt").read_text() == "built 26"
 
 
 _PARAM_PIPELINE = """\
@@ -1151,3 +1153,90 @@ def test_doctor_reports_remote_name_validation_rule(tmp_path: pathlib.Path) -> N
         "Error: Invalid config remotes.bad name: 's3://valid-bucket/prefix'; "
         + "Invalid remote name 'bad name': must be alphanumeric, hyphens, or underscores"
     )
+
+
+_DIRECTORY_INPUT_PIPELINE = """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def listing(tree: pathlib.Path) -> str:
+    files = sorted(p for p in tree.rglob("*") if p.is_file())
+    return ";".join(f"{p.relative_to(tree).as_posix()}={p.read_text()}" for p in files)
+
+
+with Pipeline("d") as pipeline:
+    listing(pipeline.input("tree"))
+"""
+
+
+@pytest.mark.parametrize("relpath", ["__pycache__/x.pyc", "build/y"])
+def test_editing_any_file_in_directory_input_reruns_consumer(
+    tmp_path: pathlib.Path, relpath: str
+) -> None:
+    """A directory input's hash covers every file, whatever its name."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIRECTORY_INPUT_PIPELINE,
+            "data/raw/tree/keep.txt": "keep",
+            "data/raw/tree/__pycache__/x.pyc": "v1",
+            "data/raw/tree/build/y": "v1",
+        },
+    )
+    output = root / "data" / "d" / "listing.txt"
+    _ok(_pivot(root, "repro"))
+    assert output.read_text() == "__pycache__/x.pyc=v1;build/y=v1;keep.txt=keep"
+
+    (root / "data" / "raw" / "tree" / relpath).write_text("v2")
+    out = _ok(_pivot(root, "repro"))
+
+    assert f"{relpath}=v2" in output.read_text(), out
+
+
+_DIRECTORY_OUTPUT_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, StageParams, stage
+
+
+@stage
+def bundle(params: StageParams) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "bundle"
+    for relpath in ("keep.txt", "__pycache__/x.pyc", "build/y"):
+        (out / relpath).parent.mkdir(parents=True, exist_ok=True)
+        (out / relpath).write_text(relpath)
+    return out
+
+
+with Pipeline("o") as pipeline:
+    bundle(params=StageParams())
+"""
+
+
+def _tree_contents(root: pathlib.Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): path.read_text()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_directory_output_keeps_every_file_through_checkout(tmp_path: pathlib.Path) -> None:
+    """A directory output is cached and restored whole, whatever its files are named."""
+    root = _project(tmp_path, {"pipeline.py": _DIRECTORY_OUTPUT_PIPELINE})
+    bundle = root / "data" / "o" / "bundle.dat"
+    expected = {name: name for name in ("keep.txt", "__pycache__/x.pyc", "build/y")}
+    _ok(_pivot(root, "repro"))
+    assert _tree_contents(bundle) == expected
+
+    if bundle.is_symlink():
+        bundle.unlink()
+    else:
+        shutil.rmtree(bundle)
+    out = _ok(_pivot(root, "checkout"))
+
+    assert _tree_contents(bundle) == expected, out

@@ -36,10 +36,10 @@ if TYPE_CHECKING:
 def _helper_pipeline_source(change_suffix: str, *, third: str, refused: bool = False) -> str:
     """pipeline.py with stages keep, change (input + change_suffix) and ``third``.
 
-    With ``refused``, ``change`` reads its suffix from a module-level tuple, which
+    With ``refused``, ``change`` reads its suffix from a module-level list, which
     fingerprinting refuses.
     """
-    suffixes = f"SUFFIXES = ({change_suffix!r},)\n\n\n" if refused else ""
+    suffixes = f"SUFFIXES = [{change_suffix!r}]\n\n\n" if refused else ""
     change_value = "SUFFIXES[0]" if refused else repr(change_suffix)
     return f"""\
 from __future__ import annotations

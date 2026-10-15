@@ -65,7 +65,7 @@ import pandas as pd
 
 from pivot import Pipeline, stage
 
-COL = ("a",)
+COL = ("a", ["b"])
 
 
 @stage
@@ -78,7 +78,9 @@ with Pipeline("k") as pipeline:
 """
 
 
-def test_module_level_tuple_read_by_stage_is_an_error(tmp_path: pathlib.Path) -> None:
+def test_module_level_tuple_holding_a_list_read_by_stage_is_an_error(
+    tmp_path: pathlib.Path,
+) -> None:
     root = _helper_project(
         tmp_path, {"pipeline.py": _TUPLE_PIPELINE, "data/raw/t.csv": "a,b,c\n1,2,3\n"}
     )
@@ -86,8 +88,88 @@ def test_module_level_tuple_read_by_stage_is_an_error(tmp_path: pathlib.Path) ->
     proc = _helper_pivot(root, "repro")
 
     output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"tuple capture was accepted:\n{output}"
-    assert "COL" in output, output
+    assert proc.returncode != 0, f"tuple holding a list was accepted:\n{output}"
+    assert "captures non-scalar variable 'COL' (type: tuple)" in output, output
+
+
+_IMMUTABLE_CAPTURE_PIPELINE = """\
+import pandas as pd
+
+import settings
+from pivot import Pipeline, stage
+from settings import VALUE
+
+
+@stage
+def show(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw.assign(v=SHOW)
+
+
+with Pipeline("im") as pipeline:
+    show(pipeline.input("t.csv"))
+"""
+
+
+@pytest.mark.parametrize("access", ["VALUE", "settings.VALUE"], ids=["from-import", "module-attr"])
+@pytest.mark.parametrize(
+    ("show", "original", "same", "edited", "shown_before", "shown_after"),
+    [
+        pytest.param(
+            '"-".join({access})',
+            'VALUE = ("patchable", "squash")\n',
+            'VALUE = (\n    "patchable",\n    "squash",\n)\n',
+            'VALUE = ("patchable", "squash", "zstd")\n',
+            "patchable-squash",
+            "patchable-squash-zstd",
+            id="tuple",
+        ),
+        pytest.param(
+            '"-".join(sorted({access}))',
+            'VALUE = frozenset({"tasks", "runs", "models"})\n',
+            'VALUE = frozenset({"runs", "models", "tasks"})\n',
+            'VALUE = frozenset({"tasks", "runs", "jobs"})\n',
+            "models-runs-tasks",
+            "jobs-runs-tasks",
+            id="frozenset",
+        ),
+        pytest.param(
+            "{access}.pattern + str({access}.flags)",
+            'import re\n\nVALUE = re.compile(r"x+")\n',
+            'import re\n\nVALUE = re.compile(r"x+", re.UNICODE)\n',
+            'import re\n\nVALUE = re.compile(r"x+", re.IGNORECASE)\n',
+            "x+32",
+            "x+34",
+            id="pattern-flags",
+        ),
+    ],
+)
+def test_editing_immutable_module_value_reruns_stage(
+    tmp_path: pathlib.Path,
+    access: str,
+    show: str,
+    original: str,
+    same: str,
+    edited: str,
+    shown_before: str,
+    shown_after: str,
+) -> None:
+    """A tuple, frozenset or compiled regex is tracked by value, not by its source text."""
+    pipeline = _IMMUTABLE_CAPTURE_PIPELINE.replace("SHOW", show.format(access=access))
+    root = _helper_project(
+        tmp_path,
+        {"pipeline.py": pipeline, "settings.py": original, "data/raw/t.csv": "a\n1\n"},
+    )
+    output_path = root / "data/im/show.jsonl"
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert _helper_rows(output_path) == [{"a": 1, "v": shown_before}]
+
+    (root / "settings.py").write_text(same)
+    status = _helper_ok(_helper_pivot(root, "status"))
+    assert "1 cached, 0 stale" in status, f"an equal value made the stage stale:\n{status}"
+
+    (root / "settings.py").write_text(edited)
+    output = _helper_ok(_helper_pivot(root, "repro"))
+    assert _helper_rows(output_path) == [{"a": 1, "v": shown_after}], output
 
 
 _MODULE_ATTR_PIPELINE = """\
@@ -631,7 +713,7 @@ from typing import Annotated
 from pivot import Pipeline, loaders, stage
 
 FACTOR = 2
-COLS = ("a",)
+COLS = ["a"]
 
 
 def scale_rows(data: dict) -> dict:
@@ -715,7 +797,7 @@ import pandas as pd
 from pivot import Pipeline, stage
 
 FACTOR = 2
-COLS = ("a",)
+COLS = ["a"]
 
 
 def factor() -> int:
@@ -799,8 +881,8 @@ def test_non_scalar_read_by_bound_function_is_an_error(
     proc = _helper_pivot(root, "repro")
 
     output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"tuple read by a bound function was accepted:\n{output}"
-    assert "captures non-scalar variable 'COLS' (type: tuple)" in output, output
+    assert proc.returncode != 0, f"list read by a bound function was accepted:\n{output}"
+    assert "captures non-scalar variable 'COLS' (type: list)" in output, output
 
 
 @pytest.mark.parametrize(
@@ -839,7 +921,7 @@ def test_user_callable_instance_bound_in_config_is_an_error(
 def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathlib.Path) -> None:
     pipeline = (
         _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", "keep_cols")
-        .replace('COLS = ("a",)', 'COLS = ("a",)\nSTAGE_KEYS = ["k"]')
+        .replace('COLS = ["a"]', 'COLS = ["a"]\nSTAGE_KEYS = ["k"]')
         .replace('return {"a": 3}', 'return {"a": len(STAGE_KEYS)}')
     )
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
@@ -849,7 +931,7 @@ def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathli
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert "'STAGE_KEYS' (type: list)" in output, output
-    assert "'COLS' (type: tuple)" in output, output
+    assert "'COLS' (type: list)" in output, output
 
 
 def test_editing_model_class_used_by_loader_reruns_stage(tmp_path: pathlib.Path) -> None:
@@ -877,7 +959,7 @@ from typing import Annotated
 from pivot import Pipeline, loaders, stage
 
 FACTOR = 2
-KEYS = ("a",)
+KEYS = ["a"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -936,9 +1018,9 @@ def test_non_scalar_read_by_custom_loader_method_is_an_error(tmp_path: pathlib.P
     proc = _helper_pivot(root, "repro")
 
     output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"tuple read by a loader's save() was accepted:\n{output}"
+    assert proc.returncode != 0, f"list read by a loader's save() was accepted:\n{output}"
     assert "Stage 's/make'" in output, output
-    assert "captures non-scalar variable 'KEYS' (type: tuple)" in output, output
+    assert "captures non-scalar variable 'KEYS' (type: list)" in output, output
 
 
 _SHARED_LOADER_PIPELINE = """\
@@ -948,7 +1030,7 @@ import pathlib
 
 from pivot import Pipeline, loaders, stage
 
-KEYS = ("a",)
+KEYS = ["a"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1804,7 +1886,7 @@ from pivot import Pipeline, stage
 
 class Config:
     SCALE = int(os.environ.get("SCALE", "2"))
-    COLUMNS = ("a",)
+    COLUMNS = ("a", ["b"])
 
 
 class Mode(enum.Enum):
@@ -1857,7 +1939,7 @@ def test_value_read_through_a_class_at_import_reruns_stage(
 
 
 def test_non_scalar_class_attribute_is_an_error(tmp_path: pathlib.Path) -> None:
-    """A tuple read as `Config.COLUMNS` is refused like a module-level tuple."""
+    """A tuple holding a list read as `Config.COLUMNS` is refused."""
     pipeline = _CLASS_ATTRIBUTE_PIPELINE.format(read="len(Config.COLUMNS)")
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
 
@@ -2047,7 +2129,7 @@ class Color(enum.IntEnum):
 
 
 class Config:
-    COLUMNS = ("a",)
+    COLUMNS = ("a", ["b"])
 """
 
 _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE = """\
@@ -2096,7 +2178,7 @@ def test_class_attribute_through_a_module_follows_the_class_rule(
 
 
 def test_non_scalar_class_attribute_through_a_module_is_an_error(tmp_path: pathlib.Path) -> None:
-    """`settings.Config.COLUMNS` is refused, as `Config.COLUMNS` is."""
+    """`settings.Config.COLUMNS` holding a list is refused."""
     pipeline = _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE.format(read="len(settings.Config.COLUMNS)")
     root = _helper_project(
         tmp_path,

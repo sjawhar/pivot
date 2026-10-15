@@ -15,9 +15,9 @@ logical keys to hashes:
 | `self:<name>` | The stage function's own AST |
 | `func:<module>.<qualname>` | Helper functions called by the stage |
 | `class:<module>.<qualname>` | User-defined classes referenced by the stage |
-| `const:<module>.<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`), read as a global or as `module.NAME`; a helper read as `module.helper` is a `func:` entry, a library function an `ext:` entry |
-| `const:<module>.<qualname>.<name>` | Scalars in a closure cell, keyed under the function that holds the cell, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
-| `default:<module>.<qualname>.<parameter>` | Default argument values (scalars and `StageParams`) |
+| `const:<module>.<name>` | Immutable module-level values, read as a global or as `module.NAME`; a helper read as `module.helper` is a `func:` entry, a library function an `ext:` entry |
+| `const:<module>.<qualname>.<name>` | Immutable values in a closure cell, keyed under the function that holds the cell, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
+| `default:<module>.<qualname>.<parameter>` | Default argument values the AST does not record |
 | `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); library code is not hashed |
 | `schema:<module>.<qualname>` | Pydantic model JSON schemas |
 | `wire:<parameter>` | Call-site artifact wiring: a direct identity, or a collection's kind and ordered identities; input path bindings use `wire:<parameter>:path` or `:paths` |
@@ -50,11 +50,12 @@ If `train()` calls `normalize()` which calls `clip_outliers()`, all three
 functions appear in the manifest. Changing `clip_outliers` triggers a
 re-run of `train` even though `train` itself didn't change.
 
-Module-level primitive values are tracked too. If your stage does
-`from myproject import config` and then accesses `config.THRESHOLD`, Pivot captures the primitive
-value or the called function. A stage reading any other module-level value—such as a tuple,
-collection, enum member, frozen model, or instance—raises `StageDefinitionError`; use
-[StageParams](parameters.md) instead.
+Module-level scalars, exact tuples and frozensets of scalars, and compiled
+regular expressions are tracked by value. If your stage does `from myproject
+import config` and then accesses `config.THRESHOLD`, Pivot captures the value
+or the called function. A stage reading any other module-level value, such as a
+list, dict, set, nested collection, enum member, frozen model, or instance,
+raises `StageDefinitionError`; use [StageParams](parameters.md) instead.
 
 ## What Triggers a Re-Run
 
@@ -91,10 +92,12 @@ def normalize(df):
 ### Module-Level Values
 
 A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or
-`None`; editing it re-runs the stage. Reading any other module-level value
-(tuple, list, dict, set, frozenset, enum member, class instance, or a method
-bound to an instance such as `np.random.default_rng(SEED).normal`), directly or
-as `module.NAME`, is a `StageDefinitionError` that names the variable:
+`None`, a `tuple` or `frozenset` of such values, or a compiled regular
+expression; editing it re-runs the stage. A regex is tracked by its pattern and
+flags. Reading any other module-level value (list, dict, set, a tuple holding a
+tuple, list or object, enum member, class instance, or a method bound to an
+instance such as `np.random.default_rng(SEED).normal`), directly or as
+`module.NAME`, is a `StageDefinitionError` that names the variable:
 
 ```python
 COLUMNS = {"score": float}  # Module-level dict
@@ -107,14 +110,15 @@ def process(data: pd.DataFrame) -> pd.DataFrame:
 
 The same rule covers a default argument that reads a module value, such as
 `def process(data, cols=COLUMNS)`, on the stage or on a helper it calls. A
-default is evaluated when the module loads, so Pivot checks its value: a scalar
-is tracked, and anything else is refused. A literal default such as
-`cols=("a", "b")` is part of the function's code and is tracked with it. A
-default that is a pipeline input handle (`raw=RAW` with
-`RAW = pipeline.input("t.csv")`) is wired as an input and tracked by its content.
+default is evaluated when the module loads, so Pivot checks its value: a scalar,
+a tuple or frozenset of scalars, or a compiled regex is tracked, and anything
+else is refused. A literal default such as `cols=("a", "b")` is part of the
+function's code and is tracked with it. A default that is a pipeline input
+handle (`raw=RAW` with `RAW = pipeline.input("t.csv")`) is wired as an input
+and tracked by its content.
 
-Fix: move the value into the stage's [StageParams](parameters.md). Configuration
-in module-level collections is not supported.
+Fix: move a mutable or nested value into the stage's [StageParams](parameters.md).
+Configuration in module-level mutable collections is not supported.
 
 To suppress the check (at your own risk), set
 `core.unsafe_fingerprinting = true` in your Pivot config or
