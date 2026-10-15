@@ -56,7 +56,7 @@ if TYPE_CHECKING:
 @pytest.fixture
 def mp_manager() -> Generator[SyncManager]:
     """Provide a multiprocessing Manager with automatic cleanup."""
-    manager = multiprocessing.Manager()
+    manager = multiprocessing.get_context("spawn").Manager()
     yield manager
     manager.shutdown()
 
