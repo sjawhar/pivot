@@ -6,7 +6,7 @@ import pathlib
 
 import click
 
-from pivot import config, discovery, project, registry, types
+from pivot import config, discovery, exceptions, project, registry, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -235,7 +235,7 @@ def get(
     if pipeline is None:
         try:
             pipeline = discovery.discover_pipeline()
-        except discovery.DiscoveryError as e:
+        except (discovery.DiscoveryError, exceptions.PipelineConfigError) as e:
             logger.warning(f"Pipeline not loaded, so every target is read as a file: {e}")
         if pipeline is not None:
             cli_decorators.store_pipeline_in_context(pipeline)

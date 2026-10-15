@@ -147,6 +147,30 @@ def test_get_restores_files_while_pipeline_is_broken(
     assert (repo_path / "notes.txt").read_text() == "notes"
 
 
+def test_get_restores_a_file_while_pipeline_root_is_refused(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
+    """A root-refused pipeline stops stage lookup, not restoration of a tracked file."""
+    repo_path, commit = git_repo
+    (repo_path / "notes.txt").write_text("notes")
+    sha = commit("initial")
+    (repo_path / "pipeline.py").write_text(
+        "from pathlib import Path\n\n"
+        + "from pivot.compose import Pipeline\n\n"
+        + 'with Pipeline("sub", root=Path(__file__).parent / "sub") as pipeline:\n'
+        + "    pass\n"
+    )
+    (repo_path / "notes.txt").unlink()
+    (repo_path / ".pivot" / "cache").mkdir(parents=True)
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "--force", "notes.txt"])
+
+    assert result.exit_code == 0, result.output
+    assert (repo_path / "notes.txt").read_text() == "notes"
+
+
 def test_get_skip_existing_without_force(
     runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
 ) -> None:
