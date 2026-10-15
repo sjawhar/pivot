@@ -120,6 +120,8 @@ pivot repro --resources gpu=2
 
 Resource names are case-insensitive. Resources control admission only: a waiting stage does not consume a worker, and changing a resource declaration does not invalidate cached outputs.
 
+- `joblib.Parallel` defaults to threads inside a stage; for CPU-bound Python work, run `PIVOT_NESTED_PARALLELISM=processes pivot repro` and declare `@stage(resources={"cpu": "all"})` so nested process pools do not overlap.
+
 ## Pipelines and inputs
 
 - `pipeline.py` must bind the pipeline to a module variable named `pipeline`. Pivot finds `pipeline.py` in the current directory or the project root (the top-most directory containing `.pivot/`).
