@@ -336,6 +336,7 @@ class OutEntry(TypedDict):
 
     key: str | None
     hash: str
+    path: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -358,7 +359,7 @@ class LockData(TypedDict):
     params: dict[str, Any]
     dep_hashes: dict[ArtifactIdentity, HashInfo]
     output_hashes: dict[ArtifactIdentity, HashInfo]
-
+    output_paths: NotRequired[dict[ArtifactIdentity, str]]
 
 class OutputMessageKind(enum.StrEnum):
     """Discriminant for worker→engine output messages."""

@@ -43,7 +43,7 @@ successful run:
 | `code_manifest` | [Fingerprint](fingerprinting.md) dict (key → hash) |
 | `params` | Serialised [parameters](parameters.md) dict |
 | `deps` | One entry per input: producer, key, content hash |
-| `outs` | One entry per output: key, content hash |
+| `outs` | One entry per output: key, project-relative POSIX path, content hash |
 
 This is the ground truth for "what did the stage look like last time it
 ran?" The skip algorithm compares current state against these fields.

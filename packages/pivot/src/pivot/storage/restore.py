@@ -12,13 +12,13 @@ import yaml
 from pivot import exceptions, git, project, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
-from pivot.types import DirHash, FileHash
+from pivot.types import DirHash, FileHash, HashInfo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from pivot.storage.track import PvtData
-    from pivot.types import HashInfo, OutEntry, StorageLockData
+    from pivot.types import OutEntry, StorageLockData
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class StageTarget(TypedDict):
     stage_name: str
     state_dir: pathlib.Path
     paths_by_key: dict[str | None, str]
-    """Lock output key -> workspace path (relative to the project root)."""
+    """Fallback lock output key -> workspace path for older locks with no recorded path."""
 
 
 def _parse_yaml_bytes[T](
@@ -158,11 +158,19 @@ def resolve_targets(
                     f"Stage '{stage_name}' has no lock file at revision '{rev}'"
                 )
             paths_by_key = stage_target["paths_by_key"]
-            hashes: dict[str, HashInfo | None] = {
-                paths_by_key[entry["key"]]: _out_entry_to_output_hash(entry)
-                for entry in lock_data["outs"]
-                if entry["key"] in paths_by_key
-            }
+            hashes = dict[str, HashInfo | None]()
+            for entry in lock_data["outs"]:
+                key = entry["key"]
+                if "path" in entry:
+                    path = entry["path"]
+                elif key in paths_by_key:
+                    path = paths_by_key[key]
+                else:
+                    raise exceptions.TargetNotFoundError(
+                        f"Target '{target}' output key {key!r} at revision '{rev}' has no "
+                        + "recorded path and is not defined by the current pipeline"
+                    )
+                hashes[path] = _out_entry_to_output_hash(entry)
             if not hashes:
                 raise exceptions.TargetNotFoundError(
                     f"Target '{target}' recorded no outputs at revision '{rev}'"
@@ -378,12 +386,8 @@ def restore_targets_from_revision(
     if output is not None:
         if len(target_infos) != 1:
             raise exceptions.GetError("--output/-o can only be used with a single target")
-        if target_infos[0]["target_type"] == TargetType.STAGE:
-            raise exceptions.GetError(
-                "--output/-o cannot be used with stage names (use file path instead)"
-            )
         if len(target_infos[0]["paths"]) != 1:
-            raise exceptions.GetError("--output/-o cannot be used with directory targets")
+            raise exceptions.GetError("--output/-o can only be used with a single output")
 
     results = list[RestoreResult]()
 
