@@ -779,7 +779,7 @@ with Pipeline("d") as pipeline:
     shards(pipeline.input("t.csv"))
 """
 
-# The same stage, also writing a build/ directory, a name the directory hash skips.
+# The same stage, also writing a build/ directory that is part of the artifact.
 _DIROUT_BUILD_PIPELINE = _DIROUT_PIPELINE.replace(
     "    return out\n",
     '    (out / "build").mkdir()\n'
@@ -885,10 +885,10 @@ def test_pull_refuses_directory_output_with_hand_edited_file(
     assert (shards / "1.txt").read_text() == "7", "a refused pull must not restore anything"
 
 
-def test_pull_keeps_build_dir_the_stage_writes_inside_its_directory_output(
+def test_pull_restores_build_dir_inside_directory_output(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ) -> None:
-    """build/ is skipped by the directory hash, so it is not part of the output: pull keeps it."""
+    """build/ is an artifact member, so pull restores it with the other output files."""
     clone, env = _dirout_clone_after_teammate_rerun(
         tmp_path, moto_services["s3"], _DIROUT_BUILD_PIPELINE
     )
