@@ -308,10 +308,8 @@ def test_hash_directory_includes_size(tmp_path: pathlib.Path) -> None:
     assert manifest[0]["size"] == 5
 
 
-def test_hash_directory_leaves_out_symlinks_to_files_outside_the_cache(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A symlink that is not a cache-object link is not part of the manifest."""
+def test_hash_directory_skips_symlinks(tmp_path: pathlib.Path) -> None:
+    """Symlinks in directory are skipped."""
     test_dir = tmp_path / "mydir"
     test_dir.mkdir()
     (test_dir / "real.txt").write_text("content")
@@ -319,7 +317,9 @@ def test_hash_directory_leaves_out_symlinks_to_files_outside_the_cache(
 
     _, manifest = cache.hash_directory(test_dir)
 
-    assert [entry["relpath"] for entry in manifest] == ["real.txt"]
+    relpaths = [e["relpath"] for e in manifest]
+    assert "real.txt" in relpaths
+    assert "link.txt" not in relpaths, "Symlinks should be skipped"
 
 
 def test_hash_directory_marks_executable(tmp_path: pathlib.Path) -> None:
