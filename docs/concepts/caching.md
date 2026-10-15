@@ -43,7 +43,7 @@ successful run:
 | `code_manifest` | [Fingerprint](fingerprinting.md) dict (key → hash) |
 | `params` | Serialised [parameters](parameters.md) dict |
 | `deps` | One entry per input: producer, key, content hash |
-| `outs` | One entry per output: key, content hash, tag (`data`, `metric`, `plot`) |
+| `outs` | One entry per output: key, content hash |
 
 This is the ground truth for "what did the stage look like last time it
 ran?" The skip algorithm compares current state against these fields.
@@ -125,7 +125,8 @@ restored.
 
 ## File Change Detection
 
-Pivot uses a two-level strategy for detecting file changes:
+Pivot uses a two-level strategy for detecting file changes in dependencies and
+outputs Pivot committed:
 
 1. **Stat check** — compare `(mtime_ns, size, inode)` against the
    StateDB cache. If all three match, reuse the cached hash (no I/O).
@@ -134,11 +135,16 @@ Pivot uses a two-level strategy for detecting file changes:
 
 This gives O(1) skip detection for unchanged files while remaining
 correct when files do change (content hash is the source of truth).
+The fast path cannot detect an edit that preserves the size, inode, and
+mtime, such as a tool that restores the original mtime. Pivot detects the
+file after its metadata changes. Run `pivot repro --force <stage>` to rewrite
+the stage's output.
 
 ## Checkout Modes
 
 When restoring outputs from cache, Pivot supports three strategies,
-tried in order of preference:
+tried in order of preference. The same order links each stage output to
+its cache entry after the stage runs, and when a skipped stage restores it:
 
 | Mode | How it works | Trade-off |
 |------|-------------|-----------|

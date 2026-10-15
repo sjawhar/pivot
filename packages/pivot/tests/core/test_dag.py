@@ -70,7 +70,7 @@ class _DependencyStore:
     def prepare_output(self, ref: ArtifactRef) -> Path:
         raise AssertionError(f"not used by dependency validation: {ref}")
 
-    def commit(self, ref: ArtifactRef, path: Path) -> str:
+    def commit(self, ref: ArtifactRef, path: Path) -> HashInfo:
         raise AssertionError(f"not used by dependency validation: {ref} {path}")
 
     def hash_artifact(

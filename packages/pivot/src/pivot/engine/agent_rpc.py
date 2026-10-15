@@ -341,10 +341,16 @@ class AgentRpcHandler:
                     except Exception as e:
                         raise ValueError(f"Failed to load params.yaml: {e}") from e
                     all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
+                    producers = {
+                        ref.identity.producer
+                        for ref in reg_info["deps"].values()
+                        if ref.identity.producer in all_stages
+                    }
+                    locks = explain_mod.read_locks(
+                        [stage, *producers], all_stages, config_io.get_state_dir()
+                    )
                     producer_hashes = explain_mod.producer_output_hashes(
-                        list(all_stages),
-                        all_stages,
-                        config_io.get_state_dir(),
+                        locks[producer] for producer in producers
                     )
                     store = store_mod.WorkspaceStore(
                         project_root=project.get_project_root(),
@@ -363,6 +369,7 @@ class AgentRpcHandler:
                             reg_info, config_io.get_state_dir()
                         ),
                         store=store,
+                        lock_data=locks[stage],
                         allow_missing=True,
                         producer_hashes=producer_hashes,
                     )

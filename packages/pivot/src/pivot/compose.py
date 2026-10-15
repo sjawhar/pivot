@@ -100,7 +100,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             identity=identity,
             format=handle._source.format,
             python_type=handle._python_type,
-            tag=types.ArtifactTag.DATA,
+            tag=types.ArtifactTag.INPUT,
         )
 
     source = handle._source
@@ -205,7 +205,8 @@ def _default_values(func: Callable[..., Any]) -> dict[str, object]:
 
 def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
     key = types.identity_key(identity)
-    return key if tag == types.ArtifactTag.DATA else f"{key} ({tag})"
+    plain = tag in (types.ArtifactTag.DATA, types.ArtifactTag.INPUT)
+    return key if plain else f"{key} ({tag})"
 
 
 def _show_items(items: collections.abc.Mapping[str, object]) -> str:
@@ -452,7 +453,7 @@ def _emit_stage_info(
         outs=outs,
         incremental_inputs=incremental_inputs,
         params=node.params,
-        resources=dict(getattr(func, "__pivot_resources__", {})),
+        resources=dict(node.resources),
         variant=node.variant,
         signature=inspect.signature(func),
         fingerprint=None,
@@ -655,12 +656,20 @@ class Pipeline:
         self._registry = new_registry
 
     def _check_inputs_against_outputs(self, reg: registry.StageRegistry) -> None:
-        """Refuse an input whose path equals, contains, or lies inside a registered output.
+        """Refuse an input named like a stage, or whose path overlaps a registered output.
 
-        Runs once the registry holds every output: at materialization and after an include()
-        outside a construction block (how --all combines pipelines).
+        An input's identity is its name and a stage's single output's identity is the stage
+        name, so one name cannot be both. Runs once the registry holds every output: at
+        materialization and after an include() outside a construction block (how --all
+        combines pipelines).
         """
+        stage_names = set(reg.list_stages())
         for node in self._inputs.values():
+            if node.name in stage_names:
+                raise exceptions.PipelineConfigError(
+                    f"Input '{node.name}' has the name of stage '{node.name}'. "
+                    + "Rename the input, or pass the stage's handle to read its output."
+                )
             normalized = pathlib.Path(os.path.normpath(self._root / node.path))
             if not normalized.is_relative_to(self._root):
                 continue  # path_policy keeps inputs in the project; outputs always are
@@ -785,6 +794,7 @@ class Pipeline:
         original_func: Callable[..., object],
         stage_wrapper: Callable[..., object],
         output_specs: list[_OutputSpec],
+        resources: dict[str, int | str],
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> ArtifactHandle:
@@ -919,6 +929,7 @@ class Pipeline:
             output_specs=output_specs,
             call_index=count,
             variant=variant_str,
+            resources=resources,
             list_input_handles=list_input_handles,
             collection_params=collection_params,
             incremental_inputs=incremental_inputs,
@@ -1229,8 +1240,14 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
 # --- @stage decorator ---
 
 
-def _normalize_stage_resources(resources: dict[str, int | str] | None) -> dict[str, int | str]:
-    """Normalize and validate a stage's scheduler resource requests."""
+def _normalize_stage_resources(
+    resources: collections.abc.Mapping[str, object] | None,
+) -> dict[str, int | str]:
+    """Normalize and validate a stage's scheduler resource requests.
+
+    Values are checked at runtime, since a decorator argument can be anything: a positive
+    int (not bool), or ``"all"`` for cpu only.
+    """
     if resources is None:
         return dict[str, int | str]()
 
@@ -1249,7 +1266,7 @@ def _normalize_stage_resources(resources: dict[str, int | str] | None) -> dict[s
             if normalized_name != "cpu":
                 raise ValueError("Only the 'cpu' resource supports an 'all' request")
             normalized[normalized_name] = "all"
-        elif not isinstance(request, bool) and request > 0:
+        elif isinstance(request, int) and not isinstance(request, bool) and request > 0:
             normalized[normalized_name] = request
         else:
             raise ValueError(
@@ -1291,7 +1308,6 @@ def stage[**P, R](
 def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None) -> Callable[P, R]:
     """Build a stage wrapper for a validated resource declaration."""
     normalized_resources = _normalize_stage_resources(resources)
-    setattr(func, "__pivot_resources__", normalized_resources)  # noqa: B010
     _cached_specs: list[_OutputSpec] | None = None
 
     def _get_output_specs() -> list[_OutputSpec]:
@@ -1305,7 +1321,9 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
+        return pipeline._record_stage(
+            func, wrapper, _get_output_specs(), normalized_resources, args, kwargs
+        )
 
     wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
     wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
@@ -1334,6 +1352,7 @@ class _StageNode:
     no_fingerprint: bool = False
     code_deps: list[str] = dataclasses.field(default_factory=list)
     incremental_inputs: dict[str, str] = dataclasses.field(default_factory=dict)
+    resources: dict[str, int | str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass

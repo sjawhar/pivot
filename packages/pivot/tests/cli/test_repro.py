@@ -1562,6 +1562,87 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
             proc.wait()
 
 
+_WATCH_CPU_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage(resources={"cpu": 2})
+def solo(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 2
+
+
+@stage
+def other(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 3
+
+
+with Pipeline("w") as pipeline:
+    solo(pipeline.input("solo.csv"))
+    other(pipeline.input("other.csv"))
+"""
+
+
+def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A watch run of one `cpu: 2` stage fits the worker count; an over-capacity request is an
+    invalid pipeline, not the end of the watch."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".pivot").mkdir()
+    (project / "data" / "raw").mkdir(parents=True)
+    (project / "data" / "raw" / "solo.csv").write_text("n\n1\n")
+    (project / "data" / "raw" / "other.csv").write_text("n\n1\n")
+    (project / ".pivot" / "config.yaml").write_text("core:\n  max_workers: 2\n")
+    pipeline_py = project / "pipeline.py"
+    pipeline_py.write_text(_WATCH_CPU_PIPELINE)
+    output = project / "data" / "w" / "solo.jsonl"
+    log_path = tmp_path / "watch.log"
+    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    def doubled() -> list[int] | None:
+        if not output.exists():
+            return None
+        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--debounce", "100"],
+            cwd=project,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    try:
+        _wait_for_watch(proc, log_path, lambda: doubled() == [2])
+
+        # Only `solo` is scheduled now: one stage, but the cpu capacity is still 2 workers.
+        (project / "data" / "raw" / "solo.csv").write_text("n\n5\n")
+        _wait_for_watch(proc, log_path, lambda: doubled() == [10])
+
+        pipeline_py.write_text(_WATCH_CPU_PIPELINE.replace('"cpu": 2', '"gpu": 2'))
+        _wait_for_watch(
+            proc,
+            log_path,
+            lambda: "Pipeline invalid - waiting for fix" in log_path.read_text(errors="replace"),
+        )
+        assert "requests 2 units of resource 'gpu', but its capacity is 1" in log_path.read_text(
+            errors="replace"
+        )
+        time.sleep(1)
+        assert proc.poll() is None, log_path.read_text(errors="replace")
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def test_repro_watch_ctrl_c_exits_while_a_reload_import_hangs(tmp_path: pathlib.Path) -> None:
     """Ctrl-C stops plain watch at once even while an edited pipeline.py's import never returns."""
     project = tmp_path / "project"

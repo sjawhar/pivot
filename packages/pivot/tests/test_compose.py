@@ -600,7 +600,7 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     assert stage_a["name"] == "compose_build/_helper_build_stage_a"
     assert stage_a["deps"]["raw"].identity == types.ArtifactIdentity(producer="raw", key=None)
     assert isinstance(stage_a["deps"]["raw"].format, loaders.YAML)
-    assert stage_a["deps"]["raw"].tag is types.ArtifactTag.DATA
+    assert stage_a["deps"]["raw"].tag is types.ArtifactTag.INPUT
     assert stage_a["params"] is not None
     assert isinstance(stage_a["params"], stage_def.StageParams)
     assert stage_a["params_arg_name"] == "params"
@@ -1961,12 +1961,12 @@ def _helper_execute_compose_stage(
         project_root=str(tmp_path),
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
+        checkout_modes=[cache.CheckoutMode.COPY],
     )
     stage_info = executor_core.prepare_worker_info(
         pipeline.get_stage(stage_name),
         pipeline,
         overrides={},
-        checkout_modes=[cache.CheckoutMode.COPY],
         run_id="test_run",
         force=False,
         no_commit=False,

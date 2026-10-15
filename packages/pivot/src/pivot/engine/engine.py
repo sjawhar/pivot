@@ -28,7 +28,6 @@ from pivot import (
     config,
     exceptions,
     fingerprint,
-    merkle,
     parameters,
     project,
     registry,
@@ -67,7 +66,7 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactTag,
     CompletionType,
-    DepEntry,
+    DeferredWrites,
     HashInfo,
     LockData,
     OnError,
@@ -317,7 +316,6 @@ class Engine:
         self._stored_max_workers = None
         self._stored_resource_capacity = dict[str, int]()
         self._current_overrides: parameters.ParamsOverrides | None = None
-        self._merkle_ids: dict[str, str] = {}
 
         # Track whether run() has completed to prevent re-use
         self._run_completed = False
@@ -1096,18 +1094,26 @@ class Engine:
                     + "files first."
                 )
 
-        # Compute max workers
+        # Compute max workers: the pool never needs more workers than stages, but the cpu
+        # resource capacity is the configured worker count, whatever this run schedules.
         effective_max_workers = (
             1
             if not parallel
             else executor_core.compute_max_workers(len(execution_order), max_workers)
         )
+        cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1
 
-        stage_resources, capacities = self._resolve_stage_resources(
-            execution_order,
-            effective_max_workers,
-            resource_capacity,
-        )
+        try:
+            stage_resources, capacities = self._resolve_stage_resources(
+                execution_order,
+                cpu_capacity,
+                resource_capacity,
+            )
+        except exceptions.ValidationError as exc:
+            if not self._watches_filesystem():
+                raise
+            await self._invalidate_pipeline([str(exc)])
+            return {}
 
         # Load config. Startup and every reload check params.yaml, so in watch mode an error
         # here is an edit the watcher has not reported yet: the pipeline becomes invalid.
@@ -1120,7 +1126,6 @@ class Engine:
             return {}
         checkout_modes = config.get_checkout_mode_order()
         self._current_overrides = overrides
-        self._merkle_ids = dict[str, str]()
 
         # Get project paths for worker info
         project_root = project.get_project_root()
@@ -1527,36 +1532,29 @@ class Engine:
     def _resolve_stage_resources(
         self,
         execution_order: list[str],
-        max_workers: int,
+        cpu_capacity: int,
         cli_resource_capacity: dict[str, int],
     ) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
-        """Resolve configured and CLI resource capacities for a scheduler run."""
+        """Resolve configured and CLI resource capacities for a scheduler run.
+
+        ``cpu`` defaults to ``cpu_capacity`` (the worker count) unless config or
+        ``--resources`` sets it.
+        """
         capacities = {
             name.casefold(): capacity for name, capacity in config.get_resource_capacities().items()
         }
         capacities.update(
             {name.casefold(): capacity for name, capacity in cli_resource_capacity.items()}
         )
-        capacities["cpu"] = max_workers
+        capacities.setdefault("cpu", cpu_capacity)
 
         requests = dict[str, dict[str, int]]()
         for stage_name in execution_order:
             request = {"cpu": 1}
+            # compose validated each request: a positive int, or "all" for cpu only.
             for resource, amount in self._get_stage(stage_name)["resources"].items():
-                normalized_resource = resource.casefold()
-                capacity = capacities.setdefault(normalized_resource, 1)
-                if amount == "all":
-                    if normalized_resource != "cpu":
-                        raise exceptions.ValidationError(
-                            f"Stage {stage_name!r} requests 'all' for non-CPU resource {resource!r}"
-                        )
-                    request[normalized_resource] = capacity
-                elif isinstance(amount, int) and not isinstance(amount, bool) and amount > 0:
-                    request[normalized_resource] = amount
-                else:
-                    raise exceptions.ValidationError(
-                        f"Stage {stage_name!r} has an invalid request {amount!r} for resource {resource!r}"
-                    )
+                capacity = capacities.setdefault(resource, 1)
+                request[resource] = capacity if amount == "all" else int(amount)
             for resource, amount in request.items():
                 capacity = capacities[resource]
                 if amount > capacity:
@@ -1635,6 +1633,7 @@ class Engine:
             project_root=str(project_root),
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
+            checkout_modes=checkout_modes,
         )
         started = 0
         max_to_start = self._effective_max_workers - len(self._futures)
@@ -1669,7 +1668,7 @@ class Engine:
                         stage_info,
                         overrides,
                         force,
-                        cache_dir,
+                        store_spec,
                         state_dir,
                         project_root,
                         results,
@@ -1693,7 +1692,6 @@ class Engine:
                     stage_info,
                     pipeline,
                     overrides,
-                    checkout_modes,
                     run_id,
                     force,
                     no_commit,
@@ -1744,7 +1742,7 @@ class Engine:
         stage_info: RegistryStageInfo,
         overrides: parameters.ParamsOverrides,
         force: bool,
-        cache_dir: pathlib.Path,
+        store_spec: store_mod.StoreSpec,
         state_dir: pathlib.Path,
         project_root: pathlib.Path,
         results: dict[str, executor_core.ExecutionSummary],
@@ -1757,15 +1755,6 @@ class Engine:
             return False
 
         stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
-        files_cache_dir = cache_dir / "files"
-        pipeline = self._require_pipeline()
-        store_spec = store_mod.StoreSpec(
-            kind="workspace",
-            cache_dir=str(files_cache_dir),
-            project_root=str(project_root),
-            pipeline_name=pipeline.name,
-            input_bindings=pipeline.input_bindings,
-        )
         store = store_mod.store_from_spec(store_spec)
 
         def _read_lock() -> LockData | None:
@@ -1791,10 +1780,6 @@ class Engine:
             return False
 
         out_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
-        out_specs = [
-            (types.identity_key(ref.identity), ref.tag != ArtifactTag.METRIC)
-            for ref in stage_info["outs"]
-        ]
 
         # Acquire artifact locks (READ on deps, WRITE on outs) to prevent
         # concurrent pivot runs from racing during skip check + output restore.
@@ -1818,7 +1803,6 @@ class Engine:
                 current_fingerprint,
                 current_params,
                 out_paths,
-                out_specs,
                 store,
                 stage_state_dir,
                 state_dir,
@@ -1837,7 +1821,6 @@ class Engine:
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
         out_paths: list[str],
-        out_specs: list[tuple[str, bool]],
         store: store_mod.Store,
         stage_state_dir: pathlib.Path,
         state_dir: pathlib.Path,
@@ -1852,13 +1835,21 @@ class Engine:
         deps = stage_info["deps"]
 
         def _restore_outputs_to_lock(state_db: state_mod.StateDB) -> bool:
-            return worker.restore_outputs_to_hashes(
+            restored_entries = list[tuple[str, int, int, int, str]]()
+            restored = worker.restore_outputs_to_hashes(
                 store,
                 stage_info["outs"],
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=stage_state_dir,
+                file_hash_entries=restored_entries,
             )
+            if restored and restored_entries:
+                with state_mod.StateDB(stage_state_dir) as writable_db:
+                    writable_db.apply_deferred_writes(
+                        stage_name, [], DeferredWrites(file_hash_entries=restored_entries)
+                    )
+            return restored
 
         def _get_skip_state_db() -> state_mod.StateDB:
             if skip_state_dbs is not None:
@@ -1884,16 +1875,12 @@ class Engine:
                 )
                 if not can_skip:
                     return False, None
-                deps_list = [
-                    DepEntry(
-                        producer=identity.producer,
-                        key=identity.key,
-                        hash=info["hash"],
-                    )
-                    for identity, info in lock_data["dep_hashes"].items()
-                ]
-                input_hash = run_history.compute_input_hash(
-                    current_fingerprint, current_params, deps_list, out_specs
+                input_hash = run_history.stage_input_hash(
+                    current_fingerprint,
+                    current_params,
+                    deps.values(),
+                    lock_data["dep_hashes"],
+                    stage_info["outs"],
                 )
                 if not _restore_outputs_to_lock(state_db):
                     return False, None
@@ -1930,9 +1917,6 @@ class Engine:
         dep_hashes_by_identity = {
             types.identity_from_key(key): info for key, info in dep_hashes.items()
         }
-        self._update_merkle_ids_for_stage(
-            stage_info, current_fingerprint, current_params, dep_hashes_by_identity
-        )
         if missing or unreadable:
             return False
 
@@ -1949,19 +1933,12 @@ class Engine:
         if decision["changed"]:
             return False
 
-        deps_list = [
-            DepEntry(
-                producer=identity.producer,
-                key=identity.key,
-                hash=info["hash"],
-            )
-            for identity, info in dep_hashes_by_identity.items()
-        ]
-        input_hash = run_history.compute_input_hash(
+        input_hash = run_history.stage_input_hash(
             current_fingerprint,
             current_params,
-            deps_list,
-            out_specs,
+            deps.values(),
+            dep_hashes_by_identity,
+            stage_info["outs"],
         )
 
         def _restore_lock_outputs() -> bool:
@@ -2017,28 +1994,6 @@ class Engine:
             input_hash=result["input_hash"],
         )
 
-    def _update_merkle_ids_for_stage(
-        self,
-        stage_info: RegistryStageInfo,
-        code_manifest: dict[str, str],
-        params: dict[str, Any],
-        dep_hashes: dict[types.ArtifactIdentity, HashInfo],
-    ) -> None:
-        for ref in stage_info["deps"].values():
-            identity_key = types.identity_key(ref.identity)
-            identity = ref.identity
-            if identity in dep_hashes and identity_key not in self._merkle_ids:
-                self._merkle_ids[identity_key] = dep_hashes[identity]["hash"]
-
-        input_merkle_ids = {
-            types.identity_key(ref.identity): self._merkle_ids[types.identity_key(ref.identity)]
-            for ref in stage_info["deps"].values()
-            if types.identity_key(ref.identity) in self._merkle_ids
-        }
-        stage_merkle_id = merkle.compute_merkle_id(code_manifest, params, input_merkle_ids)
-        for out_ref in stage_info["outs"]:
-            self._merkle_ids[types.identity_key(out_ref.identity)] = stage_merkle_id
-
     async def _compute_explanation(
         self,
         stage_name: str,
@@ -2052,6 +2007,7 @@ class Engine:
         Returns None if computation fails (explanation should never block execution).
         """
         from pivot import explain as explain_mod
+        from pivot.storage import lock
 
         def _compute() -> StageExplanation:
             pipeline = self._require_pipeline()
@@ -2061,6 +2017,9 @@ class Engine:
                 input_bindings=pipeline.input_bindings,
                 cache_dir=pathlib.Path(worker_info["store_spec"]["cache_dir"]),
             )
+            lock_data = lock.StageLock(
+                stage_name, lock.get_stages_dir(worker_info["state_dir"])
+            ).read()
             return explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
@@ -2070,6 +2029,7 @@ class Engine:
                 overrides=overrides,
                 state_dir=worker_info["state_dir"],
                 store=store,
+                lock_data=lock_data,
                 force=force,
                 allow_missing=True,
             )

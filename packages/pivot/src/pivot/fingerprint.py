@@ -2507,9 +2507,8 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.ast_parse", _t_parse)
 
         _t_norm = metrics.start()
-        if hasattr(func, "__pivot_resources__"):
-            globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
-            _strip_stage_decorator(tree, globals_dict)
+        globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
+        _strip_stage_decorator(tree, globals_dict)
         tree = _normalize_ast(tree)
         ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
         metrics.end("fingerprint.normalize_and_dump", _t_norm)

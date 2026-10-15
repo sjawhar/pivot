@@ -34,6 +34,14 @@ def consumer(intermediate_file: str) -> str:
     return "final"
 
 
+def _shared_train(input_file: str) -> str:
+    return "trained"
+
+
+train_cpu = compose.stage(_shared_train)
+train_gpu = compose.stage(resources={"gpu": 1})(_shared_train)
+
+
 # =============================================================================
 # No Stages Tests
 # =============================================================================
@@ -103,6 +111,27 @@ def test_list_renders_stage_resources(
     text_result = runner.invoke(cli.cli, ["list"])
     assert text_result.exit_code == 0, text_result.output
     assert "resources: gpu=1" in text_result.output
+
+
+def test_list_keeps_each_wrappers_resources_for_one_shared_function(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
+) -> None:
+    """`stage(f)` and `stage(resources=...)(f)` are separate stages with their own requests."""
+    with mock_discovery:
+        raw = mock_discovery.input("input.txt", t=str)
+        with mock_discovery.variant("cpu"):
+            train_cpu(raw)
+        with mock_discovery.variant("gpu"):
+            train_gpu(raw)
+
+    result = runner.invoke(cli.cli, ["list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    resources = {s["name"]: s["resources"] for s in json.loads(result.output)["stages"]}
+    assert resources == {
+        "test/_shared_train@cpu": {},
+        "test/_shared_train@gpu": {"gpu": 1},
+    }
 
 
 def test_list_deps_shows_source_stage(
