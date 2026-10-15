@@ -811,6 +811,22 @@ class Pipeline:
             )
             return ArtifactHandle(self, dummy_input, None, object)
 
+        for parameter in sig.parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                self._validation_errors.append(
+                    f"{qualified_name}: parameter '{parameter.name}' uses *args; "
+                    + "use a list[...] parameter instead of *args."
+                )
+            elif parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                self._validation_errors.append(
+                    f"{qualified_name}: parameter '{parameter.name}' is positional-only; remove the /."
+                )
+            elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                self._validation_errors.append(
+                    f"{qualified_name}: parameter '{parameter.name}' uses **kwargs; "
+                    + "use named parameters instead."
+                )
+
         input_handles = dict[str, ArtifactHandle]()
         list_input_handles = dict[str, list[ArtifactHandle]]()
         collection_params = dict[str, CollectionKind]()
@@ -953,7 +969,7 @@ class Pipeline:
             )
             for err in self._validation_errors:
                 msg += f"  {err}\n"
-            raise ValueError(msg)
+            raise exceptions.StageDefinitionError(msg)
 
     def _upstream_closure(self) -> list[tuple[Pipeline, _StageNode]]:
         """Collect foreign stages reachable from this pipeline's handles via DFS."""

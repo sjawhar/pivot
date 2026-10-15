@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from conftest import isolated_pivot_dir
 from pivot import cli, compose
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import click.testing
 
 
@@ -162,3 +165,34 @@ def test_list_accepts_all_flag(runner: click.testing.CliRunner) -> None:
     result = runner.invoke(cli.cli, ["list", "--help"])
     assert result.exit_code == 0
     assert "--all" in result.output, "List should accept --all flag"
+
+
+def test_list_refuses_a_varargs_stage_before_any_stage_runs(
+    runner: click.testing.CliRunner, tmp_path: Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "pipeline.py").write_text(
+            """
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def join(*parts: str) -> str:
+    return "".join(parts)
+
+
+with Pipeline("varargs") as pipeline:
+    first = pipeline.input("first.txt", t=str)
+    second = pipeline.input("second.txt", t=str)
+    join(first, second)
+"""
+        )
+
+        result = runner.invoke(cli.cli, ["list"])
+
+    assert result.exit_code == 1, result.output
+    assert "varargs/join" in result.output
+    assert (
+        "parameter 'parts' uses *args; use a list[...] parameter instead of *args" in result.output
+    )
+    assert not list(cwd.rglob("*.lock")), "definition errors must prevent execution"
