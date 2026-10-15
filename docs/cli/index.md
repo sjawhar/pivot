@@ -919,6 +919,8 @@ pivot doctor [OPTIONS]
 | `--json` | Output as JSONL |
 | `--remote` | Also check remote connectivity |
 
+Configuration errors identify the invalid key and value and state the required format.
+
 ---
 
 ### `pivot completion`

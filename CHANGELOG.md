@@ -2,6 +2,64 @@
 
 <!-- version list -->
 
+## v0.3.1 (2026-10-15)
+
+### Bug Fixes
+
+- Params comparison, cached-run lock refresh, watch routing for enclosing and aliased inputs,
+  explain and doctor output ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **cli**: Display falsy explain values ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **doctor**: Name the invalid remote entry ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **doctor**: Report invalid remote configuration
+  ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **engine**: Refresh stage lock after artifact wait
+  ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **skip**: Compare params canonically ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **watch**: Match symlinked input paths ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **watch**: Preserve output path semantics ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **watch**: Recognize symlinked output parents ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **watch**: Rerun all enclosing input consumers ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+### Chores
+
+- Format post-skip regression coverage ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+### Performance Improvements
+
+- **watch**: Index resolved input aliases ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+### Testing
+
+- **watch**: Assert output routing for either watcher spelling
+  ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+- **watch**: Cover physical output watchfiles events
+  ([#475](https://github.com/sjawhar/pivot/pull/475),
+  [`6af2e32`](https://github.com/sjawhar/pivot/commit/6af2e322940e16cc7518c6c18fe00b70efb99649))
+
+
 ## v0.3.0 (2026-10-15)
 
 ### Bug Fixes

@@ -190,7 +190,7 @@ def params_equal(old: object, new: object) -> bool:
     (``parameters.get_effective_params``), so the text is the canonical encoding. Python
     equality alone would call a NaN param changed on every run, because nan != nan.
     """
-    return old == new or json.dumps(old, sort_keys=True) == json.dumps(new, sort_keys=True)
+    return json.dumps(old, sort_keys=True) == json.dumps(new, sort_keys=True)
 
 
 def diff_dep_hashes(

@@ -4,10 +4,11 @@ import enum
 import os
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 import click
+import pydantic
 
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -85,6 +86,32 @@ def _sanitize_url(url: str) -> str:
         netloc += f":{parsed.port}"
 
     return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _find_invalid_remote(
+    remotes: dict[object, object],
+) -> tuple[object, object, str]:
+    """Return the first remote entry that fails the configuration validator."""
+    from pivot.config import models
+
+    for name, remote in remotes.items():
+        try:
+            models.PivotConfig.model_validate({"remotes": {name: remote}})
+        except pydantic.ValidationError as error:
+            detail = error.errors()[0]
+            return name, remote, detail["msg"].removeprefix("Value error, ")
+    raise AssertionError("invalid remotes mapping contains no invalid entry")
+
+
+def _format_config_validation_error(error: pydantic.ValidationError) -> str:
+    """Format a config validation error for the doctor command's user-facing boundary."""
+    detail = error.errors()[0]
+    location = ".".join(str(part) for part in detail["loc"])
+    value = detail["input"]
+    if location == "remotes" and isinstance(value, dict) and value:
+        name, remote, message = _find_invalid_remote(cast("dict[object, object]", value))
+        return f"Invalid config remotes.{name}: {remote!r}; {message}"
+    return f"Invalid config {location}: {value!r}; expected {detail['msg'].removeprefix('Value error, ')}"
 
 
 def _relative_path(path: pathlib.Path, project_root: pathlib.Path) -> str:
@@ -316,7 +343,10 @@ def doctor(ctx: click.Context, as_json: bool, check_remote: bool) -> None:
     checks.append(project_check)
 
     checks.append(_check_pipeline_config(project_root))
-    checks.append(_check_cache_directory(project_root))
+    try:
+        checks.append(_check_cache_directory(project_root))
+    except pydantic.ValidationError as e:
+        raise click.ClickException(_format_config_validation_error(e)) from e
     checks.append(_check_git_repository(project_root))
 
     if check_remote:

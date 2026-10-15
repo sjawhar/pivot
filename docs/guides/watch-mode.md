@@ -60,6 +60,9 @@ Watch mode reacts to **external** file changes — files you edit in your editor
 Changes that trigger re-runs:
 
 - Editing an input file declared with `pipeline.input()`
+- Editing a file inside a directory declared with `pipeline.input()` reruns that directory's
+  consumer, alongside any stage that declares the file directly
+- Editing through a symlinked path reruns every stage that consumes the same underlying input file
 - Editing a stage's Python source code (detected by [fingerprinting](../concepts/fingerprinting.md))
 - Editing parameter files
 

@@ -104,7 +104,7 @@ the stage stale with reason `Params changed`:
 pivot params show                # effective values for all stages
 pivot params show params/scale   # one stage
 pivot params diff                # compare against git HEAD
-pivot status --explain           # shows old and new values for changed params
+pivot status --explain           # shows old and new values, including 0 and false, for changed params
 ```
 
 ## Relationship to Other Concepts

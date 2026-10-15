@@ -540,6 +540,183 @@ with Pipeline("chains") as pipeline:
 """
 
 
+def _helper_nested_input_source() -> str:
+    """pipeline.py with a directory input and a file inside that directory."""
+    return """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def directory(folder: pathlib.Path) -> str:
+    return (folder / "a.txt").read_text()
+
+
+@stage
+def file(data: str) -> str:
+    return data
+
+
+with Pipeline("nested") as pipeline:
+    directory(pipeline.input("folder", path="inputs", t=pathlib.Path))
+    file(pipeline.input("file", path="inputs/a.txt", t=str))
+"""
+
+
+@pytest.mark.anyio
+async def test_child_input_edit_reruns_directory_and_file_consumers(
+    watch_project: pathlib.Path,
+) -> None:
+    """Changing a child input runs consumers of both the file and its directory."""
+    inputs = watch_project / "inputs"
+    inputs.mkdir()
+    child = inputs / "a.txt"
+    child.write_text("one")
+    (watch_project / "pipeline.py").write_text(_helper_nested_input_source())
+    pipeline = _helper_discover(watch_project)
+    directory_output = _helper_output_path(watch_project, pipeline, "nested/directory")
+    file_output = _helper_output_path(watch_project, pipeline, "nested/file")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=2)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert (directory_output.read_text(), file_output.read_text()) == ("one", "one")
+
+            child.write_text("two")
+            directory_done = await recorder.wait_for(
+                _helper_completes("nested/directory"), start=first_idle, timeout=10
+            )
+            file_done = await recorder.wait_for(
+                _helper_completes("nested/file"), start=first_idle, timeout=10
+            )
+            await recorder.wait_for(
+                _helper_is_idle, start=max(directory_done, file_done), timeout=10
+            )
+            assert (directory_output.read_text(), file_output.read_text()) == ("two", "two")
+            tg.cancel_scope.cancel()
+
+
+def _helper_symlinked_input_source() -> str:
+    """pipeline.py with direct, directory, and symlink aliases for one input file."""
+    return """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def whole(folder: pathlib.Path) -> str:
+    return (folder / "sub/a.txt").read_text()
+
+
+@stage
+def nested(folder: pathlib.Path) -> str:
+    return (folder / "a.txt").read_text()
+
+
+@stage
+def direct(data: str) -> str:
+    return data
+
+
+@stage
+def aliasdir(folder: pathlib.Path) -> str:
+    return (folder / "a.txt").read_text()
+
+
+@stage
+def aliasfile(data: str) -> str:
+    return data
+
+
+@stage
+def unrelated(data: str) -> str:
+    return data
+
+
+with Pipeline("aliases") as pipeline:
+    whole(pipeline.input("whole", path="inputs", t=pathlib.Path))
+    nested(pipeline.input("nested", path="inputs/sub", t=pathlib.Path))
+    direct(pipeline.input("direct", path="inputs/sub/a.txt", t=str))
+    aliasdir(pipeline.input("aliasdir", path="alias", t=pathlib.Path))
+    aliasfile(pipeline.input("aliasfile", path="alias-file.txt", t=str))
+    unrelated(pipeline.input("unrelated", path="other/a.txt", t=str))
+"""
+
+
+@pytest.mark.anyio
+async def test_input_edits_reach_consumers_through_symlinked_paths(
+    watch_project: pathlib.Path,
+) -> None:
+    """Physical and symlinked edits rerun every consumer of the same input file."""
+    inputs = watch_project / "inputs"
+    child = inputs / "sub" / "a.txt"
+    child.parent.mkdir(parents=True)
+    child.write_text("one")
+    other = watch_project / "other" / "a.txt"
+    other.parent.mkdir()
+    other.write_text("other")
+    (watch_project / "alias").symlink_to(inputs / "sub", target_is_directory=True)
+    (watch_project / "alias-file.txt").symlink_to(child)
+    (watch_project / "pipeline.py").write_text(_helper_symlinked_input_source())
+    pipeline = _helper_discover(watch_project)
+    affected_stages = {
+        "aliases/whole",
+        "aliases/nested",
+        "aliases/direct",
+        "aliases/aliasdir",
+        "aliases/aliasfile",
+    }
+    outputs = {
+        stage: _helper_output_path(watch_project, pipeline, stage)
+        for stage in affected_stages | {"aliases/unrelated"}
+    }
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=6)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await recorder.wait_for(_helper_is_idle)
+            assert {outputs[stage].read_text() for stage in affected_stages} == {"one"}
+            assert outputs["aliases/unrelated"].read_text() == "other"
+
+            for event_path, expected in (
+                (child, "two"),
+                (watch_project / "alias" / "a.txt", "three"),
+            ):
+                start = len(recorder.events)
+                event_path.write_text(expected)
+                completed = set[str]()
+                for stage in affected_stages:
+                    done = await recorder.wait_for(
+                        _helper_completes(stage), start=start, timeout=10
+                    )
+                    event = recorder.events[done]
+                    assert event["type"] == "stage_completed"
+                    completed.add(event["stage"])
+                idle = await recorder.wait_for(_helper_is_idle, start=start, timeout=10)
+                for event in recorder.events[start:idle]:
+                    if event["type"] == "stage_completed":
+                        completed.add(event["stage"])
+                assert completed == affected_stages
+                assert {outputs[stage].read_text() for stage in affected_stages} == {expected}
+                assert outputs["aliases/unrelated"].read_text() == "other"
+            tg.cancel_scope.cancel()
+
+
 @pytest.mark.anyio
 async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
     watch_project: pathlib.Path,

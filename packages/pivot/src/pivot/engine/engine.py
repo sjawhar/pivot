@@ -1787,9 +1787,11 @@ class Engine:
             return lock_service.acquire_many(lock_requests)
 
         lock_handle = await anyio.to_thread.run_sync(_acquire_artifact_locks)
-        await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
-
         try:
+            lock_data = await anyio.to_thread.run_sync(_read_lock)
+            if lock_data is None:
+                return False
+            await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
             return await self._try_skip_with_locks(
                 stage_name,
                 stage_info,
