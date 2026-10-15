@@ -30,6 +30,7 @@ from . import (
     stage_def,
     types,
 )
+from . import loaders as loaders_mod
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -39,14 +40,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from networkx import DiGraph
-
-    from . import loaders as loaders_mod
-
-
-def _get_loaders():  # type: ignore[return-value]
-    from . import loaders
-
-    return loaders
 
 
 class _MetricTag:
@@ -374,8 +367,6 @@ def _emit_stage_info(
     state_dir: pathlib.Path,
 ) -> registry.RegistryStageInfo:
     func = node.original_func
-    assert not hasattr(func, "_is_stage")
-
     deps = dict[str, types.ArtifactRef]()
 
     for param_name, handle in node.input_handles.items():
@@ -584,7 +575,7 @@ class Pipeline:
                         name=name,
                         python_type=None,
                         path=path,
-                        format=_get_loaders().PathOnly(),
+                        format=loaders_mod.PathOnly(),
                         inherited=True,
                     )
                 )
@@ -807,7 +798,7 @@ class Pipeline:
                 name="__error__",
                 python_type=None,
                 path="__error__",
-                format=_get_loaders().PathOnly(),
+                format=loaders_mod.PathOnly(),
             )
             return ArtifactHandle(self, dummy_input, None, object)
 
@@ -1010,7 +1001,7 @@ class Pipeline:
                         name=name,
                         python_type=None,
                         path=path,
-                        format=_get_loaders().PathOnly(),
+                        format=loaders_mod.PathOnly(),
                         inherited=True,
                     )
                 )
@@ -1052,7 +1043,6 @@ def _resolve_default_formats() -> dict[type, str]:
 def _infer_format(
     python_type: type,
 ) -> loaders_mod.Writer[object]:
-    loaders = _get_loaders()
     defaults = _resolve_default_formats()
 
     # Unwrap generic aliases (e.g. dict[str, Any] → dict) for lookup and issubclass
@@ -1062,14 +1052,14 @@ def _infer_format(
     loader_name = defaults.get(lookup_type)
     if loader_name is not None:
         loader_class = typing.cast(
-            "type[loaders_mod.Writer[object]]", getattr(loaders, loader_name)
+            "type[loaders_mod.Writer[object]]", getattr(loaders_mod, loader_name)
         )
         return loader_class()
 
     for registered_type, registered_loader in defaults.items():
         if isinstance(lookup_type, type) and issubclass(lookup_type, registered_type):
             loader_class = typing.cast(
-                "type[loaders_mod.Writer[object]]", getattr(loaders, registered_loader)
+                "type[loaders_mod.Writer[object]]", getattr(loaders_mod, registered_loader)
             )
             return loader_class()
 
@@ -1083,38 +1073,35 @@ def _infer_format(
 def _format_extension(
     fmt: object,
 ) -> str:
-    loaders = _get_loaders()
-    return loaders.format_extension(fmt)
+    return loaders_mod.format_extension(fmt)
 
 
 def _infer_input_format_from_type(t: type) -> loaders_mod.Reader[object] | None:
-    loaders = _get_loaders()
     if t is pathlib.Path:
-        return loaders.PathOnly()  # type: ignore[return-value]
+        return loaders_mod.PathOnly()  # type: ignore[return-value]
     if t is str:
-        return loaders.Text()  # type: ignore[return-value]
+        return loaders_mod.Text()  # type: ignore[return-value]
     return None
 
 
 def _infer_format_from_extension(path: str) -> loaders_mod.Reader[object]:
     """Infer loader from file extension for p.input() declarations."""
-    loaders = _get_loaders()
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     match ext:
         case "yaml" | "yml":
-            return loaders.YAML()  # type: ignore[return-value]
+            return loaders_mod.YAML()  # type: ignore[return-value]
         case "csv":
-            return loaders.CSV()  # type: ignore[return-value]
+            return loaders_mod.CSV()  # type: ignore[return-value]
         case "jsonl":
-            return loaders.DataFrameJSONL()  # type: ignore[return-value]
+            return loaders_mod.DataFrameJSONL()  # type: ignore[return-value]
         case "json":
-            return loaders.JSON()  # type: ignore[return-value]
+            return loaders_mod.JSON()  # type: ignore[return-value]
         case "txt" | "sql" | "jinja":
-            return loaders.Text()  # type: ignore[return-value]
+            return loaders_mod.Text()  # type: ignore[return-value]
         case "pkl" | "pickle":
-            return loaders.Pickle()  # type: ignore[return-value]
+            return loaders_mod.Pickle()  # type: ignore[return-value]
         case _:
-            return loaders.PathOnly()  # type: ignore[return-value]
+            return loaders_mod.PathOnly()  # type: ignore[return-value]
 
 
 # --- Return type analysis ---
@@ -1153,7 +1140,6 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
     base_type = args[0]
     tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
     fmt: loaders_mod.Writer[object] | None = None
-    loaders = _get_loaders()
     label = _output_label(key)
     for metadata in args[1:]:
         if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
@@ -1164,7 +1150,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
                     + f"with {type(metadata).__name__.removeprefix('_').removesuffix('Tag').lower()}."
                 )
             tag = metadata
-        elif isinstance(metadata, loaders.Writer):
+        elif isinstance(metadata, loaders_mod.Writer):
             if fmt is not None:
                 raise exceptions.StageDefinitionError(
                     f"Stage '{stage_name}': {label} has more than one loader."
@@ -1187,14 +1173,14 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
 
     if fmt is None:
         if isinstance(tag, _PlotTag):
-            fmt = typing.cast("loaders_mod.Writer[object]", loaders.MatplotlibFigure())
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders_mod.MatplotlibFigure())
         elif isinstance(tag, _MetricTag):
-            fmt = typing.cast("loaders_mod.Writer[object]", loaders.YAML())
+            fmt = typing.cast("loaders_mod.Writer[object]", loaders_mod.YAML())
         else:
             fmt = _infer_format(base_type)
 
     if isinstance(tag, _IncrementalTag) and (
-        not isinstance(fmt, loaders.Loader) or type(fmt).empty is loaders.Loader.empty
+        not isinstance(fmt, loaders_mod.Loader) or type(fmt).empty is loaders_mod.Loader.empty
     ):
         raise exceptions.StageDefinitionError(
             f"Stage '{stage_name}': {label} is incremental but loader "
@@ -1296,8 +1282,6 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
             return func(*args, **kwargs)
         return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
 
-    wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
-    wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
     return wrapper
 
 

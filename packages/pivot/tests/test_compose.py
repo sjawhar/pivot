@@ -190,11 +190,9 @@ def test_stage_preserves_metadata() -> None:
     def my_func(x: pd.DataFrame) -> pd.DataFrame:
         return x
 
-    stage_func = typing.cast("typing.Any", my_func)
-
     assert my_func.__name__ == "my_func"
-    assert stage_func._is_stage is True
-    assert stage_func._original_func is not my_func
+    assert inspect.unwrap(my_func) is not my_func, "the wrapper wraps the original function"
+    assert inspect.unwrap(my_func).__name__ == "my_func"
 
 
 # --- Return type analysis ---
@@ -612,7 +610,7 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     stage_b = legacy.get_stage("compose_build/_helper_build_stage_b")
 
     assert stage_a["func"] is inspect.unwrap(_helper_build_stage_a)
-    assert not hasattr(stage_a["func"], "_is_stage")
+    assert not hasattr(stage_a["func"], "__wrapped__"), "stage info holds the original function"
     assert stage_a["name"] == "compose_build/_helper_build_stage_a"
     assert stage_a["deps"]["raw"].identity == types.ArtifactIdentity(producer="raw", key=None)
     assert isinstance(stage_a["deps"]["raw"].format, loaders.YAML)
