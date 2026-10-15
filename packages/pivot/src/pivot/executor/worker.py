@@ -37,7 +37,6 @@ from pivot.storage import artifact_lock, cache, lock, state
 from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
-    DepEntry,
     DirHash,
     FileHash,
     HashInfo,
@@ -254,7 +253,7 @@ def execute_stage(
                 with state.StateDB(state_dir, readonly=True) as state_db:
                     outputs_missing_from_cache = False
                     if lock_data is not None and not stage_info["force"]:
-                        out_paths = _get_normalized_out_paths(stage_info)
+                        out_paths = [types.identity_key(out.identity) for out in stage_outs]
                         if can_skip_via_generation(
                             stage_name=stage_name,
                             fingerprint=stage_info["fingerprint"],
@@ -265,12 +264,12 @@ def execute_stage(
                             state_db=state_db,
                             store=store,
                         ):
-                            out_specs = _get_output_specs(stage_info)
-                            deps_list = _deps_list_for_input_hash(
-                                stage_info, _to_identity_keyed_hashes(lock_data["dep_hashes"])
-                            )
-                            input_hash = run_history.compute_input_hash(
-                                current_fingerprint, current_params, deps_list, out_specs
+                            input_hash = run_history.stage_input_hash(
+                                current_fingerprint,
+                                current_params,
+                                stage_info["deps"].values(),
+                                lock_data["dep_hashes"],
+                                stage_outs,
                             )
                             restored = restore_outputs_to_hashes(
                                 store,
@@ -471,12 +470,6 @@ def _to_identity_hashes(hashes: dict[str, HashInfo]) -> dict[types.ArtifactIdent
     return {types.identity_from_key(key): info for key, info in hashes.items()}
 
 
-def _to_identity_keyed_hashes(
-    hashes: dict[types.ArtifactIdentity, HashInfo],
-) -> dict[str, HashInfo]:
-    return {types.identity_key(identity): info for identity, info in hashes.items()}
-
-
 class OutputRestoreResult(NamedTuple):
     """Whether output restoration succeeded and wrote workspace bytes.
 
@@ -560,37 +553,6 @@ def restore_outputs_to_hashes(
     return not unavailable
 
 
-def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
-    outs = stage_info.get("outs", [])
-    return [types.identity_key(out.identity) for out in outs]
-
-
-def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
-    outs = stage_info.get("outs", [])
-    return [
-        (types.identity_key(out.identity), out.tag is not types.ArtifactTag.METRIC) for out in outs
-    ]
-
-
-def _deps_list_for_input_hash(
-    stage_info: WorkerStageInfo,
-    dep_hashes: dict[str, HashInfo],
-) -> list[DepEntry]:
-    deps_info = stage_info["deps"]
-    entries = list[DepEntry]()
-    for ref in deps_info.values():
-        dep_key = types.identity_key(ref.identity)
-        hash_info = dep_hashes[dep_key]
-        entries.append(
-            DepEntry(
-                producer=ref.identity.producer,
-                key=ref.identity.key,
-                hash=hash_info["hash"],
-            )
-        )
-    return entries
-
-
 def _check_skip_or_run(
     stage_info: WorkerStageInfo,
     lock_data: LockData | None,
@@ -600,16 +562,19 @@ def _check_skip_or_run(
 ) -> tuple[str | None, str, str, bool]:
     """Determine if stage can skip or must run."""
     out_identities = [out.identity for out in stage_info["outs"]]
-    out_specs = _get_output_specs(stage_info)
-    deps_list = _deps_list_for_input_hash(stage_info, dep_hashes)
-    input_hash = run_history.compute_input_hash(
-        current_fingerprint, current_params, deps_list, out_specs
+    dep_hashes_by_identity = _to_identity_hashes(dep_hashes)
+    input_hash = run_history.stage_input_hash(
+        current_fingerprint,
+        current_params,
+        stage_info["deps"].values(),
+        dep_hashes_by_identity,
+        stage_info["outs"],
     )
     decision = skip.check_stage(
         lock_data=lock_data,
         fingerprint=current_fingerprint,
         params=current_params,
-        dep_hashes=_to_identity_hashes(dep_hashes),
+        dep_hashes=dep_hashes_by_identity,
         out_paths=out_identities,
         run_cache_allowed=not bool(stage_info["incremental_inputs"]),
     )

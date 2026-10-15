@@ -15,18 +15,9 @@ from pivot.executor import worker
 from pivot.storage import lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
-from pivot.types import ArtifactTag, DeferredWrites, DepEntry, HashInfo, LockData
+from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
 
 logger = logging.getLogger(__name__)
-
-
-def _split_identity(identity: str) -> tuple[str, str | None]:
-    if ":" in identity:
-        producer, key = identity.split(":", 1)
-        if key == "":
-            return producer, None
-        return producer, key
-    return identity, None
 
 
 def commit_stages(
@@ -122,17 +113,12 @@ def commit_stages(
                 types.identity_from_key(key): info for key, info in dep_hashes.items()
             }
             stage_outs = stage_info["outs"]
-            out_specs = [
-                (types.identity_key(out.identity), out.tag is not ArtifactTag.METRIC)
-                for out in stage_outs
-            ]
-            deps_list = [
-                DepEntry(producer=producer, key=key, hash=info["hash"])
-                for identity, info in dep_hashes.items()
-                for producer, key in [_split_identity(identity)]
-            ]
-            input_hash = run_history.compute_input_hash(
-                fingerprint, current_params, deps_list, out_specs
+            input_hash = run_history.stage_input_hash(
+                fingerprint,
+                current_params,
+                stage_info["deps"].values(),
+                dep_hashes_by_identity,
+                stage_outs,
             )
 
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)

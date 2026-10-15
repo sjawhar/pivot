@@ -349,3 +349,43 @@ def test_status_pull_count_passes_through_committed_metric_stage(tmp_path: pathl
     out = _ok(_pivot(clone, "status"))
 
     assert "Run `pivot pull` to restore outputs of 2 stages from the remote" in out, out
+
+
+_SHARED_DEP_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw * 2
+
+
+@stage
+def both(a: pd.DataFrame, b: pd.DataFrame) -> dict:
+    return {"sum": int(a["a"].sum() + b["a"].sum())}
+
+
+with Pipeline("dup") as pipeline:
+    made = make(pipeline.input("x.csv"))
+    both(made, made)
+"""
+
+
+def test_commit_run_cache_entry_is_hit_for_stage_reading_one_artifact_twice(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot commit` and the worker must file a stage's run-cache entry under one key."""
+    root = _project(tmp_path, {"pipeline.py": _SHARED_DEP_PIPELINE, "data/raw/x.csv": "a\n1\n"})
+    _ok(_pivot(root, "repro", "--no-commit"))
+    _ok(_pivot(root, "commit"))
+    raw = root / "data" / "raw" / "x.csv"
+    raw.write_text("a\n5\n")
+    _ok(_pivot(root, "repro"))
+    raw.write_text("a\n1\n")
+
+    out = _ok(_pivot(root, "repro"))
+
+    assert "0 ran, 2 cached" in out, out
+    assert (root / "data" / "dup" / "both.yaml").read_text() == "sum: 4\n"

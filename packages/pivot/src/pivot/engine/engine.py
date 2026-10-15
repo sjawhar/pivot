@@ -67,7 +67,6 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactTag,
     CompletionType,
-    DepEntry,
     HashInfo,
     LockData,
     OnError,
@@ -1791,10 +1790,6 @@ class Engine:
             return False
 
         out_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
-        out_specs = [
-            (types.identity_key(ref.identity), ref.tag != ArtifactTag.METRIC)
-            for ref in stage_info["outs"]
-        ]
 
         # Acquire artifact locks (READ on deps, WRITE on outs) to prevent
         # concurrent pivot runs from racing during skip check + output restore.
@@ -1818,7 +1813,6 @@ class Engine:
                 current_fingerprint,
                 current_params,
                 out_paths,
-                out_specs,
                 store,
                 stage_state_dir,
                 state_dir,
@@ -1837,7 +1831,6 @@ class Engine:
         current_fingerprint: dict[str, str],
         current_params: dict[str, Any],
         out_paths: list[str],
-        out_specs: list[tuple[str, bool]],
         store: store_mod.Store,
         stage_state_dir: pathlib.Path,
         state_dir: pathlib.Path,
@@ -1884,16 +1877,12 @@ class Engine:
                 )
                 if not can_skip:
                     return False, None
-                deps_list = [
-                    DepEntry(
-                        producer=identity.producer,
-                        key=identity.key,
-                        hash=info["hash"],
-                    )
-                    for identity, info in lock_data["dep_hashes"].items()
-                ]
-                input_hash = run_history.compute_input_hash(
-                    current_fingerprint, current_params, deps_list, out_specs
+                input_hash = run_history.stage_input_hash(
+                    current_fingerprint,
+                    current_params,
+                    deps.values(),
+                    lock_data["dep_hashes"],
+                    stage_info["outs"],
                 )
                 if not _restore_outputs_to_lock(state_db):
                     return False, None
@@ -1949,19 +1938,12 @@ class Engine:
         if decision["changed"]:
             return False
 
-        deps_list = [
-            DepEntry(
-                producer=identity.producer,
-                key=identity.key,
-                hash=info["hash"],
-            )
-            for identity, info in dep_hashes_by_identity.items()
-        ]
-        input_hash = run_history.compute_input_hash(
+        input_hash = run_history.stage_input_hash(
             current_fingerprint,
             current_params,
-            deps_list,
-            out_specs,
+            deps.values(),
+            dep_hashes_by_identity,
+            stage_info["outs"],
         )
 
         def _restore_lock_outputs() -> bool:
