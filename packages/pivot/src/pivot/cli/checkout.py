@@ -97,6 +97,7 @@ def _restore_path_sync(
             "already exists" without --force). Cache misses return ("missing", name)
             instead of raising.
     """
+    keep_ignored = False
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
@@ -108,8 +109,9 @@ def _restore_path_sync(
                 )
             case CheckoutBehavior.SKIP_EXISTING:
                 # Existing file: skip. Existing real directory: fill in its missing files, or
-                # swap in the target when every differing file is pivot's own cached output.
-                # Never overwrite content the cache lacks (a local change).
+                # swap in the target when every differing file is pivot's own cached output,
+                # keeping the entries the directory hash skips. Never overwrite content the
+                # cache lacks (a local change).
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return ("skipped", path.name)
                 outcome = cache.restore_missing_in_directory(
@@ -124,6 +126,7 @@ def _restore_path_sync(
                     if outcome["unavailable"]:
                         return ("missing", path.name)
                     return ("restored" if outcome["restored"] else "skipped", path.name)
+                keep_ignored = True
             case CheckoutBehavior.FORCE:
                 cache.remove_output(path)
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
@@ -135,6 +138,7 @@ def _restore_path_sync(
         cache_dir,
         checkout_modes=checkout_modes,
         state_dir=state_dir,
+        keep_ignored=keep_ignored,
     )
     if not success:
         return ("missing", path.name)

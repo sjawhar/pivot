@@ -553,6 +553,8 @@ def restore_from_cache(
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
     state_dir: pathlib.Path | None = None,
+    *,
+    keep_ignored: bool = False,
 ) -> bool:
     """Restore file or directory from cache. Returns True if successful.
 
@@ -564,12 +566,14 @@ def restore_from_cache(
         checkout_modes: Ordered list of link modes to try with fallback on failure.
         state_dir: State directory for lock files (e.g. per-stage .pivot/ dir).
             Required for directory restores to prevent concurrent restore races.
+        keep_ignored: When replacing an existing directory, move the entries the directory
+            hash skips (build/, *.swp, ...) into the restored tree instead of deleting them.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
 
     if is_dir_hash(output_hash):
         return _restore_directory_from_cache(
-            path, output_hash, cache_dir, effective_modes, state_dir
+            path, output_hash, cache_dir, effective_modes, state_dir, keep_ignored=keep_ignored
         )
     return _restore_file_from_cache(path, output_hash, cache_dir, effective_modes)
 
@@ -596,14 +600,24 @@ def _restore_directory_from_cache(
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
     state_dir: pathlib.Path | None = None,
+    *,
+    keep_ignored: bool = False,
 ) -> bool:
     """Restore directory from cache atomically with file locking."""
     cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
 
+    # Entries of the existing directory that are not part of the output, to carry over.
+    keep = list[str]()
+    if keep_ignored and path.is_dir() and not path.is_symlink():
+        _, keep = _scan_entries(path, {entry["relpath"] for entry in output_hash["manifest"]})
+
     # Validate ALL manifest entries exist before writing anything (security)
     # This also handles the SYMLINK fast path - if cache_dir_path doesn't exist,
-    # we need to check individual files
-    symlink_fast_path = checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists()
+    # we need to check individual files. A directory that keeps local entries cannot
+    # be a link to the cache tree.
+    symlink_fast_path = (
+        not keep and checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists()
+    )
     if not symlink_fast_path:
         for entry in output_hash["manifest"]:
             file_cache_path = get_cache_path(cache_dir, entry["hash"])
@@ -654,6 +668,8 @@ def _restore_directory_from_cache(
         # Track state for proper cleanup
         swap_completed = False
         backup_restore_failed = False
+        carried = list[str]()
+        carried_back_failed = False
 
         try:
             resolved_temp = temp_path.resolve()
@@ -696,6 +712,16 @@ def _restore_directory_from_cache(
                 except OSError as e:
                     logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
 
+            # Ignored entries are not part of the output: move them into the new tree.
+            for relpath in keep:
+                source = path / relpath
+                if not (source.exists() or source.is_symlink()):
+                    continue
+                destination = temp_path / relpath
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(destination)
+                carried.append(relpath)
+
             # Atomic swap with rollback capability:
             # - Backup original first so we can restore on failure
             # - Replace atomically so path always has valid content
@@ -724,10 +750,18 @@ def _restore_directory_from_cache(
                 except OSError as e:
                     logger.debug(f"Failed to restore backup: {e}")
                     backup_restore_failed = True
+            # Return carried entries to the directory they came from
+            if not swap_completed:
+                for relpath in carried:
+                    try:
+                        (temp_path / relpath).rename(path / relpath)
+                    except OSError as e:
+                        logger.debug(f"Failed to return {relpath!r} to {path}: {e}")
+                        carried_back_failed = True
             raise
         finally:
-            # Clean up temp directory on any exit
-            if temp_path.exists():
+            # Clean up temp directory on any exit, unless it still holds user entries
+            if temp_path.exists() and not carried_back_failed:
                 _clear_path(temp_path)
             # Only clean up backup if swap completed successfully
             # Don't delete backup if restoration failed - that's the user's data!
@@ -772,6 +806,41 @@ def _is_cached(cache_dir: pathlib.Path, content_hash: str | None) -> bool:
     )
 
 
+def _scan_entries(path: pathlib.Path, expected_paths: set[str]) -> tuple[list[str], list[str]]:
+    """Return (files and symlinks, entries the directory hash skips) under path, as relpaths.
+
+    Symlinked directories are not followed. A skipped name that is, or holds, a manifest
+    path is part of the output and is scanned like any other entry.
+    """
+    expected_dirs = {
+        str(parent)
+        for relpath in expected_paths
+        for parent in pathlib.PurePosixPath(relpath).parents
+        if str(parent) != "."
+    }
+    files = list[str]()
+    ignored = list[str]()
+
+    def _walk(directory: pathlib.Path) -> None:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                entry_path = pathlib.Path(entry.path)
+                relpath = str(entry_path.relative_to(path))
+                if (
+                    _should_skip_entry(entry)
+                    and relpath not in expected_paths
+                    and relpath not in expected_dirs
+                ):
+                    ignored.append(relpath)
+                elif entry.is_symlink() or entry.is_file():
+                    files.append(relpath)
+                elif entry.is_dir():
+                    _walk(entry_path)
+
+    _walk(path)
+    return files, ignored
+
+
 def restore_missing_in_directory(
     path: pathlib.Path,
     output_hash: DirHash,
@@ -782,11 +851,11 @@ def restore_missing_in_directory(
 
     When every existing file matches the target, the missing files are restored in place
     and nothing else is touched. When some file differs from the target or is not in it,
-    only a whole-directory swap brings the target, and the swap deletes everything the
-    directory holds. It is safe only if every entry it removes is in the cache (pivot's own
-    earlier output): then nothing is written and ``replace`` asks the caller to swap with
-    restore_from_cache. Otherwise nothing is written, and the entries the cache lacks (local
-    edits, extra files, and entries the directory hash ignores) are returned.
+    only a whole-directory swap brings the target. It is safe only if every file it
+    removes is in the cache (pivot's own earlier output): then nothing is written and
+    ``replace`` asks the caller to swap with ``restore_from_cache(..., keep_ignored=True)``,
+    which carries over the entries the directory hash skips (build/, *.swp, ...). Otherwise
+    nothing is written, and the files the cache lacks (local edits, extra files) are returned.
     """
     lexical_base = pathlib.Path(os.path.abspath(path))
     resolved_base = path.resolve()
@@ -831,22 +900,8 @@ def restore_missing_in_directory(
             )
         missing.append((entry, file_path, file_cache_path))
 
-    # Entries the directory hash ignores (build/, *.swp, ...) are never cached.
-    ignored = list[str]()
-
-    def _extra_relpaths(directory: pathlib.Path) -> Generator[str]:
-        """Yield file or symlink paths without following symlink directories."""
-        with os.scandir(directory) as entries:
-            for existing_entry in entries:
-                existing_path = pathlib.Path(existing_entry.path)
-                if _should_skip_entry(existing_entry):
-                    ignored.append(str(existing_path.relative_to(path)))
-                elif existing_entry.is_symlink() or existing_entry.is_file():
-                    yield str(existing_path.relative_to(path))
-                elif existing_entry.is_dir():
-                    yield from _extra_relpaths(existing_path)
-
-    for relpath in _extra_relpaths(path):
+    files, _ = _scan_entries(path, expected_paths)
+    for relpath in files:
         if relpath in expected_paths:
             continue
         extra_path = path / relpath
@@ -856,14 +911,9 @@ def restore_missing_in_directory(
             changed[relpath], _ = hash_file(extra_path)
 
     if changed:
-        # Replacing the directory deletes every entry it holds; refuse if any is not cached.
+        # Replacing the directory deletes every file it holds; refuse if any is not cached.
         local_changes = sorted(
-            [
-                rel
-                for rel, content_hash in changed.items()
-                if not _is_cached(cache_dir, content_hash)
-            ]
-            + ignored
+            rel for rel, content_hash in changed.items() if not _is_cached(cache_dir, content_hash)
         )
         if local_changes:
             return MissingRestore(

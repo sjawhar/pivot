@@ -375,6 +375,14 @@ with Pipeline("d") as pipeline:
     shards(pipeline.input("t.csv"))
 """
 
+# The same stage, also writing a build/ directory, a name the directory hash skips.
+_DIROUT_BUILD_PIPELINE = _DIROUT_PIPELINE.replace(
+    "    return out\n",
+    '    (out / "build").mkdir()\n'
+    + '    (out / "build" / "log.txt").write_text(f"built {len(raw)} rows")\n'
+    + "    return out\n",
+)
+
 
 def _commit(cwd: pathlib.Path, message: str) -> None:
     subprocess.run(["git", "add", "-A"], cwd=cwd, check=True)
@@ -386,7 +394,7 @@ def _commit(cwd: pathlib.Path, message: str) -> None:
 
 
 def _dirout_clone_after_teammate_rerun(
-    tmp_path: pathlib.Path, s3_endpoint: str
+    tmp_path: pathlib.Path, s3_endpoint: str, pipeline_py: str = _DIROUT_PIPELINE
 ) -> tuple[pathlib.Path, dict[str, str]]:
     """A dev ran a directory-output stage at v1; a teammate re-ran it at v2, pushed and committed.
 
@@ -414,7 +422,7 @@ def _dirout_clone_after_teammate_rerun(
     _project(
         src,
         {
-            "pipeline.py": _DIROUT_PIPELINE,
+            "pipeline.py": pipeline_py,
             "data/raw/t.csv": "a,b\n1,2\n3,4\n",
             ".gitignore": "/data/d/\n__pycache__/\n",
         },
@@ -471,3 +479,20 @@ def test_pull_refuses_directory_output_with_hand_edited_file(
     )
     assert (shards / "0.txt").read_text() == "mine", "the edit must survive"
     assert (shards / "1.txt").read_text() == "7", "a refused pull must not restore anything"
+
+
+def test_pull_keeps_build_dir_the_stage_writes_inside_its_directory_output(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """build/ is skipped by the directory hash, so it is not part of the output: pull keeps it."""
+    clone, env = _dirout_clone_after_teammate_rerun(
+        tmp_path, moto_services["s3"], _DIROUT_BUILD_PIPELINE
+    )
+    shards = clone / "data" / "d" / "shards.dat"
+    assert (shards / "build" / "log.txt").read_text() == "built 2 rows"
+
+    _ok(_pivot(clone, "pull", "d/shards", env=env))
+
+    assert sorted(p.name for p in shards.iterdir()) == ["0.txt", "1.txt", "build"]
+    assert (shards / "0.txt").read_text() == "11"
+    assert (shards / "build" / "log.txt").read_text() == "built 2 rows"

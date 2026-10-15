@@ -64,14 +64,18 @@ def _helper_track_directory(root: pathlib.Path) -> pathlib.Path:
     return data_dir
 
 
-def _helper_cache_directory(path: pathlib.Path, contents: dict[str, str]) -> track.PvtData:
+def _helper_cache_directory(
+    path: pathlib.Path,
+    contents: dict[str, str],
+    checkout_mode: config.CheckoutMode = config.CheckoutMode.COPY,
+) -> track.PvtData:
     path.mkdir(parents=True)
     for relpath, content in contents.items():
         file_path = path / relpath
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
     output_hash = cache.save_to_cache(
-        path, config.get_cache_dir() / "files", checkout_mode=config.CheckoutMode.COPY
+        path, config.get_cache_dir() / "files", checkout_mode=checkout_mode
     )
     assert "manifest" in output_hash
     return track.PvtData(
@@ -178,10 +182,10 @@ def test_checkout_only_missing_refuses_update_when_a_file_holds_an_uncached_edit
     assert not (data_dir / "c.txt").exists(), "A refused checkout must not restore anything"
 
 
-def test_checkout_only_missing_refuses_update_that_would_delete_ignored_entries(
+def test_checkout_only_missing_keeps_ignored_entries_when_replacing_directory(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
-    """Entries the directory hash ignores are never cached, so replacing the directory refuses."""
+    """Entries the directory hash skips are not part of the output: the replaced tree keeps them."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
     new_pvt_data = _helper_cache_directory(
@@ -191,15 +195,49 @@ def test_checkout_only_missing_refuses_update_that_would_delete_ignored_entries(
     track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
     (data_dir / "build").mkdir()
     (data_dir / "build" / "x.o").write_text("object\n")
+    (data_dir / ".a.txt.swp").write_text("swap\n")
     (data_dir / "draft.txt~").write_text("backup\n")
 
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
 
-    assert result.exit_code != 0
-    assert "not in the cache: build, draft.txt~. Use --force" in result.output
+    assert result.exit_code == 0, result.output
+    assert sorted(p.name for p in data_dir.iterdir()) == [
+        ".a.txt.swp",
+        "a.txt",
+        "build",
+        "c.txt",
+        "draft.txt~",
+    ]
+    assert (data_dir / "a.txt").read_text() == "one updated\n"
     assert (data_dir / "build" / "x.o").read_text() == "object\n"
+    assert (data_dir / ".a.txt.swp").read_text() == "swap\n"
     assert (data_dir / "draft.txt~").read_text() == "backup\n"
-    assert (data_dir / "a.txt").read_text() == "one\n"
+
+
+def test_checkout_only_missing_symlink_mode_keeps_editor_swap_file(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    """With a cached tree to link to, the swap still keeps an open editor's swap file."""
+    root = project.get_project_root()
+    data_dir = _helper_track_directory(root)
+    new_pvt_data = _helper_cache_directory(
+        root / "new-ext",
+        {"a.txt": "one updated\n", "c.txt": "three\n"},
+        checkout_mode=config.CheckoutMode.SYMLINK,
+    )
+    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    (data_dir / ".a.txt.swp").write_text("swap\n")
+
+    result = runner.invoke(
+        cli.cli, ["checkout", "--only-missing", "--checkout-mode", "symlink", "data/ext"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not data_dir.is_symlink(), "a directory that keeps local entries cannot link the cache"
+    assert (data_dir / ".a.txt.swp").read_text() == "swap\n"
+    assert (data_dir / "a.txt").read_text() == "one updated\n"
+    assert (data_dir / "c.txt").read_text() == "three\n"
+    assert not (data_dir / "b.txt").exists()
 
 
 def test_checkout_only_missing_reports_edited_file_in_directory(
