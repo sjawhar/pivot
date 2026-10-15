@@ -177,13 +177,15 @@ class WorkspaceStore:
         else:
             path = self._resolve_output_path(ref)
 
-        resolved = path.resolve()
-        existing = self._path_map.get(str(resolved))
+        # Logical path, not resolve(): two declared paths that are symlinks to one file (a
+        # symlink checkout, two symlinked inputs) are distinct artifacts.
+        logical = os.path.normpath(path)
+        existing = self._path_map.get(logical)
         if existing is not None and existing != ref.identity:
             raise ValueError(
-                f"Collision detected: {ref.identity} maps to {resolved} already used by {existing}"
+                f"Collision detected: {ref.identity} maps to {logical} already used by {existing}"
             )
-        self._path_map[str(resolved)] = ref.identity
+        self._path_map[logical] = ref.identity
         return path
 
     def checkout(self, ref: types.ArtifactRef) -> pathlib.Path:

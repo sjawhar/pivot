@@ -578,3 +578,75 @@ def test_input_reads_its_own_file_when_another_pipelines_output_has_its_name(
     assert "1 cached, 0 stale" in status, status
     assert "0 ran, 1 cached" in rerun, rerun
     assert (root / "data" / "other" / "report.yaml").read_text() == "prior_sum: 100\n"
+
+
+_TWO_INPUTS_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def rows(train: pd.DataFrame, test: pd.DataFrame) -> dict:
+    return {"rows": int(len(train) + len(test))}
+
+
+with Pipeline("sym") as pipeline:
+    rows(pipeline.input("train.csv"), pipeline.input("test.csv"))
+"""
+
+
+def test_two_inputs_symlinked_to_one_file_run(tmp_path: pathlib.Path) -> None:
+    """Inputs are told apart by their declared paths, not by the files the paths point to."""
+    root = _project(tmp_path, {"pipeline.py": _TWO_INPUTS_PIPELINE, "shared/base.csv": "a\n1\n2\n"})
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "train.csv").symlink_to("../../shared/base.csv")
+    (root / "data" / "raw" / "test.csv").symlink_to("../../shared/base.csv")
+
+    out = _ok(_pivot(root, "repro"))
+
+    assert "1 ran" in out, out
+    assert (root / "data" / "sym" / "rows.yaml").read_text() == "rows: 4\n"
+
+
+_SAME_CONTENT_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def left(numbers: pd.DataFrame) -> dict:
+    return {"rows": int(len(numbers))}
+
+
+@stage
+def right(numbers: pd.DataFrame) -> dict:
+    return {"rows": int(len(numbers))}
+
+
+@stage
+def both(a: dict, b: dict) -> dict:
+    return {"total": a["rows"] + b["rows"]}
+
+
+with Pipeline("sym") as pipeline:
+    numbers = pipeline.input("numbers.csv")
+    both(left(numbers), right(numbers))
+"""
+
+
+def test_outputs_symlinked_to_one_cache_object_feed_one_stage(tmp_path: pathlib.Path) -> None:
+    """Two equal outputs checked out as symlinks share a cache object; their consumer still runs."""
+    root = _project(
+        tmp_path, {"pipeline.py": _SAME_CONTENT_PIPELINE, "data/raw/numbers.csv": "a\n1\n2\n"}
+    )
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    _ok(_pivot(root, "repro"))
+    left, right = root / "data" / "sym" / "left.yaml", root / "data" / "sym" / "right.yaml"
+    assert left.resolve() == right.resolve()
+
+    out = _ok(_pivot(root, "run", "sym/both", "--force"))
+
+    assert "1 ran" in out, out
+    assert (root / "data" / "sym" / "both.yaml").read_text() == "total: 4\n"
