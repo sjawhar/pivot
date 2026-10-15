@@ -1005,17 +1005,27 @@ class Pipeline:
         closure: list[tuple[Pipeline, _StageNode]],
     ) -> None:
         foreign_bindings = dict[str, str]()
+
+        def _add_foreign_input(handle: ArtifactHandle) -> None:
+            if not isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                return
+            inp = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
+                raise ValueError(
+                    f"Input binding conflict: input '{inp.name}' is bound to "
+                    + f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
+                    + "in different pipelines."
+                )
+            foreign_bindings[inp.name] = inp.path
+
+        for local_node in self._stages:
+            for handle in _iter_all_handles(local_node):
+                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    _add_foreign_input(handle)
+
         for _foreign_pipeline, foreign_node in closure:
             for handle in _iter_all_handles(foreign_node):
-                if isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    inp = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
-                        raise ValueError(
-                            f"Input binding conflict: input '{inp.name}' is bound to "
-                            + f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
-                            + "in different pipelines."
-                        )
-                    foreign_bindings[inp.name] = inp.path
+                _add_foreign_input(handle)
 
         local_bindings = self.input_bindings
         for name, path in foreign_bindings.items():

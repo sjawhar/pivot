@@ -1777,6 +1777,26 @@ def test_build_includes_only_foreign_closure(tmp_path: pathlib.Path) -> None:
 # --- Cross-pipeline input-binding merge ---
 
 
+@stage
+def _helper_join_direct_foreign_inputs(left: str, right: str) -> str:
+    return f"{left}:{right}"
+
+
+def test_direct_foreign_input_binding_conflict_raises(tmp_path: pathlib.Path) -> None:
+    first = Pipeline("first", root=tmp_path)
+    with first:
+        left = first.input("shared.txt", path="first.txt", t=str)
+    second = Pipeline("second", root=tmp_path)
+    with second:
+        right = second.input("shared.txt", path="second.txt", t=str)
+
+    with (
+        pytest.raises(ValueError, match=r"Input binding conflict.*shared\.txt"),
+        Pipeline("consumer", root=tmp_path),
+    ):
+        _helper_join_direct_foreign_inputs(left, right)
+
+
 def test_cross_pipeline_input_bindings_propagated(tmp_path: pathlib.Path) -> None:
     p1 = Pipeline("base", root=tmp_path)
     with p1:

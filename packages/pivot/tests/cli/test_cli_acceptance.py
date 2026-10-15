@@ -139,6 +139,47 @@ def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: path
     assert out.index("pivot pull") < out.index("pivot repro"), out
 
 
+_IMPORTED_INPUT_SHARED = """\
+from pivot.compose import Pipeline
+
+
+with Pipeline("shared") as inputs:
+    source = inputs.input("shared.txt", path="actual.txt")
+"""
+
+
+_IMPORTED_INPUT_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+from shared import source
+
+
+@stage
+def result(data: str) -> str:
+    return data
+
+
+with Pipeline("demo") as pipeline:
+    result(source)
+"""
+
+
+def test_repro_uses_a_directly_imported_inputs_declared_path(tmp_path: pathlib.Path) -> None:
+    """A direct imported input handle keeps its path instead of falling back to data/raw/name."""
+    root = _project(
+        tmp_path,
+        {
+            "shared.py": _IMPORTED_INPUT_SHARED,
+            "pipeline.py": _IMPORTED_INPUT_PIPELINE,
+            "actual.txt": "ACTUAL",
+            "data/raw/shared.txt": "WRONG DEFAULT",
+        },
+    )
+
+    _ok(_pivot(root, "repro"))
+
+    assert (root / "data" / "demo" / "result.txt").read_text() == "ACTUAL"
+
+
 def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> None:
     """Config lock, artifact locks and the agent socket must not show up as untracked files."""
     root = _project(tmp_path, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
