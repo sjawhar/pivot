@@ -57,13 +57,15 @@ def _get_lock_path_from_token(token: str, state_dir: pathlib.Path) -> pathlib.Pa
     return lock_dir / f"{_RESTORE_LOCK_PREFIX}{token}"
 
 
-def _get_lock_path(target_path: pathlib.Path, state_dir: pathlib.Path) -> pathlib.Path:
+def _get_lock_path(
+    target_path: pathlib.Path, state_dir: pathlib.Path, *, token: str | None = None
+) -> pathlib.Path:
     """Get lock file path under state_dir/locks/ for a logical restore target.
 
     The final path component is intentionally not resolved: a restored symlink must
     retain the same lock as the missing workspace path it replaced.
     """
-    return _get_lock_path_from_token(_restore_target_token(target_path), state_dir)
+    return _get_lock_path_from_token(token or _restore_target_token(target_path), state_dir)
 
 
 @contextlib.contextmanager
@@ -77,7 +79,7 @@ def restore_lock(path: pathlib.Path, state_dir: pathlib.Path | None) -> Generato
         yield None
         return
     token = _restore_target_token(path)
-    lock_fd = os.open(_get_lock_path_from_token(token, state_dir), os.O_CREAT | os.O_RDWR, 0o644)
+    lock_fd = os.open(_get_lock_path(path, state_dir, token=token), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         yield token

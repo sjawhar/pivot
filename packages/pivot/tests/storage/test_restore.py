@@ -10,9 +10,11 @@ import yaml
 from pivot import exceptions, project
 from pivot.cli import checkout
 from pivot.storage import cache, restore
+from pivot.types import FileHash
 
 if TYPE_CHECKING:
     import pathlib
+    from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
 
@@ -20,15 +22,15 @@ if TYPE_CHECKING:
 def _hold_checkout_restore(
     project_root: pathlib.Path,
     path: pathlib.Path,
-    output_hash: cache.FileHash,
+    output_hash: FileHash,
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
-    started: multiprocessing.synchronize.Event,
-    release: multiprocessing.synchronize.Event,
+    started: Event,
+    release: Event,
     result_queue: multiprocessing.Queue[tuple[str, str]],
 ) -> None:
     """Pause checkout after it has acquired its restore lock."""
-    project._project_root_cache = project_root  # pyright: ignore[reportPrivateUsage]
+    project._project_root_cache = project_root
     original_stage_checkout = cache._stage_checkout
 
     def _stage_after_release(
@@ -60,12 +62,12 @@ def _hold_checkout_restore(
 def _get_while_checkout_restores(
     project_root: pathlib.Path,
     path: pathlib.Path,
-    output_hash: cache.FileHash,
+    output_hash: FileHash,
     cache_dir: pathlib.Path,
     result_queue: multiprocessing.Queue[tuple[str, str]],
 ) -> None:
     """Run the local-cache branch of ``pivot get`` in a separate process."""
-    project._project_root_cache = project_root  # pyright: ignore[reportPrivateUsage]
+    project._project_root_cache = project_root
     result = restore.restore_file(
         rel_path=str(path.relative_to(project_root)),
         output_hash=output_hash,
@@ -590,7 +592,7 @@ def test_get_waits_for_checkout_restore_on_shared_cache(tmp_path: pathlib.Path) 
     cache_path.write_text("cached content")
     target = project_root / "data" / "out.txt"
     target.parent.mkdir(parents=True)
-    output_hash = cache.FileHash(hash=file_hash)
+    output_hash = FileHash(hash=file_hash)
 
     ctx = multiprocessing.get_context("spawn")
     started = ctx.Event()
