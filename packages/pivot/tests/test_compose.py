@@ -705,6 +705,25 @@ def test_pipeline_build_artifact_refs_and_tags(tmp_path: pathlib.Path) -> None:
     assert tags["chart"] is types.ArtifactTag.PLOT
 
 
+@stage
+def _helper_read_tagged(metrics: dict, chart: pd.DataFrame) -> dict:
+    return {"rows": metrics["rows"], "chart_rows": len(chart)}
+
+
+def test_consumer_dep_carries_the_producer_out_tag(tmp_path: pathlib.Path) -> None:
+    """One output carries one tag, whether read as the producer's out or a consumer's dep."""
+    with Pipeline("compose_tagged", root=tmp_path) as pipeline:
+        built = _helper_build_tagged()
+        _helper_read_tagged(built.metrics, built["chart"])
+
+    outs = pipeline.get_stage("compose_tagged/_helper_build_tagged")["outs"]
+    deps = pipeline.get_stage("compose_tagged/_helper_read_tagged")["deps"]
+    out_tags = {out.identity.key: out.tag for out in outs}
+
+    assert deps["metrics"].tag is out_tags["metrics"] is types.ArtifactTag.METRIC
+    assert deps["chart"].tag is out_tags["chart"] is types.ArtifactTag.PLOT
+
+
 def test_validate_artifact_identity_rejects_path_separators() -> None:
     # Slashes are allowed as namespace separators
     types.validate_artifact_identity(

@@ -92,6 +92,17 @@ __all__ = [
 ]
 
 
+def _artifact_tag(tag: _MetricTag | _PlotTag | _IncrementalTag | None) -> types.ArtifactTag:
+    """The engine tag for an output's compose tag; a dep and an out of one output share it."""
+    if isinstance(tag, _MetricTag):
+        return types.ArtifactTag.METRIC
+    if isinstance(tag, _PlotTag):
+        return types.ArtifactTag.PLOT
+    if isinstance(tag, _IncrementalTag):
+        return types.ArtifactTag.INCREMENTAL
+    return types.ArtifactTag.DATA
+
+
 def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types.ArtifactRef:
     if isinstance(handle._source, _InputNode):
         identity = types.ArtifactIdentity(producer=handle._source.name, key=None)
@@ -127,22 +138,13 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         output_spec = matched
         output_key = output_spec.key
 
-    if isinstance(output_spec.tag, _MetricTag):
-        dep_tag = types.ArtifactTag.METRIC
-    elif isinstance(output_spec.tag, _PlotTag):
-        dep_tag = types.ArtifactTag.PLOT
-    elif isinstance(output_spec.tag, _IncrementalTag):
-        dep_tag = types.ArtifactTag.INCREMENTAL
-    else:
-        dep_tag = types.ArtifactTag.DATA
-
     identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
     types.validate_artifact_identity(identity)
     return types.ArtifactRef(
         identity=identity,
         format=output_spec.format,
         python_type=handle._python_type,
-        tag=dep_tag,
+        tag=_artifact_tag(output_spec.tag),
     )
 
 
@@ -389,15 +391,6 @@ def _emit_stage_info(
 
     for output_spec in node.output_specs:
         output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
-        if isinstance(output_spec.tag, _MetricTag):
-            out_tag = types.ArtifactTag.METRIC
-        elif isinstance(output_spec.tag, _PlotTag):
-            out_tag = types.ArtifactTag.PLOT
-        elif isinstance(output_spec.tag, _IncrementalTag):
-            out_tag = types.ArtifactTag.INCREMENTAL
-        else:
-            out_tag = types.ArtifactTag.DATA
-
         identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
         types.validate_artifact_identity(identity)
         outs.append(
@@ -405,7 +398,7 @@ def _emit_stage_info(
                 identity=identity,
                 format=output_spec.format,
                 python_type=output_spec.python_type,
-                tag=out_tag,
+                tag=_artifact_tag(output_spec.tag),
             )
         )
 
