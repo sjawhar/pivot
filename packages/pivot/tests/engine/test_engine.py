@@ -31,13 +31,13 @@ from pivot.engine.types import (
     StageExecutionState,
 )
 from pivot.engine.worker_pool import WorkerPool
+from pivot.executor import core as executor_core
 from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import FileHash, LockData, OnError, StageStatus, identity_key
 
 if TYPE_CHECKING:
-    from pivot.executor import core as executor_core
     from pivot.registry import RegistryStageInfo
 
 
@@ -57,6 +57,21 @@ def _helper_watch_merge(
     second: dict[str, int],
 ) -> dict[str, int]:
     return {**first, **second}
+
+
+@stage
+def _helper_cancel_first() -> str:
+    return "first"
+
+
+@stage
+def _helper_cancel_second(value: str) -> str:
+    return f"{value} second"
+
+
+@stage
+def _helper_cancel_other() -> str:
+    return "other"
 
 
 def _helper_watch_pipeline(
@@ -916,19 +931,28 @@ async def test_engine_cancel_during_coordinator_skip_releases_resources_without_
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cancellation during a coordinator skip check leaves no stage to submit."""
-    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
-    stage_name = "watch/_helper_watch_scale"
-    stage_info = pipeline.get_stage(stage_name)
+    """Cancellation before first submission finalizes every remaining stage once."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    with Pipeline("cancel", root=tmp_path) as pipeline:
+        first = _helper_cancel_first()
+        _helper_cancel_second(first)
+        _helper_cancel_other()
+
+    stage_names = {
+        "cancel/_helper_cancel_first",
+        "cancel/_helper_cancel_second",
+        "cancel/_helper_cancel_other",
+    }
     cache_dir = tmp_path / ".pivot" / "cache"
     cache_dir.mkdir()
-    results: dict[str, executor_core.ExecutionSummary] = {}
+    events = list[OutputEvent]()
     pool = MagicMock(spec=WorkerPool)
+    pool.submit.side_effect = AssertionError("cancelled stage was submitted")
+    results = dict[str, executor_core.ExecutionSummary]()
 
     async with Engine(pipeline=pipeline) as engine:
-        engine._graph = engine_graph.build_graph({stage_name: stage_info})
-        await engine._initialize_orchestration([stage_name], max_workers=1)
-        engine._worker_pool = pool
         engine._run_state = engine_mod._RunState.RUNNING
 
         async def _cancel_during_skip(*_args: object, **_kwargs: object) -> bool:
@@ -936,25 +960,47 @@ async def test_engine_cancel_during_coordinator_skip_releases_resources_without_
             return False
 
         monkeypatch.setattr(engine, "_try_skip_in_coordinator", _cancel_during_skip)
+        monkeypatch.setattr(engine, "_ensure_worker_pool", lambda: pool)
+        output_recv = engine._output_recv
+        output_send = engine._output_send
+        assert output_recv is not None
+        assert output_send is not None
 
-        await engine._start_ready_stages(
-            cache_dir=cache_dir,
-            overrides=parameters.ParamsOverrides(),
-            checkout_modes=cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
-            force=False,
-            no_commit=False,
-            stage_start_times={},
-            run_id="cancel-during-skip",
-            project_root=tmp_path,
-            state_dir=tmp_path / ".pivot",
-            results=results,
+        async def _capture_events() -> None:
+            async for event in output_recv:
+                events.append(event)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_capture_events)
+            results = await engine._orchestrate_execution(
+                stages=None,
+                force=False,
+                single_stage=False,
+                parallel=True,
+                max_workers=1,
+                resource_capacity={},
+                no_commit=True,
+                on_error=OnError.FAIL,
+                cache_dir=cache_dir,
+            )
+            await output_send.aclose()
+
+        assert set(results) == stage_names
+        assert all(result["status"] == StageStatus.CANCELLED for result in results.values())
+        assert all(
+            engine._scheduler.get_state(stage_name) == StageExecutionState.COMPLETED
+            for stage_name in stage_names
         )
-
+        terminal_stages = [
+            event["stage"]
+            for event in events
+            if event["type"] == "stage_completed" and event["status"] == StageStatus.CANCELLED
+        ]
+        assert sorted(terminal_stages) == sorted(stage_names)
+        assert len(terminal_stages) == len(set(terminal_stages))
         pool.submit.assert_not_called()
-        assert results[stage_name]["status"] == StageStatus.CANCELLED
-        assert engine._scheduler.get_state(stage_name) == StageExecutionState.COMPLETED
-        engine._scheduler.set_state(stage_name, StageExecutionState.READY)
-        assert engine._scheduler.can_start(stage_name), "Cancellation must release CPU capacity"
+        engine._scheduler.set_state("cancel/_helper_cancel_first", StageExecutionState.READY)
+        assert engine._scheduler.can_start("cancel/_helper_cancel_first")
 
 
 @pytest.mark.anyio

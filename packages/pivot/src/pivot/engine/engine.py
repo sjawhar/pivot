@@ -1177,6 +1177,9 @@ class Engine:
                 results=results,
             )
 
+            if self._cancel_event.is_set():
+                await self._finalize_cancelled_stages(results, run_id)
+
             # Only start drain thread and main loop if workers were dispatched.
             # When all stages skip in the coordinator, the pool is never created.
             if self._worker_pool is not None:
@@ -1306,25 +1309,10 @@ class Engine:
                                                 run_id=run_id,
                                             )
 
-                            # Check cancellation
+                            # A run can be cancelled before the first worker is submitted.
+                            # Finalize here as well as after the initial dispatch attempt.
                             if self._cancel_event.is_set():
-                                cancelled = self._scheduler.apply_cancel()
-                                for name, old_state in cancelled:
-                                    await self.emit(
-                                        StageStateChanged(
-                                            type="stage_state_changed",
-                                            stage=name,
-                                            state=StageExecutionState.COMPLETED,
-                                            previous_state=old_state,
-                                        )
-                                    )
-                                    await self._emit_terminal_stage(
-                                        name,
-                                        StageStatus.CANCELLED,
-                                        "cancelled",
-                                        results,
-                                        run_id=run_id,
-                                    )
+                                await self._finalize_cancelled_stages(results, run_id)
 
                             # Start more stages if slots available
                             if not self._scheduler.stop_starting_new:
@@ -2174,6 +2162,29 @@ class Engine:
         await self._process_deferred_events(stage_name)
 
         return duration_ms
+
+    async def _finalize_cancelled_stages(
+        self,
+        results: dict[str, executor_core.ExecutionSummary],
+        run_id: str,
+    ) -> None:
+        """Mark every ready or pending stage cancelled exactly once."""
+        for stage_name, old_state in self._scheduler.apply_cancel():
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=stage_name,
+                    state=StageExecutionState.COMPLETED,
+                    previous_state=old_state,
+                )
+            )
+            await self._emit_terminal_stage(
+                stage_name,
+                StageStatus.CANCELLED,
+                "cancelled",
+                results,
+                run_id=run_id,
+            )
 
     async def _emit_terminal_stage(
         self,
