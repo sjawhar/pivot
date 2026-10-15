@@ -63,8 +63,15 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global primitive constant change                     | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
 | Global collection, enum, or class instance           | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`                                                              |
 | Non-scalar module attribute                          | ✅ (error) | `test_integration.py::test_non_scalar_module_attribute_raises`                                                                      |
+| Method bound to an instance (`Scaler(3).apply`, `default_rng(0).normal`) as a global, cell, partial argument, loader field or `module.NAME` | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`, `test_integration.py::test_non_scalar_module_attribute_raises`, `test_manifest_cache_cli.py::test_method_bound_to_an_instance_is_an_error` |
+| Method bound to a Logger, a scalar, a class or a library module's own state (`np.random.normal`) | 🚫 | `test_safe_fingerprinting.py::test_methods_bound_to_a_logger_scalar_or_library_are_allowed`, `test_manifest_cache_cli.py::test_method_bound_to_a_scalar_class_or_library_is_allowed` |
 | Pydantic schema hash (model_json_schema)             | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                    |
 | Pydantic class in type hint                          | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                           |
+| Pydantic class read as a global (`Out().scale`), import-time field default | ✅ | `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
+| Class attribute read as `Config.SCALE` (scalar, Enum member, function) | ✅ | `test_fingerprint.py::test_class_attributes_a_stage_reads_are_tracked_one_by_one`, `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
+| Non-scalar class attribute read as `Config.COLUMNS` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_class_attribute_is_an_error` |
+| Class attribute the language or a library defines (`NamedTuple._fields`, `Enum._member_names_`, an inherited stdlib dict, a property object) | 🚫 (class AST only) | `test_manifest_cache_cli.py::test_class_attribute_the_language_or_a_library_defines_is_not_refused` |
+| `settings.Config.SCALE`, `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                  |
 | Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                         |
@@ -75,7 +82,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Nested function body change                          | ✅        | `test_fingerprint.py::test_nested_function_not_in_globals` (detected via parent AST hash)                                          |
 | Globals referenced only by nested functions          | ✅        | `test_change_detection.py::test_nested_function_global_reference_detected`, `test_change_detection.py::test_nested_function_global_change_causes_miss` |
 | Helper starting with `_` prefix                      | ✅        | `test_change_detection.py::test_underscore_helper_change_detected`                                                                 |
-| Stdlib callable in closure (e.g., `typing.cast`)     | 🚫        | `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`                                                              |
+| Stdlib callable via its module (e.g., `typing.cast`) | 🚫        | `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`                                                              |
+| Name rebound to another library function (`agg = np.mean` → `np.median`, from-import, partial) | ✅ | `test_manifest_cache_cli.py::test_rebinding_a_library_function_reruns_stage` |
+| Library function chosen at import (`getattr(np, os.environ[...])`) | ✅ | `test_manifest_cache_cli.py::test_library_function_chosen_at_import_reruns_stage` |
+| Library function in loader config stays cached | 🚫 | `test_manifest_cache_cli.py::test_library_function_in_loader_config_stays_cached` |
 | `logging.Logger` in closure                          | 🚫        | Loggers are functionally irrelevant for cache invalidation                                                                          |
 | Helper starting with `__` dunder                     | ❌        | `test_fingerprint.py::test_fingerprint_with_underscore_globals`                                                                     |
 
@@ -169,6 +179,11 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Closure value with deterministic repr | ✅        | `test_fingerprint.py::test_fingerprint_captures_unrecognized_closure_value` |
 | Closure value with `0x` in repr (non-deterministic) | 🚫  | `test_fingerprint.py::test_hash_unrecognized_closure_value_memory_address_raises` |
 | Closure value with repr > 10KB        | 🚫        | `test_fingerprint.py::test_hash_unrecognized_closure_value_large_repr_raises` |
+| Two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) | ✅ | `test_manifest_cache_cli.py::test_two_closures_from_one_factory_keep_their_values_in_every_process` |
+| Secret in a helper default or loader field changes | ✅ | `test_manifest_cache_cli.py::test_changing_a_secret_read_by_a_stage_reruns_it`, `test_functools.py::test_secret_partial_argument_hashes_by_keyed_digest` |
+| Factory-built stage under a same-named pipeline, run separately | ✅ | `test_manifest_cache_cli.py::test_same_named_pipelines_run_separately_keep_factory_closures_apart` |
+| `include()` of two factory-built stages under one name | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_two_factory_closures_under_one_stage_name` |
+| `include()` of one stage read through two factory-built loaders | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_one_stage_reading_through_two_factory_loaders` |
 
 ---
 
@@ -250,7 +265,7 @@ Tests in `test_callback_vulnerabilities.py` document edge cases where callback c
 | `functools.partial` arguments tracked              | ✅        | `test_functools.py::test_partial_args_change_triggers_fingerprint_change`               |
 | `functools.partial` wrapped function tracked       | ✅        | `test_functools.py::test_partial_underlying_func_change_triggers_fingerprint_change`    |
 | Instance/container state callbacks not tracked     | ❌        | `test_callback_vulnerabilities.py::test_container_callback_change_detected`             |
-| Class attribute callbacks (runtime modified)       | ❌        | `test_callback_vulnerabilities.py::test_class_attribute_callback_change_detected`       |
+| Class attribute callbacks (runtime modified)       | ✅        | `test_callback_vulnerabilities.py::test_class_attribute_callback_change_detected`       |
 
 ---
 
@@ -312,7 +327,10 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 8. **Module-qualified manifest keys**: `func:`, `class:`, `const:`, `schema:`, `partial:`,
    `mod:`, and `loader:` keys use the definition or binding module. A manifest can therefore
    contain `func:project.alpha.helper` and `func:project.beta.helper` without one overwriting
-   the other.
+   the other. A closure cell is keyed under the function that holds it: the stage function's
+   own cells under its definition (`const:project.make_stage.<locals>.make.factor`), a local
+   helper's cells under the binding it was reached through (`const:project.h2.factor`, with the
+   helper at `func:project.h2`), so two closures from one factory keep their own values.
 
 9. **Class body dependency tracking**: When `getclosurevars()` fails on a class, the class body
    is parsed to capture base classes and field annotations. Resolved user-code classes are
@@ -377,6 +395,11 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
     `StageDefinitionError` unless unsafe fingerprinting is explicitly enabled, in which case
     Pivot warns instead of pretending to track its contents.
 
+    A method bound to an instance is refused the same way (`apply = Scaler(3).apply`,
+    `normal = np.random.default_rng(SEED).normal`): the instance it carries is state no code
+    hash records. A method bound to a module, a class, a scalar or a `logging.Logger`, or a
+    library module's own export such as `np.random.normal`, is recorded by name instead.
+
     Tests: `test_integration.py::test_non_scalar_module_attribute_raises`,
     `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`
 
@@ -395,9 +418,16 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_fingerprint.py::test_resolve_annotations_individually_mixed`
 
-20. **Non-user-code callables silently skipped**: Stdlib/third-party callables captured in closures (e.g., `typing.cast`, `json.dumps`) are skipped rather than hashed. Their `repr()` contains memory addresses (`0x...`) which would trigger false mutable-capture errors. These functions are already tracked via module dependency analysis when accessed as `module.func`.
+20. **Library callables are recorded by name**: A stdlib or third-party function or class read
+    through a global, closure cell, default or partial (`agg = np.mean`,
+    `from numpy import median as agg`) gets an `ext:<binding>` entry holding its definition
+    name (`numpy.mean`); its code is not hashed. Rebinding the name reruns the stage, and a
+    cache hit re-reads the name. In loader config and partial arguments a library function's
+    canonical form is `["external", name]`, since its `repr()` can hold a memory address.
+    Reached through its module (`typing.cast`), a library callable adds no entry.
 
-    Tests: `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`
+    Tests: `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`,
+    `test_manifest_cache_cli.py::test_rebinding_a_library_function_reruns_stage`
 
 21. **Loggers silently skipped**: `logging.Logger` instances captured in closures are skipped. Module-level loggers (`_logger = logging.getLogger(__name__)`) are functionally irrelevant for cache invalidation — their repr can change based on logging configuration.
 

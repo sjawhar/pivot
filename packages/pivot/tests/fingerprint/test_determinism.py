@@ -302,6 +302,100 @@ def test_function_argument_hash_is_stable_across_processes(tmp_path: pathlib.Pat
     assert len(results) == 1, results
 
 
+_LIBRARY_NAME_SCRIPT = """\
+import functools
+import json
+
+import numpy as np
+
+from pivot import fingerprint
+
+agg = np.mean
+log = np.log
+join = ",".join
+reduce_mean = functools.partial(np.median, axis=0)
+
+
+def stage(x):
+    return agg(x) + log(x) + len(join(["a"])) + reduce_mean(x)
+
+
+manifest = fingerprint.get_stage_fingerprint(stage)
+print(json.dumps({k: v for k, v in manifest.items() if k.startswith(("ext:", "partial:"))}))
+"""
+
+
+def test_library_callables_are_named_without_addresses(tmp_path: pathlib.Path) -> None:
+    """`ext:` entries name a library callable by definition; every process gets the same text."""
+    (tmp_path / ".pivot").mkdir()
+    script = tmp_path / "library_stage.py"
+    script.write_text(_LIBRARY_NAME_SCRIPT)
+    outputs = {
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        for seed in range(3)
+    }
+
+    assert len(outputs) == 1, outputs
+    entries = json.loads(outputs.pop())
+    assert entries["ext:__main__.agg"] == "numpy.mean", entries
+    assert entries["ext:__main__.log"] == "numpy.log", entries
+    assert entries["ext:__main__.join"] == "builtins.str.join[',']", entries
+    assert entries["ext:__main__.reduce_mean.func"] == "numpy.median", entries
+    assert not any("0x" in value for value in entries.values()), entries
+
+
+_CYCLE_SCRIPT = """\
+import json
+
+from pivot import fingerprint
+
+
+class Node:
+    def __init__(self, factor):
+        self.me = self
+        self.factor = factor
+
+
+loop = [1]
+loop.append(loop)
+for value in (Node(2), Node(3), loop):
+    print(fingerprint._serialize_value_for_hash(value))
+"""
+
+
+def test_self_referencing_values_canonicalise_to_a_stable_cycle_token(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An object or list that holds itself ends in `["cycle", N]`, the same in every process."""
+    (tmp_path / ".pivot").mkdir()
+    script = tmp_path / "cycle_values.py"
+    script.write_text(_CYCLE_SCRIPT)
+    outputs = {
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in range(3)
+    }
+
+    assert len(outputs) == 1, outputs
+    node_two, node_three, loop = (json.loads(line) for line in outputs.pop().splitlines())
+    assert node_two != node_three, "the attribute beside the cycle is still hashed"
+    assert '["cycle", 2]' in json.dumps(node_two), node_two
+    assert loop == ["list", [1, ["cycle", 1]]], loop
+
+
 class _Opts:
     depth: int
     tags: set[str]

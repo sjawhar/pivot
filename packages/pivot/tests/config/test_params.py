@@ -15,7 +15,7 @@ import pydantic
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from pivot import exceptions, parameters, project, stage_def
+from pivot import exceptions, fingerprint, parameters, project, stage_def
 from pivot.compose import Pipeline, stage
 
 if TYPE_CHECKING:
@@ -999,6 +999,49 @@ def test_racing_threads_keep_every_gitignore_line(
             thread.join()
 
         _assert_gitignore_kept(root, set(keys))
+
+
+class _SecretDefault(stage_def.StageParams):
+    token: pydantic.SecretStr = pydantic.SecretStr("unset")
+
+
+_SECRET_CREDS = _SecretDefault(token=pydantic.SecretStr("value"))
+
+
+def _uses_secret_default(creds: _SecretDefault = _SECRET_CREDS) -> int:
+    return len(creds.token.get_secret_value())
+
+
+def _fingerprint_at(barrier: threading.Barrier, digests: list[str]) -> None:
+    barrier.wait()
+    manifest = fingerprint.get_stage_fingerprint(_uses_secret_default)
+    digests.append(manifest[f"default:{__name__}._uses_secret_default.creds"])
+
+
+def test_racing_fingerprints_create_one_key_and_keep_every_gitignore_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secret in a helper default is digested while fingerprinting, which may be the first
+    use of the key: racing fingerprints must share one key and leave .gitignore whole."""
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    for trial in range(10):
+        root = tmp_path / f"trial{trial}"
+        (root / ".pivot").mkdir(parents=True)
+        (root / ".pivot" / ".gitignore").write_text(_OLD_GITIGNORE)
+        monkeypatch.setattr(project, "_project_root_cache", root)
+        barrier = threading.Barrier(16)
+        digests = list[str]()
+        threads = [
+            threading.Thread(target=_fingerprint_at, args=(barrier, digests)) for _ in range(16)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(digests) == 16 and len(set(digests)) == 1, digests
+        assert (root / ".pivot" / "secret.key").exists(), "fingerprinting should create the key"
+        _assert_gitignore_kept(root, {parameters._secret_key().hex()})
 
 
 _KEY_CHILD = """\

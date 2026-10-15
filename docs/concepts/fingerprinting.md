@@ -17,7 +17,9 @@ logical keys to hashes:
 | `class:<module>.<qualname>` | User-defined classes referenced by the stage |
 | `mod:<module>.<attr>` | Attributes accessed on imported user modules |
 | `const:<module>.<name>` | Module-level scalars (`bool`, `int`, `float`, `str`, `bytes`, `None`) |
+| `const:<module>.<qualname>.<name>` | Scalars in a closure cell, keyed under the function that holds the cell, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | `default:<module>.<qualname>.<parameter>` | Default argument values (scalars and `StageParams`) |
+| `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); library code is not hashed |
 | `schema:<module>.<qualname>` | Pydantic model JSON schemas |
 | `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…` | Reader/Writer method ASTs and config for each input and output |
 
@@ -90,7 +92,8 @@ def normalize(df):
 
 A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or
 `None`; editing it re-runs the stage. Reading any other module-level value
-(tuple, list, dict, set, frozenset, enum member, class instance), directly or
+(tuple, list, dict, set, frozenset, enum member, class instance, or a method
+bound to an instance such as `np.random.default_rng(SEED).normal`), directly or
 as `module.NAME`, is a `StageDefinitionError` that names the variable:
 
 ```python

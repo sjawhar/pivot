@@ -17,15 +17,19 @@ _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 def _helper_pivot(
-    cwd: pathlib.Path, *args: str, hash_seed: int | None = None
+    cwd: pathlib.Path,
+    *args: str,
+    hash_seed: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    full_env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
     if hash_seed is not None:
-        env["PYTHONHASHSEED"] = str(hash_seed)
+        full_env["PYTHONHASHSEED"] = str(hash_seed)
+    full_env.update(env or {})
     return subprocess.run(
         [_PIVOT_BIN, *args],
         cwd=cwd,
-        env=env,
+        env=full_env,
         capture_output=True,
         text=True,
         timeout=180,
@@ -985,3 +989,938 @@ def test_variable_read_by_loader_on_two_inputs_is_named_once(tmp_path: pathlib.P
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert output.count("captures non-scalar variable 'KEYS'") == 1, output
+
+
+_ENV_SCALE_PIPELINE = """\
+import os
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+SCALE = int(os.environ.get("SCALE", "2"))
+
+
+@stage
+def scale(x: pd.DataFrame) -> pd.DataFrame:
+    return x * SCALE
+
+
+with Pipeline("env") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+
+def test_scalar_read_from_environment_at_import_reruns_stage(tmp_path: pathlib.Path) -> None:
+    """A cached manifest is reused only while every value the stage reads is unchanged."""
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _ENV_SCALE_PIPELINE, "data/raw/x.csv": "a\n1\n"}
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    assert (root / "data/env/scale.jsonl").read_text() == '{"a":2}\n'
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
+
+    assert "1 stale" in status, status
+    assert (root / "data/env/scale.jsonl").read_text() == '{"a":7}\n', output
+
+
+_SETTINGS_FILE_PIPELINE = """\
+import json
+import pathlib
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+FACTOR = int(json.loads(pathlib.Path("settings.json").read_text())["factor"])
+
+
+def make_stage(factor: int):
+    @stage
+    def made(x: pd.DataFrame) -> pd.DataFrame:
+        return x * factor
+
+    return made
+
+
+made = make_stage(FACTOR)
+
+
+@stage
+def plain(x: pd.DataFrame) -> pd.DataFrame:
+    return x * FACTOR
+
+
+with Pipeline("cfg") as pipeline:
+    made(pipeline.input("x.csv"))
+    plain(pipeline.input("x.csv"))
+"""
+
+
+def test_scalar_read_from_settings_file_at_import_reruns_stages(tmp_path: pathlib.Path) -> None:
+    """A settings file is not project source: the value read from it is checked on a hit."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _SETTINGS_FILE_PIPELINE,
+            "settings.json": '{"factor": 2}\n',
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":2}\n'
+    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":2}\n'
+
+    (root / "settings.json").write_text('{"factor": 7}\n')
+    status = _helper_ok(_helper_pivot(root, "status"))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "2 stale" in status, status
+    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":7}\n', output
+    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":7}\n', output
+
+
+_FACTORY_STAGES = """\
+import pandas as pd
+
+from pivot import stage
+
+
+def make_stage(factor: int):
+    @stage
+    def make(x: pd.DataFrame) -> pd.DataFrame:
+        return x * factor
+
+    return make
+"""
+
+
+def _factory_side(factor: int) -> str:
+    return (
+        "from pivot import Pipeline\nfrom shared.stages import make_stage\n\n"
+        + f"make = make_stage({factor})\n\n"
+        + 'with Pipeline("rep") as pipeline:\n    make(pipeline.input("x.csv"))\n'
+    )
+
+
+_INCLUDE_BOTH = (
+    "from pivot import Pipeline\n"
+    + "from left.pipeline import pipeline as left\n"
+    + "from right.pipeline import pipeline as right\n\n"
+    + 'with Pipeline("all") as pipeline:\n'
+    + "    pipeline.include(left)\n"
+    + "    pipeline.include(right)\n"
+)
+
+
+def test_include_refuses_two_factory_closures_under_one_stage_name(tmp_path: pathlib.Path) -> None:
+    """make_stage(2) and make_stage(5) share a file and qualname; their closure values differ."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "shared/stages.py": _FACTORY_STAGES,
+            "left/pipeline.py": _factory_side(2),
+            "right/pipeline.py": _factory_side(5),
+            "pipeline.py": _INCLUDE_BOTH,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "list")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert (
+        "Stage 'rep/make' is defined twice with different closure values (factor=2 vs factor=5), "
+        + "both calling make_stage.<locals>.make in shared/stages.py"
+    ) in output, output
+
+
+_FACTORY_LOADER_STAGES = """\
+import dataclasses
+from collections.abc import Callable
+from typing import Any
+
+import pandas as pd
+
+from pivot import loaders, stage
+
+
+def make_scaler(factor: int) -> Callable[[pd.DataFrame], pd.DataFrame]:
+    def scaler(df: pd.DataFrame) -> pd.DataFrame:
+        return df * factor
+
+    return scaler
+
+
+def _identity(df: pd.DataFrame) -> pd.DataFrame:
+    return df
+
+
+@dataclasses.dataclass(frozen=True)
+class ScaledCSV(loaders.CSV):
+    transform: Callable[[pd.DataFrame], pd.DataFrame] = _identity
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return self.transform(super().load(path))
+
+
+@stage
+def make(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+"""
+
+
+def _factory_loader_side(factor: int) -> str:
+    return (
+        "from pivot import Pipeline\nfrom shared.stages import ScaledCSV, make, make_scaler\n\n"
+        + 'with Pipeline("rep") as pipeline:\n'
+        + f'    make(pipeline.input("x.csv", format=ScaledCSV(transform=make_scaler({factor}))))\n'
+    )
+
+
+def test_include_refuses_one_stage_reading_through_two_factory_loaders(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A loader field holding make_scaler(2) or make_scaler(5) reads the input two ways."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "shared/stages.py": _FACTORY_LOADER_STAGES,
+            "left/pipeline.py": _factory_loader_side(2),
+            "right/pipeline.py": _factory_loader_side(5),
+            "pipeline.py": _INCLUDE_BOTH,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "list")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "Stage 'rep/make' is defined twice with different input formats" in output, output
+
+
+def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Right's factor=5 closure never gets left's cached factor=2 manifest."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "shared/stages.py": _FACTORY_STAGES,
+            "left/pipeline.py": _factory_side(2),
+            "right/pipeline.py": _factory_side(5),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    left = _helper_ok(_helper_pivot(root / "left", "repro"))
+    assert (root / "data/rep/make.jsonl").read_text() == '{"a":2}\n', left
+    right = _helper_ok(_helper_pivot(root / "right", "repro"))
+
+    assert "1 ran" in right, right
+    assert (root / "data/rep/make.jsonl").read_text() == '{"a":5}\n', right
+
+
+_NAN_PREP_DEFAULT = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def drop_low(raw: pd.DataFrame, ceiling: float = float("nan")) -> pd.DataFrame:
+    return raw[raw["score"] >= 0.5]
+
+
+with Pipeline("prep") as pipeline:
+    kept = drop_low(pipeline.input("scores.csv"))
+"""
+
+_NAN_PREP_FACTORY = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+THRESHOLD = float("nan")
+
+
+def make_stage(threshold: float):
+    @stage
+    def drop_low(raw: pd.DataFrame) -> pd.DataFrame:
+        return raw[raw["score"] >= 0.5] if threshold != threshold else raw
+
+    return drop_low
+
+
+drop_low = make_stage(THRESHOLD)
+
+with Pipeline("prep") as pipeline:
+    kept = drop_low(pipeline.input("scores.csv"))
+"""
+
+_NAN_ROOT = """\
+from pivot import Pipeline
+from prep.pipeline import pipeline as prep
+
+with Pipeline("all") as pipeline:
+    pipeline.include(prep)
+"""
+
+
+@pytest.mark.parametrize(
+    "prep",
+    [
+        pytest.param(_NAN_PREP_DEFAULT, id="nan-default"),
+        pytest.param(_NAN_PREP_FACTORY, id="nan-closure-cell"),
+    ],
+)
+def test_reimported_stage_with_a_nan_value_is_one_stage(tmp_path: pathlib.Path, prep: str) -> None:
+    """`pivot repro prep/pipeline.py` imports prep again; its new NaN is the same value."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "prep/pipeline.py": prep,
+            "pipeline.py": _NAN_ROOT,
+            "data/raw/scores.csv": "name,score\na,0.2\nb,0.7\n",
+        },
+    )
+
+    output = _helper_ok(_helper_pivot(root, "repro", "prep/pipeline.py"))
+
+    assert "1 ran" in output, output
+
+
+_SELF_REFERENCE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class Node:
+    def __init__(self) -> None:
+        self.me = self
+        self.factor = 2
+
+
+NODE = Node()
+
+
+{definition}
+
+
+with Pipeline("cyc") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+_SELF_REFERENCE_CELL = """\
+def make_stage(node: Node):
+    @stage
+    def scale(x: pd.DataFrame) -> pd.DataFrame:
+        return x * node.factor
+
+    return scale
+
+
+scale = make_stage(NODE)"""
+
+_SELF_REFERENCE_DEFAULT = """\
+@stage
+def scale(x: pd.DataFrame, node: Node = NODE) -> pd.DataFrame:
+    return x * node.factor"""
+
+
+@pytest.mark.parametrize(
+    ("definition", "variable"),
+    [
+        pytest.param(_SELF_REFERENCE_CELL, "node", id="closure-cell"),
+        pytest.param(_SELF_REFERENCE_DEFAULT, "NODE", id="default"),
+    ],
+)
+def test_self_referencing_object_is_refused_not_a_crash(
+    tmp_path: pathlib.Path, definition: str, variable: str
+) -> None:
+    """An object that holds itself is a D2 refusal, and unsafe mode warns and runs."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _SELF_REFERENCE_PIPELINE.format(definition=definition),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    refused = _helper_pivot(root, "repro")
+    unsafe = _helper_pivot(root, "repro", env={"PIVOT_UNSAFE_FINGERPRINTING": "1"})
+
+    refused_output = refused.stdout + refused.stderr
+    assert refused.returncode != 0, refused_output
+    assert "recursion" not in refused_output, refused_output
+    assert f"captures non-scalar variable '{variable}'" in refused_output, refused_output
+    assert "(type: Node)" in refused_output, refused_output
+    unsafe_output = _helper_ok(unsafe)
+    assert "1 ran" in unsafe_output, unsafe_output
+    assert (root / "data/cyc/scale.jsonl").read_text() == '{"a":2}\n'
+
+
+_TWO_CLOSURES_MODULE = """\
+def make(factor):
+    def inner(x):
+        return x * factor
+
+    return inner
+
+
+h2 = make(2)
+h5 = make(5)
+
+
+def stage(x):
+    return h2(x) + h5(x)
+"""
+
+_TWO_CLOSURES_SCRIPT = """\
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from pivot import fingerprint
+import two_closures
+
+print(json.dumps(fingerprint.get_stage_fingerprint(two_closures.stage), sort_keys=True))
+"""
+
+
+def test_two_closures_from_one_factory_keep_their_values_in_every_process(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`h2 = make(2)` and `h5 = make(5)` key their cells by binding; no hash seed picks one."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "two_closures.py").write_text(_TWO_CLOSURES_MODULE)
+    script = tmp_path / "script.py"
+    script.write_text(_TWO_CLOSURES_SCRIPT)
+    manifests = list[dict[str, str]]()
+    for seed in ("0", "1", "2", "3"):
+        env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+        env["PYTHONHASHSEED"] = seed
+        proc = subprocess.run(
+            [sys.executable, str(script), str(tmp_path)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        manifests.append(json.loads(proc.stdout))
+
+    assert all(manifest == manifests[0] for manifest in manifests), manifests
+    assert manifests[0]["const:two_closures.h2.factor"] == "2", manifests[0]
+    assert manifests[0]["const:two_closures.h5.factor"] == "5", manifests[0]
+
+
+_LIBRARY_BINDING_PIPELINE = """\
+import functools
+import os
+
+import numpy as np
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+{binding}
+
+
+@stage
+def summarise(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [float(agg(x["a"]))]}})
+
+
+with Pipeline("lib") as pipeline:
+    summarise(pipeline.input("x.csv"))
+"""
+
+
+def _helper_summary(root: pathlib.Path) -> float:
+    return json.loads((root / "data/lib/summarise.jsonl").read_text())["a"]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        pytest.param("agg = np.mean", "agg = np.median", id="module-attribute"),
+        pytest.param(
+            "from numpy import mean as agg", "from numpy import median as agg", id="from-import"
+        ),
+        pytest.param(
+            "agg = functools.partial(np.mean, axis=0)",
+            "agg = functools.partial(np.median, axis=0)",
+            id="partial-function",
+        ),
+    ],
+)
+def test_rebinding_a_library_function_reruns_stage(
+    tmp_path: pathlib.Path, before: str, after: str
+) -> None:
+    """A module-level name bound to a library function is recorded by what it names."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _LIBRARY_BINDING_PIPELINE.format(binding=before),
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert _helper_summary(root) == 3.0
+
+    (root / "pipeline.py").write_text(_LIBRARY_BINDING_PIPELINE.format(binding=after))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in output, output
+    assert _helper_summary(root) == 2.0, output
+
+
+def test_library_function_chosen_at_import_reruns_stage(tmp_path: pathlib.Path) -> None:
+    """A cache hit re-reads which library function the name holds."""
+    binding = 'agg = getattr(np, os.environ.get("AGG", "mean"))'
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _LIBRARY_BINDING_PIPELINE.format(binding=binding),
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={"AGG": "mean"}))
+    assert _helper_summary(root) == 3.0
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"AGG": "median"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"AGG": "median"}))
+
+    assert "1 stale" in status, status
+    assert _helper_summary(root) == 2.0, output
+
+
+_LIBRARY_LOADER_PIPELINE = """\
+import dataclasses
+from collections.abc import Callable
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class AggCSV(loaders.CSV):
+    agg: Callable[..., Any] = np.median
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return pd.DataFrame({"a": [float(self.agg(super().load(path)["a"]))]})
+
+
+@stage
+def summarise(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+
+
+with Pipeline("lib") as pipeline:
+    summarise(pipeline.input("x.csv", format=AggCSV(agg=np.mean)))
+"""
+
+
+def test_library_function_in_loader_config_stays_cached(tmp_path: pathlib.Path) -> None:
+    """A library function in loader config is named by module and qualname, not its address."""
+    root = _helper_project(
+        tmp_path, {"pipeline.py": _LIBRARY_LOADER_PIPELINE, "data/raw/x.csv": "a\n1\n2\n6\n"}
+    )
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in first, first
+
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "0 ran, 1 cached" in second, second
+    assert _helper_summary(root) == 3.0
+
+
+_BOUND_METHOD_PIPELINE = """\
+import functools
+
+import numpy as np
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class Scaler:
+    def __init__(self, factor: int) -> None:
+        self.factor = factor
+
+    def apply(self, x: float) -> float:
+        return x * self.factor
+
+
+{binding}
+
+
+@stage
+def summarise(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [float(method(1.0))]}})
+
+
+with Pipeline("lib") as pipeline:
+    summarise(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    ("binding", "variable"),
+    [
+        pytest.param("method = Scaler(3).apply", "method", id="user-instance"),
+        pytest.param("method = np.random.default_rng(0).normal", "method", id="seeded-generator"),
+        pytest.param(
+            "method = functools.partial(Scaler(3).apply)",
+            "pipeline.method.func",
+            id="partial-of-user-instance-method",
+        ),
+        pytest.param(
+            "method = functools.partial(np.random.default_rng(0).normal, scale=1.0)",
+            "pipeline.method.func",
+            id="partial-of-seeded-generator-method",
+        ),
+    ],
+)
+def test_method_bound_to_an_instance_is_an_error(
+    tmp_path: pathlib.Path, binding: str, variable: str
+) -> None:
+    """`Scaler(3).apply` carries state no code hash records, so the stage is refused."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _BOUND_METHOD_PIPELINE.format(binding=binding),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert f"captures non-scalar variable '{variable}' (type: method)" in output, output
+    assert "StageParams" in output, output
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        pytest.param("method = ','.join", id="method-of-a-scalar"),
+        pytest.param("method = dict.fromkeys", id="classmethod-of-a-builtin"),
+        pytest.param("method = np.random.normal", id="library-module-export"),
+    ],
+)
+def test_method_bound_to_a_scalar_class_or_library_is_allowed(
+    tmp_path: pathlib.Path, binding: str
+) -> None:
+    """A method bound to a scalar, a class or a library module's own state is not refused."""
+    pipeline = _BOUND_METHOD_PIPELINE.format(binding=binding).replace(
+        "float(method(1.0))", "len(str(method))"
+    )
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in output, output
+
+
+_SECRET_DEFAULT_PIPELINE = """\
+import os
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, StageParams, stage
+
+
+class Creds(StageParams):
+    token: pydantic.SecretStr = pydantic.SecretStr("unset")
+
+
+def _length(creds: Creds = Creds(token=pydantic.SecretStr(os.environ["TOKEN"]))) -> int:
+    return len(creds.token.get_secret_value())
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({"a": [_length()]})
+
+
+with Pipeline("sec") as pipeline:
+    measure(pipeline.input("x.csv"))
+"""
+
+_SECRET_LOADER_PIPELINE = """\
+import dataclasses
+import os
+from typing import Any
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenCSV(loaders.CSV):
+    token: pydantic.SecretStr = pydantic.SecretStr("unset")
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return pd.DataFrame({"a": [len(self.token.get_secret_value())]})
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+
+
+with Pipeline("sec") as pipeline:
+    token = pydantic.SecretStr(os.environ["TOKEN"])
+    measure(pipeline.input("x.csv", format=TokenCSV(token=token)))
+"""
+
+_SECRET_IN_DATACLASS_LOADER_PIPELINE = """\
+import dataclasses
+import os
+from typing import Any
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Auth:
+    token: pydantic.SecretStr
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenCSV(loaders.CSV):
+    auth: Auth = Auth(pydantic.SecretStr("unset"))
+
+    def load(self, path: Any) -> pd.DataFrame:
+        return pd.DataFrame({"a": [len(self.auth.token.get_secret_value())]})
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return x
+
+
+with Pipeline("sec") as pipeline:
+    auth = Auth(pydantic.SecretStr(os.environ["TOKEN"]))
+    measure(pipeline.input("x.csv", format=TokenCSV(auth=auth)))
+"""
+
+_SECRET_IN_DATACLASS_PARTIAL_PIPELINE = """\
+import dataclasses
+import functools
+import os
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Auth:
+    token: pydantic.SecretStr
+
+
+def _length(auth: Auth) -> int:
+    return len(auth.token.get_secret_value())
+
+
+LENGTH = functools.partial(_length, Auth(pydantic.SecretStr(os.environ["TOKEN"])))
+
+
+@stage
+def measure(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({"a": [LENGTH()]})
+
+
+with Pipeline("sec") as pipeline:
+    measure(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        pytest.param(_SECRET_DEFAULT_PIPELINE, id="stage-params-default"),
+        pytest.param(_SECRET_LOADER_PIPELINE, id="loader-field"),
+        pytest.param(_SECRET_IN_DATACLASS_LOADER_PIPELINE, id="dataclass-in-loader-field"),
+        pytest.param(_SECRET_IN_DATACLASS_PARTIAL_PIPELINE, id="dataclass-in-partial-argument"),
+    ],
+)
+def test_changing_a_secret_read_by_a_stage_reruns_it(tmp_path: pathlib.Path, pipeline: str) -> None:
+    """A secret in a helper default or loader config is fingerprinted by its keyed digest."""
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+    env = {"TOKEN": "first-secret"}
+    _helper_ok(_helper_pivot(root, "repro", env=env))
+    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":12}\n'
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"TOKEN": "second-secret-x"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"TOKEN": "second-secret-x"}))
+
+    assert "1 stale" in status, status
+    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":15}\n', output
+    lock = (root / ".pivot/stages/sec/measure.lock").read_text()
+    assert "first-secret" not in lock and "second-secret-x" not in lock, lock
+    key_file = root / ".pivot/secret.key"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+    ignored = subprocess.run(
+        ["git", "check-ignore", ".pivot/secret.key"], cwd=root, capture_output=True, text=True
+    )
+    assert ignored.returncode == 0, "secret.key must be gitignored"
+
+
+_CLASS_ATTRIBUTE_PIPELINE = """\
+import enum
+import os
+
+import pandas as pd
+import pydantic
+
+from pivot import Pipeline, stage
+
+
+class Config:
+    SCALE = int(os.environ.get("SCALE", "2"))
+    COLUMNS = ("a",)
+
+
+class Mode(enum.Enum):
+    DOUBLE = int(os.environ.get("MODE", "2"))
+
+
+class Out(pydantic.BaseModel):
+    scale: int = int(os.environ.get("OUT", "2"))
+
+
+@stage
+def scale(x: pd.DataFrame) -> pd.DataFrame:
+    return x * {read}
+
+
+with Pipeline("cls") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    ("read", "variable"),
+    [
+        pytest.param("Config.SCALE", "SCALE", id="class-scalar"),
+        pytest.param("Mode.DOUBLE.value", "MODE", id="enum-member"),
+        pytest.param("Out().scale", "OUT", id="pydantic-default"),
+    ],
+)
+def test_value_read_through_a_class_at_import_reruns_stage(
+    tmp_path: pathlib.Path, read: str, variable: str
+) -> None:
+    """`Config.SCALE`, an Enum member and a pydantic field default are re-read on a hit."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _CLASS_ATTRIBUTE_PIPELINE.format(read=read),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={variable: "2"}))
+    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":2}\n'
+    cached = _helper_ok(_helper_pivot(root, "status", env={variable: "2"}))
+
+    status = _helper_ok(_helper_pivot(root, "status", env={variable: "7"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={variable: "7"}))
+
+    assert "1 cached, 0 stale" in cached, cached
+    assert "1 stale" in status, status
+    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":7}\n', output
+
+
+def test_non_scalar_class_attribute_is_an_error(tmp_path: pathlib.Path) -> None:
+    """A tuple read as `Config.COLUMNS` is refused like a module-level tuple."""
+    pipeline = _CLASS_ATTRIBUTE_PIPELINE.format(read="len(Config.COLUMNS)")
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "captures non-scalar variable 'pipeline.Config.COLUMNS' (type: tuple)" in output, output
+    assert "StageParams" in output, output
+
+
+_LIBRARY_DEFINED_CLASS_ATTRIBUTE_PIPELINE = """\
+import enum
+import http.server
+import typing
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+class Opts(typing.NamedTuple):
+    x: int = 1
+
+
+class Color(enum.IntEnum):
+    RED = 1
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    pass
+
+
+class Helper:
+    @property
+    def prop(self) -> int:
+        return 1
+
+
+@stage
+def count(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [{read}]}})
+
+
+with Pipeline("lib") as pipeline:
+    count(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        pytest.param("len(Opts._fields) + len(Opts._field_defaults)", id="namedtuple-fields"),
+        pytest.param(
+            "len(Color._member_names_) + len(Color._value2member_map_)", id="enum-members"
+        ),
+        pytest.param("len(Handler.responses)", id="library-base-dict"),
+        pytest.param("int(isinstance(Helper.prop, property))", id="property-object"),
+    ],
+)
+def test_class_attribute_the_language_or_a_library_defines_is_not_refused(
+    tmp_path: pathlib.Path, read: str
+) -> None:
+    """`NamedTuple._fields`, `Enum._member_names_` and an inherited stdlib dict are not D2's."""
+    pipeline = _LIBRARY_DEFINED_CLASS_ATTRIBUTE_PIPELINE.format(read=read)
+    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in first, first
+    assert "0 ran, 1 cached" in second, second

@@ -168,18 +168,39 @@ def _iter_all_handles(node: _StageNode) -> list[ArtifactHandle]:
     return result
 
 
-def _stage_definition(func: Callable[..., Any], root: pathlib.Path) -> tuple[str, str]:
-    """Name the file (relative to the project root) and qualname that define a stage function.
+def _stage_definition(func: Callable[..., Any]) -> fingerprint.FunctionIdentity:
+    """Name the function a stage runs: `fingerprint.function_identity` of the unwrapped function.
 
-    Importing a pipeline file again makes new function objects with the same definition.
+    Importing a pipeline file again makes new function objects with the same identity. Two
+    closures from one factory (`make_stage(2)`, `make_stage(5)`) share a file and qualname but
+    differ in their closure values.
     """
+    return fingerprint.function_identity(inspect.unwrap(func))
+
+
+def _shown_file(func: Callable[..., Any], root: pathlib.Path) -> str:
+    """The file defining a stage function, relative to the pipeline root when inside it."""
     func = inspect.unwrap(func)
     source = inspect.getsourcefile(func)
     if source is None:
-        return func.__module__, func.__qualname__
+        return func.__module__
     path = pathlib.Path(source).resolve()
-    location = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
-    return location, func.__qualname__
+    return str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+
+
+def _cell_values(func: Callable[..., Any]) -> dict[str, object]:
+    """The live closure cell values of `func`, by free variable name."""
+    func = inspect.unwrap(func)
+    names = func.__code__.co_freevars
+    return {
+        name: fingerprint._cell_value(cell)
+        for name, cell in zip(names, func.__closure__ or (), strict=True)
+    }
+
+
+def _default_values(func: Callable[..., Any]) -> dict[str, object]:
+    """The live default values of `func`, by parameter name."""
+    return dict(fingerprint._function_defaults(inspect.unwrap(func)))
 
 
 def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
@@ -255,22 +276,44 @@ def _stage_difference(
     root: pathlib.Path,
 ) -> str | None:
     """Describe the first part that makes two infos different stages, or None if they match."""
-    first_file, first_name = _stage_definition(existing["func"], root)
-    again_file, again_name = _stage_definition(incoming["func"], root)
-    if first_file == again_file and first_name != again_name:
+    first = _stage_definition(existing["func"])
+    again = _stage_definition(incoming["func"])
+    first_file = _shown_file(existing["func"], root)
+    again_file = _shown_file(incoming["func"], root)
+    first_name, again_name = first["qualname"], again["qualname"]
+    same_file = (first["file"], first["module"]) == (again["file"], again["module"])
+    if same_file and first_name != again_name:
         return f"functions: {first_name} and {again_name}, both in {first_file}"
-    if first_file != again_file:
+    if not same_file:
         return f"functions: {first_name} in {first_file} and {again_name} in {again_file}"
+    both = f"both calling {first_name} in {first_file}"
+    if first["code"] != again["code"]:
+        return f"function code, {both}"
+    # Compare canonical JSON text, as the manifest cache key does: a NaN made by importing the
+    # file again is a new float, and `nan != nan`, but both are written `NaN`.
+    bound = (
+        ("closure values", first["cells"], again["cells"], _cell_values),
+        ("default values", first["defaults"], again["defaults"], _default_values),
+    )
+    for label, first_bound, again_bound, live_values in bound:
+        first_values = {name: json.dumps(value) for name, value in first_bound}
+        again_values = {name: json.dumps(value) for name, value in again_bound}
+        if first_values != again_values:
+            changed = sorted(
+                name for name in first_values if first_values[name] != again_values.get(name)
+            )
+            first_live = live_values(existing["func"])
+            again_live = live_values(incoming["func"])
+            first_shown = ", ".join(f"{name}={first_live[name]!r}" for name in changed)
+            again_shown = ", ".join(f"{name}={again_live[name]!r}" for name in changed)
+            return f"{label} ({first_shown} vs {again_shown}), {both}"
     for (label, first_key, first_shown), (_, again_key, again_shown) in zip(
         _stage_wiring(existing), _stage_wiring(incoming), strict=True
     ):
         if first_key != again_key:
             if first_shown == again_shown:
                 first_shown, again_shown = repr(first_key), repr(again_key)
-            return (
-                f"{label} ({first_shown} vs {again_shown}), "
-                + f"both calling {first_name} in {first_file}"
-            )
+            return f"{label} ({first_shown} vs {again_shown}), {both}"
     return None
 
 
@@ -283,9 +326,10 @@ def _require_same_stage(
     """Allow one stage reached twice; refuse two different stages under one name.
 
     A stage name is its lock file and output paths, so two different stages under one name
-    would share them. Two infos are one stage when they have the same definition (file and
-    qualname) and the same wiring (``_stage_wiring``). Including one pipeline twice, a diamond
-    of includes, and a pipeline file imported again by ``pivot repro <path>`` all match.
+    would share them. Two infos are one stage when they run the same function
+    (`fingerprint.function_identity`: file, qualname, code, closure values and defaults) with
+    the same wiring (``_stage_wiring``). Including one pipeline twice, a diamond of includes,
+    and a pipeline file imported again by ``pivot repro <path>`` all match.
     """
     difference = _stage_difference(existing, incoming, root)
     if difference is None:
