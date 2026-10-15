@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import pathlib
 from typing import TYPE_CHECKING, Any
@@ -1035,6 +1036,45 @@ async def test_download_batch_keeps_existing_destination(
 
     assert [r["success"] for r in results] == [True]
     assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
+    assert [p.name for p in tmp_path.iterdir()] == ["entry"], "no download temp file left"
+
+
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
+@pytest.mark.parametrize("exists", [False, True])
+async def test_download_batch_without_hard_links(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+    monkeypatch: pytest.MonkeyPatch,
+    link_errno: int,
+    exists: bool,
+) -> None:
+    """On a filesystem that refuses link() (vfat, many SMB and FUSE mounts), download still
+    promotes the verified file, and still keeps an existing entry."""
+    content = b"content"
+    cache_hash = _helper_hash(content)
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+        Body=content,
+    )
+    dest = tmp_path / "entry"
+    inode = None
+    if exists:
+        dest.write_bytes(content)
+        inode = dest.stat().st_ino
+
+    def _refuse_link(src: object, dst: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    results = await s3_remote.download_batch([(cache_hash, dest)], readonly=True)
+
+    assert [r["success"] for r in results] == [True], results
+    assert dest.read_bytes() == content
+    if inode is not None:
+        assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
     assert [p.name for p in tmp_path.iterdir()] == ["entry"], "no download temp file left"
 
 

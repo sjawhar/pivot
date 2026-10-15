@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import re
@@ -36,6 +37,9 @@ STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 BULK_EXISTS_LIST_THRESHOLD = 50
 
 _HEX_PATTERN = re.compile(r"^[a-f0-9]{16}$")
+
+# link() errors on filesystems without hard links (vfat, exFAT, many SMB and FUSE mounts).
+_NO_HARDLINK_ERRNO = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 # Cached S3 config to avoid re-parsing config on every call.
 # Safe without locking - asyncio is single-threaded, worst case race just
@@ -253,7 +257,10 @@ async def _atomic_download(
         if actual_hash != expected_hash:
             raise exceptions.RemoteError(
                 f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
-                + f"for {bucket}/{key}. Re-push it from a trusted source."
+                + f"for {bucket}/{key}. Delete {bucket}/{key} from the remote, then run "
+                + "`pivot push` on a machine whose cache has a good copy and that has never "
+                + "pushed or pulled this object with this remote; Pivot skips objects its "
+                + "record says the remote already holds."
             )
         if readonly:
             os.chmod(tmp_path, 0o444)
@@ -263,8 +270,18 @@ async def _atomic_download(
         else:
             # link() refuses an existing name, so a concurrent reader never sees the
             # entry disappear. The temp file is removed below either way.
-            with contextlib.suppress(FileExistsError):
+            try:
                 os.link(tmp_path, local_path)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                if exc.errno not in _NO_HARDLINK_ERRNO:
+                    raise
+                # No hard links here, so nothing can be hardlinking the entry either:
+                # rename unless another process already promoted it.
+                if not os.path.exists(local_path):
+                    os.replace(tmp_path, local_path)
+                    move_succeeded = True
     finally:
         if fd >= 0:
             os.close(fd)
