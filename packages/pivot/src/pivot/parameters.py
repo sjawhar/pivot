@@ -4,6 +4,7 @@ import contextlib
 import copy
 import dataclasses
 import difflib
+import errno
 import hashlib
 import hmac
 import json
@@ -576,18 +577,45 @@ def _secret_key() -> bytes:
     ``PIVOT_SECRET_KEY`` (64 hex digits) wins, so CI and teammates can share digests.
     Otherwise the key is ``.pivot/secret.key`` under the project root, created on first use
     with mode 0600 and added to ``.pivot/.gitignore``: it must never be committed. A clone
-    without the key makes a new one, so its stages with secrets re-run once.
+    without the key makes a new one, so its stages with secrets re-run once. The key file is
+    never read through a symbolic link.
 
     Raises:
-        ParamsError: ``PIVOT_SECRET_KEY`` or the key file does not hold 32 hex-encoded bytes.
+        ParamsError: ``PIVOT_SECRET_KEY`` or the key file does not hold 32 hex-encoded bytes,
+            or the key file is a symbolic link.
     """
     if (from_env := os.environ.get(_SECRET_KEY_ENV)) is not None:
         return _parse_secret_key(from_env, _SECRET_KEY_ENV)
     pivot_dir = project.get_project_root() / ".pivot"
     key_file = pivot_dir / _SECRET_KEY_FILE
-    if not key_file.exists():
+    try:
+        text = _read_no_follow(key_file)
+    except FileNotFoundError:
         _create_secret_key(pivot_dir, key_file)
-    return _parse_secret_key(key_file.read_text(), str(key_file))
+        text = _read_no_follow(key_file)
+    return _parse_secret_key(text, str(key_file))
+
+
+def _open_no_follow(path: pathlib.Path, flags: int) -> int:
+    """Open ``path`` without following a symbolic link at it; return the descriptor.
+
+    Raises:
+        ParamsError: ``path`` is a symbolic link.
+    """
+    try:
+        return os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise exceptions.ParamsError(
+                f"{path} is a symbolic link; Pivot does not follow one there. "
+                + "Replace it with a regular file."
+            ) from error
+        raise
+
+
+def _read_no_follow(path: pathlib.Path) -> str:
+    with os.fdopen(_open_no_follow(path, os.O_RDONLY)) as handle:
+        return handle.read()
 
 
 def _parse_secret_key(text: str, source: str) -> bytes:
