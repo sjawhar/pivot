@@ -343,6 +343,36 @@ def test_restore_killed_at_any_rename_loses_no_kept_entry(tmp_path: pathlib.Path
     assert crashes >= 4, f"only {crashes} crash points exercised"
 
 
+def test_restore_without_carrying_puts_entries_staged_by_a_killed_checkout_into_the_new_tree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After a killed `checkout --only-missing`, a restore that carries nothing (as `pivot repro`
+    restores a stale output) still puts the staged entries into the tree it writes."""
+    ext, v2_hash = _helper_kept_entries_layout(tmp_path)
+    child = multiprocessing.get_context("spawn").Process(
+        target=_helper_crash_at_rename, args=(tmp_path, v2_hash, 2)
+    )
+    child.start()
+    child.join(timeout=120)
+    assert child.exitcode == _CRASH_EXIT
+    assert cache.staged_kept_entries(ext) is not None, "the kill must leave entries staged"
+
+    restored = cache.restore_from_cache(
+        ext,
+        v2_hash,
+        tmp_path / ".pivot" / "cache" / "files",
+        checkout_modes=[cache.CheckoutMode.COPY],
+        state_dir=tmp_path / ".pivot",
+    )
+
+    assert restored
+    assert sorted(p.name for p in ext.iterdir()) == [".a.txt.swp", "a.txt", "build", "c.txt"]
+    assert (ext / "build" / "x.o").read_text() == "object\n"
+    assert (ext / ".a.txt.swp").read_text() == "swap\n"
+    assert (ext / "a.txt").read_text() == "one updated\n"
+    assert cache.staged_kept_entries(ext) is None
+
+
 def test_checkout_only_missing_reads_no_content_of_unchanged_hardlinked_directory(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner, mocker: MockerFixture
 ) -> None:

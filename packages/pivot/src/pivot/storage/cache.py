@@ -680,18 +680,15 @@ def _restore_directory_from_cache(
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
         # Entries of the existing directory that are not part of the output, to carry over.
-        # An interrupted restore of this target may have left some in keep_dir: put them
-        # back first, so this restore carries them like the rest.
+        # A restore that carries them first puts back what an interrupted one left staged in
+        # keep_dir, so they are carried like the rest. Any other restore leaves keep_dir alone
+        # and moves its contents into the new tree after the swap.
         keep_dir = _keep_staging_path(path)
         keep = list[str]()
-        if path.is_dir() and not path.is_symlink():
-            # Every restore of path puts back what an interrupted one left staged.
+        if keep_ignored and path.is_dir() and not path.is_symlink():
             if keep_dir.exists():
                 _move_kept_entries(keep_dir, path)
-            if keep_ignored:
-                _, keep = _scan_entries(
-                    path, {entry["relpath"] for entry in output_hash["manifest"]}
-                )
+            _, keep = _scan_entries(path, {entry["relpath"] for entry in output_hash["manifest"]})
         if symlink_fast_path and (keep or keep_dir.exists()):
             # A directory that keeps local entries cannot be a link to the cache tree.
             symlink_fast_path = False
