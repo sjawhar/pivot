@@ -328,7 +328,6 @@ class DepEntry(TypedDict):
     producer: str
     key: str | None
     hash: str
-    display: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -338,8 +337,6 @@ class OutEntry(TypedDict):
 
     key: str | None
     hash: str
-    tag: str
-    display: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 

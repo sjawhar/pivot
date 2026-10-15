@@ -148,10 +148,6 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | None:
         return f"{field}.producer"
     if "key" not in entry or not (entry["key"] is None or isinstance(entry["key"], str)):
         return f"{field}.key"
-    if list_key == "outs" and not isinstance(entry.get("tag"), str):
-        return f"{field}.tag"
-    if "display" in entry and not isinstance(entry["display"], str):
-        return f"{field}.display"
     if "size" in entry and not _is_int(entry["size"]):
         return f"{field}.size"
     if "manifest" in entry:
@@ -190,14 +186,6 @@ def _lock_shape_error(data: object) -> str | None:
     return None
 
 
-def _get_output_tag(hash_info: HashInfo) -> str:
-    raw: dict[str, object] = cast("dict[str, object]", cast("object", hash_info))
-    value = raw.get("tag")
-    if isinstance(value, str):
-        return value
-    return "data"
-
-
 def _convert_to_storage_format(data: LockData) -> StorageLockData:
     """Convert internal LockData to storage format (list-based, identity keys, sorted)."""
     normalized_deps = _ensure_identity_keys(data["dep_hashes"])
@@ -213,7 +201,7 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     outs_list = list[OutEntry]()
     for identity, hash_info in normalized_outs.items():
-        entry = OutEntry(key=identity.key, hash=hash_info["hash"], tag=_get_output_tag(hash_info))
+        entry = OutEntry(key=identity.key, hash=hash_info["hash"])
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
         outs_list.append(entry)
