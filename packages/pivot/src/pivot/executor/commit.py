@@ -143,9 +143,9 @@ def commit_stages(
             # 6. Hash and cache outputs
             output_hashes_by_key = dict[str, HashInfo]()
             output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
+            output_paths_by_identity = dict[types.ArtifactIdentity, str]()
             file_hash_entries = list[tuple[str, int, int, int, str]]()
             outputs_missing = False
-
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)
                 try:
@@ -154,6 +154,9 @@ def commit_stages(
                     file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[out.identity] = hash_info
+                    output_paths_by_identity[out.identity] = out_path.relative_to(
+                        project_root
+                    ).as_posix()
                 except FileNotFoundError:
                     logger.error(
                         "Stage '%s': output missing: %s — skipping", stage_name, identity_key
@@ -179,6 +182,7 @@ def commit_stages(
                 params=current_params,
                 dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
                 output_hashes=dict(sorted(output_hashes_by_identity.items())),
+                output_paths=output_paths_by_identity,
             )
             production_lock.write(new_lock_data)
 

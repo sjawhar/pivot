@@ -2139,3 +2139,160 @@ def test_submodule_read_through_its_package_is_tracked(tmp_path: pathlib.Path) -
 
     assert "1 ran" in output, output
     assert (root / "data/sub/scale.jsonl").read_text() == '{"a":100}\n', output
+
+
+_DIRECT_WIRING_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def combine(left: str, right: str) -> str:
+    return left + ":" + right
+
+
+with Pipeline("wire") as pipeline:
+    a = pipeline.input("a.txt", t=str)
+    b = pipeline.input("b.txt", t=str)
+    {call}
+"""
+
+_COLLECTION_WIRING_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def combine(items: list[str] | tuple[str, ...]) -> str:
+    return type(items).__name__ + ":" + ":".join(items)
+
+
+with Pipeline("wire") as pipeline:
+    a = pipeline.input("a.txt", t=str)
+    b = pipeline.input("b.txt", t=str)
+    {call}
+"""
+
+
+@pytest.mark.parametrize(
+    ("template", "before", "after", "initial", "expected"),
+    [
+        pytest.param(
+            _DIRECT_WIRING_PIPELINE,
+            "combine(a, b)",
+            "combine(b, a)",
+            "A:B",
+            "B:A",
+            id="direct-input-order",
+        ),
+        pytest.param(
+            _COLLECTION_WIRING_PIPELINE,
+            "combine([a, b])",
+            "combine([b, a])",
+            "list:A:B",
+            "list:B:A",
+            id="list-input-order",
+        ),
+        pytest.param(
+            _COLLECTION_WIRING_PIPELINE,
+            "combine([a, b])",
+            "combine((a, b))",
+            "list:A:B",
+            "tuple:A:B",
+            id="collection-kind",
+        ),
+    ],
+)
+@pytest.mark.parametrize("delete_lock", [False, True], ids=["lock", "run-cache"])
+def test_rewiring_stage_inputs_reruns_and_never_restores_old_output(
+    tmp_path: pathlib.Path,
+    template: str,
+    before: str,
+    after: str,
+    initial: str,
+    expected: str,
+    delete_lock: bool,
+) -> None:
+    """The parameter-to-artifact binding, collection kind and order belong in the manifest."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": template.format(call=before),
+            "data/raw/a.txt": "A",
+            "data/raw/b.txt": "B",
+        },
+    )
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in first, first
+    assert (root / "data/wire/combine.txt").read_text() == initial
+
+    (root / "pipeline.py").write_text(template.format(call=after))
+    status = _helper_ok(_helper_pivot(root, "status", "--explain"))
+    if delete_lock:
+        (root / ".pivot/stages/wire/combine.lock").unlink()
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "Inputs rewired:" in status, status
+    assert "combine" in status, status
+    assert "1 ran" in second, second
+    assert (root / "data/wire/combine.txt").read_text() == expected
+
+
+_PATH_WIRING_PIPELINE = """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def result(file: pathlib.Path) -> str:
+    return file.name
+
+
+with Pipeline("path") as pipeline:
+    result(pipeline.input("input", path="{path}", t=pathlib.Path))
+"""
+
+
+@pytest.mark.parametrize("delete_lock", [False, True], ids=["lock", "run-cache"])
+def test_rebinding_path_input_with_same_content_reruns_and_never_restores_old_output(
+    tmp_path: pathlib.Path, delete_lock: bool
+) -> None:
+    """A PathOnly input's binding path is stage wiring even when the bytes do not change."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _PATH_WIRING_PIPELINE.format(path="old.txt"),
+            "old.txt": "same",
+            "new.txt": "same",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/path/result.txt").read_text() == "old.txt"
+
+    (root / "pipeline.py").write_text(_PATH_WIRING_PIPELINE.format(path="new.txt"))
+    status = _helper_ok(_helper_pivot(root, "status", "--explain"))
+    if delete_lock:
+        (root / ".pivot/stages/path/result.lock").unlink()
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "Inputs rewired: file" in status, status
+    assert "1 ran" in output, output
+    assert (root / "data/path/result.txt").read_text() == "new.txt"
+
+
+def test_unchanged_wiring_stays_cached(tmp_path: pathlib.Path) -> None:
+    """A wiring entry is stable when the pipeline call has not changed."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _DIRECT_WIRING_PIPELINE.format(call="combine(a, b)"),
+            "data/raw/a.txt": "A",
+            "data/raw/b.txt": "B",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+
+    status = _helper_ok(_helper_pivot(root, "status"))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 cached, 0 stale" in status, status
+    assert "0 ran, 1 cached" in output, output

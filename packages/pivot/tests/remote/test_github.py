@@ -235,7 +235,7 @@ def test_resolve_ref_auth_error(mocker: MockerFixture) -> None:
 
 
 def test_list_directory_success(mocker: MockerFixture) -> None:
-    """Contents API list response returns file names."""
+    """Contents API list response preserves names and entry types."""
     _mock_aiohttp_session(
         mocker,
         200,
@@ -248,8 +248,11 @@ def test_list_directory_success(mocker: MockerFixture) -> None:
 
     result = asyncio.run(github.list_directory("org", "repo", "data", "main"))
 
-    assert result is not None
-    assert sorted(result) == ["subdir", "test.csv", "train.csv"]
+    assert result == [
+        {"name": "train.csv", "type": "file"},
+        {"name": "test.csv", "type": "file"},
+        {"name": "subdir", "type": "dir"},
+    ]
 
 
 def test_list_directory_not_found(mocker: MockerFixture) -> None:

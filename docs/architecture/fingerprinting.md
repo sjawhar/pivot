@@ -212,6 +212,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `class:` | Class definitions | `class:myproject.params.TrainParams` |
 | `const:` | Primitive values read as globals or as `module.NAME` | `const:myproject.settings.THRESHOLD` |
 | `default:` | Default argument values that the AST does not record | `default:myproject.stages.scale.factor` |
+| `wire:` | Call-site artifact wiring: parameter bindings, collection kind/order, input paths | `wire:left` → `raw-a`, `wire:items` → `{"kind":"list","identities":["a","b"]}`, `wire:file:path` → `old.txt` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
 | `ext:` | A library function or class a stage reads, named by its definition (its code is not hashed) | `ext:myproject.stages.agg` → `numpy.mean` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
