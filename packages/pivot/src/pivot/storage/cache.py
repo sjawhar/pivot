@@ -589,6 +589,20 @@ def _resolve_checkout_modes(
     return DEFAULT_CHECKOUT_MODE_ORDER.copy()
 
 
+def missing_cache_objects(
+    output_hash: HashInfo, cache_dir: pathlib.Path, checkout_modes: list[CheckoutMode]
+) -> list[str]:
+    """Return hashes required to restore an output that are absent from the cache."""
+    if is_dir_hash(output_hash):
+        tree_path = get_cache_path(cache_dir, output_hash["hash"])
+        if checkout_modes[0] == CheckoutMode.SYMLINK and tree_path.exists():
+            return []
+        hashes = [entry["hash"] for entry in output_hash["manifest"]]
+    else:
+        hashes = [output_hash["hash"]]
+    return [file_hash for file_hash in hashes if not get_cache_path(cache_dir, file_hash).exists()]
+
+
 def save_to_cache(
     path: pathlib.Path,
     cache_dir: pathlib.Path,

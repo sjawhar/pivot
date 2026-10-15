@@ -15,6 +15,7 @@ import sys
 import uuid
 
 import boto3
+import yaml
 
 from pivot import loaders
 
@@ -204,6 +205,45 @@ def test_repro_refuses_a_directory_artifact_that_contains_a_symlink(
 
     assert proc.returncode == 1, out
     assert "Directory artifact contains symlink" in out
+
+
+_FORCE_CHECKOUT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def produce() -> str:
+    return "cached"
+
+
+with Pipeline("checkout") as pipeline:
+    produce()
+"""
+
+
+def test_checkout_force_preserves_existing_output_when_its_cache_object_is_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A cache miss is reported before --force can delete the workspace output."""
+    root = _project(tmp_path, {"pipeline.py": _FORCE_CHECKOUT_PIPELINE})
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "copy"))
+    _ok(_pivot(root, "repro"))
+
+    output = root / "data" / "checkout" / "produce.txt"
+    output.write_text("workspace edit")
+    lock_data = yaml.safe_load(
+        (root / ".pivot" / "stages" / "checkout" / "produce.lock").read_text()
+    )
+    output_hash = lock_data["outs"][0]["hash"]
+    (root / ".pivot" / "cache" / "files" / output_hash[:2] / output_hash[2:]).unlink()
+
+    proc = _pivot(root, "checkout", "--force", "checkout/produce")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert output_hash in out
+    assert "cache object" in out.lower()
+    assert output.read_text() == "workspace edit"
 
 
 def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: pathlib.Path) -> None:

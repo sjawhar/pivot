@@ -192,6 +192,10 @@ $ pivot checkout --only-missing    # restore only missing files; never overwrite
 $ pivot checkout --force           # overwrite existing files
 ```
 
+With `--force`, Pivot checks the required local cache objects before replacing an
+existing file. If any object is missing, it names the missing hash and leaves
+the workspace file unchanged.
+
 ### `pivot commit`
 
 Record current outputs in lock files and cache without re-running:

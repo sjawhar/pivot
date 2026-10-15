@@ -157,7 +157,12 @@ def _restore_path_locked(
                     return ("restored" if outcome["restored"] else "skipped", path.name)
                 keep_ignored = True
             case CheckoutBehavior.FORCE:
-                cache.remove_output(path)
+                missing = cache.missing_cache_objects(output_hash, cache_dir, checkout_modes)
+                if missing:
+                    raise click.ClickException(
+                        f"Cannot overwrite '{path.name}': cache object missing: {', '.join(missing)}. "
+                        + "The workspace output was not changed."
+                    )
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
