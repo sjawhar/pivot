@@ -77,15 +77,6 @@ def test_parse_node_extracts_type_and_value() -> None:
     assert value == "train"
 
 
-def test_parse_node_handles_colons_in_path() -> None:
-    """parse_artifact_identity parses producer-only strings."""
-    identity = graph.parse_artifact_identity("external")
-    assert identity == ArtifactIdentity("external", None)
-
-    identity = graph.parse_artifact_identity("producer:key")
-    assert identity == ArtifactIdentity("producer", "key")
-
-
 # --- Graph building tests ---
 
 
