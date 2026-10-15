@@ -130,10 +130,14 @@ def test_affected_output_path_does_not_resolve_to_an_input(
     assert coord.get_affected_stages([output_path]) == ["consume_output"]
 
 
-def test_physical_output_event_uses_symlinked_output_identity(
-    tmp_path: pathlib.Path,
+@pytest.mark.parametrize(
+    "event_dir",
+    [pytest.param("real", id="physical"), pytest.param("linked", id="logical")],
+)
+def test_output_event_under_symlinked_parent_uses_output_identity(
+    tmp_path: pathlib.Path, event_dir: str
 ) -> None:
-    """A physical output event retains its producer and does not route through raw aliases."""
+    """Either spelling of an output event retains its producer and skips raw-input aliases."""
     real_dir = tmp_path / "real"
     real_dir.mkdir()
     linked_dir = tmp_path / "linked"
@@ -151,23 +155,24 @@ def test_physical_output_event_uses_symlinked_output_identity(
         }
     )
     coord = WatchCoordinator(graph, artifact_paths)
+    event_path = tmp_path / event_dir / "out.txt"
 
-    assert coord.get_producer(physical_output) == "source"
+    assert coord.get_producer(event_path) == "source"
     assert (
         coord.should_filter_path(
-            physical_output,
+            event_path,
             get_stage_state=_helper_state_map(StageExecutionState.RUNNING).__getitem__,
         )
         is True
     )
-    assert coord.get_affected_stages([physical_output]) == ["consume_output"]
+    assert coord.get_affected_stages([event_path]) == ["consume_output"]
 
 
 @pytest.mark.anyio
 async def test_watchfiles_physical_output_event_uses_symlinked_output_identity(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A watchfiles event for a symlinked output parent retains the output producer."""
+    """Whatever spelling watchfiles reports for the output, it routes as the output."""
     real_dir = tmp_path / "real"
     linked_dir = tmp_path / "linked"
     linked_dir.symlink_to(real_dir, target_is_directory=True)
@@ -194,17 +199,19 @@ async def test_watchfiles_physical_output_event_uses_symlinked_output_identity(
         with anyio.fail_after(10):
             event = await receive.receive()
         assert event["type"] == "data_artifact_changed"
-        event_paths = {pathlib.Path(event_path) for event_path in event["paths"]}
-        assert physical_output in event_paths
-        assert coord.get_producer(physical_output) == "source"
-        assert (
-            coord.should_filter_path(
-                physical_output,
-                get_stage_state=_helper_state_map(StageExecutionState.RUNNING).__getitem__,
+        output_events = [
+            pathlib.Path(event_path)
+            for event_path in event["paths"]
+            if pathlib.Path(event_path).name == "out.txt"
+        ]
+        assert output_events, f"watchfiles reported no output path: {event['paths']}"
+        running = _helper_state_map(StageExecutionState.RUNNING)
+        for event_path in output_events:
+            assert coord.get_producer(event_path) == "source", event_path
+            assert coord.should_filter_path(event_path, get_stage_state=running.__getitem__), (
+                event_path
             )
-            is True
-        )
-        assert coord.get_affected_stages([physical_output]) == ["consume_output"]
+            assert coord.get_affected_stages([event_path]) == ["consume_output"], event_path
         tg.cancel_scope.cancel()
 
 
