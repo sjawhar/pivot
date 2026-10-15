@@ -244,8 +244,11 @@ def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> None:
         with os.fdopen(fd, "wb") as file:
             file.write(content)
 
-    with cache.restore_lock(dest_path, config.get_state_dir()):
-        cache.atomic_write_file(dest_path, write_content)
+    with cache.restore_lock(dest_path, config.get_state_dir()) as lock_token:
+        staging_path = (
+            cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
+        )
+        cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
 
 
 def restore_file(

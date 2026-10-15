@@ -315,6 +315,11 @@ pathlib.Path.replace = replace
     process.communicate(timeout=30)
 
     assert target.read_text() == "workspace content"
+    _ok(_pivot(root, "get", "--force", "--rev", "HEAD", "source.txt"))
+
+    assert target.read_text() == "revision content"
+    assert list(root.glob("*.tmp")) == []
+    assert list(root.glob(".pivot_restore_*.file")) == []
 
 
 def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: pathlib.Path) -> None:

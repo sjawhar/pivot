@@ -76,8 +76,8 @@ def staged_kept_entries(path: pathlib.Path) -> pathlib.Path | None:
     return keep_dir if keep_dir.exists() else None
 
 
-def _restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathlib.Path:
-    """Return the deterministic staging path for a file checkout."""
+def restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathlib.Path:
+    """Return the deterministic staging path for a file restore."""
     return path.parent / f"{_RESTORE_TEMP_PREFIX}{token or _restore_target_token(path)}.file"
 
 
@@ -123,26 +123,37 @@ def atomic_write_file(
     dest: pathlib.Path,
     write_fn: Callable[[int], None],
     mode: int = 0o644,
+    *,
+    staging_path: pathlib.Path | None = None,
 ) -> None:
-    """Atomically write to dest using temp file + rename pattern.
+    """Atomically write to dest using a temporary file and replacement.
+
+    A caller holding a restore lock can supply its target-tagged staging path so a
+    later restore of the same target cleans up a process killed before replacement.
 
     Args:
         dest: Target file path.
         write_fn: Function that receives the file descriptor and writes content.
                   MUST close fd (typically via os.fdopen which takes ownership).
         mode: File permissions (default 0o644).
+        staging_path: Optional deterministic temporary path beside ``dest``.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
-    tmp = pathlib.Path(tmp_path)
+    if staging_path is None:
+        fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
+        tmp = pathlib.Path(tmp_path)
+    else:
+        tmp = staging_path
+        _clear_path(tmp)
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     fd_closed = False
     try:
         write_fn(fd)
         fd_closed = True  # write_fn took ownership via os.fdopen
-        os.chmod(tmp_path, mode)
+        os.chmod(tmp, mode)
         tmp.replace(dest)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        _clear_path(tmp)
         raise
     finally:
         # Only close fd if write_fn didn't (e.g., exception before os.fdopen)
@@ -699,7 +710,7 @@ def _store_file(
     cache_path = get_cache_path(cache_dir, file_hash)
     copy_to_cache(path, cache_path)
     with restore_lock(path, state_dir) as lock_token:
-        staging_path = _restore_staging_path(path, lock_token)
+        staging_path = restore_staging_path(path, lock_token)
         _clear_path(staging_path)
         _checkout_with_fallback(
             path,
@@ -777,7 +788,7 @@ def _store_directory(
             for entry in manifest:
                 file_path = path / entry["relpath"]
                 cache_path = get_cache_path(cache_dir, entry["hash"])
-                staging_path = _restore_staging_path(file_path)
+                staging_path = restore_staging_path(file_path)
                 _clear_path(staging_path)
                 _checkout_with_fallback(
                     file_path,
@@ -902,7 +913,7 @@ def _restore_file_from_cache(
                 lock_token=held_token,
             )
 
-    staging_path = _restore_staging_path(path, lock_token)
+    staging_path = restore_staging_path(path, lock_token)
     _clear_path(staging_path)
     _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
     return True
