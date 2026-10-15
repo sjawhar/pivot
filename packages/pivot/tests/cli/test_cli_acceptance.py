@@ -1076,3 +1076,31 @@ with Pipeline("p") as pipeline:
     assert first.returncode == 0, first_stdout + first_stderr
     assert second.returncode == 0, second_stdout + second_stderr
     assert (root / "data/p/grow.txt").read_text() == "aa"
+
+
+def test_status_explain_displays_falsy_new_param_values(tmp_path: pathlib.Path) -> None:
+    """A changed parameter value of zero is displayed instead of an unavailable marker."""
+    pipeline = """\
+from pivot import Pipeline, StageParams, stage
+
+
+class Params(StageParams):
+    factor: int = 10
+
+
+@stage
+def scale(params: Params) -> str:
+    return str(params.factor)
+
+
+with Pipeline("p") as pipeline:
+    scale(params=Params())
+"""
+    root = _project(tmp_path, {"pipeline.py": pipeline})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("p/scale:\n  factor: 0\n")
+
+    explanation = _ok(_pivot(root, "status", "--explain"))
+
+    assert "Old: 10" in explanation, explanation
+    assert "New: 0" in explanation, explanation

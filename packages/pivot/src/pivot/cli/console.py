@@ -117,8 +117,12 @@ class Console:
             self._echo(f"    {key}")
 
             if change_type == "modified":
-                self._echo(f"      Old: {self._color(str(old_val) if old_val else 'N/A', 'red')}")
-                self._echo(f"      New: {self._color(str(new_val) if new_val else 'N/A', 'green')}")
+                self._echo(
+                    f"      Old: {self._color(str(old_val) if old_val is not None else 'N/A', 'red')}"
+                )
+                self._echo(
+                    f"      New: {self._color(str(new_val) if new_val is not None else 'N/A', 'green')}"
+                )
             elif change_type == "added":
                 self._echo(f"      {self._color('(added)', 'green')} {new_val}")
             else:
