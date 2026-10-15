@@ -243,9 +243,6 @@ def test_checkout_all_uses_merged_pipeline_paths(
         pipeline_a.mkdir(parents=True, exist_ok=True)
         pipeline_b.mkdir(parents=True, exist_ok=True)
 
-        (pipeline_a / ".pivot").mkdir()
-        (pipeline_b / ".pivot").mkdir()
-
         pipeline_a_code = """\
 from __future__ import annotations
 
@@ -261,7 +258,7 @@ def stage_func() -> None:
     return None
 
 
-pipeline = Pipeline("pipe_a", root=pathlib.Path(__file__).parent)
+pipeline = Pipeline("pipe_a")
 
 pipeline._registry.add_existing(RegistryStageInfo(
     func=stage_func,
@@ -305,7 +302,7 @@ def stage_func() -> None:
     return None
 
 
-pipeline = Pipeline("pipe_b", root=pathlib.Path(__file__).parent)
+pipeline = Pipeline("pipe_b")
 
 pipeline._registry.add_existing(RegistryStageInfo(
     func=stage_func,
@@ -341,7 +338,7 @@ pipeline._registry.add_existing(RegistryStageInfo(
         output_path = merged_store.resolve_display_path(ref)
         output_hash = _helper_cache_file(output_path, "id,value\n1,2\n")
 
-        lock_dir = pipeline_a / ".pivot"
+        lock_dir = project_root / ".pivot"
         _helper_write_lock("train", lock_dir, {ref.identity: output_hash})
 
         result = runner.invoke(cli.cli, ["checkout", "--all", "train"])

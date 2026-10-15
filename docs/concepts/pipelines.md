@@ -37,9 +37,10 @@ Rules for `pipeline.py`:
 - Errors in the block (unsupported argument types, wrong arity) are collected
   and reported together when the block exits.
 
-`Pipeline(name, root=None)` takes the pipeline name and an optional root
-directory; the root defaults to the project root (the top-most directory that
-contains `.pivot/`).
+`Pipeline(name, root=None)` takes the pipeline name. A pipeline always keeps its
+lock files and state in the project's `.pivot/` and its outputs in the project's
+`data/`, so `root` may only be the project root (the top-most directory that
+contains `.pivot/`) or omitted; discovery refuses any other `root`.
 
 ### Where Pivot looks
 

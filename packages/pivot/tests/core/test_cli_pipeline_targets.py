@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from pivot.cli import targets as cli_targets
 from pivot.compose import Pipeline
 
@@ -16,13 +18,12 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("set_project_root")
 def test_resolve_pipeline_file_targets_pipeline_py(tmp_path: pathlib.Path) -> None:
     """Pipeline .py file target resolves to its stage names."""
     sub = tmp_path / "sub"
     sub.mkdir()
     pipeline_code = """\
-import pathlib
-
 from pivot.compose import Pipeline, stage
 
 
@@ -36,7 +37,7 @@ def stage_b() -> dict:
     return {}
 
 
-with Pipeline("test_pipe", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("test_pipe") as pipeline:
     stage_a()
     stage_b()
 """
@@ -77,13 +78,12 @@ def test_resolve_pipeline_file_targets_not_pipeline_filename(tmp_path: pathlib.P
     assert pipelines == [], "Non-pipeline filename should not load pipelines"
 
 
+@pytest.mark.usefixtures("set_project_root")
 def test_resolve_pipeline_file_targets_mixed_targets(tmp_path: pathlib.Path) -> None:
     """Mix of pipeline file and non-pipeline targets — pipeline resolved, others pass through."""
     sub = tmp_path / "sub"
     sub.mkdir()
     pipeline_code = """\
-import pathlib
-
 from pivot.compose import Pipeline, stage
 
 
@@ -92,7 +92,7 @@ def my_stage() -> dict:
     return {}
 
 
-with Pipeline("mixed_test", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("mixed_test") as pipeline:
     my_stage()
 """
     (sub / "pipeline.py").write_text(pipeline_code)

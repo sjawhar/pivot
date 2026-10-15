@@ -10,7 +10,7 @@ import types as _stdlib_types
 import cloudpickle
 import pytest
 
-from pivot import discovery
+from pivot import discovery, project
 from tests import conftest
 
 
@@ -151,6 +151,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     assert pipeline.list_stages() == ["test/clean"]
 
 
+@pytest.mark.usefixtures("set_project_root")
 def test_discover_subdirectory_pipeline_imports_package_helper(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -164,7 +165,7 @@ def clean(value: str) -> str:
     )
     (report / "pipeline.py").write_text(
         """
-import pathlib
+
 
 from pivot.compose import Pipeline, stage
 from report.helpers import clean
@@ -175,7 +176,7 @@ def preprocess(value: str) -> str:
     return clean(value)
 
 
-with Pipeline("report", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("report") as pipeline:
     preprocess(pipeline.input("value.txt", t=str))
 """
     )
@@ -188,6 +189,7 @@ with Pipeline("report", root=pathlib.Path(__file__).parent) as pipeline:
     assert "func:report.helpers.clean" in pipeline.ensure_fingerprint("report/preprocess")
 
 
+@pytest.mark.usefixtures("set_project_root")
 def test_discover_all_reuses_pipeline_imported_by_another_pipeline(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -208,7 +210,7 @@ def kept(value: str) -> str:
     return value
 
 
-with Pipeline("prep", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("prep") as pipeline:
     kept_handle = kept(pipeline.input("value.txt", t=str))
 """
     )
@@ -216,7 +218,7 @@ with Pipeline("prep", root=pathlib.Path(__file__).parent) as pipeline:
     report.mkdir()
     (report / "pipeline.py").write_text(
         """
-import pathlib
+
 
 from pivot.compose import Pipeline, stage
 from prep.pipeline import kept_handle
@@ -227,7 +229,7 @@ def consume(value: str) -> str:
     return value
 
 
-with Pipeline("report", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("report") as pipeline:
     consume(kept_handle)
 """
     )
@@ -309,12 +311,16 @@ with Pipeline("{root.name}") as pipeline:
     return pipeline_path
 
 
-def test_failed_pipeline_import_rolls_back_sibling_modules(tmp_path: pathlib.Path) -> None:
+def test_failed_pipeline_import_rolls_back_sibling_modules(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     failed = _write_sibling_stage_project(tmp_path / "failed", "a", broken=True)
+    monkeypatch.setattr(project, "_project_root_cache", failed.parent)
     with pytest.raises(discovery.DiscoveryError, match="broken pipeline"):
         discovery.discover_pipeline(project_root=failed.parent)
 
     valid = _write_sibling_stage_project(tmp_path / "valid", "b")
+    monkeypatch.setattr(project, "_project_root_cache", valid.parent)
     pipeline = discovery.discover_pipeline(project_root=valid.parent)
 
     assert pipeline is not None
@@ -335,12 +341,13 @@ def test_direct_pipeline_load_starts_fresh_import_session(tmp_path: pathlib.Path
     assert second_pipeline.get_stage("second/build")["func"]() == "b"
 
 
+@pytest.mark.usefixtures("set_project_root")
 def test_discover_all_skips_ordinary_broken_sibling(tmp_path: pathlib.Path) -> None:
     valid = tmp_path / "valid"
     valid.mkdir()
     (valid / "pipeline.py").write_text(
         """
-import pathlib
+
 
 from pivot.compose import Pipeline, stage
 
@@ -350,7 +357,7 @@ def build() -> str:
     return "ok"
 
 
-with Pipeline("valid", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("valid") as pipeline:
     build()
 """
     )
@@ -404,6 +411,7 @@ def test_discovery_restores_displaced_pipeline_module_and_caller_path(
     monkeypatch.setitem(sys.modules, "pipeline", foreign)
     root = _write_sibling_stage_project(tmp_path / "project", "project").parent
     monkeypatch.syspath_prepend(str(root))
+    monkeypatch.setattr(project, "_project_root_cache", root)
 
     pipeline = discovery.discover_pipeline(project_root=root)
 
@@ -414,8 +422,11 @@ def test_discovery_restores_displaced_pipeline_module_and_caller_path(
     assert sys.path.count(str(root)) == 1
 
 
-def test_discovery_keeps_project_module_preimported_by_caller(tmp_path: pathlib.Path) -> None:
+def test_discovery_keeps_project_module_preimported_by_caller(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = _write_sibling_stage_project(tmp_path / "project", "caller").parent
+    monkeypatch.setattr(project, "_project_root_cache", root)
     # The caller's own import outlives discovery by design, so this test must remove it itself.
     with conftest.stage_module_isolation(root):
         stages = importlib.import_module("stages")
@@ -443,6 +454,7 @@ def test_discover_pipeline_missing_pipeline_variable_names_instance(
         discovery.discover_pipeline(project_root=tmp_path)
 
 
+@pytest.mark.usefixtures("set_project_root")
 def test_discover_all_rolls_back_pickle_registration_for_broken_sibling(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -460,7 +472,7 @@ raise RuntimeError(VALUE)
     valid.mkdir()
     (valid / "pipeline.py").write_text(
         """
-import pathlib
+
 
 from pivot.compose import Pipeline, stage
 
@@ -470,7 +482,7 @@ def build() -> str:
     return "valid"
 
 
-with Pipeline("valid", root=pathlib.Path(__file__).parent) as pipeline:
+with Pipeline("valid") as pipeline:
     build()
 """
     )

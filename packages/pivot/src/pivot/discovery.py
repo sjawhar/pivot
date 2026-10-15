@@ -14,7 +14,7 @@ from typing import Final
 
 import cloudpickle
 
-from pivot import fingerprint, metrics, project, types
+from pivot import exceptions, fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
 
 logger = logging.getLogger(__name__)
@@ -238,6 +238,30 @@ def _rollback_import_attempt(
             sys.modules.pop(module_name, None)
 
 
+def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -> None:
+    """Refuse a pipeline whose stages would keep state outside the project's ``.pivot``.
+
+    Inputs and outputs resolve against the project root, but ``root=`` moves a stage's lock
+    files and half its StateDB, so a ``root=`` other than the project root splits one stage's
+    state across two directories. Stages from another pipeline carry that pipeline's root.
+    """
+    advice = (
+        f"but a pipeline always uses the project's .pivot and data/ ({project_root}); "
+        + "remove root="
+    )
+    if pipeline.root.resolve() != project_root:
+        raise exceptions.PipelineConfigError(
+            f"Pipeline '{pipeline.name}' sets root={pipeline.root}, {advice}"
+        )
+    for stage_name in pipeline.list_stages():
+        state_dir = pipeline.get_stage(stage_name)["state_dir"]
+        if state_dir is not None and state_dir.resolve() != project_root / ".pivot":
+            raise exceptions.PipelineConfigError(
+                f"Stage '{stage_name}' comes from a pipeline that sets root={state_dir.parent}, "
+                + advice
+            )
+
+
 def find_config_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
     """Find the pipeline config file in a directory.
 
@@ -292,6 +316,8 @@ def discover_pipeline(
 
         if all_pipelines:
             result = _discover_all_pipelines(root, session)
+            if result is not None:
+                _require_project_state(result, root)
             loaded = result is not None
             return result
         # Check cwd first if it's within project root but not the root itself
@@ -311,8 +337,6 @@ def discover_pipeline(
         _t_module = metrics.start()
         try:
             result = _load_pipeline_from_module(config_path, session)
-            loaded = result is not None
-            return result
         except SystemExit as e:
             raise DiscoveryError(f"Pipeline {config_path} called sys.exit({e.code})") from e
         except DiscoveryError:
@@ -323,6 +347,10 @@ def discover_pipeline(
             metrics.end("discovery.load_module", _t_module)
             fingerprint.flush_ast_hash_cache()
             fingerprint.flush_manifest_cache()
+        if result is not None:
+            _require_project_state(result, root)
+        loaded = result is not None
+        return result
     finally:
         if session is not None and not loaded:
             _end_import_session(session)
@@ -548,14 +576,17 @@ def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:
     loaded = False
     try:
         pipeline = _load_pipeline_from_module(resolved_path, session)
-        loaded = pipeline is not None
-        return pipeline
     except DiscoveryError as e:
         logger.warning(f"Pipeline discovery issue in {path}: {e}")
-        return None
+        pipeline = None
     except Exception as e:
         logger.debug(f"Failed to load pipeline from {path}: {e}")
-        return None
+        pipeline = None
+    try:
+        if pipeline is not None:
+            _require_project_state(pipeline, project_root)
+        loaded = pipeline is not None
+        return pipeline
     finally:
         if not loaded:
             _end_import_session(session)
