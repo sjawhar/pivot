@@ -290,6 +290,25 @@ def test_prepare_output_unlinks_readonly_cas_hardlink(tmp_path: pathlib.Path) ->
     assert not output_path.exists(), "prepare_output should unlink read-only file"
 
 
+def test_workspace_store_refuses_an_output_resolving_outside_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    sentinel = tmp_path.parent / f"{tmp_path.name}-sentinel.txt"
+    sentinel.write_text("PRESERVE")
+    ref = _helper_ref(
+        "pipe/stage",
+        str(sentinel),
+        types.ArtifactTag.DATA,
+        loaders.Text(),
+    )
+
+    with pytest.raises(ValueError, match="resolves outside project root"):
+        workspace_store.prepare_output(ref)
+
+    assert sentinel.read_text() == "PRESERVE"
+
+
 def test_resolve_output_path_uses_prefixed_producer(tmp_path: pathlib.Path) -> None:
     ws = store.WorkspaceStore(tmp_path, "ignored", {})
     ref = types.ArtifactRef(

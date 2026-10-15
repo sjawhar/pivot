@@ -769,6 +769,11 @@ def test_validate_artifact_identity_rejects_path_separators() -> None:
         types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/../b"))
     with pytest.raises(ValueError):
         types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/./b"))
+    # Absolute identity components could discard the managed output prefix.
+    with pytest.raises(ValueError, match="producer cannot be absolute"):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="/tmp/out", key=None))
+    with pytest.raises(ValueError, match="key cannot be absolute"):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="/tmp/out"))
 
 
 # --- Pipeline variant context manager ---

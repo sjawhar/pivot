@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import pathlib
 from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
@@ -297,6 +298,8 @@ class ArtifactRef:
 def validate_artifact_identity(identity: ArtifactIdentity) -> None:
     if identity.producer.strip() == "":
         raise ValueError("Artifact producer cannot be empty")
+    if pathlib.PurePath(identity.producer).is_absolute():
+        raise ValueError(f"Artifact producer cannot be absolute: {identity.producer!r}")
     bad_chars = {"\\", "\0", ":"}
     if bad_chars & set(identity.producer):
         raise ValueError(
@@ -310,6 +313,8 @@ def validate_artifact_identity(identity: ArtifactIdentity) -> None:
 
     if identity.key is None:
         return
+    if pathlib.PurePath(identity.key).is_absolute():
+        raise ValueError(f"Artifact key cannot be absolute: {identity.key!r}")
     if identity.key.strip() == "":
         raise ValueError("Artifact key cannot be empty")
     if bad_chars & set(identity.key):

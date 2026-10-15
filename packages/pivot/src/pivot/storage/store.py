@@ -165,7 +165,12 @@ class WorkspaceStore:
         return self._project_root / "data" / "raw" / name
 
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        return self._project_root / relative_output_path(ref)
+        path = self._project_root / relative_output_path(ref)
+        if not path.resolve().is_relative_to(self._project_root):
+            raise ValueError(
+                f"Output {types.identity_key(ref.identity)!r} resolves outside project root: {path}"
+            )
+        return path
 
     def _resolve_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         if ref.tag is types.ArtifactTag.INPUT:
