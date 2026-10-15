@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false
 """Bipartite artifact-stage graph built on NetworkX."""
 
 from __future__ import annotations

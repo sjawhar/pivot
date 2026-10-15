@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportMissingModuleSource=false
 """DAG-aware pipeline execution with full dependency resolution.
 
 The `pivot repro` command runs stages with their dependencies, supporting

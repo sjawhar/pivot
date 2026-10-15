@@ -1,4 +1,3 @@
-# pyright: reportImportCycles=false, reportMissingImports=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib

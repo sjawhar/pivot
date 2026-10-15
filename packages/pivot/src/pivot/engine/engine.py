@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportMissingModuleSource=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnusedCallResult=false, reportExplicitAny=false, reportAny=false
 from __future__ import annotations
 
 import collections

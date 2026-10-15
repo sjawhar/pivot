@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false
 """Per-stage lock files for tracking pipeline state.
 
 StageLock provides persistent lock files (.lock) for change detection,

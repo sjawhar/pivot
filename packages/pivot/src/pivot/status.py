@@ -40,7 +40,6 @@ Example::
     )
 """
 
-# pyright: reportMissingImports=false, reportMissingModuleSource=false, reportImplicitRelativeImport=false
 
 from __future__ import annotations
 

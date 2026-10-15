@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportImportCycles=false
 from __future__ import annotations
 
 import functools

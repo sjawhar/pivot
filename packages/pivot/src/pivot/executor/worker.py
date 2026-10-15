@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false
 """Worker process execution for pipeline stages.
 
 Functions that execute in separate processes via ProcessPoolExecutor.
