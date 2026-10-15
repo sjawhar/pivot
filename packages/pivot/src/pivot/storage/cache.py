@@ -36,7 +36,52 @@ XXHASH64_HEX_LENGTH = 16  # xxhash64 produces 64-bit hash = 16 hex characters
 _RESTORE_TEMP_PREFIX = ".pivot_restore_"
 _BACKUP_TEMP_PREFIX = ".pivot_backup_"
 _RESTORE_LOCK_PREFIX = ".pivot_restore_lock_"
+_KEEP_STAGING_PREFIX = ".pivot_keep_"
 _RESTORE_TEMP_MAX_AGE = 3600  # 1 hour
+
+
+def _keep_staging_path(path: pathlib.Path) -> pathlib.Path:
+    """Sibling that holds a directory's kept entries (see keep_ignored) while it is replaced.
+
+    It is named after the target and no cleanup removes it, so entries an interrupted
+    restore leaves there wait for the next restore of the same target to put them back.
+    """
+    logical_path = path.parent.resolve() / path.name
+    token = hashlib.sha256(str(logical_path).encode()).hexdigest()[:32]
+    return path.parent / f"{_KEEP_STAGING_PREFIX}{token}"
+
+
+def _move_kept_entries(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Move every entry under source into destination, merging directories, then drop source.
+
+    Raises CacheRestoreError, leaving that entry and the rest in source, when a file or
+    link already exists at its destination.
+    """
+    with os.scandir(source) as entries:
+        for entry in entries:
+            target = destination / entry.name
+            if not os.path.lexists(target):
+                destination.mkdir(parents=True, exist_ok=True)
+                pathlib.Path(entry.path).rename(target)
+            elif (
+                entry.is_dir(follow_symlinks=False) and target.is_dir() and not target.is_symlink()
+            ):
+                _move_kept_entries(pathlib.Path(entry.path), target)
+            else:
+                raise exceptions.CacheRestoreError(
+                    f"Cannot put back {entry.path}: {target} already exists. "
+                    + "Move the entry by hand, then retry."
+                )
+    source.rmdir()
+
+
+def staged_kept_entries(path: pathlib.Path) -> pathlib.Path | None:
+    """The directory where an interrupted restore of path left kept entries, if any.
+
+    Any later restore of path (restore_from_cache) puts them back.
+    """
+    keep_dir = _keep_staging_path(path)
+    return keep_dir if keep_dir.exists() else None
 
 
 def _get_lock_path(target_path: pathlib.Path, state_dir: pathlib.Path) -> pathlib.Path:
@@ -568,6 +613,8 @@ def restore_from_cache(
             Required for directory restores to prevent concurrent restore races.
         keep_ignored: When replacing an existing directory, move the entries the directory
             hash skips (build/, *.swp, ...) into the restored tree instead of deleting them.
+            They wait in a sibling staging directory during the swap. Entries an interrupted
+            restore left there are put into the restored tree by any later restore of path.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
 
@@ -606,18 +653,10 @@ def _restore_directory_from_cache(
     """Restore directory from cache atomically with file locking."""
     cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
 
-    # Entries of the existing directory that are not part of the output, to carry over.
-    keep = list[str]()
-    if keep_ignored and path.is_dir() and not path.is_symlink():
-        _, keep = _scan_entries(path, {entry["relpath"] for entry in output_hash["manifest"]})
-
     # Validate ALL manifest entries exist before writing anything (security)
     # This also handles the SYMLINK fast path - if cache_dir_path doesn't exist,
-    # we need to check individual files. A directory that keeps local entries cannot
-    # be a link to the cache tree.
-    symlink_fast_path = (
-        not keep and checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists()
-    )
+    # we need to check individual files
+    symlink_fast_path = checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists()
     if not symlink_fast_path:
         for entry in output_hash["manifest"]:
             file_cache_path = get_cache_path(cache_dir, entry["hash"])
@@ -639,6 +678,26 @@ def _restore_directory_from_cache(
         if lock_path is not None:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        # Entries of the existing directory that are not part of the output, to carry over.
+        # An interrupted restore of this target may have left some in keep_dir: put them
+        # back first, so this restore carries them like the rest.
+        keep_dir = _keep_staging_path(path)
+        keep = list[str]()
+        if path.is_dir() and not path.is_symlink():
+            # Every restore of path puts back what an interrupted one left staged.
+            if keep_dir.exists():
+                _move_kept_entries(keep_dir, path)
+            if keep_ignored:
+                _, keep = _scan_entries(
+                    path, {entry["relpath"] for entry in output_hash["manifest"]}
+                )
+        if symlink_fast_path and (keep or keep_dir.exists()):
+            # A directory that keeps local entries cannot be a link to the cache tree.
+            symlink_fast_path = False
+            for entry in output_hash["manifest"]:
+                if not get_cache_path(cache_dir, entry["hash"]).exists():
+                    return False
 
         # SYMLINK fast path: create symlink at temp location, then atomic rename
         if symlink_fast_path:
@@ -668,8 +727,6 @@ def _restore_directory_from_cache(
         # Track state for proper cleanup
         swap_completed = False
         backup_restore_failed = False
-        carried = list[str]()
-        carried_back_failed = False
 
         try:
             resolved_temp = temp_path.resolve()
@@ -712,15 +769,16 @@ def _restore_directory_from_cache(
                 except OSError as e:
                     logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
 
-            # Ignored entries are not part of the output: move them into the new tree.
+            # Entries the directory hash skips are not part of the output. Stage them in
+            # keep_dir, which no cleanup removes, and put them into the new tree after the
+            # swap. A crash at any point leaves each one in path, keep_dir or the new tree.
             for relpath in keep:
                 source = path / relpath
-                if not (source.exists() or source.is_symlink()):
+                if not os.path.lexists(source):
                     continue
-                destination = temp_path / relpath
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                source.rename(destination)
-                carried.append(relpath)
+                staged = keep_dir / relpath
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(staged)
 
             # Atomic swap with rollback capability:
             # - Backup original first so we can restore on failure
@@ -734,6 +792,9 @@ def _restore_directory_from_cache(
 
             temp_path.replace(path)
             swap_completed = True
+
+            if keep_dir.exists():
+                _move_kept_entries(keep_dir, path)
 
             try:
                 _clear_path(backup_path)
@@ -750,18 +811,19 @@ def _restore_directory_from_cache(
                 except OSError as e:
                     logger.debug(f"Failed to restore backup: {e}")
                     backup_restore_failed = True
-            # Return carried entries to the directory they came from
-            if not swap_completed:
-                for relpath in carried:
-                    try:
-                        (temp_path / relpath).rename(path / relpath)
-                    except OSError as e:
-                        logger.debug(f"Failed to return {relpath!r} to {path}: {e}")
-                        carried_back_failed = True
+            # Return staged entries to the original directory if the swap did not happen
+            if not swap_completed and keep_dir.exists() and path.is_dir() and not path.is_symlink():
+                try:
+                    _move_kept_entries(keep_dir, path)
+                except (OSError, exceptions.CacheRestoreError) as e:
+                    logger.warning(
+                        f"Entries kept from {path} remain in {keep_dir} ({e}); "
+                        + "the next restore of it puts them back"
+                    )
             raise
         finally:
-            # Clean up temp directory on any exit, unless it still holds user entries
-            if temp_path.exists() and not carried_back_failed:
+            # Clean up temp directory on any exit
+            if temp_path.exists():
                 _clear_path(temp_path)
             # Only clean up backup if swap completed successfully
             # Don't delete backup if restoration failed - that's the user's data!

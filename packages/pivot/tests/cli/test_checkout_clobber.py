@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import os
+import pathlib
+import time
 from typing import TYPE_CHECKING
 
 from pivot import cli, config, project, types
+from pivot.cli import checkout as checkout_mod
 from pivot.remote import storage as remote_storage
 from pivot.storage import cache, state, track
 
 if TYPE_CHECKING:
-    import pathlib
-
     import click.testing
     from pytest_mock import MockerFixture
 
     from pivot.registry import PipelineLike
+
+_CRASH_EXIT = 73
 
 
 def test_pull_only_missing_accepts_existing_cache_file_symlinks(
@@ -238,6 +243,104 @@ def test_checkout_only_missing_symlink_mode_keeps_editor_swap_file(
     assert (data_dir / "a.txt").read_text() == "one updated\n"
     assert (data_dir / "c.txt").read_text() == "three\n"
     assert not (data_dir / "b.txt").exists()
+
+
+def _helper_kept_entries_layout(root: pathlib.Path) -> tuple[pathlib.Path, types.DirHash]:
+    """data/ext at v1 plus build/x.o and .a.txt.swp (skipped by the hash); v2 in the cache."""
+    cache_dir = root / ".pivot" / "cache" / "files"
+    v2 = root / "v2src"
+    v2.mkdir(parents=True)
+    (v2 / "a.txt").write_text("one updated\n")
+    (v2 / "c.txt").write_text("three\n")
+    v2_hash = cache.save_to_cache(v2, cache_dir, checkout_mode=config.CheckoutMode.COPY)
+    assert "manifest" in v2_hash
+    ext = root / "data" / "ext"
+    ext.mkdir(parents=True)
+    (ext / "a.txt").write_text("one\n")
+    (ext / "b.txt").write_text("two\n")
+    _ = cache.save_to_cache(ext, cache_dir, checkout_mode=config.CheckoutMode.COPY)
+    (ext / "build").mkdir()
+    (ext / "build" / "x.o").write_text("object\n")
+    (ext / ".a.txt.swp").write_text("swap\n")
+    return ext, v2_hash
+
+
+def _helper_restore_only_missing(root: pathlib.Path, v2_hash: types.DirHash) -> str:
+    """Run the per-target restore `pivot checkout --only-missing` runs for data/ext."""
+    result, _ = checkout_mod._restore_path_sync(
+        root / "data" / "ext",
+        v2_hash,
+        root / ".pivot" / "cache" / "files",
+        [cache.CheckoutMode.COPY],
+        checkout_mod.CheckoutBehavior.SKIP_EXISTING,
+        root / ".pivot",
+    )
+    return result
+
+
+def _helper_crash_at_rename(root: pathlib.Path, v2_hash: types.DirHash, crash_at: int) -> None:
+    """Run the restore in a child process and exit it, unflushed, at rename number crash_at."""
+    calls = 0
+    original_rename = pathlib.Path.rename
+    original_replace = pathlib.Path.replace
+
+    def crash_rename(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        nonlocal calls
+        if calls == crash_at:
+            os._exit(_CRASH_EXIT)
+        calls += 1
+        return original_rename(self, target)
+
+    def crash_replace(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        nonlocal calls
+        if calls == crash_at:
+            os._exit(_CRASH_EXIT)
+        calls += 1
+        return original_replace(self, target)
+
+    pathlib.Path.rename = crash_rename  # pyright: ignore[reportAttributeAccessIssue] - crash injection
+    pathlib.Path.replace = crash_replace  # pyright: ignore[reportAttributeAccessIssue] - crash injection
+    _ = _helper_restore_only_missing(root, v2_hash)
+
+
+def test_restore_killed_at_any_rename_loses_no_kept_entry(tmp_path: pathlib.Path) -> None:
+    """A kill between any two renames of the swap leaves kept entries where the next restore
+    finds them, even after leftovers age past the stale-temp cutoff."""
+    ctx = multiprocessing.get_context("spawn")
+    crashes = 0
+    for crash_at in range(20):
+        root = tmp_path / f"crash-{crash_at}"
+        _, v2_hash = _helper_kept_entries_layout(root)
+        child = ctx.Process(target=_helper_crash_at_rename, args=(root, v2_hash, crash_at))
+        child.start()
+        child.join(timeout=120)
+        if child.exitcode == 0:
+            break
+        assert child.exitcode == _CRASH_EXIT, f"rename {crash_at}: child exit {child.exitcode}"
+        crashes += 1
+        aged = time.time() - 2 * 3600
+        for leftover in (root / "data").iterdir():
+            if leftover.name.startswith(".pivot_"):
+                os.utime(leftover, (aged, aged))
+
+        _ = _helper_restore_only_missing(root, v2_hash)
+
+        ext = root / "data" / "ext"
+        where = sorted(
+            str(p.relative_to(root)) for p in root.rglob("*") if p.name in ("x.o", ".a.txt.swp")
+        )
+        assert (ext / "build" / "x.o").read_text() == "object\n", (
+            f"rename {crash_at}: x.o at {where}"
+        )
+        assert (ext / ".a.txt.swp").read_text() == "swap\n", f"rename {crash_at}: .swp at {where}"
+        assert (ext / "a.txt").read_text() == "one updated\n", f"rename {crash_at}"
+        assert not (ext / "b.txt").exists(), f"rename {crash_at}"
+        assert [
+            p.name for p in (root / "data").iterdir() if p.name.startswith(".pivot_keep_")
+        ] == []
+    else:
+        raise AssertionError("the restore never completed without a crash")
+    assert crashes >= 4, f"only {crashes} crash points exercised"
 
 
 def test_checkout_only_missing_reads_no_content_of_unchanged_hardlinked_directory(

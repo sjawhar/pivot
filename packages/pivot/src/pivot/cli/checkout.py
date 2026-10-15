@@ -129,7 +129,9 @@ def _restore_path_sync(
                         f"'{path.name}' has local changes that are not in the cache: "
                         + f"{', '.join(outcome['local_changes'])}. Use --force to overwrite."
                     )
-                if not outcome["replace"]:
+                # An interrupted restore may have staged kept entries beside the directory;
+                # the restore below puts them back, so take it even when nothing else differs.
+                if not outcome["replace"] and cache.staged_kept_entries(path) is None:
                     if outcome["unavailable"]:
                         return ("missing", path.name)
                     return ("restored" if outcome["restored"] else "skipped", path.name)
