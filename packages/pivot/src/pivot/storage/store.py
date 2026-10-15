@@ -216,6 +216,7 @@ class WorkspaceStore:
         output_hash: types.HashInfo,
         *,
         state_dir: pathlib.Path | None = None,
+        checkout_modes: list[config.CheckoutMode] | None = None,
     ) -> bool:
         if self._cache_dir is None:
             return False
@@ -226,7 +227,7 @@ class WorkspaceStore:
             output_path,
             output_hash,
             self._cache_dir,
-            checkout_modes=self._checkout_modes,
+            checkout_modes=checkout_modes if checkout_modes is not None else self._checkout_modes,
             state_dir=state_dir,
         )
 

@@ -22,6 +22,7 @@ from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast,
 import pydantic
 
 from pivot import (
+    config,
     exceptions,
     loaders,
     metrics,
@@ -890,7 +891,12 @@ def _prepare_incremental_inputs(
             )
         output_path = store.resolve_display_path(ref)
         cache.remove_output(output_path)
-        if not store.restore_from_cache(ref, output_hash, state_dir=state_dir):
+        if not store.restore_from_cache(
+            ref,
+            output_hash,
+            state_dir=state_dir,
+            checkout_modes=[config.CheckoutMode.COPY],
+        ):
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
                 + f"Run 'pivot pull' to restore it, or remove '{stage_lock.path}' and rerun "
