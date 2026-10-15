@@ -51,7 +51,7 @@ def _input_ref(name: str) -> ArtifactRef:
         identity=ArtifactIdentity(name, None),
         format=loaders.Text(),
         python_type=str,
-        tag=ArtifactTag.DATA,
+        tag=ArtifactTag.INPUT,
     )
 
 

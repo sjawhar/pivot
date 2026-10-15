@@ -439,6 +439,7 @@ def test_validate_dependency_sources_reports_missing_pipeline_input_path(
             [ArtifactIdentity("demo/combine", None)],
         )
     }
+    stages["demo/combine"]["deps"]["_0"].tag = ArtifactTag.INPUT
     store = store_mod.WorkspaceStore(
         project_root=set_project_root,
         pipeline_name="demo",

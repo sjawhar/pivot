@@ -496,3 +496,85 @@ def test_noop_status_reads_no_output_bytes_after_skip_restore(tmp_path: pathlib.
 
     assert "2 cached" in out, out
     assert "cache.hash_file" not in out, out
+
+
+_INPUT_NAMED_LIKE_STAGE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def summary(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 7
+
+
+@stage
+def report(prior: pd.DataFrame) -> dict:
+    return {"prior_sum": int(prior.to_numpy().sum())}
+
+
+with Pipeline("rep") as pipeline:
+    summary(pipeline.input("numbers.csv"))
+    report(pipeline.input("rep/summary", path="data/raw/prior.jsonl"))
+"""
+
+
+def test_input_named_like_a_stage_is_refused(tmp_path: pathlib.Path) -> None:
+    """An input and a stage share one identity namespace, so one name cannot be both."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _INPUT_NAMED_LIKE_STAGE_PIPELINE,
+            "data/raw/numbers.csv": "a\n1\n2\n",
+            "data/raw/prior.jsonl": '{"a":100}\n',
+        },
+    )
+
+    proc = _pivot(root, "list")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Input 'rep/summary'" in out and "stage 'rep/summary'" in out, out
+
+
+_OTHER_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def report(prior: pd.DataFrame) -> dict:
+    return {"prior_sum": int(prior.to_numpy().sum())}
+
+
+with Pipeline("other") as pipeline:
+    report(pipeline.input("k/scale", path="data/raw/prior.jsonl"))
+"""
+
+
+def test_input_reads_its_own_file_when_another_pipelines_output_has_its_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Whether a dependency is an input is decided by the pipeline, never by what is on disk."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _CHAIN_PIPELINE,
+            "data/raw/t.csv": "a\n1\n2\n",
+            "data/raw/prior.jsonl": '{"a":100}\n',
+            "other/pipeline.py": _OTHER_PIPELINE,
+        },
+    )
+    other = root / "other"
+    _ok(_pivot(other, "repro"))
+    _ok(_pivot(root, "repro"))
+    assert (root / "data" / "k" / "scale.jsonl").is_file()
+
+    status = _ok(_pivot(other, "status"))
+    rerun = _ok(_pivot(other, "repro"))
+
+    assert "1 cached, 0 stale" in status, status
+    assert "0 ran, 1 cached" in rerun, rerun
+    assert (root / "data" / "other" / "report.yaml").read_text() == "prior_sum: 100\n"

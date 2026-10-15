@@ -220,8 +220,8 @@ def test_workspace_store_input_bindings(tmp_path: pathlib.Path) -> None:
         pipeline_name="pipe",
         input_bindings={"custom": "data/external/custom.csv"},
     )
-    custom_ref = _helper_ref("custom", None, types.ArtifactTag.DATA, loaders.Text())
-    default_ref = _helper_ref("rawdata", None, types.ArtifactTag.DATA, loaders.Text())
+    custom_ref = _helper_ref("custom", None, types.ArtifactTag.INPUT, loaders.Text())
+    default_ref = _helper_ref("rawdata", None, types.ArtifactTag.INPUT, loaders.Text())
 
     assert workspace_store.checkout(custom_ref) == tmp_path / "data/external/custom.csv"
     assert workspace_store.checkout(default_ref) == tmp_path / "data/raw/rawdata"
@@ -233,8 +233,8 @@ def test_workspace_store_collision_detection(tmp_path: pathlib.Path) -> None:
         pipeline_name="pipe",
         input_bindings={"foo": "data/raw/bar"},
     )
-    foo_ref = _helper_ref("foo", None, types.ArtifactTag.DATA, loaders.Text())
-    bar_ref = _helper_ref("bar", None, types.ArtifactTag.DATA, loaders.Text())
+    foo_ref = _helper_ref("foo", None, types.ArtifactTag.INPUT, loaders.Text())
+    bar_ref = _helper_ref("bar", None, types.ArtifactTag.INPUT, loaders.Text())
 
     _ = workspace_store.checkout(foo_ref)
     with pytest.raises(ValueError, match="Collision"):
@@ -254,7 +254,7 @@ def test_workspace_store_resolves_external_input(tmp_path: pathlib.Path) -> None
         identity=types.ArtifactIdentity("ext.jsonl", None),
         format=loaders.DataFrameJSONL(),
         python_type=list,
-        tag=types.ArtifactTag.DATA,
+        tag=types.ArtifactTag.INPUT,
     )
 
     assert workspace_store.exists(ref)

@@ -121,7 +121,7 @@ def test_stage_returning_external_path_dependency_does_not_move_user_file(
         identity=types.ArtifactIdentity(producer="external", key=None),
         format=loaders.PathOnly(),
         python_type=pathlib.Path,
-        tag=types.ArtifactTag.DATA,
+        tag=types.ArtifactTag.INPUT,
     )
     out = types.ArtifactRef(
         identity=types.ArtifactIdentity(producer="pathret/passthrough", key=None),

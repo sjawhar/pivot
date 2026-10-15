@@ -85,7 +85,7 @@ def _stage_info(
     return worker.WorkerStageInfo(
         func=func,
         fingerprint={"self:consume": "0123456789abcdef"},
-        deps={"data": _ref("raw")} if deps is None else deps,
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)} if deps is None else deps,
         outs=[_ref(_STAGE)] if outs is None else outs,
         store_spec=cast(
             "store_mod.StoreSpec",
@@ -450,7 +450,10 @@ def test_unchanged_stage_with_unrestorable_output_reruns(
 def test_missing_and_unreadable_dependencies_are_named(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    deps = {"a": _ref("raw"), "b": _ref("other")}
+    deps = {
+        "a": _ref("raw", tag=types.ArtifactTag.INPUT),
+        "b": _ref("other", tag=types.ArtifactTag.INPUT),
+    }
     bindings = {"raw": "raw.txt", "other": "other.txt"}
     (project / "raw.txt").unlink()
 

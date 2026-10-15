@@ -87,7 +87,7 @@ class _GenerationCase:
         self.state_db = state_db
         self.raw = project / "raw.txt"
         self.raw.write_text("input-v1")
-        self.dep = _ref("raw")
+        self.dep = _ref("raw", tag=types.ArtifactTag.INPUT)
         self.out = _ref(_STAGE)
         dep_hash, _ = cache.hash_file(self.raw, state_db)
         generation = state_db.increment_generation("raw")
@@ -432,7 +432,7 @@ def test_hash_dependencies_reports_unreadable_dependency(
     raw.chmod(0)
     try:
         hashes, missing, unreadable, entries = worker.hash_dependencies(
-            {"data": _ref("raw")}, store, state_db
+            {"data": _ref("raw", tag=types.ArtifactTag.INPUT)}, store, state_db
         )
     finally:
         raw.chmod(0o644)
@@ -449,7 +449,12 @@ def test_hash_dependencies_records_stat_write_backs_for_files_only(
     (project / "tree" / "a.txt").write_text("a")
 
     hashes, missing, unreadable, entries = worker.hash_dependencies(
-        {"data": _ref("raw"), "tree": _ref("tree")}, store, state_db
+        {
+            "data": _ref("raw", tag=types.ArtifactTag.INPUT),
+            "tree": _ref("tree", tag=types.ArtifactTag.INPUT),
+        },
+        store,
+        state_db,
     )
 
     assert (missing, unreadable) == ([], [])
@@ -521,7 +526,7 @@ def test_run_cache_key_marks_metric_outputs_uncacheable(
         _upper,
         project,
         worker_env,
-        deps={"data": _ref("raw")},
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)},
         outs=[data_out, metric_out],
         no_commit=True,
     )
@@ -546,7 +551,7 @@ def test_completed_run_asks_coordinator_to_bump_output_generations(
         _upper,
         project,
         worker_env,
-        deps={"data": _ref("raw")},
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)},
         outs=[_ref(_STAGE)],
         no_commit=False,
     )

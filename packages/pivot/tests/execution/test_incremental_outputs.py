@@ -175,7 +175,7 @@ def test_incremental_stage_never_restores_an_older_run_cache_entry(
         identity=types.ArtifactIdentity(producer="input", key=None),
         format=loaders.Text(),
         python_type=str,
-        tag=types.ArtifactTag.DATA,
+        tag=types.ArtifactTag.INPUT,
     )
     output = _output_ref("history", loaders.JSON[dict[str, int]]())
     info = _worker_info(

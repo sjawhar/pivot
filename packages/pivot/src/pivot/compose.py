@@ -100,7 +100,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             identity=identity,
             format=handle._source.format,
             python_type=handle._python_type,
-            tag=types.ArtifactTag.DATA,
+            tag=types.ArtifactTag.INPUT,
         )
 
     source = handle._source
@@ -205,7 +205,8 @@ def _default_values(func: Callable[..., Any]) -> dict[str, object]:
 
 def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
     key = types.identity_key(identity)
-    return key if tag == types.ArtifactTag.DATA else f"{key} ({tag})"
+    plain = tag in (types.ArtifactTag.DATA, types.ArtifactTag.INPUT)
+    return key if plain else f"{key} ({tag})"
 
 
 def _show_items(items: collections.abc.Mapping[str, object]) -> str:
@@ -655,12 +656,20 @@ class Pipeline:
         self._registry = new_registry
 
     def _check_inputs_against_outputs(self, reg: registry.StageRegistry) -> None:
-        """Refuse an input whose path equals, contains, or lies inside a registered output.
+        """Refuse an input named like a stage, or whose path overlaps a registered output.
 
-        Runs once the registry holds every output: at materialization and after an include()
-        outside a construction block (how --all combines pipelines).
+        An input's identity is its name and a stage's single output's identity is the stage
+        name, so one name cannot be both. Runs once the registry holds every output: at
+        materialization and after an include() outside a construction block (how --all
+        combines pipelines).
         """
+        stage_names = set(reg.list_stages())
         for node in self._inputs.values():
+            if node.name in stage_names:
+                raise exceptions.PipelineConfigError(
+                    f"Input '{node.name}' has the name of stage '{node.name}'. "
+                    + "Rename the input, or pass the stage's handle to read its output."
+                )
             normalized = pathlib.Path(os.path.normpath(self._root / node.path))
             if not normalized.is_relative_to(self._root):
                 continue  # path_policy keeps inputs in the project; outputs always are

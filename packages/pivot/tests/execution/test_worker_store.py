@@ -86,7 +86,7 @@ def test_execute_stage_uses_store_spec_for_io(
         "data": _make_artifact_ref(
             "input",
             None,
-            tag=types.ArtifactTag.DATA,
+            tag=types.ArtifactTag.INPUT,
             loader=loaders.Text(),
             python_type=str,
         )
@@ -186,7 +186,7 @@ def test_execute_stage_single_field_typeddict(
         "data": _make_artifact_ref(
             "input",
             None,
-            tag=types.ArtifactTag.DATA,
+            tag=types.ArtifactTag.INPUT,
             loader=loaders.Text(),
             python_type=str,
         )

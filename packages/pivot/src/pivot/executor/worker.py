@@ -195,12 +195,6 @@ def execute_stage(
     project_root = stage_info["project_root"]
     store = store_mod.store_from_spec(stage_info["store_spec"])
 
-    # For store-based stages, mark outputs as produced so _resolve_path returns
-    # the correct output path (not input path) during run cache skip checks
-    if isinstance(store, store_mod.WorkspaceStore):
-        for out in stage_info["outs"]:
-            store._output_producers.add(out.identity.producer)  # pyright: ignore[reportPrivateUsage]
-
     # Set project root cache explicitly - workers in reusable pool may have
     # stale cache from previous execution in different project/test.
     project._project_root_cache = project_root  # pyright: ignore[reportPrivateUsage]

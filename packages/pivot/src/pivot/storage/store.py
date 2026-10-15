@@ -140,7 +140,6 @@ class WorkspaceStore:
     _pipeline_name: str
     _input_bindings: dict[str, str]
     _path_map: dict[str, types.ArtifactIdentity]
-    _output_producers: set[str]
     _cache_dir: pathlib.Path | None
     _checkout_modes: list[config.CheckoutMode] | None
 
@@ -157,19 +156,8 @@ class WorkspaceStore:
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
         self._path_map = {}
-        self._output_producers = set[str]()
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
         self._checkout_modes = checkout_modes
-
-    def _is_input_ref(self, ref: types.ArtifactRef) -> bool:
-        if ref.tag != types.ArtifactTag.DATA:
-            return False
-        if ref.identity.key is not None:
-            return False
-        if ref.identity.producer in self._output_producers:
-            return False
-        output_path = self._resolve_output_path(ref)
-        return not (output_path.exists() or output_path.is_symlink())
 
     def _resolve_input_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         name = ref.identity.producer
@@ -184,7 +172,7 @@ class WorkspaceStore:
         return self._project_root / relative_output_path(ref)
 
     def _resolve_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        if self._is_input_ref(ref):
+        if ref.tag is types.ArtifactTag.INPUT:
             path = self._resolve_input_path(ref)
         else:
             path = self._resolve_output_path(ref)
@@ -202,7 +190,6 @@ class WorkspaceStore:
         return self._resolve_path(ref)
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path:
-        self._output_producers.add(ref.identity.producer)
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             cache.remove_output(path)
@@ -214,7 +201,6 @@ class WorkspaceStore:
 
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo:
         """Hash a written output once and, unless it is a metric, place it in the cache."""
-        self._output_producers.add(ref.identity.producer)
         output_hash: types.HashInfo
         if path.is_dir():
             tree_hash, manifest = cache.hash_directory(path, None)

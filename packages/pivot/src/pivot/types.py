@@ -277,6 +277,7 @@ def identity_from_key(key: str) -> ArtifactIdentity:
 
 
 class ArtifactTag(enum.StrEnum):
+    INPUT = "input"
     DATA = "data"
     METRIC = "metric"
     PLOT = "plot"
