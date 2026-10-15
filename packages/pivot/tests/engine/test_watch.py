@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import pathlib
 
+import anyio
 import networkx as nx
+import pytest
 
 from pivot import project
 from pivot import types as pivot_types
 from pivot.engine import graph as engine_graph
-from pivot.engine.types import NodeType, StageExecutionState
+from pivot.engine import sources
+from pivot.engine.types import InputEvent, NodeType, StageExecutionState
 from pivot.engine.watch import WatchCoordinator
 
 
@@ -158,6 +161,51 @@ def test_physical_output_event_uses_symlinked_output_identity(
         is True
     )
     assert coord.get_affected_stages([physical_output]) == ["consume_output"]
+
+
+@pytest.mark.anyio
+async def test_watchfiles_physical_output_event_uses_symlinked_output_identity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A watchfiles event for a symlinked output parent retains the output producer."""
+    real_dir = tmp_path / "real"
+    linked_dir = tmp_path / "linked"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    real_dir.mkdir()
+    output_path = linked_dir / "out.txt"
+    physical_output = real_dir / "out.txt"
+    raw_alias = tmp_path / "raw-alias.txt"
+    raw_alias.symlink_to(physical_output)
+    graph, artifact_paths = _helper_build_graph(
+        {
+            "source": {"outs": [str(output_path)]},
+            "consume_output": {"deps": [str(output_path)]},
+            "consume_input": {"deps": [str(raw_alias)]},
+        }
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+    source = sources.FilesystemSource(watch_paths=[tmp_path], debounce_ms=50)
+    send, receive = anyio.create_memory_object_stream[InputEvent](1)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        await anyio.wait_all_tasks_blocked()
+        output_path.write_text("output")
+        with anyio.fail_after(10):
+            event = await receive.receive()
+        assert event["type"] == "data_artifact_changed"
+        event_paths = {pathlib.Path(event_path) for event_path in event["paths"]}
+        assert physical_output in event_paths
+        assert coord.get_producer(physical_output) == "source"
+        assert (
+            coord.should_filter_path(
+                physical_output,
+                get_stage_state=_helper_state_map(StageExecutionState.RUNNING).__getitem__,
+            )
+            is True
+        )
+        assert coord.get_affected_stages([physical_output]) == ["consume_output"]
+        tg.cancel_scope.cancel()
 
 
 def test_symlink_event_refreshes_retargeted_input_alias(
