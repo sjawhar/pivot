@@ -54,8 +54,6 @@ def test_lock_file_read(set_project_root: Path) -> None:
     stage_lock.write(data)
     result = stage_lock.read()
 
-    if result and "merkle_id" in result:
-        del result["merkle_id"]
     assert result == data
 
 
@@ -122,9 +120,6 @@ def test_parallel_lock_writes(tmp_path: Path) -> None:
     for name in stages:
         stage_lock = lock.StageLock(name, tmp_path)
         result = stage_lock.read()
-        # Remove merkle_id from result for comparison (it's added on read)
-        if result and "merkle_id" in result:
-            del result["merkle_id"]
         assert result == LockData(
             code_manifest={f"self:{name}": f"hash_{name}"},
             params={},
@@ -482,7 +477,6 @@ _MANIFEST_ENTRY: dict[str, object] = {
             {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "hash": "abc"}]}]},
             id="short-manifest-hash",
         ),
-        pytest.param("merkle_id", {"merkle_id": ["m"]}, id="list-merkle-id"),
         pytest.param("schema_version", {"schema_version": "2"}, id="string-schema-version"),
     ],
 )
@@ -505,7 +499,8 @@ def test_lock_read_treats_wrongly_typed_fields_as_missing_and_names_them(
 
 
 def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
-    """The validator accepts each optional field the writer and older locks produce."""
+    """The validator accepts each optional field the writer produces, and ignores fields older
+    locks carry (`display`, `tag`, `size`, `merkle_id`)."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
     stage_lock.path.parent.mkdir(parents=True)
     document = {
@@ -525,8 +520,7 @@ def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
 
     assert result is not None
     assert result["params"] == {"lr": 0.1, "nested": {"a": [1, 2]}}
-    assert "merkle_id" in result
-    assert result["merkle_id"] == "abc"
+    assert sorted(result) == ["code_manifest", "dep_hashes", "output_hashes", "params"]
 
 
 def test_written_lock_outs_record_key_and_hash_only(tmp_path: Path) -> None:

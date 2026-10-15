@@ -28,7 +28,6 @@ from pivot import (
     config,
     exceptions,
     fingerprint,
-    merkle,
     parameters,
     project,
     registry,
@@ -317,7 +316,6 @@ class Engine:
         self._stored_max_workers = None
         self._stored_resource_capacity = dict[str, int]()
         self._current_overrides: parameters.ParamsOverrides | None = None
-        self._merkle_ids: dict[str, str] = {}
 
         # Track whether run() has completed to prevent re-use
         self._run_completed = False
@@ -1128,7 +1126,6 @@ class Engine:
             return {}
         checkout_modes = config.get_checkout_mode_order()
         self._current_overrides = overrides
-        self._merkle_ids = dict[str, str]()
 
         # Get project paths for worker info
         project_root = project.get_project_root()
@@ -1920,9 +1917,6 @@ class Engine:
         dep_hashes_by_identity = {
             types.identity_from_key(key): info for key, info in dep_hashes.items()
         }
-        self._update_merkle_ids_for_stage(
-            stage_info, current_fingerprint, current_params, dep_hashes_by_identity
-        )
         if missing or unreadable:
             return False
 
@@ -1999,28 +1993,6 @@ class Engine:
             reason=result["reason"],
             input_hash=result["input_hash"],
         )
-
-    def _update_merkle_ids_for_stage(
-        self,
-        stage_info: RegistryStageInfo,
-        code_manifest: dict[str, str],
-        params: dict[str, Any],
-        dep_hashes: dict[types.ArtifactIdentity, HashInfo],
-    ) -> None:
-        for ref in stage_info["deps"].values():
-            identity_key = types.identity_key(ref.identity)
-            identity = ref.identity
-            if identity in dep_hashes and identity_key not in self._merkle_ids:
-                self._merkle_ids[identity_key] = dep_hashes[identity]["hash"]
-
-        input_merkle_ids = {
-            types.identity_key(ref.identity): self._merkle_ids[types.identity_key(ref.identity)]
-            for ref in stage_info["deps"].values()
-            if types.identity_key(ref.identity) in self._merkle_ids
-        }
-        stage_merkle_id = merkle.compute_merkle_id(code_manifest, params, input_merkle_ids)
-        for out_ref in stage_info["outs"]:
-            self._merkle_ids[types.identity_key(out_ref.identity)] = stage_merkle_id
 
     async def _compute_explanation(
         self,

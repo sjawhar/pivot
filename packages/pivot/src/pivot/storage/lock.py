@@ -180,9 +180,6 @@ def _lock_shape_error(data: object) -> str | None:
                 return error
     if "schema_version" in document and not _is_int(document["schema_version"]):
         return "schema_version"
-    merkle_id = document.get("merkle_id")
-    if merkle_id is not None and not isinstance(merkle_id, str):
-        return "merkle_id"
     return None
 
 
@@ -209,18 +206,13 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
 
-    storage = StorageLockData(
+    return StorageLockData(
         schema_version=2,
         code_manifest=sorted_code_manifest,
         params=data["params"],
         deps=deps_list,
         outs=outs_list,
     )
-    if "merkle_id" in data:
-        mid = data["merkle_id"]
-        if mid is not None:
-            storage["merkle_id"] = mid
-    return storage
 
 
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
@@ -247,7 +239,6 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
         params=data["params"],
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
-        merkle_id=data.get("merkle_id"),
     )
 
 

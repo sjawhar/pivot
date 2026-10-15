@@ -350,7 +350,6 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
-    merkle_id: NotRequired[str]
 
 
 class LockData(TypedDict):
@@ -360,7 +359,6 @@ class LockData(TypedDict):
     params: dict[str, Any]
     dep_hashes: dict[ArtifactIdentity, HashInfo]
     output_hashes: dict[ArtifactIdentity, HashInfo]
-    merkle_id: NotRequired[str | None]
 
 
 class OutputMessageKind(enum.StrEnum):

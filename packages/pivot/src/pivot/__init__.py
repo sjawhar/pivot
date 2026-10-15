@@ -10,7 +10,6 @@ __version__ = "0.2.0a1"
 
 if TYPE_CHECKING:
     from pivot import loaders as loaders
-    from pivot import merkle as merkle
     from pivot import stage_def as stage_def
     from pivot.compose import Pipeline as Pipeline
     from pivot.compose import incremental as incremental
@@ -23,7 +22,6 @@ if TYPE_CHECKING:
 # Lazy import mapping for runtime: (module_path, attr_name or None for module import)
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "no_fingerprint": ("pivot.decorators", "no_fingerprint"),
-    "merkle": ("pivot.merkle", None),
     "loaders": ("pivot.loaders", None),
     "stage_def": ("pivot.stage_def", None),
     "Pipeline": ("pivot.compose", "Pipeline"),

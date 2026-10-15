@@ -82,7 +82,6 @@ def _helper_write_lock(
             params={},
             dep_hashes={},
             output_hashes=output_hashes,
-            merkle_id=None,
         )
     )
 

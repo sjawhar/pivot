@@ -71,7 +71,6 @@ def _lock_data(draw: st.DrawFn) -> tuple[str, LockData]:
         params=draw(st.dictionaries(st.text(min_size=1), _param_values, max_size=4)),
         dep_hashes=draw(st.dictionaries(_identities, _hash_infos, max_size=4)),
         output_hashes={ArtifactIdentity(stage_name, key): draw(_hash_infos) for key in out_keys},
-        merkle_id=draw(st.none() | _hashes),
     )
     return stage_name, data
 
