@@ -1,15 +1,81 @@
 from __future__ import annotations
 
+import multiprocessing
+import queue
 from typing import TYPE_CHECKING, cast
 
 import pytest
 import yaml
 
 from pivot import exceptions, project
+from pivot.cli import checkout
 from pivot.storage import cache, restore
 
 if TYPE_CHECKING:
+    import pathlib
+
     from conftest import GitRepo
+
+
+def _hold_checkout_restore(
+    project_root: pathlib.Path,
+    path: pathlib.Path,
+    output_hash: cache.FileHash,
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+    started: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+    result_queue: multiprocessing.Queue[tuple[str, str]],
+) -> None:
+    """Pause checkout after it has acquired its restore lock."""
+    project._project_root_cache = project_root  # pyright: ignore[reportPrivateUsage]
+    original_stage_checkout = cache._stage_checkout
+
+    def _stage_after_release(
+        tmp_path: pathlib.Path,
+        source: pathlib.Path,
+        checkout_mode: cache.CheckoutMode,
+        *,
+        executable: bool,
+    ) -> None:
+        started.set()
+        assert release.wait(10)
+        original_stage_checkout(tmp_path, source, checkout_mode, executable=executable)
+
+    cache._stage_checkout = _stage_after_release
+    try:
+        result, _ = checkout._restore_path_sync(
+            path,
+            output_hash,
+            cache_dir,
+            [cache.CheckoutMode.COPY],
+            checkout.CheckoutBehavior.FORCE,
+            state_dir,
+        )
+        result_queue.put(("checkout", result))
+    finally:
+        cache._stage_checkout = original_stage_checkout
+
+
+def _get_while_checkout_restores(
+    project_root: pathlib.Path,
+    path: pathlib.Path,
+    output_hash: cache.FileHash,
+    cache_dir: pathlib.Path,
+    result_queue: multiprocessing.Queue[tuple[str, str]],
+) -> None:
+    """Run the local-cache branch of ``pivot get`` in a separate process."""
+    project._project_root_cache = project_root  # pyright: ignore[reportPrivateUsage]
+    result = restore.restore_file(
+        rel_path=str(path.relative_to(project_root)),
+        output_hash=output_hash,
+        rev="HEAD",
+        dest_path=path,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=True,
+    )
+    result_queue.put(("get", result["status"]))
 
 
 # =============================================================================
@@ -510,6 +576,61 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
     assert len(messages) == 1
     assert "from cache" in messages[0]
     assert output_path.read_bytes() == b"cached content"
+
+
+def test_get_waits_for_checkout_restore_on_shared_cache(tmp_path: pathlib.Path) -> None:
+    """Get and checkout share a restore lock when the cache is outside the project."""
+    project_root = tmp_path / "project"
+    state_dir = project_root / ".pivot"
+    state_dir.mkdir(parents=True)
+    shared_cache = tmp_path / "shared" / "cache"
+    file_hash = "0123456789abcdef"
+    cache_path = cache.get_cache_path(shared_cache / "files", file_hash)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("cached content")
+    target = project_root / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    output_hash = cache.FileHash(hash=file_hash)
+
+    ctx = multiprocessing.get_context("spawn")
+    started = ctx.Event()
+    release = ctx.Event()
+    results = ctx.Queue()
+    checkout_proc = ctx.Process(
+        target=_hold_checkout_restore,
+        args=(
+            project_root,
+            target,
+            output_hash,
+            shared_cache / "files",
+            state_dir,
+            started,
+            release,
+            results,
+        ),
+    )
+    checkout_proc.start()
+    assert started.wait(10)
+
+    get_proc = ctx.Process(
+        target=_get_while_checkout_restores,
+        args=(project_root, target, output_hash, shared_cache, results),
+    )
+    get_proc.start()
+    with pytest.raises(queue.Empty):
+        results.get(timeout=0.5)
+
+    release.set()
+    checkout_proc.join(10)
+    get_proc.join(10)
+
+    assert checkout_proc.exitcode == 0
+    assert get_proc.exitcode == 0
+    assert {results.get(timeout=1), results.get(timeout=1)} == {
+        ("checkout", "restored"),
+        ("get", restore.RestoreStatus.RESTORED),
+    }
+    assert target.read_text() == "cached content"
 
 
 def test_parse_pvt_data_with_manifest() -> None:

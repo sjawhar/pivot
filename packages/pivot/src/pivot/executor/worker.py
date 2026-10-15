@@ -154,6 +154,7 @@ class WorkerStageInfo(TypedDict):
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
+    project_state_dir: pathlib.Path
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
 
@@ -190,6 +191,7 @@ def execute_stage(
     _ = cache_dir
     ring_buffer = _OutputRingBuffer()
     state_dir = stage_info["state_dir"]
+    project_state_dir = stage_info["project_state_dir"]
     project_root = stage_info["project_root"]
     store = store_mod.store_from_spec(stage_info["store_spec"])
 
@@ -277,7 +279,7 @@ def execute_stage(
                                 stage_outs,
                                 lock_data["output_hashes"],
                                 state_db,
-                                state_dir=stage_info["state_dir"],
+                                state_dir=project_state_dir,
                             )
                             if restored:
                                 return _make_result(
@@ -329,7 +331,7 @@ def execute_stage(
                             stage_outs,
                             lock_data["output_hashes"],
                             state_db,
-                            state_dir=stage_info["state_dir"],
+                            state_dir=project_state_dir,
                         )
                         if restored:
                             return _make_result(
@@ -348,7 +350,7 @@ def execute_stage(
                             stage_outs,
                             store,
                             state_db,
-                            state_dir=stage_info["state_dir"],
+                            state_dir=project_state_dir,
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -399,6 +401,7 @@ def execute_stage(
                     stage_info["incremental_inputs"],
                     lock_data,
                     state_dir,
+                    project_state_dir,
                     project_root,
                 )
                 if no_commit:
@@ -856,7 +859,8 @@ def _prepare_incremental_inputs(
     incremental_inputs: dict[str, types.ArtifactIdentity],
     lock_data: LockData | None,
     store: store_mod.Store,
-    state_dir: pathlib.Path,
+    stage_state_dir: pathlib.Path,
+    project_state_dir: pathlib.Path,
 ) -> dict[str, Any]:
     """Restore previous incremental outputs and load them for the stage call."""
     if not incremental_inputs:
@@ -874,7 +878,7 @@ def _prepare_incremental_inputs(
             continue
 
         output_hash = lock_data["output_hashes"].get(identity)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         if output_hash is None:
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
@@ -883,7 +887,7 @@ def _prepare_incremental_inputs(
             )
         output_path = store.resolve_display_path(ref)
         cache.remove_output(output_path)
-        if not store.restore_from_cache(ref, output_hash, state_dir=state_dir):
+        if not store.restore_from_cache(ref, output_hash, state_dir=project_state_dir):
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
                 + f"Run 'pivot pull' to restore it, or remove '{stage_lock.path}' and rerun "
@@ -907,6 +911,7 @@ def _run_stage_function_with_store(
     incremental_inputs: dict[str, types.ArtifactIdentity],
     lock_data: LockData | None,
     state_dir: pathlib.Path,
+    project_state_dir: pathlib.Path,
     project_root: pathlib.Path,
 ) -> dict[types.ArtifactRef, pathlib.Path]:
     with (
@@ -935,6 +940,7 @@ def _run_stage_function_with_store(
                 lock_data,
                 store,
                 state_dir,
+                project_state_dir,
             )
         )
 

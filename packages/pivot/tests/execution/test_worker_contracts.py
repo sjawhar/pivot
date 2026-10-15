@@ -111,6 +111,7 @@ def _stage_info(
         params_arg_name=None,
         project_root=project,
         state_dir=project / ".pivot",
+        project_state_dir=project / ".pivot",
         collection_params={},
         incremental_inputs={},
     )
@@ -861,6 +862,7 @@ def test_first_run_gives_every_incremental_input_its_empty_value(tmp_path: pathl
         None,
         store,
         tmp_path / ".pivot",
+        tmp_path / ".pivot",
     )
 
     assert values == {"prev_a": {}, "prev_b": ""}
@@ -882,7 +884,7 @@ def test_incremental_input_that_cannot_be_restored_names_the_fix(
 
     with pytest.raises(exceptions.CacheRestoreError) as exc_info:
         worker._prepare_incremental_inputs(
-            _STAGE, [ref], {"prev": ref.identity}, lock_data, store, state_dir
+            _STAGE, [ref], {"prev": ref.identity}, lock_data, store, state_dir, state_dir
         )
 
     assert str(exc_info.value) == (

@@ -151,6 +151,7 @@ def test_stage_returning_external_path_dependency_does_not_move_user_file(
         params_arg_name=None,
         project_root=tmp_path,
         state_dir=state_dir,
+        project_state_dir=state_dir,
         collection_params={},
         incremental_inputs={},
     )

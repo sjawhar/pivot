@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, TypedDict, TypeGuard
 import xxhash
 import yaml
 
-from pivot import exceptions, git, project, yaml_config
+from pivot import config, exceptions, git, project, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
 from pivot.types import DirHash, FileHash
@@ -275,7 +275,7 @@ def restore_file(
                     output_hash,
                     cache_dir / "files",
                     checkout_modes=checkout_modes,
-                    state_dir=cache_dir.parent,
+                    state_dir=config.get_state_dir(),
                 )
                 if success:
                     return RestoreResult(
