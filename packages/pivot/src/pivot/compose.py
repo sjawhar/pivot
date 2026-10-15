@@ -453,7 +453,7 @@ def _emit_stage_info(
         outs=outs,
         incremental_inputs=incremental_inputs,
         params=node.params,
-        resources=dict(getattr(func, "__pivot_resources__", {})),
+        resources=dict(node.resources),
         variant=node.variant,
         signature=inspect.signature(func),
         fingerprint=None,
@@ -794,6 +794,7 @@ class Pipeline:
         original_func: Callable[..., object],
         stage_wrapper: Callable[..., object],
         output_specs: list[_OutputSpec],
+        resources: dict[str, int | str],
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> ArtifactHandle:
@@ -928,6 +929,7 @@ class Pipeline:
             output_specs=output_specs,
             call_index=count,
             variant=variant_str,
+            resources=resources,
             list_input_handles=list_input_handles,
             collection_params=collection_params,
             incremental_inputs=incremental_inputs,
@@ -1300,7 +1302,6 @@ def stage[**P, R](
 def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None) -> Callable[P, R]:
     """Build a stage wrapper for a validated resource declaration."""
     normalized_resources = _normalize_stage_resources(resources)
-    setattr(func, "__pivot_resources__", normalized_resources)  # noqa: B010
     _cached_specs: list[_OutputSpec] | None = None
 
     def _get_output_specs() -> list[_OutputSpec]:
@@ -1314,7 +1315,9 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
+        return pipeline._record_stage(
+            func, wrapper, _get_output_specs(), normalized_resources, args, kwargs
+        )
 
     wrapper._is_stage = True  # pyright: ignore[reportAttributeAccessIssue] - dynamic attr for stage detection
     wrapper._original_func = func  # pyright: ignore[reportAttributeAccessIssue] - for bridge to unwrap
@@ -1343,6 +1346,7 @@ class _StageNode:
     no_fingerprint: bool = False
     code_deps: list[str] = dataclasses.field(default_factory=list)
     incremental_inputs: dict[str, str] = dataclasses.field(default_factory=dict)
+    resources: dict[str, int | str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
