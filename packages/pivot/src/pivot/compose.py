@@ -368,13 +368,22 @@ def _emit_stage_info(
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     deps = dict[str, types.ArtifactRef]()
+    input_paths = dict[str, str]()
+
+    def add_dep(param_name: str, handle: ArtifactHandle) -> None:
+        ref = _handle_to_artifact_ref(handle, qualified_name)
+        deps[param_name] = ref
+        if ref.tag is types.ArtifactTag.INPUT:
+            source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            assert isinstance(source, _InputNode)
+            input_paths[types.identity_key(ref.identity)] = os.path.normpath(source.path)
 
     for param_name, handle in node.input_handles.items():
-        deps[param_name] = _handle_to_artifact_ref(handle, qualified_name)
+        add_dep(param_name, handle)
 
     for param_name, handles in node.list_input_handles.items():
         for i, handle in enumerate(handles):
-            deps[f"{param_name}[{i}]"] = _handle_to_artifact_ref(handle, qualified_name)
+            add_dep(f"{param_name}[{i}]", handle)
 
     outs = list[types.ArtifactRef]()
 
@@ -443,6 +452,7 @@ def _emit_stage_info(
         collection_params={k: str(v) for k, v in node.collection_params.items()},
         no_fingerprint=node.no_fingerprint,
         code_deps=list(node.code_deps),
+        input_paths=input_paths,
     )
 
 

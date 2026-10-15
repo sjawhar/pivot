@@ -58,7 +58,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 23 tracks only class attributes a user class body wrote, not library-defined ones.
 # Version 24 records `module.NAME` reads with the keys a global gets (`const:`, `func:`,
 # `ext:`), not `mod:`, and follows `settings.Config.SCALE` and `pkg.sub.helper`.
-_CACHE_SCHEMA_VERSION = 24
+# Version 25 records call-site artifact wiring (parameter bindings, collection kind/order,
+# and project-relative input paths) in the code manifest.
+_CACHE_SCHEMA_VERSION = 25
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")

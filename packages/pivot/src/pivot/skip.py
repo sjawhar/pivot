@@ -105,6 +105,15 @@ def _first_reason(
     # Actual changes take precedence over "forced" — force is the fallback
     # reason when nothing else changed.
     if code_changes:
+        rewired = sorted(
+            {
+                change["key"].removeprefix("wire:").split(":", 1)[0]
+                for change in code_changes
+                if change["key"].startswith("wire:")
+            }
+        )
+        if rewired:
+            return f"Inputs rewired: {', '.join(rewired)}"
         return "Code changed"
     if param_changes:
         return "Params changed"
