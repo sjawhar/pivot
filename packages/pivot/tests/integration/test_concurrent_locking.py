@@ -82,6 +82,7 @@ from pivot.compose import Pipeline, stage
 
 @stage
 def stage_a() -> str:
+    pathlib.Path("stage_a_started").touch()
     time.sleep(float(os.environ.get("STAGE_A_SLEEP", "3")))
     return "hello from a"
 
@@ -165,6 +166,16 @@ def _helper_run_pivot(
     )
 
 
+def _helper_wait_for_path(path: pathlib.Path, timeout: float = 30.0) -> None:
+    """Wait until a stage has started under its artifact lock."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for {path}")
+
+
 def _helper_output(project: pathlib.Path, stage: str) -> pathlib.Path:
     return project / "data" / "test" / f"{stage}.txt"
 
@@ -213,7 +224,7 @@ def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
     env = _helper_make_env(STAGE_A_SLEEP="3")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    time.sleep(0.5)
+    _helper_wait_for_path(tmp_path / "stage_a_started")
     proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env, resolve_deps=True)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)
@@ -266,7 +277,7 @@ def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
     env = _helper_make_env(STAGE_A_SLEEP="4")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    time.sleep(1.0)
+    _helper_wait_for_path(tmp_path / "stage_a_started")
     proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)
