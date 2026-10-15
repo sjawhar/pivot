@@ -979,3 +979,34 @@ def test_list_refuses_a_fractional_resource_request(tmp_path: pathlib.Path) -> N
 
     assert proc.returncode == 1, out
     assert "Stage resource 'gpu' must request a positive integer or 'all'" in out, out
+
+
+def test_repro_reruns_for_distinct_equal_union_params(tmp_path: pathlib.Path) -> None:
+    """A bool override must not reuse an int run just because Python equates their values."""
+    pipeline = """\
+from pivot import Pipeline, StageParams, stage
+
+
+class Params(StageParams):
+    value: int | bool = 1
+
+
+@stage
+def show(params: Params) -> str:
+    return type(params.value).__name__ + ":" + str(params.value)
+
+
+with Pipeline("p") as pipeline:
+    show(params=Params())
+"""
+    root = _project(tmp_path, {"pipeline.py": pipeline})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("p/show:\n  value: true\n")
+
+    explanation = _ok(_pivot(root, "status", "--explain"))
+    repro = _ok(_pivot(root, "repro"))
+
+    assert "Param Changes:" in explanation, explanation
+    assert "value" in explanation, explanation
+    assert "1 ran" in repro, repro
+    assert (root / "data/p/show.txt").read_text() == "bool:True"

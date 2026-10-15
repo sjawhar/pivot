@@ -33,6 +33,8 @@ If **any** of these fail, the generation check returns `False` and execution fal
 `StageLock.is_changed_with_lock_data()` compares the full lock file state:
 - Code manifest (fingerprint of stage function + helper functions)
 - Parameters (effective params after overrides)
+- Parameters compare by canonical JSON encoding, so values with different serialized types invalidate
+  a stage even when Python considers them equal.
 - Dependency hashes (content hashes of all input files/directories)
 - Output path list (detect added/removed outputs)
 
