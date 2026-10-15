@@ -258,9 +258,12 @@ async def _atomic_download(
             raise exceptions.RemoteError(
                 f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
                 + f"for {bucket}/{key}. Delete {bucket}/{key} from the remote, then run "
-                + "`pivot push` on a machine whose cache has a good copy and that has never "
-                + "pushed or pulled this object with this remote; Pivot skips objects its "
-                + "record says the remote already holds."
+                + "`pivot push` on a machine whose cache has a good copy and has not run "
+                + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
+                + "against this remote for this object. Pivot records hashes those commands "
+                + "upload, download, or find, then skips recorded hashes. If every machine "
+                + "with a good copy has recorded it, delete `.pivot/state.lmdb/` before "
+                + "pushing; this also clears run history and local caches."
             )
         if readonly:
             os.chmod(tmp_path, 0o444)
