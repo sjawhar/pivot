@@ -90,6 +90,8 @@ Outputs: `data/scores/clean/rows.jsonl`, `metrics/scores/clean/summary.yaml`, `d
   - a **`StageParams` instance**, at most one per stage; never `Optional[...]` or a union,
   - a **previous-output marker** from `pipeline.previous()` or `pipeline.previous("key")`; the function receives its own prior output tagged `incremental`.
 - Plain values (`factor=3`, a string, a path) are rejected: `parameter 'factor' has unsupported type 'int'`. Put them in `StageParams`.
+- `*args`, positional-only parameters (`/`) and `**kwargs` are rejected: workers call stages with named keyword arguments. Use a `list[...]` parameter for several artifact inputs and ordinary named parameters for all other inputs.
+
 - Define stages, their `StageParams`, their return `TypedDict`s and custom loaders at module level. Workers receive the function by pickling. With postponed/string annotations (for example, `from __future__ import annotations`), return annotations are resolved in the module namespace, so a `TypedDict` defined inside a function fails with `name 'Result' is not defined`.
 - Outside a `with Pipeline` block a stage is an ordinary function, so test it directly: `clean(df, CleanParams(min_score=0.9))`.
 

@@ -109,7 +109,7 @@ def _setup_resolve_mocks(
     mocker.patch(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
-        return_value=[f"{stage_name}.lock"],
+        return_value=[{"name": f"{stage_name}.lock", "type": "file"}],
     )
     mocker.patch(
         "pivot.import_artifact.github.resolve_ref",

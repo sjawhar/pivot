@@ -165,7 +165,13 @@ class WorkspaceStore:
         return self._project_root / "data" / "raw" / name
 
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        return self._project_root / relative_output_path(ref)
+        path = self._project_root / relative_output_path(ref)
+        logical_path = pathlib.Path(os.path.normpath(path))
+        if not logical_path.is_relative_to(self._project_root):
+            raise ValueError(
+                f"Output {types.identity_key(ref.identity)!r} maps outside project root: {path}"
+            )
+        return path
 
     def _resolve_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         if ref.tag is types.ArtifactTag.INPUT:
@@ -216,6 +222,7 @@ class WorkspaceStore:
         output_hash: types.HashInfo,
         *,
         state_dir: pathlib.Path | None = None,
+        checkout_modes: list[config.CheckoutMode] | None = None,
     ) -> bool:
         if self._cache_dir is None:
             return False
@@ -226,7 +233,7 @@ class WorkspaceStore:
             output_path,
             output_hash,
             self._cache_dir,
-            checkout_modes=self._checkout_modes,
+            checkout_modes=checkout_modes if checkout_modes is not None else self._checkout_modes,
             state_dir=state_dir,
         )
 

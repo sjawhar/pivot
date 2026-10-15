@@ -110,6 +110,38 @@ _EMPTY_PIPELINE = (
     "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
 )
 
+_DEEP_OUTPUT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def make() -> dict:
+    return {"made": True}
+
+
+with Pipeline("deep") as pipeline:
+    make()
+"""
+
+
+def test_repro_skips_an_oversized_output_hash_cache_key(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An output path above LMDB's key limit still produces a successful committed run."""
+    root = tmp_path / ("a" * 200) / ("b" * 200) / ("c" * 80)
+    root.mkdir(parents=True)
+    with isolated_pivot_dir(runner, root):
+        pathlib.Path("pipeline.py").write_text(_DEEP_OUTPUT_PIPELINE)
+
+        first = runner.invoke(cli.cli, ["repro"])
+        second = runner.invoke(cli.cli, ["repro"])
+
+        assert first.exit_code == 0, first.output
+        assert "1 ran" in first.output, first.output
+        assert pathlib.Path(".pivot", "stages", "deep", "make.lock").exists()
+        assert second.exit_code == 0, second.output
+        assert "0 ran, 1 cached" in second.output, second.output
+
 
 def _output(pipeline: compose.Pipeline, stage_name: str) -> pathlib.Path:
     return pipeline.root / "data" / "test" / f"{stage_name}.txt"

@@ -542,6 +542,50 @@ def test_written_lock_outs_record_key_and_hash_only(tmp_path: Path) -> None:
     assert stage_lock.read() is not None
 
 
+def test_written_lock_records_project_relative_output_path(tmp_path: Path) -> None:
+    """A production lock records each output's workspace path in portable form."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    identity = _id("p/stage", "m")
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:stage": "h"},
+            params={},
+            dep_hashes={},
+            output_hashes={identity: {"hash": "fedcba9876543210"}},
+            output_paths={identity: "data/p/stage/m.txt"},
+        )
+    )
+
+    document = yaml.safe_load(stage_lock.path.read_text())
+    parsed = stage_lock.read()
+
+    assert document["outs"] == [
+        {"key": "m", "hash": "fedcba9876543210", "path": "data/p/stage/m.txt"}
+    ]
+    assert parsed is not None
+    assert "output_paths" in parsed
+    assert parsed["output_paths"] == {identity: "data/p/stage/m.txt"}
+
+
+def test_lock_rejects_absolute_output_path(tmp_path: Path) -> None:
+    """An output lock path is project-relative, not an absolute filesystem path."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    stage_lock.path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "code_manifest": {"self:stage": "h"},
+                "params": {},
+                "deps": [],
+                "outs": [{**_OUT, "path": "/tmp/output.txt"}],
+            }
+        )
+    )
+
+    assert stage_lock.read() is None
+
+
 def test_older_v2_lock_with_out_tag_and_display_still_parses(tmp_path: Path) -> None:
     """Locks written before `tag` and `display` were dropped stay valid: extra keys are ignored."""
     stage_lock = lock.StageLock("p/stage", tmp_path)

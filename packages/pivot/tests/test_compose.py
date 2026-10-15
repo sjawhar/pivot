@@ -772,6 +772,11 @@ def test_validate_artifact_identity_rejects_path_separators() -> None:
         types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/../b"))
     with pytest.raises(ValueError):
         types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/./b"))
+    # Absolute identity components could discard the managed output prefix.
+    with pytest.raises(ValueError, match="producer cannot be absolute"):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="/tmp/out", key=None))
+    with pytest.raises(ValueError, match="key cannot be absolute"):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="/tmp/out"))
 
 
 # --- Pipeline variant context manager ---
@@ -1265,11 +1270,49 @@ def _helper_with_plain_arg(data: pd.DataFrame, verbose: bool = False) -> pd.Data
 
 def test_record_stage_rejects_explicit_unsupported_arg(tmp_path: pathlib.Path) -> None:
     with (
-        pytest.raises(ValueError, match="unsupported type"),
+        pytest.raises(exceptions.StageDefinitionError, match="unsupported type"),
         Pipeline("test", root=tmp_path) as pipeline,
     ):
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_with_plain_arg(data=inp, verbose=True)
+
+
+@stage
+def _helper_join_varargs(*parts: str) -> str:
+    return "".join(parts)
+
+
+@stage
+def _helper_echo_positional_only(value: str, /) -> str:
+    return value
+
+
+@stage
+def _helper_collect_kwargs(**extra: str) -> str:
+    return "".join(extra.values())
+
+
+def test_record_stage_rejects_signatures_workers_cannot_call_with_kwargs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Workers call a stage as func(**kwargs), so varargs-only signatures are refused early."""
+    with (
+        pytest.raises(exceptions.StageDefinitionError) as exc_info,
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        first = pipeline.input("first.txt", t=str)
+        second = pipeline.input("second.txt", t=str)
+        _helper_join_varargs(first, second)
+        _helper_echo_positional_only(first)
+        _helper_collect_kwargs()
+
+    message = str(exc_info.value)
+    assert "test/_helper_join_varargs" in message
+    assert "parameter 'parts' uses *args; use a list[...] parameter instead of *args" in message
+    assert "test/_helper_echo_positional_only" in message
+    assert "parameter 'value' is positional-only; remove the /" in message
+    assert "test/_helper_collect_kwargs" in message
+    assert "parameter 'extra' uses **kwargs; use named parameters instead" in message
 
 
 def test_record_stage_ignores_default_unsupported_arg(tmp_path: pathlib.Path) -> None:
@@ -1343,6 +1386,7 @@ def _make_stage_info(
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 
@@ -1740,6 +1784,36 @@ def test_build_includes_only_foreign_closure(tmp_path: pathlib.Path) -> None:
 
 
 # --- Cross-pipeline input-binding merge ---
+
+
+@stage
+def _helper_join_direct_foreign_inputs(left: str, right: str) -> str:
+    return f"{left}:{right}"
+
+
+def test_direct_foreign_input_binding_conflict_raises(tmp_path: pathlib.Path) -> None:
+    first = Pipeline("first", root=tmp_path)
+    with first:
+        left = first.input("shared.txt", path="first.txt", t=str)
+    second = Pipeline("second", root=tmp_path)
+    with second:
+        right = second.input("shared.txt", path="second.txt", t=str)
+
+    with (
+        pytest.raises(ValueError, match=r"Input binding conflict.*shared\.txt"),
+        Pipeline("consumer", root=tmp_path),
+    ):
+        _helper_join_direct_foreign_inputs(left, right)
+
+
+def test_direct_foreign_input_binding_is_exposed_to_watch_paths(tmp_path: pathlib.Path) -> None:
+    shared = Pipeline("shared", root=tmp_path)
+    with shared:
+        source = shared.input("shared.txt", path="actual.txt", t=str)
+    with Pipeline("consumer", root=tmp_path) as consumer:
+        _helper_join_direct_foreign_inputs(source, source)
+
+    assert consumer.input_bindings["shared.txt"] == "actual.txt"
 
 
 def test_cross_pipeline_input_bindings_propagated(tmp_path: pathlib.Path) -> None:
