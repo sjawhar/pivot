@@ -38,6 +38,8 @@ class _ImportSession:
     path_entry: str
     caller_path_entries: list[tuple[int, str]]
     preexisting_root_modules: dict[str, _stdlib_types.ModuleType]
+    # Whether each module file lies under root; every scan of sys.modules shares one resolve.
+    file_under_root: dict[str, bool] = dataclasses.field(default_factory=dict)
     owned_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(default_factory=dict)
     displaced_modules: dict[str, object] = dataclasses.field(default_factory=dict)
     preexisting_pickle_by_value_modules: set[str] = dataclasses.field(default_factory=set)
@@ -77,12 +79,13 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     if _import_session is not None:
         _end_import_session(_import_session)
     root = root.resolve()
+    file_under_root = dict[str, bool]()
     preexisting_root_modules = {
         module_name: module
         for module_name, module in sys.modules.items()
         if module_name != "pivot"
         and not module_name.startswith("pivot.")
-        and _module_is_under_root(module, root)
+        and _module_is_under_root(module, root, file_under_root)
     }
     root_str = str(root)
     caller_path_entries = [
@@ -96,6 +99,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         root_str,
         caller_path_entries,
         preexisting_root_modules,
+        file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
     )
     importlib.invalidate_caches()
@@ -110,20 +114,26 @@ def _displace_module(module_name: str, session: _ImportSession) -> None:
     sys.modules.pop(module_name, None)
 
 
-def _module_is_under_root(module: _stdlib_types.ModuleType, root: pathlib.Path) -> bool:
+def _module_is_under_root(
+    module: _stdlib_types.ModuleType, root: pathlib.Path, file_under_root: dict[str, bool]
+) -> bool:
     """Whether a regular or namespace project module is loaded from this project root.
 
     Libraries are never project modules, even from a virtualenv inside the root: a session
     removes the modules it owns, and some extensions (numpy's) cannot be imported twice.
+    ``file_under_root`` memoizes the verdict per module file for this root.
     """
     if not fingerprint.is_user_code(module):
         return False
     module_file = getattr(module, "__file__", None)
     if isinstance(module_file, str):
-        try:
-            return pathlib.Path(module_file).resolve().is_relative_to(root)
-        except (OSError, ValueError):
-            return False
+        if (verdict := file_under_root.get(module_file)) is None:
+            try:
+                verdict = pathlib.Path(module_file).resolve().is_relative_to(root)
+            except (OSError, ValueError):
+                verdict = False
+            file_under_root[module_file] = verdict
+        return verdict
     module_paths = getattr(module, "__path__", ())
     try:
         return any(pathlib.Path(path).resolve().is_relative_to(root) for path in module_paths)
@@ -154,7 +164,7 @@ def _track_root_modules(session: _ImportSession) -> None:
     for module_name, module in list(sys.modules.items()):
         if module_name == "pivot" or module_name.startswith("pivot."):
             continue
-        if not _module_is_under_root(module, session.root):
+        if not _module_is_under_root(module, session.root, session.file_under_root):
             continue
         if session.preexisting_root_modules.get(module_name) is not module:
             session.owned_modules[module_name] = module
@@ -184,7 +194,7 @@ def _ensure_parent_modules(module_name: str, session: _ImportSession) -> None:
         parent_dir = session.root.joinpath(*parts[:index])
         existing = sys.modules.get(parent_name)
         if isinstance(existing, _stdlib_types.ModuleType) and _module_is_under_root(
-            existing, session.root
+            existing, session.root, session.file_under_root
         ):
             continue
         if existing is not None:
