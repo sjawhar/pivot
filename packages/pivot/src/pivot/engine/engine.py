@@ -2007,6 +2007,7 @@ class Engine:
         Returns None if computation fails (explanation should never block execution).
         """
         from pivot import explain as explain_mod
+        from pivot.storage import lock
 
         def _compute() -> StageExplanation:
             pipeline = self._require_pipeline()
@@ -2016,6 +2017,9 @@ class Engine:
                 input_bindings=pipeline.input_bindings,
                 cache_dir=pathlib.Path(worker_info["store_spec"]["cache_dir"]),
             )
+            lock_data = lock.StageLock(
+                stage_name, lock.get_stages_dir(worker_info["state_dir"])
+            ).read()
             return explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
@@ -2025,6 +2029,7 @@ class Engine:
                 overrides=overrides,
                 state_dir=worker_info["state_dir"],
                 store=store,
+                lock_data=lock_data,
                 force=force,
                 allow_missing=True,
             )

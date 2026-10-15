@@ -345,6 +345,7 @@ def test_explain_shows_cached_after_run_cache_skip(
             input_bindings={"input.txt": "input.txt"},
             cache_dir=worker_env,
         ),
+        lock_data=lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot")).read(),
         force=False,
     )
 
@@ -413,6 +414,7 @@ def test_explain_uses_generation_tracking_when_state_db_exists(
         overrides=None,
         state_dir=state_dir,
         store=workspace,
+        lock_data=lock.StageLock("consumer", lock.get_stages_dir(state_dir)).read(),
         producer_hashes=producer_lock["output_hashes"],
     )
 
@@ -448,6 +450,7 @@ def test_explain_does_not_create_state_db(tmp_path: pathlib.Path) -> None:
             input_bindings={},
             cache_dir=state_dir / "cache",
         ),
+        lock_data=lock.StageLock("test_stage", lock.get_stages_dir(state_dir)).read(),
     )
 
     assert explanation["will_run"] is False

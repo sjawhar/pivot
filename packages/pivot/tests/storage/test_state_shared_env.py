@@ -114,6 +114,7 @@ explanation = explain.get_stage_explanation(
         input_bindings={},
         cache_dir=state_dir / 'cache',
     ),
+    lock_data=lock.StageLock('stage', lock.get_stages_dir(state_dir)).read(),
 )
 assert explanation['will_run'] is False
 """
