@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import decimal
 import json
+import logging
 import os
 import pathlib
 import signal
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from conftest import isolated_pivot_dir, send_rpc
-from pivot import cli, compose, executor
+from pivot import cli, compose, executor, loaders
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
@@ -69,9 +73,74 @@ def quiet() -> str:
     return "done"
 
 
+@compose.stage
+def frame_metric() -> Annotated[pd.DataFrame, compose.metric]:
+    return pd.DataFrame({"value": [1.0]})
+
+
+@compose.stage
+def open_ended_dims() -> pd.DataFrame:
+    valid_to = np.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]")
+    return pd.DataFrame({"k": ["a", "b"], "valid_to": valid_to})
+
+
+@compose.stage
+def current_dims(dims: pd.DataFrame) -> list[str]:
+    return [str(k) for k in dims.loc[dims["valid_to"] > pd.Timestamp("2025-01-01"), "k"]]
+
+
+@compose.stage
+def matrix() -> pd.DataFrame:
+    return pd.DataFrame(np.array([[1.5, 2.5], [3.5, 4.5]]))
+
+
+@compose.stage
+def first_col(m: pd.DataFrame) -> list[float]:
+    return [float(value) for value in m[0]]
+
+
+@compose.stage
+def chatty_lossy() -> pd.DataFrame:
+    for row in range(60):
+        logging.getLogger("etl").warning("skipping malformed row %d", row)
+    return pd.DataFrame({"price": [decimal.Decimal("0.1")]})
+
+
 _EMPTY_PIPELINE = (
     "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
 )
+
+_DEEP_OUTPUT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def make() -> dict:
+    return {"made": True}
+
+
+with Pipeline("deep") as pipeline:
+    make()
+"""
+
+
+def test_repro_skips_an_oversized_output_hash_cache_key(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An output path above LMDB's key limit still produces a successful committed run."""
+    root = tmp_path / ("a" * 200) / ("b" * 200) / ("c" * 80)
+    root.mkdir(parents=True)
+    with isolated_pivot_dir(runner, root):
+        pathlib.Path("pipeline.py").write_text(_DEEP_OUTPUT_PIPELINE)
+
+        first = runner.invoke(cli.cli, ["repro"])
+        second = runner.invoke(cli.cli, ["repro"])
+
+        assert first.exit_code == 0, first.output
+        assert "1 ran" in first.output, first.output
+        assert pathlib.Path(".pivot", "stages", "deep", "make.lock").exists()
+        assert second.exit_code == 0, second.output
+        assert "0 ran, 1 cached" in second.output, second.output
 
 
 def _output(pipeline: compose.Pipeline, stage_name: str) -> pathlib.Path:
@@ -462,6 +531,110 @@ def test_list_names_a_single_output_as_the_return_value(
     # Quoted: the temp directory name ("test_list_names_a_single_output...") contains the bare word.
     assert repr(compose.SINGLE_OUTPUT_KEY) not in result.output, result.output
     assert expected in result.output, result.output
+
+
+_SUB_ROOTED_PIPELINE = """
+import pathlib
+
+import pandas as pd
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def double(x: pd.DataFrame) -> pd.DataFrame:
+    return x * 2
+
+
+with Pipeline("sub", root=pathlib.Path(__file__).parent) as pipeline:
+    double(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "raw_dir",
+    [
+        pytest.param("sub/data/raw", id="input-under-the-pipeline-root"),
+        pytest.param("data/raw", id="input-under-the-project-root"),
+    ],
+)
+def test_repro_refuses_a_pipeline_rooted_below_the_project(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_dir: str,
+) -> None:
+    """root= that is not the project root would split locks, StateDB and outputs: refuse it."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / raw_dir).mkdir(parents=True)
+        (cwd / raw_dir / "x.csv").write_text("a\n1\n")
+        (cwd / "sub").mkdir(exist_ok=True)
+        (cwd / "sub" / "pipeline.py").write_text(_SUB_ROOTED_PIPELINE)
+        monkeypatch.chdir(cwd / "sub")
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 1, result.output
+        assert "Pipeline 'sub' sets root=" in result.output, result.output
+        assert "always uses the project's .pivot and data/" in result.output, result.output
+        assert "remove root=" in result.output, result.output
+        assert not list(cwd.rglob("*.lock")), "no stage may run, so no lock is written"
+        assert not (cwd / "data" / "sub").exists(), "no output is written"
+        assert not (cwd / "sub" / "data" / "sub").exists(), "no output is written"
+
+
+def test_repro_of_a_pipeline_file_refuses_a_root_below_the_project(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`pivot repro sub/pipeline.py` loads the file directly; it is refused the same way."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "x.csv").write_text("a\n1\n")
+        (cwd / "sub").mkdir()
+        (cwd / "sub" / "pipeline.py").write_text(_SUB_ROOTED_PIPELINE)
+        (cwd / "pipeline.py").write_text(
+            "from pivot.compose import Pipeline\n\nwith Pipeline('top') as pipeline:\n    pass\n"
+        )
+
+        result = runner.invoke(cli.cli, ["repro", "sub/pipeline.py"])
+
+        assert result.exit_code == 1, result.output
+        assert "Pipeline 'sub' sets root=" in result.output, result.output
+        assert not list(cwd.rglob("*.lock")), "no stage may run, so no lock is written"
+
+
+_SYMLINKED_STATE_PIPELINE = """
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def copy(value: str) -> str:
+    return value
+
+
+with Pipeline("symlinked") as pipeline:
+    copy(pipeline.input("value.txt", t=str))
+"""
+
+
+def test_repro_and_status_accept_a_symlinked_project_state_dir(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A `.pivot` symlink is a supported project-state layout."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "data" / "raw").mkdir(parents=True)
+        (cwd / "data" / "raw" / "value.txt").write_text("value")
+        (cwd / "pipeline.py").write_text(_SYMLINKED_STATE_PIPELINE)
+        state_dir = cwd.parent / f"{cwd.name}-state"
+        (cwd / ".pivot").rename(state_dir)
+        (cwd / ".pivot").symlink_to(state_dir, target_is_directory=True)
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        status = runner.invoke(cli.cli, ["status"])
+
+    assert repro.exit_code == 0, repro.output
+    assert status.exit_code == 0, status.output
+    assert (cwd / "data" / "symlinked" / "copy.txt").read_text() == "value"
 
 
 # =============================================================================
@@ -1030,6 +1203,102 @@ def test_repro_without_show_output_hides_logs(
     assert "quiet" in result.output
 
 
+def test_repro_shows_lossy_output_warning_without_show_output(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A plain `pivot repro` prints a stage's warning in its report and still exits 0."""
+    with mock_discovery:
+        frame_metric()
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    # The console wraps long lines; compare the words.
+    text = " ".join(result.output.split())
+    warning = (
+        "WARNING: Stage 'test/frame_metric' wrote its YAML output in a form Pivot cannot "
+        + "read back: YAML output must contain plain data; got DataFrame at root."
+    )
+    assert warning in text, result.output
+    assert text.index("✓ test/frame_metric done") < text.index(warning), "prints under its stage"
+    assert "Summary: 1 ran, 0 cached, 0 blocked, 0 failed" in text
+
+
+def test_repro_quiet_suppresses_lossy_output_warning(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    with mock_discovery:
+        frame_metric()
+
+    result = runner.invoke(cli.cli, ["--quiet", "repro"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "", "Quiet mode should suppress the warning"
+
+
+def test_repro_never_writes_an_out_of_range_date_as_a_different_date(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A 9999-12-31 sentinel in a datetime64[us] column must not reach the next stage as 1816."""
+    with mock_discovery:
+        current_dims(open_ended_dims())
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    text = " ".join(result.output.split())
+    assert "WARNING: Stage 'test/open_ended_dims' wrote its DataFrameJSONL output" in text, (
+        result.output
+    )
+    assert "column 'valid_to'" in text
+    written = (mock_discovery.root / "data" / "test" / "open_ended_dims.jsonl").read_text()
+    assert "1816" not in written
+    assert written == pd.DataFrame(
+        {
+            "k": ["a", "b"],
+            "valid_to": np.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]"),
+        }
+    ).to_json(lines=True, orient="records")
+
+
+def test_repro_keeps_integer_column_labels_for_the_next_stage(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A frame built from a numpy array has labels 0, 1; the next stage indexes m[0]."""
+    with mock_discovery:
+        first_col(matrix())
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    written = (mock_discovery.root / "data" / "test" / "first_col.yaml").read_text()
+    assert written == "- 1.5\n- 3.5\n"
+
+
+def test_repro_reports_lossy_output_after_many_stage_warnings(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """The stage's own warnings are capped with a count; Pivot's own warning always shows."""
+    with mock_discovery:
+        chatty_lossy()
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "WARNING: skipping malformed row 49" in text
+    assert "WARNING: skipping malformed row 50" not in text
+    assert (
+        "WARNING: Stage 'test/chatty_lossy' wrote its DataFrameJSONL output in a form Pivot "
+        + "cannot read back: DataFrameJSONL cannot write column 'price'"
+    ) in text, result.output
+    assert "… 10 more warnings (run with --show-output)" in text
+
+
 def _same_named_pipeline(side: str) -> str:
     return (
         "import pandas as pd\n\nfrom pivot import Pipeline, stage\n\n\n"
@@ -1523,7 +1792,7 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
     def scaled() -> list[int] | None:
         if not output.exists():
             return None
-        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+        return [int(n) for n in loaders.DataFrameJSONL().load(output)["n"].tolist()]
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(
@@ -1553,6 +1822,87 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
 
         params_yaml.write_text("smoke/scale:\n  factor: 5\n")
         _wait_for_watch(proc, log_path, lambda: scaled() == [5, 10])
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+_WATCH_CPU_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage(resources={"cpu": 2})
+def solo(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 2
+
+
+@stage
+def other(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 3
+
+
+with Pipeline("w") as pipeline:
+    solo(pipeline.input("solo.csv"))
+    other(pipeline.input("other.csv"))
+"""
+
+
+def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A watch run of one `cpu: 2` stage fits the worker count; an over-capacity request is an
+    invalid pipeline, not the end of the watch."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".pivot").mkdir()
+    (project / "data" / "raw").mkdir(parents=True)
+    (project / "data" / "raw" / "solo.csv").write_text("n\n1\n")
+    (project / "data" / "raw" / "other.csv").write_text("n\n1\n")
+    (project / ".pivot" / "config.yaml").write_text("core:\n  max_workers: 2\n")
+    pipeline_py = project / "pipeline.py"
+    pipeline_py.write_text(_WATCH_CPU_PIPELINE)
+    output = project / "data" / "w" / "solo.jsonl"
+    log_path = tmp_path / "watch.log"
+    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    def doubled() -> list[int] | None:
+        if not output.exists():
+            return None
+        return [int(value) for value in loaders.DataFrameJSONL().load(output)["n"].tolist()]
+
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--debounce", "100"],
+            cwd=project,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    try:
+        _wait_for_watch(proc, log_path, lambda: doubled() == [2])
+
+        # Only `solo` is scheduled now: one stage, but the cpu capacity is still 2 workers.
+        (project / "data" / "raw" / "solo.csv").write_text("n\n5\n")
+        _wait_for_watch(proc, log_path, lambda: doubled() == [10])
+
+        pipeline_py.write_text(_WATCH_CPU_PIPELINE.replace('"cpu": 2', '"gpu": 2'))
+        _wait_for_watch(
+            proc,
+            log_path,
+            lambda: "Pipeline invalid - waiting for fix" in log_path.read_text(errors="replace"),
+        )
+        assert "requests 2 units of resource 'gpu', but its capacity is 1" in log_path.read_text(
+            errors="replace"
+        )
+        time.sleep(1)
+        assert proc.poll() is None, log_path.read_text(errors="replace")
     finally:
         proc.send_signal(signal.SIGTERM)
         try:

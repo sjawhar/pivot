@@ -47,6 +47,7 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 
@@ -70,7 +71,7 @@ class _DependencyStore:
     def prepare_output(self, ref: ArtifactRef) -> Path:
         raise AssertionError(f"not used by dependency validation: {ref}")
 
-    def commit(self, ref: ArtifactRef, path: Path) -> str:
+    def commit(self, ref: ArtifactRef, path: Path) -> HashInfo:
         raise AssertionError(f"not used by dependency validation: {ref} {path}")
 
     def hash_artifact(
@@ -231,6 +232,7 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             collection_params={},
             no_fingerprint=False,
             code_deps=[],
+            input_paths={},
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
@@ -248,6 +250,7 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             collection_params={},
             no_fingerprint=False,
             code_deps=[],
+            input_paths={},
         ),
     }
 
@@ -290,6 +293,7 @@ def test_validate_dependency_sources_uses_store() -> None:
             collection_params={},
             no_fingerprint=False,
             code_deps=[],
+            input_paths={},
         ),
     }
 
@@ -322,6 +326,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             collection_params={},
             no_fingerprint=False,
             code_deps=[],
+            input_paths={},
         ),
     }
 
@@ -344,6 +349,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             collection_params={},
             no_fingerprint=False,
             code_deps=[],
+            input_paths={},
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
@@ -361,6 +367,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             collection_params={},
             no_fingerprint=False,
             code_deps=[],
+            input_paths={},
         ),
     }
 

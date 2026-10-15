@@ -85,7 +85,7 @@ def _stage_info(
     return worker.WorkerStageInfo(
         func=func,
         fingerprint={"self:consume": "0123456789abcdef"},
-        deps={"data": _ref("raw")} if deps is None else deps,
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)} if deps is None else deps,
         outs=[_ref(_STAGE)] if outs is None else outs,
         store_spec=cast(
             "store_mod.StoreSpec",
@@ -97,6 +97,7 @@ def _stage_info(
                     "project_root": str(project),
                     "pipeline_name": "skip",
                     "input_bindings": {"raw": "raw.txt"} if bindings is None else bindings,
+                    "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
                 },
             ),
         ),
@@ -104,13 +105,13 @@ def _stage_info(
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[],
         run_id="test_run",
         force=force,
         no_commit=no_commit,
         params_arg_name=None,
         project_root=project,
         state_dir=project / ".pivot",
+        project_state_dir=project / ".pivot",
         collection_params={},
         incremental_inputs={},
     )
@@ -450,7 +451,10 @@ def test_unchanged_stage_with_unrestorable_output_reruns(
 def test_missing_and_unreadable_dependencies_are_named(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    deps = {"a": _ref("raw"), "b": _ref("other")}
+    deps = {
+        "a": _ref("raw", tag=types.ArtifactTag.INPUT),
+        "b": _ref("other", tag=types.ArtifactTag.INPUT),
+    }
     bindings = {"raw": "raw.txt", "other": "other.txt"}
     (project / "raw.txt").unlink()
 
@@ -615,7 +619,10 @@ def test_unreadable_state_database_fails_the_stage_without_a_run_cache_key(
 def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    """Workers open StateDB read-only; the coordinator applies their file-hash entries."""
+    """Workers open StateDB read-only; the coordinator applies their file-hash entries.
+
+    Entries cover the dependency the worker hashed and the output it committed.
+    """
     raw = project.resolve() / "raw.txt"
 
     result = worker.execute_stage(
@@ -628,7 +635,8 @@ def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     assert "deferred_writes" in result
     deferred = result["deferred_writes"]
     assert "file_hash_entries" in deferred
-    assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw)]
+    output = project.resolve() / "data" / "skip" / "consume.txt"
+    assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw), str(output)]
 
 
 # =============================================================================
@@ -861,6 +869,7 @@ def test_first_run_gives_every_incremental_input_its_empty_value(tmp_path: pathl
         None,
         store,
         tmp_path / ".pivot",
+        tmp_path / ".pivot",
     )
 
     assert values == {"prev_a": {}, "prev_b": ""}
@@ -882,7 +891,7 @@ def test_incremental_input_that_cannot_be_restored_names_the_fix(
 
     with pytest.raises(exceptions.CacheRestoreError) as exc_info:
         worker._prepare_incremental_inputs(
-            _STAGE, [ref], {"prev": ref.identity}, lock_data, store, state_dir
+            _STAGE, [ref], {"prev": ref.identity}, lock_data, store, state_dir, state_dir
         )
 
     assert str(exc_info.value) == (
@@ -943,11 +952,6 @@ def test_queue_writer_reads_subprocess_bytes_until_end_of_file(
     assert elapsed < 4.0, "the reader thread must stop at end of file"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="red test for Task 9 (cli-fixes Slice 2 PR): worker pipe reader decodes each read "
-    + "separately",
-)
 def test_queue_writer_keeps_a_character_split_across_pipe_reads(
     output_queue: mp.Queue[OutputMessage],
 ) -> None:
@@ -973,6 +977,21 @@ def test_queue_writer_keeps_a_character_split_across_pipe_reads(
 
     assert _log_lines(_drain(output_queue)) == [(_STAGE, "abc€", False)]
     assert ring.snapshot() == [("abc€", False)]
+
+
+def test_queue_writer_reports_a_truncated_character_at_eof(
+    output_queue: mp.Queue[OutputMessage],
+) -> None:
+    """Output that ends mid-character is still logged (as U+FFFD), not silently dropped."""
+    ring = worker._OutputRingBuffer()
+    writer = worker._QueueWriter(_STAGE, output_queue, is_stderr=False, ring_buffer=ring)
+    writer.__enter__()
+    try:
+        _ = os.write(writer.fileno(), b"abc" + "€".encode()[:1])
+    finally:
+        writer.__exit__(None, None, None)
+
+    assert _log_lines(_drain(output_queue)) == [(_STAGE, "abc\ufffd", False)]
 
 
 _LEAKED_CHILD_SCRIPT = textwrap.dedent(

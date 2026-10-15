@@ -89,6 +89,60 @@ def test_load_dataframe_jsonl(tmp_path: Path) -> None:
     assert df.iloc[0]["name"] == "alice"
 
 
+def test_dataframe_jsonl_metadata_is_excluded_from_data_readers(tmp_path: Path) -> None:
+    jsonl_file = tmp_path / "pivot.jsonl"
+    frame = pandas.DataFrame(
+        {
+            "timestamp": pandas.to_datetime(pandas.Series(["2024-03-04 12:34:56.123456789", None])),
+            "value": [1, 2],
+        }
+    )
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+
+    loaded = data.load_dataframe(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, frame)
+    assert data.get_schema(jsonl_file) == {
+        "timestamp": "datetime64[ns]",
+        "value": "int64",
+    }
+    assert data.get_row_count(jsonl_file) == 2
+
+
+def test_dataframe_jsonl_schema_and_count_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jsonl_file = tmp_path / "large.jsonl"
+    frame = pandas.DataFrame(
+        {
+            "timestamp": pandas.to_datetime(pandas.Series(["2024-03-04 12:34:56.123456789"] * 101)),
+            "value": list(range(101)),
+        }
+    )
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+    original_load = loaders.DataFrameJSONL.load
+
+    def load_without_full_read(
+        self: loaders.DataFrameJSONL, path: Path, *, max_rows: int | None = None
+    ) -> pandas.DataFrame:
+        if max_rows is None:
+            raise AssertionError("schema must not load the full JSONL artifact")
+        assert max_rows == 100
+        return original_load(self, path, max_rows=max_rows)
+
+    monkeypatch.setattr(loaders.DataFrameJSONL, "load", load_without_full_read)
+    assert data.get_schema(jsonl_file) == {
+        "timestamp": "datetime64[ns]",
+        "value": "int64",
+    }
+
+    def fail_load(*args: object, **kwargs: object) -> pandas.DataFrame:
+        raise AssertionError("row count must stream JSONL without loading it")
+
+    monkeypatch.setattr(loaders.DataFrameJSONL, "load", fail_load)
+    assert data.get_row_count(jsonl_file) == 101
+
+
 def test_load_dataframe_unsupported(tmp_path: Path) -> None:
     """Unsupported format raises DataError."""
     file = tmp_path / "data.parquet"
@@ -1269,6 +1323,7 @@ def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactR
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 

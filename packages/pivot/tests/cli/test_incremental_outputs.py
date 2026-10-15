@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import pathlib
 from typing import TYPE_CHECKING
+
+import yaml
 
 from conftest import isolated_pivot_dir
 from pivot import cli
@@ -43,6 +46,70 @@ def keep(previous: pd.DataFrame) -> Annotated[pd.DataFrame, incremental, loaders
 with Pipeline("incremental") as pipeline:
     keep(previous=pipeline.previous())
 """
+
+_PROBE_PIPELINE = """\
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import pathlib
+from typing import Annotated
+
+from pivot import Pipeline, incremental, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Probe(loaders.Loader[dict[str, int]]):
+    def empty(self) -> dict[str, int]:
+        return {}
+
+    def load(self, path: pathlib.Path) -> dict[str, int]:
+        before = path.read_text()
+        pathlib.Path("incremental-probe.json").write_text(
+            json.dumps({"nlink": os.stat(path).st_nlink, "writable": os.access(path, os.W_OK)})
+        )
+        path.write_text(before + " ")
+        return json.loads(before)
+
+    def save(self, data: dict[str, int], path: pathlib.Path) -> None:
+        path.write_text(json.dumps(data))
+
+
+@stage
+def grow(previous: dict[str, int]) -> Annotated[dict[str, int], incremental, Probe()]:
+    return {"count": previous.get("count", 0) + 1}
+
+
+with Pipeline("incremental") as pipeline:
+    grow(pipeline.previous())
+"""
+
+
+def test_incremental_previous_restores_a_writable_copy(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An incremental loader can edit its restored prior value without touching the cache."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_PROBE_PIPELINE)
+
+        first = runner.invoke(cli.cli, ["repro", "--force"])
+        assert first.exit_code == 0, first.output
+        lock_data = yaml.safe_load(
+            pathlib.Path(".pivot", "stages", "incremental", "grow.lock").read_text()
+        )
+        first_hash = lock_data["outs"][0]["hash"]
+        cache_path = pathlib.Path(".pivot", "cache", "files", first_hash[:2], first_hash[2:])
+        cached_before = cache_path.read_text()
+
+        second = runner.invoke(cli.cli, ["repro", "--force"])
+
+        assert second.exit_code == 0, second.output
+        assert json.loads(pathlib.Path("incremental-probe.json").read_text()) == {
+            "nlink": 1,
+            "writable": True,
+        }
+        assert cache_path.read_text() == cached_before
 
 
 def _write_pipeline_and_input() -> None:

@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false
 """Worker process execution for pipeline stages.
 
 Functions that execute in separate processes via ProcessPoolExecutor.
@@ -7,6 +6,7 @@ Must be module-level and picklable.
 
 from __future__ import annotations
 
+import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
@@ -18,11 +18,13 @@ import random
 import sys
 import threading
 import traceback
+import warnings
 from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast, overload, override
 
 import pydantic
 
 from pivot import (
+    config,
     exceptions,
     loaders,
     metrics,
@@ -37,7 +39,6 @@ from pivot.storage import artifact_lock, cache, lock, state
 from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
-    DepEntry,
     DirHash,
     FileHash,
     HashInfo,
@@ -147,13 +148,13 @@ class WorkerStageInfo(TypedDict):
     params: stage_def.StageParams | None
     variant: str | None
     overrides: parameters.ParamsOverrides
-    checkout_modes: list[cache.CheckoutMode]
     run_id: str
     force: bool
     no_commit: bool
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
+    project_state_dir: pathlib.Path
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
 
@@ -163,15 +164,19 @@ def _make_result(
     reason: str,
     ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
-    return StageResult(
+    result = StageResult(
         status=status,
         reason=reason,
         input_hash=input_hash,
         output_lines=ring_buffer.snapshot(),
         metrics=metrics.get_entries(),
     )
+    if file_hash_entries:
+        result["deferred_writes"] = DeferredWrites(file_hash_entries=file_hash_entries)
+    return result
 
 
 def execute_stage(
@@ -190,14 +195,9 @@ def execute_stage(
     _ = cache_dir
     ring_buffer = _OutputRingBuffer()
     state_dir = stage_info["state_dir"]
+    project_state_dir = stage_info["project_state_dir"]
     project_root = stage_info["project_root"]
     store = store_mod.store_from_spec(stage_info["store_spec"])
-
-    # For store-based stages, mark outputs as produced so _resolve_path returns
-    # the correct output path (not input path) during run cache skip checks
-    if isinstance(store, store_mod.WorkspaceStore):
-        for out in stage_info["outs"]:
-            store._output_producers.add(out.identity.producer)  # pyright: ignore[reportPrivateUsage]
 
     # Set project root cache explicitly - workers in reusable pool may have
     # stale cache from previous execution in different project/test.
@@ -254,7 +254,7 @@ def execute_stage(
                 with state.StateDB(state_dir, readonly=True) as state_db:
                     outputs_missing_from_cache = False
                     if lock_data is not None and not stage_info["force"]:
-                        out_paths = _get_normalized_out_paths(stage_info)
+                        out_paths = [types.identity_key(out.identity) for out in stage_outs]
                         if can_skip_via_generation(
                             stage_name=stage_name,
                             fingerprint=stage_info["fingerprint"],
@@ -265,19 +265,21 @@ def execute_stage(
                             state_db=state_db,
                             store=store,
                         ):
-                            out_specs = _get_output_specs(stage_info)
-                            deps_list = _deps_list_for_input_hash(
-                                stage_info, _to_identity_keyed_hashes(lock_data["dep_hashes"])
+                            input_hash = run_history.stage_input_hash(
+                                current_fingerprint,
+                                current_params,
+                                stage_info["deps"].values(),
+                                lock_data["dep_hashes"],
+                                stage_outs,
                             )
-                            input_hash = run_history.compute_input_hash(
-                                current_fingerprint, current_params, deps_list, out_specs
-                            )
+                            restored_entries = list[tuple[str, int, int, int, str]]()
                             restored = restore_outputs_to_hashes(
                                 store,
                                 stage_outs,
                                 lock_data["output_hashes"],
                                 state_db,
-                                state_dir=stage_info["state_dir"],
+                                state_dir=project_state_dir,
+                                file_hash_entries=restored_entries,
                             )
                             if restored:
                                 return _make_result(
@@ -285,6 +287,7 @@ def execute_stage(
                                     "unchanged (generation)",
                                     ring_buffer,
                                     input_hash=input_hash,
+                                    file_hash_entries=restored_entries,
                                 )
                             outputs_missing_from_cache = True
 
@@ -324,12 +327,14 @@ def execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
+                        restored_entries = list[tuple[str, int, int, int, str]]()
                         restored = restore_outputs_to_hashes(
                             store,
                             stage_outs,
                             lock_data["output_hashes"],
                             state_db,
-                            state_dir=stage_info["state_dir"],
+                            state_dir=project_state_dir,
+                            file_hash_entries=restored_entries,
                         )
                         if restored:
                             return _make_result(
@@ -337,6 +342,7 @@ def execute_stage(
                                 skip_reason,
                                 ring_buffer,
                                 input_hash=input_hash,
+                                file_hash_entries=restored_entries,
                             )
                         run_reason = "outputs missing from cache"
 
@@ -348,7 +354,7 @@ def execute_stage(
                             stage_outs,
                             store,
                             state_db,
-                            state_dir=stage_info["state_dir"],
+                            state_dir=project_state_dir,
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -365,6 +371,7 @@ def execute_stage(
                                 output_hashes=_to_identity_hashes(
                                     dict(sorted(run_cache_skip["output_hashes"].items()))
                                 ),
+                                output_paths=lock_output_paths(stage_outs, store, project_root),
                             )
                             deferred = _commit_lock_and_build_deferred(
                                 stage_info,
@@ -373,7 +380,8 @@ def execute_stage(
                                 run_cache_skip["output_hashes"],
                                 production_lock,
                                 state_db,
-                                file_hash_entries=file_hash_entries,
+                                file_hash_entries=file_hash_entries
+                                + run_cache_skip["file_hash_entries"],
                                 increment_outputs=run_cache_skip["outputs_restored"],
                             )
                             return StageResult(
@@ -399,12 +407,21 @@ def execute_stage(
                     stage_info["incremental_inputs"],
                     lock_data,
                     state_dir,
+                    project_state_dir,
                     project_root,
                 )
                 if no_commit:
                     output_hashes = _hash_output_paths(output_paths)
                 else:
-                    output_hashes = _commit_outputs_with_store(output_paths, store)
+                    output_hashes = _commit_outputs_with_store(
+                        output_paths, store, project_state_dir
+                    )
+                    for ref, path in output_paths.items():
+                        file_hash_entries.extend(
+                            output_file_hash_entries(
+                                path, output_hashes[types.identity_key(ref.identity)]
+                            )
+                        )
 
                 # For --no-commit, skip lock/cache writes entirely
                 if no_commit:
@@ -421,6 +438,7 @@ def execute_stage(
                     params=current_params,
                     dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
                     output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
+                    output_paths=lock_output_paths(stage_outs, store, project_root),
                 )
 
                 # Single StateDB open for post-execution work
@@ -471,12 +489,6 @@ def _to_identity_hashes(hashes: dict[str, HashInfo]) -> dict[types.ArtifactIdent
     return {types.identity_from_key(key): info for key, info in hashes.items()}
 
 
-def _to_identity_keyed_hashes(
-    hashes: dict[types.ArtifactIdentity, HashInfo],
-) -> dict[str, HashInfo]:
-    return {types.identity_key(identity): info for identity, info in hashes.items()}
-
-
 class OutputRestoreResult(NamedTuple):
     """Whether output restoration succeeded and wrote workspace bytes.
 
@@ -500,6 +512,7 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: Literal[False] = False,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> bool: ...
 
 
@@ -513,6 +526,7 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: Literal[True],
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -525,8 +539,13 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: bool = False,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> bool | OutputRestoreResult:
-    """Verify outputs match recorded hashes and restore cacheable mismatches."""
+    """Verify outputs match recorded hashes and restore cacheable mismatches.
+
+    ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file
+    restored from the cache, so the next check finds it without reading it.
+    """
     unavailable = list[types.ArtifactRef]()
     outputs_restored = False
     if not isinstance(store, store_mod.WorkspaceStore):
@@ -547,6 +566,10 @@ def restore_outputs_to_hashes(
                         continue
                     if store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
                         outputs_restored = True
+                        if file_hash_entries is not None:
+                            file_hash_entries.extend(
+                                output_file_hash_entries(output_path, expected_hash)
+                            )
                         continue
             unavailable.append(ref)
             if restore:
@@ -560,37 +583,6 @@ def restore_outputs_to_hashes(
     return not unavailable
 
 
-def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
-    outs = stage_info.get("outs", [])
-    return [types.identity_key(out.identity) for out in outs]
-
-
-def _get_output_specs(stage_info: WorkerStageInfo) -> list[tuple[str, bool]]:
-    outs = stage_info.get("outs", [])
-    return [
-        (types.identity_key(out.identity), out.tag is not types.ArtifactTag.METRIC) for out in outs
-    ]
-
-
-def _deps_list_for_input_hash(
-    stage_info: WorkerStageInfo,
-    dep_hashes: dict[str, HashInfo],
-) -> list[DepEntry]:
-    deps_info = stage_info["deps"]
-    entries = list[DepEntry]()
-    for ref in deps_info.values():
-        dep_key = types.identity_key(ref.identity)
-        hash_info = dep_hashes[dep_key]
-        entries.append(
-            DepEntry(
-                producer=ref.identity.producer,
-                key=ref.identity.key,
-                hash=hash_info["hash"],
-            )
-        )
-    return entries
-
-
 def _check_skip_or_run(
     stage_info: WorkerStageInfo,
     lock_data: LockData | None,
@@ -600,16 +592,19 @@ def _check_skip_or_run(
 ) -> tuple[str | None, str, str, bool]:
     """Determine if stage can skip or must run."""
     out_identities = [out.identity for out in stage_info["outs"]]
-    out_specs = _get_output_specs(stage_info)
-    deps_list = _deps_list_for_input_hash(stage_info, dep_hashes)
-    input_hash = run_history.compute_input_hash(
-        current_fingerprint, current_params, deps_list, out_specs
+    dep_hashes_by_identity = _to_identity_hashes(dep_hashes)
+    input_hash = run_history.stage_input_hash(
+        current_fingerprint,
+        current_params,
+        stage_info["deps"].values(),
+        dep_hashes_by_identity,
+        stage_info["outs"],
     )
     decision = skip.check_stage(
         lock_data=lock_data,
         fingerprint=current_fingerprint,
         params=current_params,
-        dep_hashes=_to_identity_hashes(dep_hashes),
+        dep_hashes=dep_hashes_by_identity,
         out_paths=out_identities,
         run_cache_allowed=not bool(stage_info["incremental_inputs"]),
     )
@@ -625,6 +620,46 @@ def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> Ha
         return DirHash(hash=tree_hash, manifest=manifest)
     file_hash, _ = cache.hash_file(path, state_db)
     return FileHash(hash=file_hash)
+
+
+def output_file_hash_entries(
+    path: pathlib.Path, output_hash: HashInfo
+) -> list[tuple[str, int, int, int, str]]:
+    """StateDB file-hash entries for an output whose hash is already known.
+
+    Stats each file (each manifest entry, for a directory) and pairs it with its known hash;
+    nothing is read. Call it once the output has its final inode: a hardlink checkout
+    replaces the file the stage wrote. An output whose file-hash StateDB key exceeds LMDB's
+    limit is omitted: this cache only avoids a later hash and must not fail the stage.
+    """
+    if is_dir_hash(output_hash):
+        files = [(path / entry["relpath"], entry["hash"]) for entry in output_hash["manifest"]]
+    else:
+        files = [(path, output_hash["hash"])]
+    entries = list[tuple[str, int, int, int, str]]()
+    for file_path, file_hash in files:
+        if not state.file_hash_key_fits(file_path):
+            logger.debug("Skipping oversized output file-hash cache entry: %s", file_path)
+            continue
+        fs_stat = file_path.stat()
+        entries.append(
+            (str(file_path), fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
+        )
+    return entries
+
+
+def lock_output_paths(
+    outs: list[types.ArtifactRef],
+    store: store_mod.Store,
+    project_root: pathlib.Path,
+) -> dict[types.ArtifactIdentity, str]:
+    """Project-relative, POSIX output paths for a production workspace lock."""
+    if not isinstance(store, store_mod.WorkspaceStore):
+        return {}
+    root = project_root.resolve()
+    return {
+        ref.identity: store.resolve_display_path(ref).relative_to(root).as_posix() for ref in outs
+    }
 
 
 def _set_deterministic_seeds() -> None:
@@ -790,6 +825,42 @@ def _write_output_with_store(
         _reject_path_inside_project(ref, value, project_root, dependency_paths)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
+
+    output_label = (
+        f"its {type(writer).__name__} output"
+        if ref.identity.key is None
+        else f"output {ref.identity.key!r}"
+    )
+
+    def save_output(output_value: Any, destination: pathlib.Path) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", loaders.LossyOutputWarning)
+            try:
+                writer.save(output_value, destination)
+            except TypeError as e:
+                if isinstance(writer, loaders.YAML):
+                    raise TypeError(
+                        f"Stage '{ref.identity.producer}' cannot write {output_label}: {e}"
+                    ) from e
+                raise
+        for caught_warning in caught:
+            if issubclass(caught_warning.category, loaders.LossyOutputWarning):
+                logger.warning(
+                    "Stage '%s' wrote %s %s: %s",
+                    ref.identity.producer,
+                    output_label,
+                    types.LOSSY_OUTPUT_PHRASE,
+                    caught_warning.message,
+                )
+            else:
+                warnings.warn_explicit(
+                    caught_warning.message,
+                    caught_warning.category,
+                    caught_warning.filename,
+                    caught_warning.lineno,
+                    source=caught_warning.source,
+                )
+
     if ref.tag is types.ArtifactTag.DIRECTORY:
         if not isinstance(value, dict):
             raise RuntimeError(
@@ -816,11 +887,11 @@ def _write_output_with_store(
             members.append((output_path / normalized, item_value))
         for full_path, item_value in members:
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            writer.save(item_value, full_path)
+            save_output(item_value, full_path)
         return output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer.save(value, output_path)
+    save_output(value, output_path)
     return output_path
 
 
@@ -856,7 +927,8 @@ def _prepare_incremental_inputs(
     incremental_inputs: dict[str, types.ArtifactIdentity],
     lock_data: LockData | None,
     store: store_mod.Store,
-    state_dir: pathlib.Path,
+    stage_state_dir: pathlib.Path,
+    project_state_dir: pathlib.Path,
 ) -> dict[str, Any]:
     """Restore previous incremental outputs and load them for the stage call."""
     if not incremental_inputs:
@@ -874,7 +946,7 @@ def _prepare_incremental_inputs(
             continue
 
         output_hash = lock_data["output_hashes"].get(identity)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         if output_hash is None:
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
@@ -883,7 +955,12 @@ def _prepare_incremental_inputs(
             )
         output_path = store.resolve_display_path(ref)
         cache.remove_output(output_path)
-        if not store.restore_from_cache(ref, output_hash, state_dir=state_dir):
+        if not store.restore_from_cache(
+            ref,
+            output_hash,
+            state_dir=project_state_dir,
+            checkout_modes=[config.CheckoutMode.COPY],
+        ):
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
                 + f"Run 'pivot pull' to restore it, or remove '{stage_lock.path}' and rerun "
@@ -907,6 +984,7 @@ def _run_stage_function_with_store(
     incremental_inputs: dict[str, types.ArtifactIdentity],
     lock_data: LockData | None,
     state_dir: pathlib.Path,
+    project_state_dir: pathlib.Path,
     project_root: pathlib.Path,
 ) -> dict[types.ArtifactRef, pathlib.Path]:
     with (
@@ -935,6 +1013,7 @@ def _run_stage_function_with_store(
                 lock_data,
                 store,
                 state_dir,
+                project_state_dir,
             )
         )
 
@@ -980,15 +1059,17 @@ def _hash_output_paths(
 def _commit_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
+    project_state_dir: pathlib.Path,
 ) -> dict[str, HashInfo]:
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
-        store.commit(ref, path)
         if isinstance(store, store_mod.WorkspaceStore):
-            store.backup_to_cache(ref, path)
-        output_hashes[types.identity_key(ref.identity)] = store.hash_artifact(ref)
+            output_hash = store.commit(ref, path, state_dir=project_state_dir)
+        else:
+            output_hash = store.commit(ref, path)
+        output_hashes[types.identity_key(ref.identity)] = output_hash
     return output_hashes
 
 
@@ -1065,14 +1146,19 @@ class _QueueWriter:
 
     def _pipe_reader(self) -> None:
         assert self._read_fd is not None  # Guaranteed by _ensure_pipe() before thread starts
+        # One incremental decoder per pipe: a multi-byte character split across two reads
+        # is held until its remaining bytes arrive instead of becoming U+FFFD.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
             while True:
                 data = os.read(self._read_fd, 8192)
                 if not data:
                     break
-                self.write(data.decode("utf-8", errors="replace"))
+                self.write(decoder.decode(data))
         except OSError:
             pass
+        # Flush a truncated trailing character so it is reported rather than dropped.
+        self.write(decoder.decode(b"", final=True))
 
     def _ensure_pipe(self) -> None:
         if self._read_fd is not None:
@@ -1367,6 +1453,7 @@ class RunCacheSkipResult(TypedDict):
 
     output_hashes: dict[str, HashInfo]
     outputs_restored: bool
+    file_hash_entries: list[tuple[str, int, int, int, str]]
 
 
 def _try_skip_via_run_cache_with_store(
@@ -1393,6 +1480,7 @@ def _try_skip_via_run_cache_with_store(
         return None
     identity_hashes = _to_identity_hashes(output_hashes)
 
+    restored_entries = list[tuple[str, int, int, int, str]]()
     restoration = restore_outputs_to_hashes(
         store,
         stage_outs,
@@ -1400,10 +1488,12 @@ def _try_skip_via_run_cache_with_store(
         state_db,
         state_dir=state_dir,
         report_changes=True,
+        file_hash_entries=restored_entries,
     )
     if not restoration.available:
         return None
     return RunCacheSkipResult(
         output_hashes=output_hashes,
         outputs_restored=restoration.outputs_restored,
+        file_hash_entries=restored_entries,
     )

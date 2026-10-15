@@ -964,6 +964,44 @@ def test_params_without_secrets_never_create_a_key(
     assert not (tmp_path / ".pivot" / "secret.key").exists()
 
 
+@pytest.mark.parametrize("target_exists", [True, False], ids=["to-a-key", "dangling"])
+def test_symlinked_secret_key_is_refused_not_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_exists: bool
+) -> None:
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".pivot").mkdir()
+    elsewhere = tmp_path / "elsewhere.key"
+    if target_exists:
+        elsewhere.write_text("ab" * 32 + "\n")
+    key_file = tmp_path / ".pivot" / "secret.key"
+    key_file.symlink_to(elsewhere)
+
+    with pytest.raises(exceptions.ParamsError, match="secret.key is a symbolic link"):
+        parameters.get_effective_params(_SecretParams(), "p/s", None)
+
+    assert key_file.is_symlink()
+    assert elsewhere.exists() == target_exists
+
+
+def test_symlinked_gitignore_is_refused_before_a_key_is_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIVOT_SECRET_KEY", raising=False)
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    (tmp_path / ".pivot").mkdir()
+    elsewhere = tmp_path / "elsewhere.gitignore"
+    elsewhere.write_text("/cache/\n")
+    (tmp_path / ".pivot" / ".gitignore").symlink_to(elsewhere)
+
+    with pytest.raises(exceptions.ParamsError, match=r"\.gitignore is a symbolic link"):
+        parameters.get_effective_params(_SecretParams(), "p/s", None)
+
+    assert elsewhere.read_text() == "/cache/\n"
+    assert not (tmp_path / ".pivot" / "secret.key").exists()
+    assert not list((tmp_path / ".pivot").glob(".secret-key-*"))
+
+
 _OLD_GITIGNORE = "# Cache directory\n/cache/\n\n/state.lmdb/\n/locks/\n/agent.sock\n/plots/\n"
 
 

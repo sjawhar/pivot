@@ -96,18 +96,19 @@ def _worker_info(
             "project_root": str(tmp_path),
             "pipeline_name": "incremental",
             "input_bindings": input_bindings or {},
+            "checkout_modes": [cache.CheckoutMode.COPY],
         },
         signature=None,
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[cache.CheckoutMode.COPY],
         run_id="test-run",
         force=force,
         no_commit=False,
         params_arg_name=None,
         project_root=tmp_path,
         state_dir=tmp_path / ".pivot",
+        project_state_dir=tmp_path / ".pivot",
         collection_params={},
         incremental_inputs={"previous": output.identity},
     )
@@ -175,7 +176,7 @@ def test_incremental_stage_never_restores_an_older_run_cache_entry(
         identity=types.ArtifactIdentity(producer="input", key=None),
         format=loaders.Text(),
         python_type=str,
-        tag=types.ArtifactTag.DATA,
+        tag=types.ArtifactTag.INPUT,
     )
     output = _output_ref("history", loaders.JSON[dict[str, int]]())
     info = _worker_info(

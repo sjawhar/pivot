@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from pivot import loaders, types
 from pivot.remote import sync
-from pivot.storage import lock
+from pivot.storage import lock, track
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
@@ -48,6 +48,7 @@ def _make_stage_info(
         "collection_params": {},
         "no_fingerprint": False,
         "code_deps": [],
+        "input_paths": {},
     }
     return info
 
@@ -222,10 +223,12 @@ def test_get_target_hashes_identity_key_target(tmp_path: pathlib.Path) -> None:
 
 
 def test_get_target_hashes_include_deps(tmp_path: pathlib.Path) -> None:
-    """include_deps=True includes dependency hashes."""
+    """include_deps=True includes the hashes of upstream stage outputs the stage depends on."""
     stage_name = "train"
     data_ref = _helper_ref(stage_name, None, types.ArtifactTag.DATA, loaders.CSV())
+    source_ref = _helper_ref("source", None, types.ArtifactTag.DATA, loaders.CSV())
     stage_info = _make_stage_info(stage_name, [data_ref], state_dir=tmp_path)
+    source_info = _make_stage_info("source", [source_ref], state_dir=tmp_path)
 
     _write_stage_lock(
         stage_name,
@@ -254,8 +257,159 @@ def test_get_target_hashes_include_deps(tmp_path: pathlib.Path) -> None:
         [stage_name],
         tmp_path,
         include_deps=True,
-        all_stages={stage_name: stage_info},
+        all_stages={stage_name: stage_info, "source": source_info},
     )
 
     assert "0123000000000000" in hashes
     assert "de45600000000000" in hashes
+
+
+def _helper_write_lock_with_deps(
+    stage_name: str,
+    state_dir: pathlib.Path,
+    *,
+    dep_hashes: dict[types.ArtifactIdentity, types.HashInfo],
+    output_hashes: dict[types.ArtifactIdentity, types.HashInfo],
+) -> None:
+    lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).write(
+        types.LockData(
+            code_manifest={},
+            params={},
+            dep_hashes=dep_hashes,
+            output_hashes=output_hashes,
+        )
+    )
+
+
+def test_get_target_hashes_include_deps_skips_raw_inputs(set_project_root: pathlib.Path) -> None:
+    """Raw inputs (git-tracked, produced by no stage) are never cached, so pull must not fetch them."""
+    scale_ref = _helper_ref("smoke/scale", None, types.ArtifactTag.DATA, loaders.CSV())
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "smoke/scale": _make_stage_info("smoke/scale", [scale_ref], state_dir=set_project_root),
+        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+    }
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("smoke/scale", None): types.FileHash(hash="5ca1ed0000000000"),
+            types.ArtifactIdentity("numbers.csv", None): types.FileHash(hash="0a0a0a0000000000"),
+        },
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"], set_project_root, include_deps=True, all_stages=all_stages
+    )
+
+    assert hashes == {"7074a10000000000", "5ca1ed0000000000"}, (
+        "Should fetch the stage's output and its upstream stage output, not the raw input"
+    )
+
+
+def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A `pivot track` input is in the local cache, so push sends it and pull fetches it."""
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+    }
+    raw_dir = set_project_root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    track.write_pvt_file(
+        raw_dir / "numbers.csv.pvt",
+        track.PvtData(path="numbers.csv", hash="7cacced000000000", size=4),
+    )
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("numbers.csv", None): types.FileHash(hash="7cacced000000000"),
+        },
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"], set_project_root, include_deps=True, all_stages=all_stages
+    )
+
+    assert hashes == {"7074a10000000000", "7cacced000000000"}
+
+
+def test_get_target_hashes_include_deps_skips_imported_inputs(
+    set_project_root: pathlib.Path,
+) -> None:
+    """An input brought in with `pivot import` is written to the workspace, never cached or
+    pushed to this project's remote, so pull must not fetch it."""
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+    }
+    raw_dir = set_project_root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    track.write_pvt_file(
+        raw_dir / "numbers.csv.pvt",
+        track.PvtData(
+            path="numbers.csv",
+            hash="1a1a1a0000000000",
+            size=4,
+            source=track.ImportSource(
+                repo="https://github.com/org/upstream",
+                rev="main",
+                rev_lock="0123456789abcdef0123456789abcdef01234567",
+                stage="up/numbers",
+                path="up/numbers",
+                remote="s3://upstream-bucket/cache",
+            ),
+        ),
+    )
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("numbers.csv", None): types.FileHash(hash="1a1a1a0000000000"),
+        },
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"], set_project_root, include_deps=True, all_stages=all_stages
+    )
+
+    assert hashes == {"7074a10000000000"}, "An imported input's blob is not in this remote"
+
+
+def test_get_target_hashes_include_deps_skips_metric_outputs_of_upstream(
+    set_project_root: pathlib.Path,
+) -> None:
+    """An upstream Metric output is git-tracked, not cached, so it is not fetched."""
+    eval_ref = _helper_ref("p/eval", "score", types.ArtifactTag.METRIC, loaders.JSON())
+    report_ref = _helper_ref("p/report", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "p/eval": _make_stage_info("p/eval", [eval_ref], state_dir=set_project_root),
+        "p/report": _make_stage_info("p/report", [report_ref], state_dir=set_project_root),
+    }
+    _helper_write_lock_with_deps(
+        "p/report",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("p/eval", "score"): types.FileHash(hash="3e7a1c0000000000"),
+        },
+        output_hashes={
+            types.ArtifactIdentity("p/report", None): types.FileHash(hash="4e9047000000000a"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["p/report"], set_project_root, include_deps=True, all_stages=all_stages
+    )
+
+    assert hashes == {"4e9047000000000a"}

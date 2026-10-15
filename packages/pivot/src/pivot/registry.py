@@ -1,7 +1,7 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingModuleSource=false, reportExplicitAny=false, reportAny=false
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import pathlib
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
@@ -40,6 +40,7 @@ class RegistryStageInfo(TypedDict):
         state_dir: Per-stage state directory (None means use default determined at runtime).
         no_fingerprint: Use file-level hashing instead of AST fingerprinting.
         code_deps: Extra project-relative files hashed into a no_fingerprint stage's fingerprint.
+        input_paths: Project-relative paths by input artifact identity, for the wiring manifest.
     """
 
     func: Callable[..., Any]
@@ -57,6 +58,7 @@ class RegistryStageInfo(TypedDict):
     collection_params: dict[str, str]
     no_fingerprint: bool
     code_deps: list[str]
+    input_paths: dict[str, str]
 
 
 class StageRegistry:
@@ -263,6 +265,7 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
                 result = _compute_file_fingerprint(info["func"], info["code_deps"])
             else:
                 result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
+            result.update(_wiring_manifest(info))
             for dep_name, dep in info["deps"].items():
                 for key, value in fingerprint.get_loader_fingerprint(dep.format).items():
                     result[f"dep:{dep_name}:{key}"] = value
@@ -273,6 +276,49 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
         return result
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
+
+
+def _wiring_manifest(info: RegistryStageInfo) -> dict[str, str]:
+    """Return the call-site artifact wiring that gives a stage its input meaning.
+
+    Dependency content hashes intentionally collapse duplicate identities for cache reuse, but
+    a stage call does not: ``combine(a, b)`` differs from ``combine(b, a)``, and a list differs
+    from a tuple. Inputs also carry their project-relative binding path because a ``PathOnly``
+    stage can observe it even when old and new files have identical contents.
+    """
+    paths = info["input_paths"]
+    result = dict[str, str]()
+    collection_params = info["collection_params"]
+    for parameter, kind in collection_params.items():
+        refs = [
+            dep
+            for _index, dep in sorted(
+                (
+                    (int(name.removeprefix(f"{parameter}[").removesuffix("]")), dep)
+                    for name, dep in info["deps"].items()
+                    if name.startswith(f"{parameter}[") and name.endswith("]")
+                ),
+                key=lambda item: item[0],
+            )
+        ]
+        identities = [types.identity_key(ref.identity) for ref in refs]
+        result[f"wire:{parameter}"] = json.dumps(
+            {"kind": kind, "identities": identities}, separators=(",", ":")
+        )
+        input_paths = [
+            paths.get(identity) if ref.tag is types.ArtifactTag.INPUT else None
+            for ref, identity in zip(refs, identities, strict=True)
+        ]
+        if any(path is not None for path in input_paths):
+            result[f"wire:{parameter}:paths"] = json.dumps(input_paths, separators=(",", ":"))
+    for parameter, ref in info["deps"].items():
+        if parameter.split("[", 1)[0] in collection_params:
+            continue
+        identity = types.identity_key(ref.identity)
+        result[f"wire:{parameter}"] = identity
+        if ref.tag is types.ArtifactTag.INPUT and identity in paths:
+            result[f"wire:{parameter}:path"] = paths[identity]
+    return result
 
 
 def _compute_file_fingerprint(func: Callable[..., Any], code_deps: list[str]) -> dict[str, str]:

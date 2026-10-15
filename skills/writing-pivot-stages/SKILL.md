@@ -90,6 +90,8 @@ Outputs: `data/scores/clean/rows.jsonl`, `metrics/scores/clean/summary.yaml`, `d
   - a **`StageParams` instance**, at most one per stage; never `Optional[...]` or a union,
   - a **previous-output marker** from `pipeline.previous()` or `pipeline.previous("key")`; the function receives its own prior output tagged `incremental`.
 - Plain values (`factor=3`, a string, a path) are rejected: `parameter 'factor' has unsupported type 'int'`. Put them in `StageParams`.
+- `*args`, positional-only parameters (`/`) and `**kwargs` are rejected: workers call stages with named keyword arguments. Use a `list[...]` parameter for several artifact inputs and ordinary named parameters for all other inputs.
+
 - Define stages, their `StageParams`, their return `TypedDict`s and custom loaders at module level. Workers receive the function by pickling. With postponed/string annotations (for example, `from __future__ import annotations`), return annotations are resolved in the module namespace, so a `TypedDict` defined inside a function fails with `name 'Result' is not defined`.
 - Outside a `with Pipeline` block a stage is an ordinary function, so test it directly: `clean(df, CleanParams(min_score=0.9))`.
 
@@ -117,6 +119,8 @@ pivot repro --resources gpu=2
 ```
 
 Resource names are case-insensitive. Resources control admission only: a waiting stage does not consume a worker, and changing a resource declaration does not invalidate cached outputs.
+
+- `joblib.Parallel` defaults to threads inside a stage; for CPU-bound Python work, run `PIVOT_NESTED_PARALLELISM=processes pivot repro` and declare `@stage(resources={"cpu": "all"})` so nested process pools do not overlap.
 
 ## Pipelines and inputs
 
@@ -152,7 +156,7 @@ Any other type fails with `Cannot infer serialization format for type int`; wrap
 - An incremental output receives the loader's `empty()` value on the first run and a writable copy of its previous cached value on later runs. Bind it with `pipeline.previous()` for a single output or `pipeline.previous("key")` for a tagged `TypedDict` field. The marker creates no DAG edge, can bind one parameter only, and requires a full `Loader` with `load()`, `save()`, and `empty()`.
 - For a `pathlib.Path` return, create a file or directory outside the project (for example in a temporary directory) and return that path. Pivot moves it to the managed output path; returning a path already inside the project is rejected because Pivot does not take ownership of user files.
 - A multi-output handle must be narrowed before use: `cleaned.rows` or `cleaned["rows"]`. Passing `cleaned` itself fails with `received handle from multi-output stage ... without selecting an output`.
-- Convert numpy scalars to Python types (`float(x)`, `int(x)`) before putting them in a `dict` or `list` output; YAML cannot read them back.
+- A `dict` or `list` output is written as YAML: numpy scalars and arrays are converted to plain Python numbers and lists. A DataFrame, a dataclass, or any other object inside it is written in a form Pivot cannot read back, with a warning under the stage in the `pivot repro` report; convert it first (`df.to_dict()`, `dataclasses.asdict(x)`). A later release will fail the stage instead.
 - Loaders: `pivot.loaders.CSV`, `JSON`, `YAML`, `Text`, `JSONL`, `DataFrameJSONL`, `Pickle`, `MatplotlibFigure` (`pip install "pivot[matplotlib]"`). A custom loader is a module-level `@dataclasses.dataclass(frozen=True)` subclass of `loaders.Writer[T]` (`save`) or `loaders.Loader[T]` (`load`, `save`, and `empty`).
 
 ## Configuration: one `StageParams` per stage
@@ -172,7 +176,7 @@ scores/scale@x10:
 
 ## Module-level constants
 
-A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`; editing it re-runs the stage. Reading any other module-level value (tuple, list, dict, set, frozenset, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`), directly, as `module.NAME`, or as a default argument (`cols=COLUMNS`), is an error that names the variable. Move it into the stage's `StageParams`.
+A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`, a tuple or frozenset of those scalars, or a compiled regex; editing it re-runs the stage. Reading any other module-level value (list, dict, set, a tuple holding a tuple, list or object, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`), directly, as `module.NAME`, or as a default argument (`cols=COLUMNS`), is an error that names the variable. Move it into the stage's `StageParams`.
 
 ## Variants and fan-out
 
@@ -274,7 +278,7 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock fil
 | `has unsupported Annotated metadata 'DirectoryOut'` | Create the directory outside the project and return a `pathlib.Path` to it |
 | `Input binding conflict: inputs 'a' and 'b' are both bound to '<path>'` | Use one `pipeline.input()` name per file |
 | `Output path conflict: 'p/x/y' and 'p/x:y' both write data/p/x/y.jsonl` | Rename a stage, pipeline or `TypedDict` field so each output has its own path |
-| `could not determine a constructor for the tag` | Convert numpy scalars with `float()`/`int()` before returning |
+| `wrote its YAML output in a form Pivot cannot read back` (a warning) | Convert the value before returning it: `df.to_dict()`, `dataclasses.asdict(x)`, or pick a format with `Annotated[T, loaders.X()]` |
 
 ## Checklist
 

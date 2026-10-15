@@ -4,6 +4,7 @@ import contextlib
 import copy
 import dataclasses
 import difflib
+import errno
 import hashlib
 import hmac
 import json
@@ -123,12 +124,14 @@ def _override_errors(
     ``_merge_overrides`` finds them, so values are then checked with ``extra="ignore"``. When
     that check passes, the walk saw every mapping's model, so it saw every unknown key.
     """
+    if not any(key in overrides for key in _override_keys(stage_name)):
+        return []
     params_cls = type(params)
     unknown: _UnknownKeys = []
     set_twice = list[tuple[str, str]]()
     data = _merge_overrides(
         params_cls,
-        params.model_dump(round_trip=True, by_alias=False),
+        _field_values(params),
         params,
         stage_name,
         overrides,
@@ -353,12 +356,10 @@ def apply_overrides[T: pydantic.BaseModel](
 
     params_cls = type(params_instance)
     set_twice = list[tuple[str, str]]()
-    # The round-trip dump is keyed by field name (by_alias=False holds even when the model
-    # serializes by alias) and leaves out computed fields, which a model that forbids extra
-    # fields would refuse.
+    # Field values, unlike model_dump(), retain fields declared with exclude=True.
     data = _merge_overrides(
         params_cls,
-        params_instance.model_dump(round_trip=True, by_alias=False),
+        _field_values(params_instance),
         params_instance,
         stage_name,
         overrides,
@@ -368,6 +369,14 @@ def apply_overrides[T: pydantic.BaseModel](
     if set_twice:
         raise exceptions.ParamsError("; ".join(message for _, message in set_twice))
     return params_cls.model_validate(data, by_alias=True, by_name=True)
+
+
+def _field_values(params: pydantic.BaseModel) -> dict[str, Any]:
+    """Return every declared field and allowed extra value without serialization exclusions."""
+    values = {name: getattr(params, name) for name in type(params).model_fields}
+    if params.model_extra:
+        values.update(params.model_extra)
+    return values
 
 
 # (params.yaml key, path of field names, list indexes and dict keys, model the key was given to)
@@ -576,18 +585,45 @@ def _secret_key() -> bytes:
     ``PIVOT_SECRET_KEY`` (64 hex digits) wins, so CI and teammates can share digests.
     Otherwise the key is ``.pivot/secret.key`` under the project root, created on first use
     with mode 0600 and added to ``.pivot/.gitignore``: it must never be committed. A clone
-    without the key makes a new one, so its stages with secrets re-run once.
+    without the key makes a new one, so its stages with secrets re-run once. Neither file is
+    read or written through a symbolic link.
 
     Raises:
-        ParamsError: ``PIVOT_SECRET_KEY`` or the key file does not hold 32 hex-encoded bytes.
+        ParamsError: ``PIVOT_SECRET_KEY`` or the key file does not hold 32 hex-encoded bytes,
+            or the key file or ``.pivot/.gitignore`` is a symbolic link.
     """
     if (from_env := os.environ.get(_SECRET_KEY_ENV)) is not None:
         return _parse_secret_key(from_env, _SECRET_KEY_ENV)
     pivot_dir = project.get_project_root() / ".pivot"
     key_file = pivot_dir / _SECRET_KEY_FILE
-    if not key_file.exists():
+    try:
+        text = _read_no_follow(key_file)
+    except FileNotFoundError:
         _create_secret_key(pivot_dir, key_file)
-    return _parse_secret_key(key_file.read_text(), str(key_file))
+        text = _read_no_follow(key_file)
+    return _parse_secret_key(text, str(key_file))
+
+
+def _open_no_follow(path: pathlib.Path, flags: int) -> int:
+    """Open ``path`` without following a symbolic link at it; return the descriptor.
+
+    Raises:
+        ParamsError: ``path`` is a symbolic link.
+    """
+    try:
+        return os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise exceptions.ParamsError(
+                f"{path} is a symbolic link; Pivot does not follow one there. "
+                + "Replace it with a regular file."
+            ) from error
+        raise
+
+
+def _read_no_follow(path: pathlib.Path) -> str:
+    with os.fdopen(_open_no_follow(path, os.O_RDONLY)) as handle:
+        return handle.read()
 
 
 def _parse_secret_key(text: str, source: str) -> bytes:
@@ -603,27 +639,29 @@ def _parse_secret_key(text: str, source: str) -> bytes:
 def _create_secret_key(pivot_dir: pathlib.Path, key_file: pathlib.Path) -> None:
     """Write a random key to ``key_file`` with mode 0600, and gitignore it.
 
-    The key is written to a private temporary file and hard-linked into place, so a worker
-    racing to create it reads either no file or a whole key, and one key wins. Only the
-    worker whose link made the key touches ``.gitignore``, after the link, and it only
+    ``.pivot/.gitignore`` is opened first, so a symbolic link there is refused before any key
+    exists. The key is written to a private temporary file and hard-linked into place, so a
+    worker racing to create it reads either no file or a whole key, and one key wins. Only the
+    worker whose link made the key writes to ``.gitignore``, after the link, and it only
     appends the entry when it is missing: the file is never rewritten, so a racing reader
     never sees it truncated.
     """
-    descriptor, temporary = tempfile.mkstemp(dir=pivot_dir, prefix=".secret-key-")
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(secrets.token_hex(32) + "\n")
+    ignore = _open_no_follow(pivot_dir / ".gitignore", os.O_RDWR | os.O_APPEND | os.O_CREAT)
+    with os.fdopen(ignore, "a+") as gitignore:
+        descriptor, temporary = tempfile.mkstemp(dir=pivot_dir, prefix=".secret-key-")
         try:
-            os.link(temporary, key_file)
-        except FileExistsError:
-            return
-    finally:
-        os.unlink(temporary)
-    gitignore = pivot_dir / ".gitignore"
-    text = gitignore.read_text() if gitignore.exists() else ""
-    if f"/{_SECRET_KEY_FILE}" not in text.splitlines():
-        with gitignore.open("a") as handle:
-            handle.write(
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(secrets.token_hex(32) + "\n")
+            try:
+                os.link(temporary, key_file)
+            except FileExistsError:
+                return
+        finally:
+            os.unlink(temporary)
+        gitignore.seek(0)
+        text = gitignore.read()
+        if f"/{_SECRET_KEY_FILE}" not in text.splitlines():
+            gitignore.write(
                 ("\n" if text and not text.endswith("\n") else "") + f"/{_SECRET_KEY_FILE}\n"
             )
 

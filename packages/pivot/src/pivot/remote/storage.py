@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import re
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict
+
+import xxhash
 
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
@@ -34,6 +37,9 @@ STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 BULK_EXISTS_LIST_THRESHOLD = 50
 
 _HEX_PATTERN = re.compile(r"^[a-f0-9]{16}$")
+
+# link() errors on filesystems without hard links (vfat, exFAT, many SMB and FUSE mounts).
+_NO_HARDLINK_ERRNO = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 # Cached S3 config to avoid re-parsing config on every call.
 # Safe without locking - asyncio is single-threaded, worst case race just
@@ -188,8 +194,9 @@ async def _write_all_async(fd: int, data: bytes) -> None:
 async def _stream_download_to_fd(
     response: GetObjectOutputTypeDef,
     fd: int,
-) -> None:
-    """Stream S3 response body to file descriptor in chunks with timeout."""
+) -> str:
+    """Stream S3 response body to fd and return its xxh64 integrity digest."""
+    hasher = xxhash.xxh64()
     stream = response["Body"]
     try:
         while True:
@@ -199,10 +206,12 @@ async def _stream_download_to_fd(
             )
             if not chunk:
                 break
+            hasher.update(chunk)
             await _write_all_async(fd, chunk)
     finally:
         with contextlib.suppress(Exception):
             stream.close()  # pyright: ignore[reportUnknownMemberType]
+    return hasher.hexdigest()
 
 
 async def _atomic_download(
@@ -210,12 +219,19 @@ async def _atomic_download(
     bucket: str,
     key: str,
     local_path: Path,
+    expected_hash: str,
     *,
+    overwrite: bool,
     readonly: bool = False,
 ) -> None:
-    """Download S3 object to local path atomically via temp file with streaming.
+    """Download an expected cache blob atomically and verify its xxh64 integrity.
+
+    The digest detects accidental corruption during storage or transfer. It does not
+    authenticate remote content.
 
     Args:
+        overwrite: Replace an existing file at local_path. When False, an existing file is
+            kept: a content-addressed cache entry another process may be hardlinking.
         readonly: If True, set file permissions to 0o444 (for cache files).
     """
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,13 +251,40 @@ async def _atomic_download(
                     f"Access denied to {bucket}/{key}. Check AWS credentials."
                 ) from exc
             raise exceptions.RemoteError(f"Failed to download from S3: {exc}") from exc
-        await _stream_download_to_fd(response, fd)
+        actual_hash = await _stream_download_to_fd(response, fd)
         os.close(fd)
         fd = -1  # Mark as closed
+        if actual_hash != expected_hash:
+            raise exceptions.RemoteError(
+                f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
+                + f"for {bucket}/{key}. Delete {bucket}/{key} from the remote, then run "
+                + "`pivot push` on a machine whose cache has a good copy and has not run "
+                + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
+                + "against this remote for this object. Pivot records hashes those commands "
+                + "upload, download, or find, then skips recorded hashes. If every machine "
+                + "with a good copy has recorded it, delete `.pivot/state.lmdb/` before "
+                + "pushing; this also clears run history and local caches."
+            )
         if readonly:
             os.chmod(tmp_path, 0o444)
-        os.replace(tmp_path, local_path)
-        move_succeeded = True
+        if overwrite:
+            os.replace(tmp_path, local_path)
+            move_succeeded = True
+        else:
+            # link() refuses an existing name, so a concurrent reader never sees the
+            # entry disappear. The temp file is removed below either way.
+            try:
+                os.link(tmp_path, local_path)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                if exc.errno not in _NO_HARDLINK_ERRNO:
+                    raise
+                # No hard links here, so nothing can be hardlinking the entry either:
+                # rename unless another process already promoted it.
+                if not os.path.exists(local_path):
+                    os.replace(tmp_path, local_path)
+                    move_succeeded = True
     finally:
         if fd >= 0:
             os.close(fd)
@@ -555,6 +598,8 @@ class S3Remote:
                     self._bucket,
                     _hash_to_key(self._prefix, cache_hash),
                     local_path,
+                    cache_hash,
+                    overwrite=True,
                     readonly=readonly,
                 )
         except botocore_exc.ClientError as e:
@@ -614,7 +659,10 @@ class S3Remote:
         *,
         readonly: bool = False,
     ) -> list[TransferResult]:
-        """Download multiple files in parallel with atomic writes and streaming.
+        """Download multiple cache entries in parallel with atomic writes and streaming.
+
+        A destination that already exists is kept, never replaced: destinations are
+        content-addressed cache entries that other processes may be hardlinking.
 
         Args:
             readonly: If True, set file permissions to 0o444 (for cache files).
@@ -643,6 +691,8 @@ class S3Remote:
                                 self._bucket,
                                 _hash_to_key(self._prefix, hash_),
                                 local_path,
+                                hash_,
+                                overwrite=False,
                                 readonly=readonly,
                             )
                             completed += 1

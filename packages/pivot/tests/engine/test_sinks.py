@@ -18,6 +18,7 @@ from rich.console import Console
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+from pivot import types
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks
 from pivot.engine.types import (
@@ -617,6 +618,156 @@ async def test_static_sink_ignores_log_lines_when_show_output_disabled() -> None
     await sink.handle(event)
 
     assert output.getvalue() == "", "Should ignore log lines when show_output=False"
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_reports_worker_warnings_of_a_stage_that_ran(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """Warnings a stage logged reach the report; its other output stays hidden."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sink_type(console=console, show_output=False)
+
+    for line in ("progress 50%", "WARNING: Stage 'train' wrote its YAML output lossily"):
+        await sink.handle(LogLine(type="log_line", seq=0, stage="train", line=line, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "WARNING: Stage 'train' wrote its YAML output lossily" in result
+    assert result.index("train") < result.index("WARNING:"), "warning prints under its stage"
+    assert "progress 50%" not in result
+
+
+async def test_sink_does_not_repeat_streamed_warnings() -> None:
+    """With --show-output the warning already streamed; the report does not print it twice."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sinks.StaticConsoleSink(console=console, show_output=True)
+
+    await sink.handle(
+        LogLine(type="log_line", seq=0, stage="train", line="WARNING: lossy", is_stderr=True)
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    assert output.getvalue().count("WARNING: lossy") == 1
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_always_reports_lossy_output_warnings_after_many_stage_warnings(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """Pivot's own output-write warning is never lost behind the stage's warnings."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=400)
+    sink = sink_type(console=console, show_output=False)
+
+    for i in range(60):
+        await sink.handle(
+            LogLine(
+                type="log_line",
+                seq=i,
+                stage="noisy",
+                line=f"WARNING: skipping malformed row {i}",
+                is_stderr=True,
+            )
+        )
+    lossy = (
+        f"WARNING: Stage 'noisy' wrote its DataFrameJSONL output {types.LOSSY_OUTPUT_PHRASE}: "
+        + "DataFrameJSONL cannot write column 'price'"
+    )
+    await sink.handle(LogLine(type="log_line", seq=60, stage="noisy", line=lossy, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=61,
+            stage="noisy",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert lossy in result
+    assert "WARNING: skipping malformed row 49" in result
+    assert "WARNING: skipping malformed row 50" not in result
+    assert "… 10 more warnings (run with --show-output)" in result
+    assert result.index("skipping malformed row 49") < result.index("… 10 more warnings")
+    assert result.index(lossy) < result.index("skipping malformed row 0"), "lossy prints first"
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_collapses_repeated_stage_warnings_with_a_count(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """matplotlib logs the same findfont line hundreds of times; the report prints it once."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=400)
+    sink = sink_type(console=console, show_output=False)
+
+    repeated = "WARNING: findfont: Font family 'Montserrat' not found."
+    for i in range(300):
+        await sink.handle(
+            LogLine(type="log_line", seq=i, stage="plot", line=repeated, is_stderr=True)
+        )
+    lossy = (
+        f"WARNING: Stage 'plot' wrote its YAML output {types.LOSSY_OUTPUT_PHRASE}: "
+        + "YAML output must contain plain data; got DataFrame at root."
+    )
+    await sink.handle(LogLine(type="log_line", seq=300, stage="plot", line=lossy, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=301,
+            stage="plot",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    warning_lines = [line.strip() for line in output.getvalue().splitlines() if "WARNING:" in line]
+    assert warning_lines == [lossy, f"{repeated} (×300)"]
+    assert "more warnings" not in output.getvalue()
 
 
 async def test_static_sink_log_lines_stream_before_completions() -> None:

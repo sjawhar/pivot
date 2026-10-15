@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false
 from __future__ import annotations
 
 import pathlib

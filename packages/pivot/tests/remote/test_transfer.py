@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+import xxhash
 
 from pivot import exceptions, project
 from pivot.remote import config as remote_config
@@ -39,6 +40,7 @@ def _helper_make_all_stages(*stage_names: str) -> dict[str, RegistryStageInfo]:
         name: RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
             state_dir=None,
             outs=[],
+            input_paths={},
         )
         for name in stage_names
     }
@@ -574,7 +576,7 @@ async def test_pull_async_handles_failures(lock_project: Path, mocker: MockerFix
 
 
 async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixture) -> None:
-    """Pull includes dependency hashes when stages specified."""
+    """Pull includes the hashes of upstream stage outputs a target stage depends on."""
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
@@ -585,7 +587,7 @@ async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixtur
         state_dir,
         "my_stage",
         outs={None: FileHash(hash=out_hash)},
-        deps={"in.csv": FileHash(hash=dep_hash)},
+        deps={"upstream": FileHash(hash=dep_hash)},
     )
 
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
@@ -604,9 +606,11 @@ async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixtur
         mock_state,
         "origin",
         targets=["my_stage"],
-        all_stages=_helper_make_all_stages("my_stage"),
+        all_stages=_helper_make_all_stages("my_stage", "upstream"),
     )
 
+    requested = {hash_ for hash_, _ in mock_remote.download_batch.call_args.args[0]}
+    assert requested == {out_hash, dep_hash}, "Should request the output and the upstream dep"
     assert result["transferred"] == 2
 
 
@@ -713,7 +717,7 @@ async def test_pull_async_integration(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Integration: pull files from real moto S3."""
-    hash1 = "ab" + "c" * 14
+    hash1 = xxhash.xxh64(b"content1").hexdigest()
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
@@ -741,7 +745,7 @@ async def test_push_pull_roundtrip_integration(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Integration: push then pull to verify roundtrip."""
-    hash1 = "ab" + "c" * 14
+    hash1 = xxhash.xxh64(b"original").hexdigest()
 
     state_dir1 = tmp_path / ".pivot1"
     cache_dir1 = state_dir1 / "cache"
@@ -812,8 +816,8 @@ async def test_pull_async_with_deps_integration(
     aioboto3_s3_client: S3Client,
 ) -> None:
     """Integration: pull with dependency hashes."""
-    out_hash = "ab" + "c" * 14
-    dep_hash = "de" + "f" * 14
+    out_hash = xxhash.xxh64(b"main_file").hexdigest()
+    dep_hash = xxhash.xxh64(b"dependency_file").hexdigest()
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
@@ -834,7 +838,7 @@ async def test_pull_async_with_deps_integration(
         state_dir,
         "my_stage",
         outs={None: FileHash(hash=out_hash)},
-        deps={"in.csv": FileHash(hash=dep_hash)},
+        deps={"upstream": FileHash(hash=dep_hash)},
     )
 
     state_db = state_mod.StateDB(state_dir)
@@ -846,7 +850,7 @@ async def test_pull_async_with_deps_integration(
         state_db,
         "origin",
         targets=["my_stage"],
-        all_stages=_helper_make_all_stages("my_stage"),
+        all_stages=_helper_make_all_stages("my_stage", "upstream"),
     )
 
     files_dir = cache_dir / "files"

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 from pivot import loaders, types
 from pivot.executor import worker
+from pivot.storage import cache
 
 if TYPE_CHECKING:
     import multiprocessing as mp
@@ -65,13 +66,13 @@ def _make_worker_stage_info(
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[],
         run_id="test_run",
         force=False,
         no_commit=True,
         params_arg_name=None,
         project_root=tmp_path,
         state_dir=state_dir,
+        project_state_dir=state_dir,
         collection_params={},
         incremental_inputs={},
     )
@@ -86,7 +87,7 @@ def test_execute_stage_uses_store_spec_for_io(
         "data": _make_artifact_ref(
             "input",
             None,
-            tag=types.ArtifactTag.DATA,
+            tag=types.ArtifactTag.INPUT,
             loader=loaders.Text(),
             python_type=str,
         )
@@ -110,6 +111,7 @@ def test_execute_stage_uses_store_spec_for_io(
                 "project_root": str(tmp_path),
                 "pipeline_name": "pipe",
                 "input_bindings": {"input": "input.txt"},
+                "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
             },
         ),
     )
@@ -157,6 +159,7 @@ def test_execute_stage_loads_directory_dependency(
                 "project_root": str(tmp_path),
                 "pipeline_name": "pipe",
                 "input_bindings": {},
+                "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
             },
         ),
     )
@@ -184,7 +187,7 @@ def test_execute_stage_single_field_typeddict(
         "data": _make_artifact_ref(
             "input",
             None,
-            tag=types.ArtifactTag.DATA,
+            tag=types.ArtifactTag.INPUT,
             loader=loaders.Text(),
             python_type=str,
         )
@@ -208,6 +211,7 @@ def test_execute_stage_single_field_typeddict(
                 "project_root": str(tmp_path),
                 "pipeline_name": "pipe",
                 "input_bindings": {"input": "input.txt"},
+                "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
             },
         ),
     )

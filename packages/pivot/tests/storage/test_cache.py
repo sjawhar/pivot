@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import concurrent.futures
 import mmap
 import multiprocessing
 import os
 import pathlib
+import queue
 import stat
 import time
 from typing import TYPE_CHECKING, cast
@@ -11,6 +13,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from pivot.storage import cache, state
+from pivot.types import HashInfo
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -45,6 +48,7 @@ def _helper_assert_no_temp_dirs(
 if TYPE_CHECKING:
     from collections.abc import Generator
     from multiprocessing.managers import SyncManager
+    from threading import Barrier
 
     from pivot.types import DirHash, FileHash
 
@@ -52,7 +56,7 @@ if TYPE_CHECKING:
 @pytest.fixture
 def mp_manager() -> Generator[SyncManager]:
     """Provide a multiprocessing Manager with automatic cleanup."""
-    manager = multiprocessing.Manager()
+    manager = multiprocessing.get_context("spawn").Manager()
     yield manager
     manager.shutdown()
 
@@ -674,9 +678,141 @@ def test_cleanup_removes_old_temps(tmp_path: pathlib.Path) -> None:
     old_mtime = time.time() - 7200
     os.utime(old_temp, (old_mtime, old_mtime))
 
-    cache._cleanup_stale_restore_temps(tmp_path, None)
+    cache._cleanup_stale_restore_temps(tmp_path)
 
     assert not old_temp.exists()
+
+
+def test_cleanup_removes_stale_prefixed_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale file staged for restore is cleaned up like a stale directory."""
+    stale_file = tmp_path / f"{cache._RESTORE_TEMP_PREFIX}old.file"
+    stale_file.write_text("orphan")
+    monkeypatch.setattr(cache, "_RESTORE_TEMP_MAX_AGE", -1)
+
+    cache._cleanup_stale_restore_temps(tmp_path)
+
+    assert not stale_file.exists()
+
+
+def _crash_save_after_staging(path: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    """Exit after save staged its workspace replacement, before its atomic rename."""
+
+    def _replace_and_crash(self: pathlib.Path, destination: pathlib.Path) -> pathlib.Path:
+        os._exit(73)
+
+    pathlib.Path.replace = _replace_and_crash  # pyright: ignore[reportAttributeAccessIssue]
+    _ = cache.save_to_cache(path, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+
+def test_save_file_cleans_staging_left_by_killed_save(tmp_path: pathlib.Path) -> None:
+    """A later save clears the deterministic file staging path an interrupted save left."""
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("stage output\n")
+    cache_dir = tmp_path / "cache"
+    _ = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    target.unlink()
+    target.write_text("stage output\n")
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_crash_save_after_staging, args=(target, cache_dir)
+    )
+    process.start()
+    process.join(timeout=60)
+
+    staging_path = target.parent / (
+        f"{cache._RESTORE_TEMP_PREFIX}{cache._restore_target_token(target)}.file"
+    )
+    assert process.exitcode == 73
+    assert staging_path.exists()
+
+    _ = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+    assert not staging_path.exists()
+    assert target.read_text() == "stage output\n"
+
+
+def test_save_directory_uses_target_tagged_staging_paths(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directory saves use deterministic staging names for each workspace file."""
+    target = tmp_path / "data" / "out"
+    target.mkdir(parents=True)
+    (target / "root.txt").write_text("root")
+    (target / "sub").mkdir()
+    (target / "sub" / "nested.txt").write_text("nested")
+    staging_paths = list[pathlib.Path | None]()
+    original_checkout = cache._checkout_with_fallback
+
+    def _record_staging(
+        path: pathlib.Path,
+        cache_path: pathlib.Path,
+        checkout_modes: list[cache.CheckoutMode],
+        *,
+        executable: bool = False,
+        staging_path: pathlib.Path | None = None,
+        keep_existing_copy: bool = False,
+    ) -> None:
+        staging_paths.append(staging_path)
+        original_checkout(
+            path,
+            cache_path,
+            checkout_modes,
+            executable=executable,
+            staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
+        )
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", _record_staging)
+
+    _ = cache.save_to_cache(target, tmp_path / "cache", checkout_mode=cache.CheckoutMode.COPY)
+
+    workspace_files = [target / "root.txt", target / "sub" / "nested.txt"]
+    assert staging_paths == [
+        path.parent / f"{cache._RESTORE_TEMP_PREFIX}{cache._restore_target_token(path)}.file"
+        for path in workspace_files
+    ]
+
+
+def _save_file_while_restore_lock_is_held(
+    path: pathlib.Path,
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+    result_queue: multiprocessing.Queue[str],
+) -> None:
+    """Save one workspace file under the target's restore lock."""
+    _ = cache.save_to_cache(
+        path,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.COPY,
+        state_dir=state_dir,
+    )
+    result_queue.put("saved")
+
+
+def test_save_waits_for_target_restore_lock(tmp_path: pathlib.Path) -> None:
+    """A save cannot clear a checkout's staging file while that checkout holds the lock."""
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("stage output\n")
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    results = multiprocessing.get_context("spawn").Queue()
+    process = multiprocessing.get_context("spawn").Process(
+        target=_save_file_while_restore_lock_is_held,
+        args=(target, cache_dir, state_dir, results),
+    )
+
+    with cache.restore_lock(target, state_dir):
+        process.start()
+        with pytest.raises(queue.Empty):
+            results.get(timeout=0.5)
+
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    assert results.get(timeout=1) == "saved"
 
 
 def test_cleanup_preserves_recent_temps(tmp_path: pathlib.Path) -> None:
@@ -687,7 +823,7 @@ def test_cleanup_preserves_recent_temps(tmp_path: pathlib.Path) -> None:
     (recent_temp / "file.txt").write_text("recent")
     # mtime is now, which is recent
 
-    cache._cleanup_stale_restore_temps(tmp_path, None)
+    cache._cleanup_stale_restore_temps(tmp_path)
 
     assert recent_temp.exists()
     # Cleanup
@@ -705,7 +841,7 @@ def test_cleanup_skips_symlinks_via_is_dir(tmp_path: pathlib.Path) -> None:
     symlink = tmp_path / f"{cache._RESTORE_TEMP_PREFIX}symlink_attack"
     symlink.symlink_to(real_dir)
 
-    cache._cleanup_stale_restore_temps(tmp_path, None)
+    cache._cleanup_stale_restore_temps(tmp_path)
 
     # The real directory should still exist
     assert real_dir.exists()
@@ -740,6 +876,40 @@ def test_get_lock_path_uses_hash_of_resolved_path(tmp_path: pathlib.Path) -> Non
     assert all(c in "0123456789abcdef" for c in hash_portion)
 
 
+def test_get_lock_path_is_stable_when_target_becomes_symlink(tmp_path: pathlib.Path) -> None:
+    """The lock identifies the workspace path, not the cache target it currently points to."""
+    state_dir = tmp_path / ".pivot"
+    target = tmp_path / "data" / "output.txt"
+    target.parent.mkdir(parents=True)
+    before = cache._get_lock_path(target, state_dir)
+
+    cache_target = tmp_path / "cache" / "output.txt"
+    cache_target.parent.mkdir()
+    cache_target.write_text("cached")
+    target.symlink_to(cache_target)
+
+    assert cache._get_lock_path(target, state_dir) == before
+
+
+def test_directory_restore_keeps_lock_file(tmp_path: pathlib.Path) -> None:
+    """A waiting restorer must continue to contend on the same lock inode."""
+    target = tmp_path / "data" / "out"
+    target.mkdir(parents=True)
+    (target / "result.txt").write_text("content")
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+    assert cache.restore_from_cache(
+        target,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.COPY,
+        state_dir=state_dir,
+    )
+    assert cache._get_lock_path(target, state_dir).exists()
+
+
 def test_get_lock_path_different_targets_different_locks(tmp_path: pathlib.Path) -> None:
     """Different target paths produce different lock files."""
     state_dir = tmp_path / ".pivot"
@@ -755,12 +925,17 @@ def _restore_worker(
     test_dir: pathlib.Path,
     output_hash: DirHash,
     cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
     result_queue: multiprocessing.Queue[tuple[str, str | bool]],
 ) -> None:
     """Worker function for concurrent restore test (must be module-level for pickling)."""
     try:
         result = cache.restore_from_cache(
-            test_dir, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK
+            test_dir,
+            output_hash,
+            cache_dir,
+            checkout_mode=cache.CheckoutMode.HARDLINK,
+            state_dir=state_dir,
         )
         result_queue.put(("success", result))
     except Exception as e:
@@ -787,11 +962,13 @@ def test_concurrent_restore_uses_locking(
         "multiprocessing.Queue[tuple[str, str | bool]]",
         cast("object", mp_manager.Queue()),
     )
-    p1 = multiprocessing.Process(
-        target=_restore_worker, args=(test_dir, output_hash, cache_dir, result_queue)
+    state_dir = tmp_path / ".pivot"
+    ctx = multiprocessing.get_context("spawn")
+    p1 = ctx.Process(
+        target=_restore_worker, args=(test_dir, output_hash, cache_dir, state_dir, result_queue)
     )
-    p2 = multiprocessing.Process(
-        target=_restore_worker, args=(test_dir, output_hash, cache_dir, result_queue)
+    p2 = ctx.Process(
+        target=_restore_worker, args=(test_dir, output_hash, cache_dir, state_dir, result_queue)
     )
     p1.start()
     p2.start()
@@ -802,6 +979,223 @@ def test_concurrent_restore_uses_locking(
     results = [result_queue.get(timeout=60), result_queue.get(timeout=60)]
     assert all(r[0] == "success" for r in results), f"Got errors: {results}"
     assert (test_dir / "file.txt").read_text() == "content"
+
+
+_SHARED_PARENT_FILES = 6
+_SHARED_PARENT_DIRS = 4
+_FILES_PER_DIR = 10
+
+
+def _helper_cache_shared_parent_outputs(root: pathlib.Path) -> dict[str, HashInfo]:
+    """Cache file and directory outputs that all live in one parent directory."""
+    cache_dir = root / "cache"
+    parent = root / "data" / "shared"
+    parent.mkdir(parents=True)
+    hashes = dict[str, HashInfo]()
+    for i in range(_SHARED_PARENT_FILES):
+        path = parent / f"file{i}.txt"
+        path.write_text(f"file {i}\n")
+        hashes[str(path)] = cache.save_to_cache(
+            path, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+        )
+    for i in range(_SHARED_PARENT_DIRS):
+        path = parent / f"dir{i}"
+        (path / "sub").mkdir(parents=True)
+        for j in range(_FILES_PER_DIR):
+            (path / "sub" / f"f{j}.txt").write_text(f"dir {i} file {j}\n")
+        hashes[str(path)] = cache.save_to_cache(
+            path, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+        )
+    return hashes
+
+
+def _helper_assert_shared_parent_outputs(parent: pathlib.Path) -> None:
+    for i in range(_SHARED_PARENT_FILES):
+        assert (parent / f"file{i}.txt").read_text() == f"file {i}\n"
+    for i in range(_SHARED_PARENT_DIRS):
+        sub = parent / f"dir{i}" / "sub"
+        assert sorted(p.name for p in sub.iterdir()) == sorted(
+            f"f{j}.txt" for j in range(_FILES_PER_DIR)
+        )
+        for j in range(_FILES_PER_DIR):
+            assert (sub / f"f{j}.txt").read_text() == f"dir {i} file {j}\n"
+    _helper_assert_no_temp_dirs(parent)
+
+
+def _helper_restore_all_at_barrier(
+    hashes: dict[str, HashInfo],
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+    barrier: Barrier,
+) -> list[str]:
+    """Restore every output from 8 threads at once; return one line per failed restore."""
+    barrier.wait()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(
+                cache.restore_from_cache,
+                pathlib.Path(path),
+                output_hash,
+                cache_dir,
+                checkout_modes=checkout_modes,
+                state_dir=state_dir,
+            )
+            for path, output_hash in hashes.items()
+        ]
+    failures = list[str]()
+    for future in futures:
+        exc = future.exception()
+        if exc is not None:
+            failures.append(f"{type(exc).__name__}: {exc}")
+        elif future.result() is not True:
+            failures.append("restore_from_cache returned False")
+    return failures
+
+
+@pytest.mark.parametrize(
+    "checkout_modes",
+    [
+        pytest.param([cache.CheckoutMode.COPY], id="copy"),
+        pytest.param(cache.DEFAULT_CHECKOUT_MODE_ORDER, id="default-order"),
+        pytest.param([cache.CheckoutMode.SYMLINK], id="symlink"),
+    ],
+)
+def test_concurrent_restores_into_shared_parent(
+    tmp_path: pathlib.Path, checkout_modes: list[cache.CheckoutMode]
+) -> None:
+    """Processes restoring the same outputs into one parent directory all succeed (#461)."""
+    hashes = _helper_cache_shared_parent_outputs(tmp_path)
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    parent = tmp_path / "data" / "shared"
+    n_procs = 4
+    ctx = multiprocessing.get_context("spawn")
+    failures = list[str]()
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        barrier = manager.Barrier(n_procs, timeout=60)
+        for _ in range(5):
+            for path in hashes:
+                cache.remove_output(pathlib.Path(path))
+            results = pool.starmap(
+                _helper_restore_all_at_barrier,
+                [(hashes, cache_dir, state_dir, checkout_modes, barrier)] * n_procs,
+            )
+            failures.extend(f for result in results for f in result)
+            _helper_assert_shared_parent_outputs(parent)
+
+    assert failures == []
+
+
+def _helper_restore_repeatedly_at_barrier(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+    times: int,
+    barrier: Barrier,
+) -> list[str]:
+    barrier.wait()
+    failures = list[str]()
+    for _ in range(times):
+        try:
+            restored = cache.restore_from_cache(
+                path,
+                output_hash,
+                cache_dir,
+                checkout_mode=cache.CheckoutMode.COPY,
+                state_dir=state_dir,
+            )
+        except OSError as e:
+            failures.append(f"{type(e).__name__}: {e}")
+        else:
+            if not restored:
+                failures.append("restore_from_cache returned False")
+    return failures
+
+
+def test_concurrent_repeated_restores_of_one_directory(tmp_path: pathlib.Path) -> None:
+    """The per-path restore lock excludes every concurrent restorer, not just the first (#461).
+
+    Deleting the lock file on release lets a third process lock a fresh file while a
+    waiter still holds the old one; both then swap the directory at once.
+    """
+    target = tmp_path / "data" / "out"
+    target.mkdir(parents=True)
+    for j in range(5):
+        (target / f"f{j}.txt").write_text(f"{j}\n")
+    cache_dir = tmp_path / "cache"
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    n_procs = 8
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        barrier = manager.Barrier(n_procs, timeout=60)
+        results = pool.starmap(
+            _helper_restore_repeatedly_at_barrier,
+            [(target, output_hash, cache_dir, tmp_path / ".pivot", 40, barrier)] * n_procs,
+        )
+
+    assert [f for result in results for f in result] == []
+    assert sorted(p.name for p in target.iterdir()) == [f"f{j}.txt" for j in range(5)]
+    _helper_assert_no_temp_dirs(target.parent)
+
+
+def _helper_crash_after_backup_rename(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+) -> None:
+    """Simulate a kill after the original output moves to the backup location."""
+    original_rename = pathlib.Path.rename
+
+    def _rename_and_crash(source: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        result = original_rename(source, target)
+        if source == path and target.name.startswith(cache._BACKUP_TEMP_PREFIX):
+            os._exit(73)
+        return result
+
+    pathlib.Path.rename = _rename_and_crash  # pyright: ignore[reportAttributeAccessIssue]
+    _ = cache.restore_from_cache(
+        path,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.COPY,
+        state_dir=state_dir,
+    )
+
+
+def test_directory_restore_recovers_fresh_crash_orphans(tmp_path: pathlib.Path) -> None:
+    """The next restore removes its fresh temp and backup dirs after a process crash (#228)."""
+    target = tmp_path / "data" / "out"
+    target.mkdir(parents=True)
+    (target / "result.txt").write_text("cached content")
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    (target / "result.txt").write_text("old workspace content")
+
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(
+        target=_helper_crash_after_backup_rename,
+        args=(target, output_hash, cache_dir, state_dir),
+    )
+    process.start()
+    process.join(timeout=60)
+
+    assert process.exitcode == 73
+    assert not target.exists()
+
+    assert cache.restore_from_cache(
+        target,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.COPY,
+        state_dir=state_dir,
+    )
+
+    assert (target / "result.txt").read_text() == "cached content"
+    _helper_assert_no_temp_dirs(target.parent)
 
 
 # === Remove Output Tests ===
@@ -902,6 +1296,30 @@ def test_remove_output_readonly_nested_directory(tmp_path: pathlib.Path) -> None
     cache.remove_output(test_dir)
 
     assert not test_dir.exists()
+
+
+@pytest.mark.parametrize("mode", [cache.CheckoutMode.COPY, cache.CheckoutMode.HARDLINK])
+def test_save_directory_with_read_only_subdirectory(
+    tmp_path: pathlib.Path, mode: cache.CheckoutMode
+) -> None:
+    """A directory output holding a read-only subdirectory saves and checks out.
+
+    File checkouts stage a temp file beside the target; the stage must not fail on a
+    parent the stage's own code made read-only.
+    """
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    (out / "sub" / "f.txt").write_text("content\n")
+    (out / "top.txt").write_text("top\n")
+    os.chmod(out / "sub", 0o555)
+    try:
+        output_hash = cache.save_to_cache(out, tmp_path / "cache", checkout_mode=mode)
+
+        assert "manifest" in output_hash
+        assert (out / "sub" / "f.txt").read_text() == "content\n"
+        _helper_assert_no_temp_dirs(out / "sub")
+    finally:
+        os.chmod(out / "sub", 0o755)
 
 
 def test_remove_output_hardlinked_file_preserves_cache_permissions(tmp_path: pathlib.Path) -> None:

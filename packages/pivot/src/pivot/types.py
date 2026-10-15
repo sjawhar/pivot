@@ -1,8 +1,8 @@
-# pyright: reportImplicitRelativeImport=false, reportExplicitAny=false
 from __future__ import annotations
 
 import dataclasses
 import enum
+import pathlib
 from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
@@ -106,6 +106,11 @@ class DisplayCategory(enum.StrEnum):
     CANCELLED = "cancelled"
     FAILED = "failed"
     UNKNOWN = "unknown"
+
+
+# The worker logs every LossyOutputWarning as "Stage '<stage>' wrote <output> <phrase>: ...";
+# the console report keys on the phrase to show those warnings uncapped.
+LOSSY_OUTPUT_PHRASE = "in a form Pivot cannot read back"
 
 
 def categorize_stage_result(status: StageStatus) -> DisplayCategory:
@@ -277,6 +282,7 @@ def identity_from_key(key: str) -> ArtifactIdentity:
 
 
 class ArtifactTag(enum.StrEnum):
+    INPUT = "input"
     DATA = "data"
     METRIC = "metric"
     PLOT = "plot"
@@ -297,6 +303,8 @@ class ArtifactRef:
 def validate_artifact_identity(identity: ArtifactIdentity) -> None:
     if identity.producer.strip() == "":
         raise ValueError("Artifact producer cannot be empty")
+    if pathlib.PurePath(identity.producer).is_absolute():
+        raise ValueError(f"Artifact producer cannot be absolute: {identity.producer!r}")
     bad_chars = {"\\", "\0", ":"}
     if bad_chars & set(identity.producer):
         raise ValueError(
@@ -310,6 +318,8 @@ def validate_artifact_identity(identity: ArtifactIdentity) -> None:
 
     if identity.key is None:
         return
+    if pathlib.PurePath(identity.key).is_absolute():
+        raise ValueError(f"Artifact key cannot be absolute: {identity.key!r}")
     if identity.key.strip() == "":
         raise ValueError("Artifact key cannot be empty")
     if bad_chars & set(identity.key):
@@ -327,7 +337,6 @@ class DepEntry(TypedDict):
     producer: str
     key: str | None
     hash: str
-    display: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -337,8 +346,7 @@ class OutEntry(TypedDict):
 
     key: str | None
     hash: str
-    tag: str
-    display: NotRequired[str]
+    path: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
 
@@ -352,7 +360,6 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
-    merkle_id: NotRequired[str]
 
 
 class LockData(TypedDict):
@@ -362,7 +369,7 @@ class LockData(TypedDict):
     params: dict[str, Any]
     dep_hashes: dict[ArtifactIdentity, HashInfo]
     output_hashes: dict[ArtifactIdentity, HashInfo]
-    merkle_id: NotRequired[str | None]
+    output_paths: NotRequired[dict[ArtifactIdentity, str]]
 
 
 class OutputMessageKind(enum.StrEnum):
@@ -412,7 +419,7 @@ class ChangeType(enum.StrEnum):
 class CodeChange(TypedDict):
     """Change info for a code component in the fingerprint."""
 
-    key: str  # e.g., "func:helper_a", "mod:utils.helper"
+    key: str  # e.g., "func:helper_a", "const:settings.FACTOR"
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType
@@ -566,6 +573,24 @@ class StatusOutput(TypedDict, total=False):
     suggestions: list[str]
 
 
+class DepChangeJson(TypedDict):
+    """A DepChange as JSON: the identity as ``{producer, key}``, as the RPC sends it."""
+
+    identity: ArtifactIdentityJson
+    old_hash: str | None
+    new_hash: str | None
+    change_type: ChangeType
+
+
+def dep_change_to_json(change: DepChange) -> DepChangeJson:
+    return DepChangeJson(
+        identity=identity_to_json(change["identity"]),
+        old_hash=change["old_hash"],
+        new_hash=change["new_hash"],
+        change_type=change["change_type"],
+    )
+
+
 class ExplainStageJson(TypedDict):
     """JSON-serializable stage explanation for status --explain --json output."""
 
@@ -576,7 +601,7 @@ class ExplainStageJson(TypedDict):
     is_forced: bool
     code_changes: list[CodeChange]
     param_changes: list[ParamChange]
-    dep_changes: list[DepChange]
+    dep_changes: list[DepChangeJson]
     upstream_stale: list[str]
 
 

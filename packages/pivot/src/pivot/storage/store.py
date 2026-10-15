@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib
@@ -7,7 +6,7 @@ import pathlib
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
-from pivot import compose, config, loaders, types
+from pivot import config, stage_def, types
 from pivot.storage import cache
 from pivot.storage import state as state_mod
 
@@ -21,7 +20,7 @@ class Store(Protocol):
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path: ...
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str: ...
+    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo: ...
 
     def hash_artifact(
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
@@ -36,6 +35,7 @@ class StoreSpec(TypedDict):
     project_root: str
     pipeline_name: str
     input_bindings: dict[str, str]
+    checkout_modes: list[config.CheckoutMode]
 
 
 class CacheStore:
@@ -57,7 +57,7 @@ class CacheStore:
             yield db
 
     def _ref_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        key = ref.identity.key or compose.SINGLE_OUTPUT_KEY
+        key = ref.identity.key or stage_def.SINGLE_OUTPUT_KEY
         return self._ref_dir / ref.identity.producer / key
 
     def checkout(self, ref: types.ArtifactRef) -> pathlib.Path:
@@ -85,7 +85,14 @@ class CacheStore:
         os.close(fd)
         return pathlib.Path(tmp_path)
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str:
+    def commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        state_dir: pathlib.Path | None = None,
+    ) -> types.HashInfo:
+        _ = state_dir
         with self._state_db() as db:
             output_hash = cache.save_to_cache(
                 path,
@@ -99,7 +106,7 @@ class CacheStore:
         cache.remove_output(ref_path)
         ref_path.parent.mkdir(parents=True, exist_ok=True)
         ref_path.symlink_to(cache_path.resolve())
-        return output_hash["hash"]
+        return output_hash
 
     def hash_artifact(
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
@@ -139,8 +146,8 @@ class WorkspaceStore:
     _pipeline_name: str
     _input_bindings: dict[str, str]
     _path_map: dict[str, types.ArtifactIdentity]
-    _output_producers: set[str]
     _cache_dir: pathlib.Path | None
+    _checkout_modes: list[config.CheckoutMode] | None
 
     def __init__(
         self,
@@ -148,56 +155,52 @@ class WorkspaceStore:
         pipeline_name: str,
         input_bindings: dict[str, str],
         cache_dir: pathlib.Path | None = None,
+        checkout_modes: list[config.CheckoutMode] | None = None,
     ) -> None:
+        """``checkout_modes`` orders how outputs are linked to the cache; None means the default."""
         self._project_root = project_root.resolve()
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
         self._path_map = {}
-        self._output_producers = set[str]()
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
-
-    def _is_input_ref(self, ref: types.ArtifactRef) -> bool:
-        if ref.tag != types.ArtifactTag.DATA:
-            return False
-        if ref.identity.key is not None:
-            return False
-        if ref.identity.producer in self._output_producers:
-            return False
-        output_path = self._resolve_output_path(ref)
-        return not (output_path.exists() or output_path.is_symlink())
+        self._checkout_modes = checkout_modes
 
     def _resolve_input_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         name = ref.identity.producer
         if name in self._input_bindings:
-            binding = pathlib.Path(self._input_bindings[name])
-            if binding.is_absolute():
-                return binding
-            return self._project_root / binding
+            return self._project_root / self._input_bindings[name]
         return self._project_root / "data" / "raw" / name
 
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        return self._project_root / relative_output_path(ref)
+        path = self._project_root / relative_output_path(ref)
+        logical_path = pathlib.Path(os.path.normpath(path))
+        if not logical_path.is_relative_to(self._project_root):
+            raise ValueError(
+                f"Output {types.identity_key(ref.identity)!r} maps outside project root: {path}"
+            )
+        return path
 
     def _resolve_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        if self._is_input_ref(ref):
+        if ref.tag is types.ArtifactTag.INPUT:
             path = self._resolve_input_path(ref)
         else:
             path = self._resolve_output_path(ref)
 
-        resolved = path.resolve()
-        existing = self._path_map.get(str(resolved))
+        # Logical path, not resolve(): two declared paths that are symlinks to one file (a
+        # symlink checkout, two symlinked inputs) are distinct artifacts.
+        logical = os.path.normpath(path)
+        existing = self._path_map.get(logical)
         if existing is not None and existing != ref.identity:
             raise ValueError(
-                f"Collision detected: {ref.identity} maps to {resolved} already used by {existing}"
+                f"Collision detected: {ref.identity} maps to {logical} already used by {existing}"
             )
-        self._path_map[str(resolved)] = ref.identity
+        self._path_map[logical] = ref.identity
         return path
 
     def checkout(self, ref: types.ArtifactRef) -> pathlib.Path:
         return self._resolve_path(ref)
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path:
-        self._output_producers.add(ref.identity.producer)
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             cache.remove_output(path)
@@ -207,25 +210,30 @@ class WorkspaceStore:
         cache.remove_output(path)
         return path
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> str:
-        self._output_producers.add(ref.identity.producer)
+    def commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        state_dir: pathlib.Path | None = None,
+    ) -> types.HashInfo:
+        """Hash a written output once and, unless it is a metric, place it in the cache."""
+        output_hash: types.HashInfo
         if path.is_dir():
-            tree_hash, _ = cache.hash_directory(path, None)
-            return tree_hash
-        file_hash, _ = cache.hash_file(path, None)
-        return file_hash
-
-    def backup_to_cache(self, ref: types.ArtifactRef, path: pathlib.Path) -> None:
-        if self._cache_dir is None:
-            return
-        if ref.tag is types.ArtifactTag.METRIC:
-            return
-        _ = cache.save_to_cache(
-            path,
-            self._cache_dir,
-            state_db=None,
-            checkout_mode=config.CheckoutMode.COPY,
-        )
+            tree_hash, manifest = cache.hash_directory(path, None)
+            output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
+        else:
+            file_hash, _ = cache.hash_file(path, None)
+            output_hash = types.FileHash(hash=file_hash)
+        if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
+            cache.store_hashed_output(
+                path,
+                output_hash,
+                self._cache_dir,
+                self._checkout_modes,
+                state_dir=state_dir,
+            )
+        return output_hash
 
     def restore_from_cache(
         self,
@@ -233,6 +241,7 @@ class WorkspaceStore:
         output_hash: types.HashInfo,
         *,
         state_dir: pathlib.Path | None = None,
+        checkout_modes: list[config.CheckoutMode] | None = None,
     ) -> bool:
         if self._cache_dir is None:
             return False
@@ -243,7 +252,7 @@ class WorkspaceStore:
             output_path,
             output_hash,
             self._cache_dir,
-            checkout_mode=config.CheckoutMode.COPY,
+            checkout_modes=checkout_modes if checkout_modes is not None else self._checkout_modes,
             state_dir=state_dir,
         )
 
@@ -316,6 +325,10 @@ def relative_output_path(ref: types.ArtifactRef) -> pathlib.Path:
             return pathlib.Path(prefix) / stage_name
         return pathlib.Path(prefix) / stage_name / key
 
+    from pivot import (
+        loaders,
+    )  # loaders imports pandas; keep it off CLI paths that never place outputs
+
     ext = loaders.format_extension(ref.format)
     if key is None:
         return pathlib.Path(prefix) / f"{stage_name}.{ext}"
@@ -336,5 +349,6 @@ def store_from_spec(spec: StoreSpec) -> Store:
             pipeline_name=spec["pipeline_name"],
             input_bindings=spec["input_bindings"],
             cache_dir=pathlib.Path(cache_dir_str) if cache_dir_str else None,
+            checkout_modes=spec["checkout_modes"],
         )
     raise ValueError(f"Unknown store kind: {kind}")

@@ -11,6 +11,8 @@ import sys
 import pytest
 from tests.conftest import init_git_repo
 
+from pivot import loaders
+
 _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
@@ -52,12 +54,18 @@ def _helper_ok(proc: subprocess.CompletedProcess[str]) -> str:
     return output
 
 
+def _helper_rows(path: pathlib.Path) -> list[dict[str, object]]:
+    """The records a stage wrote to a DataFrameJSONL output, as the next stage loads them."""
+    records = loaders.DataFrameJSONL().load(path).to_dict(orient="records")
+    return [{str(key): value for key, value in record.items()} for record in records]
+
+
 _TUPLE_PIPELINE = """\
 import pandas as pd
 
 from pivot import Pipeline, stage
 
-COL = ("a",)
+COL = ("a", ["b"])
 
 
 @stage
@@ -70,7 +78,9 @@ with Pipeline("k") as pipeline:
 """
 
 
-def test_module_level_tuple_read_by_stage_is_an_error(tmp_path: pathlib.Path) -> None:
+def test_module_level_tuple_holding_a_list_read_by_stage_is_an_error(
+    tmp_path: pathlib.Path,
+) -> None:
     root = _helper_project(
         tmp_path, {"pipeline.py": _TUPLE_PIPELINE, "data/raw/t.csv": "a,b,c\n1,2,3\n"}
     )
@@ -78,8 +88,88 @@ def test_module_level_tuple_read_by_stage_is_an_error(tmp_path: pathlib.Path) ->
     proc = _helper_pivot(root, "repro")
 
     output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"tuple capture was accepted:\n{output}"
-    assert "COL" in output, output
+    assert proc.returncode != 0, f"tuple holding a list was accepted:\n{output}"
+    assert "captures non-scalar variable 'COL' (type: tuple)" in output, output
+
+
+_IMMUTABLE_CAPTURE_PIPELINE = """\
+import pandas as pd
+
+import settings
+from pivot import Pipeline, stage
+from settings import VALUE
+
+
+@stage
+def show(raw: pd.DataFrame) -> pd.DataFrame:
+    return raw.assign(v=SHOW)
+
+
+with Pipeline("im") as pipeline:
+    show(pipeline.input("t.csv"))
+"""
+
+
+@pytest.mark.parametrize("access", ["VALUE", "settings.VALUE"], ids=["from-import", "module-attr"])
+@pytest.mark.parametrize(
+    ("show", "original", "same", "edited", "shown_before", "shown_after"),
+    [
+        pytest.param(
+            '"-".join({access})',
+            'VALUE = ("patchable", "squash")\n',
+            'VALUE = (\n    "patchable",\n    "squash",\n)\n',
+            'VALUE = ("patchable", "squash", "zstd")\n',
+            "patchable-squash",
+            "patchable-squash-zstd",
+            id="tuple",
+        ),
+        pytest.param(
+            '"-".join(sorted({access}))',
+            'VALUE = frozenset({"tasks", "runs", "models"})\n',
+            'VALUE = frozenset({"runs", "models", "tasks"})\n',
+            'VALUE = frozenset({"tasks", "runs", "jobs"})\n',
+            "models-runs-tasks",
+            "jobs-runs-tasks",
+            id="frozenset",
+        ),
+        pytest.param(
+            "{access}.pattern + str({access}.flags)",
+            'import re\n\nVALUE = re.compile(r"x+")\n',
+            'import re\n\nVALUE = re.compile(r"x+", re.UNICODE)\n',
+            'import re\n\nVALUE = re.compile(r"x+", re.IGNORECASE)\n',
+            "x+32",
+            "x+34",
+            id="pattern-flags",
+        ),
+    ],
+)
+def test_editing_immutable_module_value_reruns_stage(
+    tmp_path: pathlib.Path,
+    access: str,
+    show: str,
+    original: str,
+    same: str,
+    edited: str,
+    shown_before: str,
+    shown_after: str,
+) -> None:
+    """A tuple, frozenset or compiled regex is tracked by value, not by its source text."""
+    pipeline = _IMMUTABLE_CAPTURE_PIPELINE.replace("SHOW", show.format(access=access))
+    root = _helper_project(
+        tmp_path,
+        {"pipeline.py": pipeline, "settings.py": original, "data/raw/t.csv": "a\n1\n"},
+    )
+    output_path = root / "data/im/show.jsonl"
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert _helper_rows(output_path) == [{"a": 1, "v": shown_before}]
+
+    (root / "settings.py").write_text(same)
+    status = _helper_ok(_helper_pivot(root, "status"))
+    assert "1 cached, 0 stale" in status, f"an equal value made the stage stale:\n{status}"
+
+    (root / "settings.py").write_text(edited)
+    output = _helper_ok(_helper_pivot(root, "repro"))
+    assert _helper_rows(output_path) == [{"a": 1, "v": shown_after}], output
 
 
 _MODULE_ATTR_PIPELINE = """\
@@ -109,13 +199,13 @@ def test_editing_sibling_module_scalar_reruns_stage(tmp_path: pathlib.Path) -> N
         },
     )
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":10}\n{"a":20}\n'
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 10}, {"a": 20}]
 
     # Different size, so Python's mtime+size bytecode check cannot reuse stale bytecode.
     (root / "settings.py").write_text("FACTOR = 200\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":200}\n{"a":400}\n', output
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 200}, {"a": 400}], output
 
 
 _FROM_IMPORT_PIPELINE = """\
@@ -149,7 +239,7 @@ def test_editing_from_imported_scalar_reruns_stage(tmp_path: pathlib.Path) -> No
     (root / "settings.py").write_text("FACTOR = 200\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":200}\n{"a":400}\n', output
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 200}, {"a": 400}], output
 
 
 _REBOUND_HELPER_PIPELINE = """\
@@ -184,7 +274,7 @@ def test_rebinding_module_attribute_callable_reruns_stage(tmp_path: pathlib.Path
     (root / "settings.py").write_text("from transforms import triple as transform\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/ms/scale.jsonl").read_text() == '{"a":3}\n{"a":6}\n', output
+    assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 3}, {"a": 6}], output
 
 
 _LIST_DEFAULT_PIPELINE = """\
@@ -297,14 +387,14 @@ def test_editing_scalar_module_value_used_as_default_reruns_stage(
 ) -> None:
     root = _helper_project(tmp_path, {**files, "data/raw/t.csv": "a\n1\n2\n"})
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     rel_path, old, new = edit
     path = root / rel_path
     path.write_text(path.read_text().replace(old, new))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":50}\n{"a":100}\n', output
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 50}, {"a": 100}], output
 
 
 def _helper_same_named_pipeline(origin: str) -> str:
@@ -384,12 +474,12 @@ def test_editing_scalar_read_by_cached_helper_reruns_stage(
     pipeline = _CACHED_HELPER_PIPELINE.replace("@functools.cache", decorator)
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":7}\n{"a":14}\n', output
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 7}, {"a": 14}], output
 
 
 def test_non_scalar_read_by_cached_helper_is_an_error(tmp_path: pathlib.Path) -> None:
@@ -471,12 +561,12 @@ def test_artifact_handle_default_is_wired_as_an_input(tmp_path: pathlib.Path) ->
 
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/h/scale.jsonl").read_text() == '{"a":3}\n{"a":6}\n', output
-    assert (root / "data/h/total.jsonl").read_text() == '{"a":1}\n{"a":2}\n', output
+    assert _helper_rows(root / "data/h/scale.jsonl") == [{"a": 3}, {"a": 6}], output
+    assert _helper_rows(root / "data/h/total.jsonl") == [{"a": 1}, {"a": 2}], output
 
     (root / "data/raw/t.csv").write_text("a\n5\n")
     output = _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/h/scale.jsonl").read_text() == '{"a":15}\n', output
+    assert _helper_rows(root / "data/h/scale.jsonl") == [{"a": 15}], output
 
 
 _LOADER_CONFIG_PIPELINE = """\
@@ -623,7 +713,7 @@ from typing import Annotated
 from pivot import Pipeline, loaders, stage
 
 FACTOR = 2
-COLS = ("a",)
+COLS = ["a"]
 
 
 def scale_rows(data: dict) -> dict:
@@ -707,7 +797,7 @@ import pandas as pd
 from pivot import Pipeline, stage
 
 FACTOR = 2
-COLS = ("a",)
+COLS = ["a"]
 
 
 def factor() -> int:
@@ -760,12 +850,12 @@ def test_value_read_by_partial_argument_function_reruns_stage(
     pipeline = _PARTIAL_ARGUMENT_PIPELINE.replace("BINDING", binding)
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":2}\n{"a":4}\n'
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
-    assert (root / "data/d/scale.jsonl").read_text() == '{"a":7}\n{"a":14}\n', output
+    assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 7}, {"a": 14}], output
 
 
 @pytest.mark.parametrize(
@@ -791,8 +881,8 @@ def test_non_scalar_read_by_bound_function_is_an_error(
     proc = _helper_pivot(root, "repro")
 
     output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"tuple read by a bound function was accepted:\n{output}"
-    assert "captures non-scalar variable 'COLS' (type: tuple)" in output, output
+    assert proc.returncode != 0, f"list read by a bound function was accepted:\n{output}"
+    assert "captures non-scalar variable 'COLS' (type: list)" in output, output
 
 
 @pytest.mark.parametrize(
@@ -831,7 +921,7 @@ def test_user_callable_instance_bound_in_config_is_an_error(
 def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathlib.Path) -> None:
     pipeline = (
         _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", "keep_cols")
-        .replace('COLS = ("a",)', 'COLS = ("a",)\nSTAGE_KEYS = ["k"]')
+        .replace('COLS = ["a"]', 'COLS = ["a"]\nSTAGE_KEYS = ["k"]')
         .replace('return {"a": 3}', 'return {"a": len(STAGE_KEYS)}')
     )
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
@@ -841,7 +931,7 @@ def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathli
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert "'STAGE_KEYS' (type: list)" in output, output
-    assert "'COLS' (type: tuple)" in output, output
+    assert "'COLS' (type: list)" in output, output
 
 
 def test_editing_model_class_used_by_loader_reruns_stage(tmp_path: pathlib.Path) -> None:
@@ -869,7 +959,7 @@ from typing import Annotated
 from pivot import Pipeline, loaders, stage
 
 FACTOR = 2
-KEYS = ("a",)
+KEYS = ["a"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -928,9 +1018,9 @@ def test_non_scalar_read_by_custom_loader_method_is_an_error(tmp_path: pathlib.P
     proc = _helper_pivot(root, "repro")
 
     output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"tuple read by a loader's save() was accepted:\n{output}"
+    assert proc.returncode != 0, f"list read by a loader's save() was accepted:\n{output}"
     assert "Stage 's/make'" in output, output
-    assert "captures non-scalar variable 'KEYS' (type: tuple)" in output, output
+    assert "captures non-scalar variable 'KEYS' (type: list)" in output, output
 
 
 _SHARED_LOADER_PIPELINE = """\
@@ -940,7 +1030,7 @@ import pathlib
 
 from pivot import Pipeline, loaders, stage
 
-KEYS = ("a",)
+KEYS = ["a"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1009,13 +1099,13 @@ def test_scalar_read_from_environment_at_import_reruns_stage(tmp_path: pathlib.P
         tmp_path, {"pipeline.py": _ENV_SCALE_PIPELINE, "data/raw/x.csv": "a\n1\n"}
     )
     _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
-    assert (root / "data/env/scale.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/env/scale.jsonl") == [{"a": 2}]
 
     status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
     output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
 
     assert "1 stale" in status, status
-    assert (root / "data/env/scale.jsonl").read_text() == '{"a":7}\n', output
+    assert _helper_rows(root / "data/env/scale.jsonl") == [{"a": 7}], output
 
 
 _SETTINGS_FILE_PIPELINE = """\
@@ -1062,16 +1152,16 @@ def test_scalar_read_from_settings_file_at_import_reruns_stages(tmp_path: pathli
         },
     )
     _helper_ok(_helper_pivot(root, "repro"))
-    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":2}\n'
-    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/cfg/made.jsonl") == [{"a": 2}]
+    assert _helper_rows(root / "data/cfg/plain.jsonl") == [{"a": 2}]
 
     (root / "settings.json").write_text('{"factor": 7}\n')
     status = _helper_ok(_helper_pivot(root, "status"))
     output = _helper_ok(_helper_pivot(root, "repro"))
 
     assert "2 stale" in status, status
-    assert (root / "data/cfg/made.jsonl").read_text() == '{"a":7}\n', output
-    assert (root / "data/cfg/plain.jsonl").read_text() == '{"a":7}\n', output
+    assert _helper_rows(root / "data/cfg/made.jsonl") == [{"a": 7}], output
+    assert _helper_rows(root / "data/cfg/plain.jsonl") == [{"a": 7}], output
 
 
 _FACTORY_STAGES = """\
@@ -1193,6 +1283,9 @@ def test_include_refuses_one_stage_reading_through_two_factory_loaders(
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert "Stage 'rep/make' is defined twice with different input formats" in output, output
+    assert "transform=make_scaler.<locals>.scaler(factor=2)" in output, output
+    assert "transform=make_scaler.<locals>.scaler(factor=5)" in output, output
+    assert " at 0x" not in output, output
 
 
 def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
@@ -1210,11 +1303,11 @@ def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
     )
 
     left = _helper_ok(_helper_pivot(root / "left", "repro"))
-    assert (root / "data/rep/make.jsonl").read_text() == '{"a":2}\n', left
+    assert _helper_rows(root / "data/rep/make.jsonl") == [{"a": 2}], left
     right = _helper_ok(_helper_pivot(root / "right", "repro"))
 
     assert "1 ran" in right, right
-    assert (root / "data/rep/make.jsonl").read_text() == '{"a":5}\n', right
+    assert _helper_rows(root / "data/rep/make.jsonl") == [{"a": 5}], right
 
 
 _NAN_PREP_DEFAULT = """\
@@ -1354,7 +1447,7 @@ def test_self_referencing_object_is_refused_not_a_crash(
     assert "(type: Node)" in refused_output, refused_output
     unsafe_output = _helper_ok(unsafe)
     assert "1 ran" in unsafe_output, unsafe_output
-    assert (root / "data/cyc/scale.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/cyc/scale.jsonl") == [{"a": 2}]
 
 
 _TWO_CLOSURES_MODULE = """\
@@ -1435,7 +1528,10 @@ with Pipeline("lib") as pipeline:
 
 
 def _helper_summary(root: pathlib.Path) -> float:
-    return json.loads((root / "data/lib/summarise.jsonl").read_text())["a"]
+    (row,) = _helper_rows(root / "data/lib/summarise.jsonl")
+    value = row["a"]
+    assert isinstance(value, float), row
+    return value
 
 
 @pytest.mark.parametrize(
@@ -1761,13 +1857,13 @@ def test_changing_a_secret_read_by_a_stage_reruns_it(tmp_path: pathlib.Path, pip
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
     env = {"TOKEN": "first-secret"}
     _helper_ok(_helper_pivot(root, "repro", env=env))
-    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":12}\n'
+    assert _helper_rows(root / "data/sec/measure.jsonl") == [{"a": 12}]
 
     status = _helper_ok(_helper_pivot(root, "status", env={"TOKEN": "second-secret-x"}))
     output = _helper_ok(_helper_pivot(root, "repro", env={"TOKEN": "second-secret-x"}))
 
     assert "1 stale" in status, status
-    assert (root / "data/sec/measure.jsonl").read_text() == '{"a":15}\n', output
+    assert _helper_rows(root / "data/sec/measure.jsonl") == [{"a": 15}], output
     lock = (root / ".pivot/stages/sec/measure.lock").read_text()
     assert "first-secret" not in lock and "second-secret-x" not in lock, lock
     key_file = root / ".pivot/secret.key"
@@ -1790,7 +1886,7 @@ from pivot import Pipeline, stage
 
 class Config:
     SCALE = int(os.environ.get("SCALE", "2"))
-    COLUMNS = ("a",)
+    COLUMNS = ("a", ["b"])
 
 
 class Mode(enum.Enum):
@@ -1831,7 +1927,7 @@ def test_value_read_through_a_class_at_import_reruns_stage(
         },
     )
     _helper_ok(_helper_pivot(root, "repro", env={variable: "2"}))
-    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":2}\n'
+    assert _helper_rows(root / "data/cls/scale.jsonl") == [{"a": 2}]
     cached = _helper_ok(_helper_pivot(root, "status", env={variable: "2"}))
 
     status = _helper_ok(_helper_pivot(root, "status", env={variable: "7"}))
@@ -1839,11 +1935,11 @@ def test_value_read_through_a_class_at_import_reruns_stage(
 
     assert "1 cached, 0 stale" in cached, cached
     assert "1 stale" in status, status
-    assert (root / "data/cls/scale.jsonl").read_text() == '{"a":7}\n', output
+    assert _helper_rows(root / "data/cls/scale.jsonl") == [{"a": 7}], output
 
 
 def test_non_scalar_class_attribute_is_an_error(tmp_path: pathlib.Path) -> None:
-    """A tuple read as `Config.COLUMNS` is refused like a module-level tuple."""
+    """A tuple holding a list read as `Config.COLUMNS` is refused."""
     pipeline = _CLASS_ATTRIBUTE_PIPELINE.format(read="len(Config.COLUMNS)")
     root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
 
@@ -1916,3 +2012,380 @@ def test_class_attribute_the_language_or_a_library_defines_is_not_refused(
 
     assert "1 ran" in first, first
     assert "0 ran, 1 cached" in second, second
+
+
+_MODULE_READ_SETTINGS = """\
+import functools
+import logging
+import os
+
+import numpy as np
+
+AGG = np.{agg}
+log = logging.getLogger("settings")
+ROUND = functools.partial(round, ndigits=1)
+
+
+class Config:
+    SCALE = int(os.environ.get("SCALE", "2"))
+"""
+
+_MODULE_READ_PIPELINE = """\
+import pandas as pd
+
+import settings
+from pivot import Pipeline, stage
+
+
+@stage
+def via_module(x: pd.DataFrame) -> pd.DataFrame:
+    settings.log.info("hi")
+    value = settings.ROUND(float(settings.AGG(x["a"]))) * settings.Config.SCALE
+    return pd.DataFrame({"a": [value]})
+
+
+with Pipeline("mod") as pipeline:
+    via_module(pipeline.input("x.csv"))
+"""
+
+
+def _helper_module_read_project(tmp_path: pathlib.Path) -> pathlib.Path:
+    return _helper_project(
+        tmp_path,
+        {
+            "settings.py": _MODULE_READ_SETTINGS.format(agg="mean"),
+            "pipeline.py": _MODULE_READ_PIPELINE,
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+
+
+def test_logger_partial_and_library_function_read_through_a_module_are_accepted(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`settings.log`, `settings.ROUND` and `settings.AGG` follow the rule their global forms do."""
+    root = _helper_module_read_project(tmp_path)
+
+    first = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    second = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+
+    assert "1 ran" in first, first
+    assert "0 ran, 1 cached" in second, second
+    assert _helper_rows(root / "data/mod/via_module.jsonl") == [{"a": 6.0}]
+
+
+def test_library_function_rebound_in_a_module_reruns_stage(tmp_path: pathlib.Path) -> None:
+    """`settings.AGG = np.mean` → `np.median` is recorded by name, as `AGG` would be."""
+    root = _helper_module_read_project(tmp_path)
+    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+
+    (root / "settings.py").write_text(_MODULE_READ_SETTINGS.format(agg="median"))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+
+    assert "1 ran" in output, output
+    assert _helper_rows(root / "data/mod/via_module.jsonl") == [{"a": 4.0}], output
+
+
+def test_class_attribute_read_through_a_module_at_import_reruns_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`settings.Config.SCALE` computed at import is re-read like `Config.SCALE`."""
+    pipeline = _MODULE_READ_PIPELINE.replace(
+        '    settings.log.info("hi")\n'
+        + '    value = settings.ROUND(float(settings.AGG(x["a"]))) * settings.Config.SCALE\n',
+        '    value = float(x["a"].sum()) * settings.Config.SCALE\n',
+    )
+    assert "settings.AGG" not in pipeline
+    root = _helper_project(
+        tmp_path,
+        {
+            "settings.py": _MODULE_READ_SETTINGS.format(agg="mean"),
+            "pipeline.py": pipeline,
+            "data/raw/x.csv": "a\n1\n2\n6\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    cached = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "2"}))
+
+    status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
+    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
+
+    assert "1 cached, 0 stale" in cached, cached
+    assert "1 stale" in status, status
+    assert _helper_rows(root / "data/mod/via_module.jsonl") == [{"a": 63.0}], output
+
+
+_LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS = """\
+import enum
+import typing
+
+
+class Opts(typing.NamedTuple):
+    x: int = 1
+
+
+class Color(enum.IntEnum):
+    RED = 1
+
+
+class Config:
+    COLUMNS = ("a", ["b"])
+"""
+
+_LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE = """\
+import pandas as pd
+
+import settings
+from pivot import Pipeline, stage
+
+
+@stage
+def count(x: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({{"a": [{read}]}})
+
+
+with Pipeline("lib") as pipeline:
+    count(pipeline.input("x.csv"))
+"""
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        pytest.param("len(settings.Opts._fields)", id="namedtuple-fields"),
+        pytest.param("len(settings.Color._member_names_)", id="enum-member-names"),
+        pytest.param("int(settings.Color.RED)", id="enum-member"),
+    ],
+)
+def test_class_attribute_through_a_module_follows_the_class_rule(
+    tmp_path: pathlib.Path, read: str
+) -> None:
+    """`settings.Opts._fields` is left to the class AST hash, as `Opts._fields` is."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "settings.py": _LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS,
+            "pipeline.py": _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE.format(read=read),
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in first, first
+    assert "0 ran, 1 cached" in second, second
+
+
+def test_non_scalar_class_attribute_through_a_module_is_an_error(tmp_path: pathlib.Path) -> None:
+    """`settings.Config.COLUMNS` holding a list is refused."""
+    pipeline = _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE.format(read="len(settings.Config.COLUMNS)")
+    root = _helper_project(
+        tmp_path,
+        {
+            "settings.py": _LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS,
+            "pipeline.py": pipeline,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+
+    proc = _helper_pivot(root, "repro")
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "captures non-scalar variable 'settings.Config.COLUMNS' (type: tuple)" in output, output
+
+
+_SUBMODULE_PIPELINE = """\
+import pandas as pd
+
+import pkg.sub
+from pivot import Pipeline, stage
+
+
+@stage
+def scale(x: pd.DataFrame) -> pd.DataFrame:
+    return pkg.sub.helper(x) * pkg.sub.SCALE
+
+
+with Pipeline("sub") as pipeline:
+    scale(pipeline.input("x.csv"))
+"""
+
+
+def test_submodule_read_through_its_package_is_tracked(tmp_path: pathlib.Path) -> None:
+    """`pkg.sub.helper` and `pkg.sub.SCALE` are walked like `sub.helper` and `sub.SCALE`."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pkg/__init__.py": "",
+            "pkg/sub.py": "SCALE = 2\n\n\ndef helper(x):\n    return x\n",
+            "pipeline.py": _SUBMODULE_PIPELINE,
+            "data/raw/x.csv": "a\n1\n",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert _helper_rows(root / "data/sub/scale.jsonl") == [{"a": 2}]
+
+    (root / "pkg/sub.py").write_text("SCALE = 50\n\n\ndef helper(x):\n    return x + 1\n")
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 ran" in output, output
+    assert _helper_rows(root / "data/sub/scale.jsonl") == [{"a": 100}], output
+
+
+_DIRECT_WIRING_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def combine(left: str, right: str) -> str:
+    return left + ":" + right
+
+
+with Pipeline("wire") as pipeline:
+    a = pipeline.input("a.txt", t=str)
+    b = pipeline.input("b.txt", t=str)
+    {call}
+"""
+
+_COLLECTION_WIRING_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def combine(items: list[str] | tuple[str, ...]) -> str:
+    return type(items).__name__ + ":" + ":".join(items)
+
+
+with Pipeline("wire") as pipeline:
+    a = pipeline.input("a.txt", t=str)
+    b = pipeline.input("b.txt", t=str)
+    {call}
+"""
+
+
+@pytest.mark.parametrize(
+    ("template", "before", "after", "initial", "expected"),
+    [
+        pytest.param(
+            _DIRECT_WIRING_PIPELINE,
+            "combine(a, b)",
+            "combine(b, a)",
+            "A:B",
+            "B:A",
+            id="direct-input-order",
+        ),
+        pytest.param(
+            _COLLECTION_WIRING_PIPELINE,
+            "combine([a, b])",
+            "combine([b, a])",
+            "list:A:B",
+            "list:B:A",
+            id="list-input-order",
+        ),
+        pytest.param(
+            _COLLECTION_WIRING_PIPELINE,
+            "combine([a, b])",
+            "combine((a, b))",
+            "list:A:B",
+            "tuple:A:B",
+            id="collection-kind",
+        ),
+    ],
+)
+@pytest.mark.parametrize("delete_lock", [False, True], ids=["lock", "run-cache"])
+def test_rewiring_stage_inputs_reruns_and_never_restores_old_output(
+    tmp_path: pathlib.Path,
+    template: str,
+    before: str,
+    after: str,
+    initial: str,
+    expected: str,
+    delete_lock: bool,
+) -> None:
+    """The parameter-to-artifact binding, collection kind and order belong in the manifest."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": template.format(call=before),
+            "data/raw/a.txt": "A",
+            "data/raw/b.txt": "B",
+        },
+    )
+    first = _helper_ok(_helper_pivot(root, "repro"))
+    assert "1 ran" in first, first
+    assert (root / "data/wire/combine.txt").read_text() == initial
+
+    (root / "pipeline.py").write_text(template.format(call=after))
+    status = _helper_ok(_helper_pivot(root, "status", "--explain"))
+    if delete_lock:
+        (root / ".pivot/stages/wire/combine.lock").unlink()
+    second = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "Inputs rewired:" in status, status
+    assert "combine" in status, status
+    assert "1 ran" in second, second
+    assert (root / "data/wire/combine.txt").read_text() == expected
+
+
+_PATH_WIRING_PIPELINE = """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def result(file: pathlib.Path) -> str:
+    return file.name
+
+
+with Pipeline("path") as pipeline:
+    result(pipeline.input("input", path="{path}", t=pathlib.Path))
+"""
+
+
+@pytest.mark.parametrize("delete_lock", [False, True], ids=["lock", "run-cache"])
+def test_rebinding_path_input_with_same_content_reruns_and_never_restores_old_output(
+    tmp_path: pathlib.Path, delete_lock: bool
+) -> None:
+    """A PathOnly input's binding path is stage wiring even when the bytes do not change."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _PATH_WIRING_PIPELINE.format(path="old.txt"),
+            "old.txt": "same",
+            "new.txt": "same",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+    assert (root / "data/path/result.txt").read_text() == "old.txt"
+
+    (root / "pipeline.py").write_text(_PATH_WIRING_PIPELINE.format(path="new.txt"))
+    status = _helper_ok(_helper_pivot(root, "status", "--explain"))
+    if delete_lock:
+        (root / ".pivot/stages/path/result.lock").unlink()
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "Inputs rewired: file" in status, status
+    assert "1 ran" in output, output
+    assert (root / "data/path/result.txt").read_text() == "new.txt"
+
+
+def test_unchanged_wiring_stays_cached(tmp_path: pathlib.Path) -> None:
+    """A wiring entry is stable when the pipeline call has not changed."""
+    root = _helper_project(
+        tmp_path,
+        {
+            "pipeline.py": _DIRECT_WIRING_PIPELINE.format(call="combine(a, b)"),
+            "data/raw/a.txt": "A",
+            "data/raw/b.txt": "B",
+        },
+    )
+    _helper_ok(_helper_pivot(root, "repro"))
+
+    status = _helper_ok(_helper_pivot(root, "status"))
+    output = _helper_ok(_helper_pivot(root, "repro"))
+
+    assert "1 cached, 0 stale" in status, status
+    assert "0 ran, 1 cached" in output, output

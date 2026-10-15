@@ -7,6 +7,8 @@ user-selected output paths.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -82,6 +84,7 @@ from pivot.compose import Pipeline, stage
 
 @stage
 def stage_a() -> str:
+    pathlib.Path("stage_a_started").touch()
     time.sleep(float(os.environ.get("STAGE_A_SLEEP", "3")))
     return "hello from a"
 
@@ -165,8 +168,49 @@ def _helper_run_pivot(
     )
 
 
+def _helper_wait_for_path(path: pathlib.Path, timeout: float = 30.0) -> None:
+    """Wait until a stage has started under its artifact lock."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for {path}")
+
+
+def _helper_wait_for_write_lock(lock_path: pathlib.Path) -> None:
+    """Wait until another process owns lock_path exclusively, instead of sleeping by guess."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if lock_path.exists():
+            fd = os.open(lock_path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        time.sleep(0.01)
+    raise TimeoutError(f"writer never acquired artifact lock {lock_path}")
+
+
 def _helper_output(project: pathlib.Path, stage: str) -> pathlib.Path:
     return project / "data" / "test" / f"{stage}.txt"
+
+
+def test_wait_for_write_lock_waits_until_lock_is_held(tmp_path: pathlib.Path) -> None:
+    """Contention tests start their reader only after the writer owns the artifact lock."""
+    lock_path = tmp_path / "lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _helper_wait_for_write_lock(lock_path)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +257,7 @@ def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
     env = _helper_make_env(STAGE_A_SLEEP="3")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    time.sleep(0.5)
+    _helper_wait_for_path(tmp_path / "stage_a_started")
     proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env, resolve_deps=True)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)
@@ -266,7 +310,8 @@ def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
     env = _helper_make_env(STAGE_A_SLEEP="4")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    time.sleep(1.0)
+    stage_a_lock = tmp_path / ".pivot" / "locks" / hashlib.sha256(b"test/stage_a").hexdigest()
+    _helper_wait_for_write_lock(stage_a_lock)
     proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)

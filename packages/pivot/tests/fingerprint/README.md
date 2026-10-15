@@ -61,7 +61,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Transitive helper (helper's helper)                  | ✅        | `test_fingerprint.py::test_transitive_dependencies_captured`                                                                        |
 | Global primitive constant                            | ✅        | `test_fingerprint.py::test_constant_captured`, `test_fingerprint.py::test_multiple_constants_captured`                              |
 | Global primitive constant change                     | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
-| Global collection, enum, or class instance           | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`                                                              |
+| Global tuple, frozenset of scalars, or compiled regex | ✅ | `test_safe_fingerprinting.py::test_immutable_capture_is_tracked_by_value`, `test_safe_fingerprinting.py::test_editing_immutable_capture_changes_fingerprint`, `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage` |
+| Global list, dict, set, nested tuple, enum, or class instance | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises` |
 | Non-scalar module attribute                          | ✅ (error) | `test_integration.py::test_non_scalar_module_attribute_raises`                                                                      |
 | Method bound to an instance (`Scaler(3).apply`, `default_rng(0).normal`) as a global, cell, partial argument, loader field or `module.NAME` | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`, `test_integration.py::test_non_scalar_module_attribute_raises`, `test_manifest_cache_cli.py::test_method_bound_to_an_instance_is_an_error` |
 | Method bound to a Logger, a scalar, a class or a library module's own state (`np.random.normal`) | 🚫 | `test_safe_fingerprinting.py::test_methods_bound_to_a_logger_scalar_or_library_are_allowed`, `test_manifest_cache_cli.py::test_method_bound_to_a_scalar_class_or_library_is_allowed` |
@@ -71,7 +72,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Class attribute read as `Config.SCALE` (scalar, Enum member, function) | ✅ | `test_fingerprint.py::test_class_attributes_a_stage_reads_are_tracked_one_by_one`, `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
 | Non-scalar class attribute read as `Config.COLUMNS` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_class_attribute_is_an_error` |
 | Class attribute the language or a library defines (`NamedTuple._fields`, `Enum._member_names_`, an inherited stdlib dict, a property object) | 🚫 (class AST only) | `test_manifest_cache_cli.py::test_class_attribute_the_language_or_a_library_defines_is_not_refused` |
-| `settings.Config.SCALE`, `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
+| `settings.Config.SCALE` (class reached through a user module) | ✅ | `test_manifest_cache_cli.py::test_class_attribute_read_through_a_module_at_import_reruns_stage`, `test_manifest_cache_cli.py::test_class_attribute_through_a_module_follows_the_class_rule`, `test_manifest_cache_cli.py::test_non_scalar_class_attribute_through_a_module_is_an_error` |
+| `settings.log`, `settings.ROUND` (a partial), `settings.AGG` (`np.mean`) | ✅ (same rule as the global form) | `test_manifest_cache_cli.py::test_logger_partial_and_library_function_read_through_a_module_are_accepted`, `test_manifest_cache_cli.py::test_library_function_rebound_in_a_module_reruns_stage` |
+| `pkg.sub.helper`, `pkg.sub.SCALE` (submodule through its package) | ✅ | `test_manifest_cache_cli.py::test_submodule_read_through_its_package_is_tracked` |
+| `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                  |
 | Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                         |
@@ -109,7 +113,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | ----------------------------------- | --------- | --------------------------------------------------------------------------------------- |
 | Module function body change         | ✅        | `test_integration.py::test_module_attr_change_detected`                                 |
 | Module function change (end-to-end) | ✅        | `test_change_detection.py::test_helper_via_module_attr_change_causes_miss`              |
-| Transitive dependency change        | ✅        | `test_change_detection.py::test_transitive_dependency_change_causes_miss`               |
+| Module immutable tuple, frozenset, or compiled regex | ✅ | `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage` |
 | Module constant                     | ✅        | `test_integration.py::test_constant_via_module_attr_captured`                           |
 | Module constant captured            | ✅        | `test_change_detection.py::test_module_constant_captured_via_module_attr`               |
 | Module primitive collection         | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
@@ -314,10 +318,10 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 5. **Lazy imports not tracked**: Imports inside function bodies are not detected. Recommended pattern: use module-level imports.
 
 6. **Non-scalar module values are refused**: A stage may capture module-level `bool`, `int`,
-   `float`, `str`, `bytes`, and `None` values. Any other module-level value—including a
-   collection, enum member, frozen model, or class instance—raises `StageDefinitionError`.
-   `core.unsafe_fingerprinting=true` or `PIVOT_UNSAFE_FINGERPRINTING=1` downgrades that error
-   to a warning.
+   `float`, `str`, `bytes`, and `None` values, a `tuple` or `frozenset` whose members are all
+   such scalars (one level deep), and a compiled regex (recorded by full pattern and flags).
+   Any other module-level value—including a list, dict, set, a tuple holding a collection or
+   object, enum member, frozen model, or class instance—raises `StageDefinitionError`.
 
 7. **Portable bytecode fallback**: When source is unavailable or a function is wrapped,
    `marshal.dumps(__code__)` captures bytecode and constants. Pivot replaces every
@@ -325,7 +329,9 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
    across checkout paths.
 
 8. **Module-qualified manifest keys**: `func:`, `class:`, `const:`, `schema:`, `partial:`,
-   `mod:`, and `loader:` keys use the definition or binding module. A manifest can therefore
+   `ext:` and `loader:` keys use the definition or binding module. A value read as
+   `settings.NAME` gets the key it would get as a global (`const:settings.FACTOR`,
+   `func:settings.helper`, `ext:settings.AGG`). A manifest can therefore
    contain `func:project.alpha.helper` and `func:project.beta.helper` without one overwriting
    the other. A closure cell is keyed under the function that holds it: the stage function's
    own cells under its definition (`const:project.make_stage.<locals>.make.factor`), a local

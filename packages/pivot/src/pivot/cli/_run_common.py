@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportMissingModuleSource=false
 """Shared helpers for run and repro CLI commands."""
 
 from __future__ import annotations

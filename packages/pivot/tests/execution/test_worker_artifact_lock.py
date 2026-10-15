@@ -61,21 +61,22 @@ def _make_stage_info(
             "project_root": str(tmp_path),
             "pipeline_name": "test",
             "input_bindings": {"input": "input.csv"},
+            "checkout_modes": [
+                cache.CheckoutMode.HARDLINK,
+                cache.CheckoutMode.SYMLINK,
+                cache.CheckoutMode.COPY,
+            ],
         },
         "params": None,
         "variant": None,
         "overrides": {},
-        "checkout_modes": [
-            cache.CheckoutMode.HARDLINK,
-            cache.CheckoutMode.SYMLINK,
-            cache.CheckoutMode.COPY,
-        ],
         "run_id": "test_run",
         "force": True,
         "no_commit": True,
         "params_arg_name": None,
         "project_root": tmp_path,
         "state_dir": tmp_path / ".pivot",
+        "project_state_dir": tmp_path / ".pivot",
         "collection_params": {},
         "incremental_inputs": {},
     }
@@ -88,7 +89,7 @@ def test_lock_acquired_with_correct_keys(tmp_path: pathlib.Path, mocker: MockerF
     (tmp_path / ".pivot").mkdir(parents=True)
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
@@ -136,7 +137,7 @@ def test_lock_released_on_success(tmp_path: pathlib.Path, mocker: MockerFixture)
     (tmp_path / "input.csv").write_text("data")
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
@@ -206,7 +207,7 @@ def test_waiting_on_lock_status_message(tmp_path: pathlib.Path, mocker: MockerFi
     (tmp_path / "input.csv").write_text("data")
 
     input_ref = _make_artifact_ref(
-        "input", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str
+        "input", None, tag=types.ArtifactTag.INPUT, loader=loaders.Text(), python_type=str
     )
     output_ref = _make_artifact_ref(
         "test_stage", None, tag=types.ArtifactTag.DATA, loader=loaders.Text(), python_type=str

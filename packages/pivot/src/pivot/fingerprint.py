@@ -11,6 +11,7 @@ import logging
 import marshal
 import os
 import pathlib
+import re
 import sys
 import textwrap
 import types
@@ -56,8 +57,15 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 22 tracks class attributes a stage reads (`Config.SCALE`) and the schema of a
 # pydantic class read as a global.
 # Version 23 tracks only class attributes a user class body wrote, not library-defined ones.
-_CACHE_SCHEMA_VERSION = 23
+# Version 24 records `module.NAME` reads with the keys a global gets (`const:`, `func:`,
+# `ext:`), not `mod:`, and follows `settings.Config.SCALE` and `pkg.sub.helper`.
+# Version 25 records call-site artifact wiring (parameter bindings, collection kind/order,
+# and project-relative input paths) in the code manifest.
+# Version 26 records tuples and frozensets of scalars and compiled regexes by value.
+_CACHE_SCHEMA_VERSION = 26
 _REPR_SIZE_LIMIT = 10_000
+
+_SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
@@ -559,6 +567,24 @@ class _ValueKind(enum.Enum):
     SCALAR = "scalar"
 
 
+def _immutable_value_text(value: Any) -> str | None:
+    """Return the manifest text for a safely trackable immutable value, if any.
+
+    Scalars keep their existing repr. Exact tuples and frozensets are tracked only when every
+    member is an exact scalar type, one level deep. Compiled regexes record their full pattern
+    and flags because their repr truncates long patterns.
+    """
+    if isinstance(value, _SCALAR_TYPES):
+        return repr(value)
+    if type(value) in (tuple, frozenset) and all(
+        type(item) in _SCALAR_TYPES for item in cast("tuple[Any, ...] | frozenset[Any]", value)
+    ):
+        return _serialize_value_for_hash(value)
+    if isinstance(value, re.Pattern):
+        return _serialize_value_for_hash(value)
+    return None
+
+
 def _value_kind(value: Any) -> _ValueKind:
     """Classify a value a walked function reads; the walk and a cache hit share this."""
     # functools.partial fails is_user_code() (module is functools/stdlib).
@@ -572,7 +598,7 @@ def _value_kind(value: Any) -> _ValueKind:
         return _ValueKind.MODULE
     if isinstance(value, logging.Logger):
         return _ValueKind.LOGGER
-    if isinstance(value, (bool, int, float, str, bytes, type(None))):
+    if _immutable_value_text(value) is not None:
         return _ValueKind.SCALAR
     return _ValueKind.REFUSED
 
@@ -594,7 +620,7 @@ def _value_token(value: Any) -> str:
     if kind is _ValueKind.MODULE:
         return f"module:{value.__name__}"
     if kind is _ValueKind.SCALAR:
-        return f"{type(value).__name__}:{value!r}"
+        return f"{type(value).__name__}:{_immutable_value_text(value)}"
     if kind is _ValueKind.EXTERNAL:
         return f"external:{_library_name(value)}"
     return kind.value
@@ -871,8 +897,8 @@ def get_stage_fingerprint(
     - 'self:<name>': Function itself (hash)
     - 'func:<module>.<qualname>': Referenced helper functions (hash, transitive)
     - 'class:<module>.<qualname>': Referenced class definitions (hash, transitive)
-    - 'mod:<module>.<attr>': User-code module attributes (hash for callables, repr for primitives)
-    - 'const:<module>.<name>': Global primitive constants (repr value)
+    - 'const:<module>.<name>': Primitive constants, read as globals or as `module.NAME`
+    - 'ext:<module>.<name>': Library functions and classes, named by definition
     """
     if visited is None:
         visited = set()
@@ -1213,6 +1239,11 @@ def _resolve_dotted_path(parts: tuple[str, ...], ns: dict[str, Any]) -> Any:
     return obj
 
 
+def _method_function(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Return the underlying function behind a bound method."""
+    return cast("Callable[..., Any]", getattr(method, "__func__", method))
+
+
 def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
     """Generate fingerprint manifest for a loader instance.
 
@@ -1240,13 +1271,14 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
         if method is not None:
             _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
 
-    # Fingerprint save() if this is a Writer
+    # Use each method definition rather than a temporary bound method so the
+    # weak AST hash cache retains the entry across loader fingerprint calls.
     if isinstance(loader, loaders_module.Writer):
-        manifest[f"loader:{class_name}:save"] = hash_function_ast(loader.save)
+        manifest[f"loader:{class_name}:save"] = hash_function_ast(_method_function(loader.save))
 
     # Fingerprint load() if this is a Reader
     if isinstance(loader, loaders_module.Reader):
-        manifest[f"loader:{class_name}:load"] = hash_function_ast(loader.load)
+        manifest[f"loader:{class_name}:load"] = hash_function_ast(_method_function(loader.load))
 
         # Only fingerprint empty() if it's overridden in a Loader subclass
         if isinstance(loader, loaders_module.Loader):
@@ -1258,7 +1290,9 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
                     break
                 if "empty" in cls.__dict__:
                     # Found override in a subclass
-                    manifest[f"loader:{class_name}:empty"] = hash_function_ast(typed_loader.empty)
+                    manifest[f"loader:{class_name}:empty"] = hash_function_ast(
+                        _method_function(typed_loader.empty)
+                    )
                     break
 
     loader_any = cast("Any", loader)
@@ -1323,9 +1357,9 @@ def _check_non_scalar_capture(
         subject += f" as the default of parameter '{parameter}'"
     message = (
         f"Stage '{stage_name}': {subject} (type: {type(value).__name__}).\n"
-        + "Pivot tracks only module-level bool, int, float, str, bytes, and None values. "
-        + "Other values may change without a reliable fingerprint, which can cause silent wrong "
-        + "outputs.\n"
+        + "Pivot tracks module-level bool, int, float, str, bytes, and None values, tuples and "
+        + "frozensets of them, and compiled regexes. Other values may change without a reliable "
+        + "fingerprint, which can cause silent wrong outputs.\n"
         + "Fix: move this value into the stage's StageParams, or read it from a pipeline input.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
@@ -1490,7 +1524,9 @@ def _process_closure_values(
         step = f"{prefix}:{name}"
         _record_read(func, step)
         with _walking(step):
-            _process_captured_value(name, binding_ref, value, func, manifest, visited, stage_name)
+            _process_captured_value(
+                name, binding_ref, value, func, manifest, visited, stage_name, chain=name
+            )
 
 
 def _walk_owner(func: Callable[..., Any]) -> str:
@@ -1511,10 +1547,14 @@ def _process_captured_value(
     visited: set[int],
     stage_name: str,
     *,
+    chain: str | None,
     parameter: str | None = None,
 ) -> None:
     """Fingerprint one value `func` reads, or refuse it as a non-scalar capture.
 
+    `chain` is the expression `func` reaches the value by (`Config`, `settings.Config`, a
+    parameter name): the attributes read on a user class or user module are followed from it.
+    None means the value is not reached by a name, and its attributes are not followed.
     `parameter` names the parameter when the value is a default argument.
     """
     match _value_kind(value):
@@ -1524,12 +1564,15 @@ def _process_captured_value(
             )
         case _ValueKind.USER:
             _process_callable_dependency(binding_ref, value, manifest, visited)
-            if isinstance(value, type):
-                _process_class_reads(parameter or name, value, func, manifest, visited, stage_name)
+            if isinstance(value, type) and chain is not None:
+                _process_class_reads(chain, value, func, manifest, visited, stage_name)
         case _ValueKind.MODULE:
-            _process_module_dependency(parameter or name, value, func, manifest, visited)
+            if chain is not None:
+                _process_module_dependency(chain, value, func, manifest, visited)
         case _ValueKind.SCALAR:
-            manifest[f"const:{binding_ref}"] = repr(value)
+            text = _immutable_value_text(value)
+            assert text is not None
+            manifest[f"const:{binding_ref}"] = text
         case _ValueKind.REFUSED:
             _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
         case _ValueKind.EXTERNAL:
@@ -1540,16 +1583,32 @@ def _process_captured_value(
             return
 
 
+def _attributes_read(func: Callable[..., Any], chain: str) -> list[str]:
+    """Each attribute `func` reads directly on the value it reaches as `chain`, in source order.
+
+    For `chain` "settings", `settings.AGG(...)` and `settings.Config.SCALE` give `AGG` and
+    `Config`; what is read on `Config` is found from the chain "settings.Config".
+    """
+    prefix = f"{chain}."
+    found = dict[str, None]()
+    for owner, path in ast_utils.extract_module_attr_usage(func):
+        expression = f"{owner}.{path}"
+        if expression.startswith(prefix):
+            found[expression.removeprefix(prefix).split(".", 1)[0]] = None
+    return list(found)
+
+
 def _process_class_reads(
-    name: str,
+    chain: str,
     cls: type,
     func: Callable[..., Any],
     manifest: dict[str, str],
     visited: set[int],
     stage_name: str,
 ) -> None:
-    """Track each attribute `func` reads from user class `cls` through `name` (`Config.SCALE`).
+    """Track each attribute `func` reads from user class `cls`, reached as `chain`.
 
+    `chain` is `Config` for a global, `settings.Config` through a module, or a parameter name.
     The class AST hash does not see a class attribute computed at import, so each attribute
     `func` reads that the user wrote in a class body (`_is_user_class_attribute`) gets the rule
     a module-level value gets: a scalar is `const:<class>.<NAME>`, a non-scalar is refused, a
@@ -1562,9 +1621,7 @@ def _process_class_reads(
         _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", cls), manifest, visited)
         return
     class_ref = _definition_ref(cls)
-    read = ast_utils.extract_module_attr_usage(func)
-    attributes = dict.fromkeys(path.split(".", 1)[0] for owner, path in read if owner == name)
-    for attribute in attributes:
+    for attribute in _attributes_read(func, chain):
         if attribute.startswith("__") or not _is_user_class_attribute(cls, attribute):
             continue
         step = f"ca:{attribute}"
@@ -1585,6 +1642,7 @@ def _process_class_reads(
                     manifest,
                     visited,
                     stage_name,
+                    chain=None,
                 )
 
 
@@ -1647,7 +1705,7 @@ def _process_default_values(
         binding_ref = f"{func_ref}.{parameter}"
         step = f"d:{parameter}"
         _record_read(func, step)
-        if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        if isinstance(value, _SCALAR_TYPES):
             manifest[f"default:{binding_ref}"] = repr(value)
             continue
         if isinstance(value, stage_def.StageParams):
@@ -1661,10 +1719,22 @@ def _process_default_values(
         expression = expressions.get(parameter)
         if expression is not None and _is_literal(expression):
             continue
+        text = _immutable_value_text(value)
+        if text is not None:
+            manifest[f"default:{binding_ref}"] = text
+            continue
         source = ast.unparse(expression) if expression is not None else parameter
         with _walking(step):
             _process_captured_value(
-                source, binding_ref, value, func, manifest, visited, stage_name, parameter=parameter
+                source,
+                binding_ref,
+                value,
+                func,
+                manifest,
+                visited,
+                stage_name,
+                chain=parameter,
+                parameter=parameter,
             )
 
 
@@ -2098,12 +2168,16 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     canonical({field: value})]`, field by field, so a secret inside one reaches that leaf
     rather than the generated repr's mask. An object whose class keeps `object.__repr__`
     (which holds the address) and that has a `__dict__` becomes
-    `[module.qualname, canonical(vars(obj))]`.
-    Other leaves keep their `repr`, tagged with their type. A class is a leaf, even a pydantic
-    model class: only an instance is dumped.
+    `[module.qualname, canonical(vars(obj))]`. A compiled regex becomes
+    `["re.Pattern", canonical(pattern), flags]`, so its full pattern is recorded. Other leaves
+    keep their `repr`, tagged with their type. A class is a leaf, even a pydantic model class:
+    only an instance is dumped.
     """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, re.Pattern):
+        pattern = cast("re.Pattern[Any]", value)
+        return ["re.Pattern", _canonicalize_value_for_hash(pattern.pattern), pattern.flags]
     if id(value) in active:
         return ["cycle", len(active) - active.index(id(value))]
     if hasattr(value, "model_dump") and not isinstance(value, type):
@@ -2172,60 +2246,44 @@ def _add_callable_to_manifest(
 
 
 def _process_module_dependency(
-    name: str,
+    chain: str,
     module: types.ModuleType,
     func: Callable[..., Any],
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
-    """Process module attribute dependencies and add to manifest."""
-    # Only track attributes from user-code modules.
-    # Non-user-code modules (numpy, pandas, stdlib) are not tracked because:
-    # - AST already captures which functions are called
-    # - We can't detect library implementation changes anyway
-    # - repr() of objects like np.c_ contains memory addresses (non-deterministic)
+    """Fingerprint each attribute `func` reads on user module `module`, reached as `chain`.
+
+    An attribute read as `settings.NAME` takes the path a global takes
+    (`_process_captured_value`), with the binding `<module>.<NAME>`: a scalar is
+    `const:settings.FACTOR`, a library function `ext:settings.AGG`, a partial or a logger gets
+    the global rule, and a class or submodule has its own reads followed from the longer chain
+    (`settings.Config.SCALE`). A cache hit re-reads each attribute (`a:NAME`). A library
+    module adds nothing: its attributes are library code, and `repr()` of objects like `np.c_`
+    holds an address.
+    """
     if not is_user_code(module):
         return
-
-    _t = metrics.start()
-    attrs = ast_utils.extract_module_attr_usage(func)
-    metrics.end("fingerprint.extract_module_attr_usage", _t)
-    module_name = getattr(module, "__name__", name)
-
-    for mod_name, attr_name in attrs:
-        if mod_name not in (name, module_name):
-            continue
-        step = f"a:{attr_name}"
+    stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
+    for attribute in _attributes_read(func, chain):
+        step = f"a:{attribute}"
         _record_read(module, step)
-        key = f"mod:{module_name}.{attr_name}"
-        if key in manifest:
-            continue
         try:
-            attr_value = getattr(module, attr_name)
+            value = getattr(module, attribute)
         except AttributeError:
-            manifest[key] = "unknown"
             continue
+        binding_ref = f"{module.__name__}.{attribute}"
         with _walking(step):
-            if (
-                _is_callable_instance(attr_value)
-                or _is_user_class_instance(attr_value)
-                or _carries_instance(attr_value)
-            ):
-                _check_non_scalar_capture(
-                    f"{module_name}.{attr_name}",
-                    attr_value,
-                    _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
-                )
-            elif callable(attr_value) and is_user_code(attr_value):
-                _add_callable_to_manifest(key, attr_value, manifest, visited)
-            elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
-                manifest[key] = repr(attr_value)
-            else:
-                _check_non_scalar_capture(
-                    f"{module_name}.{attr_name}",
-                    attr_value,
-                    _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
-                )
+            _process_captured_value(
+                binding_ref,
+                binding_ref,
+                value,
+                func,
+                manifest,
+                visited,
+                stage_name,
+                chain=f"{chain}.{attribute}",
+            )
 
 
 def _get_qualname_for_cache(func: Callable[..., Any]) -> str:
@@ -2491,9 +2549,8 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint.ast_parse", _t_parse)
 
         _t_norm = metrics.start()
-        if hasattr(func, "__pivot_resources__"):
-            globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
-            _strip_stage_decorator(tree, globals_dict)
+        globals_dict = cast("dict[str, Any]", getattr(func, "__globals__", {}))
+        _strip_stage_decorator(tree, globals_dict)
         tree = _normalize_ast(tree)
         ast_str = ast.dump(tree, annotate_fields=True, include_attributes=False)
         metrics.end("fingerprint.normalize_and_dump", _t_norm)

@@ -1,4 +1,3 @@
-# pyright: reportImplicitRelativeImport=false
 """Per-stage lock files for tracking pipeline state.
 
 StageLock provides persistent lock files (.lock) for change detection,
@@ -12,8 +11,9 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import re
-from typing import TYPE_CHECKING, TypeGuard, cast
+from typing import TypeGuard, cast
 
 import yaml
 
@@ -32,9 +32,6 @@ from pivot.types import (
     is_dir_hash,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 logger = logging.getLogger(__name__)
 
 _VALID_STAGE_NAME = re.compile(
@@ -47,7 +44,7 @@ _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 STAGES_REL_PATH = ".pivot/stages"
 
 
-def get_stages_dir(state_dir: Path) -> Path:
+def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
     """Return the stages directory for lock files.
 
     Lock files are stored in .pivot/stages/ (git-tracked) rather than
@@ -106,6 +103,17 @@ def _is_nonempty_str(value: object) -> bool:
     return isinstance(value, str) and value != ""
 
 
+def _is_project_relative_posix_path(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\\" in value:
+        return False
+    path = pathlib.PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and path.as_posix() == value
+        and all(part not in {".", ".."} for part in path.parts)
+    )
+
+
 def _is_str_mapping(value: object, *, str_values: bool) -> bool:
     if not isinstance(value, dict):
         return False
@@ -148,10 +156,12 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | None:
         return f"{field}.producer"
     if "key" not in entry or not (entry["key"] is None or isinstance(entry["key"], str)):
         return f"{field}.key"
-    if list_key == "outs" and not isinstance(entry.get("tag"), str):
-        return f"{field}.tag"
-    if "display" in entry and not isinstance(entry["display"], str):
-        return f"{field}.display"
+    if (
+        list_key == "outs"
+        and "path" in entry
+        and not _is_project_relative_posix_path(entry["path"])
+    ):
+        return f"{field}.path"
     if "size" in entry and not _is_int(entry["size"]):
         return f"{field}.size"
     if "manifest" in entry:
@@ -184,18 +194,7 @@ def _lock_shape_error(data: object) -> str | None:
                 return error
     if "schema_version" in document and not _is_int(document["schema_version"]):
         return "schema_version"
-    merkle_id = document.get("merkle_id")
-    if merkle_id is not None and not isinstance(merkle_id, str):
-        return "merkle_id"
     return None
-
-
-def _get_output_tag(hash_info: HashInfo) -> str:
-    raw: dict[str, object] = cast("dict[str, object]", cast("object", hash_info))
-    value = raw.get("tag")
-    if isinstance(value, str):
-        return value
-    return "data"
 
 
 def _convert_to_storage_format(data: LockData) -> StorageLockData:
@@ -213,7 +212,9 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     outs_list = list[OutEntry]()
     for identity, hash_info in normalized_outs.items():
-        entry = OutEntry(key=identity.key, hash=hash_info["hash"], tag=_get_output_tag(hash_info))
+        entry = OutEntry(key=identity.key, hash=hash_info["hash"])
+        if "output_paths" in data and identity in data["output_paths"]:
+            entry["path"] = data["output_paths"][identity]
         if is_dir_hash(hash_info):
             entry["manifest"] = hash_info["manifest"]
         outs_list.append(entry)
@@ -221,18 +222,13 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
 
-    storage = StorageLockData(
+    return StorageLockData(
         schema_version=2,
         code_manifest=sorted_code_manifest,
         params=data["params"],
         deps=deps_list,
         outs=outs_list,
     )
-    if "merkle_id" in data:
-        mid = data["merkle_id"]
-        if mid is not None:
-            storage["merkle_id"] = mid
-    return storage
 
 
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
@@ -247,20 +243,25 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
         dep_hashes[identity] = hash_info
 
     output_hashes = dict[ArtifactIdentity, HashInfo]()
+    output_paths = dict[ArtifactIdentity, str]()
     for entry in data["outs"]:
         identity = ArtifactIdentity(stage_name, entry["key"])
         if "manifest" in entry:
             output_hashes[identity] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
         else:
             output_hashes[identity] = FileHash(hash=entry["hash"])
+        if "path" in entry:
+            output_paths[identity] = entry["path"]
 
-    return LockData(
+    lock_data = LockData(
         code_manifest=data["code_manifest"],
         params=data["params"],
         dep_hashes=dep_hashes,
         output_hashes=output_hashes,
-        merkle_id=data.get("merkle_id"),
     )
+    if output_paths:
+        lock_data["output_paths"] = output_paths
+    return lock_data
 
 
 def _ensure_identity_keys(
@@ -278,9 +279,9 @@ class StageLock:
     """Manages lock file for a single pipeline stage."""
 
     stage_name: str
-    path: Path
+    path: pathlib.Path
 
-    def __init__(self, stage_name: str, stages_dir: Path) -> None:
+    def __init__(self, stage_name: str, stages_dir: pathlib.Path) -> None:
         """Initialize a stage lock for the given stage in stages_dir."""
         reason = stage_name_error(stage_name)
         if reason is not None:
@@ -315,7 +316,7 @@ class StageLock:
 
 
 def find_orphaned_locks(
-    stages_dir: Path,
+    stages_dir: pathlib.Path,
     registered_stages: set[str],
 ) -> list[str]:
     """Find lock files in stages_dir that don't correspond to any registered stage.

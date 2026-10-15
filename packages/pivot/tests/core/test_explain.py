@@ -53,7 +53,7 @@ def _input_ref(name: str) -> ArtifactRef:
         identity=ArtifactIdentity(name, None),
         format=loaders.Text(),
         python_type=str,
-        tag=ArtifactTag.DATA,
+        tag=ArtifactTag.INPUT,
     )
 
 
@@ -64,6 +64,11 @@ def _store(tmp_path: pathlib.Path) -> store_mod.WorkspaceStore:
         input_bindings={"data.csv": "data.csv"},
         cache_dir=tmp_path / ".pivot" / "cache",
     )
+
+
+def _lock(state_dir: pathlib.Path, stage_name: str) -> LockData | None:
+    """The stage's lock as status reads it before explaining."""
+    return lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
 
 
 def test_get_stage_explanation_with_allow_missing_stale_pvt(
@@ -100,6 +105,7 @@ def test_get_stage_explanation_with_allow_missing_stale_pvt(
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "pvt_stage"),
         allow_missing=True,
         tracked_files=tracked_files,
         tracked_trie=tracked_trie,
@@ -353,6 +359,7 @@ def test_get_stage_explanation_no_lock(tmp_path: pathlib.Path) -> None:
         overrides=None,
         state_dir=tmp_path / ".pivot",
         store=_store(tmp_path),
+        lock_data=None,
     )
 
     assert result == StageExplanation(
@@ -382,6 +389,7 @@ def test_get_stage_explanation_unchanged(tmp_path: pathlib.Path) -> None:
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "unchanged_stage"),
     )
 
     assert result["will_run"] is False
@@ -407,6 +415,7 @@ def test_get_stage_explanation_without_state_db_has_no_side_effects(
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "unchanged_stage"),
     )
 
     assert result["will_run"] is False
@@ -454,6 +463,7 @@ def _explain_with_outputs(
         overrides=None,
         state_dir=state_dir,
         store=store,
+        lock_data=_lock(state_dir, "s"),
     )
 
 
@@ -512,6 +522,7 @@ def test_get_stage_explanation_code_changed(tmp_path: pathlib.Path) -> None:
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "code_stage"),
     )
 
     assert result["will_run"] is True
@@ -543,6 +554,7 @@ def test_get_stage_explanation_params_changed(tmp_path: pathlib.Path) -> None:
         overrides={"param_stage": {"learning_rate": 0.001}},
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "param_stage"),
     )
 
     assert result["will_run"] is True
@@ -575,6 +587,7 @@ def test_get_stage_explanation_deps_changed(tmp_path: pathlib.Path) -> None:
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "dep_stage"),
     )
 
     assert result["will_run"] is True
@@ -611,6 +624,7 @@ def test_get_stage_explanation_multiple_changes(tmp_path: pathlib.Path) -> None:
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "multi_stage"),
     )
 
     assert result["will_run"] is True
@@ -634,6 +648,7 @@ def test_get_stage_explanation_missing_deps(tmp_path: pathlib.Path) -> None:
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "missing_deps_stage"),
     )
 
     assert result["will_run"] is True
@@ -664,6 +679,7 @@ def test_get_stage_explanation_invalid_params(tmp_path: pathlib.Path) -> None:
         overrides={"stage": {"unknown_field": "value"}},
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "stage"),
     )
 
     assert result["will_run"] is True
@@ -688,6 +704,7 @@ def test_get_stage_explanation_invalid_params_does_not_echo_a_secret(
         overrides={"stage": {"pin": "99x999"}},
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "stage"),
     )
 
     assert result["will_run"] is True
@@ -721,6 +738,7 @@ def test_get_stage_explanation_force_without_changes(
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, stage_name),
         force=True,
     )
 
@@ -750,6 +768,7 @@ def test_get_stage_explanation_force_with_code_changes(tmp_path: pathlib.Path) -
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "code_stage"),
         force=True,
     )
 
@@ -775,6 +794,7 @@ def test_get_stage_explanation_force_with_missing_deps(tmp_path: pathlib.Path) -
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "dep_stage"),
         force=True,
     )
 
@@ -934,6 +954,7 @@ def test_get_stage_explanation_with_allow_missing_uses_pvt_hash(
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "pvt_stage"),
         allow_missing=True,
         tracked_files=tracked_files,
         tracked_trie=tracked_trie,
@@ -960,6 +981,7 @@ def test_get_stage_explanation_allow_missing_untracked_still_fails(
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "stage"),
         allow_missing=True,
         tracked_files={},
         tracked_trie=pygtrie.Trie(),
@@ -991,6 +1013,7 @@ def test_get_stage_explanation_allow_missing_uses_lock_file_hash(
         overrides=None,
         state_dir=state_dir,
         store=_store(tmp_path),
+        lock_data=_lock(state_dir, "lock_fallback_stage"),
         allow_missing=True,
         tracked_files={},
         tracked_trie=pygtrie.Trie(),

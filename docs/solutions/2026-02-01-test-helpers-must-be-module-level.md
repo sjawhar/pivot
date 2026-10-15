@@ -42,7 +42,7 @@ def _helper_uses_math():
 
 def test_fingerprint_tracking():
     manifest = fingerprint.get_stage_fingerprint(_helper_uses_math)
-    # manifest contains mod:math.pi - changes detected correctly
+    # manifest contains self:helper_uses_math - changes detected correctly
 ```
 
 For test files, follow this pattern:

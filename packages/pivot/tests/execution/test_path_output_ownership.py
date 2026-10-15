@@ -7,6 +7,7 @@ import pytest
 
 from pivot import exceptions, loaders, types
 from pivot.executor import worker
+from pivot.storage import cache
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
@@ -120,7 +121,7 @@ def test_stage_returning_external_path_dependency_does_not_move_user_file(
         identity=types.ArtifactIdentity(producer="external", key=None),
         format=loaders.PathOnly(),
         python_type=pathlib.Path,
-        tag=types.ArtifactTag.DATA,
+        tag=types.ArtifactTag.INPUT,
     )
     out = types.ArtifactRef(
         identity=types.ArtifactIdentity(producer="pathret/passthrough", key=None),
@@ -139,18 +140,19 @@ def test_stage_returning_external_path_dependency_does_not_move_user_file(
             "project_root": str(tmp_path),
             "pipeline_name": "pathret",
             "input_bindings": {"external": str(external)},
+            "checkout_modes": cache.DEFAULT_CHECKOUT_MODE_ORDER.copy(),
         },
         signature=None,
         params=None,
         variant=None,
         overrides={},
-        checkout_modes=[],
         run_id="test_run",
         force=False,
         no_commit=True,
         params_arg_name=None,
         project_root=tmp_path,
         state_dir=state_dir,
+        project_state_dir=state_dir,
         collection_params={},
         incremental_inputs={},
     )

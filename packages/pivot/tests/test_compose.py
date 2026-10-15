@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import queue
 import tempfile
 import typing
 from typing import TYPE_CHECKING, Annotated, NotRequired, Required, TypedDict
 
+import numpy
 import pandas as pd
 import pytest
+import yaml
 
 from pivot import exceptions, fingerprint, loaders, stage_def, types
 from pivot.compose import (
@@ -158,6 +161,22 @@ def test_artifact_handle_input_no_suboutputs() -> None:
         _ = handle.anything
 
 
+def test_handle_output_lookup_keeps_each_dunders_exception(tmp_path: pathlib.Path) -> None:
+    """Attribute access raises AttributeError and item access KeyError, naming the outputs."""
+    with Pipeline("lookup", root=tmp_path) as pipeline:
+        built = _helper_build_tagged()
+        source = pipeline.input("raw.txt", t=str)
+
+    with pytest.raises(AttributeError, match=r"has no output 'missing'\. Available: \["):
+        _ = built.missing
+    with pytest.raises(KeyError, match=r"has no output 'missing'\. Available: \["):
+        _ = built["missing"]  # pyright: ignore[reportGeneralTypeIssues] - the error under test
+    with pytest.raises(AttributeError, match="has no sub-outputs"):
+        _ = source.missing
+    with pytest.raises(KeyError, match="has no sub-outputs"):
+        _ = source["missing"]  # pyright: ignore[reportArgumentType] - the error under test
+
+
 # --- @stage decorator ---
 
 
@@ -174,11 +193,9 @@ def test_stage_preserves_metadata() -> None:
     def my_func(x: pd.DataFrame) -> pd.DataFrame:
         return x
 
-    stage_func = typing.cast("typing.Any", my_func)
-
     assert my_func.__name__ == "my_func"
-    assert stage_func._is_stage is True
-    assert stage_func._original_func is not my_func
+    assert inspect.unwrap(my_func) is not my_func, "the wrapper wraps the original function"
+    assert inspect.unwrap(my_func).__name__ == "my_func"
 
 
 # --- Return type analysis ---
@@ -596,11 +613,11 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     stage_b = legacy.get_stage("compose_build/_helper_build_stage_b")
 
     assert stage_a["func"] is inspect.unwrap(_helper_build_stage_a)
-    assert not hasattr(stage_a["func"], "_is_stage")
+    assert not hasattr(stage_a["func"], "__wrapped__"), "stage info holds the original function"
     assert stage_a["name"] == "compose_build/_helper_build_stage_a"
     assert stage_a["deps"]["raw"].identity == types.ArtifactIdentity(producer="raw", key=None)
     assert isinstance(stage_a["deps"]["raw"].format, loaders.YAML)
-    assert stage_a["deps"]["raw"].tag is types.ArtifactTag.DATA
+    assert stage_a["deps"]["raw"].tag is types.ArtifactTag.INPUT
     assert stage_a["params"] is not None
     assert isinstance(stage_a["params"], stage_def.StageParams)
     assert stage_a["params_arg_name"] == "params"
@@ -705,6 +722,25 @@ def test_pipeline_build_artifact_refs_and_tags(tmp_path: pathlib.Path) -> None:
     assert tags["chart"] is types.ArtifactTag.PLOT
 
 
+@stage
+def _helper_read_tagged(metrics: dict, chart: pd.DataFrame) -> dict:
+    return {"rows": metrics["rows"], "chart_rows": len(chart)}
+
+
+def test_consumer_dep_carries_the_producer_out_tag(tmp_path: pathlib.Path) -> None:
+    """One output carries one tag, whether read as the producer's out or a consumer's dep."""
+    with Pipeline("compose_tagged", root=tmp_path) as pipeline:
+        built = _helper_build_tagged()
+        _helper_read_tagged(built.metrics, built["chart"])
+
+    outs = pipeline.get_stage("compose_tagged/_helper_build_tagged")["outs"]
+    deps = pipeline.get_stage("compose_tagged/_helper_read_tagged")["deps"]
+    out_tags = {out.identity.key: out.tag for out in outs}
+
+    assert deps["metrics"].tag is out_tags["metrics"] is types.ArtifactTag.METRIC
+    assert deps["chart"].tag is out_tags["chart"] is types.ArtifactTag.PLOT
+
+
 def test_validate_artifact_identity_rejects_path_separators() -> None:
     # Slashes are allowed as namespace separators
     types.validate_artifact_identity(
@@ -736,6 +772,11 @@ def test_validate_artifact_identity_rejects_path_separators() -> None:
         types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/../b"))
     with pytest.raises(ValueError):
         types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="a/./b"))
+    # Absolute identity components could discard the managed output prefix.
+    with pytest.raises(ValueError, match="producer cannot be absolute"):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="/tmp/out", key=None))
+    with pytest.raises(ValueError, match="key cannot be absolute"):
+        types.validate_artifact_identity(types.ArtifactIdentity(producer="ok", key="/tmp/out"))
 
 
 # --- Pipeline variant context manager ---
@@ -1229,11 +1270,49 @@ def _helper_with_plain_arg(data: pd.DataFrame, verbose: bool = False) -> pd.Data
 
 def test_record_stage_rejects_explicit_unsupported_arg(tmp_path: pathlib.Path) -> None:
     with (
-        pytest.raises(ValueError, match="unsupported type"),
+        pytest.raises(exceptions.StageDefinitionError, match="unsupported type"),
         Pipeline("test", root=tmp_path) as pipeline,
     ):
         inp = pipeline.input("data.csv", path="data/raw/data.csv", t=pd.DataFrame)
         _helper_with_plain_arg(data=inp, verbose=True)
+
+
+@stage
+def _helper_join_varargs(*parts: str) -> str:
+    return "".join(parts)
+
+
+@stage
+def _helper_echo_positional_only(value: str, /) -> str:
+    return value
+
+
+@stage
+def _helper_collect_kwargs(**extra: str) -> str:
+    return "".join(extra.values())
+
+
+def test_record_stage_rejects_signatures_workers_cannot_call_with_kwargs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Workers call a stage as func(**kwargs), so varargs-only signatures are refused early."""
+    with (
+        pytest.raises(exceptions.StageDefinitionError) as exc_info,
+        Pipeline("test", root=tmp_path) as pipeline,
+    ):
+        first = pipeline.input("first.txt", t=str)
+        second = pipeline.input("second.txt", t=str)
+        _helper_join_varargs(first, second)
+        _helper_echo_positional_only(first)
+        _helper_collect_kwargs()
+
+    message = str(exc_info.value)
+    assert "test/_helper_join_varargs" in message
+    assert "parameter 'parts' uses *args; use a list[...] parameter instead of *args" in message
+    assert "test/_helper_echo_positional_only" in message
+    assert "parameter 'value' is positional-only; remove the /" in message
+    assert "test/_helper_collect_kwargs" in message
+    assert "parameter 'extra' uses **kwargs; use named parameters instead" in message
 
 
 def test_record_stage_ignores_default_unsupported_arg(tmp_path: pathlib.Path) -> None:
@@ -1307,6 +1386,7 @@ def _make_stage_info(
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 
@@ -1706,6 +1786,36 @@ def test_build_includes_only_foreign_closure(tmp_path: pathlib.Path) -> None:
 # --- Cross-pipeline input-binding merge ---
 
 
+@stage
+def _helper_join_direct_foreign_inputs(left: str, right: str) -> str:
+    return f"{left}:{right}"
+
+
+def test_direct_foreign_input_binding_conflict_raises(tmp_path: pathlib.Path) -> None:
+    first = Pipeline("first", root=tmp_path)
+    with first:
+        left = first.input("shared.txt", path="first.txt", t=str)
+    second = Pipeline("second", root=tmp_path)
+    with second:
+        right = second.input("shared.txt", path="second.txt", t=str)
+
+    with (
+        pytest.raises(ValueError, match=r"Input binding conflict.*shared\.txt"),
+        Pipeline("consumer", root=tmp_path),
+    ):
+        _helper_join_direct_foreign_inputs(left, right)
+
+
+def test_direct_foreign_input_binding_is_exposed_to_watch_paths(tmp_path: pathlib.Path) -> None:
+    shared = Pipeline("shared", root=tmp_path)
+    with shared:
+        source = shared.input("shared.txt", path="actual.txt", t=str)
+    with Pipeline("consumer", root=tmp_path) as consumer:
+        _helper_join_direct_foreign_inputs(source, source)
+
+    assert consumer.input_bindings["shared.txt"] == "actual.txt"
+
+
 def test_cross_pipeline_input_bindings_propagated(tmp_path: pathlib.Path) -> None:
     p1 = Pipeline("base", root=tmp_path)
     with p1:
@@ -1961,12 +2071,12 @@ def _helper_execute_compose_stage(
         project_root=str(tmp_path),
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
+        checkout_modes=[cache.CheckoutMode.COPY],
     )
     stage_info = executor_core.prepare_worker_info(
         pipeline.get_stage(stage_name),
         pipeline,
         overrides={},
-        checkout_modes=[cache.CheckoutMode.COPY],
         run_id="test_run",
         force=False,
         no_commit=False,
@@ -2051,3 +2161,132 @@ def test_stage_returning_path_inside_workspace_is_rejected(
     assert (tmp_path / "data" / "raw" / "handwritten.bin").read_bytes() == b"inside workspace", (
         "Rejected workspace file must be left untouched"
     )
+
+
+# --- YAML metrics must be safe-readable by downstream stages ---
+
+
+@stage
+def _helper_metric_numpy_scalar(params: stage_def.StageParams) -> Annotated[dict, metric]:
+    return {"mean": numpy.float64(0.5)}
+
+
+@stage
+def _helper_consume_metric_scalar(stats: dict) -> dict:
+    return {"mean": stats["mean"]}
+
+
+def test_metric_numpy_scalar_is_safe_for_downstream_stage(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        stats = _helper_metric_numpy_scalar(params=stage_def.StageParams())
+        _helper_consume_metric_scalar(stats=stats)
+
+    producer_result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_numpy_scalar", tmp_path, output_queue
+    )
+    assert producer_result["status"] == types.StageStatus.RAN, producer_result["reason"]
+
+    consumer_result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_consume_metric_scalar", tmp_path, output_queue
+    )
+    assert consumer_result["status"] == types.StageStatus.RAN, consumer_result["reason"]
+
+    metric_data = loaders.YAML[dict[str, float]]().load(
+        tmp_path / "metrics" / "metricsafe" / "_helper_metric_numpy_scalar.yaml"
+    )
+    assert metric_data == {"mean": 0.5}
+
+
+@stage
+def _helper_metric_dataframe(params: stage_def.StageParams) -> Annotated[pd.DataFrame, metric]:
+    return pd.DataFrame({"value": [1.0]})
+
+
+def _helper_stage_logs(output_queue: mp.Queue[OutputMessage]) -> list[str]:
+    lines = list[str]()
+    while True:
+        try:
+            message = output_queue.get(timeout=0.5)
+        except queue.Empty:
+            return lines
+        if message is not None and message["kind"] == types.OutputMessageKind.LOG:
+            lines.append(message["line"])
+
+
+def test_metric_dataframe_warns_with_stage_and_output_and_keeps_old_yaml(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        _helper_metric_dataframe(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_dataframe", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = [line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")]
+    assert len(warnings) == 1, warnings
+    assert "Stage 'metricsafe/_helper_metric_dataframe' wrote its YAML output" in warnings[0]
+    assert "got DataFrame at root" in warnings[0]
+    assert "None" not in warnings[0], "a single output has no key to name"
+    written = tmp_path / "metrics" / "metricsafe" / "_helper_metric_dataframe.yaml"
+    assert written.read_text() == yaml.dump(
+        pd.DataFrame({"value": [1.0]}), default_flow_style=False
+    )
+
+
+@stage
+def _helper_metric_longdouble(params: stage_def.StageParams) -> Annotated[dict, metric]:
+    return {"mean": numpy.longdouble("1.0000000000000000009")}
+
+
+def test_metric_longdouble_warns_with_stage_and_type(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        _helper_metric_longdouble(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_longdouble", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = [line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")]
+    assert len(warnings) == 1, warnings
+    assert "metricsafe/_helper_metric_longdouble" in warnings[0]
+    assert "longdouble" in warnings[0]
+
+
+class _HelperFrameAndCounts(TypedDict):
+    frame: pd.DataFrame
+    counts: dict
+
+
+@stage
+def _helper_lossy_keyed_outputs(params: stage_def.StageParams) -> _HelperFrameAndCounts:
+    return _HelperFrameAndCounts(
+        frame=pd.DataFrame({"cell": [{1, 2}]}), counts={"when": numpy.timedelta64(5, "ns")}
+    )
+
+
+def test_lossy_keyed_outputs_warn_naming_each_output(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("lossy", root=tmp_path) as pipeline:
+        _helper_lossy_keyed_outputs(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "lossy/_helper_lossy_keyed_outputs", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = sorted(
+        line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")
+    )
+    assert len(warnings) == 2, warnings
+    assert "Stage 'lossy/_helper_lossy_keyed_outputs' wrote output 'counts'" in warnings[0]
+    assert "timedelta64" in warnings[0]
+    assert "Stage 'lossy/_helper_lossy_keyed_outputs' wrote output 'frame'" in warnings[1]
+    assert "column 'cell'" in warnings[1]

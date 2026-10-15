@@ -86,6 +86,8 @@ Restored 3 file(s)
 
 After pulling, `pivot repro` skips stages whose outputs are already present and match their lock file hashes.
 
+Every downloaded file is checked against the hash it is stored under before it enters the local cache. A file that does not match is discarded and counted as failed (`Hash mismatch: expected …, got …`), and `pivot pull` exits without restoring anything. To repair the remote, delete that object from it, then run `pivot push` on a machine whose cache has a good copy and has not run `pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` against this remote for this object. Pivot records hashes those commands upload, download, or find, then skips recorded hashes. If every machine with a good copy has recorded it, delete `.pivot/state.lmdb/` before pushing; this also clears run history and local caches. The check catches corruption in storage or transfer. It does not authenticate who wrote the file.
+
 ### Selective Pull
 
 ```bash
@@ -107,7 +109,7 @@ pivot pull --dry-run
 | `-n`, `--dry-run` | Show what would be downloaded |
 | `-j`, `--jobs` | Number of parallel download threads |
 | `-f`, `--force` | Overwrite existing workspace files |
-| `--only-missing` | Only restore files that don't exist on disk |
+| `--only-missing` | Only restore files that don't exist on disk (the default without `--force`); a directory is replaced when every changed or extra file is pivot's own earlier output, and refused (naming the files) when one holds a local change the cache lacks. Entries the directory hash skips (`build/`, `__pycache__/`, `*.swp`, ...) are kept as they are |
 | `--checkout-mode` | `symlink`, `hardlink`, or `copy` (default: project config) |
 
 ## Fetch and Checkout Separately
@@ -140,6 +142,8 @@ pivot checkout --only-missing
 | Config (`.pivot/config.yaml`) | No | Yes (commit this) |
 
 **Lock files are the bridge.** They map each stage output to its content hash. Push uploads the files referenced by those hashes; pull downloads them. Always commit lock files to version control so other machines know what to pull.
+
+Pulling a stage also fetches the outputs of the upstream stages it depends on, and any dependency tracked with `pivot track`. It never fetches raw inputs committed to git (`data/raw/...`), metric outputs (git carries both), or files brought in with `pivot import`: those come from the source repo's remote, and `pivot update` refreshes them.
 
 ## Multiple Remotes
 

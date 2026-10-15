@@ -56,6 +56,16 @@ When multiple `pivot` processes share the same StateDB:
   - LMDB's internal write serialization (via `lock.mdb`) handles actual mutual exclusion
 - On timeout: raises `PivotDBWriteTimeoutError` with diagnostic message
 
+## Restore Locking
+
+- Restores with a `state_dir` take an exclusive per-target `flock` in `state_dir/locks/`.
+- Restore lock files persist. Do not unlink or age-delete them: a waiter can hold the
+  old inode while a new opener locks a replacement inode, defeating mutual exclusion.
+- File restores stage their link or copy beside the target, under a name tagged with the
+  target's token, and atomically replace it. Directory restores build in a private
+  temporary directory and swap it. Both run under the target's restore lock, and each
+  first removes the token-tagged entries a killed restore of the same target left.
+
 ## Path Storage
 
 All paths stored in the database must be **relative** to ensure portability across machines and correct cache behavior.

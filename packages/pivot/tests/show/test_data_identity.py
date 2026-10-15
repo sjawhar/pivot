@@ -51,6 +51,7 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 
@@ -104,8 +105,8 @@ def test_extract_output_hashes_from_lock_uses_identity_keys() -> None:
         "params": {},
         "deps": [],
         "outs": [
-            {"key": None, "hash": "deadbeef", "tag": "data"},
-            {"key": "model", "hash": "beadfeed", "tag": "data"},
+            {"key": None, "hash": "deadbeef"},
+            {"key": "model", "hash": "beadfeed"},
         ],
     }
 

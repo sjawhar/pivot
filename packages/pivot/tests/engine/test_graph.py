@@ -48,6 +48,7 @@ def _create_stage(
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 
@@ -75,15 +76,6 @@ def test_parse_node_extracts_type_and_value() -> None:
     node_type, value = graph.parse_node("stage:train")
     assert node_type == types.NodeType.STAGE
     assert value == "train"
-
-
-def test_parse_node_handles_colons_in_path() -> None:
-    """parse_artifact_identity parses producer-only strings."""
-    identity = graph.parse_artifact_identity("external")
-    assert identity == ArtifactIdentity("external", None)
-
-    identity = graph.parse_artifact_identity("producer:key")
-    assert identity == ArtifactIdentity("producer", "key")
 
 
 # --- Graph building tests ---
@@ -439,6 +431,7 @@ def test_validate_dependency_sources_reports_missing_pipeline_input_path(
             [ArtifactIdentity("demo/combine", None)],
         )
     }
+    stages["demo/combine"]["deps"]["_0"].tag = ArtifactTag.INPUT
     store = store_mod.WorkspaceStore(
         project_root=set_project_root,
         pipeline_name="demo",

@@ -18,6 +18,13 @@ _GITHUB_SSH_RE = re.compile(r"^git@github\.com:([^/]+)/([^/.]+?)(?:\.git)?$")
 _API_BASE = "https://api.github.com"
 
 
+class DirectoryEntry(typing.TypedDict):
+    """One GitHub Contents API directory entry."""
+
+    name: str
+    type: str
+
+
 def get_token() -> str | None:
     """Get GitHub auth token from environment.
 
@@ -126,7 +133,7 @@ async def list_directory(
     token: str | None = None,
     *,
     session: aiohttp.ClientSession | None = None,
-) -> list[str] | None:
+) -> list[DirectoryEntry] | None:
     url = f"{_API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
     if session is not None:
         status, data = await _get(session, url, token)
@@ -137,15 +144,16 @@ async def list_directory(
         return None
     if isinstance(data, list):
         data_list = typing.cast("list[object]", data)
-        names: list[str] = []
+        entries = list[DirectoryEntry]()
         for entry in data_list:
-            if not isinstance(entry, dict) or "name" not in entry:
+            if not isinstance(entry, dict):
                 continue
             entry_dict = typing.cast("dict[str, object]", entry)
-            name = entry_dict["name"]
-            if isinstance(name, str):
-                names.append(name)
-        return names
+            name = entry_dict.get("name")
+            entry_type = entry_dict.get("type")
+            if isinstance(name, str) and isinstance(entry_type, str):
+                entries.append(DirectoryEntry(name=name, type=entry_type))
+        return entries
     return None
 
 

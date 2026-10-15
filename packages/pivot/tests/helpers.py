@@ -79,7 +79,7 @@ def set_test_pipeline(pipeline: PipelineLike | None) -> None:
 
 def _original_func(func: Callable[..., Any]) -> Callable[..., Any]:
     """Return the undecorated function behind an @stage wrapper."""
-    return typing.cast("Callable[..., Any]", getattr(func, "_original_func", func))
+    return inspect.unwrap(func)
 
 
 def _param_types(func: Callable[..., Any]) -> dict[str, object]:
@@ -149,7 +149,7 @@ def register_test_stage(
         TypeError: If ``params`` is given but the function has no StageParams parameter.
     """
     target = pipeline or get_test_pipeline()
-    stage_func = func if getattr(func, "_is_stage", False) else compose.stage(func)
+    stage_func = func if hasattr(func, "__wrapped__") else compose.stage(func)
     param_types = _param_types(func)
     params_arg = next(
         (n for n, hint in param_types.items() if _params_class(hint) is not None), None
@@ -295,7 +295,7 @@ def create_pipeline_py(
                 flags=re.MULTILINE,
             )
         lines.append(source)
-        if not getattr(func, "_is_stage", False):
+        if not hasattr(func, "__wrapped__"):
             lines.append(f"{stage_name} = stage({stage_name})")
         lines.append("")
 

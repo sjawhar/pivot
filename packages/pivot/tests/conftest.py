@@ -230,6 +230,48 @@ def set_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator
     yield tmp_path
 
 
+_VENV_LIBRARY = "pivot_test_native_ext"
+
+
+@pytest.fixture
+def venv_inside_root_project(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[pathlib.Path]:
+    """A project whose virtualenv sits inside its root, as `uv venv` in the project makes.
+
+    `pipeline.py` imports a library from `<root>/.venv/.../site-packages` that, like numpy's C
+    extension, fails when imported a second time in one process.
+    """
+    site_packages = tmp_path / ".venv" / "lib" / "python3.13" / "site-packages"
+    library = site_packages / _VENV_LIBRARY
+    library.mkdir(parents=True)
+    (library / "__init__.py").write_text(
+        "import pathlib\n"
+        + "_marker = pathlib.Path(__file__).with_name('imported')\n"
+        + "if _marker.exists():\n"
+        + "    raise ImportError('cannot load module more than once per process')\n"
+        + "_marker.touch()\n"
+    )
+    (tmp_path / "pipeline.py").write_text(
+        "from typing import TypedDict\n\n"
+        + f"import {_VENV_LIBRARY}\n"
+        + "from pivot.compose import Pipeline, stage\n\n\n"
+        + "class TrainOutputs(TypedDict):\n    model: str\n    score: str\n\n\n"
+        + "@stage\n"
+        + "def train() -> TrainOutputs:\n"
+        + '    return {"model": "m", "score": "1"}\n\n\n'
+        + 'with Pipeline("venv") as pipeline:\n'
+        + "    train()\n"
+    )
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.syspath_prepend(str(site_packages))
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    yield tmp_path
+    sys.modules.pop(_VENV_LIBRARY, None)
+
+
 def init_git_repo(path: pathlib.Path, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
     """Initialize a git repo with user config at the given path.
 

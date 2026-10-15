@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING, TypedDict, TypeGuard
 import xxhash
 import yaml
 
-from pivot import exceptions, git, project, yaml_config
+from pivot import config, exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
-from pivot.types import DirHash, FileHash
+from pivot.types import DirHash, FileHash, HashInfo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from pivot.storage.track import PvtData
-    from pivot.types import HashInfo, OutEntry, StorageLockData
+    from pivot.types import OutEntry, StorageLockData
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class StageTarget(TypedDict):
     stage_name: str
     state_dir: pathlib.Path
     paths_by_key: dict[str | None, str]
-    """Lock output key -> workspace path (relative to the project root)."""
+    """Fallback lock output key -> workspace path for older locks with no recorded path."""
 
 
 def _parse_yaml_bytes[T](
@@ -158,11 +158,22 @@ def resolve_targets(
                     f"Stage '{stage_name}' has no lock file at revision '{rev}'"
                 )
             paths_by_key = stage_target["paths_by_key"]
-            hashes: dict[str, HashInfo | None] = {
-                paths_by_key[entry["key"]]: _out_entry_to_output_hash(entry)
-                for entry in lock_data["outs"]
-                if entry["key"] in paths_by_key
-            }
+            selected_key = types.identity_from_key(target).key
+            hashes = dict[str, HashInfo | None]()
+            for entry in lock_data["outs"]:
+                key = entry["key"]
+                if selected_key is not None and key != selected_key:
+                    continue
+                if "path" in entry:
+                    path = entry["path"]
+                elif key in paths_by_key:
+                    path = paths_by_key[key]
+                else:
+                    raise exceptions.TargetNotFoundError(
+                        f"Target '{target}' output key {key!r} at revision '{rev}' has no "
+                        + "recorded path and is not defined by the current pipeline"
+                    )
+                hashes[path] = _out_entry_to_output_hash(entry)
             if not hashes:
                 raise exceptions.TargetNotFoundError(
                     f"Target '{target}' recorded no outputs at revision '{rev}'"
@@ -226,6 +237,14 @@ def _verify_content_hash(content: bytes, expected_hash: str) -> bool:
     return actual_hash == expected_hash
 
 
+def _write_fallback_content(dest_path: pathlib.Path, content: bytes, force: bool) -> None:
+    """Replace a cache-miss target while holding the same lock as cache restores."""
+    with cache.restore_lock(dest_path, config.get_state_dir()):
+        if (force or dest_path.is_symlink()) and (dest_path.exists() or dest_path.is_symlink()):
+            cache.remove_output(dest_path)
+        dest_path.write_bytes(content)
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -243,16 +262,6 @@ def restore_file(
             status=RestoreStatus.SKIPPED,
             path=path_str,
             message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
-        )
-
-    try:
-        if force and dest_path.exists():
-            cache.remove_output(dest_path)
-    except OSError as e:
-        return RestoreResult(
-            status=RestoreStatus.ERROR,
-            path=path_str,
-            message=f"Error: {dest_path} - failed to remove existing file: {e}",
         )
 
     # Ensure parent directory exists before any restore strategy
@@ -275,7 +284,7 @@ def restore_file(
                     output_hash,
                     cache_dir / "files",
                     checkout_modes=checkout_modes,
-                    state_dir=cache_dir.parent,
+                    state_dir=config.get_state_dir(),
                 )
                 if success:
                     return RestoreResult(
@@ -290,7 +299,7 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            dest_path.write_bytes(content)
+            _write_fallback_content(dest_path, content, force)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -319,7 +328,7 @@ def restore_file(
                     ),
                 )
             try:
-                dest_path.write_bytes(remote_content)
+                _write_fallback_content(dest_path, remote_content, force)
             except OSError as e:
                 return RestoreResult(
                     status=RestoreStatus.ERROR,
@@ -378,12 +387,8 @@ def restore_targets_from_revision(
     if output is not None:
         if len(target_infos) != 1:
             raise exceptions.GetError("--output/-o can only be used with a single target")
-        if target_infos[0]["target_type"] == TargetType.STAGE:
-            raise exceptions.GetError(
-                "--output/-o cannot be used with stage names (use file path instead)"
-            )
         if len(target_infos[0]["paths"]) != 1:
-            raise exceptions.GetError("--output/-o cannot be used with directory targets")
+            raise exceptions.GetError("--output/-o can only be used with a single output")
 
     results = list[RestoreResult]()
 

@@ -14,7 +14,7 @@ import shutil
 import stat
 import tempfile
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import xxhash
 
@@ -39,16 +39,53 @@ _RESTORE_LOCK_PREFIX = ".pivot_restore_lock_"
 _RESTORE_TEMP_MAX_AGE = 3600  # 1 hour
 
 
-def _get_lock_path(target_path: pathlib.Path, state_dir: pathlib.Path) -> pathlib.Path:
-    """Get lock file path under state_dir/locks/ for a restore target.
+def _restore_target_token(target_path: pathlib.Path) -> str:
+    """Return a stable token identifying the logical workspace target."""
+    logical_path = target_path.parent.resolve() / target_path.name
+    return hashlib.sha256(str(logical_path).encode()).hexdigest()[:32]
 
-    Uses SHA-256 hash of the absolute target path to avoid filename length issues
-    and collisions between targets in different directories.
-    """
+
+def _restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathlib.Path:
+    """Return the deterministic staging path for a file checkout."""
+    return path.parent / f"{_RESTORE_TEMP_PREFIX}{token or _restore_target_token(path)}.file"
+
+
+def _get_lock_path_from_token(token: str, state_dir: pathlib.Path) -> pathlib.Path:
+    """Get a restore lock path from a previously resolved target token."""
     lock_dir = state_dir / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    path_hash = hashlib.sha256(str(target_path.resolve()).encode()).hexdigest()[:32]
-    return lock_dir / f"{_RESTORE_LOCK_PREFIX}{path_hash}"
+    return lock_dir / f"{_RESTORE_LOCK_PREFIX}{token}"
+
+
+def _get_lock_path(
+    target_path: pathlib.Path, state_dir: pathlib.Path, *, token: str | None = None
+) -> pathlib.Path:
+    """Get lock file path under state_dir/locks/ for a logical restore target.
+
+    The final path component is intentionally not resolved: a restored symlink must
+    retain the same lock as the missing workspace path it replaced.
+    """
+    return _get_lock_path_from_token(token or _restore_target_token(target_path), state_dir)
+
+
+@contextlib.contextmanager
+def restore_lock(path: pathlib.Path, state_dir: pathlib.Path | None) -> Generator[str | None]:
+    """Hold the exclusive restore lock for path and yield its target token.
+
+    No lock is taken when state_dir is None. The lock file is never deleted. Unlinking it
+    would let a new restorer lock a fresh file while a waiter still holds the old one.
+    """
+    if state_dir is None:
+        yield None
+        return
+    token = _restore_target_token(path)
+    lock_fd = os.open(_get_lock_path(path, state_dir, token=token), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield token
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def atomic_write_file(
@@ -277,27 +314,15 @@ def _clear_path(path: pathlib.Path) -> None:
             path.unlink()
 
 
-def _cleanup_stale_restore_temps(parent_dir: pathlib.Path, lock_dir: pathlib.Path | None) -> None:
-    """Remove restore temp directories and stale lock files older than max age."""
+def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
+    """Remove stale restore and backup artifacts older than max age."""
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
-    # Clean stale lock files from centralized lock directory
-    if lock_dir is not None and lock_dir.exists():
-        for entry in os.scandir(lock_dir):
-            if entry.is_file(follow_symlinks=False) and entry.name.startswith(_RESTORE_LOCK_PREFIX):
-                try:
-                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
-                        logger.debug(f"Cleaning up stale lock file: {entry.path}")
-                        os.unlink(entry.path)
-                except OSError as e:
-                    logger.debug(f"Failed to clean up lock file {entry.path}: {e}")
-
-    # Clean temp/backup directories from data parent dir
     if not parent_dir.exists():
         return
 
     for entry in os.scandir(parent_dir):
-        if not entry.is_dir(follow_symlinks=False):
+        if entry.name.startswith(_RESTORE_LOCK_PREFIX):
             continue
         if not (
             entry.name.startswith(_RESTORE_TEMP_PREFIX)
@@ -305,11 +330,33 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path, lock_dir: pathlib.Pat
         ):
             continue
         try:
-            if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            entry_stat = entry.stat(follow_symlinks=False)
+            if entry.is_dir(follow_symlinks=False):
+                age = entry_stat.st_mtime
+            elif stat.S_ISREG(entry_stat.st_mode):
+                age = entry_stat.st_ctime
+            else:
+                continue
+            if age < cutoff:
                 logger.debug(f"Cleaning up stale temp: {entry.path}")
                 _clear_path(pathlib.Path(entry.path))
         except OSError as e:
             logger.debug(f"Failed to clean up temp {entry.path}: {e}")
+
+
+def _cleanup_fresh_restore_orphans(path: pathlib.Path, token: str) -> None:
+    """Remove fresh temp and backup entries left by an interrupted restore of path.
+
+    The caller holds path's restore lock, so entries tagged with token cannot belong to
+    a live restore of the same target.
+    """
+    prefixes = (
+        f"{_RESTORE_TEMP_PREFIX}{token}.",
+        f"{_BACKUP_TEMP_PREFIX}{token}.",
+    )
+    for entry in os.scandir(path.parent):
+        if entry.name.startswith(prefixes):
+            _clear_path(pathlib.Path(entry.path))
 
 
 def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
@@ -353,14 +400,37 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
 FALLBACK_ERRNO = frozenset({errno.EXDEV, errno.EPERM, errno.EACCES})
 
 
+def _stage_checkout(
+    tmp_path: pathlib.Path,
+    cache_path: pathlib.Path,
+    checkout_mode: CheckoutMode,
+    *,
+    executable: bool,
+) -> None:
+    """Create the link or copy of cache_path at tmp_path."""
+    if checkout_mode == CheckoutMode.SYMLINK:
+        tmp_path.symlink_to(cache_path.resolve())
+    elif checkout_mode == CheckoutMode.HARDLINK:
+        os.link(cache_path, tmp_path)
+    else:
+        shutil.copy2(cache_path, tmp_path)
+        os.chmod(tmp_path, 0o755 if executable else 0o644)
+
+
 def _checkout_from_cache(
     path: pathlib.Path,
     cache_path: pathlib.Path,
     checkout_mode: CheckoutMode,
     *,
     executable: bool = False,
+    staging_path: pathlib.Path | None = None,
 ) -> None:
-    """Create link from workspace path to cache."""
+    """Create link or copy at path atomically, so readers never see a partial file.
+
+    Args:
+        staging_path: Where to build the link or copy before renaming it over path.
+            Defaults to a fresh random name beside path.
+    """
     # Idempotency: skip if already correctly linked
     if checkout_mode == CheckoutMode.SYMLINK and path.is_symlink():
         with contextlib.suppress(OSError):
@@ -371,15 +441,28 @@ def _checkout_from_cache(
             if path.stat().st_ino == cache_path.stat().st_ino:
                 return
 
-    _clear_path(path)
-
-    if checkout_mode == CheckoutMode.SYMLINK:
-        path.symlink_to(cache_path.resolve())
-    elif checkout_mode == CheckoutMode.HARDLINK:
-        os.link(cache_path, path)
-    else:
-        shutil.copy2(cache_path, path)
-        os.chmod(path, 0o755 if executable else 0o644)
+    tmp_path = staging_path or path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
+    try:
+        try:
+            _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
+        except PermissionError:
+            # A read-only parent. Replacing an existing entry needs it writable anyway,
+            # so make it writable as _clear_path does (never chmod the file: it may be
+            # a hardlink to the read-only cache), then retry.
+            parent_mode = path.parent.stat().st_mode
+            if parent_mode & stat.S_IWUSR or not (path.exists() or path.is_symlink()):
+                raise
+            os.chmod(path.parent, parent_mode | stat.S_IWUSR)
+            _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
+        try:
+            tmp_path.replace(path)
+        except IsADirectoryError:
+            _clear_path(path)
+            tmp_path.replace(path)
+    finally:
+        # Also covers a replace() that did nothing: POSIX rename is a no-op when both
+        # names are hardlinks to the same inode, leaving tmp_path behind.
+        tmp_path.unlink(missing_ok=True)
 
 
 def _checkout_with_fallback(
@@ -388,13 +471,24 @@ def _checkout_with_fallback(
     checkout_modes: list[CheckoutMode],
     *,
     executable: bool = False,
+    staging_path: pathlib.Path | None = None,
+    keep_existing_copy: bool = False,
 ) -> None:
-    """Try each link mode in order until one succeeds."""
+    """Try each link mode in order until one succeeds.
+
+    With ``keep_existing_copy``, reaching COPY while ``path`` still exists leaves it in place:
+    the caller guarantees it already holds the cached bytes. A failed link attempt clears
+    ``path`` first, so COPY then copies from the cache as usual.
+    """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
     for i, mode in enumerate(checkout_modes):
+        if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
+            return
         try:
-            _checkout_from_cache(path, cache_path, mode, executable=executable)
+            _checkout_from_cache(
+                path, cache_path, mode, executable=executable, staging_path=staging_path
+            )
             return
         except OSError as e:
             if e.errno not in FALLBACK_ERRNO or i == len(checkout_modes) - 1:
@@ -425,6 +519,7 @@ def save_to_cache(
     state_db: state_mod.StateDB | None = None,
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> HashInfo:
     """Save file or directory to cache, replace with link, return hash info.
 
@@ -434,12 +529,13 @@ def save_to_cache(
         state_db: Optional state database for hash caching
         checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
         checkout_modes: Ordered list of link modes to try with fallback on failure.
+        state_dir: State directory for the workspace target's restore lock.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
 
     if path.is_dir():
-        return _save_directory_to_cache(path, cache_dir, state_db, effective_modes)
-    return _save_file_to_cache(path, cache_dir, state_db, effective_modes)
+        return _save_directory_to_cache(path, cache_dir, state_db, effective_modes, state_dir)
+    return _save_file_to_cache(path, cache_dir, state_db, effective_modes, state_dir)
 
 
 def _save_file_to_cache(
@@ -447,6 +543,7 @@ def _save_file_to_cache(
     cache_dir: pathlib.Path,
     state_db: state_mod.StateDB | None,
     checkout_modes: list[CheckoutMode],
+    state_dir: pathlib.Path | None,
 ) -> FileHash:
     """Save single file to cache."""
     # Idempotency: check if already a valid cache symlink (cheap check first)
@@ -458,12 +555,38 @@ def _save_file_to_cache(
                 return FileHash(hash=existing_hash)
 
     file_hash, _ = hash_file(path, state_db)
-    cache_path = get_cache_path(cache_dir, file_hash)
-
-    copy_to_cache(path, cache_path)
-    _checkout_with_fallback(path, cache_path, checkout_modes)
-
+    _store_file(
+        path,
+        file_hash,
+        cache_dir,
+        checkout_modes,
+        keep_existing_copy=False,
+        state_dir=state_dir,
+    )
     return FileHash(hash=file_hash)
+
+
+def _store_file(
+    path: pathlib.Path,
+    file_hash: str,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+    *,
+    keep_existing_copy: bool,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    cache_path = get_cache_path(cache_dir, file_hash)
+    copy_to_cache(path, cache_path)
+    with restore_lock(path, state_dir) as lock_token:
+        staging_path = _restore_staging_path(path, lock_token)
+        _clear_path(staging_path)
+        _checkout_with_fallback(
+            path,
+            cache_path,
+            checkout_modes,
+            staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
+        )
 
 
 def _save_directory_to_cache(
@@ -471,6 +594,7 @@ def _save_directory_to_cache(
     cache_dir: pathlib.Path,
     state_db: state_mod.StateDB | None,
     checkout_modes: list[CheckoutMode],
+    state_dir: pathlib.Path | None,
 ) -> DirHash:
     """Save directory to cache."""
     # Idempotency check for SYMLINK mode
@@ -484,37 +608,100 @@ def _save_directory_to_cache(
                 return DirHash(hash=existing_hash, manifest=manifest)
 
     tree_hash, manifest = hash_directory(path, state_db)
+    output_hash = DirHash(hash=tree_hash, manifest=manifest)
+    _store_directory(
+        path,
+        output_hash,
+        cache_dir,
+        checkout_modes,
+        keep_existing_copy=False,
+        state_dir=state_dir,
+    )
+    return output_hash
 
+
+def _store_directory(
+    path: pathlib.Path,
+    output_hash: DirHash,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+    *,
+    keep_existing_copy: bool,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    manifest = output_hash["manifest"]
     # Cache individual files first
     for entry in manifest:
         file_path = path / entry["relpath"]
         cache_path = get_cache_path(cache_dir, entry["hash"])
         copy_to_cache(file_path, cache_path)
 
-    if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
-        # SYMLINK mode: cache entire directory, symlink to it
-        cache_dir_path = get_cache_path(cache_dir, tree_hash)
-        if not cache_dir_path.exists():
-            cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(path, cache_dir_path)
-            for f in cache_dir_path.rglob("*"):
-                # Skip symlinks to avoid changing permissions on target files outside cache
-                if f.is_file() and not f.is_symlink():
-                    os.chmod(f, 0o444)
-            os.chmod(cache_dir_path, 0o555)
+    with restore_lock(path, state_dir):
+        if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
+            # SYMLINK mode: cache entire directory, symlink to it
+            cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
+            if not cache_dir_path.exists():
+                cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(path, cache_dir_path)
+                for f in cache_dir_path.rglob("*"):
+                    # Skip symlinks to avoid changing permissions on target files outside cache
+                    if f.is_file() and not f.is_symlink():
+                        os.chmod(f, 0o444)
+                os.chmod(cache_dir_path, 0o555)
 
-        _clear_path(path)
-        path.symlink_to(cache_dir_path.resolve())
+            _clear_path(path)
+            path.symlink_to(cache_dir_path.resolve())
+        else:
+            # HARDLINK/COPY modes: replace each file with link/copy from cache
+            for entry in manifest:
+                file_path = path / entry["relpath"]
+                cache_path = get_cache_path(cache_dir, entry["hash"])
+                staging_path = _restore_staging_path(file_path)
+                _clear_path(staging_path)
+                _checkout_with_fallback(
+                    file_path,
+                    cache_path,
+                    checkout_modes,
+                    executable=entry["isexec"],
+                    staging_path=staging_path,
+                    keep_existing_copy=keep_existing_copy,
+                )
+
+
+def store_hashed_output(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode] | None = None,
+    *,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    """Put an output whose hash is already known into the cache, then link it per mode.
+
+    ``output_hash`` must be the hash of ``path``'s current contents; nothing is hashed again.
+    Each file is copied into the cache once and the workspace path is linked to the cache entry
+    with the first checkout mode that works. Reaching COPY leaves the workspace file as it is,
+    since it already holds the cached bytes.
+    """
+    effective_modes = _resolve_checkout_modes(None, checkout_modes)
+    if is_dir_hash(output_hash):
+        _store_directory(
+            path,
+            output_hash,
+            cache_dir,
+            effective_modes,
+            keep_existing_copy=True,
+            state_dir=state_dir,
+        )
     else:
-        # HARDLINK/COPY modes: replace each file with link/copy from cache
-        for entry in manifest:
-            file_path = path / entry["relpath"]
-            cache_path = get_cache_path(cache_dir, entry["hash"])
-            _checkout_with_fallback(
-                file_path, cache_path, checkout_modes, executable=entry["isexec"]
-            )
-
-    return DirHash(hash=tree_hash, manifest=manifest)
+        _store_file(
+            path,
+            output_hash["hash"],
+            cache_dir,
+            effective_modes,
+            keep_existing_copy=True,
+            state_dir=state_dir,
+        )
 
 
 def restore_from_cache(
@@ -524,6 +711,8 @@ def restore_from_cache(
     checkout_mode: CheckoutMode | None = None,
     checkout_modes: list[CheckoutMode] | None = None,
     state_dir: pathlib.Path | None = None,
+    *,
+    lock_token: str | None = None,
 ) -> bool:
     """Restore file or directory from cache. Returns True if successful.
 
@@ -533,16 +722,25 @@ def restore_from_cache(
         cache_dir: Cache directory
         checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
         checkout_modes: Ordered list of link modes to try with fallback on failure.
-        state_dir: State directory for lock files (e.g. per-stage .pivot/ dir).
-            Required for directory restores to prevent concurrent restore races.
+        state_dir: State directory for restore locks and crash cleanup.
+        lock_token: Target token yielded by an already-held restore_lock for path.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
+    if lock_token is not None and state_dir is None:
+        raise ValueError("state_dir is required when lock_token is set")
 
     if is_dir_hash(output_hash):
         return _restore_directory_from_cache(
-            path, output_hash, cache_dir, effective_modes, state_dir
+            path,
+            output_hash,
+            cache_dir,
+            effective_modes,
+            state_dir,
+            lock_token=lock_token,
         )
-    return _restore_file_from_cache(path, output_hash, cache_dir, effective_modes)
+    return _restore_file_from_cache(
+        path, output_hash, cache_dir, effective_modes, state_dir, lock_token=lock_token
+    )
 
 
 def _restore_file_from_cache(
@@ -550,14 +748,38 @@ def _restore_file_from_cache(
     output_hash: FileHash,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
+    state_dir: pathlib.Path | None = None,
+    *,
+    lock_token: str | None = None,
 ) -> bool:
-    """Restore single file from cache."""
+    """Restore single file from cache.
+
+    With a state_dir, holds path's restore lock and stages the file under one name
+    tagged with path's token, so the next restore removes what a killed one left.
+    """
     cache_path = get_cache_path(cache_dir, output_hash["hash"])
     if not cache_path.exists():
         return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    _checkout_with_fallback(path, cache_path, checkout_modes)
+    if state_dir is None:
+        _checkout_with_fallback(path, cache_path, checkout_modes)
+        return True
+
+    if lock_token is None:
+        with restore_lock(path, state_dir) as held_token:
+            return _restore_file_from_cache(
+                path,
+                output_hash,
+                cache_dir,
+                checkout_modes,
+                state_dir,
+                lock_token=held_token,
+            )
+
+    staging_path = _restore_staging_path(path, lock_token)
+    _clear_path(staging_path)
+    _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
     return True
 
 
@@ -567,163 +789,265 @@ def _restore_directory_from_cache(
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
     state_dir: pathlib.Path | None = None,
+    *,
+    lock_token: str | None = None,
 ) -> bool:
-    """Restore directory from cache atomically with file locking."""
+    """Restore a directory atomically."""
     cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
-
-    # Validate ALL manifest entries exist before writing anything (security)
-    # This also handles the SYMLINK fast path - if cache_dir_path doesn't exist,
-    # we need to check individual files
     symlink_fast_path = checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists()
     if not symlink_fast_path:
         for entry in output_hash["manifest"]:
-            file_cache_path = get_cache_path(cache_dir, entry["hash"])
-            if not file_cache_path.exists():
+            if not get_cache_path(cache_dir, entry["hash"]).exists():
                 return False
 
-    # Ensure parent exists and clean up stale temps
     path.parent.mkdir(parents=True, exist_ok=True)
-    if state_dir is not None:
-        lock_path = _get_lock_path(path, state_dir)
-        _cleanup_stale_restore_temps(path.parent, lock_path.parent)
-    else:
-        lock_path = None
-        _cleanup_stale_restore_temps(path.parent, None)
+    _cleanup_stale_restore_temps(path.parent)
 
-    # Acquire lock for this specific path to prevent concurrent restore races
-    lock_fd: int | None = None
+    if state_dir is not None and lock_token is None:
+        with restore_lock(path, state_dir) as held_token:
+            return _restore_directory_from_cache(
+                path,
+                output_hash,
+                cache_dir,
+                checkout_modes,
+                state_dir,
+                lock_token=held_token,
+            )
+
+    target_token = lock_token or _restore_target_token(path)
+    if lock_token is not None:
+        _cleanup_fresh_restore_orphans(path, target_token)
+    restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
+
+    if symlink_fast_path:
+        temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
+        try:
+            temp_symlink.symlink_to(cache_dir_path.resolve())
+            _clear_path(path)
+            temp_symlink.replace(path)
+            return True
+        except OSError as e:
+            logger.debug(f"Symlink creation failed, will try file-by-file: {e}")
+            if temp_symlink.is_symlink():
+                temp_symlink.unlink()
+            for entry in output_hash["manifest"]:
+                if not get_cache_path(cache_dir, entry["hash"]).exists():
+                    return False
+
+    temp_path = pathlib.Path(tempfile.mkdtemp(prefix=restore_prefix, dir=path.parent))
+    backup_path = path.parent / f"{_BACKUP_TEMP_PREFIX}{target_token}.{secrets.token_hex(4)}"
+    swap_completed = False
+    backup_restore_failed = False
     try:
-        if lock_path is not None:
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
-        # SYMLINK fast path: create symlink at temp location, then atomic rename
-        if symlink_fast_path:
-            temp_symlink = path.parent / f"{_RESTORE_TEMP_PREFIX}symlink_{secrets.token_hex(4)}"
-            try:
-                # Test symlink creation at temp location first
-                temp_symlink.symlink_to(cache_dir_path.resolve())
-                # Atomic swap: clear target then rename temp symlink
-                _clear_path(path)
-                temp_symlink.replace(path)
-                return True
-            except OSError as e:
-                logger.debug(f"Symlink creation failed, will try file-by-file: {e}")
-                if temp_symlink.is_symlink():
-                    temp_symlink.unlink()
-                # Re-validate file entries before falling back to file-by-file
-                for entry in output_hash["manifest"]:
-                    file_cache_path = get_cache_path(cache_dir, entry["hash"])
-                    if not file_cache_path.exists():
-                        return False
-
-        temp_path = pathlib.Path(tempfile.mkdtemp(prefix=_RESTORE_TEMP_PREFIX, dir=path.parent))
-        backup_path = (
-            path.parent / f"{_BACKUP_TEMP_PREFIX}{path.name}.{os.getpid()}.{secrets.token_hex(4)}"
-        )
-
-        # Track state for proper cleanup
-        swap_completed = False
-        backup_restore_failed = False
+        resolved_temp = temp_path.resolve()
+        for file_count, entry in enumerate(output_hash["manifest"], start=1):
+            file_cache_path = get_cache_path(cache_dir, entry["hash"])
+            file_path = temp_path / entry["relpath"]
+            if not file_path.resolve().is_relative_to(resolved_temp):
+                raise exceptions.SecurityValidationError(
+                    f"Manifest contains path traversal: {entry['relpath']!r}"
+                )
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            _checkout_with_fallback(
+                file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
+            )
+            if file_count % 100 == 0:
+                try:
+                    os.utime(temp_path, None)
+                except OSError as e:
+                    logger.debug(f"mtime refresh failed (may be NFS with root_squash): {e}")
 
         try:
-            resolved_temp = temp_path.resolve()
+            os.utime(temp_path, None)
+        except OSError as e:
+            logger.debug(f"mtime refresh failed (may be NFS with root_squash): {e}")
 
-            # Restore all files to temp directory
-            for file_count, entry in enumerate(output_hash["manifest"], start=1):
-                file_cache_path = get_cache_path(cache_dir, entry["hash"])
-                file_path = temp_path / entry["relpath"]
-
-                # Validate no path traversal (e.g., "../../../etc/passwd")
-                if not file_path.resolve().is_relative_to(resolved_temp):
-                    raise exceptions.SecurityValidationError(
-                        f"Manifest contains path traversal: {entry['relpath']!r}"
-                    )
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                _checkout_with_fallback(
-                    file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
-                )
-                # Keep mtime fresh to prevent cleanup during long restores
-                if file_count % 100 == 0:
-                    try:
-                        os.utime(temp_path, None)
-                    except OSError as e:
-                        logger.debug(f"mtime refresh failed (may be NFS with root_squash): {e}")
-
-            # Final mtime touch after restore completes
+        if CheckoutMode.COPY in checkout_modes:
             try:
-                os.utime(temp_path, None)
+                os.chmod(temp_path, 0o755)
+                for item in temp_path.rglob("*"):
+                    if item.is_dir() and not item.is_symlink():
+                        os.chmod(item, 0o755)
             except OSError as e:
-                logger.debug(f"mtime refresh failed (may be NFS with root_squash): {e}")
+                logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
 
-            # Ensure directories writable if COPY mode was used
-            # Use is_dir with follow_symlinks=False to avoid traversing symlinks
-            if CheckoutMode.COPY in checkout_modes:
-                try:
-                    os.chmod(temp_path, 0o755)
-                    for item in temp_path.rglob("*"):
-                        if item.is_dir() and not item.is_symlink():
-                            os.chmod(item, 0o755)
-                except OSError as e:
-                    logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
+        try:
+            if path.exists() or path.is_symlink():
+                path.rename(backup_path)
+        except FileNotFoundError:
+            logger.debug("Path disappeared between check and rename, proceeding")
 
-            # Atomic swap with rollback capability:
-            # - Backup original first so we can restore on failure
-            # - Replace atomically so path always has valid content
-            # - Clean backup only after successful swap
+        temp_path.replace(path)
+        swap_completed = True
+
+        try:
+            _clear_path(backup_path)
+        except OSError as e:
+            logger.debug(f"Backup cleanup failed (non-critical): {e}")
+        return True
+    except BaseException:
+        if backup_path.exists() and not path.exists():
             try:
-                if path.exists() or path.is_symlink():
-                    path.rename(backup_path)
-            except FileNotFoundError:
-                logger.debug("Path disappeared between check and rename, proceeding")
-
-            temp_path.replace(path)
-            swap_completed = True
-
-            try:
-                _clear_path(backup_path)
+                backup_path.rename(path)
             except OSError as e:
-                logger.debug(f"Backup cleanup failed (non-critical): {e}")
-
-            return True
-
-        except BaseException:
-            # Restore original if we had one and swap didn't complete
-            if backup_path.exists() and not path.exists():
-                try:
-                    backup_path.rename(path)
-                except OSError as e:
-                    logger.debug(f"Failed to restore backup: {e}")
-                    backup_restore_failed = True
-            raise
-        finally:
-            # Clean up temp directory on any exit
-            if temp_path.exists():
-                _clear_path(temp_path)
-            # Only clean up backup if swap completed successfully
-            # Don't delete backup if restoration failed - that's the user's data!
-            if backup_path.exists() and swap_completed and not backup_restore_failed:
-                _clear_path(backup_path)
-
+                logger.debug(f"Failed to restore backup: {e}")
+                backup_restore_failed = True
+        raise
     finally:
-        if lock_fd is not None and lock_path is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError as e:
-                logger.debug(f"Failed to unlock: {e}")
-            try:
-                os.close(lock_fd)
-            except OSError as e:
-                logger.debug(f"Failed to close lock fd: {e}")
-            try:
-                lock_path.unlink(missing_ok=True)
-            except OSError as e:
-                logger.debug(f"Failed to delete lock file: {e}")
+        if temp_path.exists():
+            _clear_path(temp_path)
+        if backup_path.exists() and swap_completed and not backup_restore_failed:
+            _clear_path(backup_path)
 
 
 def remove_output(path: pathlib.Path) -> None:
     """Remove output file or directory before execution."""
     _clear_path(path)
+
+
+class MissingRestore(TypedDict):
+    """Outcome of restore_missing_in_directory."""
+
+    restored: int  # missing files restored in place
+    unavailable: int  # missing files whose blob is not in the cache
+    local_changes: list[str]  # changed or extra files whose content the cache lacks
+    replace: bool  # directory holds only cached content but not the target: replace it whole
+
+
+def _is_cached(cache_dir: pathlib.Path, content_hash: str | None) -> bool:
+    return (
+        content_hash is not None
+        and is_valid_hash(content_hash)
+        and get_cache_path(cache_dir, content_hash).exists()
+    )
+
+
+def _scan_entries(path: pathlib.Path) -> list[str]:
+    """Return every file and symlink under ``path`` as relative paths.
+
+    Symlinked directories are not followed.
+    """
+    files = list[str]()
+
+    def _walk(directory: pathlib.Path) -> None:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                entry_path = pathlib.Path(entry.path)
+                relpath = str(entry_path.relative_to(path))
+                if entry.is_symlink() or entry.is_file():
+                    files.append(relpath)
+                elif entry.is_dir():
+                    _walk(entry_path)
+
+    _walk(path)
+    return files
+
+
+def _is_same_file(file_stat: os.stat_result, cache_path: pathlib.Path) -> bool:
+    """Whether file_stat is the cache blob itself (a hardlink checkout). Cache blobs are
+    read-only and never rewritten, so sharing the inode proves the content without a read."""
+    try:
+        blob_stat = cache_path.stat()
+    except FileNotFoundError:
+        return False
+    return (file_stat.st_dev, file_stat.st_ino) == (blob_stat.st_dev, blob_stat.st_ino)
+
+
+def restore_missing_in_directory(
+    path: pathlib.Path,
+    output_hash: DirHash,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+    state_db: state_mod.StateDB | None = None,
+) -> MissingRestore:
+    """Restore missing target files without overwriting local changes.
+
+    When every existing file matches the target, missing files are restored in place. When a
+    file differs from the target or an extra file exists, only a whole-directory swap can
+    restore the target. The swap is safe only when every file it removes is in the cache;
+    otherwise the local changes are returned without writing anything.
+
+    A retained file is read only when nothing else proves its content: a symlink to the
+    target's cache path, a hardlink to the target's cache blob, or a matching ``state_db``
+    entry each settle it without a read.
+    """
+    lexical_base = pathlib.Path(os.path.abspath(path))
+    resolved_base = path.resolve()
+    expected_paths = set[str]()
+    missing = list[tuple[DirManifestEntry, pathlib.Path, pathlib.Path]]()
+    # relpath -> hash of the content on disk (None when it cannot be in the cache)
+    changed = dict[str, str | None]()
+
+    for entry in output_hash["manifest"]:
+        relpath = entry["relpath"]
+        expected_paths.add(relpath)
+        file_path = path / relpath
+        lexical_path = pathlib.Path(os.path.abspath(file_path))
+        if not lexical_path.is_relative_to(lexical_base):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {relpath!r}"
+            )
+
+        file_cache_path = get_cache_path(cache_dir, entry["hash"])
+        if file_path.is_symlink():
+            if not file_path.parent.resolve().is_relative_to(resolved_base):
+                raise exceptions.SecurityValidationError(
+                    f"Manifest contains path traversal: {relpath!r}"
+                )
+            if file_path.resolve() == file_cache_path.resolve():
+                if not file_cache_path.exists():
+                    missing.append((entry, file_path, file_cache_path))
+            else:
+                changed[relpath] = _get_symlink_cache_hash(file_path, cache_dir)
+            continue
+        if file_path.exists():
+            if not file_path.is_file():
+                changed[relpath] = None
+                continue
+            if _is_same_file(file_path.stat(), file_cache_path):
+                continue
+            file_hash, _ = hash_file(file_path, state_db)
+            if file_hash != entry["hash"]:
+                changed[relpath] = file_hash
+            continue
+        if not file_path.parent.resolve().is_relative_to(resolved_base):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {relpath!r}"
+            )
+        missing.append((entry, file_path, file_cache_path))
+
+    files = _scan_entries(path)
+    for relpath in files:
+        if relpath in expected_paths:
+            continue
+        extra_path = path / relpath
+        if extra_path.is_symlink():
+            changed[relpath] = _get_symlink_cache_hash(extra_path, cache_dir)
+        else:
+            changed[relpath], _ = hash_file(extra_path, state_db)
+
+    if changed:
+        # Replacing the directory deletes every file it holds; refuse if any is not cached.
+        local_changes = sorted(
+            rel for rel, content_hash in changed.items() if not _is_cached(cache_dir, content_hash)
+        )
+        if local_changes:
+            return MissingRestore(
+                restored=0, unavailable=0, local_changes=local_changes, replace=False
+            )
+        return MissingRestore(restored=0, unavailable=0, local_changes=[], replace=True)
+
+    unavailable = sum(1 for _, _, file_cache_path in missing if not file_cache_path.exists())
+    if unavailable:
+        return MissingRestore(restored=0, unavailable=unavailable, local_changes=[], replace=False)
+
+    for entry, file_path, file_cache_path in missing:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _checkout_with_fallback(
+            file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
+        )
+
+    return MissingRestore(restored=len(missing), unavailable=0, local_changes=[], replace=False)
 
 
 def protect(path: pathlib.Path) -> None:
