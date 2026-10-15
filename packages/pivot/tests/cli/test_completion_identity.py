@@ -53,6 +53,7 @@ def _make_stage_info(name: str, outs: list[types.ArtifactRef]) -> RegistryStageI
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
     )
 
 

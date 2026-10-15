@@ -4,7 +4,7 @@ import inspect
 import json
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 import pygtrie
 
@@ -58,7 +58,7 @@ class RegistryStageInfo(TypedDict):
     collection_params: dict[str, str]
     no_fingerprint: bool
     code_deps: list[str]
-    input_paths: NotRequired[dict[str, str]]
+    input_paths: dict[str, str]
 
 
 class StageRegistry:
@@ -286,7 +286,7 @@ def _wiring_manifest(info: RegistryStageInfo) -> dict[str, str]:
     from a tuple. Inputs also carry their project-relative binding path because a ``PathOnly``
     stage can observe it even when old and new files have identical contents.
     """
-    paths = info.get("input_paths", {})
+    paths = info["input_paths"]
     result = dict[str, str]()
     collection_params = info["collection_params"]
     for parameter, kind in collection_params.items():

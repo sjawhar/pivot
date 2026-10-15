@@ -91,6 +91,7 @@ def _helper_info(
         collection_params={},
         no_fingerprint=False,
         code_deps=[],
+        input_paths={},
         incremental_inputs={},
     )
 
