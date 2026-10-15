@@ -897,6 +897,99 @@ def test_pull_keeps_build_dir_the_stage_writes_inside_its_directory_output(
     assert (shards / "build" / "log.txt").read_text() == "built 2 rows"
 
 
+_ARTIFACT_SYMLINK_RESTORE_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def assemble() -> pathlib.Path:
+    output = pathlib.Path(tempfile.mkdtemp())
+    for relpath, content in {
+        "keep.txt": "keep",
+        "build/required.txt": "build",
+        "dist/required.txt": "dist",
+        "node_modules/required.txt": "modules",
+        ".venv/required.txt": "venv",
+        "editor.swp": "editor",
+        "nested/sub/file.txt": "nested",
+    }.items():
+        path = output / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    return output
+
+
+with Pipeline("dir") as pipeline:
+    assemble()
+"""
+
+
+def test_pull_keeps_cache_derived_directory_file_symlinks_as_artifact_members(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A pull that restores a directory file-by-file leaves a usable directory artifact."""
+    env = _env(
+        AWS_ENDPOINT_URL=moto_services["s3"],
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"artifact-links-{uuid.uuid4().hex[:8]}"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=moto_services["s3"],
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    )
+    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(
+        src,
+        {
+            "pipeline.py": _ARTIFACT_SYMLINK_RESTORE_PIPELINE,
+            ".gitignore": "/data/dir/\n__pycache__/\n",
+        },
+    )
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(src, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(src, "config", "set", "cache.checkout_mode", "copy"))
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    _commit(src, "source")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    _ok(_pivot(clone, "config", "set", "cache.checkout_mode", "symlink"))
+
+    _ok(_pivot(clone, "pull", "dir/assemble", env=env))
+
+    output = clone / "data" / "dir" / "assemble.dat"
+    expected = {
+        "keep.txt": "keep",
+        "build/required.txt": "build",
+        "dist/required.txt": "dist",
+        "node_modules/required.txt": "modules",
+        ".venv/required.txt": "venv",
+        "editor.swp": "editor",
+        "nested/sub/file.txt": "nested",
+    }
+    assert {relpath: (output / relpath).read_text() for relpath in expected} == expected
+    assert all((output / relpath).is_symlink() for relpath in expected)
+    lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "dir" / "assemble.lock").read_text())
+    assert len(lock_data["outs"][0]["manifest"]) == len(expected)
+
+    assert "1 cached" in _ok(_pivot(clone, "status", env=env))
+    assert "0 ran, 1 cached" in _ok(_pivot(clone, "repro", env=env))
+    assert "Verification passed" in _ok(_pivot(clone, "verify", env=env))
+    _ok(_pivot(clone, "commit", "dir/assemble", env=env))
+
+
 _PARAM_PIPELINE = """\
 import pandas as pd
 

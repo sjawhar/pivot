@@ -242,34 +242,58 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
                 yield from _scandir_recursive(pathlib.Path(entry.path))
 
 
-def _scandir_artifact_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
-    """Yield every regular file in an artifact directory, rejecting symlinks."""
+def _scandir_artifact_recursive(
+    path: pathlib.Path, cache_dir: pathlib.Path | None
+) -> Generator[os.DirEntry[str]]:
+    """Yield artifact files, allowing only descendants linked to cache objects."""
+    resolved_cache = cache_dir.resolve() if cache_dir is not None else None
     with os.scandir(path) as entries:
         for entry in entries:
+            entry_path = pathlib.Path(entry.path)
             if entry.is_symlink():
+                try:
+                    cache_derived = (
+                        resolved_cache is not None
+                        and entry_path.resolve().is_relative_to(resolved_cache)
+                        and entry_path.is_file()
+                    )
+                except OSError:
+                    cache_derived = False
+                if cache_derived:
+                    yield entry
+                    continue
                 raise exceptions.CacheError(f"Directory artifact contains symlink: {entry.path}")
             if entry.is_file():
                 yield entry
             elif entry.is_dir():
-                yield from _scandir_artifact_recursive(pathlib.Path(entry.path))
+                yield from _scandir_artifact_recursive(entry_path, cache_dir)
 
 
 def _hash_directory(
     path: pathlib.Path,
     state_db: state_mod.StateDB | None,
     entries: Generator[os.DirEntry[str]],
+    *,
+    cache_dir: pathlib.Path | None = None,
 ) -> tuple[str, list[DirManifestEntry]]:
     """Hash yielded regular files into a directory manifest."""
     _t = metrics.start()
     manifest = list[DirManifestEntry]()
     resolved_base = path.resolve()
+    resolved_cache = cache_dir.resolve() if cache_dir is not None else None
 
     for entry in sorted(entries, key=lambda e: e.path):
         file_path = pathlib.Path(entry.path)
-        # Verify file is still within the directory (paranoid check)
-        if not file_path.resolve().is_relative_to(resolved_base):
-            continue
         try:
+            resolved_file = file_path.resolve()
+            cache_derived = (
+                resolved_cache is not None
+                and file_path.is_symlink()
+                and resolved_file.is_relative_to(resolved_cache)
+            )
+            # Verify files stay in the artifact, except cache-derived checkout links.
+            if not cache_derived and not resolved_file.is_relative_to(resolved_base):
+                continue
             rel = file_path.relative_to(path)
             file_stat = entry.stat(follow_symlinks=True)
             file_hash, _ = hash_file(file_path, state_db)
@@ -301,9 +325,16 @@ def hash_directory(
 def hash_artifact_directory(
     path: pathlib.Path,
     state_db: state_mod.StateDB | None = None,
+    *,
+    cache_dir: pathlib.Path | None = None,
 ) -> tuple[str, list[DirManifestEntry]]:
-    """Hash a directory artifact, keeping every regular descendant."""
-    return _hash_directory(path, state_db, _scandir_artifact_recursive(path))
+    """Hash a directory artifact, keeping regular and cache-derived descendants."""
+    return _hash_directory(
+        path,
+        state_db,
+        _scandir_artifact_recursive(path, cache_dir),
+        cache_dir=cache_dir,
+    )
 
 
 _VALID_HASH_CHARS = frozenset("0123456789abcdef")
@@ -694,10 +725,10 @@ def _save_directory_to_cache(
             cache_dir_path = get_cache_path(cache_dir, existing_hash)
             if cache_dir_path.exists():
                 # Already correctly linked - compute manifest from actual content
-                _, manifest = hash_artifact_directory(path, state_db)
+                _, manifest = hash_artifact_directory(path, state_db, cache_dir=cache_dir)
                 return DirHash(hash=existing_hash, manifest=manifest)
 
-    tree_hash, manifest = hash_artifact_directory(path, state_db)
+    tree_hash, manifest = hash_artifact_directory(path, state_db, cache_dir=cache_dir)
     output_hash = DirHash(hash=tree_hash, manifest=manifest)
     _store_directory(
         path,

@@ -68,15 +68,19 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
 
 
 def _on_disk_matches_expected(
-    path: pathlib.Path, expected_hash: HashInfo, *, artifact_directory: bool = False
+    path: pathlib.Path,
+    expected_hash: HashInfo,
+    *,
+    artifact_directory: bool = False,
+    cache_dir: pathlib.Path | None = None,
 ) -> bool:
     if is_dir_hash(expected_hash):
         if not path.is_dir():
             return False
-        hash_directory = (
-            cache.hash_artifact_directory if artifact_directory else cache.hash_directory
-        )
-        actual_hash, _ = hash_directory(path)
+        if artifact_directory:
+            actual_hash, _ = cache.hash_artifact_directory(path, cache_dir=cache_dir)
+        else:
+            actual_hash, _ = cache.hash_directory(path)
     else:
         if not path.is_file():
             return False
@@ -137,7 +141,10 @@ def _restore_path_locked(
         match behavior:
             case CheckoutBehavior.ERROR:
                 if _on_disk_matches_expected(
-                    path, output_hash, artifact_directory=artifact_directory
+                    path,
+                    output_hash,
+                    artifact_directory=artifact_directory,
+                    cache_dir=cache_dir,
                 ):
                     return ("skipped", path.name)
                 raise click.ClickException(

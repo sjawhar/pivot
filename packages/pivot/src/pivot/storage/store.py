@@ -67,7 +67,7 @@ class CacheStore:
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                ref_hash, _ = cache.hash_artifact_directory(ref_path, db)
+                ref_hash, _ = cache.hash_artifact_directory(ref_path, db, cache_dir=self._cache_dir)
             else:
                 ref_hash, _ = cache.hash_file(ref_path, db)
 
@@ -117,14 +117,18 @@ class CacheStore:
 
         if state_db is not None:
             if ref_path.is_dir():
-                tree_hash, manifest = cache.hash_artifact_directory(ref_path, state_db)
+                tree_hash, manifest = cache.hash_artifact_directory(
+                    ref_path, state_db, cache_dir=self._cache_dir
+                )
                 return types.DirHash(hash=tree_hash, manifest=manifest)
             file_hash, _ = cache.hash_file(ref_path, state_db)
             return types.FileHash(hash=file_hash)
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                tree_hash, manifest = cache.hash_artifact_directory(ref_path, db)
+                tree_hash, manifest = cache.hash_artifact_directory(
+                    ref_path, db, cache_dir=self._cache_dir
+                )
                 return types.DirHash(hash=tree_hash, manifest=manifest)
 
             file_hash, _ = cache.hash_file(ref_path, db)
@@ -220,7 +224,9 @@ class WorkspaceStore:
         """Hash a written output once and, unless it is a metric, place it in the cache."""
         output_hash: types.HashInfo
         if path.is_dir():
-            tree_hash, manifest = cache.hash_artifact_directory(path, None)
+            tree_hash, manifest = cache.hash_artifact_directory(
+                path, None, cache_dir=self._cache_dir
+            )
             output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
         else:
             file_hash, _ = cache.hash_file(path, None)
