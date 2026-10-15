@@ -116,7 +116,6 @@ def _restore_path_locked(
     lock_token: str | None,
 ) -> tuple[RestoreResult, str]:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
-    keep_ignored = False
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
@@ -127,10 +126,9 @@ def _restore_path_locked(
                     + "Use --force to overwrite or --only-missing to skip existing files."
                 )
             case CheckoutBehavior.SKIP_EXISTING:
-                # Existing file: skip. Existing real directory: fill in its missing files, or
-                # swap in the target when every differing file is pivot's own cached output,
-                # keeping the entries the directory hash skips. Never overwrite content the
-                # cache lacks (a local change).
+                # Existing real directories can fill missing files in place, or swap to the
+                # target when every differing or extra file is pivot's own cached output.
+                # Never overwrite content the cache lacks (a local change).
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return ("skipped", path.name)
                 # Reuse hashes `pivot status` and `pivot track` recorded; never create the DB.
@@ -147,13 +145,10 @@ def _restore_path_locked(
                         f"'{path.name}' has local changes that are not in the cache: "
                         + f"{', '.join(outcome['local_changes'])}. Use --force to overwrite."
                     )
-                # An interrupted restore may have staged kept entries beside the directory;
-                # the restore below puts them back, so take it even when nothing else differs.
-                if not outcome["replace"] and cache.staged_kept_entries(path) is None:
+                if not outcome["replace"]:
                     if outcome["unavailable"]:
                         return ("missing", path.name)
                     return ("restored" if outcome["restored"] else "skipped", path.name)
-                keep_ignored = True
             case CheckoutBehavior.FORCE:
                 cache.remove_output(path)
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
@@ -166,7 +161,6 @@ def _restore_path_locked(
         checkout_modes=checkout_modes,
         state_dir=state_dir,
         lock_token=lock_token,
-        keep_ignored=keep_ignored,
     )
     if not success:
         return ("missing", path.name)

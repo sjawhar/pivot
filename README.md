@@ -92,12 +92,12 @@ def process(raw: pd.DataFrame) -> pd.DataFrame:
 
 #### Module-level values
 
-Pivot tracks module-level `bool`, `int`, `float`, `str`, `bytes`, and `None` values used by
-a stage. Any other module-level value—such as a tuple, collection, enum member, frozen model,
-compiled regular expression, instance, or a method bound to an instance—raises
-`StageDefinitionError`; put configuration in `StageParams` instead. Set
-`core.unsafe_fingerprinting=true` or `PIVOT_UNSAFE_FINGERPRINTING=1` only to downgrade that
-error to a warning.
+Pivot tracks module-level `bool`, `int`, `float`, `str`, `bytes`, and `None` values, tuples
+and frozensets of those scalars, and compiled regular expressions used by a stage. Any other
+module-level value—such as a list, dict, set, nested collection, enum member, frozen model,
+instance, or a method bound to an instance—raises `StageDefinitionError`; put configuration in
+`StageParams` instead. Set `core.unsafe_fingerprinting=true` or
+`PIVOT_UNSAFE_FINGERPRINTING=1` only to downgrade that error to a warning.
 
 ### Explain Mode
 

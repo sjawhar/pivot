@@ -21,19 +21,19 @@ Catalog of fingerprinting gap patterns discovered through adversarial testing. C
 
 ---
 
-### RC-2: Primitive Collections in Closures Ignored
+### RC-2: Immutable Module Captures (FIXED)
 
-Collections (tuple, list, dict, set, frozenset) containing only primitives are routed to `_process_collection_dependency`, which only scans for callables. Primitive data values are silently discarded.
+**Fixed by:** `_immutable_value_text` records exact tuples and frozensets of
+`bool`, `int`, `float`, `str`, `bytes`, and `None` values by canonical form,
+and `re.Pattern` values by full pattern and flags. `_value_token` reuses the
+same text when cached manifests re-read a capture.
 
-**Where in code:** `fingerprint.py` `_process_closure_values()` matches tuples/lists/etc on the collection branch → `_process_collection_dependency()` iterates elements checking only `callable(value) and is_user_code(value)`.
+**Scope:** Lists, dicts, sets, tuple or frozenset values containing another
+collection or object, enum members, and class instances remain refused.
 
-**Asymmetry:** The module attribute path (`_process_module_dependency`) checks `_is_primitive_collection()` and hashes the serialized value. The closure path has no equivalent — same data detected or ignored depending on import style.
-
-**Example patterns:**
-- `_FIGSIZE = (9, 5)` used in `plt.subplots(figsize=_FIGSIZE)` via direct reference
-- Color tuples, threshold lists, dimension specs — any `tuple`/`list`/`dict` of numbers/strings used in function bodies via `LOAD_GLOBAL`
-
-**Fix:** Check `_is_primitive_collection()` before routing to `_process_collection_dependency`. Hash serialized value for primitive-only collections.
+**Regression:** `test_safe_fingerprinting.py::test_immutable_capture_is_tracked_by_value`,
+`test_determinism.py::test_frozenset_capture_is_deterministic_across_hash_seeds`,
+and `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage`.
 
 ---
 
