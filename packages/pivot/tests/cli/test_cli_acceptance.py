@@ -990,6 +990,57 @@ def test_pull_keeps_cache_derived_directory_file_symlinks_as_artifact_members(
     _ok(_pivot(clone, "commit", "dir/assemble", env=env))
 
 
+_PATH_DIRECTORY_DEPENDENCY_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def assemble(version: str) -> pathlib.Path:
+    output = pathlib.Path(tempfile.mkdtemp())
+    (output / "build").mkdir()
+    (output / "build" / "required.txt").write_text(version)
+    (output / "keep.txt").write_text("constant")
+    return output
+
+
+@stage
+def consume(bundle: pathlib.Path) -> str:
+    return (bundle / "build" / "required.txt").read_text()
+
+
+with Pipeline("chain") as pipeline:
+    consume(assemble(pipeline.input("version.txt")))
+"""
+
+
+def test_path_directory_output_has_one_hash_as_output_and_dependency(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A Path directory output preserves ignored-looking descendants for consumers."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _PATH_DIRECTORY_DEPENDENCY_PIPELINE,
+            "data/raw/version.txt": "one",
+        },
+    )
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "copy"))
+
+    assert "2 ran" in _ok(_pivot(root, "repro"))
+    assert "2 cached" in _ok(_pivot(root, "status"))
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+
+    (root / "data" / "raw" / "version.txt").write_text("two")
+    assert "2 ran" in _ok(_pivot(root, "repro"))
+    assert (
+        root / "data" / "chain" / "assemble.dat" / "build" / "required.txt"
+    ).read_text() == "two"
+    assert (root / "data" / "chain" / "consume.txt").read_text() == "two"
+
+
 _PARAM_PIPELINE = """\
 import pandas as pd
 
