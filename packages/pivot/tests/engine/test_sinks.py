@@ -727,6 +727,47 @@ async def test_sink_always_reports_lossy_output_warnings_after_many_stage_warnin
     assert "WARNING: skipping malformed row 50" not in result
     assert "… 10 more warnings (run with --show-output)" in result
     assert result.index("skipping malformed row 49") < result.index("… 10 more warnings")
+    assert result.index(lossy) < result.index("skipping malformed row 0"), "lossy prints first"
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_collapses_repeated_stage_warnings_with_a_count(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """matplotlib logs the same findfont line hundreds of times; the report prints it once."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=400)
+    sink = sink_type(console=console, show_output=False)
+
+    repeated = "WARNING: findfont: Font family 'Montserrat' not found."
+    for i in range(300):
+        await sink.handle(
+            LogLine(type="log_line", seq=i, stage="plot", line=repeated, is_stderr=True)
+        )
+    lossy = (
+        f"WARNING: Stage 'plot' wrote its YAML output {types.LOSSY_OUTPUT_PHRASE}: "
+        + "YAML output must contain plain data; got DataFrame at root."
+    )
+    await sink.handle(LogLine(type="log_line", seq=300, stage="plot", line=lossy, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=301,
+            stage="plot",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    warning_lines = [line.strip() for line in output.getvalue().splitlines() if "WARNING:" in line]
+    assert warning_lines == [lossy, f"{repeated} (×300)"]
+    assert "more warnings" not in output.getvalue()
 
 
 async def test_static_sink_log_lines_stream_before_completions() -> None:

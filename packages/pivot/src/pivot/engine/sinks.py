@@ -89,11 +89,12 @@ def _categorize(event: StageCompleted) -> DisplayCategory:
 class _StageWarnings:
     """A stage's ``WARNING:`` lines for the report.
 
-    Pivot's own output-write warnings are always kept; the stage's own warnings keep
-    the first ``_MAX_LOG_LINES_PER_STAGE`` and count the rest.
+    Pivot's own output-write warnings are always kept and print first. The stage's own
+    warnings are counted per distinct line (in first-seen order); the report shows the
+    first ``_MAX_LOG_LINES_PER_STAGE`` distinct lines and counts the rest.
     """
 
-    stage: list[str] = dataclasses.field(default_factory=list[str])
+    stage: dict[str, int] = dataclasses.field(default_factory=dict[str, int])
     lossy_outputs: list[str] = dataclasses.field(default_factory=list[str])
     dropped: int = 0
 
@@ -174,7 +175,11 @@ def _print_completions(
                         console.print(detail)
             elif event["stage"] in warnings_by_stage:
                 buffered = warnings_by_stage[event["stage"]]
-                for warning_line in [*buffered.stage, *buffered.lossy_outputs]:
+                stage_lines = [
+                    line if count == 1 else f"{line} (×{count})"
+                    for line, count in buffered.stage.items()
+                ]
+                for warning_line in [*buffered.lossy_outputs, *stage_lines]:
                     escaped = rich.markup.escape(warning_line)
                     console.print(f"          [yellow]{escaped}[/yellow]")
                 if buffered.dropped:
@@ -207,8 +212,10 @@ def _buffer_log_line(
     buffered = stage_warnings.setdefault(event["stage"], _StageWarnings())
     if LOSSY_OUTPUT_PHRASE in line and line.startswith("WARNING: Stage '"):
         buffered.lossy_outputs.append(line)
+    elif line in buffered.stage:
+        buffered.stage[line] += 1
     elif len(buffered.stage) < _MAX_LOG_LINES_PER_STAGE:
-        buffered.stage.append(line)
+        buffered.stage[line] = 1
     else:
         buffered.dropped += 1
 
