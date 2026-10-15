@@ -372,39 +372,49 @@ def test_restore_targets_from_revision_force_overwrite(
 def test_restore_targets_from_revision_output_with_stage(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Raises GetError when -o used with stage name."""
+    """A single stage output can be restored to an explicit --output path."""
     repo_path, commit = git_repo
-
-    # Create lock file for stage
     cache_dir = repo_path / ".pivot" / "cache"
-    state_dir = repo_path / ".pivot"
+    source = repo_path / "cached-stage-output.txt"
+    source.write_text("stage output")
+    output_hash = cache.save_to_cache(
+        source, cache_dir / "files", checkout_mode=cache.CheckoutMode.COPY
+    )
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
     lock_content = {
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [{"key": None, "hash": "de45600000000000", "tag": "data"}],
+        "outs": [
+            {
+                "key": None,
+                "hash": output_hash["hash"],
+                "path": "data/train/output.txt",
+            }
+        ],
     }
     (repo_path / ".pivot" / "stages" / "train.lock").write_text(yaml.dump(lock_content))
-
     sha = commit("add lock")
-
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "output.txt"
 
-    with pytest.raises(exceptions.GetError, match="stage names"):
-        restore.restore_targets_from_revision(
-            targets=["train"],
-            rev=sha[:7],
-            output=repo_path / "output.txt",
-            cache_dir=cache_dir,
-            stage_targets={
-                "train": restore.StageTarget(
-                    stage_name="train", state_dir=state_dir, paths_by_key={None: "model.pkl"}
-                )
-            },
-            checkout_modes=[cache.CheckoutMode.COPY],
-            force=False,
-        )
+    messages, success = restore.restore_targets_from_revision(
+        targets=["train"],
+        rev=sha[:7],
+        output=output_path,
+        cache_dir=cache_dir,
+        stage_targets={
+            "train": restore.StageTarget(
+                stage_name="train", state_dir=repo_path / ".pivot", paths_by_key={None: "model.pkl"}
+            )
+        },
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+    )
+
+    assert success
+    assert messages == [f"Restored: {output_path} (from cache)"]
+    assert output_path.read_text() == "stage output"
 
 
 # =============================================================================

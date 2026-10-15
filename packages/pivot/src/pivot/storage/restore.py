@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, TypedDict, TypeGuard
 import xxhash
 import yaml
 
-from pivot import exceptions, git, project, yaml_config
+from pivot import exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
 from pivot.types import DirHash, FileHash, HashInfo
@@ -158,9 +158,12 @@ def resolve_targets(
                     f"Stage '{stage_name}' has no lock file at revision '{rev}'"
                 )
             paths_by_key = stage_target["paths_by_key"]
+            selected_key = types.identity_from_key(target).key
             hashes = dict[str, HashInfo | None]()
             for entry in lock_data["outs"]:
                 key = entry["key"]
+                if selected_key is not None and key != selected_key:
+                    continue
                 if "path" in entry:
                     path = entry["path"]
                 elif key in paths_by_key:
