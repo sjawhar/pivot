@@ -197,7 +197,7 @@ def test_container_callback_change_detected():
 
 
 # =============================================================================
-# VULNERABILITY 4: Class attribute runtime modification
+# Class attribute runtime modification: tracked, a class attribute read is re-read
 # =============================================================================
 
 
@@ -212,10 +212,6 @@ def _helper_stage_uses_class_attr():
     return _ConfigClass.callback()
 
 
-@pytest.mark.xfail(
-    reason="Class attributes modified at runtime not tracked",
-    strict=True,
-)
 def test_class_attribute_callback_change_detected():
     """Changes to class attribute callbacks should be detected."""
     _ConfigClass.callback = _callback_v1

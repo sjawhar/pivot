@@ -64,6 +64,23 @@ ENUM_MEMBER = CapturedMode.DEFAULT
 CALLABLE_INSTANCE = CallableConfig()
 
 
+class Scaler:
+    factor: int
+
+    def __init__(self, factor: int) -> None:
+        self.factor = factor
+
+    def apply(self, x: int) -> int:
+        return x * self.factor
+
+
+BOUND_METHOD = Scaler(3).apply
+SEEDED_NORMAL = np.random.default_rng(0).normal
+LOGGER_INFO = logging.getLogger(__name__).info
+COMMA_JOIN = ",".join
+LIBRARY_NORMAL = np.random.normal
+
+
 class _ExternalCallable:
     __module__ = "math"
 
@@ -151,6 +168,39 @@ def _stage_uses_enum_member() -> str:
 
 def _stage_uses_callable_instance() -> int:
     return CALLABLE_INSTANCE()
+
+
+def _stage_uses_bound_method() -> int:
+    return BOUND_METHOD(1)
+
+
+def _stage_uses_seeded_normal() -> float:
+    return float(SEEDED_NORMAL())
+
+
+def _make_stage_with_bound_method_cell() -> Callable[[], int]:
+    cell_method = Scaler(4).apply
+
+    def stage() -> int:
+        return cell_method(1)
+
+    return stage
+
+
+def _apply_each(method: Callable[[int], int], items: list[int]) -> int:
+    return sum(method(item) for item in items)
+
+
+_PARTIAL_OVER_METHOD = functools.partial(_apply_each, Scaler(5).apply)
+
+
+def _stage_uses_partial_over_bound_method() -> int:
+    return _PARTIAL_OVER_METHOD([1])
+
+
+def _stage_uses_stateless_bound_methods() -> int:
+    LOGGER_INFO("x")
+    return len(COMMA_JOIN(["a"])) + int(LIBRARY_NORMAL() * 0)
 
 
 def _stage_uses_three_non_scalar_values() -> int:
@@ -260,6 +310,17 @@ def _stage_uses_compiled_pattern() -> bool:
             "CallableConfig",
             id="callable-instance",
         ),
+        pytest.param(_stage_uses_bound_method, "BOUND_METHOD", "method", id="bound-method"),
+        pytest.param(_stage_uses_seeded_normal, "SEEDED_NORMAL", "method", id="seeded-generator"),
+        pytest.param(
+            _make_stage_with_bound_method_cell(), "cell_method", "method", id="bound-method-cell"
+        ),
+        pytest.param(
+            _stage_uses_partial_over_bound_method,
+            "_PARTIAL_OVER_METHOD.args[0]",
+            "method",
+            id="bound-method-in-partial",
+        ),
     ],
 )
 def test_non_scalar_closure_capture_raises(
@@ -314,6 +375,14 @@ def test_scalar_and_callable_closure_capture_allows_fingerprint(func: Callable[[
 
 def test_common_function_and_class_references_are_allowed() -> None:
     fingerprint.get_stage_fingerprint(_stage_uses_common_callables)
+
+
+def test_methods_bound_to_a_logger_scalar_or_library_are_allowed() -> None:
+    """A Logger's, a scalar's or a library module's own bound method carries no stage state."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_stateless_bound_methods)
+
+    assert manifest[f"ext:{__name__}.COMMA_JOIN"] == "builtins.str.join[',']", manifest
+    assert manifest[f"ext:{__name__}.LIBRARY_NORMAL"] == "numpy.random.RandomState.normal"
 
 
 def test_nonlocal_stdlib_module_is_allowed() -> None:

@@ -412,7 +412,7 @@ def test_register_captures_constants(test_pipeline: PipelineLike) -> None:
     helpers.register_test_stage(uses_constant)
 
     fp = test_pipeline.ensure_fingerprint("test/uses_constant")
-    assert f"const:{__name__}.LEARNING_RATE" in fp
+    assert f"const:{__name__}.{uses_constant.__qualname__}.LEARNING_RATE" in fp
 
 
 def test_registry_build_dag_integration(tmp_path: pathlib.Path) -> None:

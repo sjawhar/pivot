@@ -63,6 +63,7 @@ from pivot import (
     project,
     registry,
 )
+from pivot import fingerprint as fingerprint_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
@@ -205,8 +206,9 @@ def get_pipeline_explanations(
         if not execution_order:
             return []
 
-        for stage_name in execution_order:
-            pipeline.ensure_fingerprint(stage_name)
+        with fingerprint_mod.fingerprint_pass():
+            for stage_name in execution_order:
+                pipeline.ensure_fingerprint(stage_name)
         overrides = parameters.load_params_yaml(pipeline)
 
         store = _make_workspace_store(pipeline)
@@ -296,8 +298,9 @@ def get_pipeline_status(
         if not execution_order:
             return [], stage_graph
 
-        for stage_name in execution_order:
-            pipeline.ensure_fingerprint(stage_name)
+        with fingerprint_mod.fingerprint_pass():
+            for stage_name in execution_order:
+                pipeline.ensure_fingerprint(stage_name)
         overrides = parameters.load_params_yaml(pipeline)
 
         store = _make_workspace_store(pipeline)
