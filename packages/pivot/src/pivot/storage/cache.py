@@ -184,43 +184,65 @@ def _cache_object_key(path: pathlib.Path) -> str | None:
     return key if is_valid_hash(key) and target.is_file() else None
 
 
-def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
+def _scandir_recursive(
+    path: pathlib.Path, left_out: list[pathlib.Path]
+) -> Generator[os.DirEntry[str]]:
     """Yield every file under `path` recursively, using os.scandir() for efficiency.
 
     A declared directory artifact is hashed and cached whole: no name is ignored, so a change
     to any file in a directory input reruns its consumers, and every file in a directory output
     survives cache and restore. Ignore rules belong to code fingerprinting and watch mode.
     A symlink to a cache object (left by a symlink checkout) counts as the file it points to;
-    any other symlink is refused rather than silently left out of the artifact.
+    any other symlink is not stored and is appended to ``left_out``.
     DirEntry objects cache stat results, avoiding redundant syscalls.
     PermissionError propagates to caller - partial hashes would be incorrect.
 
     Args:
         path: Directory to scan
+        left_out: Collects the symlinks that are not part of the artifact
     """
     with os.scandir(path) as entries:
         for entry in entries:
             if entry.is_symlink():
                 if _cache_object_key(pathlib.Path(entry.path)) is not None:
                     yield entry
-                    continue
-                raise exceptions.CacheError(f"Directory artifact contains symlink: {entry.path}")
-            if entry.is_file():
+                else:
+                    left_out.append(pathlib.Path(entry.path))
+            elif entry.is_file():
                 yield entry
             elif entry.is_dir():
-                yield from _scandir_recursive(pathlib.Path(entry.path))
+                yield from _scandir_recursive(pathlib.Path(entry.path), left_out)
+
+
+def _warn_left_out_symlinks(path: pathlib.Path, left_out: list[pathlib.Path]) -> None:
+    """Log one warning naming every symlink a directory artifact does not store."""
+    absolute = path.absolute()
+    cwd = pathlib.Path.cwd()
+    shown = absolute.relative_to(cwd) if absolute.is_relative_to(cwd) else path
+    names = ", ".join(sorted(str(link.relative_to(path)) for link in left_out))
+    one = len(left_out) == 1
+    logger.warning(
+        "Directory artifact %s leaves out %s %s (a symlink inside a directory artifact is not "
+        + "stored); replace %s with a real file or directory",
+        shown,
+        "symlink" if one else "symlinks",
+        names,
+        "it" if one else "each",
+    )
 
 
 def hash_directory(
     path: pathlib.Path,
     state_db: state_mod.StateDB | None = None,
+    *,
+    warn_left_out_symlinks: bool = False,
 ) -> tuple[str, list[DirManifestEntry]]:
     """Compute tree hash of directory, returning hash and manifest.
 
     Symlink handling:
     - A symlink to a cache object is hashed by its target's content under its own relpath;
       the content must match the object's name
-    - Any other symlink inside the directory raises CacheError
+    - Any other symlink inside the directory is left out of the manifest
     - Base path may be symlinked (resolved for consistency)
 
     Note: For portability, paths are stored as normalized (symlinks preserved)
@@ -229,12 +251,15 @@ def hash_directory(
     Args:
         path: Directory to hash
         state_db: Optional StateDB for caching file hashes
+        warn_left_out_symlinks: Log one warning naming the symlinks left out. Set where a
+            manifest is recorded (a stage output, a tracked directory), not on every re-hash.
     """
     _t = metrics.start()
     manifest = list[DirManifestEntry]()
+    left_out = list[pathlib.Path]()
     resolved_base = path.resolve()
 
-    for entry in sorted(_scandir_recursive(path), key=lambda e: e.path):
+    for entry in sorted(_scandir_recursive(path, left_out), key=lambda e: e.path):
         file_path = pathlib.Path(entry.path)
         # Verify a regular file is still within the directory (paranoid check). A cache-object
         # link resolves into the cache by design.
@@ -245,7 +270,8 @@ def hash_directory(
             file_stat = entry.stat(follow_symlinks=True)
             file_hash, _ = hash_file(file_path, state_db)
             if entry.is_symlink() and file_hash != _cache_object_key(file_path):
-                raise exceptions.CacheError(f"Directory artifact contains symlink: {entry.path}")
+                left_out.append(file_path)
+                continue
             manifest_entry: DirManifestEntry = {
                 "relpath": str(rel),
                 "hash": file_hash,
@@ -255,6 +281,9 @@ def hash_directory(
             manifest.append(manifest_entry)
         except FileNotFoundError:
             continue  # File deleted between scan and hash
+
+    if left_out and warn_left_out_symlinks:
+        _warn_left_out_symlinks(path, left_out)
 
     manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     tree_hash = xxhash.xxh64(manifest_json.encode()).hexdigest()

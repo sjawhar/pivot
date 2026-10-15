@@ -144,17 +144,48 @@ with Pipeline("directory") as pipeline:
 """
 
 
-def test_repro_refuses_a_directory_artifact_that_contains_a_symlink(
+def test_repro_warns_about_a_symlink_left_out_of_a_directory_artifact(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A directory artifact cannot silently omit a symlinked descendant."""
+    """A user symlink is left out of a directory output, with a warning under the stage."""
     root = _project(tmp_path, {"pipeline.py": _DIRECTORY_ARTIFACT_SYMLINK_PIPELINE})
+    output = root / "data" / "directory" / "assemble.dat"
 
-    proc = _pivot(root, "repro")
-    out = proc.stdout + proc.stderr
+    out = _ok(_pivot(root, "repro"))
 
-    assert proc.returncode == 1, out
-    assert "Directory artifact contains symlink" in out
+    warning = (
+        "WARNING: Directory artifact data/directory/assemble.dat leaves out symlink link.txt "
+        + "(a symlink inside a directory artifact is not stored); "
+        + "replace it with a real file or directory"
+    )
+    assert warning in " ".join(out.split()), out
+    lock_data = yaml.safe_load(
+        (root / ".pivot" / "stages" / "directory" / "assemble.lock").read_text()
+    )
+    assert [entry["relpath"] for entry in lock_data["outs"][0]["manifest"]] == ["target.txt"]
+
+    shutil.rmtree(output)
+    assert "0 ran, 1 cached" in _ok(_pivot(root, "repro"))
+    assert (output / "target.txt").read_text() == "target"
+    assert not (output / "link.txt").exists() and not (output / "link.txt").is_symlink()
+
+
+def test_track_warns_about_a_symlink_left_out_of_a_tracked_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Tracking a directory with a user symlink records the regular files and warns."""
+    root = _project(tmp_path, {"data/tracked/keep.txt": "keep"})
+    (root / "data" / "tracked" / "link.txt").symlink_to(root / "data" / "tracked" / "keep.txt")
+
+    out = _ok(_pivot(root, "track", "data/tracked"))
+
+    assert (
+        "Directory artifact data/tracked leaves out symlink link.txt "
+        + "(a symlink inside a directory artifact is not stored); "
+        + "replace it with a real file or directory"
+    ) in " ".join(out.split()), out
+    pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
+    assert [entry["relpath"] for entry in pvt["manifest"]] == ["keep.txt"]
 
 
 _FORCE_CHECKOUT_PIPELINE = """\
@@ -941,7 +972,7 @@ def test_pull_keeps_cache_derived_directory_file_symlinks_as_artifact_members(
     assert "1 cached" in _ok(_pivot(clone, "status", env=env))
     assert "0 ran, 1 cached" in _ok(_pivot(clone, "repro", env=env))
     assert "Verification passed" in _ok(_pivot(clone, "verify", env=env))
-    _ok(_pivot(clone, "commit", "dir/assemble", env=env))
+    assert "leaves out symlink" not in _ok(_pivot(clone, "commit", "dir/assemble", env=env))
 
     lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "dir" / "assemble.lock").read_text())
     assert len(lock_data["outs"][0]["manifest"]) == len(expected)
@@ -957,7 +988,7 @@ def test_tracked_directory_checked_out_as_symlinks_stays_clean(tmp_path: pathlib
     assert (root / "data" / "tracked" / "keep.txt").is_symlink()
 
     assert "1 clean" in _ok(_pivot(root, "status", "--tracked-only"))
-    _ok(_pivot(root, "track", "--force", "data/tracked"))
+    assert "leaves out symlink" not in _ok(_pivot(root, "track", "--force", "data/tracked"))
 
     pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
     assert sorted(entry["relpath"] for entry in pvt["manifest"]) == ["keep.txt", "nested/f.txt"]

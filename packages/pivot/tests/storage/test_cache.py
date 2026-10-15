@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import mmap
 import multiprocessing
 import os
@@ -12,7 +13,6 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from pivot import exceptions
 from pivot.storage import cache, state
 from pivot.types import HashInfo
 
@@ -194,19 +194,46 @@ def test_hash_directory(tmp_path: pathlib.Path) -> None:
     assert len(manifest) == 2
 
 
-def test_hash_directory_refuses_symlinked_descendants(tmp_path: pathlib.Path) -> None:
-    """A directory artifact reports a symlink rather than silently excluding it."""
+def test_hash_directory_warns_about_left_out_symlinks(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A recorded directory names each user symlink it leaves out, in one warning."""
     test_dir = tmp_path / "artifact"
-    test_dir.mkdir()
+    (test_dir / "nested").mkdir(parents=True)
     target = test_dir / "target.txt"
     target.write_text("target")
     (test_dir / "link.txt").symlink_to(target)
+    (test_dir / "nested" / "other.txt").symlink_to(target)
 
-    with pytest.raises(exceptions.CacheError, match="Directory artifact contains symlink"):
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        _, manifest = cache.hash_directory(test_dir, warn_left_out_symlinks=True)
+
+    assert [entry["relpath"] for entry in manifest] == ["target.txt"]
+    assert [record.getMessage() for record in caplog.records] == [
+        f"Directory artifact {test_dir} leaves out symlinks link.txt, nested/other.txt "
+        + "(a symlink inside a directory artifact is not stored); "
+        + "replace each with a real file or directory"
+    ]
+
+
+def test_hash_directory_rehash_is_silent_about_left_out_symlinks(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Status and skip checks re-hash a directory without repeating the warning."""
+    test_dir = tmp_path / "artifact"
+    test_dir.mkdir()
+    (test_dir / "target.txt").write_text("target")
+    (test_dir / "link.txt").symlink_to(test_dir / "target.txt")
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
         cache.hash_directory(test_dir)
 
+    assert caplog.records == []
 
-def test_hash_directory_hashes_cache_object_links_by_target(tmp_path: pathlib.Path) -> None:
+
+def test_hash_directory_hashes_cache_object_links_by_target(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A symlink checkout's link to a cache object counts as the file it points to."""
     source = tmp_path / "source"
     source.mkdir()
@@ -218,7 +245,11 @@ def test_hash_directory_hashes_cache_object_links_by_target(tmp_path: pathlib.Pa
     linked.mkdir()
     (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, expected_manifest[0]["hash"]))
 
-    assert cache.hash_directory(linked) == (expected_hash, expected_manifest)
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        result = cache.hash_directory(linked, warn_left_out_symlinks=True)
+
+    assert result == (expected_hash, expected_manifest)
+    assert caplog.records == []
 
 
 def test_hash_directory_relative_paths(tmp_path: pathlib.Path) -> None:
@@ -277,15 +308,18 @@ def test_hash_directory_includes_size(tmp_path: pathlib.Path) -> None:
     assert manifest[0]["size"] == 5
 
 
-def test_hash_directory_refuses_symlinks_to_files_outside_the_cache(tmp_path: pathlib.Path) -> None:
-    """A symlink that is not a cache-object link cannot be silently skipped."""
+def test_hash_directory_leaves_out_symlinks_to_files_outside_the_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A symlink that is not a cache-object link is not part of the manifest."""
     test_dir = tmp_path / "mydir"
     test_dir.mkdir()
     (test_dir / "real.txt").write_text("content")
     (test_dir / "link.txt").symlink_to(test_dir / "real.txt")
 
-    with pytest.raises(exceptions.CacheError, match="Directory artifact contains symlink"):
-        cache.hash_directory(test_dir)
+    _, manifest = cache.hash_directory(test_dir)
+
+    assert [entry["relpath"] for entry in manifest] == ["real.txt"]
 
 
 def test_hash_directory_marks_executable(tmp_path: pathlib.Path) -> None:

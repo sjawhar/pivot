@@ -1046,7 +1046,7 @@ def _hash_output_paths(
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if path.is_dir():
-            tree_hash, manifest = cache.hash_directory(path, state_db)
+            tree_hash, manifest = cache.hash_directory(path, state_db, warn_left_out_symlinks=True)
             output_hashes[types.identity_key(ref.identity)] = DirHash(
                 hash=tree_hash, manifest=manifest
             )

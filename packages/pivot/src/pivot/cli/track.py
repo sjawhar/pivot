@@ -149,7 +149,7 @@ def _track_single_path(
 
     # Hash and cache
     if path.is_dir():
-        tree_hash, manifest = cache.hash_directory(path)
+        tree_hash, manifest = cache.hash_directory(path, warn_left_out_symlinks=True)
         total_size = sum(e["size"] for e in manifest)
         num_files = len(manifest)
 

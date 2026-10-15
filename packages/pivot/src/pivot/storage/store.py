@@ -220,7 +220,7 @@ class WorkspaceStore:
         """Hash a written output once and, unless it is a metric, place it in the cache."""
         output_hash: types.HashInfo
         if path.is_dir():
-            tree_hash, manifest = cache.hash_directory(path, None)
+            tree_hash, manifest = cache.hash_directory(path, None, warn_left_out_symlinks=True)
             output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
         else:
             file_hash, _ = cache.hash_file(path, None)
