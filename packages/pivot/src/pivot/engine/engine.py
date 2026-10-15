@@ -12,7 +12,6 @@ import linecache
 import logging
 import pathlib
 import queue
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -2720,13 +2719,13 @@ class Engine:
     def _load_pipeline(self, root: pathlib.Path) -> tuple[registry.PipelineLike | None, list[str]]:
         """Re-import the project's pipeline, fingerprint every stage and check ``params.yaml``.
 
-        Runs in a daemon thread. All of a reload's ``sys.modules`` changes (dropping project
-        modules, importing the edited ones) happen in this one call, on one thread. Returns the
-        new pipeline, or None if the project defines none, and the errors that make it invalid.
+        Runs in a daemon thread. All of a reload's ``sys.modules`` changes happen in this one
+        call, on one thread: discovery's import session drops the project modules the previous
+        load imported, then imports the edited ones. Returns the new pipeline, or None if the
+        project defines none, and the errors that make it invalid.
         """
         from pivot import discovery
 
-        self._clear_project_modules(root)
         new_pipeline = discovery.discover_pipeline(root, all_pipelines=self._all_pipelines)
         if new_pipeline is None:
             return None, list[str]()
@@ -2750,26 +2749,6 @@ class Engine:
         self._pipeline = old_pipeline
         self._pipeline_error = "\n".join(errors)
         return self._pipeline_error
-
-    def _clear_project_modules(self, root: pathlib.Path) -> None:
-        """Remove project modules from sys.modules."""
-        to_remove = list[str]()
-
-        for name, module in list(sys.modules.items()):
-            if module is None:  # pyright: ignore[reportUnnecessaryComparison] - sys.modules values can be None
-                continue
-            module_file = getattr(module, "__file__", None)
-            if module_file is None:
-                continue
-            try:
-                module_path = pathlib.Path(module_file)
-                if module_path.is_relative_to(root):
-                    to_remove.append(name)
-            except (TypeError, ValueError):
-                continue
-
-        for name in to_remove:
-            del sys.modules[name]
 
     async def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
         """Emit PipelineReloaded event with diff information.
