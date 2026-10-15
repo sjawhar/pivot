@@ -369,7 +369,7 @@ async def test_full_import_flow_mocked(
     mocker.patch(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
-        return_value=["train.lock"],
+        return_value=[{"name": "train.lock", "type": "file"}],
     )
     resolve_ref_mock = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",

@@ -821,6 +821,22 @@ class Pipeline:
             )
             return ArtifactHandle(self, dummy_input, None, object)
 
+        for parameter in sig.parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                self._validation_errors.append(
+                    f"{qualified_name}: parameter '{parameter.name}' uses *args; "
+                    + "use a list[...] parameter instead of *args."
+                )
+            elif parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                self._validation_errors.append(
+                    f"{qualified_name}: parameter '{parameter.name}' is positional-only; remove the /."
+                )
+            elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                self._validation_errors.append(
+                    f"{qualified_name}: parameter '{parameter.name}' uses **kwargs; "
+                    + "use named parameters instead."
+                )
+
         input_handles = dict[str, ArtifactHandle]()
         list_input_handles = dict[str, list[ArtifactHandle]]()
         collection_params = dict[str, CollectionKind]()
@@ -963,7 +979,7 @@ class Pipeline:
             )
             for err in self._validation_errors:
                 msg += f"  {err}\n"
-            raise ValueError(msg)
+            raise exceptions.StageDefinitionError(msg)
 
     def _upstream_closure(self) -> list[tuple[Pipeline, _StageNode]]:
         """Collect foreign stages reachable from this pipeline's handles via DFS."""
@@ -999,17 +1015,27 @@ class Pipeline:
         closure: list[tuple[Pipeline, _StageNode]],
     ) -> None:
         foreign_bindings = dict[str, str]()
+
+        def _add_foreign_input(handle: ArtifactHandle) -> None:
+            if not isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                return
+            inp = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
+                raise ValueError(
+                    f"Input binding conflict: input '{inp.name}' is bound to "
+                    + f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
+                    + "in different pipelines."
+                )
+            foreign_bindings[inp.name] = inp.path
+
+        for local_node in self._stages:
+            for handle in _iter_all_handles(local_node):
+                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    _add_foreign_input(handle)
+
         for _foreign_pipeline, foreign_node in closure:
             for handle in _iter_all_handles(foreign_node):
-                if isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    inp = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
-                        raise ValueError(
-                            f"Input binding conflict: input '{inp.name}' is bound to "
-                            + f"'{foreign_bindings[inp.name]}' and '{inp.path}' "
-                            + "in different pipelines."
-                        )
-                    foreign_bindings[inp.name] = inp.path
+                _add_foreign_input(handle)
 
         local_bindings = self.input_bindings
         for name, path in foreign_bindings.items():

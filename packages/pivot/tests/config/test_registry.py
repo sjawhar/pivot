@@ -203,7 +203,9 @@ def test_register_params_requires_params_argument(tmp_path: pathlib.Path) -> Non
         pass
 
     with (
-        pytest.raises(ValueError, match="unexpected keyword argument 'params'"),
+        pytest.raises(
+            exceptions.StageDefinitionError, match="unexpected keyword argument 'params'"
+        ),
         compose.Pipeline("test", root=tmp_path),
     ):
         process(params=MyParams())  # pyright: ignore[reportCallIssue] - the error under test
@@ -220,7 +222,7 @@ def test_register_params_must_be_stageparams(tmp_path: pathlib.Path) -> None:
         pass
 
     with (
-        pytest.raises(ValueError, match="unsupported type 'NotAStageParams'"),
+        pytest.raises(exceptions.StageDefinitionError, match="unsupported type 'NotAStageParams'"),
         compose.Pipeline("test", root=tmp_path),
     ):
         process(params=NotAStageParams())

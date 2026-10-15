@@ -139,6 +139,109 @@ def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: path
     assert out.index("pivot pull") < out.index("pivot repro"), out
 
 
+_IMPORTED_INPUT_SHARED = """\
+from pivot.compose import Pipeline
+
+
+with Pipeline("shared") as inputs:
+    source = inputs.input("shared.txt", path="actual.txt")
+"""
+
+
+_IMPORTED_INPUT_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+from shared import source
+
+
+@stage
+def result(data: str) -> str:
+    return data
+
+
+with Pipeline("demo") as pipeline:
+    result(source)
+"""
+
+
+def test_repro_uses_a_directly_imported_inputs_declared_path(tmp_path: pathlib.Path) -> None:
+    """A direct imported input handle keeps its path instead of falling back to data/raw/name."""
+    root = _project(
+        tmp_path,
+        {
+            "shared.py": _IMPORTED_INPUT_SHARED,
+            "pipeline.py": _IMPORTED_INPUT_PIPELINE,
+            "actual.txt": "ACTUAL",
+            "data/raw/shared.txt": "WRONG DEFAULT",
+        },
+    )
+
+    _ok(_pivot(root, "repro"))
+
+    assert (root / "data" / "demo" / "result.txt").read_text() == "ACTUAL"
+
+
+def test_repro_refuses_an_absolute_output_key_before_writing_outside_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("PRESERVE")
+    key = str(sentinel)
+    pipeline = (
+        "from typing import TypedDict\n\n"
+        + "from pivot.compose import Pipeline, stage\n\n"
+        + f"Result = TypedDict('Result', {{{key!r}: str}})\n\n"
+        + "@stage\n"
+        + "def result() -> Result:\n"
+        + f"    return {{{key!r}: 'REPLACED'}}\n\n"
+        + "with Pipeline('demo') as pipeline:\n"
+        + "    result()\n"
+    )
+    _project(root, {"pipeline.py": pipeline})
+
+    proc = _pivot(root, "repro")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Artifact key cannot be absolute" in out, out
+    assert sentinel.read_text() == "PRESERVE"
+    assert not (root / "data" / "demo").exists(), "definition rejection prevents execution"
+
+
+_SYMLINKED_DATA_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def copy(value: str) -> str:
+    return value
+
+
+with Pipeline("symlinked-data") as pipeline:
+    copy(pipeline.input("value.txt", t=str))
+"""
+
+
+def test_repro_allows_data_symlinked_outside_the_project(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    external_data = tmp_path / "big-data"
+    external_data.mkdir()
+    (root / "data").symlink_to(external_data, target_is_directory=True)
+    _project(
+        root,
+        {
+            "pipeline.py": _SYMLINKED_DATA_PIPELINE,
+            "data/raw/value.txt": "VALUE",
+        },
+    )
+
+    _ok(_pivot(root, "repro"))
+
+    assert (external_data / "symlinked-data" / "copy.txt").read_text() == "VALUE"
+
+
 def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> None:
     """Config lock, artifact locks and the agent socket must not show up as untracked files."""
     root = _project(tmp_path, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})

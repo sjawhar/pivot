@@ -91,7 +91,7 @@ def test_previous_requires_an_incremental_output(tmp_path: pathlib.Path) -> None
         return previous
 
     with (
-        pytest.raises(ValueError, match="update.*previous.*incremental"),
+        pytest.raises(exceptions.StageDefinitionError, match="update.*previous.*incremental"),
         compose.Pipeline("updates", root=tmp_path) as pipeline,
     ):
         update(previous=pipeline.previous())
@@ -106,7 +106,7 @@ def test_previous_rejects_unknown_output_key(tmp_path: pathlib.Path) -> None:
         return previous
 
     with (
-        pytest.raises(ValueError, match="update.*previous.*missing"),
+        pytest.raises(exceptions.StageDefinitionError, match="update.*previous.*missing"),
         compose.Pipeline("updates", root=tmp_path) as pipeline,
     ):
         update(previous=pipeline.previous("missing"))
@@ -121,7 +121,7 @@ def test_previous_rejects_two_parameters_for_one_output(tmp_path: pathlib.Path) 
         return {**first, **second}
 
     with (
-        pytest.raises(ValueError, match="update.*first.*second"),
+        pytest.raises(exceptions.StageDefinitionError, match="update.*first.*second"),
         compose.Pipeline("updates", root=tmp_path) as pipeline,
     ):
         update(first=pipeline.previous(), second=pipeline.previous())
@@ -132,7 +132,7 @@ def test_previous_marker_must_be_consumed_by_one_stage_call(tmp_path: pathlib.Pa
     _ = _incremental_tag()
 
     with (
-        pytest.raises(ValueError, match="previous.*stage call"),
+        pytest.raises(exceptions.StageDefinitionError, match="previous.*stage call"),
         compose.Pipeline("updates", root=tmp_path) as pipeline,
     ):
         pipeline.previous()
@@ -147,7 +147,7 @@ def test_previous_marker_cannot_be_reused_by_another_stage_call(tmp_path: pathli
         return previous
 
     with (
-        pytest.raises(ValueError, match="previous.*already.*update"),
+        pytest.raises(exceptions.StageDefinitionError, match="previous.*already.*update"),
         compose.Pipeline("updates", root=tmp_path) as pipeline,
     ):
         previous = pipeline.previous()

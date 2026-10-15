@@ -367,6 +367,7 @@ def execute_stage(
                                 output_hashes=_to_identity_hashes(
                                     dict(sorted(run_cache_skip["output_hashes"].items()))
                                 ),
+                                output_paths=lock_output_paths(stage_outs, store, project_root),
                             )
                             deferred = _commit_lock_and_build_deferred(
                                 stage_info,
@@ -430,6 +431,7 @@ def execute_stage(
                     params=current_params,
                     dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
                     output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
+                    output_paths=lock_output_paths(stage_outs, store, project_root),
                 )
 
                 # Single StateDB open for post-execution work
@@ -637,6 +639,20 @@ def output_file_hash_entries(
             (str(file_path), fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
         )
     return entries
+
+
+def lock_output_paths(
+    outs: list[types.ArtifactRef],
+    store: store_mod.Store,
+    project_root: pathlib.Path,
+) -> dict[types.ArtifactIdentity, str]:
+    """Project-relative, POSIX output paths for a production workspace lock."""
+    if not isinstance(store, store_mod.WorkspaceStore):
+        return {}
+    root = project_root.resolve()
+    return {
+        ref.identity: store.resolve_display_path(ref).relative_to(root).as_posix() for ref in outs
+    }
 
 
 def _set_deterministic_seeds() -> None:
