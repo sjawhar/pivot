@@ -67,6 +67,7 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactTag,
     CompletionType,
+    DeferredWrites,
     HashInfo,
     LockData,
     OnError,
@@ -1836,13 +1837,21 @@ class Engine:
         deps = stage_info["deps"]
 
         def _restore_outputs_to_lock(state_db: state_mod.StateDB) -> bool:
-            return worker.restore_outputs_to_hashes(
+            restored_entries = list[tuple[str, int, int, int, str]]()
+            restored = worker.restore_outputs_to_hashes(
                 store,
                 stage_info["outs"],
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=stage_state_dir,
+                file_hash_entries=restored_entries,
             )
+            if restored and restored_entries:
+                with state_mod.StateDB(stage_state_dir) as writable_db:
+                    writable_db.apply_deferred_writes(
+                        stage_name, [], DeferredWrites(file_hash_entries=restored_entries)
+                    )
+            return restored
 
         def _get_skip_state_db() -> state_mod.StateDB:
             if skip_state_dbs is not None:

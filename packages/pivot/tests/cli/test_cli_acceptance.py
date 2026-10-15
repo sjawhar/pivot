@@ -420,3 +420,79 @@ def test_symlink_checkout_mode_applies_when_repro_writes_and_restores_outputs(
     assert "0 ran, 2 cached" in out, out
     assert output.is_symlink()
     assert output.read_text() == '{"a":2}\n{"a":4}\n'
+
+
+def test_noop_status_reads_no_output_bytes_after_repro(tmp_path: pathlib.Path) -> None:
+    """Committed outputs are in the StateDB file-hash cache, so status hashes nothing."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "2 cached" in out, out
+    assert "cache.hash_file" not in out, out
+
+
+def test_noop_status_reads_no_output_bytes_after_pivot_commit(tmp_path: pathlib.Path) -> None:
+    """`pivot commit` records the output hashes it computes, as a run does."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro", "--no-commit"))
+    _ok(_pivot(root, "commit"))
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "2 cached" in out, out
+    assert "cache.hash_file" not in out, out
+
+
+_PARAM_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, StageParams, stage
+
+
+class ScaleParams(StageParams):
+    factor: int = 10
+
+
+@stage
+def scale(raw: pd.DataFrame, params: ScaleParams) -> pd.DataFrame:
+    return raw * params.factor
+
+
+with Pipeline("p") as pipeline:
+    scale(pipeline.input("t.csv"), params=ScaleParams())
+"""
+
+
+def test_noop_status_reads_no_output_bytes_after_run_cache_restore(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A run-cache restore records the restored outputs' hashes."""
+    root = _project(tmp_path, {"pipeline.py": _PARAM_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("p/scale:\n  factor: 20\n")
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").unlink()
+    restored = _ok(_pivot(root, "repro"))
+    assert "0 ran, 1 cached" in restored, restored
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "1 cached" in out, out
+    assert "cache.hash_file" not in out, out
+
+
+def test_noop_status_reads_no_output_bytes_after_skip_restore(tmp_path: pathlib.Path) -> None:
+    """A skipped stage that copies a deleted output back records the copy's hash."""
+    root = _project(tmp_path, {"pipeline.py": _CHAIN_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "copy"))
+    _ok(_pivot(root, "repro"))
+    (root / "data" / "k" / "scale.jsonl").unlink()
+    restored = _ok(_pivot(root, "repro"))
+    assert "0 ran, 2 cached" in restored, restored
+
+    out = _ok(_pivot(root, "status", env=_env(PIVOT_METRICS="1")))
+
+    assert "2 cached" in out, out
+    assert "cache.hash_file" not in out, out

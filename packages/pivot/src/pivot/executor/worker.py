@@ -161,15 +161,19 @@ def _make_result(
     reason: str,
     ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
-    return StageResult(
+    result = StageResult(
         status=status,
         reason=reason,
         input_hash=input_hash,
         output_lines=ring_buffer.snapshot(),
         metrics=metrics.get_entries(),
     )
+    if file_hash_entries:
+        result["deferred_writes"] = DeferredWrites(file_hash_entries=file_hash_entries)
+    return result
 
 
 def execute_stage(
@@ -270,12 +274,14 @@ def execute_stage(
                                 lock_data["dep_hashes"],
                                 stage_outs,
                             )
+                            restored_entries = list[tuple[str, int, int, int, str]]()
                             restored = restore_outputs_to_hashes(
                                 store,
                                 stage_outs,
                                 lock_data["output_hashes"],
                                 state_db,
                                 state_dir=stage_info["state_dir"],
+                                file_hash_entries=restored_entries,
                             )
                             if restored:
                                 return _make_result(
@@ -283,6 +289,7 @@ def execute_stage(
                                     "unchanged (generation)",
                                     ring_buffer,
                                     input_hash=input_hash,
+                                    file_hash_entries=restored_entries,
                                 )
                             outputs_missing_from_cache = True
 
@@ -322,12 +329,14 @@ def execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
+                        restored_entries = list[tuple[str, int, int, int, str]]()
                         restored = restore_outputs_to_hashes(
                             store,
                             stage_outs,
                             lock_data["output_hashes"],
                             state_db,
                             state_dir=stage_info["state_dir"],
+                            file_hash_entries=restored_entries,
                         )
                         if restored:
                             return _make_result(
@@ -335,6 +344,7 @@ def execute_stage(
                                 skip_reason,
                                 ring_buffer,
                                 input_hash=input_hash,
+                                file_hash_entries=restored_entries,
                             )
                         run_reason = "outputs missing from cache"
 
@@ -371,7 +381,8 @@ def execute_stage(
                                 run_cache_skip["output_hashes"],
                                 production_lock,
                                 state_db,
-                                file_hash_entries=file_hash_entries,
+                                file_hash_entries=file_hash_entries
+                                + run_cache_skip["file_hash_entries"],
                                 increment_outputs=run_cache_skip["outputs_restored"],
                             )
                             return StageResult(
@@ -403,6 +414,12 @@ def execute_stage(
                     output_hashes = _hash_output_paths(output_paths)
                 else:
                     output_hashes = _commit_outputs_with_store(output_paths, store)
+                    for ref, path in output_paths.items():
+                        file_hash_entries.extend(
+                            output_file_hash_entries(
+                                path, output_hashes[types.identity_key(ref.identity)]
+                            )
+                        )
 
                 # For --no-commit, skip lock/cache writes entirely
                 if no_commit:
@@ -492,6 +509,7 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: Literal[False] = False,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> bool: ...
 
 
@@ -505,6 +523,7 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: Literal[True],
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -517,8 +536,13 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: bool = False,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> bool | OutputRestoreResult:
-    """Verify outputs match recorded hashes and restore cacheable mismatches."""
+    """Verify outputs match recorded hashes and restore cacheable mismatches.
+
+    ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file
+    restored from the cache, so the next check finds it without reading it.
+    """
     unavailable = list[types.ArtifactRef]()
     outputs_restored = False
     if not isinstance(store, store_mod.WorkspaceStore):
@@ -539,6 +563,10 @@ def restore_outputs_to_hashes(
                         continue
                     if store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
                         outputs_restored = True
+                        if file_hash_entries is not None:
+                            file_hash_entries.extend(
+                                output_file_hash_entries(output_path, expected_hash)
+                            )
                         continue
             unavailable.append(ref)
             if restore:
@@ -589,6 +617,28 @@ def hash_output(path: pathlib.Path, state_db: state.StateDB | None = None) -> Ha
         return DirHash(hash=tree_hash, manifest=manifest)
     file_hash, _ = cache.hash_file(path, state_db)
     return FileHash(hash=file_hash)
+
+
+def output_file_hash_entries(
+    path: pathlib.Path, output_hash: HashInfo
+) -> list[tuple[str, int, int, int, str]]:
+    """StateDB file-hash entries for an output whose hash is already known.
+
+    Stats each file (each manifest entry, for a directory) and pairs it with its known hash;
+    nothing is read. Call it once the output has its final inode: a hardlink checkout
+    replaces the file the stage wrote.
+    """
+    if is_dir_hash(output_hash):
+        files = [(path / entry["relpath"], entry["hash"]) for entry in output_hash["manifest"]]
+    else:
+        files = [(path, output_hash["hash"])]
+    entries = list[tuple[str, int, int, int, str]]()
+    for file_path, file_hash in files:
+        fs_stat = file_path.stat()
+        entries.append(
+            (str(file_path), fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
+        )
+    return entries
 
 
 def _set_deterministic_seeds() -> None:
@@ -1328,6 +1378,7 @@ class RunCacheSkipResult(TypedDict):
 
     output_hashes: dict[str, HashInfo]
     outputs_restored: bool
+    file_hash_entries: list[tuple[str, int, int, int, str]]
 
 
 def _try_skip_via_run_cache_with_store(
@@ -1354,6 +1405,7 @@ def _try_skip_via_run_cache_with_store(
         return None
     identity_hashes = _to_identity_hashes(output_hashes)
 
+    restored_entries = list[tuple[str, int, int, int, str]]()
     restoration = restore_outputs_to_hashes(
         store,
         stage_outs,
@@ -1361,10 +1413,12 @@ def _try_skip_via_run_cache_with_store(
         state_db,
         state_dir=state_dir,
         report_changes=True,
+        file_hash_entries=restored_entries,
     )
     if not restoration.available:
         return None
     return RunCacheSkipResult(
         output_hashes=output_hashes,
         outputs_restored=restoration.outputs_restored,
+        file_hash_entries=restored_entries,
     )

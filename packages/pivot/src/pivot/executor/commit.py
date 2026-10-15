@@ -143,12 +143,15 @@ def commit_stages(
             # 6. Hash and cache outputs
             output_hashes_by_key = dict[str, HashInfo]()
             output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
+            file_hash_entries = list[tuple[str, int, int, int, str]]()
             outputs_missing = False
 
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)
                 try:
-                    hash_info = store.commit(out, store.resolve_display_path(out))
+                    out_path = store.resolve_display_path(out)
+                    hash_info = store.commit(out, out_path)
+                    file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[out.identity] = hash_info
                 except FileNotFoundError:
@@ -208,6 +211,8 @@ def commit_stages(
                     run_id=run_id,
                     output_hashes=output_entries,
                 )
+            if file_hash_entries:
+                deferred["file_hash_entries"] = file_hash_entries
 
             stage_db.apply_deferred_writes(stage_name, out_paths, deferred)
 

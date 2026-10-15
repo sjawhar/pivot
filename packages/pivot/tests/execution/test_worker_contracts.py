@@ -615,7 +615,10 @@ def test_unreadable_state_database_fails_the_stage_without_a_run_cache_key(
 def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    """Workers open StateDB read-only; the coordinator applies their file-hash entries."""
+    """Workers open StateDB read-only; the coordinator applies their file-hash entries.
+
+    Entries cover the dependency the worker hashed and the output it committed.
+    """
     raw = project.resolve() / "raw.txt"
 
     result = worker.execute_stage(
@@ -628,7 +631,8 @@ def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     assert "deferred_writes" in result
     deferred = result["deferred_writes"]
     assert "file_hash_entries" in deferred
-    assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw)]
+    output = project.resolve() / "data" / "skip" / "consume.txt"
+    assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw), str(output)]
 
 
 # =============================================================================
