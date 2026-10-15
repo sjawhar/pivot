@@ -1,4 +1,3 @@
-# pyright: reportPrivateUsage=false, reportUnusedFunction=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false, reportImportCycles=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import contextlib
@@ -97,18 +96,18 @@ def _artifact_tag(tag: _MetricTag | _PlotTag | _IncrementalTag | None) -> types.
 
 
 def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types.ArtifactRef:
-    if isinstance(handle._source, _InputNode):
-        identity = types.ArtifactIdentity(producer=handle._source.name, key=None)
+    if isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle; public names would shadow output keys
+        identity = types.ArtifactIdentity(producer=handle._source.name, key=None)  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         types.validate_artifact_identity(identity)
         return types.ArtifactRef(
             identity=identity,
-            format=handle._source.format,
-            python_type=handle._python_type,
+            format=handle._source.format,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            python_type=handle._python_type,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
             tag=types.ArtifactTag.DATA,
         )
 
-    source = handle._source
-    qualified_name = f"{handle._pipeline._name}/{source.name}"
+    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+    qualified_name = f"{handle._pipeline._name}/{source.name}"  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle and Pipeline
     if not source.output_specs:
         raise TypeError(
             f"Stage '{consumer_name}' depends on '{qualified_name}' which has no outputs "
@@ -118,7 +117,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         output_spec = source.output_specs[0]
         output_key = None if output_spec.key == SINGLE_OUTPUT_KEY else output_spec.key
     else:
-        matched = _select_output(source.output_specs, handle._output_key)
+        matched = _select_output(source.output_specs, handle._output_key)  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         if matched is None:
             available = [spec.key for spec in source.output_specs]
             raise TypeError(
@@ -134,7 +133,7 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
     return types.ArtifactRef(
         identity=identity,
         format=output_spec.format,
-        python_type=handle._python_type,
+        python_type=handle._python_type,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         tag=_artifact_tag(output_spec.tag),
     )
 
@@ -142,11 +141,11 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
 def _iter_stage_handles(node: _StageNode) -> list[ArtifactHandle]:
     result = list[ArtifactHandle]()
     for handle in node.input_handles.values():
-        if isinstance(handle._source, _StageNode):
+        if isinstance(handle._source, _StageNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
             result.append(handle)
     for handles in node.list_input_handles.values():
         for handle in handles:
-            if isinstance(handle._source, _StageNode):
+            if isinstance(handle._source, _StageNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                 result.append(handle)
     return result
 
@@ -186,14 +185,14 @@ def _cell_values(func: Callable[..., Any]) -> dict[str, object]:
     func = inspect.unwrap(func)
     names = func.__code__.co_freevars
     return {
-        name: fingerprint._cell_value(cell)
+        name: fingerprint._cell_value(cell)  # pyright: ignore[reportPrivateUsage] - the cell reader fingerprinting uses, so sameness matches it
         for name, cell in zip(names, func.__closure__ or (), strict=True)
     }
 
 
 def _default_values(func: Callable[..., Any]) -> dict[str, object]:
     """The live default values of `func`, by parameter name."""
-    return dict(fingerprint._function_defaults(inspect.unwrap(func)))
+    return dict(fingerprint._function_defaults(inspect.unwrap(func)))  # pyright: ignore[reportPrivateUsage] - the defaults reader fingerprinting uses
 
 
 def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
@@ -864,16 +863,19 @@ class Pipeline:
             elif isinstance(value, ArtifactHandle):
                 input_handles[param_name] = value
             elif isinstance(value, (list, tuple)):
-                items = list[Any](value)
-                if all(isinstance(v, ArtifactHandle) for v in items):
-                    list_input_handles[param_name] = items
+                collection = typing.cast("list[object] | tuple[object, ...]", value)
+                handles = [v for v in collection if isinstance(v, ArtifactHandle)]
+                if len(handles) == len(collection):
+                    list_input_handles[param_name] = handles
                     collection_params[param_name] = (
-                        CollectionKind.TUPLE if isinstance(value, tuple) else CollectionKind.LIST
+                        CollectionKind.TUPLE
+                        if isinstance(collection, tuple)
+                        else CollectionKind.LIST
                     )
                 elif param_name in explicit_params:
                     self._validation_errors.append(
                         f"{stage_name}: parameter '{param_name}' has unsupported type "
-                        + f"'{type(value).__name__}'. Use ArtifactHandle (dependency), "
+                        + f"'{type(collection).__name__}'. Use ArtifactHandle (dependency), "
                         + "StageParams (config), or list/tuple of ArtifactHandle."
                     )
             elif isinstance(value, stage_def.StageParams):
@@ -950,10 +952,10 @@ class Pipeline:
 
         for node in self._stages:
             for handle in _iter_stage_handles(node):
-                if handle._pipeline is not self:
-                    source = handle._source
+                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                     assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))
+                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
 
         while stack:
             foreign_pipeline, stage_node = stack.pop()
@@ -964,10 +966,10 @@ class Pipeline:
             result.append((foreign_pipeline, stage_node))
 
             for handle in _iter_stage_handles(stage_node):
-                if handle._pipeline is not self:
-                    source = handle._source
+                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                     assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))
+                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
 
         return result
 
@@ -978,8 +980,8 @@ class Pipeline:
         foreign_bindings = dict[str, str]()
         for _foreign_pipeline, foreign_node in closure:
             for handle in _iter_all_handles(foreign_node):
-                if isinstance(handle._source, _InputNode):
-                    inp = handle._source
+                if isinstance(handle._source, _InputNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                    inp = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
                     if inp.name in foreign_bindings and foreign_bindings[inp.name] != inp.path:
                         raise ValueError(
                             f"Input binding conflict: input '{inp.name}' is bound to "
@@ -1179,14 +1181,20 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
         else:
             fmt = _infer_format(base_type)
 
-    if isinstance(tag, _IncrementalTag) and (
-        not isinstance(fmt, loaders_mod.Loader) or type(fmt).empty is loaders_mod.Loader.empty
-    ):
+    if isinstance(tag, _IncrementalTag) and not _implements_empty(fmt):
         raise exceptions.StageDefinitionError(
             f"Stage '{stage_name}': {label} is incremental but loader "
             + f"'{type(fmt).__name__}' does not implement empty()."
         )
     return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
+
+
+def _implements_empty(fmt: object) -> bool:
+    """Whether a loader can give an incremental output's first-run value (overrides empty())."""
+    base: object = loaders_mod.Loader
+    return isinstance(fmt, loaders_mod.Loader) and inspect.getattr_static(
+        type(fmt), "empty"
+    ) is not inspect.getattr_static(base, "empty")
 
 
 def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
@@ -1280,7 +1288,7 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
         pipeline = _active_pipeline.get()
         if pipeline is None:
             return func(*args, **kwargs)
-        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)
+        return pipeline._record_stage(func, wrapper, _get_output_specs(), args, kwargs)  # pyright: ignore[reportPrivateUsage] - the @stage wrapper is Pipeline's recording entry point
 
     return wrapper
 
