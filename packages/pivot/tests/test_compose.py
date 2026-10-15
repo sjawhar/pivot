@@ -1802,6 +1802,16 @@ def test_direct_foreign_input_binding_conflict_raises(tmp_path: pathlib.Path) ->
         _helper_join_direct_foreign_inputs(left, right)
 
 
+def test_direct_foreign_input_binding_is_exposed_to_watch_paths(tmp_path: pathlib.Path) -> None:
+    shared = Pipeline("shared", root=tmp_path)
+    with shared:
+        source = shared.input("shared.txt", path="actual.txt", t=str)
+    with Pipeline("consumer", root=tmp_path) as consumer:
+        _helper_consume(source)
+
+    assert consumer.input_bindings["shared.txt"] == "actual.txt"
+
+
 def test_cross_pipeline_input_bindings_propagated(tmp_path: pathlib.Path) -> None:
     p1 = Pipeline("base", root=tmp_path)
     with p1:
