@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import decimal
 import json
+import logging
 import os
 import pathlib
 import signal
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from conftest import isolated_pivot_dir, send_rpc
-from pivot import cli, compose, executor
+from pivot import cli, compose, executor, loaders
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
@@ -67,6 +71,39 @@ def quiet() -> str:
     sys.stdout.write("This should not appear\n")
     sys.stdout.flush()
     return "done"
+
+
+@compose.stage
+def frame_metric() -> Annotated[pd.DataFrame, compose.metric]:
+    return pd.DataFrame({"value": [1.0]})
+
+
+@compose.stage
+def open_ended_dims() -> pd.DataFrame:
+    valid_to = np.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]")
+    return pd.DataFrame({"k": ["a", "b"], "valid_to": valid_to})
+
+
+@compose.stage
+def current_dims(dims: pd.DataFrame) -> list[str]:
+    return [str(k) for k in dims.loc[dims["valid_to"] > pd.Timestamp("2025-01-01"), "k"]]
+
+
+@compose.stage
+def matrix() -> pd.DataFrame:
+    return pd.DataFrame(np.array([[1.5, 2.5], [3.5, 4.5]]))
+
+
+@compose.stage
+def first_col(m: pd.DataFrame) -> list[float]:
+    return [float(value) for value in m[0]]
+
+
+@compose.stage
+def chatty_lossy() -> pd.DataFrame:
+    for row in range(60):
+        logging.getLogger("etl").warning("skipping malformed row %d", row)
+    return pd.DataFrame({"price": [decimal.Decimal("0.1")]})
 
 
 _EMPTY_PIPELINE = (
@@ -1166,6 +1203,102 @@ def test_repro_without_show_output_hides_logs(
     assert "quiet" in result.output
 
 
+def test_repro_shows_lossy_output_warning_without_show_output(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A plain `pivot repro` prints a stage's warning in its report and still exits 0."""
+    with mock_discovery:
+        frame_metric()
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    # The console wraps long lines; compare the words.
+    text = " ".join(result.output.split())
+    warning = (
+        "WARNING: Stage 'test/frame_metric' wrote its YAML output in a form Pivot cannot "
+        + "read back: YAML output must contain plain data; got DataFrame at root."
+    )
+    assert warning in text, result.output
+    assert text.index("✓ test/frame_metric done") < text.index(warning), "prints under its stage"
+    assert "Summary: 1 ran, 0 cached, 0 blocked, 0 failed" in text
+
+
+def test_repro_quiet_suppresses_lossy_output_warning(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    with mock_discovery:
+        frame_metric()
+
+    result = runner.invoke(cli.cli, ["--quiet", "repro"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "", "Quiet mode should suppress the warning"
+
+
+def test_repro_never_writes_an_out_of_range_date_as_a_different_date(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A 9999-12-31 sentinel in a datetime64[us] column must not reach the next stage as 1816."""
+    with mock_discovery:
+        current_dims(open_ended_dims())
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    text = " ".join(result.output.split())
+    assert "WARNING: Stage 'test/open_ended_dims' wrote its DataFrameJSONL output" in text, (
+        result.output
+    )
+    assert "column 'valid_to'" in text
+    written = (mock_discovery.root / "data" / "test" / "open_ended_dims.jsonl").read_text()
+    assert "1816" not in written
+    assert written == pd.DataFrame(
+        {
+            "k": ["a", "b"],
+            "valid_to": np.array(["9999-12-31", "2024-01-01"], dtype="datetime64[us]"),
+        }
+    ).to_json(lines=True, orient="records")
+
+
+def test_repro_keeps_integer_column_labels_for_the_next_stage(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """A frame built from a numpy array has labels 0, 1; the next stage indexes m[0]."""
+    with mock_discovery:
+        first_col(matrix())
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    written = (mock_discovery.root / "data" / "test" / "first_col.yaml").read_text()
+    assert written == "- 1.5\n- 3.5\n"
+
+
+def test_repro_reports_lossy_output_after_many_stage_warnings(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """The stage's own warnings are capped with a count; Pivot's own warning always shows."""
+    with mock_discovery:
+        chatty_lossy()
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "WARNING: skipping malformed row 49" in text
+    assert "WARNING: skipping malformed row 50" not in text
+    assert (
+        "WARNING: Stage 'test/chatty_lossy' wrote its DataFrameJSONL output in a form Pivot "
+        + "cannot read back: DataFrameJSONL cannot write column 'price'"
+    ) in text, result.output
+    assert "… 10 more warnings (run with --show-output)" in text
+
+
 def _same_named_pipeline(side: str) -> str:
     return (
         "import pandas as pd\n\nfrom pivot import Pipeline, stage\n\n\n"
@@ -1659,7 +1792,7 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
     def scaled() -> list[int] | None:
         if not output.exists():
             return None
-        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+        return [int(n) for n in loaders.DataFrameJSONL().load(output)["n"].tolist()]
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(
@@ -1742,7 +1875,7 @@ def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
     def doubled() -> list[int] | None:
         if not output.exists():
             return None
-        return [json.loads(line)["n"] for line in output.read_text().splitlines() if line]
+        return [int(value) for value in loaders.DataFrameJSONL().load(output)["n"].tolist()]
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(

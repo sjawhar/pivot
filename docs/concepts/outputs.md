@@ -170,9 +170,13 @@ output without a lock-file cache entry is refused unless
 A tag can be combined with an explicit writer: `Annotated[pd.DataFrame, metric,
 loaders.CSV()]` saves a CSV under `metrics/`.
 
-Convert numpy scalars to Python numbers (`float(df["v"].mean())`) before
-returning them in a `dict` or `list`: the YAML writer serializes numpy types
-with Python-specific tags that downstream stages cannot read back.
+A `dict` or `list` output is written as YAML. Numpy scalars and arrays are
+converted to plain Python numbers and lists, so `{"mean": df["v"].mean()}`
+works. A DataFrame, a dataclass, or any other object inside it is written with
+Python-specific YAML tags that `pivot metrics show` and downstream stages cannot
+read, and the `pivot repro` report prints a warning under the stage naming the
+output, the type and where it sits. Convert it first (`df.to_dict()`,
+`dataclasses.asdict(x)`); a later release will fail the stage instead.
 
 ## How Pivot writes outputs
 

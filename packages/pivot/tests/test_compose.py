@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import queue
 import tempfile
 import typing
 from typing import TYPE_CHECKING, Annotated, NotRequired, Required, TypedDict
 
+import numpy
 import pandas as pd
 import pytest
+import yaml
 
 from pivot import exceptions, fingerprint, loaders, stage_def, types
 from pivot.compose import (
@@ -2158,3 +2161,132 @@ def test_stage_returning_path_inside_workspace_is_rejected(
     assert (tmp_path / "data" / "raw" / "handwritten.bin").read_bytes() == b"inside workspace", (
         "Rejected workspace file must be left untouched"
     )
+
+
+# --- YAML metrics must be safe-readable by downstream stages ---
+
+
+@stage
+def _helper_metric_numpy_scalar(params: stage_def.StageParams) -> Annotated[dict, metric]:
+    return {"mean": numpy.float64(0.5)}
+
+
+@stage
+def _helper_consume_metric_scalar(stats: dict) -> dict:
+    return {"mean": stats["mean"]}
+
+
+def test_metric_numpy_scalar_is_safe_for_downstream_stage(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        stats = _helper_metric_numpy_scalar(params=stage_def.StageParams())
+        _helper_consume_metric_scalar(stats=stats)
+
+    producer_result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_numpy_scalar", tmp_path, output_queue
+    )
+    assert producer_result["status"] == types.StageStatus.RAN, producer_result["reason"]
+
+    consumer_result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_consume_metric_scalar", tmp_path, output_queue
+    )
+    assert consumer_result["status"] == types.StageStatus.RAN, consumer_result["reason"]
+
+    metric_data = loaders.YAML[dict[str, float]]().load(
+        tmp_path / "metrics" / "metricsafe" / "_helper_metric_numpy_scalar.yaml"
+    )
+    assert metric_data == {"mean": 0.5}
+
+
+@stage
+def _helper_metric_dataframe(params: stage_def.StageParams) -> Annotated[pd.DataFrame, metric]:
+    return pd.DataFrame({"value": [1.0]})
+
+
+def _helper_stage_logs(output_queue: mp.Queue[OutputMessage]) -> list[str]:
+    lines = list[str]()
+    while True:
+        try:
+            message = output_queue.get(timeout=0.5)
+        except queue.Empty:
+            return lines
+        if message is not None and message["kind"] == types.OutputMessageKind.LOG:
+            lines.append(message["line"])
+
+
+def test_metric_dataframe_warns_with_stage_and_output_and_keeps_old_yaml(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        _helper_metric_dataframe(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_dataframe", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = [line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")]
+    assert len(warnings) == 1, warnings
+    assert "Stage 'metricsafe/_helper_metric_dataframe' wrote its YAML output" in warnings[0]
+    assert "got DataFrame at root" in warnings[0]
+    assert "None" not in warnings[0], "a single output has no key to name"
+    written = tmp_path / "metrics" / "metricsafe" / "_helper_metric_dataframe.yaml"
+    assert written.read_text() == yaml.dump(
+        pd.DataFrame({"value": [1.0]}), default_flow_style=False
+    )
+
+
+@stage
+def _helper_metric_longdouble(params: stage_def.StageParams) -> Annotated[dict, metric]:
+    return {"mean": numpy.longdouble("1.0000000000000000009")}
+
+
+def test_metric_longdouble_warns_with_stage_and_type(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("metricsafe", root=tmp_path) as pipeline:
+        _helper_metric_longdouble(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "metricsafe/_helper_metric_longdouble", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = [line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")]
+    assert len(warnings) == 1, warnings
+    assert "metricsafe/_helper_metric_longdouble" in warnings[0]
+    assert "longdouble" in warnings[0]
+
+
+class _HelperFrameAndCounts(TypedDict):
+    frame: pd.DataFrame
+    counts: dict
+
+
+@stage
+def _helper_lossy_keyed_outputs(params: stage_def.StageParams) -> _HelperFrameAndCounts:
+    return _HelperFrameAndCounts(
+        frame=pd.DataFrame({"cell": [{1, 2}]}), counts={"when": numpy.timedelta64(5, "ns")}
+    )
+
+
+def test_lossy_keyed_outputs_warn_naming_each_output(
+    worker_env: pathlib.Path, tmp_path: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    with Pipeline("lossy", root=tmp_path) as pipeline:
+        _helper_lossy_keyed_outputs(params=stage_def.StageParams())
+
+    result = _helper_execute_compose_stage(
+        pipeline, "lossy/_helper_lossy_keyed_outputs", tmp_path, output_queue
+    )
+
+    assert result["status"] == types.StageStatus.RAN, result["reason"]
+    warnings = sorted(
+        line for line in _helper_stage_logs(output_queue) if line.startswith("WARNING:")
+    )
+    assert len(warnings) == 2, warnings
+    assert "Stage 'lossy/_helper_lossy_keyed_outputs' wrote output 'counts'" in warnings[0]
+    assert "timedelta64" in warnings[0]
+    assert "Stage 'lossy/_helper_lossy_keyed_outputs' wrote output 'frame'" in warnings[1]
+    assert "column 'cell'" in warnings[1]
