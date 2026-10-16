@@ -2,6 +2,37 @@
 
 <!-- version list -->
 
+## v0.3.3 (2026-10-16)
+
+### Bug Fixes
+
+- **storage**: Add the missing path argument to the track --force tip
+  ([#477](https://github.com/sjawhar/pivot/pull/477),
+  [`a223886`](https://github.com/sjawhar/pivot/commit/a223886017411c54614dac7302d83ba95feb3d0d))
+
+- **storage**: Close path traversal and repair gaps from re-review
+  ([#477](https://github.com/sjawhar/pivot/pull/477),
+  [`a223886`](https://github.com/sjawhar/pivot/commit/a223886017411c54614dac7302d83ba95feb3d0d))
+
+- **storage**: Close three review gaps in the exec-bit checkout guard
+  ([#477](https://github.com/sjawhar/pivot/pull/477),
+  [`a223886`](https://github.com/sjawhar/pivot/commit/a223886017411c54614dac7302d83ba95feb3d0d))
+
+- **storage**: Guard checkout against stale or colliding cache-object permissions
+  ([#477](https://github.com/sjawhar/pivot/pull/477),
+  [`a223886`](https://github.com/sjawhar/pivot/commit/a223886017411c54614dac7302d83ba95feb3d0d))
+
+- **storage**: Preserve a directory output's executable bit through checkout
+  ([#477](https://github.com/sjawhar/pivot/pull/477),
+  [`a223886`](https://github.com/sjawhar/pivot/commit/a223886017411c54614dac7302d83ba95feb3d0d))
+
+### Testing
+
+- **storage**: Cover directory-output executable bit through checkout
+  ([#477](https://github.com/sjawhar/pivot/pull/477),
+  [`a223886`](https://github.com/sjawhar/pivot/commit/a223886017411c54614dac7302d83ba95feb3d0d))
+
+
 ## v0.3.2 (2026-10-16)
 
 ### Bug Fixes
