@@ -539,6 +539,19 @@ def _checkout_from_cache(
         tmp_path.unlink(missing_ok=True)
 
 
+def _cache_object_isexec(cache_path: pathlib.Path) -> bool | None:
+    """Whether the cache object at cache_path is stored executable, or None if absent.
+
+    HARDLINK and SYMLINK checkout have no mode of their own: the workspace file shares the
+    cache object's permissions directly, so they can only ever produce whatever executable
+    bit the cache object itself carries.
+    """
+    try:
+        return bool(cache_path.stat().st_mode & stat.S_IXUSR)
+    except FileNotFoundError:
+        return None
+
+
 def _checkout_with_fallback(
     path: pathlib.Path,
     cache_path: pathlib.Path,
@@ -553,19 +566,41 @@ def _checkout_with_fallback(
     With ``keep_existing_copy``, reaching COPY while ``path`` still exists leaves it in place:
     the caller guarantees it already holds the cached bytes. A failed link attempt clears
     ``path`` first, so COPY then copies from the cache as usual.
+
+    A HARDLINK or SYMLINK whose cache object's recorded executable bit does not match
+    ``executable`` is skipped rather than attempted: two files with identical content can
+    disagree on the executable bit (the cache key is content-only), and a cache object a remote
+    pull populated by hash alone carries no executable bit at all. Either way the shared object
+    cannot represent two permissions at once, so checkout falls through to the next mode; only
+    COPY makes a private copy and can always re-chmod it correctly.
     """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
     for i, mode in enumerate(checkout_modes):
+        is_last = i == len(checkout_modes) - 1
         if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
             return
+        if mode in (CheckoutMode.HARDLINK, CheckoutMode.SYMLINK):
+            cached_isexec = _cache_object_isexec(cache_path)
+            if cached_isexec is not None and cached_isexec != executable:
+                if is_last:
+                    cached_state = "executable" if cached_isexec else "non-executable"
+                    raise exceptions.CacheModeCollisionError(
+                        f"Cache object {cache_path} is recorded {cached_state}, but {path} "
+                        + f"needs isexec={executable}."
+                    )
+                logger.debug(
+                    f"Cache object {cache_path} is executable={cached_isexec}, "
+                    + f"need {executable}; skipping {mode.value}"
+                )
+                continue
         try:
             _checkout_from_cache(
                 path, cache_path, mode, executable=executable, staging_path=staging_path
             )
             return
         except OSError as e:
-            if e.errno not in FALLBACK_ERRNO or i == len(checkout_modes) - 1:
+            if e.errno not in FALLBACK_ERRNO or is_last:
                 raise
             logger.debug(f"Checkout mode {mode.value} failed ({e}), trying next mode")
 

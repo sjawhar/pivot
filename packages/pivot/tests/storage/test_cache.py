@@ -1989,6 +1989,63 @@ def test_directory_output_executable_survives_cache_and_restore(
     assert not os.access(output / "data.txt", os.X_OK)
 
 
+def test_directory_output_isexec_collision_falls_back_to_copy(tmp_path: pathlib.Path) -> None:
+    """Two files with identical content but different executable bits hash the same and
+    share one cache object. HARDLINK/SYMLINK checkout has no mode of its own, so it can only
+    ever reproduce whatever executable bit the shared object already carries; checkout for
+    whichever file disagrees with that must fall back to COPY instead of silently serving the
+    wrong permissions.
+    """
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
+
+    non_exec_dir = tmp_path / "non_exec"
+    non_exec_dir.mkdir()
+    (non_exec_dir / "shared.sh").write_text("#!/bin/sh\necho hi\n")
+
+    exec_dir = tmp_path / "exec"
+    exec_dir.mkdir()
+    shared_in_exec = exec_dir / "shared.sh"
+    shared_in_exec.write_text("#!/bin/sh\necho hi\n")
+    shared_in_exec.chmod(0o755)
+
+    cache.save_to_cache(non_exec_dir, cache_dir, checkout_modes=modes)
+    assert not os.access(non_exec_dir / "shared.sh", os.X_OK)
+
+    cache.save_to_cache(exec_dir, cache_dir, checkout_modes=modes)
+    assert os.access(exec_dir / "shared.sh", os.X_OK), (
+        "the second save shares a cache object with the first, stored non-executable; "
+        "checkout must fall back to COPY rather than serve the first's permissions"
+    )
+    assert not os.access(non_exec_dir / "shared.sh", os.X_OK), "the first save is unaffected"
+
+
+def test_directory_output_isexec_collision_without_copy_fallback_raises(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Without COPY in checkout_modes, a cache object collision has nowhere safe to fall
+    back to: checkout raises a clear error instead of silently producing the wrong
+    executable bit."""
+    from pivot import exceptions
+
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK]
+
+    non_exec_dir = tmp_path / "non_exec"
+    non_exec_dir.mkdir()
+    (non_exec_dir / "shared.sh").write_text("#!/bin/sh\necho hi\n")
+    cache.save_to_cache(non_exec_dir, cache_dir, checkout_modes=modes)
+
+    exec_dir = tmp_path / "exec"
+    exec_dir.mkdir()
+    shared_in_exec = exec_dir / "shared.sh"
+    shared_in_exec.write_text("#!/bin/sh\necho hi\n")
+    shared_in_exec.chmod(0o755)
+
+    with pytest.raises(exceptions.CacheModeCollisionError, match="isexec"):
+        cache.save_to_cache(exec_dir, cache_dir, checkout_modes=modes)
+
+
 # === _resolve_checkout_modes Tests ===
 
 
