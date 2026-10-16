@@ -74,6 +74,41 @@ with Pipeline("test") as pipeline:
     process(pipeline.input("input.txt"))
 """
 
+_EXEC_DIR_PIPELINE = """\
+from __future__ import annotations
+
+import os
+import pathlib
+import tempfile
+from typing import Annotated, TypedDict
+
+from pivot import loaders
+from pivot.compose import Pipeline, stage
+
+
+class Made(TypedDict):
+    d: pathlib.Path
+
+
+@stage
+def make() -> Made:
+    d = pathlib.Path(tempfile.mkdtemp(prefix="pivot-exec-"))
+    (d / "x.sh").write_text("#!/bin/sh\\necho hi\\n")
+    os.chmod(d / "x.sh", 0o755)
+    (d / "y.txt").write_text("y\\n")
+    return {"d": d}
+
+
+@stage
+def use(d: pathlib.Path) -> Annotated[dict, loaders.JSON()]:
+    return {"exec": os.access(d / "x.sh", os.X_OK)}
+
+
+with Pipeline("exec") as pipeline:
+    m = make()
+    use(m.d)
+"""
+
 
 _ALIASED_RESOURCE_PIPELINE = """\
 from __future__ import annotations
@@ -1277,3 +1312,26 @@ def test_status_json_without_pipeline(
         data = json.loads(result.output)
         assert "stages" in data, "JSON output should include stages key"
         assert data["stages"] == [], "Stages should be empty without pipeline"
+
+
+def test_status_agrees_with_repro_for_directory_output_with_executable(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A directory output holding an executable file must not leave its consumer stale.
+
+    Checkout (hardlink or symlink, the default order) must preserve the executable bit a
+    directory output's manifest recorded. Otherwise the consumer re-hashes the checked-out
+    file as non-executable, that hash never matches the producer's recorded output hash, and
+    `pivot status` reports the consumer stale forever even though `pivot repro` just ran clean.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EXEC_DIR_PIPELINE)
+
+        repro = runner.invoke(cli.cli, ["repro"])
+        assert repro.exit_code == 0, repro.output
+
+        result = runner.invoke(cli.cli, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "2 stages: 2 cached, 0 stale" in result.output, result.output
+        assert "Input dependencies changed" not in result.output, result.output

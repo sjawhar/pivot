@@ -1954,6 +1954,41 @@ def test_directory_output_keeps_every_file_through_cache_and_restore(
     assert _helper_tree_contents(output) == expected
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
+)
+def test_directory_output_executable_survives_cache_and_restore(
+    tmp_path: pathlib.Path, mode: cache.CheckoutMode
+) -> None:
+    """An executable file in a directory output keeps its executable bit through
+    save_to_cache and restore_from_cache, under every checkout mode.
+
+    Regression: HARDLINK and SYMLINK checkout read their mode straight from the cache
+    object, which ``copy_to_cache`` used to chmod to 0o444 unconditionally. A consumer
+    stage then re-hashed the checked-out file as non-executable, so its recorded
+    dependency hash never matched the producer's recorded output hash and `pivot status`
+    reported it stale forever.
+    """
+    output = tmp_path / "out"
+    output.mkdir()
+    script = output / "run.sh"
+    script.write_text("#!/bin/sh\necho hi\n")
+    script.chmod(0o755)
+    (output / "data.txt").write_text("data\n")
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=[mode])
+    assert os.access(output / "run.sh", os.X_OK), "checkout must keep the executable bit"
+    assert not os.access(output / "data.txt", os.X_OK)
+
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_mode=mode)
+
+    assert os.access(output / "run.sh", os.X_OK), "restore must keep the executable bit"
+    assert not os.access(output / "data.txt", os.X_OK)
+
+
 # === _resolve_checkout_modes Tests ===
 
 
