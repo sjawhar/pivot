@@ -454,8 +454,14 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
     instead of 0o444): a HARDLINK or SYMLINK checkout has no mode of its own, so it reads
     straight through to whatever mode the cache object carries, and only COPY checkout
     re-chmods afterwards (see ``_stage_checkout``).
+
+    An existing object missing the executable bit is republished (a fresh temp file atomically
+    replacing the old one, never a chmod in place: existing hardlinks keep the old inode and
+    its mode) when ``executable`` is True, so an object an older pivot or a remote pull cached
+    non-executable can still be repaired by a caller who has the right bytes in hand. An
+    object already executable, or a non-executable request, is left alone.
     """
-    if cache_path.exists():
+    if cache_path.exists() and (not executable or _cache_object_isexec(cache_path)):
         return
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,7 +485,7 @@ def _stage_checkout(
     cache_path: pathlib.Path,
     checkout_mode: CheckoutMode,
     *,
-    executable: bool,
+    executable: bool | None,
 ) -> None:
     """Create the link or copy of cache_path at tmp_path."""
     if checkout_mode == CheckoutMode.SYMLINK:
@@ -496,7 +502,7 @@ def _checkout_from_cache(
     cache_path: pathlib.Path,
     checkout_mode: CheckoutMode,
     *,
-    executable: bool = False,
+    executable: bool | None = None,
     staging_path: pathlib.Path | None = None,
 ) -> None:
     """Create link or copy at path atomically, so readers never see a partial file.
@@ -552,12 +558,31 @@ def _cache_object_isexec(cache_path: pathlib.Path) -> bool | None:
         return None
 
 
+def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirManifestEntry]) -> None:
+    """Chmod any exec-marked file in a whole-directory SYMLINK cache tree that is missing
+    its executable bit, to 0o555.
+
+    A tree an older pivot built (every file chmod'd 0o444 regardless of isexec) keeps being
+    reused across an upgrade: its tree hash already incorporates isexec, so it never changes
+    and neither _store_directory's ``not cache_dir_path.exists()`` branch nor the
+    symlink_fast_path restore would otherwise ever revisit it. Chmod'ing in place is safe
+    here, unlike the single-file cache: a tree directory is a private ``copytree`` copy with
+    no other hardlinks sharing its files.
+    """
+    for entry in manifest:
+        if not entry["isexec"]:
+            continue
+        f = cache_dir_path / entry["relpath"]
+        if _cache_object_isexec(f) is False:
+            os.chmod(f, 0o555)
+
+
 def _checkout_with_fallback(
     path: pathlib.Path,
     cache_path: pathlib.Path,
     checkout_modes: list[CheckoutMode],
     *,
-    executable: bool = False,
+    executable: bool | None = None,
     staging_path: pathlib.Path | None = None,
     keep_existing_copy: bool = False,
 ) -> None:
@@ -567,12 +592,15 @@ def _checkout_with_fallback(
     the caller guarantees it already holds the cached bytes. A failed link attempt clears
     ``path`` first, so COPY then copies from the cache as usual.
 
-    A HARDLINK or SYMLINK whose cache object's recorded executable bit does not match
-    ``executable`` is skipped rather than attempted: two files with identical content can
-    disagree on the executable bit (the cache key is content-only), and a cache object a remote
-    pull populated by hash alone carries no executable bit at all. Either way the shared object
-    cannot represent two permissions at once, so checkout falls through to the next mode; only
-    COPY makes a private copy and can always re-chmod it correctly.
+    ``executable`` is None for a single-file output: ``FileHash`` has no isexec field, so a
+    single file's mode is never part of any hash and there is no wrong permission to guard
+    against. For a directory entry (``executable`` is a bool), a HARDLINK or SYMLINK whose
+    cache object's recorded executable bit does not match it is skipped rather than attempted:
+    two files with identical content can disagree on the executable bit (the cache key is
+    content-only), and a cache object a remote pull populated by hash alone carries no
+    executable bit at all. Either way the shared object cannot represent two permissions at
+    once, so checkout falls through to the next mode; only COPY makes a private copy and can
+    always re-chmod it correctly.
     """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
@@ -580,7 +608,7 @@ def _checkout_with_fallback(
         is_last = i == len(checkout_modes) - 1
         if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
             return
-        if mode in (CheckoutMode.HARDLINK, CheckoutMode.SYMLINK):
+        if executable is not None and mode in (CheckoutMode.HARDLINK, CheckoutMode.SYMLINK):
             cached_isexec = _cache_object_isexec(cache_path)
             if cached_isexec is not None and cached_isexec != executable:
                 if is_last:
@@ -775,6 +803,11 @@ def _store_directory(
                         os.chmod(f, 0o555 if executable else 0o444)
                 os.chmod(cache_dir_path, 0o555)
 
+            # A tree an older pivot built keeps its 0o444-everywhere files forever otherwise:
+            # the tree hash already incorporates isexec, so this branch never revisits an
+            # existing tree directory above.
+            _repair_tree_dir_isexec(cache_dir_path, manifest)
+
             _clear_path(path)
             path.symlink_to(cache_dir_path.resolve())
         else:
@@ -946,6 +979,10 @@ def _restore_directory_from_cache(
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
     if symlink_fast_path:
+        # Same repair as _store_directory: a tree an older pivot built keeps its
+        # 0o444-everywhere files forever otherwise, since the tree hash already
+        # incorporates isexec and this path never rebuilds an existing tree directory.
+        _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             temp_symlink.symlink_to(cache_dir_path.resolve())

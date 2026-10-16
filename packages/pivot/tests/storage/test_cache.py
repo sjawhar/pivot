@@ -1993,8 +1993,10 @@ def test_directory_output_isexec_collision_falls_back_to_copy(tmp_path: pathlib.
     """Two files with identical content but different executable bits hash the same and
     share one cache object. HARDLINK/SYMLINK checkout has no mode of its own, so it can only
     ever reproduce whatever executable bit the shared object already carries; checkout for
-    whichever file disagrees with that must fall back to COPY instead of silently serving the
-    wrong permissions.
+    whichever file disagrees with that must still end up correct, either because
+    ``copy_to_cache`` republishes the shared object from the caller's own bytes before
+    checkout runs, or (when no local bytes are available to repair from) by falling back to
+    COPY, instead of silently serving the wrong permissions.
     """
     cache_dir = tmp_path / "cache"
     modes = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
@@ -2015,35 +2017,133 @@ def test_directory_output_isexec_collision_falls_back_to_copy(tmp_path: pathlib.
     cache.save_to_cache(exec_dir, cache_dir, checkout_modes=modes)
     assert os.access(exec_dir / "shared.sh", os.X_OK), (
         "the second save shares a cache object with the first, stored non-executable; "
-        "checkout must fall back to COPY rather than serve the first's permissions"
+        "the collision must not leave exec_dir's own file non-executable"
     )
     assert not os.access(non_exec_dir / "shared.sh", os.X_OK), "the first save is unaffected"
 
 
-def test_directory_output_isexec_collision_without_copy_fallback_raises(
+def test_restore_from_cache_repairs_legacy_symlink_tree_isexec(tmp_path: pathlib.Path) -> None:
+    """A whole-directory SYMLINK cache tree an older pivot built (every file 0o444
+    regardless of isexec) must not keep serving a non-executable file forever: its tree hash
+    already incorporates isexec, so the tree directory is never rebuilt, but a restore through
+    the symlink fast path must still see the manifest's executable bit.
+    """
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "run.sh").write_text("#!/bin/sh\necho hi\n")
+    (output / "run.sh").chmod(0o755)
+
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    assert isinstance(output_hash, dict) and "manifest" in output_hash
+
+    # Simulate a tree an older pivot built: force every file in the tree cache dir back to
+    # 0o444, as pivot 0.3.2 did regardless of isexec. The tree hash (which already includes
+    # isexec) is unchanged, so nothing else needs to.
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    for f in tree_path.rglob("*"):
+        if f.is_file() and not f.is_symlink():
+            os.chmod(f, 0o444)
+
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert os.access(output / "run.sh", os.X_OK), (
+        "restoring from a legacy tree cache must still see the manifest's executable bit"
+    )
+
+
+def test_save_to_cache_symlink_repairs_legacy_tree_isexec(tmp_path: pathlib.Path) -> None:
+    """`_store_directory`'s SYMLINK branch must repair a legacy tree directory's isexec bits
+    even when it already exists (so the ``not cache_dir_path.exists()`` build step is
+    skipped)."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+
+    first_output = tmp_path / "first"
+    first_output.mkdir()
+    (first_output / "run.sh").write_text("#!/bin/sh\necho hi\n")
+    (first_output / "run.sh").chmod(0o755)
+    output_hash = cache.save_to_cache(first_output, cache_dir, checkout_modes=modes)
+    assert isinstance(output_hash, dict) and "manifest" in output_hash
+
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    for f in tree_path.rglob("*"):
+        if f.is_file() and not f.is_symlink():
+            os.chmod(f, 0o444)
+
+    second_output = tmp_path / "second"
+    second_output.mkdir()
+    (second_output / "run.sh").write_text("#!/bin/sh\necho hi\n")
+    (second_output / "run.sh").chmod(0o755)
+    cache.save_to_cache(second_output, cache_dir, checkout_modes=modes)
+
+    assert os.access(second_output / "run.sh", os.X_OK), (
+        "saving against an existing legacy tree must still produce an executable checkout"
+    )
+
+
+def test_directory_output_restore_isexec_mismatch_without_copy_fallback_raises(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Without COPY in checkout_modes, a cache object collision has nowhere safe to fall
-    back to: checkout raises a clear error instead of silently producing the wrong
-    executable bit."""
+    """A pure restore (no local bytes to repair the cache object from — the situation after
+    `pivot pull`, or a tree an older pivot cached) with no COPY in checkout_modes has nowhere
+    safe to fall back to when the cache object's mode disagrees with the manifest: checkout
+    raises a clear error instead of silently producing the wrong executable bit."""
     from pivot import exceptions
+    from pivot.types import DirHash, DirManifestEntry
 
     cache_dir = tmp_path / "cache"
-    modes = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK]
+    content = b"#!/bin/sh\necho hi\n"
+    file_hash = "a1b2c3d4e5f6a7b8"
+    cache_path = cache.get_cache_path(cache_dir, file_hash)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(content)
+    cache_path.chmod(0o444)  # as a cold `pivot pull` would leave it: no isexec in scope
 
-    non_exec_dir = tmp_path / "non_exec"
-    non_exec_dir.mkdir()
-    (non_exec_dir / "shared.sh").write_text("#!/bin/sh\necho hi\n")
-    cache.save_to_cache(non_exec_dir, cache_dir, checkout_modes=modes)
-
-    exec_dir = tmp_path / "exec"
-    exec_dir.mkdir()
-    shared_in_exec = exec_dir / "shared.sh"
-    shared_in_exec.write_text("#!/bin/sh\necho hi\n")
-    shared_in_exec.chmod(0o755)
+    output_hash = DirHash(
+        hash="deadbeefdeadbeef",
+        manifest=[
+            DirManifestEntry(relpath="run.sh", hash=file_hash, size=len(content), isexec=True)
+        ],
+    )
 
     with pytest.raises(exceptions.CacheModeCollisionError, match="isexec"):
-        cache.save_to_cache(exec_dir, cache_dir, checkout_modes=modes)
+        cache.restore_from_cache(
+            tmp_path / "out",
+            output_hash,
+            cache_dir,
+            checkout_modes=[cache.CheckoutMode.HARDLINK],
+        )
+
+
+def test_single_file_output_unaffected_by_directory_entry_sharing_its_bytes(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A single-file output (``FileHash``, no ``isexec`` field) must not be forced through
+    the directory exec-bit guard just because another file with identical bytes is tracked
+    as executable in some directory manifest. A single file's mode is never part of any hash,
+    so there is no wrong result for the guard to prevent: under a restrictive checkout_modes
+    with no COPY, it must still hardlink rather than raise ``CacheModeCollisionError``."""
+    cache_dir = tmp_path / "cache"
+    content = "#!/bin/sh\necho hi\n"
+
+    exec_dir = tmp_path / "exec_dir"
+    exec_dir.mkdir()
+    (exec_dir / "shared.sh").write_text(content)
+    (exec_dir / "shared.sh").chmod(0o755)
+    cache.save_to_cache(exec_dir, cache_dir, checkout_modes=[cache.CheckoutMode.HARDLINK])
+
+    single_file = tmp_path / "shared.sh"
+    single_file.write_text(content)
+    cache.save_to_cache(single_file, cache_dir, checkout_modes=[cache.CheckoutMode.HARDLINK])
+
+    assert single_file.stat().st_ino == (exec_dir / "shared.sh").stat().st_ino, (
+        "a single-file output sharing bytes with an executable directory entry must still "
+        "hardlink to the shared cache object, not fall back to a private copy"
+    )
 
 
 # === _resolve_checkout_modes Tests ===
@@ -2189,6 +2289,70 @@ def test_copy_to_cache_skips_if_exists(tmp_path: pathlib.Path) -> None:
     cache.copy_to_cache(src, cache_path)
 
     assert cache_path.read_text() == "existing content"
+
+
+def test_copy_to_cache_republishes_non_executable_object_when_executable_requested(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An object cached non-executable (by an older pivot, or by a cold `pivot pull`) is
+    republished when a caller has a fresh, executable copy of the same bytes in hand, instead
+    of staying stuck non-executable forever with no way for a later run to repair it."""
+    cache_path = tmp_path / "cache" / "ab" / "cdef"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b"content")
+    cache_path.chmod(0o444)
+
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+
+    cache.copy_to_cache(src, cache_path, executable=True)
+
+    assert cache_path.stat().st_mode & 0o777 == 0o555
+    assert cache_path.read_bytes() == b"content"
+
+
+def test_copy_to_cache_republish_never_mutates_existing_hardlinks(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Republishing a stale cache object swaps in a fresh file at the cache path; it must
+    never chmod the old object in place, since an existing HARDLINK checkout shares its
+    inode and would otherwise flip modes for every file already linked to it."""
+    cache_path = tmp_path / "cache" / "ab" / "cdef"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b"content")
+    cache_path.chmod(0o444)
+
+    linked = tmp_path / "linked.sh"
+    os.link(cache_path, linked)
+    old_ino = cache_path.stat().st_ino
+
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    cache.copy_to_cache(src, cache_path, executable=True)
+
+    assert cache_path.stat().st_ino != old_ino, (
+        "republish must write a fresh object, not chmod in place"
+    )
+    assert linked.stat().st_ino == old_ino, "an existing hardlink must keep its old inode"
+    assert linked.stat().st_mode & 0o777 == 0o444, "an existing hardlink must keep its old mode"
+
+
+def test_copy_to_cache_leaves_executable_object_alone_when_non_executable_requested(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An object already cached executable is never demoted by a later non-executable
+    request: only an executable request may repair a wrong-moded object."""
+    cache_path = tmp_path / "cache" / "ab" / "cdef"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b"content")
+    cache_path.chmod(0o555)
+
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+
+    cache.copy_to_cache(src, cache_path, executable=False)
+
+    assert cache_path.stat().st_mode & 0o777 == 0o555
 
 
 # === _make_writable_and_retry Tests ===
