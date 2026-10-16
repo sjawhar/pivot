@@ -160,12 +160,14 @@ def _track_single_path(
         total_size = sum(e["size"] for e in manifest)
         num_files = len(manifest)
 
-        # Save each file to cache
+        # copy_to_cache is idempotent and already checks existence itself; letting it see
+        # every entry (not just ones missing from the cache) is what lets it republish an
+        # object `pivot track --force` finds cached non-executable by an older pivot or a
+        # cold `pivot pull`, when this entry's bytes should be executable.
         for entry in manifest:
             file_path = path / entry["relpath"]
             file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
-            if not file_cache_path.exists():
-                cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
+            cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
 
         pvt_data: track_mod.PvtData = {
             "path": path.name,
@@ -178,8 +180,7 @@ def _track_single_path(
         file_hash, _ = cache.hash_file(path)
         file_size = path.stat().st_size
         file_cache_path = cache.get_cache_path(cache_dir, file_hash)
-        if not file_cache_path.exists():
-            cache.copy_to_cache(path, file_cache_path)
+        cache.copy_to_cache(path, file_cache_path)
 
         pvt_data = {
             "path": path.name,

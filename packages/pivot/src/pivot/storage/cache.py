@@ -568,11 +568,20 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
     symlink_fast_path restore would otherwise ever revisit it. Chmod'ing in place is safe
     here, unlike the single-file cache: a tree directory is a private ``copytree`` copy with
     no other hardlinks sharing its files.
+
+    ``manifest`` may come straight from a lock file on the restore path, so each relpath is
+    checked the same way the file-by-file restore branch already does: a manifest claiming
+    ``../../../outside/file`` must not chmod a file outside the tree.
     """
+    resolved_tree = cache_dir_path.resolve()
     for entry in manifest:
         if not entry["isexec"]:
             continue
         f = cache_dir_path / entry["relpath"]
+        if not f.resolve().is_relative_to(resolved_tree):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {entry['relpath']!r}"
+            )
         if _cache_object_isexec(f) is False:
             os.chmod(f, 0o555)
 
@@ -585,6 +594,7 @@ def _checkout_with_fallback(
     executable: bool | None = None,
     staging_path: pathlib.Path | None = None,
     keep_existing_copy: bool = False,
+    display_path: pathlib.Path | None = None,
 ) -> None:
     """Try each link mode in order until one succeeds.
 
@@ -601,9 +611,14 @@ def _checkout_with_fallback(
     executable bit at all. Either way the shared object cannot represent two permissions at
     once, so checkout falls through to the next mode; only COPY makes a private copy and can
     always re-chmod it correctly.
+
+    ``display_path`` names the file in a raised error when ``path`` is a restore-only staging
+    location (a caller checking out into a scratch directory before an atomic swap); it
+    defaults to ``path`` for every other caller.
     """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
+    display = display_path if display_path is not None else path
     for i, mode in enumerate(checkout_modes):
         is_last = i == len(checkout_modes) - 1
         if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
@@ -614,7 +629,7 @@ def _checkout_with_fallback(
                 if is_last:
                     cached_state = "executable" if cached_isexec else "non-executable"
                     raise exceptions.CacheModeCollisionError(
-                        f"Cache object {cache_path} is recorded {cached_state}, but {path} "
+                        f"Cache object {cache_path} is recorded {cached_state}, but {display} "
                         + f"needs isexec={executable}."
                     )
                 logger.debug(
@@ -1012,7 +1027,11 @@ def _restore_directory_from_cache(
                 )
             file_path.parent.mkdir(parents=True, exist_ok=True)
             _checkout_with_fallback(
-                file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
+                file_path,
+                file_cache_path,
+                checkout_modes,
+                executable=entry["isexec"],
+                display_path=path / entry["relpath"],
             )
             if file_count % 100 == 0:
                 try:

@@ -2085,6 +2085,83 @@ def test_save_to_cache_symlink_repairs_legacy_tree_isexec(tmp_path: pathlib.Path
     )
 
 
+def test_repair_tree_dir_isexec_rejects_path_traversal(tmp_path: pathlib.Path) -> None:
+    """_repair_tree_dir_isexec must not chmod outside the tree cache directory: a manifest
+    entry can come straight from a lock file on the restore path, so a relpath pointing
+    outside the tree marked isexec must raise instead of reaching through to a file outside
+    the tree, exactly like the file-by-file restore branch already does for the same
+    manifest shape."""
+    from pivot import exceptions
+    from pivot.types import DirManifestEntry
+
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "run.sh").write_text("#!/bin/sh\necho hi\n")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    assert isinstance(output_hash, dict) and "manifest" in output_hash
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not touch")
+    victim.chmod(0o644)
+
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    relpath = os.path.relpath(victim, tree_path)
+    malicious_manifest = [
+        DirManifestEntry(
+            relpath=relpath, hash="a" * cache.XXHASH64_HEX_LENGTH, size=100, isexec=True
+        )
+    ]
+
+    with pytest.raises(exceptions.SecurityValidationError, match="path traversal"):
+        cache._repair_tree_dir_isexec(tree_path, malicious_manifest)
+
+    assert victim.stat().st_mode & 0o777 == 0o644, "victim file must be untouched"
+
+
+def test_restore_from_cache_symlink_fast_path_rejects_manifest_traversal(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The symlink fast path in `_restore_directory_from_cache` must reject a lock-supplied
+    manifest with a traversal relpath before the tree-repair chmod runs, the same way the
+    file-by-file branch already does."""
+    from pivot import exceptions
+    from pivot.types import DirHash, DirManifestEntry
+
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "run.sh").write_text("#!/bin/sh\necho hi\n")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    assert isinstance(output_hash, dict) and "manifest" in output_hash
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not touch")
+    victim.chmod(0o644)
+
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    relpath = os.path.relpath(victim, tree_path)
+    tampered_hash = DirHash(
+        hash=output_hash["hash"],
+        manifest=[
+            *output_hash["manifest"],
+            DirManifestEntry(
+                relpath=relpath, hash="a" * cache.XXHASH64_HEX_LENGTH, size=100, isexec=True
+            ),
+        ],
+    )
+
+    cache.remove_output(output)
+    with pytest.raises(exceptions.SecurityValidationError, match="path traversal"):
+        cache.restore_from_cache(output, tampered_hash, cache_dir, checkout_modes=modes)
+
+    assert victim.stat().st_mode & 0o777 == 0o644, "victim file must be untouched"
+
+
 def test_directory_output_restore_isexec_mismatch_without_copy_fallback_raises(
     tmp_path: pathlib.Path,
 ) -> None:
