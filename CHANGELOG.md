@@ -2,6 +2,68 @@
 
 <!-- version list -->
 
+## v0.3.2 (2026-10-16)
+
+### Bug Fixes
+
+- **checkout**: Preserve outputs on cache misses ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **checkout**: Retain tracked directory ignore semantics
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **cli**: Honour --quiet for the left-out symlink warning in track and commit
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Atomically restore get fallbacks ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Count only links into the configured cache as directory content
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Hash cache-derived directory links
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Hash produced directories consistently
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Keep checkout and get from losing files; count only Pivot cache links in directory
+  artifacts; warn on left-out symlinks ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Preserve complete directory artifacts
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Recover interrupted get staging files
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Refuse user symlinks in directory artifacts on top of main
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+- **storage**: Warn instead of refusing symlinks in directory artifacts
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+### Documentation
+
+- Clarify directory artifact symlink rules ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+### Testing
+
+- **storage**: Keep main's symlink-skip test unchanged
+  ([#476](https://github.com/sjawhar/pivot/pull/476),
+  [`c941ad8`](https://github.com/sjawhar/pivot/commit/c941ad8b371c9ed7cf18822be1613ed91fc7d79b))
+
+
 ## v0.3.1 (2026-10-15)
 
 ### Bug Fixes
