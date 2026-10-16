@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, TypedDict
 
 from conftest import isolated_pivot_dir
-from pivot import cli, compose
-from pivot.storage import track
+from pivot import cli, compose, config
+from pivot.storage import cache, track
 
 if TYPE_CHECKING:
     import pathlib
@@ -124,6 +125,40 @@ def test_track_force_overwrites(
     assert pvt_data_updated is not None
     # Hash should be different due to modified content
     assert pvt_data_updated["hash"] != original_hash
+
+
+def test_track_force_repairs_legacy_nonexecutable_cache_object(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """`pivot track --force` must repair a cache object an older pivot cached
+    non-executable: the outer `exists()` guard this command used to wrap `copy_to_cache` in
+    skipped the republish copy_to_cache now does for an executable entry, leaving tracked
+    directories with no way to recover a stale object short of deleting it by hand."""
+    data_dir = mock_discovery.root / "tools"
+    data_dir.mkdir()
+    script = data_dir / "run.sh"
+    script.write_text("#!/bin/sh\necho hi\n")
+    script.chmod(0o755)
+
+    result = runner.invoke(cli.cli, ["track", "tools"])
+    assert result.exit_code == 0, result.output
+
+    pvt_data = track.read_pvt_file(mock_discovery.root / "tools.pvt")
+    assert pvt_data is not None and "manifest" in pvt_data
+    entry_hash = next(e["hash"] for e in pvt_data["manifest"] if e["relpath"] == "run.sh")
+
+    # Simulate an object an older pivot cached non-executable for the same bytes.
+    cache_dir = config.get_cache_dir() / "files"
+    cache_path = cache.get_cache_path(cache_dir, entry_hash)
+    os.chmod(cache_path, 0o444)
+
+    result = runner.invoke(cli.cli, ["track", "--force", "tools"])
+    assert result.exit_code == 0, result.output
+
+    assert os.access(cache_path, os.X_OK), (
+        "track --force must republish a stale non-executable cache object"
+    )
 
 
 def test_track_already_tracked_suggests_force(

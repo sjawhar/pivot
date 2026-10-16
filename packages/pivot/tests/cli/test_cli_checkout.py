@@ -283,6 +283,52 @@ def test_checkout_only_missing_restores_directory_with_missing_file(
         assert "Restored" in result.output, "Should show restoration message"
 
 
+def test_checkout_mode_collision_renders_tip_and_names_real_path(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A CacheModeCollisionError surfacing through `pivot checkout` must render its
+    actionable suggestion (not a bare message) and name the real workspace path, not the
+    restore's internal staging directory.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+
+        data_dir = pathlib.Path("tools")
+        data_dir.mkdir()
+        script = data_dir / "run.sh"
+        script.write_text("#!/bin/sh\necho hi\n")
+        script.chmod(0o755)
+
+        result = runner.invoke(cli.cli, ["track", "tools"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+
+        pvt_data = track.read_pvt_file(pathlib.Path("tools.pvt"))
+        assert pvt_data is not None and "manifest" in pvt_data
+        entry_hash = next(e["hash"] for e in pvt_data["manifest"] if e["relpath"] == "run.sh")
+
+        # Simulate an object an older pivot (or `pivot pull`) cached non-executable.
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_path = cache.get_cache_path(cache_dir, entry_hash)
+        cache_path.chmod(0o444)
+
+        shutil.rmtree(data_dir)
+
+        # --checkout-mode accepts a single mode with no fallback, so there is no COPY to
+        # resolve the mismatch: the mode-collision error must surface.
+        result = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "hardlink", "tools"])
+
+        assert result.exit_code != 0, result.output
+        assert "Tip:" in result.output, (
+            f"CacheModeCollisionError's suggestion must render: {result.output}"
+        )
+        assert ".pivot_restore_" not in result.output, (
+            f"must not name the restore's internal staging path: {result.output}"
+        )
+        assert str(script) in result.output, (
+            f"must name the real workspace path 'tools/run.sh': {result.output}"
+        )
+
+
 def test_checkout_replaces_file_with_directory(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

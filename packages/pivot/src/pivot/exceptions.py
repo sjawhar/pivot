@@ -214,6 +214,27 @@ class UncachedIncrementalOutputError(CacheError):
     """Raised when an incremental output exists without a cache entry."""
 
 
+class CacheModeCollisionError(CacheError):
+    """A HARDLINK/SYMLINK checkout shares the cache object's own permissions and found it
+    already recorded with the wrong executable bit, with no COPY fallback available.
+
+    This happens when two files with identical content disagree on their executable bit (the
+    cache key is content-only) or when a cache object was populated by a path that does not
+    know a file's intended executable bit (e.g. `pivot pull`, which downloads by hash alone).
+    """
+
+    @override
+    def get_suggestion(self) -> str:
+        return (
+            "Add CheckoutMode.COPY to checkout_modes (cache: checkout_mode: [..., copy] in "
+            ".pivot/config.yaml) so checkout can fall back to a private, correctly-permissioned "
+            "copy instead of sharing the cache object's own permissions; or, if you have the "
+            "source bytes in hand, re-running what produced them (`pivot repro --force "
+            "<stage>`, `pivot track --force <path>`) republishes the cache object with the "
+            "right bit"
+        )
+
+
 class ParamsError(PivotError):
     """Raised when parameter validation or loading fails."""
 

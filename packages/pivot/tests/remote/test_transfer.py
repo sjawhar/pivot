@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -737,6 +738,55 @@ async def test_pull_async_integration(
     cache_path = cache_mod.get_cache_path(files_dir, hash1)
     assert cache_path.read_bytes() == b"content1"
     state_db.close()
+
+
+async def test_pull_then_checkout_preserves_executable_bit_integration(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """A directory output's executable file keeps its executable bit after `pivot pull`.
+
+    `_atomic_download` writes a freshly-pulled cache object by content hash alone, with no
+    executable bit (always 0o444): it has no manifest to read one from. Checking it out as
+    HARDLINK or SYMLINK must still produce a correctly-executable workspace file, by falling
+    back to COPY rather than serving the pulled object's own (wrong) permissions.
+    """
+    content = b"#!/bin/sh\necho hi\n"
+    file_hash = xxhash.xxh64(content).hexdigest()
+
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, file_hash),
+        Body=content,
+    )
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    cache_dir.mkdir(parents=True)
+    state_db = state_mod.StateDB(state_dir)
+
+    await transfer._pull_async(cache_dir, state_dir, s3_remote, state_db, "origin")
+    state_db.close()
+
+    pulled_cache_path = cache_mod.get_cache_path(cache_dir / "files", file_hash)
+    assert not os.access(pulled_cache_path, os.X_OK), "pull has no isexec to write; sanity check"
+
+    output_hash: DirHash = {
+        "hash": "deadbeefdeadbeef",
+        "manifest": [
+            DirManifestEntry(relpath="run.sh", hash=file_hash, size=len(content), isexec=True)
+        ],
+    }
+    output_dir = tmp_path / "restored"
+    assert cache_mod.restore_from_cache(
+        output_dir,
+        output_hash,
+        cache_dir / "files",
+        checkout_modes=cache_mod.DEFAULT_CHECKOUT_MODE_ORDER,
+    )
+
+    assert os.access(output_dir / "run.sh", os.X_OK), "checkout must restore the executable bit"
 
 
 async def test_push_pull_roundtrip_integration(
