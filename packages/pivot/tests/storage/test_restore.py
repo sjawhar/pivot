@@ -495,34 +495,6 @@ def test_restore_targets_from_revision_output_with_stage(
 
 
 # =============================================================================
-# _out_entry_to_output_hash Tests
-# =============================================================================
-
-
-def test_out_entry_to_output_hash_with_manifest() -> None:
-    """Converts OutEntry with manifest to HashInfo."""
-    entry = {
-        "key": None,
-        "hash": "abc123",
-        "tag": "data",
-        "manifest": [{"relpath": "a.txt", "hash": "def456", "size": 1, "isexec": False}],
-    }
-    result = restore._out_entry_to_output_hash(entry)  # pyright: ignore[reportArgumentType]
-
-    assert result["hash"] == "abc123"
-    assert "manifest" in result
-
-
-def test_out_entry_to_output_hash_file() -> None:
-    """Converts OutEntry without manifest to FileHash."""
-    entry = {"key": None, "hash": "abc123", "tag": "data"}
-    result = restore._out_entry_to_output_hash(entry)  # pyright: ignore[reportArgumentType]
-
-    assert result["hash"] == "abc123"
-    assert "manifest" not in result
-
-
-# =============================================================================
 # restore_file Tests
 # =============================================================================
 

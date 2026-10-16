@@ -64,6 +64,7 @@ class OutputHashEntry(TypedDict):
     path: str
     hash: str
     manifest: NotRequired[list[DirManifestEntry]]
+    empty_dirs: NotRequired[list[str]]
 
 
 def output_hash_to_entry(path: str, oh: HashInfo) -> OutputHashEntry:
@@ -71,6 +72,8 @@ def output_hash_to_entry(path: str, oh: HashInfo) -> OutputHashEntry:
     entry = OutputHashEntry(path=path, hash=oh["hash"])
     if is_dir_hash(oh):
         entry["manifest"] = oh["manifest"]
+        if "empty_dirs" in oh:
+            entry["empty_dirs"] = oh["empty_dirs"]
     return entry
 
 
@@ -78,7 +81,10 @@ def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash:
     """Convert serialized OutputHashEntry back to internal HashInfo."""
     # Null check guards against corrupted JSON where manifest could be null
     if "manifest" in entry and entry["manifest"] is not None:  # pyright: ignore[reportUnnecessaryComparison]
-        return DirHash(hash=entry["hash"], manifest=entry["manifest"])
+        dir_hash = DirHash(hash=entry["hash"], manifest=entry["manifest"])
+        if "empty_dirs" in entry and entry["empty_dirs"]:
+            dir_hash["empty_dirs"] = entry["empty_dirs"]
+        return dir_hash
     return FileHash(hash=entry["hash"])
 
 

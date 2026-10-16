@@ -67,7 +67,7 @@ class CacheStore:
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                ref_hash, _ = cache.hash_directory(ref_path, db)
+                ref_hash = cache.hash_directory(ref_path, db)["hash"]
             else:
                 ref_hash, _ = cache.hash_file(ref_path, db)
 
@@ -117,15 +117,13 @@ class CacheStore:
 
         if state_db is not None:
             if ref_path.is_dir():
-                tree_hash, manifest = cache.hash_directory(ref_path, state_db)
-                return types.DirHash(hash=tree_hash, manifest=manifest)
+                return cache.hash_directory(ref_path, state_db)
             file_hash, _ = cache.hash_file(ref_path, state_db)
             return types.FileHash(hash=file_hash)
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                tree_hash, manifest = cache.hash_directory(ref_path, db)
-                return types.DirHash(hash=tree_hash, manifest=manifest)
+                return cache.hash_directory(ref_path, db)
 
             file_hash, _ = cache.hash_file(ref_path, db)
             return types.FileHash(hash=file_hash)
@@ -230,13 +228,12 @@ class WorkspaceStore:
         """
         output_hash: types.HashInfo
         if path.is_dir():
-            tree_hash, manifest = cache.hash_directory(
+            output_hash = cache.hash_directory(
                 path,
                 None,
                 cache_dir=self._cache_dir,
                 warn_left_out_symlinks=warn_left_out_symlinks,
             )
-            output_hash = types.DirHash(hash=tree_hash, manifest=manifest)
         else:
             file_hash, _ = cache.hash_file(path, None)
             output_hash = types.FileHash(hash=file_hash)
@@ -276,8 +273,7 @@ class WorkspaceStore:
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir():
-            tree_hash, manifest = cache.hash_directory(path, state_db, cache_dir=self._cache_dir)
-            return types.DirHash(hash=tree_hash, manifest=manifest)
+            return cache.hash_directory(path, state_db, cache_dir=self._cache_dir)
         file_hash, _ = cache.hash_file(path, state_db)
         return types.FileHash(hash=file_hash)
 

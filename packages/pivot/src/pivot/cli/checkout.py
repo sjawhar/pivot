@@ -74,7 +74,7 @@ def _on_disk_matches_expected(
     if is_dir_hash(expected_hash):
         if not path.is_dir():
             return False
-        actual_hash, _ = cache.hash_directory(path, cache_dir=cache_dir)
+        actual_hash = cache.hash_directory(path, cache_dir=cache_dir)["hash"]
     else:
         if not path.is_file():
             return False

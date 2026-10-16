@@ -275,10 +275,10 @@ def test_tracked_directory_clean(set_project_root: pathlib.Path) -> None:
     (data_dir / "file1.txt").write_text("content1")
     (data_dir / "file2.txt").write_text("content2")
 
-    dir_hash, manifest = cache.hash_directory(data_dir)
-    total_size = sum(entry["size"] for entry in manifest)
+    dir_hash = cache.hash_directory(data_dir)
+    total_size = sum(entry["size"] for entry in dir_hash["manifest"])
 
-    pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
+    pvt_data = track.PvtData(path="data", hash=dir_hash["hash"], size=total_size)
     track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
 
     results = status.get_tracked_files_status(set_project_root)
@@ -296,10 +296,10 @@ def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
     data_dir.mkdir()
     (data_dir / "file1.txt").write_text("content1")
 
-    dir_hash, manifest = cache.hash_directory(data_dir)
-    total_size = sum(entry["size"] for entry in manifest)
+    dir_hash = cache.hash_directory(data_dir)
+    total_size = sum(entry["size"] for entry in dir_hash["manifest"])
 
-    pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
+    pvt_data = track.PvtData(path="data", hash=dir_hash["hash"], size=total_size)
     track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
 
     (data_dir / "file1.txt").write_text("modified content")

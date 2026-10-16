@@ -1001,6 +1001,91 @@ def test_pull_keeps_cache_derived_directory_file_symlinks_as_artifact_members(
     assert "1 cached" in _ok(_pivot(clone, "status", env=env))
 
 
+_EMPTY_DIRS_PIPELINE = """\
+import pathlib
+import tempfile
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class Made(TypedDict):
+    tree: pathlib.Path
+
+
+@stage
+def make() -> Made:
+    tree = pathlib.Path(tempfile.mkdtemp())
+    (tree / "keep.txt").write_text("keep")
+    (tree / "bundle" / "classifier_source").mkdir(parents=True)
+    (tree / "logs").mkdir()
+    return {"tree": tree}
+
+
+@stage
+def pack(tree: pathlib.Path) -> Annotated[dict, loaders.JSON()]:
+    return {
+        "entries": sorted(
+            str(p.relative_to(tree)) + ("/" if p.is_dir() else "") for p in tree.rglob("*")
+        )
+    }
+
+
+with Pipeline("empty") as pipeline:
+    made = make()
+    pack(made.tree)
+"""
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_pull_restores_empty_dirs_of_directory_output(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], mode: str
+) -> None:
+    """A directory output pulled into a fresh clone is the tree its stage built, empty
+    directories included: the clone is up to date, and its consumer packs the same bytes."""
+    env = _env(
+        AWS_ENDPOINT_URL=moto_services["s3"],
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"empty-dirs-{uuid.uuid4().hex[:8]}"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=moto_services["s3"],
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    )
+    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(
+        src, {"pipeline.py": _EMPTY_DIRS_PIPELINE, ".gitignore": "/data/empty/\n__pycache__/\n"}
+    )
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(src, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    _commit(src, "source")
+    tree = pathlib.Path("data", "empty", "make", "tree.dat")
+    packed = pathlib.Path("data", "empty", "pack.json")
+    assert sorted(p.name for p in (src / tree).iterdir()) == ["bundle", "keep.txt", "logs"]
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    _ok(_pivot(clone, "config", "set", "cache.checkout_mode", mode))
+    _ok(_pivot(clone, "pull", "empty/make", "empty/pack", env=env))
+
+    assert (clone / tree / "bundle" / "classifier_source").is_dir()
+    assert (clone / tree / "logs").is_dir()
+    assert "0 ran, 2 cached" in _ok(_pivot(clone, "repro", env=env))
+    assert "2 cached" in _ok(_pivot(clone, "status", env=env))
+    _ok(_pivot(clone, "run", "--force", "empty/pack", env=env))
+    assert (clone / packed).read_text() == (src / packed).read_text()
+
+
 def test_tracked_directory_checked_out_as_symlinks_stays_clean(tmp_path: pathlib.Path) -> None:
     """A symlink checkout of a tracked directory is the tracked content, not a modification."""
     root = _project(tmp_path, {"data/tracked/keep.txt": "keep", "data/tracked/nested/f.txt": "f"})

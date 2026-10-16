@@ -409,7 +409,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                 if path.is_file():
                     current_hash, _ = cache.hash_file(path, state_db)
                 elif path.is_dir():
-                    current_hash, _ = cache.hash_directory(path, state_db, cache_dir=cache_dir)
+                    current_hash = cache.hash_directory(path, state_db, cache_dir=cache_dir)["hash"]
                 else:
                     # Path doesn't exist
                     raise FileNotFoundError(data_path)

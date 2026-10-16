@@ -600,13 +600,13 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
     # Track the directory (create .pvt with manifest)
-    dir_hash, manifest = cache.hash_directory(data_dir)
+    dir_hash = cache.hash_directory(data_dir)
     pvt_data = track.PvtData(
         path="raw",
-        hash=dir_hash,
+        hash=dir_hash["hash"],
         size=7,
         num_files=1,
-        manifest=manifest,
+        manifest=dir_hash["manifest"],
     )
     track.write_pvt_file(data_dir.parent / "raw.pvt", pvt_data)
 

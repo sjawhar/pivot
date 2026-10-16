@@ -154,9 +154,10 @@ def _track_single_path(
 
     # Hash and cache
     if path.is_dir():
-        tree_hash, manifest = cache.hash_directory(
+        dir_hash = cache.hash_directory(
             path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
         )
+        manifest = dir_hash["manifest"]
         total_size = sum(e["size"] for e in manifest)
         num_files = len(manifest)
 
@@ -171,11 +172,13 @@ def _track_single_path(
 
         pvt_data: track_mod.PvtData = {
             "path": path.name,
-            "hash": tree_hash,
+            "hash": dir_hash["hash"],
             "size": total_size,
             "num_files": num_files,
             "manifest": manifest,
         }
+        if "empty_dirs" in dir_hash:
+            pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
     else:
         file_hash, _ = cache.hash_file(path)
         file_size = path.stat().st_size
