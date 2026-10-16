@@ -128,6 +128,16 @@ under it counts, including names that code fingerprinting or watch mode may
 ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
 them changes the directory hash, and all of them return on restore.
 
+A symlink inside a directory artifact is not stored: it is left out of the
+manifest and does not come back on restore. When a stage writes the artifact,
+or `pivot track` records it, Pivot logs one warning naming each symlink it
+left out, for example `Directory artifact data/p/bundle.dat leaves out symlink
+link.txt`; replace the link with a real file or directory. A later release
+refuses these symlinks. The one exception is a link Pivot made itself: a
+symlink-mode checkout links each file to an object in the configured cache
+(`cache.dir`), and that link counts as the file it points to. A link to a
+hash-named file anywhere else is a user symlink.
+
 The declarative `DirectoryOut` annotation for a variable set of files remains
 undecided; do not add that annotation to a compositional pipeline.
 

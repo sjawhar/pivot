@@ -348,6 +348,7 @@ def get_tracked_files_status(
     results = list[TrackedFileInfo]()
 
     # Use state_db for hash caching (mtime-based)
+    cache_dir = config.get_cache_dir() / "files"
     with state_mod.StateDB(config.get_state_dir()) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
@@ -355,7 +356,7 @@ def get_tracked_files_status(
 
             try:
                 if path.is_dir():
-                    current_hash, _ = cache.hash_directory(path, state_db)
+                    current_hash, _ = cache.hash_directory(path, state_db, cache_dir=cache_dir)
                 else:
                     current_hash, _ = cache.hash_file(path, state_db)
             except FileNotFoundError:

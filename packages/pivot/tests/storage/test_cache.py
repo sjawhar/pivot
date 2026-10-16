@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import mmap
 import multiprocessing
 import os
@@ -191,6 +192,82 @@ def test_hash_directory(tmp_path: pathlib.Path) -> None:
 
     assert len(tree_hash) == 16
     assert len(manifest) == 2
+
+
+def test_hash_directory_warns_about_left_out_symlinks(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A recorded directory names each user symlink it leaves out, in one warning."""
+    test_dir = tmp_path / "artifact"
+    (test_dir / "nested").mkdir(parents=True)
+    target = test_dir / "target.txt"
+    target.write_text("target")
+    (test_dir / "link.txt").symlink_to(target)
+    (test_dir / "nested" / "other.txt").symlink_to(target)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        _, manifest = cache.hash_directory(test_dir, warn_left_out_symlinks=True)
+
+    assert [entry["relpath"] for entry in manifest] == ["target.txt"]
+    assert [record.getMessage() for record in caplog.records] == [
+        f"Directory artifact {test_dir} leaves out symlinks link.txt, nested/other.txt "
+        + "(a symlink inside a directory artifact is not stored); "
+        + "replace each with a real file or directory"
+    ]
+
+
+def test_hash_directory_rehash_is_silent_about_left_out_symlinks(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Status and skip checks re-hash a directory without repeating the warning."""
+    test_dir = tmp_path / "artifact"
+    test_dir.mkdir()
+    (test_dir / "target.txt").write_text("target")
+    (test_dir / "link.txt").symlink_to(test_dir / "target.txt")
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        cache.hash_directory(test_dir)
+
+    assert caplog.records == []
+
+
+def test_hash_directory_hashes_cache_object_links_by_target(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A symlink checkout's link to a cache object counts as the file it points to."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("keep")
+    cache_dir = tmp_path / "cache"
+    expected_hash, expected_manifest = cache.hash_directory(source)
+    cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, expected_manifest[0]["hash"]))
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        result = cache.hash_directory(linked, cache_dir=cache_dir, warn_left_out_symlinks=True)
+
+    assert result == (expected_hash, expected_manifest)
+    assert caplog.records == []
+
+
+def test_hash_directory_leaves_out_links_to_hash_named_files_outside_the_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Only a link into the given cache root is content, however its target is named."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("keep")
+    cache_dir = tmp_path / "cache"
+    _, manifest = cache.hash_directory(source)
+    cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, manifest[0]["hash"]))
+
+    assert cache.hash_directory(linked, cache_dir=tmp_path / "other-cache")[1] == []
+    assert cache.hash_directory(linked)[1] == []
 
 
 def test_hash_directory_relative_paths(tmp_path: pathlib.Path) -> None:

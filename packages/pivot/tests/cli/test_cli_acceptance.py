@@ -17,6 +17,8 @@ import uuid
 
 import boto3
 import pytest
+import xxhash
+import yaml
 
 from pivot import loaders
 
@@ -121,6 +123,205 @@ def double(raw: pd.DataFrame) -> pd.DataFrame:
 with Pipeline("c") as pipeline:
     double(pipeline.input("t.csv"))
 """
+
+_DIRECTORY_ARTIFACT_SYMLINK_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def assemble() -> pathlib.Path:
+    output = pathlib.Path(tempfile.mkdtemp(prefix="pivot-directory-artifact-"))
+    target = output / "target.txt"
+    target.write_text("target")
+    (output / "link.txt").symlink_to(target)
+    return output
+
+
+with Pipeline("directory") as pipeline:
+    assemble()
+"""
+
+
+def test_repro_warns_about_a_symlink_left_out_of_a_directory_artifact(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A user symlink is left out of a directory output, with a warning under the stage."""
+    root = _project(tmp_path, {"pipeline.py": _DIRECTORY_ARTIFACT_SYMLINK_PIPELINE})
+    output = root / "data" / "directory" / "assemble.dat"
+
+    out = _ok(_pivot(root, "repro"))
+
+    warning = (
+        "WARNING: Directory artifact data/directory/assemble.dat leaves out symlink link.txt "
+        + "(a symlink inside a directory artifact is not stored); "
+        + "replace it with a real file or directory"
+    )
+    assert warning in " ".join(out.split()), out
+    lock_data = yaml.safe_load(
+        (root / ".pivot" / "stages" / "directory" / "assemble.lock").read_text()
+    )
+    assert [entry["relpath"] for entry in lock_data["outs"][0]["manifest"]] == ["target.txt"]
+
+    shutil.rmtree(output)
+    assert "0 ran, 1 cached" in _ok(_pivot(root, "repro"))
+    assert (output / "target.txt").read_text() == "target"
+    assert not (output / "link.txt").exists() and not (output / "link.txt").is_symlink()
+
+
+def test_track_warns_about_a_symlink_left_out_of_a_tracked_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Tracking a directory with a user symlink records the regular files and warns."""
+    root = _project(tmp_path, {"data/tracked/keep.txt": "keep"})
+    (root / "data" / "tracked" / "link.txt").symlink_to(root / "data" / "tracked" / "keep.txt")
+
+    out = _ok(_pivot(root, "track", "data/tracked"))
+
+    assert (
+        "Directory artifact data/tracked leaves out symlink link.txt "
+        + "(a symlink inside a directory artifact is not stored); "
+        + "replace it with a real file or directory"
+    ) in " ".join(out.split()), out
+    pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
+    assert [entry["relpath"] for entry in pvt["manifest"]] == ["keep.txt"]
+
+
+def test_quiet_track_and_commit_do_not_print_the_left_out_symlink_warning(
+    tmp_path: pathlib.Path,
+) -> None:
+    """-q silences the record-time warning for track and commit, as it does for repro."""
+    root = _project(
+        tmp_path,
+        {"pipeline.py": _DIRECTORY_ARTIFACT_SYMLINK_PIPELINE, "data/tracked/keep.txt": "keep"},
+    )
+    (root / "data" / "tracked" / "link.txt").symlink_to(root / "data" / "tracked" / "keep.txt")
+    _ok(_pivot(root, "track", "data/tracked"))
+    _ok(_pivot(root, "repro"))
+
+    for args in (("track", "--force", "data/tracked"), ("commit", "directory/assemble")):
+        quiet = _pivot(root, "-q", *args)
+        assert quiet.returncode == 0, quiet.stdout + quiet.stderr
+        assert quiet.stderr == "", args
+
+        loud = _ok(_pivot(root, *args))
+        assert "leaves out symlink link.txt" in " ".join(loud.split()), args
+
+
+_FORCE_CHECKOUT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def produce() -> str:
+    return "cached"
+
+
+with Pipeline("checkout") as pipeline:
+    produce()
+"""
+
+
+def test_checkout_force_preserves_existing_output_when_its_cache_object_is_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A cache miss is reported before --force can delete the workspace output."""
+    root = _project(tmp_path, {"pipeline.py": _FORCE_CHECKOUT_PIPELINE})
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "copy"))
+    _ok(_pivot(root, "repro"))
+
+    output = root / "data" / "checkout" / "produce.txt"
+    output.write_text("workspace edit")
+    lock_data = yaml.safe_load(
+        (root / ".pivot" / "stages" / "checkout" / "produce.lock").read_text()
+    )
+    output_hash = lock_data["outs"][0]["hash"]
+    (root / ".pivot" / "cache" / "files" / output_hash[:2] / output_hash[2:]).unlink()
+
+    proc = _pivot(root, "checkout", "--force", "checkout/produce")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert output_hash in out
+    assert "cache object" in out.lower()
+    assert output.read_text() == "workspace edit"
+
+
+def test_get_killed_before_fallback_replacement_preserves_existing_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A killed cache-miss get leaves the prior target intact until atomic replacement."""
+    root = _project(tmp_path, {"source.txt": "revision content"})
+    subprocess.run(["git", "add", "source.txt"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial"],
+        cwd=root,
+        check=True,
+    )
+    target = root / "source.txt"
+    target.write_text("workspace content")
+    hook_dir = root / "hook"
+    hook_dir.mkdir()
+    ready = root / "ready"
+    hook_dir.joinpath("sitecustomize.py").write_text("""\
+import os
+import pathlib
+import time
+
+_target = pathlib.Path(os.environ["PIVOT_TEST_BLOCK_TARGET"])
+_ready = pathlib.Path(os.environ["PIVOT_TEST_READY"])
+_write_bytes = pathlib.Path.write_bytes
+_replace = pathlib.Path.replace
+
+def _pause() -> None:
+    _ready.write_text("ready")
+    while True:
+        time.sleep(1)
+
+def write_bytes(self: pathlib.Path, data: bytes) -> int:
+    if self == _target:
+        _pause()
+    return _write_bytes(self, data)
+
+def replace(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+    if pathlib.Path(target) == _target:
+        _pause()
+    return _replace(self, target)
+
+pathlib.Path.write_bytes = write_bytes
+pathlib.Path.replace = replace
+""")
+    env = _env(
+        PIVOT_TEST_BLOCK_TARGET=str(target),
+        PIVOT_TEST_READY=str(ready),
+    )
+    env["PYTHONPATH"] = str(hook_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [_PIVOT, "get", "--force", "--rev", "HEAD", "source.txt"],
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "pivot get did not reach the fallback replacement"
+    finally:
+        if process.poll() is None:
+            process.kill()
+    process.communicate(timeout=30)
+
+    assert target.read_text() == "workspace content"
+    _ok(_pivot(root, "get", "--force", "--rev", "HEAD", "source.txt"))
+
+    assert target.read_text() == "revision content"
+    assert list(root.glob("*.tmp")) == []
+    assert list(root.glob(".pivot_restore_*.file")) == []
 
 
 def test_status_in_clone_missing_outputs_suggests_pull_then_repro(tmp_path: pathlib.Path) -> None:
@@ -701,6 +902,157 @@ def test_pull_restores_build_dir_inside_directory_output(
     assert sorted(p.name for p in shards.iterdir()) == ["0.txt", "1.txt", "build"]
     assert (shards / "0.txt").read_text() == "11"
     assert (shards / "build" / "log.txt").read_text() == "built 26"
+
+
+_ARTIFACT_SYMLINK_RESTORE_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def assemble() -> pathlib.Path:
+    output = pathlib.Path(tempfile.mkdtemp())
+    for relpath, content in {
+        "keep.txt": "keep",
+        "build/required.txt": "build",
+        "dist/required.txt": "dist",
+        "node_modules/required.txt": "modules",
+        ".venv/required.txt": "venv",
+        "editor.swp": "editor",
+        "nested/sub/file.txt": "nested",
+    }.items():
+        path = output / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    return output
+
+
+with Pipeline("dir") as pipeline:
+    assemble()
+"""
+
+
+def test_pull_keeps_cache_derived_directory_file_symlinks_as_artifact_members(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A pull that restores a directory file-by-file leaves a usable directory artifact."""
+    env = _env(
+        AWS_ENDPOINT_URL=moto_services["s3"],
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"artifact-links-{uuid.uuid4().hex[:8]}"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=moto_services["s3"],
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    )
+    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(
+        src,
+        {
+            "pipeline.py": _ARTIFACT_SYMLINK_RESTORE_PIPELINE,
+            ".gitignore": "/data/dir/\n__pycache__/\n",
+        },
+    )
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(src, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(src, "config", "set", "cache.checkout_mode", "copy"))
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    _commit(src, "source")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    _ok(_pivot(clone, "config", "set", "cache.checkout_mode", "symlink"))
+
+    _ok(_pivot(clone, "pull", "dir/assemble", env=env))
+
+    output = clone / "data" / "dir" / "assemble.dat"
+    expected = {
+        "keep.txt": "keep",
+        "build/required.txt": "build",
+        "dist/required.txt": "dist",
+        "node_modules/required.txt": "modules",
+        ".venv/required.txt": "venv",
+        "editor.swp": "editor",
+        "nested/sub/file.txt": "nested",
+    }
+    assert {relpath: (output / relpath).read_text() for relpath in expected} == expected
+    assert all((output / relpath).is_symlink() for relpath in expected)
+    lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "dir" / "assemble.lock").read_text())
+    assert len(lock_data["outs"][0]["manifest"]) == len(expected)
+
+    assert "1 cached" in _ok(_pivot(clone, "status", env=env))
+    assert "0 ran, 1 cached" in _ok(_pivot(clone, "repro", env=env))
+    assert "Verification passed" in _ok(_pivot(clone, "verify", env=env))
+    assert "leaves out symlink" not in _ok(_pivot(clone, "commit", "dir/assemble", env=env))
+
+    lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "dir" / "assemble.lock").read_text())
+    assert len(lock_data["outs"][0]["manifest"]) == len(expected)
+    assert "1 cached" in _ok(_pivot(clone, "status", env=env))
+
+
+def test_tracked_directory_checked_out_as_symlinks_stays_clean(tmp_path: pathlib.Path) -> None:
+    """A symlink checkout of a tracked directory is the tracked content, not a modification."""
+    root = _project(tmp_path, {"data/tracked/keep.txt": "keep", "data/tracked/nested/f.txt": "f"})
+    _ok(_pivot(root, "track", "data/tracked"))
+    shutil.rmtree(root / "data" / "tracked")
+    _ok(_pivot(root, "checkout", "--checkout-mode", "symlink", "data/tracked"))
+    assert (root / "data" / "tracked" / "keep.txt").is_symlink()
+
+    assert "1 clean" in _ok(_pivot(root, "status", "--tracked-only"))
+    assert "leaves out symlink" not in _ok(_pivot(root, "track", "--force", "data/tracked"))
+
+    pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
+    assert sorted(entry["relpath"] for entry in pvt["manifest"]) == ["keep.txt", "nested/f.txt"]
+
+
+def test_only_links_into_the_configured_cache_count_as_directory_content(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A link to a content-addressed file outside the cache is a user symlink, not content."""
+    foreign_content = b"seed bytes"
+    digest = xxhash.xxh64(foreign_content).hexdigest()
+    foreign_object = tmp_path / "foreign-content-store" / digest[:2] / digest[2:]
+    foreign_object.parent.mkdir(parents=True)
+    foreign_object.write_bytes(foreign_content)
+    real_cache = tmp_path / "real-cache"
+    real_cache.mkdir()
+    cache_link = tmp_path / "cache-link"
+    cache_link.symlink_to(real_cache)
+    root = tmp_path / "project"
+    root.mkdir()
+    _project(root, {"data/tracked/keep.txt": "keep", "data/tracked/nested/f.txt": "f"})
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_link)))
+    tracked = root / "data" / "tracked"
+    (tracked / "foreign.txt").symlink_to(foreign_object)
+
+    out = _ok(_pivot(root, "track", "data/tracked"))
+
+    assert "Directory artifact data/tracked leaves out symlink foreign.txt" in " ".join(
+        out.split()
+    ), out
+    pvt_path = root / "data" / "tracked.pvt"
+    manifest = yaml.safe_load(pvt_path.read_text())["manifest"]
+    assert sorted(entry["relpath"] for entry in manifest) == ["keep.txt", "nested/f.txt"]
+
+    # A real symlink checkout through the symlinked custom cache root is still content.
+    shutil.rmtree(tracked)
+    _ok(_pivot(root, "checkout", "--checkout-mode", "symlink", "data/tracked"))
+    assert (tracked / "keep.txt").resolve().is_relative_to((real_cache / "files").resolve())
+    assert "1 clean" in _ok(_pivot(root, "status", "--tracked-only"))
+    _ok(_pivot(root, "checkout", "data/tracked"))  # existing links match: skipped, not an error
+    assert "leaves out symlink" not in _ok(_pivot(root, "track", "--force", "data/tracked"))
+    assert yaml.safe_load(pvt_path.read_text())["manifest"] == manifest
 
 
 _PARAM_PIPELINE = """\

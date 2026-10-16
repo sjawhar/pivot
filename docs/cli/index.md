@@ -388,7 +388,7 @@ pivot checkout [TARGETS...] [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
-| `--force` / `-f` | Overwrite existing files |
+| `--force` / `-f` | Overwrite existing files when every required cache object is available; otherwise refuse without changing the workspace file |
 | `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files; if a file differs from the target or is extra, replaces the directory when every such file is pivot's own earlier output (its content is in the cache), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite. Entries the directory hash skips (`build/`, `dist/`, `__pycache__/`, `node_modules/`, `.git/`, `*.pyc`, `*.swp`, `*~` and similar) are not part of the output: a replaced directory keeps them as they are. During the swap they wait in a `.pivot_keep_*` directory beside it; if pivot is killed there, the next `pivot pull` or `pivot checkout --only-missing` of that directory puts them back |
 | `--all` | Checkout all targets (ignore target filtering) |
 
