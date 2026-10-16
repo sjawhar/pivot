@@ -74,11 +74,15 @@ def _on_disk_matches_expected(
     if is_dir_hash(expected_hash):
         if not path.is_dir():
             return False
-        actual_hash = cache.hash_directory(path, cache_dir=cache_dir)["hash"]
-    else:
-        if not path.is_file():
-            return False
-        actual_hash, _ = cache.hash_file(path)
+        actual = cache.hash_directory(path, cache_dir=cache_dir)
+        # A hash pivot 0.3.3 recorded lists no empty directories, and repro still honors it.
+        # When only empty directories differ, checkout would change no file, so it matches.
+        return actual["hash"] == expected_hash["hash"] or (
+            "empty_dirs" not in expected_hash and actual["manifest"] == expected_hash["manifest"]
+        )
+    if not path.is_file():
+        return False
+    actual_hash, _ = cache.hash_file(path)
     return actual_hash == expected_hash["hash"]
 
 

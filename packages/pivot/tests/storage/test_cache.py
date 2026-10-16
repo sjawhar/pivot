@@ -2777,11 +2777,13 @@ def test_restore_directory_rejects_empty_dir_path_traversal(tmp_path: pathlib.Pa
 
 
 def _helper_add_stale_dir_to_tree(tree_path: pathlib.Path) -> None:
-    """Give a whole-directory SYMLINK cache tree an empty directory its hash does not record,
-    as an older pivot did: it hashed without empty directories but copied them into the tree."""
+    """Make a whole-directory SYMLINK cache tree look built by an older pivot: an empty
+    directory its hash does not record (it hashed without them but copied them into the tree),
+    and no record that this pivot checked the tree."""
     tree_path.chmod(0o755)
     (tree_path / "stale" / "deep").mkdir(parents=True)
     tree_path.chmod(0o555)
+    cache._tree_layout_marker(tree_path).unlink()
 
 
 def test_restore_from_cache_repairs_legacy_symlink_tree_empty_dirs(tmp_path: pathlib.Path) -> None:
@@ -2866,12 +2868,57 @@ def test_restore_from_cache_repairs_legacy_symlink_tree_unlisted_files(
     (tree_path / "linked").mkdir()
     (tree_path / "linked" / "big.bin").write_text("big")
     tree_path.chmod(0o555)
+    cache._tree_layout_marker(tree_path).unlink()
 
     cache.remove_output(output)
     assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
 
     assert _helper_tree_listing(output) == ["keep.txt"]
     assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+
+
+@pytest.mark.parametrize("with_empty_dir", [False, True], ids=["no-empty-dirs", "empty-dirs"])
+def test_symlink_restore_does_not_walk_a_tree_this_pivot_built(
+    tmp_path: pathlib.Path, mocker: MockerFixture, with_empty_dir: bool
+) -> None:
+    """The SYMLINK fast path stays a symlink swap: a tree this pivot built already holds what
+    its hash records, so restoring through it does not walk it (that walk took about 0.5 s on
+    20k files)."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    if with_empty_dir:
+        (output / "empty").mkdir()
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    scan = mocker.spy(cache, "_scan_entries")
+
+    for _ in range(2):
+        cache.remove_output(output)
+        assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert scan.call_count == 0
+
+
+def test_symlink_restore_repairs_a_legacy_tree_once(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    _helper_add_stale_dir_to_tree(cache.get_cache_path(cache_dir, output_hash["hash"]))
+    scan = mocker.spy(cache, "_scan_entries")
+
+    for _ in range(2):
+        cache.remove_output(output)
+        assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert scan.call_count == 1
+    assert _helper_dir_set(output) == set()
 
 
 def test_restore_missing_in_directory_recreates_missing_empty_dir(tmp_path: pathlib.Path) -> None:

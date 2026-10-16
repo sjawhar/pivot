@@ -9,6 +9,7 @@ import logging
 import mmap
 import os
 import pathlib
+import posixpath
 import secrets
 import shutil
 import stat
@@ -331,9 +332,11 @@ def hash_directory(
     if left_out and warn_left_out_symlinks:
         _warn_left_out_symlinks(path, left_out)
 
+    # A deepest empty directory holds no stored file and no other directory.
     found_dirs = {str(directory.relative_to(path)) for directory in dirs}
-    empty = found_dirs - _parent_dirs(entry["relpath"] for entry in manifest)
-    empty_dirs = sorted(empty - _parent_dirs(empty))
+    file_dirs = {posixpath.dirname(entry["relpath"]) for entry in manifest}
+    has_child = {posixpath.dirname(directory) for directory in found_dirs}
+    empty_dirs = sorted(found_dirs - file_dirs - has_child)
 
     hashed: object = {"empty_dirs": empty_dirs, "manifest": manifest} if empty_dirs else manifest
     hashed_json = json.dumps(hashed, sort_keys=True, separators=(",", ":"))
@@ -633,6 +636,31 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
             os.chmod(f, 0o555)
 
 
+_TREE_LAYOUT_MARKER_SUFFIX = ".layout-checked"
+
+
+def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
+    """Return the file beside a whole-directory SYMLINK cache tree that records its layout
+    holds exactly what its hash records. The name is never a cache key, so cache scans skip it.
+    """
+    return cache_dir_path.with_name(cache_dir_path.name + _TREE_LAYOUT_MARKER_SUFFIX)
+
+
+def _ensure_tree_dir_layout(cache_dir_path: pathlib.Path, output_hash: DirHash) -> None:
+    """Repair a whole-directory SYMLINK cache tree's layout once, not on every restore.
+
+    Only this pivot records ``empty_dirs``, so a tree whose hash records them was built by it
+    and needs no check. Any other tree is checked once and then marked.
+    """
+    if "empty_dirs" in output_hash:
+        return
+    marker = _tree_layout_marker(cache_dir_path)
+    if marker.exists():
+        return
+    _repair_tree_dir_layout(cache_dir_path, output_hash)
+    marker.touch()
+
+
 def _repair_tree_dir_layout(cache_dir_path: pathlib.Path, output_hash: DirHash) -> None:
     """Give a whole-directory SYMLINK cache tree exactly the files and directories
     ``output_hash`` records.
@@ -925,12 +953,13 @@ def _store_directory(
                         executable = isexec_by_relpath.get(relpath, False)
                         os.chmod(f, 0o555 if executable else 0o444)
                 os.chmod(cache_dir_path, 0o555)
+                _tree_layout_marker(cache_dir_path).touch()
 
             # A tree an older pivot built keeps its 0o444-everywhere files, and entries its hash
             # does not record, forever otherwise: its name never changes, so this branch never
             # revisits an existing tree directory above.
             _repair_tree_dir_isexec(cache_dir_path, manifest)
-            _repair_tree_dir_layout(cache_dir_path, output_hash)
+            _ensure_tree_dir_layout(cache_dir_path, output_hash)
 
             _clear_path(path)
             path.symlink_to(cache_dir_path.resolve())
@@ -1107,7 +1136,7 @@ def _restore_directory_from_cache(
         # 0o444-everywhere files, and entries its hash does not record, forever otherwise,
         # since this path never rebuilds an existing tree directory.
         _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
-        _repair_tree_dir_layout(cache_dir_path, output_hash)
+        _ensure_tree_dir_layout(cache_dir_path, output_hash)
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             temp_symlink.symlink_to(cache_dir_path.resolve())
