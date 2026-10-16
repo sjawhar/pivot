@@ -447,8 +447,14 @@ def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str 
         return None  # Includes ELOOP for circular symlinks
 
 
-def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
-    """Atomically copy file to cache with read-only permissions."""
+def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bool = False) -> None:
+    """Atomically copy file to cache with read-only permissions.
+
+    ``executable`` records the source's executable bit on the cache object itself (0o555
+    instead of 0o444): a HARDLINK or SYMLINK checkout has no mode of its own, so it reads
+    straight through to whatever mode the cache object carries, and only COPY checkout
+    re-chmods afterwards (see ``_stage_checkout``).
+    """
     if cache_path.exists():
         return
 
@@ -458,7 +464,7 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path) -> None:
     try:
         os.close(fd)
         shutil.copy2(src, tmp_path)
-        os.chmod(tmp_path, 0o444)
+        os.chmod(tmp_path, 0o555 if executable else 0o444)
         tmp.replace(cache_path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -716,7 +722,7 @@ def _store_directory(
     for entry in manifest:
         file_path = path / entry["relpath"]
         cache_path = get_cache_path(cache_dir, entry["hash"])
-        copy_to_cache(file_path, cache_path)
+        copy_to_cache(file_path, cache_path, executable=entry["isexec"])
 
     with restore_lock(path, state_dir):
         if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
@@ -725,10 +731,13 @@ def _store_directory(
             if not cache_dir_path.exists():
                 cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(path, cache_dir_path)
+                isexec_by_relpath = {entry["relpath"]: entry["isexec"] for entry in manifest}
                 for f in cache_dir_path.rglob("*"):
                     # Skip symlinks to avoid changing permissions on target files outside cache
                     if f.is_file() and not f.is_symlink():
-                        os.chmod(f, 0o444)
+                        relpath = str(f.relative_to(cache_dir_path))
+                        executable = isexec_by_relpath.get(relpath, False)
+                        os.chmod(f, 0o555 if executable else 0o444)
                 os.chmod(cache_dir_path, 0o555)
 
             _clear_path(path)

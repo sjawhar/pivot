@@ -165,7 +165,7 @@ def _track_single_path(
             file_path = path / entry["relpath"]
             file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
             if not file_cache_path.exists():
-                cache.copy_to_cache(file_path, file_cache_path)
+                cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
 
         pvt_data: track_mod.PvtData = {
             "path": path.name,
