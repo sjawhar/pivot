@@ -230,7 +230,8 @@ class CacheModeCollisionError(CacheError):
             ".pivot/config.yaml) so checkout can fall back to a private, correctly-permissioned "
             "copy instead of sharing the cache object's own permissions; or, if you have the "
             "source bytes in hand, re-running what produced them (`pivot repro --force "
-            "<stage>`, `pivot track --force`) republishes the cache object with the right bit"
+            "<stage>`, `pivot track --force <path>`) republishes the cache object with the "
+            "right bit"
         )
 
 
