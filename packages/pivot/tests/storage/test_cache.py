@@ -2821,6 +2821,59 @@ def test_save_to_cache_symlink_repairs_legacy_tree_empty_dirs(tmp_path: pathlib.
     assert cache.hash_directory(second, cache_dir=cache_dir) == output_hash
 
 
+def _helper_tree_listing(root: pathlib.Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+def test_symlink_tree_leaves_out_user_symlinks(tmp_path: pathlib.Path) -> None:
+    """A whole-directory SYMLINK cache tree holds what the hash records: a user symlink, which
+    is not stored, does not come back as a copy of its target, and a directory holding only
+    one comes back empty, as it does from a file-by-file restore."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "big.bin").write_text("big")
+    output = tmp_path / "out"
+    (output / "links").mkdir(parents=True)
+    (output / "keep.txt").write_text("keep")
+    (output / "link.txt").symlink_to(output / "keep.txt")
+    (output / "links" / "elsewhere").symlink_to(elsewhere)
+
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert _helper_tree_listing(output) == ["keep.txt", "links"]
+    assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+
+
+def test_restore_from_cache_repairs_legacy_symlink_tree_unlisted_files(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An older pivot copied a user symlink's target into the SYMLINK cache tree; restoring
+    through that tree removes what the hash does not record."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    tree_path.chmod(0o755)
+    (tree_path / "link.txt").write_text("keep")
+    (tree_path / "link.txt").chmod(0o444)
+    (tree_path / "linked").mkdir()
+    (tree_path / "linked" / "big.bin").write_text("big")
+    tree_path.chmod(0o555)
+
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert _helper_tree_listing(output) == ["keep.txt"]
+    assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+
+
 def test_restore_missing_in_directory_recreates_missing_empty_dir(tmp_path: pathlib.Path) -> None:
     cache_dir = tmp_path / "cache"
     output = tmp_path / "out"

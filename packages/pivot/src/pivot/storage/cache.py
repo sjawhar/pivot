@@ -633,41 +633,56 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
             os.chmod(f, 0o555)
 
 
-def _repair_tree_dir_empty_dirs(cache_dir_path: pathlib.Path, output_hash: DirHash) -> None:
-    """Give a whole-directory SYMLINK cache tree exactly the directories ``output_hash`` records.
+def _repair_tree_dir_layout(cache_dir_path: pathlib.Path, output_hash: DirHash) -> None:
+    """Give a whole-directory SYMLINK cache tree exactly the files and directories
+    ``output_hash`` records.
 
-    A tree an older pivot built holds every directory its source had, but its hash recorded no
-    empty one, so the tree can hold directories that a restore through it must not produce.
+    A tree an older pivot built can hold entries its hash does not record: directories its hash
+    left out because they were empty, and copies of the targets of symlinks its hash left out.
     The tree's name never changes, so neither _store_directory's ``not cache_dir_path.exists()``
-    branch nor the symlink_fast_path restore would otherwise revisit it. A directory the hash
-    does not record is removed when it is empty; one holding files the manifest does not list
-    is left as it is. Changing the tree in place is safe for the reason
-    ``_repair_tree_dir_isexec`` gives.
+    branch nor the symlink_fast_path restore would otherwise revisit it, and an output restored
+    through it would not hash to the hash it was restored for. Changing the tree in place is
+    safe for the reason ``_repair_tree_dir_isexec`` gives.
     """
-    _, found = _scan_entries(cache_dir_path)
+    found_files, found = _scan_entries(cache_dir_path)
     found_dirs = set(found)
-    extra = found_dirs - _restored_dirs(output_hash)
+    unlisted = set(found_files) - {entry["relpath"] for entry in output_hash["manifest"]}
+    extra_dirs = found_dirs - _restored_dirs(output_hash)
     missing = [
         _empty_dir_path(cache_dir_path, relpath)
         for relpath in _recorded_empty_dirs(output_hash)
         if relpath not in found_dirs
     ]
-    if not extra and not missing:
+    if not unlisted and not extra_dirs and not missing:
         return
-    tree_mode = cache_dir_path.stat().st_mode
-    os.chmod(cache_dir_path, tree_mode | stat.S_IWUSR)
+    modes = dict[pathlib.Path, int]()
+
+    def _make_writable(directory: pathlib.Path) -> None:
+        if directory not in modes:
+            modes[directory] = directory.stat().st_mode
+            os.chmod(directory, modes[directory] | stat.S_IWUSR)
+
     try:
+        for relpath in unlisted:
+            target = cache_dir_path / relpath
+            _make_writable(target.parent)
+            target.unlink(missing_ok=True)
         # Reverse order reaches a directory's children before the directory itself.
-        for relpath in sorted(extra, reverse=True):
-            try:
-                (cache_dir_path / relpath).rmdir()
-            except OSError as e:
-                if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-                    raise
+        for relpath in sorted(extra_dirs, reverse=True):
+            target = cache_dir_path / relpath
+            _make_writable(target.parent)
+            modes.pop(target, None)
+            with contextlib.suppress(FileNotFoundError):  # a concurrent repair got there first
+                target.rmdir()
         for target in missing:
+            existing = target.parent
+            while not existing.exists():
+                existing = existing.parent
+            _make_writable(existing)
             target.mkdir(parents=True, exist_ok=True)
     finally:
-        os.chmod(cache_dir_path, tree_mode)
+        for directory, mode in modes.items():
+            os.chmod(directory, mode)
 
 
 def _checkout_with_fallback(
@@ -891,7 +906,17 @@ def _store_directory(
             cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
             if not cache_dir_path.exists():
                 cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(path, cache_dir_path)
+
+                def _user_symlinks(directory: str, names: list[str]) -> list[str]:
+                    # Not stored (see _scandir_recursive); copytree would copy each target.
+                    return [
+                        name
+                        for name in names
+                        if (link := pathlib.Path(directory, name)).is_symlink()
+                        and _cache_object_key(link, cache_dir) is None
+                    ]
+
+                shutil.copytree(path, cache_dir_path, ignore=_user_symlinks)
                 isexec_by_relpath = {entry["relpath"]: entry["isexec"] for entry in manifest}
                 for f in cache_dir_path.rglob("*"):
                     # Skip symlinks to avoid changing permissions on target files outside cache
@@ -901,11 +926,11 @@ def _store_directory(
                         os.chmod(f, 0o555 if executable else 0o444)
                 os.chmod(cache_dir_path, 0o555)
 
-            # A tree an older pivot built keeps its 0o444-everywhere files, and directories its
-            # hash does not record, forever otherwise: its name never changes, so this branch
-            # never revisits an existing tree directory above.
+            # A tree an older pivot built keeps its 0o444-everywhere files, and entries its hash
+            # does not record, forever otherwise: its name never changes, so this branch never
+            # revisits an existing tree directory above.
             _repair_tree_dir_isexec(cache_dir_path, manifest)
-            _repair_tree_dir_empty_dirs(cache_dir_path, output_hash)
+            _repair_tree_dir_layout(cache_dir_path, output_hash)
 
             _clear_path(path)
             path.symlink_to(cache_dir_path.resolve())
@@ -1079,10 +1104,10 @@ def _restore_directory_from_cache(
 
     if symlink_fast_path:
         # Same repairs as _store_directory: a tree an older pivot built keeps its
-        # 0o444-everywhere files, and directories its hash does not record, forever otherwise,
+        # 0o444-everywhere files, and entries its hash does not record, forever otherwise,
         # since this path never rebuilds an existing tree directory.
         _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
-        _repair_tree_dir_empty_dirs(cache_dir_path, output_hash)
+        _repair_tree_dir_layout(cache_dir_path, output_hash)
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             temp_symlink.symlink_to(cache_dir_path.resolve())
