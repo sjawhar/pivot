@@ -611,10 +611,11 @@ def _staging_in(prefix_dir: pathlib.Path) -> Generator[None]:
 
     The exclusive lock is only tried, never waited for; a lock the filesystem refuses (NFS on a
     read-only file, or a filesystem that refuses flock() outright) only skips the sweep. Where
-    flock() is refused outright the shared lock is skipped too: nothing there can take the
-    exclusive lock to sweep (storage/AGENTS.md). The kernel drops a killed process's lock with its
-    file descriptors. Converting the exclusive lock to shared may release it first; this process
-    has made no temporary entry yet.
+    flock() is refused outright the shared lock is skipped too, so this process's temporary
+    entries are protected only from processes that are refused as well; a host whose locks do
+    work can still sweep them (storage/AGENTS.md).
+    The kernel drops a killed process's lock with its file descriptors. Converting the exclusive
+    lock to shared may release it first; this process has made no temporary entry yet.
     """
     fd = _open_cache_lock(prefix_dir / _PREFIX_LOCK)
     try:

@@ -3156,11 +3156,11 @@ def test_sweep_removes_an_older_pivots_temporary_files_once_untouched_for_an_hou
 
 
 def test_sweep_skips_an_older_pivots_temporary_file_that_vanishes(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """An older pivot sharing the cache renames its temporary file into place whenever its copy
     is done, so the file can vanish between the sweep listing it and looking at it; the sweep
-    moves on and the copy is published."""
+    moves on without asking anyone to remove it, and the copy is published."""
     src = tmp_path / "out.txt"
     src.write_text("content")
     prefix = tmp_path / "cache" / "ab"
@@ -3181,10 +3181,12 @@ def test_sweep_skips_an_older_pivots_temporary_file_that_vanishes(
 
     monkeypatch.setattr(os, "scandir", _list_then_rename_away)
 
-    cache.copy_to_cache(src, prefix / "00000000000001")
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        cache.copy_to_cache(src, prefix / "00000000000001")
 
     assert renamed == [True], "the sweep listed the directory"
     assert _helper_entries(prefix) == ["00000000000001", "0000000000000f"]
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 @pytest.mark.parametrize("flock_errno", [errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP])

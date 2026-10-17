@@ -90,9 +90,13 @@ When multiple `pivot` processes share the same StateDB:
   NLM). With host-local locks (NFS `nolock` or `local_lock=flock`/`all`, Lustre `localflock`)
   the locks here exclude nothing across hosts: one host's sweep can remove another host's live
   temporary entry, and two hosts can repair one tree at once. A publisher checks its tree before
-  marking it, so a copy that lost files is not marked. On a filesystem that refuses `flock()`
-  (Lustre without `flock`: ENOSYS; NFS when its lock manager does not answer: ENOLCK) nothing
-  sweeps and nothing repairs a tree, and staging goes on without the shared lock.
+  marking it, which narrows the window for marking a copy that lost files without closing it: a
+  sweep already deleting through the copy's directory descriptors keeps deleting after the
+  rename. Where `flock()` is refused (Lustre without `flock`: ENOSYS; NFS when its lock manager
+  does not answer: ENOLCK) staging goes on without the shared lock, and this process neither
+  sweeps nor repairs a tree. Only where every host sharing the cache is refused does nothing
+  sweep: an NFSv3 client whose own `rpc.statd` is down gets ENOLCK while other clients' locks
+  work, and their sweeps can remove its live temporary entries, with the effects above.
 - A lock file in the cache is created writable by whoever can write its directory, since NFS
   takes an exclusive lock only on a file opened for writing; one this user cannot write is
   opened read-only. Lock files are never deleted.
