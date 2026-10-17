@@ -75,11 +75,18 @@ When multiple `pivot` processes share the same StateDB:
   went missing; a symlink checkout reads its executable bit through the name. A directory
   entry whose executable bit the object does not carry is checked out as a copy.
 - On a filesystem without hard links, `publish_cache_object` renames, and only when no object is
-  there yet. Nothing there can hardlink an object.
-- A whole-directory SYMLINK tree is built under a temporary name beside its cache name, tagged
-  with the host and pid, and renamed into place, because a restore symlinks to a tree as soon
-  as its name exists. Each tree publish removes the temporary trees that this host's killed
-  publishers left in the same prefix directory.
+  there yet. Nothing there can hardlink an object, but the check and the rename are two steps:
+  two writers that both find the name free both rename, the later object wins, and a symlink
+  checkout reads the later object's mode.
+- A whole-directory SYMLINK tree is built under a `.pivot_tree_*` temporary name beside its cache
+  name and renamed into place, because a restore symlinks to a tree as soon as its name exists.
+  Each publisher holds a shared `flock` on its prefix directory's `.pivot_trees.lock` while its
+  temporary tree exists; a publisher that gets the exclusive lock first removes every temporary
+  tree there, since none has a live owner. Never judge a temporary entry abandoned by host and
+  pid: a process in another PID namespace, or on another host sharing the cache, looks dead.
+- The tree publisher marks a tree complete (`<tree>.layout-checked`). A restore or commit checks
+  an unmarked tree once, repairs its layout and every missing or wrong-size file from the file's
+  own cache object, then marks it; a tree missing a file whose object is absent restores nothing.
 
 ## Path Storage
 

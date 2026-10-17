@@ -52,7 +52,9 @@ def _helper_assert_no_temp_dirs(
 if TYPE_CHECKING:
     from collections.abc import Generator
     from multiprocessing.managers import SyncManager
-    from threading import Barrier
+    from threading import Barrier, Event
+
+    from pivot.types import DirManifestEntry
 
 
 @pytest.fixture
@@ -2681,7 +2683,7 @@ def test_symlink_tree_keeps_a_tree_another_writer_published_first(
     assert (second / "sub" / "f.txt").read_text() == "same"
     assert os.access(second / "run.sh", os.X_OK)
     assert sorted(p.name for p in tree.parent.iterdir()) == sorted(
-        [tree.name, cache._tree_layout_marker(tree).name]
+        [tree.name, cache._tree_layout_marker(tree).name, cache._TREE_PUBLISH_LOCK]
     ), "no temporary tree left"
 
 
@@ -2738,41 +2740,132 @@ def test_symlink_tree_publish_removes_a_killed_publishers_copy(tmp_path: pathlib
 
     assert process.exitcode == 73
     assert not tree.exists()
-    assert len(list(tree.parent.iterdir())) == 1, "the killed publisher's copy"
+    left = [p.name for p in tree.parent.iterdir() if p.name != cache._TREE_PUBLISH_LOCK]
+    assert len(left) == 1 and left[0].startswith(cache._TREE_TEMP_PREFIX), "the killed copy"
 
     cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
 
     assert out.resolve() == tree.resolve()
     assert sorted(p.name for p in tree.parent.iterdir()) == sorted(
-        [tree.name, cache._tree_layout_marker(tree).name]
+        [tree.name, cache._tree_layout_marker(tree).name, cache._TREE_PUBLISH_LOCK]
     )
 
 
-def test_symlink_tree_publish_keeps_copies_it_cannot_prove_abandoned(
+def _helper_publish_tree_unseen(
+    src: pathlib.Path,
+    tree: pathlib.Path,
+    manifest: list[DirManifestEntry],
+    cache_dir: pathlib.Path,
+    unseen_pid: int,
+    copied: Event,
+    release: Event,
+) -> None:
+    """Publish ``tree`` as a process the caller cannot see: one whose PID, from the caller's PID
+    namespace or host, belongs to no running process. It pauses once its copy is complete,
+    before renaming it into place, until ``release`` is set."""
+    os.getpid = lambda: unseen_pid
+    real_copytree = shutil.copytree
+
+    def _copy_then_pause(source: str, dest: str, *args: Any, **kwargs: Any) -> object:
+        result = real_copytree(source, dest, *args, **kwargs)
+        if pathlib.Path(source) == src:
+            copied.set()
+            assert release.wait(60)
+        return result
+
+    shutil.copytree = _copy_then_pause
+    cache._publish_tree(src, tree, manifest, cache_dir)
+
+
+def test_symlink_tree_publish_keeps_a_live_publishers_copy_it_cannot_see(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A copy whose publisher is still running, or that a publisher on another host sharing the
-    cache made, is left alone."""
+    """A publisher in another PID namespace (a bwrap or `unshare --pid` sandbox), or on another
+    host sharing the cache, has a PID this process sees as dead. Another tree published into the
+    same prefix directory meanwhile leaves its copy alone, and its tree is published whole."""
     cache_dir = tmp_path / "cache"
-    out, _ = _helper_same_tree_twice(tmp_path)
-    tree = cache.get_cache_path(cache_dir, cache.hash_directory(out)["hash"])
-    exited = multiprocessing.get_context("spawn").Process(target=int)
+    prefix = cache_dir / "ab"
+    prefix.mkdir(parents=True)
+    src = tmp_path / "theirs"
+    for i in range(200):
+        (src / f"d{i % 10}").mkdir(parents=True, exist_ok=True)
+        (src / f"d{i % 10}" / f"f{i}.txt").write_text(f"{i}\n")
+    theirs = cache.hash_directory(src)
+    ours_src, _ = _helper_same_tree_twice(tmp_path)
+    ours = cache.hash_directory(ours_src)
+    ctx = multiprocessing.get_context("spawn")
+    exited = ctx.Process(target=int)
     exited.start()
     exited.join(timeout=60)
-    host = cache._host_tag()
-    other_host = "0" * 8 if host != "0" * 8 else "f" * 8
-    tree.parent.mkdir(parents=True)
-    running = tree.parent / f"{cache._TREE_TEMP_PREFIX}{host}_{os.getpid()}_abc"
-    elsewhere = tree.parent / f"{cache._TREE_TEMP_PREFIX}{other_host}_{exited.pid}_abc"
-    abandoned = tree.parent / f"{cache._TREE_TEMP_PREFIX}{host}_{exited.pid}_abc"
-    for copy in (running, elsewhere, abandoned):
-        copy.mkdir()
+    with ctx.Manager() as manager:
+        copied, release = manager.Event(), manager.Event()
+        publisher = ctx.Process(
+            target=_helper_publish_tree_unseen,
+            args=(src, prefix / "cdef0123456789", theirs["manifest"], cache_dir, exited.pid)
+            + (copied, release),
+        )
+        publisher.start()
+        assert copied.wait(60)
+        cache._publish_tree(ours_src, prefix / "99990123456789", ours["manifest"], cache_dir)
+        release.set()
+        publisher.join(timeout=60)
 
-    cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+    assert publisher.exitcode == 0
+    assert cache.hash_directory(prefix / "cdef0123456789") == theirs
+    assert cache.hash_directory(prefix / "99990123456789") == ours
+    assert not [p for p in prefix.iterdir() if p.name.startswith(cache._TREE_TEMP_PREFIX)]
 
-    assert running.is_dir()
-    assert elsewhere.is_dir()
-    assert not abandoned.exists()
+
+def _helper_tree_with_files_missing(
+    tmp_path: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, DirHash]:
+    """A SYMLINK cache tree as an older pivot left it when killed while copying it straight to its
+    cache name: one file missing, one cut short, no layout marker. Its file objects are cached."""
+    cache_dir = tmp_path / "cache"
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (out / name).write_text(f"{name} " * 100)
+    output_hash = cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(output_hash)
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    tree.mkdir(parents=True)
+    (tree / "a.txt").write_text("a.txt " * 100)
+    (tree / "b.txt").write_text("b.txt ")
+    shutil.rmtree(out)
+    return cache_dir, tree, output_hash
+
+
+def test_symlink_restore_repairs_a_tree_left_with_files_missing(tmp_path: pathlib.Path) -> None:
+    """A tree whose name exists but which lacks files is not trusted: the restore repairs it from
+    the file objects, so the output hashes to the hash it was restored for."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert out.resolve() == tree.resolve()
+    assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert (tree / "c.txt").stat().st_mode & 0o777 == 0o444
+    assert cache._tree_layout_marker(tree).exists()
+
+
+def test_symlink_restore_refuses_a_tree_it_cannot_repair(tmp_path: pathlib.Path) -> None:
+    """With a missing file's object gone too, the tree can restore nothing; the restore reports a
+    cache miss instead of symlinking to it."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    c_hash = next(e["hash"] for e in output_hash["manifest"] if e["relpath"] == "c.txt")
+    cache.get_cache_path(cache_dir, c_hash).unlink()
+    out = tmp_path / "out"
+
+    assert not cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert not out.exists()
+    assert not cache._tree_layout_marker(tree).exists()
 
 
 # === _make_writable_and_retry Tests ===
