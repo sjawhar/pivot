@@ -2948,7 +2948,7 @@ def test_restore_missing_in_directory_replaces_directory_holding_extra_empty_dir
     replaced whole to reach the target."""
     cache_dir = tmp_path / "cache"
     output = tmp_path / "out"
-    output.mkdir()
+    (output / "recorded").mkdir(parents=True)
     (output / "keep.txt").write_text("keep")
     output_hash = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
     assert is_dir_hash(output_hash)
@@ -2961,3 +2961,50 @@ def test_restore_missing_in_directory_replaces_directory_holding_extra_empty_dir
     assert outcome == cache.MissingRestore(
         restored=0, unavailable=0, local_changes=[], replace=True
     )
+
+
+def test_restore_missing_in_directory_keeps_empty_dirs_a_0_3_3_hash_does_not_list(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hash pivot 0.3.3 recorded lists no empty directories, so one on disk is not extra:
+    the directory is left as it is rather than replaced, which would drop it."""
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "out"
+    (output / "cls" / "src").mkdir(parents=True)
+    (output / "keep.txt").write_text("keep")
+    saved = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(saved)
+    legacy = DirHash(hash=saved["hash"], manifest=saved["manifest"])
+
+    outcome = cache.restore_missing_in_directory(
+        output, legacy, cache_dir, [cache.CheckoutMode.COPY]
+    )
+
+    assert outcome == cache.MissingRestore(
+        restored=0, unavailable=0, local_changes=[], replace=False
+    )
+    assert (output / "cls" / "src").is_dir()
+
+
+def test_symlink_restore_succeeds_when_layout_marker_cannot_be_written(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The layout marker only saves a walk: a cache directory the restoring user cannot write
+    (another user's cache, a read-only mount) still restores, as it did before the marker."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    cache._tree_layout_marker(tree_path).unlink()
+    shard = tree_path.parent
+    shard.chmod(0o555)
+    try:
+        cache.remove_output(output)
+        assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+    finally:
+        shard.chmod(0o755)
+
+    assert (output / "keep.txt").read_text() == "keep"

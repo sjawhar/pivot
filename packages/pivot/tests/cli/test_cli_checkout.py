@@ -407,6 +407,49 @@ def test_checkout_skips_untouched_tracked_directory_recorded_by_0_3_3(
 
 
 @pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_checkout_only_missing_keeps_empty_dirs_of_directory_tracked_by_0_3_3(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """`--only-missing` (and so a plain `pivot pull`) skips an untouched directory 0.3.3
+    tracked, keeping its empty directories for a later `pivot track --force` to record."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+        data_dir = pathlib.Path("tracked")
+        (data_dir / "slot").mkdir(parents=True)
+        (data_dir / "cls" / "src").mkdir(parents=True)
+        (data_dir / "k.txt").write_text("k")
+        result = runner.invoke(cli.cli, ["track", "tracked"])
+        assert result.exit_code == 0, result.output
+        pvt_path = track.get_pvt_path(data_dir)
+        pvt_data = track.read_pvt_file(pvt_path)
+        assert pvt_data is not None
+        assert "manifest" in pvt_data
+        track.write_pvt_file(
+            pvt_path,
+            track.PvtData(
+                path=pvt_data["path"],
+                hash=_helper_legacy_dir_hash(pvt_data["manifest"]),
+                size=pvt_data["size"],
+                manifest=pvt_data["manifest"],
+            ),
+        )
+
+        result = runner.invoke(
+            cli.cli, ["checkout", "--only-missing", "--checkout-mode", mode, "tracked"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _helper_dir_set(data_dir) == {"cls", "cls/src", "slot"}
+        assert not (data_dir / "k.txt").is_symlink()
+        result = runner.invoke(cli.cli, ["track", "--force", "tracked"])
+        assert result.exit_code == 0, result.output
+        retracked = track.read_pvt_file(pvt_path)
+        assert retracked is not None
+        assert "empty_dirs" in retracked
+        assert retracked["empty_dirs"] == ["cls/src", "slot"]
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
 def test_checkout_skips_untouched_directory_output_recorded_by_0_3_3(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
 ) -> None:

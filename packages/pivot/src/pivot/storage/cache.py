@@ -658,7 +658,9 @@ def _ensure_tree_dir_layout(cache_dir_path: pathlib.Path, output_hash: DirHash) 
     if marker.exists():
         return
     _repair_tree_dir_layout(cache_dir_path, output_hash)
-    marker.touch()
+    # The marker only saves a walk; a cache the restoring user cannot write still restores.
+    with contextlib.suppress(OSError):
+        marker.touch()
 
 
 def _repair_tree_dir_layout(cache_dir_path: pathlib.Path, output_hash: DirHash) -> None:
@@ -953,7 +955,8 @@ def _store_directory(
                         executable = isexec_by_relpath.get(relpath, False)
                         os.chmod(f, 0o555 if executable else 0o444)
                 os.chmod(cache_dir_path, 0o555)
-                _tree_layout_marker(cache_dir_path).touch()
+                with contextlib.suppress(OSError):
+                    _tree_layout_marker(cache_dir_path).touch()
 
             # A tree an older pivot built keeps its 0o444-everywhere files, and entries its hash
             # does not record, forever otherwise: its name never changes, so this branch never
@@ -1360,7 +1363,10 @@ def restore_missing_in_directory(
             changed[relpath] = _get_symlink_cache_hash(extra_path, cache_dir)
         else:
             changed[relpath], _ = hash_file(extra_path, state_db)
-    extra_dirs = set(dirs) - _restored_dirs(output_hash)
+    # A hash pivot 0.3.3 recorded lists no empty directories, so on disk none of them is extra.
+    extra_dirs = (
+        set(dirs) - _restored_dirs(output_hash) if "empty_dirs" in output_hash else set[str]()
+    )
 
     if changed or extra_dirs:
         # Replacing the directory deletes every file it holds; refuse if any is not cached.
