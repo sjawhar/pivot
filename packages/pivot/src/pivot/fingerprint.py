@@ -7,6 +7,7 @@ import enum
 import functools
 import inspect
 import json
+import linecache
 import logging
 import marshal
 import os
@@ -62,7 +63,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 25 records call-site artifact wiring (parameter bindings, collection kind/order,
 # and project-relative input paths) in the code manifest.
 # Version 26 records tuples and frozensets of scalars and compiled regexes by value.
-_CACHE_SCHEMA_VERSION = 26
+# Version 27 keys cached function hashes and manifest source files by each file's content, not
+# its mtime, size and inode, which an edit can keep.
+_CACHE_SCHEMA_VERSION = 27
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -70,8 +73,8 @@ _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
 # Type alias for AST hash cache entry tuple.
-# Format: (rel_path, mtime_ns, size, inode, qualname, py_version, schema_version, hash_hex)
-type AstHashEntry = tuple[str, int, int, int, str, str, int, str]
+# Format: (rel_path, source_digest, qualname, py_version, schema_version, hash_hex)
+type AstHashEntry = tuple[str, str, str, str, int, str]
 
 
 class _PydanticModelProtocol(Protocol):
@@ -144,8 +147,8 @@ _pending_manifest_writes: list[tuple[bytes, bytes]] = []
 
 
 # Source files visited during a single stage's fingerprinting.
-# Maps rel_path -> (mtime_ns, size, ino). Set by _collecting_sources().
-_active_source_map: dict[str, tuple[int, int, int]] | None = None
+# Maps rel_path -> content digest (`_source_digest`). Set by _collecting_sources().
+_active_source_map: dict[str, str] | None = None
 
 # Stage name used for error reporting during fingerprinting.
 _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -178,20 +181,24 @@ _walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 # under it, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep apart.
 _owner_ref: contextvars.ContextVar[str | None] = contextvars.ContextVar("_owner_ref", default=None)
 
-# Per-pass memo for `function_identity` and `_hint_classes`, keyed by kind and object id.
-# Set only inside `fingerprint_pass()`; a reload or a mutated cell is seen by the next pass.
-_pass_memo: contextvars.ContextVar[dict[tuple[str, int], Any] | None] = contextvars.ContextVar(
-    "_pass_memo", default=None
+# Per-pass memo for `function_identity` and `_hint_classes`, keyed by kind and object id, and
+# for source file digests (`_source_digest`), keyed by file name.
+# Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
+# pass.
+_pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
+    contextvars.ContextVar("_pass_memo", default=None)
 )
 
 
 @contextlib.contextmanager
 def fingerprint_pass() -> Iterator[None]:
-    """Share function identities and type-hint classes across one pass over many stages.
+    """Share function identities, type-hint classes and source digests across one pass over
+    many stages.
 
     A cache hit re-reads every recorded value, and stages of one pipeline read the same
-    helpers and model classes: inside the pass each is named once. The memo holds strong
-    references, so an id is never reused within the pass, and it ends with the pass.
+    helpers, model classes and source files: inside the pass each is named or read once. The
+    memo holds strong references, so an id is never reused within the pass, and it ends with
+    the pass.
     """
     if _pass_memo.get() is not None:
         yield
@@ -383,8 +390,32 @@ def _portable_path(filename: str, root: pathlib.Path | None) -> str:
     return filename
 
 
-def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int] | None:
-    """Get (rel_path, mtime_ns, size, inode) for function source file.
+def _source_digest(file: str) -> str:
+    """Digest of source file ``file``'s content, which the function-hash and manifest caches
+    record for it.
+
+    An edit can keep a file's mtime, size and inode (two writes inside one kernel timestamp
+    tick, or a tool that restores the mtime), so the caches compare content. Within one
+    `fingerprint_pass()` each file is read once. The read also drops the lines `linecache`
+    holds for ``file``, which `inspect.getsource` checks only by that mtime and size, so a
+    function hash computed from them is of the content it is cached under.
+
+    Raises OSError when the file cannot be read.
+    """
+    memo = _pass_memo.get()
+    key = ("source", file)
+    if memo is not None and key in memo:
+        return cast("str", memo[key])
+    with open(file, "rb") as source:
+        digest = xxhash.xxh64(source.read()).hexdigest()
+    linecache.cache.pop(file, None)
+    if memo is not None:
+        memo[key] = digest
+    return digest
+
+
+def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, str] | None:
+    """Get (rel_path, content digest) for function source file.
 
     Returns None if source info unavailable (builtins, exec'd code, outside project).
     """
@@ -393,21 +424,22 @@ def _get_func_source_info(func: Callable[..., Any]) -> tuple[str, int, int, int]
         if file is None:
             return None
         path = pathlib.Path(file).resolve()
-        stat = path.stat()
+        if not path.is_file():
+            return None  # exec'd code ("<string>") or a deleted file
         from pivot import project
 
         project_root = project.get_project_root()
         rel_path = str(path.relative_to(project_root))
-        return (rel_path, stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        return (rel_path, _source_digest(file))
     except (TypeError, OSError, ValueError):
         # TypeError: builtins, exec'd
-        # OSError: file doesn't exist
+        # OSError: file unreadable
         # ValueError: path outside project root
         return None
 
 
 @contextlib.contextmanager
-def _collecting_sources() -> Iterator[dict[str, tuple[int, int, int]]]:
+def _collecting_sources() -> Iterator[dict[str, str]]:
     """Scope a source map for the duration of a fingerprint walk.
 
     Saves and restores any previously active source map, so nested calls
@@ -415,7 +447,7 @@ def _collecting_sources() -> Iterator[dict[str, tuple[int, int, int]]]:
     """
     global _active_source_map
     previous = _active_source_map
-    source_map = dict[str, tuple[int, int, int]]()
+    source_map = dict[str, str]()
     _active_source_map = source_map
     try:
         yield source_map
@@ -466,7 +498,7 @@ def _project_module_files(project_root: pathlib.Path) -> list[tuple[str, pathlib
     return files
 
 
-def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None:
+def _record_project_modules(source_map: dict[str, str]) -> None:
     """Add the file of every loaded project module to a manifest's source map.
 
     A manifest records values bound in module namespaces, and import-time code in any project
@@ -477,11 +509,12 @@ def _record_project_modules(source_map: dict[str, tuple[int, int, int]]) -> None
     from pivot import project
 
     for rel_path, path in _project_module_files(project.get_project_root()):
+        if rel_path in source_map:
+            continue
         try:
-            stat = path.stat()
+            source_map[rel_path] = _source_digest(str(path))
         except OSError:
             continue
-        source_map.setdefault(rel_path, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
 
 
 def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[str, str] | None:
@@ -522,9 +555,9 @@ def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[s
     ):
         return None
 
-    # Narrow types after validation: manifest is {str: str}, sources is {str: [int, int, int]}
+    # Narrow types after validation: manifest is {str: str}, sources is {str: digest}
     manifest = cast("dict[str, str]", manifest_raw)
-    sources = cast("dict[str, list[int]]", sources_raw)
+    sources = cast("dict[str, object]", sources_raw)
 
     # If no source files were tracked, we have nothing to validate against.
     # This happens for stages with only builtins/exec'd code. Force recompute
@@ -532,22 +565,21 @@ def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[s
     if not sources:
         return None
 
-    # Stat-check every source file
+    # Check every source file's content
     from pivot import project
 
     project_root = project.get_project_root()
-    for rel_path, stats in sources.items():
-        if len(stats) != 3:
+    for rel_path, cached_digest in sources.items():
+        if not isinstance(cached_digest, str):
             return None  # Corrupted cache entry
-        cached_mtime, cached_size, cached_ino = stats
         # Guard against path traversal from corrupted/malicious cache entries
         if rel_path.startswith("/") or ".." in pathlib.Path(rel_path).parts:
             return None
         try:
-            st = (project_root / rel_path).stat()
+            digest = _source_digest(str(project_root / rel_path))
         except OSError:
             return None  # File deleted or inaccessible
-        if st.st_mtime_ns != cached_mtime or st.st_size != cached_size or st.st_ino != cached_ino:
+        if digest != cached_digest:
             return None  # File changed
 
     if not _recorded_reads_hold(func, cast("list[object]", reads_raw)):
@@ -835,7 +867,7 @@ def _manifest_references_paths(raw: bytes, changed_paths: set[str]) -> bool:
     sources_raw: object = typed_data.get("s")
     if not isinstance(sources_raw, dict):
         return False
-    sources = cast("dict[str, list[int]]", sources_raw)
+    sources = cast("dict[str, object]", sources_raw)
     return any(source_path in changed_paths for source_path in sources)
 
 
@@ -986,7 +1018,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
             value = json.dumps(
                 {
                     "m": manifest,
-                    "s": {rel_path: list(stats) for rel_path, stats in source_map.items()},
+                    "s": source_map,
                     "r": [[list(path), read_token] for path, read_token in reads],
                 },
                 separators=(",", ":"),
@@ -2362,7 +2394,7 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     """Hash function AST (ignores whitespace, comments, docstrings).
 
     Uses persistent cache in StateDB when available, keyed by
-    (file_path, mtime_ns, size, inode, qualname, py_version, schema_version)
+    (file_path, source content digest, qualname, py_version, schema_version)
     for automatic invalidation on file changes or Python upgrades.
 
     Limitation: Lambdas and functions without source code fall back to id(func),
@@ -2373,9 +2405,8 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     if _active_source_map is not None:
         info = _get_func_source_info(func)
         if info is not None:
-            rel_path, mtime_ns, size, ino = info
-            if rel_path not in _active_source_map:
-                _active_source_map[rel_path] = (mtime_ns, size, ino)
+            rel_path, digest = info
+            _active_source_map.setdefault(rel_path, digest)
     _t = metrics.start()
     try:
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
@@ -2389,7 +2420,7 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
             return _compute_function_hash(func)
 
         # 2. Check persistent cache if appropriate
-        source_info: tuple[str, int, int, int] | None = None
+        source_info: tuple[str, str] | None = None
         qualname: str | None = None
 
         if not _should_skip_persistent_cache(func):
@@ -2398,16 +2429,10 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
                 qualname = _get_qualname_for_cache(func)
                 db = _get_state_db()
                 if db is not None:
-                    rel_path, mtime_ns, size, inode = source_info
+                    rel_path, digest = source_info
                     try:
                         persistent_cached = db.get_ast_hash(
-                            rel_path,
-                            mtime_ns,
-                            size,
-                            inode,
-                            qualname,
-                            _PYTHON_VERSION,
-                            _CACHE_SCHEMA_VERSION,
+                            rel_path, digest, qualname, _PYTHON_VERSION, _CACHE_SCHEMA_VERSION
                         )
                         if persistent_cached is not None:
                             metrics.count("fingerprint.hash_function_ast.persistent_cache_hit")
@@ -2426,18 +2451,9 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
 
         # 5. Queue persistent write (if source info available and not skipping)
         if source_info is not None and qualname is not None:
-            rel_path, mtime_ns, size, inode = source_info
+            rel_path, digest = source_info
             _pending_ast_writes.append(
-                (
-                    rel_path,
-                    mtime_ns,
-                    size,
-                    inode,
-                    qualname,
-                    _PYTHON_VERSION,
-                    _CACHE_SCHEMA_VERSION,
-                    result,
-                )
+                (rel_path, digest, qualname, _PYTHON_VERSION, _CACHE_SCHEMA_VERSION, result)
             )
             metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
 
