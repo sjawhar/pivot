@@ -183,8 +183,9 @@ class StageResult(TypedDict):
 #
 #   FileHash          Simple {hash: str} for individual files.
 #
-#   DirHash           Tree hash with manifest listing all files. The manifest
-#                     enables incremental sync (only transfer changed files).
+#   DirHash           Tree hash with manifest listing all files, plus the directory's
+#                     empty directories. The manifest enables incremental sync (only
+#                     transfer changed files).
 #
 #   HashInfo          Union type for hashes (files or directories).
 #
@@ -206,10 +207,17 @@ class DirManifestEntry(TypedDict):
 
 
 class DirHash(TypedDict):
-    """Hash info for a directory with full manifest."""
+    """Hash info for a directory with full manifest.
+
+    ``empty_dirs`` lists the directories that hold no stored file and no other directory, as
+    relpaths, sorted. Restoring the files recreates their parents and these recreate every
+    other directory, so a restored directory has exactly the directories the hashed one had.
+    The key is present only when the list is non-empty.
+    """
 
     hash: str
     manifest: list[DirManifestEntry]
+    empty_dirs: NotRequired[list[str]]
 
 
 HashInfo = FileHash | DirHash
@@ -339,6 +347,7 @@ class DepEntry(TypedDict):
     hash: str
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
+    empty_dirs: NotRequired[list[str]]
 
 
 class OutEntry(TypedDict):
@@ -349,6 +358,7 @@ class OutEntry(TypedDict):
     path: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
+    empty_dirs: NotRequired[list[str]]
 
 
 class StorageLockData(TypedDict):

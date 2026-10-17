@@ -11,7 +11,7 @@ from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.storage import cache, lock, track
 from pivot.storage import store as store_mod
-from pivot.types import DirHash, FileHash, HashInfo, RemoteStatus, TransferSummary, is_dir_hash
+from pivot.types import HashInfo, RemoteStatus, TransferSummary, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -175,9 +175,7 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
     if track_data is None:
         return None
 
-    if "manifest" in track_data:
-        return DirHash(hash=track_data["hash"], manifest=track_data["manifest"])
-    return FileHash(hash=track_data["hash"])
+    return track.pvt_to_hash_info(track_data)
 
 
 def _get_tracked_hashes(proj_root: pathlib.Path) -> set[str]:

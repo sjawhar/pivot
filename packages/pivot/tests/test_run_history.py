@@ -10,7 +10,7 @@ import pytest
 
 from pivot import run_history
 from pivot.storage import state
-from pivot.types import DeferredWrites, DepEntry, StageStatus
+from pivot.types import DeferredWrites, DepEntry, DirHash, StageStatus
 
 if TYPE_CHECKING:
     import pathlib
@@ -152,6 +152,27 @@ def test_serialize_deserialize_run_cache_entry() -> None:
     assert deserialized["run_id"] == entry["run_id"]
     assert len(deserialized["output_hashes"]) == 2
     assert deserialized["output_hashes"][0]["path"] == "model.pkl"
+
+
+@pytest.mark.parametrize(
+    "output_hash",
+    [
+        DirHash(hash="aaaaaaaaaaaaaaa0", manifest=[], empty_dirs=["bundle/classifier_source"]),
+        DirHash(hash="aaaaaaaaaaaaaaa1", manifest=[]),
+    ],
+    ids=["with-empty-dirs", "without-empty-dirs"],
+)
+def test_run_cache_entry_keeps_directory_empty_dirs(output_hash: DirHash) -> None:
+    """A run-cache restore rebuilds a directory output from its entry, so the entry carries
+    the output's empty directories; one without any carries no empty_dirs field."""
+    entry = run_history.RunCacheEntry(
+        run_id="20250110_143000_abc12345",
+        output_hashes=[run_history.output_hash_to_entry("data/out", output_hash)],
+    )
+
+    deserialized = run_history.deserialize_run_cache_entry(run_history.serialize_to_bytes(entry))
+
+    assert run_history.entry_to_output_hash(deserialized["output_hashes"][0]) == output_hash
 
 
 def test_deserialize_run_manifest_missing_keys() -> None:

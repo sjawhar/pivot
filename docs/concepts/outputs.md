@@ -128,6 +128,14 @@ under it counts, including names that code fingerprinting or watch mode may
 ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
 them changes the directory hash, and all of them return on restore.
 
+Empty directories are part of a directory artifact too: adding or removing one
+changes the directory hash, and every one comes back on restore, so a restored
+artifact holds the same directories as the one the stage built, in every
+checkout mode. A directory hash recorded by Pivot 0.3.3 or earlier does not
+list empty directories, so restoring from it still leaves them out; re-run the
+stage (`pivot repro --force <stage>`) or re-track the directory (`pivot track
+--force <path>`) to record them.
+
 A symlink inside a directory artifact is not stored: it is left out of the
 manifest and does not come back on restore. When a stage writes the artifact,
 or `pivot track` records it, Pivot logs one warning naming each symlink it

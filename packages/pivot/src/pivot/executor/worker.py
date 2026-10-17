@@ -39,7 +39,6 @@ from pivot.storage import artifact_lock, cache, lock, state
 from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
-    DirHash,
     FileHash,
     HashInfo,
     LockData,
@@ -631,8 +630,7 @@ def hash_output(
     ``cache_dir`` is the cache object root whose symlinks count as directory content.
     """
     if path.is_dir():
-        tree_hash, manifest = cache.hash_directory(path, state_db, cache_dir=cache_dir)
-        return DirHash(hash=tree_hash, manifest=manifest)
+        return cache.hash_directory(path, state_db, cache_dir=cache_dir)
     file_hash, _ = cache.hash_file(path, state_db)
     return FileHash(hash=file_hash)
 
@@ -1063,11 +1061,8 @@ def _hash_output_paths(
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if path.is_dir():
-            tree_hash, manifest = cache.hash_directory(
+            output_hashes[types.identity_key(ref.identity)] = cache.hash_directory(
                 path, state_db, cache_dir=cache_dir, warn_left_out_symlinks=True
-            )
-            output_hashes[types.identity_key(ref.identity)] = DirHash(
-                hash=tree_hash, manifest=manifest
             )
         else:
             file_hash, _ = cache.hash_file(path, state_db)
@@ -1290,8 +1285,7 @@ def hash_dependencies(
             path = pathlib.Path(normalized_path)
             try:
                 if path.is_dir():
-                    tree_hash, manifest = cache.hash_directory(path, state_db)
-                    hashes[dep] = DirHash(hash=tree_hash, manifest=manifest)
+                    hashes[dep] = cache.hash_directory(path, state_db)
                 else:
                     file_hash, fs_stat = cache.hash_file(path, state_db)
                     hashes[dep] = FileHash(hash=file_hash)

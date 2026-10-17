@@ -14,7 +14,7 @@ import pydantic
 
 from pivot import parameters, project, registry, skip, types
 from pivot.executor import worker
-from pivot.storage import lock, state
+from pivot.storage import lock, state, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactIdentity,
@@ -29,8 +29,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import pygtrie
-
-    from pivot.storage.track import PvtData
 
 OUTPUTS_MISSING_REASON = "Outputs missing from cache"
 """Reason for a stage whose lock is current but whose cacheable outputs are absent locally.
@@ -105,7 +103,7 @@ def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path |
 
 def _find_tracked_hash(
     dep: Path,
-    tracked_files: dict[str, PvtData],
+    tracked_files: dict[str, track.PvtData],
     tracked_trie: pygtrie.Trie[str],
 ) -> HashInfo | None:
     """Find hash for dep from tracked files data.
@@ -121,9 +119,7 @@ def _find_tracked_hash(
 
     # Exact match - use top-level hash
     if dep == tracked_path:
-        if "manifest" in pvt_data:
-            return {"hash": pvt_data["hash"], "manifest": pvt_data["manifest"]}
-        return {"hash": pvt_data["hash"]}
+        return track.pvt_to_hash_info(pvt_data)
 
     # Nested path - find in manifest
     if "manifest" not in pvt_data:
@@ -155,7 +151,7 @@ def get_stage_explanation(
     lock_data: LockData | None,
     force: bool = False,
     allow_missing: bool = False,
-    tracked_files: dict[str, PvtData] | None = None,
+    tracked_files: dict[str, track.PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
     producer_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
 ) -> StageExplanation:

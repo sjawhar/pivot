@@ -12,13 +12,13 @@ import yaml
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
-from pivot.types import DirHash, FileHash, HashInfo
+from pivot.types import HashInfo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from pivot.storage.track import PvtData
-    from pivot.types import OutEntry, StorageLockData
+    from pivot.types import StorageLockData
 
 logger = logging.getLogger(__name__)
 
@@ -114,13 +114,6 @@ def get_pvt_data_from_revision(pvt_rel_path: str, rev: str) -> PvtData | None:
     return _parse_pvt_data_from_bytes(content)
 
 
-def _out_entry_to_output_hash(entry: OutEntry) -> HashInfo:
-    """Convert OutEntry to HashInfo."""
-    if "manifest" in entry:
-        return DirHash(hash=entry["hash"], manifest=entry["manifest"])
-    return FileHash(hash=entry["hash"])
-
-
 def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
     """Normalize target to relative path, validating it's within project."""
     # Security check: reject path traversal in user input
@@ -173,7 +166,7 @@ def resolve_targets(
                         f"Target '{target}' output key {key!r} at revision '{rev}' has no "
                         + "recorded path and is not defined by the current pipeline"
                     )
-                hashes[path] = _out_entry_to_output_hash(entry)
+                hashes[path] = lock.entry_hash_info(entry)
             if not hashes:
                 raise exceptions.TargetNotFoundError(
                     f"Target '{target}' recorded no outputs at revision '{rev}'"
@@ -195,18 +188,12 @@ def resolve_targets(
         # Try as a .pvt tracked file
         pvt_data = get_pvt_data_from_revision(pvt_rel_path, rev)
         if pvt_data is not None:
-            file_hash = pvt_data["hash"]
-            hash_info: HashInfo
-            if "manifest" in pvt_data:
-                hash_info = DirHash(hash=file_hash, manifest=pvt_data["manifest"])
-            else:
-                hash_info = FileHash(hash=file_hash)
             results.append(
                 TargetInfo(
                     target_type=TargetType.FILE,
                     original_target=target,
                     paths=[rel_target],
-                    hashes={rel_target: hash_info},
+                    hashes={rel_target: track.pvt_to_hash_info(pvt_data)},
                 )
             )
             continue

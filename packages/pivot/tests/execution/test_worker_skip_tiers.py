@@ -263,11 +263,9 @@ def test_restore_verifies_directory_output(project: pathlib.Path, state_db: stat
     ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
     directory = store.prepare_output(ref)
     (directory / "a.txt").write_text("a")
-    tree_hash, manifest = cache.hash_directory(directory, None)
+    output_hash = cache.hash_directory(directory, None)
 
-    result = _restore(
-        store, [ref], {ref.identity: DirHash(hash=tree_hash, manifest=manifest)}, state_db
-    )
+    result = _restore(store, [ref], {ref.identity: output_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
         available=True, outputs_restored=False, unavailable=[]

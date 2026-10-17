@@ -8,7 +8,16 @@ import pytest
 import yaml
 
 from pivot.storage import lock
-from pivot.types import ArtifactIdentity, DirHash, LockData, StorageLockData
+from pivot.types import (
+    ArtifactIdentity,
+    DepEntry,
+    DirHash,
+    DirManifestEntry,
+    FileHash,
+    LockData,
+    OutEntry,
+    StorageLockData,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -477,6 +486,31 @@ _MANIFEST_ENTRY: dict[str, object] = {
             {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "hash": "abc"}]}]},
             id="short-manifest-hash",
         ),
+        pytest.param(
+            "outs[0].empty_dirs",
+            {"outs": [{**_OUT, "manifest": [_MANIFEST_ENTRY], "empty_dirs": "build"}]},
+            id="string-empty-dirs",
+        ),
+        pytest.param(
+            "outs[0].empty_dirs[0]",
+            {"outs": [{**_OUT, "manifest": [_MANIFEST_ENTRY], "empty_dirs": ["../escaped"]}]},
+            id="traversal-empty-dir",
+        ),
+        pytest.param(
+            "outs[0].empty_dirs[0]",
+            {"outs": [{**_OUT, "manifest": [_MANIFEST_ENTRY], "empty_dirs": ["/abs"]}]},
+            id="absolute-empty-dir",
+        ),
+        pytest.param(
+            "deps[0].empty_dirs[0]",
+            {"deps": [{**_DEP, "manifest": [_MANIFEST_ENTRY], "empty_dirs": [3]}]},
+            id="int-empty-dir",
+        ),
+        pytest.param(
+            "outs[0].empty_dirs",
+            {"outs": [{**_OUT, "empty_dirs": ["build"]}]},
+            id="empty-dirs-without-manifest",
+        ),
         pytest.param("schema_version", {"schema_version": "2"}, id="string-schema-version"),
     ],
 )
@@ -745,6 +779,95 @@ def test_lock_roundtrip_dir_hash_with_identity_keys(tmp_path: Path) -> None:
     info = loaded["dep_hashes"][_id("data_dir")]
     assert info["hash"] == "aaaaaaaaaaaaaaa0"
     assert "manifest" in info
+
+
+def test_lock_roundtrip_keeps_empty_dirs(tmp_path: Path) -> None:
+    """A directory's empty directories survive a lock write and read, for deps and outs."""
+    dir_hash = DirHash(
+        hash="aaaaaaaaaaaaaaa0",
+        manifest=[{"relpath": "a.csv", "hash": "1111111111111111", "size": 100, "isexec": False}],
+        empty_dirs=["bundle/classifier_source", "logs"],
+    )
+    data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={_id("upstream"): dir_hash},
+        output_hashes={_id("consume"): dir_hash},
+    )
+    stage_lock = lock.StageLock("consume", tmp_path)
+    stage_lock.write(data)
+
+    loaded = stage_lock.read()
+
+    assert loaded is not None
+    assert loaded["dep_hashes"][_id("upstream")] == dir_hash
+    assert loaded["output_hashes"][_id("consume")] == dir_hash
+
+
+def test_written_lock_records_no_empty_dirs_field_for_directory_without_any(
+    tmp_path: Path,
+) -> None:
+    """A directory with no empty directories is written exactly as before the field existed."""
+    manifest_entry = DirManifestEntry(
+        relpath="a.csv", hash="1111111111111111", size=100, isexec=False
+    )
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                _id("p/stage"): DirHash(hash="aaaaaaaaaaaaaaa0", manifest=[manifest_entry])
+            },
+        )
+    )
+
+    document = yaml.safe_load(stage_lock.path.read_text())
+
+    assert document["outs"] == [
+        {"key": None, "hash": "aaaaaaaaaaaaaaa0", "manifest": [manifest_entry]}
+    ]
+
+
+_ENTRY_MANIFEST = [DirManifestEntry(relpath="a.txt", hash="0123456789abcdef", size=1, isexec=False)]
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        pytest.param(
+            OutEntry(key=None, hash="fedcba9876543210"),
+            FileHash(hash="fedcba9876543210"),
+            id="file",
+        ),
+        pytest.param(
+            OutEntry(key=None, hash="fedcba9876543210", manifest=_ENTRY_MANIFEST),
+            DirHash(hash="fedcba9876543210", manifest=_ENTRY_MANIFEST),
+            id="directory",
+        ),
+        pytest.param(
+            DepEntry(
+                producer="p/a",
+                key=None,
+                hash="fedcba9876543210",
+                manifest=_ENTRY_MANIFEST,
+                empty_dirs=["logs"],
+            ),
+            DirHash(hash="fedcba9876543210", manifest=_ENTRY_MANIFEST, empty_dirs=["logs"]),
+            id="directory-with-empty-dirs",
+        ),
+        pytest.param(
+            OutEntry(key=None, hash="fedcba9876543210", manifest=_ENTRY_MANIFEST, empty_dirs=[]),
+            DirHash(hash="fedcba9876543210", manifest=_ENTRY_MANIFEST),
+            id="empty-empty-dirs-dropped",
+        ),
+    ],
+)
+def test_entry_hash_info(entry: DepEntry | OutEntry, expected: HashInfo) -> None:
+    """A lock entry converts to the hash it records; an empty empty_dirs list is no list, so the
+    result compares equal to a freshly computed hash of the same directory."""
+    assert lock.entry_hash_info(entry) == expected
 
 
 # --- find_orphaned_locks ---

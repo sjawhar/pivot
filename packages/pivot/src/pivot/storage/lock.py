@@ -142,6 +142,15 @@ def _manifest_error(value: object, field: str) -> str | None:
     return None
 
 
+def _empty_dirs_error(value: object, field: str) -> str | None:
+    if not isinstance(value, list):
+        return field
+    for index, relpath in enumerate(cast("list[object]", value)):
+        if not _is_project_relative_posix_path(relpath):
+            return f"{field}[{index}]"
+    return None
+
+
 def _entry_error(raw: object, field: str, list_key: str) -> str | None:
     """Check one ``deps`` or ``outs`` entry against DepEntry / OutEntry."""
     if not isinstance(raw, dict):
@@ -165,7 +174,13 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | None:
     if "size" in entry and not _is_int(entry["size"]):
         return f"{field}.size"
     if "manifest" in entry:
-        return _manifest_error(entry["manifest"], f"{field}.manifest")
+        error = _manifest_error(entry["manifest"], f"{field}.manifest")
+        if error is not None:
+            return error
+    if "empty_dirs" in entry:
+        if "manifest" not in entry:
+            return f"{field}.empty_dirs"
+        return _empty_dirs_error(entry["empty_dirs"], f"{field}.empty_dirs")
     return None
 
 
@@ -197,6 +212,24 @@ def _lock_shape_error(data: object) -> str | None:
     return None
 
 
+def _record_dir_fields(entry: DepEntry | OutEntry, hash_info: HashInfo) -> None:
+    """Copy a directory hash's manifest and empty directories onto a lock entry."""
+    if is_dir_hash(hash_info):
+        entry["manifest"] = hash_info["manifest"]
+        if "empty_dirs" in hash_info:
+            entry["empty_dirs"] = hash_info["empty_dirs"]
+
+
+def entry_hash_info(entry: DepEntry | OutEntry) -> HashInfo:
+    """Return the hash a lock ``deps`` or ``outs`` entry records."""
+    if "manifest" not in entry:
+        return FileHash(hash=entry["hash"])
+    dir_hash = DirHash(hash=entry["hash"], manifest=entry["manifest"])
+    if "empty_dirs" in entry and entry["empty_dirs"]:
+        dir_hash["empty_dirs"] = entry["empty_dirs"]
+    return dir_hash
+
+
 def _convert_to_storage_format(data: LockData) -> StorageLockData:
     """Convert internal LockData to storage format (list-based, identity keys, sorted)."""
     normalized_deps = _ensure_identity_keys(data["dep_hashes"])
@@ -205,8 +238,7 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     deps_list = list[DepEntry]()
     for identity, hash_info in normalized_deps.items():
         entry = DepEntry(producer=identity.producer, key=identity.key, hash=hash_info["hash"])
-        if is_dir_hash(hash_info):
-            entry["manifest"] = hash_info["manifest"]
+        _record_dir_fields(entry, hash_info)
         deps_list.append(entry)
     deps_list.sort(key=lambda e: (e["producer"], e["key"] or ""))
 
@@ -215,8 +247,7 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
         entry = OutEntry(key=identity.key, hash=hash_info["hash"])
         if "output_paths" in data and identity in data["output_paths"]:
             entry["path"] = data["output_paths"][identity]
-        if is_dir_hash(hash_info):
-            entry["manifest"] = hash_info["manifest"]
+        _record_dir_fields(entry, hash_info)
         outs_list.append(entry)
     outs_list.sort(key=lambda e: e["key"] or "")
 
@@ -235,21 +266,13 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
     """Convert storage format (list-based) to internal LockData (identity-keyed)."""
     dep_hashes = dict[ArtifactIdentity, HashInfo]()
     for entry in data["deps"]:
-        identity = ArtifactIdentity(entry["producer"], entry["key"])
-        if "manifest" in entry:
-            hash_info: HashInfo = DirHash(hash=entry["hash"], manifest=entry["manifest"])
-        else:
-            hash_info = FileHash(hash=entry["hash"])
-        dep_hashes[identity] = hash_info
+        dep_hashes[ArtifactIdentity(entry["producer"], entry["key"])] = entry_hash_info(entry)
 
     output_hashes = dict[ArtifactIdentity, HashInfo]()
     output_paths = dict[ArtifactIdentity, str]()
     for entry in data["outs"]:
         identity = ArtifactIdentity(stage_name, entry["key"])
-        if "manifest" in entry:
-            output_hashes[identity] = DirHash(hash=entry["hash"], manifest=entry["manifest"])
-        else:
-            output_hashes[identity] = FileHash(hash=entry["hash"])
+        output_hashes[identity] = entry_hash_info(entry)
         if "path" in entry:
             output_paths[identity] = entry["path"]
 

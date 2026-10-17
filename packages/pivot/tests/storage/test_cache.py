@@ -13,8 +13,9 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from pivot import exceptions
 from pivot.storage import cache, state
-from pivot.types import HashInfo
+from pivot.types import DirHash, HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
     from multiprocessing.managers import SyncManager
     from threading import Barrier
 
-    from pivot.types import DirHash, FileHash
+    from pivot.types import FileHash
 
 
 @pytest.fixture
@@ -182,16 +183,16 @@ def test_hash_file_mmap_fallback(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
 
 
 def test_hash_directory(tmp_path: pathlib.Path) -> None:
-    """hash_directory returns hash and manifest."""
+    """hash_directory returns the tree hash and manifest."""
     test_dir = tmp_path / "mydir"
     test_dir.mkdir()
     (test_dir / "a.txt").write_text("content a")
     (test_dir / "b.txt").write_text("content b")
 
-    tree_hash, manifest = cache.hash_directory(test_dir)
+    result = cache.hash_directory(test_dir)
 
-    assert len(tree_hash) == 16
-    assert len(manifest) == 2
+    assert len(result["hash"]) == 16
+    assert len(result["manifest"]) == 2
 
 
 def test_hash_directory_warns_about_left_out_symlinks(
@@ -206,7 +207,7 @@ def test_hash_directory_warns_about_left_out_symlinks(
     (test_dir / "nested" / "other.txt").symlink_to(target)
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
-        _, manifest = cache.hash_directory(test_dir, warn_left_out_symlinks=True)
+        manifest = cache.hash_directory(test_dir, warn_left_out_symlinks=True)["manifest"]
 
     assert [entry["relpath"] for entry in manifest] == ["target.txt"]
     assert [record.getMessage() for record in caplog.records] == [
@@ -239,16 +240,18 @@ def test_hash_directory_hashes_cache_object_links_by_target(
     source.mkdir()
     (source / "keep.txt").write_text("keep")
     cache_dir = tmp_path / "cache"
-    expected_hash, expected_manifest = cache.hash_directory(source)
+    expected = cache.hash_directory(source)
     cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
     linked = tmp_path / "linked"
     linked.mkdir()
-    (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, expected_manifest[0]["hash"]))
+    (linked / "keep.txt").symlink_to(
+        cache.get_cache_path(cache_dir, expected["manifest"][0]["hash"])
+    )
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
         result = cache.hash_directory(linked, cache_dir=cache_dir, warn_left_out_symlinks=True)
 
-    assert result == (expected_hash, expected_manifest)
+    assert result == expected
     assert caplog.records == []
 
 
@@ -260,14 +263,14 @@ def test_hash_directory_leaves_out_links_to_hash_named_files_outside_the_cache(
     source.mkdir()
     (source / "keep.txt").write_text("keep")
     cache_dir = tmp_path / "cache"
-    _, manifest = cache.hash_directory(source)
+    manifest = cache.hash_directory(source)["manifest"]
     cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
     linked = tmp_path / "linked"
     linked.mkdir()
     (linked / "keep.txt").symlink_to(cache.get_cache_path(cache_dir, manifest[0]["hash"]))
 
-    assert cache.hash_directory(linked, cache_dir=tmp_path / "other-cache")[1] == []
-    assert cache.hash_directory(linked)[1] == []
+    assert cache.hash_directory(linked, cache_dir=tmp_path / "other-cache")["manifest"] == []
+    assert cache.hash_directory(linked)["manifest"] == []
 
 
 def test_hash_directory_relative_paths(tmp_path: pathlib.Path) -> None:
@@ -279,7 +282,7 @@ def test_hash_directory_relative_paths(tmp_path: pathlib.Path) -> None:
     subdir.mkdir()
     (subdir / "nested.txt").write_text("nested")
 
-    _, manifest = cache.hash_directory(test_dir)
+    manifest = cache.hash_directory(test_dir)["manifest"]
 
     relpaths = [e["relpath"] for e in manifest]
     assert "file.txt" in relpaths
@@ -295,7 +298,7 @@ def test_hash_directory_sorted_manifest(tmp_path: pathlib.Path) -> None:
     (test_dir / "a.txt").write_text("a")
     (test_dir / "m.txt").write_text("m")
 
-    _, manifest = cache.hash_directory(test_dir)
+    manifest = cache.hash_directory(test_dir)["manifest"]
 
     relpaths = [e["relpath"] for e in manifest]
     assert relpaths == sorted(relpaths)
@@ -309,8 +312,8 @@ def test_hash_directory_deterministic(tmp_path: pathlib.Path) -> None:
         d.mkdir()
         (d / "file.txt").write_text("same content")
 
-    hash1, _ = cache.hash_directory(dir1)
-    hash2, _ = cache.hash_directory(dir2)
+    hash1 = cache.hash_directory(dir1)["hash"]
+    hash2 = cache.hash_directory(dir2)["hash"]
 
     assert hash1 == hash2
 
@@ -321,7 +324,7 @@ def test_hash_directory_includes_size(tmp_path: pathlib.Path) -> None:
     test_dir.mkdir()
     (test_dir / "file.txt").write_text("hello")
 
-    _, manifest = cache.hash_directory(test_dir)
+    manifest = cache.hash_directory(test_dir)["manifest"]
 
     assert manifest[0]["size"] == 5
 
@@ -333,7 +336,7 @@ def test_hash_directory_skips_symlinks(tmp_path: pathlib.Path) -> None:
     (test_dir / "real.txt").write_text("content")
     (test_dir / "link.txt").symlink_to(test_dir / "real.txt")
 
-    _, manifest = cache.hash_directory(test_dir)
+    manifest = cache.hash_directory(test_dir)["manifest"]
 
     relpaths = [e["relpath"] for e in manifest]
     assert "real.txt" in relpaths
@@ -350,7 +353,7 @@ def test_hash_directory_marks_executable(tmp_path: pathlib.Path) -> None:
     executable.write_text("#!/bin/bash")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
 
-    _, manifest = cache.hash_directory(test_dir)
+    manifest = cache.hash_directory(test_dir)["manifest"]
 
     manifest_dict = {e["relpath"]: e for e in manifest}
     assert manifest_dict["regular.txt"]["isexec"] is False
@@ -399,7 +402,7 @@ def test_hash_directory_handles_deleted_file(
 
     monkeypatch.setattr(cache, "hash_file", hash_file_with_delete)
 
-    _, manifest = cache.hash_directory(test_dir)
+    manifest = cache.hash_directory(test_dir)["manifest"]
     assert len(manifest) == 1
     assert manifest[0]["relpath"] == "keep.txt"
 
@@ -1913,7 +1916,7 @@ def test_hash_directory_includes_every_file(tmp_path: pathlib.Path) -> None:
     test_dir.mkdir()
     _helper_write_tree(test_dir)
 
-    _, manifest = cache.hash_directory(test_dir)
+    manifest = cache.hash_directory(test_dir)["manifest"]
 
     relpaths = {entry["relpath"] for entry in manifest}
     assert relpaths == {"keep.txt", *_TOOLING_RELPATHS}
@@ -1924,10 +1927,10 @@ def test_editing_any_file_changes_directory_hash(tmp_path: pathlib.Path, relpath
     test_dir = tmp_path / "mydir"
     test_dir.mkdir()
     _helper_write_tree(test_dir)
-    before, _ = cache.hash_directory(test_dir)
+    before = cache.hash_directory(test_dir)["hash"]
 
     (test_dir / relpath).write_text("edited")
-    after, _ = cache.hash_directory(test_dir)
+    after = cache.hash_directory(test_dir)["hash"]
 
     assert after != before, f"editing {relpath} must change the directory hash"
 
@@ -2576,8 +2579,6 @@ def test_restore_directory_copy_mode(tmp_path: pathlib.Path) -> None:
     """_restore_directory_from_cache works with COPY mode."""
     import shutil
 
-    from pivot.types import DirHash
-
     # Create source directory with a file
     src_dir = tmp_path / "source"
     src_dir.mkdir()
@@ -2588,19 +2589,16 @@ def test_restore_directory_copy_mode(tmp_path: pathlib.Path) -> None:
     cache_dir.mkdir()
 
     # Hash and cache individual files (not using SYMLINK mode)
-    dir_hash, manifest = cache.hash_directory(src_dir)
+    output_hash = cache.hash_directory(src_dir)
 
     # Cache each file individually
-    for entry in manifest:
+    for entry in output_hash["manifest"]:
         file_path = src_dir / entry["relpath"]
         cache_path = cache.get_cache_path(cache_dir, entry["hash"])
         cache.copy_to_cache(file_path, cache_path)
 
     # Remove the source directory
     shutil.rmtree(src_dir)
-
-    # Create the DirHash for restoration
-    output_hash = DirHash(hash=dir_hash, manifest=manifest)
 
     # Restore using COPY mode
     output_dir = tmp_path / "restored"
@@ -2650,3 +2648,363 @@ def test_restore_directory_rejects_path_traversal(tmp_path: pathlib.Path) -> Non
         cache._restore_directory_from_cache(
             output_dir, malicious_hash, cache_dir, [cache.CheckoutMode.COPY]
         )
+
+
+# === Empty directories ===
+
+# Hashes of _helper_write_pinned_tree and of an empty directory, recorded with pivot 0.3.3,
+# before empty directories were part of a directory's hash.
+_PINNED_TREE_HASH = "3b717a0258af2654"
+_EMPTY_ROOT_HASH = "ccab0b28617f1f56"
+_ALL_MODES = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
+
+
+def _helper_write_pinned_tree(root: pathlib.Path) -> None:
+    (root / "sub").mkdir(parents=True)
+    (root / "a.txt").write_text("alpha\n")
+    (root / "sub" / "b.bin").write_bytes(b"\x00\x01beta")
+    os.chmod(root / "sub" / "b.bin", 0o755)
+
+
+def _helper_add_empty_dirs(root: pathlib.Path) -> None:
+    (root / "bundle" / "classifier_source").mkdir(parents=True)
+    (root / "sub" / "x" / "y").mkdir(parents=True)
+
+
+def _helper_dir_set(root: pathlib.Path) -> set[str]:
+    """Every directory under root (following root itself if it is a symlink, nothing below)."""
+    return {
+        str(pathlib.Path(dirpath, name).relative_to(root))
+        for dirpath, dirnames, _ in os.walk(root)
+        for name in dirnames
+        if not pathlib.Path(dirpath, name).is_symlink()
+    }
+
+
+def test_hash_directory_without_empty_dirs_keeps_its_hash(tmp_path: pathlib.Path) -> None:
+    """A directory holding no empty directory hashes exactly as it did before empty
+    directories were recorded, so no existing lock entry for it changes."""
+    tree = tmp_path / "out"
+    _helper_write_pinned_tree(tree)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    result = cache.hash_directory(tree)
+
+    assert result["hash"] == _PINNED_TREE_HASH
+    assert "empty_dirs" not in result
+    assert cache.hash_directory(empty) == DirHash(hash=_EMPTY_ROOT_HASH, manifest=[])
+
+
+def test_hash_directory_records_deepest_empty_dirs(tmp_path: pathlib.Path) -> None:
+    """An empty directory is part of a directory's content: it is recorded (only the deepest
+    of a chain; its parents are implied) and it changes the hash."""
+    tree = tmp_path / "out"
+    _helper_write_pinned_tree(tree)
+    _helper_add_empty_dirs(tree)
+
+    result = cache.hash_directory(tree)
+
+    assert "empty_dirs" in result
+    assert result["empty_dirs"] == ["bundle/classifier_source", "sub/x/y"]
+    assert [entry["relpath"] for entry in result["manifest"]] == ["a.txt", "sub/b.bin"]
+    assert result["hash"] != _PINNED_TREE_HASH
+
+
+def test_hash_directory_counts_directory_holding_only_left_out_symlink_as_empty(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A user symlink is not stored, so a directory holding only one restores empty; its hash
+    records it as the empty directory it restores as."""
+    tree = tmp_path / "out"
+    (tree / "links").mkdir(parents=True)
+    (tree / "keep.txt").write_text("keep")
+    (tree / "links" / "keep.txt").symlink_to(tree / "keep.txt")
+
+    result = cache.hash_directory(tree)
+
+    assert "empty_dirs" in result
+    assert result["empty_dirs"] == ["links"]
+
+
+@pytest.mark.parametrize("mode", _ALL_MODES)
+@pytest.mark.parametrize("drop_tree", [False, True], ids=["cached-tree", "file-objects-only"])
+def test_directory_output_keeps_empty_dirs_through_cache_and_restore(
+    tmp_path: pathlib.Path, mode: cache.CheckoutMode, drop_tree: bool
+) -> None:
+    """A directory output restored from the cache is the tree that was saved: its empty
+    directories come back and it hashes to the hash recorded for it.
+
+    ``file-objects-only`` restores without a whole-directory SYMLINK cache tree, as after
+    `pivot pull`, which fetches file objects only.
+    """
+    output = tmp_path / "out"
+    _helper_write_pinned_tree(output)
+    _helper_add_empty_dirs(output)
+    expected_dirs = _helper_dir_set(output)
+    cache_dir = tmp_path / "cache"
+
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=[mode])
+    assert _helper_dir_set(output) == expected_dirs, "saving must keep every directory in place"
+
+    cache.remove_output(output)
+    if drop_tree:
+        cache.remove_output(cache.get_cache_path(cache_dir, output_hash["hash"]))
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_mode=mode)
+
+    assert _helper_dir_set(output) == expected_dirs
+    assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+
+
+def test_restore_directory_rejects_empty_dir_path_traversal(tmp_path: pathlib.Path) -> None:
+    """A recorded empty directory may come straight from a lock file; one pointing outside
+    the output must raise before anything is created there."""
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    saved = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(saved)
+    cache.remove_output(output)
+    malicious = DirHash(hash=saved["hash"], manifest=saved["manifest"], empty_dirs=["../escaped"])
+
+    with pytest.raises(exceptions.SecurityValidationError, match="path traversal"):
+        cache.restore_from_cache(
+            output, malicious, cache_dir, checkout_mode=cache.CheckoutMode.COPY
+        )
+
+    assert not (tmp_path / "escaped").exists()
+
+
+def _helper_add_stale_dir_to_tree(tree_path: pathlib.Path) -> None:
+    """Make a whole-directory SYMLINK cache tree look built by an older pivot: an empty
+    directory its hash does not record (it hashed without them but copied them into the tree),
+    and no record that this pivot checked the tree."""
+    tree_path.chmod(0o755)
+    (tree_path / "stale" / "deep").mkdir(parents=True)
+    tree_path.chmod(0o555)
+    cache._tree_layout_marker(tree_path).unlink()
+
+
+def test_restore_from_cache_repairs_legacy_symlink_tree_empty_dirs(tmp_path: pathlib.Path) -> None:
+    """Restoring through a legacy SYMLINK cache tree gives the tree its hash records, not one
+    with extra empty directories that would hash differently from the lock."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    _helper_add_stale_dir_to_tree(cache.get_cache_path(cache_dir, output_hash["hash"]))
+
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert _helper_dir_set(output) == set()
+    assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+
+
+def test_save_to_cache_symlink_repairs_legacy_tree_empty_dirs(tmp_path: pathlib.Path) -> None:
+    """Saving an output whose hash names an existing legacy tree repairs that tree too."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(first, cache_dir, checkout_modes=modes)
+    _helper_add_stale_dir_to_tree(cache.get_cache_path(cache_dir, output_hash["hash"]))
+
+    second = tmp_path / "second"
+    second.mkdir()
+    (second / "keep.txt").write_text("keep")
+    assert cache.save_to_cache(second, cache_dir, checkout_modes=modes) == output_hash
+
+    assert _helper_dir_set(second) == set()
+    assert cache.hash_directory(second, cache_dir=cache_dir) == output_hash
+
+
+def _helper_tree_listing(root: pathlib.Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+def test_symlink_tree_leaves_out_user_symlinks(tmp_path: pathlib.Path) -> None:
+    """A whole-directory SYMLINK cache tree holds what the hash records: a user symlink, which
+    is not stored, does not come back as a copy of its target, and a directory holding only
+    one comes back empty, as it does from a file-by-file restore."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "big.bin").write_text("big")
+    output = tmp_path / "out"
+    (output / "links").mkdir(parents=True)
+    (output / "keep.txt").write_text("keep")
+    (output / "link.txt").symlink_to(output / "keep.txt")
+    (output / "links" / "elsewhere").symlink_to(elsewhere)
+
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert _helper_tree_listing(output) == ["keep.txt", "links"]
+    assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+
+
+def test_restore_from_cache_repairs_legacy_symlink_tree_unlisted_files(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An older pivot copied a user symlink's target into the SYMLINK cache tree; restoring
+    through that tree removes what the hash does not record."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    tree_path.chmod(0o755)
+    (tree_path / "link.txt").write_text("keep")
+    (tree_path / "link.txt").chmod(0o444)
+    (tree_path / "linked").mkdir()
+    (tree_path / "linked" / "big.bin").write_text("big")
+    tree_path.chmod(0o555)
+    cache._tree_layout_marker(tree_path).unlink()
+
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert _helper_tree_listing(output) == ["keep.txt"]
+    assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+
+
+@pytest.mark.parametrize("with_empty_dir", [False, True], ids=["no-empty-dirs", "empty-dirs"])
+def test_symlink_restore_does_not_walk_a_tree_this_pivot_built(
+    tmp_path: pathlib.Path, mocker: MockerFixture, with_empty_dir: bool
+) -> None:
+    """The SYMLINK fast path stays a symlink swap: a tree this pivot built already holds what
+    its hash records, so restoring through it does not walk it (that walk took about 0.5 s on
+    20k files)."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    if with_empty_dir:
+        (output / "empty").mkdir()
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    scan = mocker.spy(cache, "_scan_entries")
+
+    for _ in range(2):
+        cache.remove_output(output)
+        assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert scan.call_count == 0
+
+
+def test_symlink_restore_repairs_a_legacy_tree_once(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    _helper_add_stale_dir_to_tree(cache.get_cache_path(cache_dir, output_hash["hash"]))
+    scan = mocker.spy(cache, "_scan_entries")
+
+    for _ in range(2):
+        cache.remove_output(output)
+        assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+
+    assert scan.call_count == 1
+    assert _helper_dir_set(output) == set()
+
+
+def test_restore_missing_in_directory_recreates_missing_empty_dir(tmp_path: pathlib.Path) -> None:
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "out"
+    (output / "empty").mkdir(parents=True)
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(output_hash)
+    (output / "empty").rmdir()
+
+    outcome = cache.restore_missing_in_directory(
+        output, output_hash, cache_dir, [cache.CheckoutMode.COPY]
+    )
+
+    assert outcome == cache.MissingRestore(
+        restored=1, unavailable=0, local_changes=[], replace=False
+    )
+    assert (output / "empty").is_dir()
+    assert cache.hash_directory(output) == output_hash
+
+
+def test_restore_missing_in_directory_replaces_directory_holding_extra_empty_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An extra empty directory holds nothing the swap could lose, so the directory is
+    replaced whole to reach the target."""
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "out"
+    (output / "recorded").mkdir(parents=True)
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(output_hash)
+    (output / "extra" / "deep").mkdir(parents=True)
+
+    outcome = cache.restore_missing_in_directory(
+        output, output_hash, cache_dir, [cache.CheckoutMode.COPY]
+    )
+
+    assert outcome == cache.MissingRestore(
+        restored=0, unavailable=0, local_changes=[], replace=True
+    )
+
+
+def test_restore_missing_in_directory_keeps_empty_dirs_a_0_3_3_hash_does_not_list(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hash pivot 0.3.3 recorded lists no empty directories, so one on disk is not extra:
+    the directory is left as it is rather than replaced, which would drop it."""
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "out"
+    (output / "cls" / "src").mkdir(parents=True)
+    (output / "keep.txt").write_text("keep")
+    saved = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(saved)
+    legacy = DirHash(hash=saved["hash"], manifest=saved["manifest"])
+
+    outcome = cache.restore_missing_in_directory(
+        output, legacy, cache_dir, [cache.CheckoutMode.COPY]
+    )
+
+    assert outcome == cache.MissingRestore(
+        restored=0, unavailable=0, local_changes=[], replace=False
+    )
+    assert (output / "cls" / "src").is_dir()
+
+
+def test_symlink_restore_succeeds_when_layout_marker_cannot_be_written(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The layout marker only saves a walk: a cache directory the restoring user cannot write
+    (another user's cache, a read-only mount) still restores, as it did before the marker."""
+    cache_dir = tmp_path / "cache"
+    modes = [cache.CheckoutMode.SYMLINK]
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("keep")
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
+    tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    cache._tree_layout_marker(tree_path).unlink()
+    shard = tree_path.parent
+    shard.chmod(0o555)
+    try:
+        cache.remove_output(output)
+        assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+    finally:
+        shard.chmod(0o755)
+
+    assert (output / "keep.txt").read_text() == "keep"

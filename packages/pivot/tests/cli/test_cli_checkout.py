@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 import pathlib
 import shutil
 from typing import TYPE_CHECKING
 
 import pytest
+import xxhash
 import yaml
 
 from conftest import isolated_pivot_dir
@@ -14,6 +17,7 @@ from pivot.storage import cache, lock, track
 if TYPE_CHECKING:
     import click.testing
 
+    from pivot.types import DirManifestEntry
 
 _EMPTY_PIPELINE = (
     "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
@@ -246,6 +250,227 @@ def test_checkout_tracked_directory(
         assert result.exit_code == 0, f"Checkout failed: {result.output}"
         assert (data_dir / "cat.jpg").read_bytes() == b"cat image"
         assert (data_dir / "dog.jpg").read_bytes() == b"dog image"
+
+
+def _helper_dir_set(root: pathlib.Path) -> set[str]:
+    """Every directory under root (following root itself if it is a symlink, nothing below)."""
+    return {
+        str(pathlib.Path(dirpath, name).relative_to(root))
+        for dirpath, dirnames, _ in os.walk(root)
+        for name in dirnames
+        if not pathlib.Path(dirpath, name).is_symlink()
+    }
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_checkout_tracked_directory_keeps_empty_dirs(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """`pivot track` records a directory's empty directories and checkout recreates them."""
+    with isolated_pivot_dir(runner, tmp_path):
+        cache_dir = _setup_test_project()
+        data_dir = pathlib.Path("images")
+        (data_dir / "raw" / "unsorted").mkdir(parents=True)
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        (data_dir / "empty").mkdir()
+        expected_dirs = _helper_dir_set(data_dir)
+
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+        pvt_data = track.read_pvt_file(track.get_pvt_path(data_dir))
+        assert pvt_data is not None
+        assert "empty_dirs" in pvt_data
+        assert pvt_data["empty_dirs"] == ["empty", "raw/unsorted"]
+
+        shutil.rmtree(data_dir)
+        result = runner.invoke(cli.cli, ["checkout", "--checkout-mode", mode, "images"])
+
+        assert result.exit_code == 0, f"Checkout failed: {result.output}"
+        assert _helper_dir_set(data_dir) == expected_dirs
+        assert cache.hash_directory(data_dir, cache_dir=cache_dir)["hash"] == pvt_data["hash"]
+
+
+_EMPTY_DIRS_PIPELINE = """\
+from __future__ import annotations
+
+import pathlib
+import tempfile
+from typing import Annotated, TypedDict
+
+from pivot import loaders
+from pivot.compose import Pipeline, stage
+
+
+class Made(TypedDict):
+    tree: pathlib.Path
+
+
+@stage
+def make() -> Made:
+    tree = pathlib.Path(tempfile.mkdtemp(prefix="pivot-empty-dirs-"))
+    (tree / "keep.txt").write_text("keep\\n")
+    (tree / "bundle" / "classifier_source").mkdir(parents=True)
+    (tree / "logs").mkdir()
+    return {"tree": tree}
+
+
+@stage
+def pack(tree: pathlib.Path) -> Annotated[dict, loaders.JSON()]:
+    return {
+        "entries": sorted(
+            str(p.relative_to(tree)) + ("/" if p.is_dir() else "") for p in tree.rglob("*")
+        )
+    }
+
+
+with Pipeline("empty") as pipeline:
+    made = make()
+    pack(made.tree)
+"""
+_EMPTY_DIRS_TREE = pathlib.Path("data", "empty", "make", "tree.dat")
+_EMPTY_DIRS_PACK = pathlib.Path("data", "empty", "pack.json")
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_restored_directory_output_keeps_empty_dirs_for_its_consumer(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """A directory output restored from the cache, by `pivot checkout` or by a cached
+    `pivot repro`, is the tree the stage built: a consumer that packs it produces the same
+    bytes as it did from the freshly built tree."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_stage_project(_EMPTY_DIRS_PIPELINE)
+        result = runner.invoke(cli.cli, ["config", "set", "cache.checkout_mode", mode])
+        assert result.exit_code == 0, result.output
+        result = runner.invoke(cli.cli, ["repro"])
+        assert result.exit_code == 0, result.output
+        fresh_dirs = _helper_dir_set(_EMPTY_DIRS_TREE)
+        fresh_pack = _EMPTY_DIRS_PACK.read_text()
+        assert fresh_dirs == {"bundle", "bundle/classifier_source", "logs"}
+        assert "bundle/classifier_source/" in fresh_pack
+
+        cache.remove_output(_EMPTY_DIRS_TREE)
+        result = runner.invoke(cli.cli, ["checkout", str(_EMPTY_DIRS_TREE)])
+        assert result.exit_code == 0, result.output
+        assert _helper_dir_set(_EMPTY_DIRS_TREE) == fresh_dirs, "checkout"
+
+        cache.remove_output(_EMPTY_DIRS_TREE)
+        result = runner.invoke(cli.cli, ["repro"])
+        assert result.exit_code == 0, result.output
+        assert _helper_dir_set(_EMPTY_DIRS_TREE) == fresh_dirs, "cached repro"
+        result = runner.invoke(cli.cli, ["run", "--force", "empty/pack"])
+        assert result.exit_code == 0, result.output
+
+        assert _EMPTY_DIRS_PACK.read_text() == fresh_pack
+        result = runner.invoke(cli.cli, ["status"])
+        assert result.exit_code == 0, result.output
+        assert "2 stages: 2 cached, 0 stale" in result.output, result.output
+
+
+def _helper_legacy_dir_hash(manifest: list[DirManifestEntry]) -> str:
+    """The hash pivot 0.3.3 recorded for a directory: its manifest alone, no empty dirs."""
+    manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    return xxhash.xxh64(manifest_json.encode()).hexdigest()
+
+
+def test_checkout_skips_untouched_tracked_directory_recorded_by_0_3_3(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A .pvt pivot 0.3.3 wrote lists none of a directory's empty directories. Checkout of
+    the untouched directory skips it, as 0.3.3 did, instead of calling it changed."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+        data_dir = pathlib.Path("images")
+        (data_dir / "slot").mkdir(parents=True)
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, result.output
+        pvt_path = track.get_pvt_path(data_dir)
+        pvt_data = track.read_pvt_file(pvt_path)
+        assert pvt_data is not None
+        assert "manifest" in pvt_data
+        track.write_pvt_file(
+            pvt_path,
+            track.PvtData(
+                path=pvt_data["path"],
+                hash=_helper_legacy_dir_hash(pvt_data["manifest"]),
+                size=pvt_data["size"],
+                manifest=pvt_data["manifest"],
+            ),
+        )
+
+        result = runner.invoke(cli.cli, ["checkout", "images"])
+
+        assert result.exit_code == 0, result.output
+        assert "different content" not in result.output
+        assert (data_dir / "slot").is_dir()
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_checkout_only_missing_keeps_empty_dirs_of_directory_tracked_by_0_3_3(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """`--only-missing` (and so a plain `pivot pull`) skips an untouched directory 0.3.3
+    tracked, keeping its empty directories for a later `pivot track --force` to record."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+        data_dir = pathlib.Path("tracked")
+        (data_dir / "slot").mkdir(parents=True)
+        (data_dir / "cls" / "src").mkdir(parents=True)
+        (data_dir / "k.txt").write_text("k")
+        result = runner.invoke(cli.cli, ["track", "tracked"])
+        assert result.exit_code == 0, result.output
+        pvt_path = track.get_pvt_path(data_dir)
+        pvt_data = track.read_pvt_file(pvt_path)
+        assert pvt_data is not None
+        assert "manifest" in pvt_data
+        track.write_pvt_file(
+            pvt_path,
+            track.PvtData(
+                path=pvt_data["path"],
+                hash=_helper_legacy_dir_hash(pvt_data["manifest"]),
+                size=pvt_data["size"],
+                manifest=pvt_data["manifest"],
+            ),
+        )
+
+        result = runner.invoke(
+            cli.cli, ["checkout", "--only-missing", "--checkout-mode", mode, "tracked"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _helper_dir_set(data_dir) == {"cls", "cls/src", "slot"}
+        assert not (data_dir / "k.txt").is_symlink()
+        result = runner.invoke(cli.cli, ["track", "--force", "tracked"])
+        assert result.exit_code == 0, result.output
+        retracked = track.read_pvt_file(pvt_path)
+        assert retracked is not None
+        assert "empty_dirs" in retracked
+        assert retracked["empty_dirs"] == ["cls/src", "slot"]
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_checkout_skips_untouched_directory_output_recorded_by_0_3_3(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """The same for a stage output whose lock pivot 0.3.3 wrote."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_stage_project(_EMPTY_DIRS_PIPELINE)
+        result = runner.invoke(cli.cli, ["config", "set", "cache.checkout_mode", mode])
+        assert result.exit_code == 0, result.output
+        result = runner.invoke(cli.cli, ["repro"])
+        assert result.exit_code == 0, result.output
+        lock_path = _stage_lock_path("empty/make")
+        document = yaml.safe_load(lock_path.read_text())
+        for out in document["outs"]:
+            out.pop("empty_dirs")
+            out["hash"] = _helper_legacy_dir_hash(out["manifest"])
+        lock_path.write_text(yaml.safe_dump(document))
+
+        result = runner.invoke(cli.cli, ["checkout", str(_EMPTY_DIRS_TREE)])
+
+        assert result.exit_code == 0, result.output
+        assert "different content" not in result.output
 
 
 def test_checkout_only_missing_restores_directory_with_missing_file(
