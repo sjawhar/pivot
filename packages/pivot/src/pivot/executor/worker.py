@@ -497,10 +497,10 @@ class OutputRestoreResult(NamedTuple):
 
     ``unavailable`` lists outputs that neither match their locked hash nor can be restored
     from the cache. ``empty_dirs_unrecorded`` lists outputs that hold every file their locked
-    hash records plus empty directories it does not, as a hash pivot wrote before 0.3.4 cannot
-    record them (``unrecorded_empty_dirs_only``): restoring such an output would delete the
-    directories, so the stage runs instead. A check (``restore=False``) lists every such output;
-    a restore stops at the first, since the stage must run anyway.
+    hash records plus empty directories it records none of (``unrecorded_empty_dirs_only``):
+    restoring such an output would delete the directories, so the stage runs instead. A check
+    (``restore=False``) lists every such output; a restore stops at the first, since the stage
+    must run anyway.
     """
 
     available: bool
@@ -510,13 +510,16 @@ class OutputRestoreResult(NamedTuple):
 
 
 def unrecorded_empty_dirs_only(expected: HashInfo, actual: HashInfo) -> bool:
-    """Whether directory output ``actual`` is ``expected``'s files plus empty directories that
-    ``expected`` cannot record.
+    """Whether directory output ``actual`` is ``expected``'s files plus empty directories, where
+    ``expected`` records no empty directories.
 
-    Pivot before 0.3.4 hashed a directory by its files alone and recorded none of its empty
-    directories. Restoring an output to such a hash deletes the empty directories its stage
-    made, and the stages that read the output then hash the stripped tree to the old value and
-    stay cached, though a fresh build would hold the directories.
+    Pivot before 0.3.4 hashed a directory by its files alone, and a hash pivot 0.3.4 or later
+    recorded for a directory that had no empty directories looks the same: lock files carry no
+    pivot version to tell them apart. Restoring an output to such a hash deletes the empty
+    directories on disk, and the stages that read the output then hash the stripped tree to the
+    old value and stay cached, though a fresh build of a stage that makes the directories would
+    hold them. Running the stage instead costs one run where the directories were only added by
+    hand; that run rebuilds the output without them.
     """
     return (
         is_dir_hash(expected)
