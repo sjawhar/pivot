@@ -787,7 +787,7 @@ def test_is_user_code_stdlib_via_symlink() -> None:
     - sys.base_prefix = /opt/homebrew/opt/python@3.13/... (symlink)
     - Actual stdlib at /opt/homebrew/Cellar/python@3.13/... (resolved)
 
-    The _is_stdlib_path check must resolve symlinks to correctly identify stdlib.
+    The is_library_path check must resolve symlinks to correctly identify stdlib.
     """
     # math module should be identified as NOT user code
     assert fingerprint.is_user_code(math) is False

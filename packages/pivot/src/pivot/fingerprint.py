@@ -2640,12 +2640,16 @@ def _is_user_code_impl(obj: Any) -> bool:
                     return False
         return True  # Namespace package not in site-packages: user code
 
-    module_file = pathlib.Path(module.__file__).resolve()
+    return not is_library_path(pathlib.Path(module.__file__).resolve())
 
-    if _is_stdlib_path(module_file):
-        return False
 
-    return not any(path in module_file.parts for path in _SITE_PACKAGE_PATHS)
+def is_library_path(path: pathlib.Path) -> bool:
+    """Whether resolved file or directory ``path`` belongs to a library, not to user code: it
+    lies under the interpreter's prefix (the stdlib, or a virtualenv), or in a site-packages or
+    dist-packages directory."""
+    if any(part in _SITE_PACKAGE_PATHS for part in path.parts):
+        return True
+    return any(path == prefix or prefix in path.parents for prefix in _STDLIB_PATHS)
 
 
 def _get_module(obj: Any) -> types.ModuleType | None:
@@ -2661,15 +2665,3 @@ def _get_module(obj: Any) -> types.ModuleType | None:
         return None
 
     return sys.modules.get(module_name)
-
-
-def _is_stdlib_path(module_file: pathlib.Path) -> bool:
-    """Check if path is in Python stdlib (but not site-packages)."""
-    for stdlib_path in _STDLIB_PATHS:
-        try:
-            if stdlib_path in module_file.parents:
-                return not any(path in module_file.parts for path in _SITE_PACKAGE_PATHS)
-        except (ValueError, OSError):
-            continue
-
-    return False
