@@ -2,6 +2,41 @@
 
 <!-- version list -->
 
+## v0.3.5 (2026-10-17)
+
+### Bug Fixes
+
+- **storage**: Never change a published cache object; reclaim killed tree publishers' copies
+  ([#480](https://github.com/sjawhar/pivot/pull/480),
+  [`a7b286c`](https://github.com/sjawhar/pivot/commit/a7b286c0b8c186a9348e5032823c8669acdfd7bb))
+
+- **storage**: Shared-cache lock files, serialised tree repair, sweep every cache temporary
+  ([#480](https://github.com/sjawhar/pivot/pull/480),
+  [`a7b286c`](https://github.com/sjawhar/pivot/commit/a7b286c0b8c186a9348e5032823c8669acdfd7bb))
+
+- **storage**: Stage without the shared lock where flock is refused; check a tree before marking it
+  ([#480](https://github.com/sjawhar/pivot/pull/480),
+  [`a7b286c`](https://github.com/sjawhar/pivot/commit/a7b286c0b8c186a9348e5032823c8669acdfd7bb))
+
+- **storage**: Stop parallel stages committing the same new bytes from failing with ENOENT
+  ([#480](https://github.com/sjawhar/pivot/pull/480),
+  [`a7b286c`](https://github.com/sjawhar/pivot/commit/a7b286c0b8c186a9348e5032823c8669acdfd7bb))
+
+- **storage**: Sweep killed tree publishers' copies under a prefix flock; repair unmarked trees
+  ([#480](https://github.com/sjawhar/pivot/pull/480),
+  [`a7b286c`](https://github.com/sjawhar/pivot/commit/a7b286c0b8c186a9348e5032823c8669acdfd7bb))
+
+### Testing
+
+- **storage**: Cover copy_to_cache on a filesystem without hard links
+  ([#480](https://github.com/sjawhar/pivot/pull/480),
+  [`a7b286c`](https://github.com/sjawhar/pivot/commit/a7b286c0b8c186a9348e5032823c8669acdfd7bb))
+
+- **storage**: Cover parallel commits of the same new cache object
+  ([#480](https://github.com/sjawhar/pivot/pull/480),
+  [`a7b286c`](https://github.com/sjawhar/pivot/commit/a7b286c0b8c186a9348e5032823c8669acdfd7bb))
+
+
 ## v0.3.4 (2026-10-17)
 
 ### Bug Fixes
