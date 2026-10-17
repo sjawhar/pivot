@@ -17,6 +17,7 @@ import queue
 import random
 import sys
 import threading
+import time
 import traceback
 import warnings
 from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast, overload, override
@@ -26,6 +27,7 @@ import pydantic
 from pivot import (
     config,
     exceptions,
+    fingerprint,
     loaders,
     metrics,
     parameters,
@@ -178,7 +180,7 @@ def _make_result(
     return result
 
 
-def execute_stage(
+def _execute_stage(
     stage_name: str,
     stage_info: WorkerStageInfo,
     cache_dir: pathlib.Path,
@@ -486,6 +488,38 @@ def execute_stage(
                 ring_buffer,
                 input_hash=input_hash,
             )
+
+
+def _user_code_files() -> list[str]:
+    """Return stat-able source files for user modules this worker has loaded."""
+    files = set[str]()
+    for module in tuple(sys.modules.values()):
+        if not fingerprint.is_user_code(module):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(module_file, str):
+            continue
+        try:
+            path = pathlib.Path(module_file).resolve(strict=True)
+        except OSError:
+            continue
+        if path.is_file():
+            files.add(str(path))
+    return sorted(files)
+
+
+def execute_stage(
+    stage_name: str,
+    stage_info: WorkerStageInfo,
+    cache_dir: pathlib.Path,
+    output_queue: Queue[OutputMessage],
+) -> StageResult:
+    """Execute a stage and report every user-code module resident in this worker."""
+    started_ns = time.time_ns()
+    result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
+    result["user_code_files"] = _user_code_files()
+    result["user_code_started_ns"] = started_ns
+    return result
 
 
 def _to_identity_hashes(hashes: dict[str, HashInfo]) -> dict[types.ArtifactIdentity, HashInfo]:

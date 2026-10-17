@@ -172,6 +172,8 @@ class StageResult(TypedDict):
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
+    user_code_files: NotRequired[list[str]]  # Absolute source paths workers imported
+    user_code_started_ns: NotRequired[int]  # Wall-clock time before worker stage execution
 
 
 # =============================================================================

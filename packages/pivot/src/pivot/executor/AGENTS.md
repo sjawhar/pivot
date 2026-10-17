@@ -1,6 +1,7 @@
 # Pivot Executor - Development Guidelines
 
-Workers execute in separate processes via `loky.get_reusable_executor()`.
+Workers execute in separate processes via `loky.get_reusable_executor()`. An Engine keeps its
+workers and manager alive across its runs; each run receives a fresh manager queue for output.
 
 ## WorkerStageInfo Contract
 
