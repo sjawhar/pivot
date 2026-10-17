@@ -2539,6 +2539,49 @@ def test_copy_to_cache_keeps_an_object_another_writer_published_first(
     assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
 
 
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
+@pytest.mark.parametrize(
+    ("existing_mode", "executable", "kept"),
+    [
+        pytest.param(None, False, False, id="absent"),
+        pytest.param(0o444, False, True, id="present"),
+        pytest.param(0o444, True, False, id="present-needs-exec-bit"),
+    ],
+)
+def test_copy_to_cache_without_hard_links(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_errno: int,
+    existing_mode: int | None,
+    executable: bool,
+    kept: bool,
+) -> None:
+    """On a filesystem that refuses link() (vfat, many SMB and FUSE mounts), a new object is
+    renamed into place, an existing one is kept, and one missing a needed executable bit is
+    still republished."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
+    inode = None
+    if existing_mode is not None:
+        cache_path.parent.mkdir(parents=True)
+        cache_path.write_text("content")
+        cache_path.chmod(existing_mode)
+        inode = cache_path.stat().st_ino
+
+    def _refuse_link(source: object, dest: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    cache.copy_to_cache(src, cache_path, executable=executable)
+
+    assert cache_path.read_text() == "content"
+    assert cache_path.stat().st_mode & 0o777 == (0o555 if executable else 0o444)
+    assert (cache_path.stat().st_ino == inode) is kept
+    assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
+
+
 def _helper_republish_executable_during_link(
     monkeypatch: pytest.MonkeyPatch,
     cache_path: pathlib.Path,
