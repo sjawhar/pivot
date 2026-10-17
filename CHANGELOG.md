@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v0.3.4 (2026-10-17)
+
+### Bug Fixes
+
+- **storage**: Honor 0.3.3 directory hashes in checkout; check a cache tree's layout once
+  ([#478](https://github.com/sjawhar/pivot/pull/478),
+  [`36c883d`](https://github.com/sjawhar/pivot/commit/36c883dc413dd66e87d8310154ca68c2adc69e62))
+
+- **storage**: Keep a 0.3.3 directory's empty dirs through --only-missing; best-effort layout marker
+  ([#478](https://github.com/sjawhar/pivot/pull/478),
+  [`36c883d`](https://github.com/sjawhar/pivot/commit/36c883dc413dd66e87d8310154ca68c2adc69e62))
+
+- **storage**: Keep user symlinks out of the SYMLINK cache tree
+  ([#478](https://github.com/sjawhar/pivot/pull/478),
+  [`36c883d`](https://github.com/sjawhar/pivot/commit/36c883dc413dd66e87d8310154ca68c2adc69e62))
+
+- **storage**: Restore a directory output's empty directories
+  ([#478](https://github.com/sjawhar/pivot/pull/478),
+  [`36c883d`](https://github.com/sjawhar/pivot/commit/36c883dc413dd66e87d8310154ca68c2adc69e62))
+
+
 ## v0.3.3 (2026-10-16)
 
 ### Bug Fixes
