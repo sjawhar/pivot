@@ -251,7 +251,7 @@ def execute_stage(
                 lock_data = production_lock.read()
 
                 with state.StateDB(state_dir, readonly=True) as state_db:
-                    outputs_missing_from_cache = False
+                    outputs_unusable: str | None = None
                     if lock_data is not None and not stage_info["force"]:
                         out_paths = [types.identity_key(out.identity) for out in stage_outs]
                         if can_skip_via_generation(
@@ -272,15 +272,16 @@ def execute_stage(
                                 stage_outs,
                             )
                             restored_entries = list[tuple[str, int, int, int, str]]()
-                            restored = restore_outputs_to_hashes(
+                            restoration = restore_outputs_to_hashes(
                                 store,
                                 stage_outs,
                                 lock_data["output_hashes"],
                                 state_db,
                                 state_dir=project_state_dir,
+                                report_changes=True,
                                 file_hash_entries=restored_entries,
                             )
-                            if restored:
+                            if restoration.available:
                                 return _make_result(
                                     StageStatus.CACHED,
                                     "unchanged (generation)",
@@ -288,7 +289,7 @@ def execute_stage(
                                     input_hash=input_hash,
                                     file_hash_entries=restored_entries,
                                 )
-                            outputs_missing_from_cache = True
+                            outputs_unusable = _outputs_unusable_reason(restoration)
 
                     dep_hashes, missing, unreadable, file_hash_entries = hash_dependencies(
                         stage_info["deps"], store, state_db
@@ -316,9 +317,9 @@ def execute_stage(
                         dep_hashes,
                     )
 
-                    if outputs_missing_from_cache and skip_reason is not None:
+                    if outputs_unusable is not None and skip_reason is not None:
                         skip_reason = None
-                        run_reason = "outputs missing from cache"
+                        run_reason = outputs_unusable
 
                     # Override skip decision if force flag is set
                     if stage_info["force"] and skip_reason is not None:
@@ -327,15 +328,16 @@ def execute_stage(
 
                     if skip_reason is not None and lock_data is not None:
                         restored_entries = list[tuple[str, int, int, int, str]]()
-                        restored = restore_outputs_to_hashes(
+                        restoration = restore_outputs_to_hashes(
                             store,
                             stage_outs,
                             lock_data["output_hashes"],
                             state_db,
                             state_dir=project_state_dir,
+                            report_changes=True,
                             file_hash_entries=restored_entries,
                         )
-                        if restored:
+                        if restoration.available:
                             return _make_result(
                                 StageStatus.CACHED,
                                 skip_reason,
@@ -343,7 +345,7 @@ def execute_stage(
                                 input_hash=input_hash,
                                 file_hash_entries=restored_entries,
                             )
-                        run_reason = "outputs missing from cache"
+                        run_reason = _outputs_unusable_reason(restoration)
 
                     # Check run cache for previously executed configuration (skip if forcing)
                     if run_reason and not stage_info["force"] and run_cache_allowed:
@@ -494,13 +496,49 @@ class OutputRestoreResult(NamedTuple):
     """Whether output restoration succeeded and wrote workspace bytes.
 
     ``unavailable`` lists outputs that neither match their locked hash nor can be restored
-    from the cache. A check (``restore=False``) lists every such output; a restore stops at
-    the first, since the stage must run anyway.
+    from the cache. ``empty_dirs_unrecorded`` lists outputs that hold every file their locked
+    hash records plus empty directories it does not, as a hash pivot wrote before 0.3.4 cannot
+    record them (``unrecorded_empty_dirs_only``): restoring such an output would delete the
+    directories, so the stage runs instead. A check (``restore=False``) lists every such output;
+    a restore stops at the first, since the stage must run anyway.
     """
 
     available: bool
     outputs_restored: bool
     unavailable: list[types.ArtifactRef]
+    empty_dirs_unrecorded: list[types.ArtifactRef]
+
+
+def unrecorded_empty_dirs_only(expected: HashInfo, actual: HashInfo) -> bool:
+    """Whether directory output ``actual`` is ``expected``'s files plus empty directories that
+    ``expected`` cannot record.
+
+    Pivot before 0.3.4 hashed a directory by its files alone and recorded none of its empty
+    directories. Restoring an output to such a hash deletes the empty directories its stage
+    made, and the stages that read the output then hash the stripped tree to the old value and
+    stay cached, though a fresh build would hold the directories.
+    """
+    return (
+        is_dir_hash(expected)
+        and is_dir_hash(actual)
+        and "empty_dirs" not in expected
+        and "empty_dirs" in actual
+        and actual["manifest"] == expected["manifest"]
+    )
+
+
+def empty_dirs_unrecorded_reason(refs: list[types.ArtifactRef]) -> str:
+    """Say why a stage whose lock is current must run: ``refs`` are its outputs whose lock does
+    not record the empty directories they hold."""
+    keys = ", ".join(types.identity_key(ref.identity) for ref in refs)
+    return f"Output holds empty directories its lock does not record: {keys}"
+
+
+def _outputs_unusable_reason(restoration: OutputRestoreResult) -> str:
+    """The reason a stage whose lock is current runs because its outputs could not be used."""
+    if restoration.empty_dirs_unrecorded:
+        return empty_dirs_unrecorded_reason(restoration.empty_dirs_unrecorded)
+    return "outputs missing from cache"
 
 
 @overload
@@ -548,6 +586,7 @@ def restore_outputs_to_hashes(
     restored from the cache, so the next check finds it without reading it.
     """
     unavailable = list[types.ArtifactRef]()
+    empty_dirs_unrecorded = list[types.ArtifactRef]()
     outputs_restored = False
     if not isinstance(store, store_mod.WorkspaceStore):
         unavailable = [ref for ref in outs if not store.exists(ref)]
@@ -562,6 +601,13 @@ def restore_outputs_to_hashes(
                     actual_hash = None
                 if actual_hash == expected_hash:
                     continue
+                if actual_hash is not None and unrecorded_empty_dirs_only(
+                    expected_hash, actual_hash
+                ):
+                    empty_dirs_unrecorded.append(ref)
+                    if restore:
+                        break
+                    continue
                 if store.cache_contains(ref, expected_hash):
                     if not restore:
                         continue
@@ -575,13 +621,15 @@ def restore_outputs_to_hashes(
             unavailable.append(ref)
             if restore:
                 break
+    available = not unavailable and not empty_dirs_unrecorded
     if report_changes:
         return OutputRestoreResult(
-            available=not unavailable,
+            available=available,
             outputs_restored=outputs_restored,
             unavailable=unavailable,
+            empty_dirs_unrecorded=empty_dirs_unrecorded,
         )
-    return not unavailable
+    return available
 
 
 def _check_skip_or_run(
