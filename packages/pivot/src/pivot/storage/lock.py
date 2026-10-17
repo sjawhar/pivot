@@ -23,6 +23,7 @@ from pivot.types import (
     ArtifactIdentity,
     DepEntry,
     DirHash,
+    DirManifestEntry,
     FileHash,
     HashInfo,
     LockData,
@@ -213,9 +214,19 @@ def _lock_shape_error(data: object) -> str | None:
 
 
 def _record_dir_fields(entry: DepEntry | OutEntry, hash_info: HashInfo) -> None:
-    """Copy a directory hash's manifest and empty directories onto a lock entry."""
+    """Copy a directory hash's manifest and empty directories onto a lock entry.
+
+    Each manifest entry is rebuilt in ``DirManifestEntry``'s field order: a hash read back from
+    the run cache carries its entries' keys sorted, and a lock written from it would otherwise
+    differ in bytes from the lock the same run writes.
+    """
     if is_dir_hash(hash_info):
-        entry["manifest"] = hash_info["manifest"]
+        entry["manifest"] = [
+            DirManifestEntry(
+                relpath=item["relpath"], hash=item["hash"], size=item["size"], isexec=item["isexec"]
+            )
+            for item in hash_info["manifest"]
+        ]
         if "empty_dirs" in hash_info:
             entry["empty_dirs"] = hash_info["empty_dirs"]
 

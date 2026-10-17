@@ -261,8 +261,9 @@ def get_stage_explanation(
             force=force,
         )
         unavailable = list[types.ArtifactRef]()
+        empty_dirs_unrecorded = list[types.ArtifactRef]()
         if not allow_missing:
-            unavailable = worker.restore_outputs_to_hashes(
+            restoration = worker.restore_outputs_to_hashes(
                 store,
                 outs,
                 lock_data["output_hashes"],
@@ -270,13 +271,19 @@ def get_stage_explanation(
                 state_dir=state_dir,
                 restore=False,
                 report_changes=True,
-            ).unavailable
-        if not decision["changed"] and unavailable:
+            )
+            unavailable = restoration.unavailable
+            empty_dirs_unrecorded = restoration.empty_dirs_unrecorded
+        if not decision["changed"] and (unavailable or empty_dirs_unrecorded):
             return StageExplanation(
                 stage_name=stage_name,
                 will_run=True,
                 is_forced=force,
-                reason=_unavailable_outputs_reason(store, unavailable),
+                reason=(
+                    _unavailable_outputs_reason(store, unavailable)
+                    if unavailable
+                    else worker.empty_dirs_unrecorded_reason(empty_dirs_unrecorded)
+                ),
                 code_changes=[],
                 param_changes=[],
                 dep_changes=[],

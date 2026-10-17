@@ -21,6 +21,7 @@ import xxhash
 import yaml
 
 from pivot import loaders
+from pivot.storage import cache
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -1084,6 +1085,72 @@ def test_pull_restores_empty_dirs_of_directory_output(
     assert "2 cached" in _ok(_pivot(clone, "status", env=env))
     _ok(_pivot(clone, "run", "--force", "empty/pack", env=env))
     assert (clone / packed).read_text() == (src / packed).read_text()
+
+
+def _helper_rewrite_lock_as_pivot_033(
+    lock_path: pathlib.Path, tree: pathlib.Path, scratch: pathlib.Path
+) -> int:
+    """Rewrite every directory hash of ``tree`` in a lock the way pivot before 0.3.4 recorded
+    it: the hash of its files alone (a copy of them without the empty directories), with no
+    ``empty_dirs``. Return how many entries changed."""
+    files_only = scratch / "files-only"
+    shutil.copytree(tree, files_only)
+    for directory in sorted(files_only.rglob("*"), reverse=True):
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    old = cache.hash_directory(files_only)
+    assert "empty_dirs" not in old
+    data = yaml.safe_load(lock_path.read_text())
+    changed = 0
+    for entry in [*data["deps"], *data["outs"]]:
+        if "empty_dirs" not in entry:
+            continue
+        assert entry["manifest"] == old["manifest"]
+        entry["hash"] = old["hash"]
+        del entry["empty_dirs"]
+        changed += 1
+    lock_path.write_text(yaml.safe_dump(data, sort_keys=False))
+    return changed
+
+
+@pytest.mark.parametrize("state", ["run-cache-kept", "state-cleared"])
+def test_repro_keeps_empty_dirs_a_pivot_033_lock_does_not_record(
+    tmp_path: pathlib.Path, state: str
+) -> None:
+    """A directory output whose lock pivot before 0.3.4 wrote, and whose tree on disk holds
+    empty directories that lock cannot record, is not restored to the lock, which would delete
+    the directories while every stage stayed cached. The stage runs (or takes its outputs from
+    a run-cache entry that records the directories), both locks come back byte for byte as a
+    fresh build writes them, and the consumer reads the tree a fresh build makes."""
+    (tmp_path / "project").mkdir()
+    root = _project(tmp_path / "project", {"pipeline.py": _EMPTY_DIRS_PIPELINE})
+    _ok(_pivot(root, "repro"))
+    tree = root / "data" / "empty" / "make" / "tree.dat"
+    packed = (root / "data" / "empty" / "pack.json").read_text()
+    stages = root / ".pivot" / "stages" / "empty"
+    fresh_locks = {name: (stages / name).read_bytes() for name in ("make.lock", "pack.lock")}
+    scratch = tmp_path / "scratch"
+    assert _helper_rewrite_lock_as_pivot_033(stages / "make.lock", tree, scratch / "make") == 1
+    assert _helper_rewrite_lock_as_pivot_033(stages / "pack.lock", tree, scratch / "pack") == 1
+    if state == "state-cleared":
+        shutil.rmtree(root / ".pivot" / "state.lmdb")
+
+    status_proc = _pivot(root, "status", "--explain", "--json")
+    _ok(status_proc)
+    status = json.loads(status_proc.stdout)
+    make = next(s for s in status["stages"] if s["name"] == "empty/make")
+    assert make["status"] == "stale"
+    assert make["reason"].startswith("Output holds empty directories its lock does not record")
+
+    _ok(_pivot(root, "repro"))
+
+    assert (tree / "bundle" / "classifier_source").is_dir()
+    assert (tree / "logs").is_dir()
+    assert (root / "data" / "empty" / "pack.json").read_text() == packed
+    assert {name: (stages / name).read_bytes() for name in fresh_locks} == fresh_locks
+    make_out = yaml.safe_load((stages / "make.lock").read_text())["outs"][0]
+    assert make_out["empty_dirs"] == ["bundle/classifier_source", "logs"]
+    assert "0 ran, 2 cached" in _ok(_pivot(root, "repro"))
 
 
 def test_tracked_directory_checked_out_as_symlinks_stays_clean(tmp_path: pathlib.Path) -> None:

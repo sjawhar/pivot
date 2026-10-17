@@ -254,7 +254,7 @@ def test_restore_reports_matching_outputs_available_without_writing(
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=True, outputs_restored=False, unavailable=[]
+        available=True, outputs_restored=False, unavailable=[], empty_dirs_unrecorded=[]
     )
 
 
@@ -268,7 +268,7 @@ def test_restore_verifies_directory_output(project: pathlib.Path, state_db: stat
     result = _restore(store, [ref], {ref.identity: output_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=True, outputs_restored=False, unavailable=[]
+        available=True, outputs_restored=False, unavailable=[], empty_dirs_unrecorded=[]
     )
 
 
@@ -283,7 +283,7 @@ def test_restore_brings_back_deleted_output_from_cache(
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=True, outputs_restored=True, unavailable=[]
+        available=True, outputs_restored=True, unavailable=[], empty_dirs_unrecorded=[]
     )
     assert path.read_text() == "cached out"
 
@@ -299,7 +299,7 @@ def test_restore_reports_output_without_recorded_hash_unavailable(
     result = _restore(store, [unrecorded, recorded], {recorded.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[unrecorded]
+        available=False, outputs_restored=False, unavailable=[unrecorded], empty_dirs_unrecorded=[]
     )
 
 
@@ -316,7 +316,7 @@ def test_restore_reports_output_missing_from_cache_unavailable(
     result = _restore(store, [ref], {ref.identity: FileHash(hash=file_hash)}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[ref]
+        available=False, outputs_restored=False, unavailable=[ref], empty_dirs_unrecorded=[]
     )
     assert not path.exists()
 
@@ -337,7 +337,7 @@ def test_restore_reports_failed_restore_unavailable(
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[ref]
+        available=False, outputs_restored=False, unavailable=[ref], empty_dirs_unrecorded=[]
     )
 
 
@@ -368,10 +368,13 @@ def test_check_lists_every_unavailable_output_and_writes_nothing(
     restored = _restore(store, outs, hashes, state_db)
 
     assert checked == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[unrecorded, uncached]
+        available=False,
+        outputs_restored=False,
+        unavailable=[unrecorded, uncached],
+        empty_dirs_unrecorded=[],
     )
     assert restored == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[unrecorded]
+        available=False, outputs_restored=False, unavailable=[unrecorded], empty_dirs_unrecorded=[]
     )
     assert not restorable_path.exists()
 
@@ -398,9 +401,82 @@ def test_restore_keeps_checking_outputs_after_restoring_one(
     )
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=True, unavailable=[uncached]
+        available=False, outputs_restored=True, unavailable=[uncached], empty_dirs_unrecorded=[]
     )
     assert restorable_path.read_text() == "cached"
+
+
+def _old_lock_tree(
+    project: pathlib.Path, store: store_mod.WorkspaceStore, ref: types.ArtifactRef
+) -> tuple[pathlib.Path, HashInfo]:
+    """A cached directory output holding an empty directory, and the hash pivot before 0.3.4
+    recorded for it: its files alone, as a copy without the directory hashes."""
+    directory = store.prepare_output(ref)
+    (directory / "a.txt").write_text("a")
+    (directory / "logs").mkdir()
+    store.commit(ref, directory)
+    files_only = project / "files-only"
+    files_only.mkdir()
+    (files_only / "a.txt").write_text("a")
+    old_hash = cache.hash_directory(files_only, None)
+    assert "empty_dirs" not in old_hash
+    return directory, old_hash
+
+
+@pytest.mark.parametrize("restore", [True, False], ids=["restore", "check"])
+def test_old_lock_without_empty_dirs_makes_the_stage_run_instead_of_stripping_them(
+    project: pathlib.Path, state_db: state.StateDB, restore: bool
+) -> None:
+    """An output holding every file its lock records plus an empty directory that a lock
+    written before pivot 0.3.4 cannot record is not restored to that lock: the restore would
+    delete the directory. The output is reported unusable, so the stage runs and records it."""
+    store = _workspace(project, {})
+    ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
+    directory, old_hash = _old_lock_tree(project, store, ref)
+    assert store.cache_contains(ref, old_hash), "a restore would be possible"
+
+    result = worker.restore_outputs_to_hashes(
+        store, [ref], {ref.identity: old_hash}, state_db, restore=restore, report_changes=True
+    )
+
+    assert result == worker.OutputRestoreResult(
+        available=False, outputs_restored=False, unavailable=[], empty_dirs_unrecorded=[ref]
+    )
+    assert (directory / "logs").is_dir()
+
+
+def test_old_lock_still_restores_a_directory_whose_files_changed(
+    project: pathlib.Path, state_db: state.StateDB
+) -> None:
+    """An output whose files differ from its old lock's is restored from the cache as before."""
+    store = _workspace(project, {})
+    ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
+    directory, old_hash = _old_lock_tree(project, store, ref)
+    (directory / "a.txt").unlink()
+    (directory / "a.txt").write_text("edited")
+
+    result = _restore(store, [ref], {ref.identity: old_hash}, state_db)
+
+    assert result == worker.OutputRestoreResult(
+        available=True, outputs_restored=True, unavailable=[], empty_dirs_unrecorded=[]
+    )
+    assert (directory / "a.txt").read_text() == "a"
+
+
+def test_unrecorded_empty_dirs_only_needs_matching_files_and_an_old_hash() -> None:
+    manifest = [types.DirManifestEntry(relpath="a.txt", hash="1" * 16, size=1, isexec=False)]
+    old = types.DirHash(hash="0" * 16, manifest=manifest)
+    with_dirs = types.DirHash(hash="2" * 16, manifest=manifest, empty_dirs=["logs"])
+    other_files = types.DirHash(
+        hash="3" * 16,
+        manifest=[types.DirManifestEntry(relpath="b.txt", hash="1" * 16, size=1, isexec=False)],
+        empty_dirs=["logs"],
+    )
+
+    assert worker.unrecorded_empty_dirs_only(old, with_dirs)
+    assert not worker.unrecorded_empty_dirs_only(with_dirs, old), "a newer lock is authoritative"
+    assert not worker.unrecorded_empty_dirs_only(old, other_files), "the files differ"
+    assert not worker.unrecorded_empty_dirs_only(FileHash(hash="0" * 16), with_dirs)
 
 
 def test_restore_on_cache_store_reports_whether_every_output_is_stored(
