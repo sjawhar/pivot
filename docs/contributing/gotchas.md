@@ -38,6 +38,12 @@ def filter_positive(x: float) -> bool:
     return x > 0.5
 ```
 
+### User Code Never Loads Through Mtime-Checked Bytecode
+
+CPython reuses a cached `.pyc` while the source's size and whole-second mtime match the ones it recorded, so an edit that keeps a file's size, written in the second its previous version was written and cached, imports the previous code. While a discovery's import session lasts (from that discovery until the next one ends it), every file fingerprinting treats as user code (`fingerprint.is_library_path` is false for its resolved path, outside pivot's own source; under the project root, outside the tooling directories discovery skips) imports through `discovery._ProjectSourceLoader`: in the process that discovered, and in every worker, whose pool installs the same path hook as its initializer (`discovery.install_user_code_loader`). A worker imports by name a stage's module that discovery does not send by value (one outside the root, or under it in a `src` layout) and any module a stage body imports. The loader caches checked-hash bytecode (PEP 552), checked against the source's content on every import by any process, after replacing other bytecode for the file (removing it under `sys.dont_write_bytecode`). It compiles from source when it cannot write the cache (a read-only `__pycache__`), under `sys.dont_write_bytecode`, and under `--check-hash-based-pycs never`, which workers do not inherit. A library package symlinked into the root loads as CPython loads it. A process pivot does not start, such as a subprocess a stage runs, imports with CPython's loader and can still read mtime-checked bytecode left in a read-only `__pycache__`. Before the first discovery, or after a session ends, imports get CPython's default loader: a test that rewrites a module and imports it outside a session, for example with `importlib.util.spec_from_file_location`, should remove `importlib.util.cache_from_source(path)` first.
+
+Fingerprinting's own caches, of function hashes (`fp:`) and stage manifests (`sm:`), record each source file by the digest of its content, not by its mtime, size and inode, which an edit can keep to the nanosecond (two writes inside one kernel timestamp tick, or a tool that restores the mtime).
+
 ## Multiprocessing
 
 ### loky Can't Pickle `mp.Queue()`

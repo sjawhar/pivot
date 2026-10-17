@@ -1,17 +1,27 @@
 # pyright: reportMissingImports=false
 from __future__ import annotations
 
+import _imp
 import importlib
+import importlib.machinery
+import importlib.util
 import json
+import os
 import pathlib
+import py_compile
+import subprocess
 import sys
 import types as _stdlib_types
+from typing import TYPE_CHECKING
 
 import cloudpickle
 import pytest
 
-from pivot import discovery, project
+from pivot import discovery, fingerprint, project
 from tests import conftest
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 
 def test_find_config_in_dir_ignores_pivot_yaml(tmp_path: pathlib.Path) -> None:
@@ -339,6 +349,337 @@ def test_direct_pipeline_load_starts_fresh_import_session(tmp_path: pathlib.Path
     assert first_pipeline is not None
     assert second_pipeline is not None
     assert second_pipeline.get_stage("second/build")["func"]() == "b"
+
+
+def _helper_rewrite_in_one_second(path: pathlib.Path, text: str) -> None:
+    """Rewrite ``path`` with ``text``, of the same size, as if its previous write, that write's
+    cached bytecode and this write all fell in one whole second: CPython checks cached bytecode
+    only by the source's size and whole-second mtime."""
+    old = path.stat()
+    cached = pathlib.Path(importlib.util.cache_from_source(str(path)))
+    assert cached.is_file(), "the first discovery caches the file's bytecode"
+    assert len(text.encode()) == old.st_size
+    path.write_text(text)
+    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+    os.utime(cached, ns=(old.st_atime_ns, old.st_mtime_ns))
+
+
+@pytest.fixture
+def sibling_project(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """A project whose pipeline.py imports ``VALUE = "alpha"`` from its sibling stages.py."""
+    root = _write_sibling_stage_project(tmp_path / "project", "alpha").parent
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    return root
+
+
+def test_discovery_loads_a_same_size_edit_of_pipeline_py_made_in_the_same_second(
+    sibling_project: pathlib.Path,
+) -> None:
+    """An edit to pipeline.py that keeps its size, made in the second its previous version was
+    written and compiled, is loaded, not the previous version's cached bytecode."""
+    pipeline_path = sibling_project / "pipeline.py"
+    first = discovery.discover_pipeline(project_root=sibling_project)
+    assert first is not None
+    assert first.list_stages() == ["project/build"]
+
+    _helper_rewrite_in_one_second(
+        pipeline_path, pipeline_path.read_text().replace("build", "built")
+    )
+    second = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert second is not None
+    assert second.list_stages() == ["project/built"]
+
+
+def test_discovery_loads_a_same_size_edit_of_an_imported_module_made_in_the_same_second(
+    sibling_project: pathlib.Path,
+) -> None:
+    """The same holds for a project module pipeline.py imports."""
+    first = discovery.discover_pipeline(project_root=sibling_project)
+    assert first is not None
+    assert first.get_stage("project/build")["func"]() == "alpha"
+
+    _helper_rewrite_in_one_second(sibling_project / "stages.py", 'VALUE = "bravo"\n')
+    second = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert second is not None
+    assert second.get_stage("project/build")["func"]() == "bravo"
+
+
+@pytest.mark.parametrize("cache_case", ["pycache", "read-only-pycache", "dont-write-bytecode"])
+def test_discovery_loads_an_edit_over_bytecode_another_tool_cached_in_the_same_second(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, cache_case: str
+) -> None:
+    """Bytecode checked by mtime that an older pivot or a plain ``python`` import cached does not
+    hide a same-size edit made in its second either, even when that bytecode cannot be replaced:
+    ``__pycache__`` is read-only, or Python is told not to write bytecode."""
+    stages = sibling_project / "stages.py"
+    py_compile.compile(str(stages), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    _helper_rewrite_in_one_second(stages, 'VALUE = "bravo"\n')
+    pycache = sibling_project / "__pycache__"
+    if cache_case == "read-only-pycache":
+        pycache.chmod(0o555)
+    if cache_case == "dont-write-bytecode":
+        monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    try:
+        pipeline = discovery.discover_pipeline(project_root=sibling_project)
+    finally:
+        pycache.chmod(0o755)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "bravo"
+
+
+def test_discovery_writes_no_project_bytecode_when_python_is_told_not_to(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``sys.dont_write_bytecode`` (``PYTHONDONTWRITEBYTECODE``, ``python -B``) keeps project
+    directories free of ``__pycache__``, as it does for any import, and the mtime-checked
+    bytecode another tool left is removed, so no other process (a worker importing a stage's
+    module by name) can read it."""
+    stages = sibling_project / "stages.py"
+    py_compile.compile(str(stages), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    left = pathlib.Path(importlib.util.cache_from_source(str(stages)))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    pipeline = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "alpha"
+    assert not left.exists()
+    assert list((sibling_project / "__pycache__").iterdir()) == []
+
+
+def test_discovery_compiles_from_source_when_hash_based_bytecode_is_never_checked(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``--check-hash-based-pycs never`` CPython trusts checked-hash bytecode without
+    checking it, so project code is compiled from source: a same-size edit in the second of
+    the cached version is still seen."""
+    assert discovery.discover_pipeline(project_root=sibling_project) is not None
+    _helper_rewrite_in_one_second(sibling_project / "stages.py", 'VALUE = "bravo"\n')
+    monkeypatch.setattr(_imp, "check_hash_based_pycs", "never")
+
+    pipeline = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "bravo"
+
+
+def test_never_checked_mode_still_replaces_bytecode_another_tool_cached(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``--check-hash-based-pycs never`` discovery compiles from source, and it still
+    replaces the mtime-checked bytecode another tool cached: pivot's workers do not inherit the
+    flag, and another process importing the module by name, as a worker does, reads that
+    bytecode."""
+    stages = sibling_project / "stages.py"
+    py_compile.compile(str(stages), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    _helper_rewrite_in_one_second(stages, 'VALUE = "bravo"\n')
+    monkeypatch.setattr(_imp, "check_hash_based_pycs", "never")
+
+    pipeline = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "bravo"
+    assert discovery._is_checked_hash_pyc(importlib.util.cache_from_source(str(stages)))
+    other_process = subprocess.run(
+        [sys.executable, "-c", "import stages; print(stages.VALUE)"],
+        cwd=sibling_project,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert other_process.stdout.strip() == "bravo"
+
+
+_MODULES_BY_KIND = {
+    "nested package": "pkg.sub.mod",
+    "namespace package": "nspkg.inner.leaf",
+    "vendored directory": "vendored_mod",
+    "module outside the root": "outside_mod",
+    "library inside the root": "inside_lib_mod",
+    "stdlib": "colorsys",
+}
+
+
+@pytest.fixture
+def import_layout(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[pathlib.Path]:
+    """A project whose pipeline.py imports one module of each kind ``_MODULES_BY_KIND`` names.
+    The modules it imports and its sys.path entries are removed afterwards."""
+    root = tmp_path / "project"
+    site = root / ".venv" / "lib" / "python3" / "site-packages"
+    files = {
+        root / "pkg" / "__init__.py": "",
+        root / "pkg" / "sub" / "__init__.py": "",
+        root / "pkg" / "sub" / "mod.py": "VALUE = 1\n",
+        root / "nspkg" / "inner" / "leaf.py": "VALUE = 2\n",
+        root / "vendor" / "vendored_mod.py": "VALUE = 3\n",
+        tmp_path / "outside" / "outside_mod.py": "VALUE = 4\n",
+        site / "inside_lib_mod.py": "VALUE = 5\n",
+    }
+    for path, text in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    for entry in (root / "vendor", tmp_path / "outside", site):
+        monkeypatch.syspath_prepend(str(entry))
+    stdlib_module = sys.modules.pop(_MODULES_BY_KIND["stdlib"], None)
+    imports = "\n".join(f"import {name}" for name in _MODULES_BY_KIND.values())
+    (root / "pipeline.py").write_text(
+        f"{imports}\n\nfrom pivot.compose import Pipeline\n\n"
+        + "with Pipeline('layout') as pipeline:\n    pass\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    try:
+        yield root
+    finally:
+        for name in _MODULES_BY_KIND.values():
+            sys.modules.pop(name, None)
+        if stdlib_module is not None:
+            sys.modules[_MODULES_BY_KIND["stdlib"]] = stdlib_module
+
+
+def test_discovery_loads_user_code_and_only_user_code_through_the_checked_loader(
+    import_layout: pathlib.Path,
+) -> None:
+    """Every module fingerprinting treats as user code, under the root or outside it, loads
+    through ``_ProjectSourceLoader``; a library inside the root and the stdlib keep CPython's
+    loader, and their bytecode is not rewritten as checked-hash bytecode."""
+    assert discovery.discover_pipeline(project_root=import_layout) is not None
+
+    loaders = {
+        kind: type(sys.modules[name].__loader__).__name__ for kind, name in _MODULES_BY_KIND.items()
+    }
+    assert loaders == {
+        "nested package": "_ProjectSourceLoader",
+        "namespace package": "_ProjectSourceLoader",
+        "vendored directory": "_ProjectSourceLoader",
+        "module outside the root": "_ProjectSourceLoader",
+        "library inside the root": "SourceFileLoader",
+        "stdlib": "SourceFileLoader",
+    }
+    for kind in ("library inside the root", "stdlib"):
+        source = sys.modules[_MODULES_BY_KIND[kind]].__file__
+        assert source is not None
+        assert not discovery._is_checked_hash_pyc(importlib.util.cache_from_source(source)), kind
+
+
+@pytest.mark.parametrize("dont_write_bytecode", [False, True], ids=["write", "dont-write"])
+def test_library_package_symlinked_into_the_root_keeps_its_bytecode(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, dont_write_bytecode: bool
+) -> None:
+    """A library package symlinked into the root is found on the root's import path, but its
+    files resolve into site-packages: it loads as CPython loads it, and the bytecode its
+    install cached there is neither rewritten as checked-hash bytecode nor removed."""
+    package = tmp_path / "env" / "lib" / "python3.13" / "site-packages" / "symlinked_lib"
+    package.mkdir(parents=True)
+    init = package / "__init__.py"
+    init.write_text('VALUE = "lib"\n')
+    py_compile.compile(str(init), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    library_bytecode = pathlib.Path(importlib.util.cache_from_source(str(init)))
+    installed = library_bytecode.read_bytes()
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "symlinked_lib").symlink_to(package, target_is_directory=True)
+    (root / "pipeline.py").write_text(
+        "import symlinked_lib\n\nfrom pivot.compose import Pipeline\n\n"
+        + "with Pipeline('layout') as pipeline:\n    pass\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    monkeypatch.setattr(sys, "dont_write_bytecode", dont_write_bytecode)
+    try:
+        assert discovery.discover_pipeline(project_root=root) is not None
+        assert sys.modules["symlinked_lib"].VALUE == "lib"
+    finally:
+        sys.modules.pop("symlinked_lib", None)
+
+    assert library_bytecode.is_file(), "the library's bytecode is not removed"
+    assert library_bytecode.read_bytes() == installed, "nor rewritten"
+
+
+def test_user_code_rule_skips_libraries_the_stdlib_and_pivot(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directories the loader takes are the ones fingerprinting treats as user code: not
+    the interpreter's prefix (the stdlib, even with the interpreter installed under the root),
+    not site-packages, not pivot's own source, and under the root not the tooling directories
+    discovery skips."""
+    root = tmp_path / "project"
+    env = root / "env"
+    monkeypatch.setattr(fingerprint, "_STDLIB_PATHS", (*fingerprint._STDLIB_PATHS, env))
+    pivot_dir = pathlib.Path(discovery.__file__).resolve().parent
+
+    holds = {
+        str(path): discovery._holds_user_code(str(path), root)
+        for path in (
+            root,
+            root / "pkg" / "sub",
+            tmp_path / "outside",
+            env / "lib" / "python3.13",
+            root / ".venv" / "lib" / "python3.13" / "site-packages",
+            root / "node_modules" / "x",
+            pathlib.Path(json.__file__).resolve().parent,
+            pathlib.Path(cloudpickle.__file__).resolve().parent,
+            pivot_dir,
+            pivot_dir / "storage",
+        )
+    }
+
+    assert [path for path, holds_user in holds.items() if holds_user] == [
+        str(root),
+        str(root / "pkg" / "sub"),
+        str(tmp_path / "outside"),
+    ]
+
+
+def test_session_end_gives_user_code_cpythons_loader_back(
+    import_layout: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The loader is installed from a discovery until the next discovery ends its session; after
+    that, sys.path_hooks is as it was and an import from a user-code directory gets CPython's
+    loader again."""
+    root = import_layout
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert discovery.discover_pipeline(project_root=empty) is None, "ends any earlier session"
+    hooks_before = list(sys.path_hooks)
+    assert discovery.discover_pipeline(project_root=root) is not None
+    assert len(sys.path_hooks) == len(hooks_before) + 1
+    (tmp_path / "outside" / "late_mod.py").write_text("VALUE = 6\n")
+    importlib.invalidate_caches()
+    try:
+        assert type(importlib.import_module("late_mod").__loader__).__name__ == (
+            "_ProjectSourceLoader"
+        ), "a module imported while the session lasts gets the loader"
+        del sys.modules["late_mod"]
+
+        assert discovery.discover_pipeline(project_root=empty) is None
+
+        assert sys.path_hooks == hooks_before
+        assert type(importlib.import_module("late_mod").__loader__) is (
+            importlib.machinery.SourceFileLoader
+        )
+    finally:
+        sys.modules.pop("late_mod", None)
+
+
+def test_discovery_reuses_the_bytecode_of_an_unchanged_project_file(
+    sibling_project: pathlib.Path,
+) -> None:
+    """A project file that has not changed since discovery cached its bytecode is loaded from
+    that bytecode, not compiled and cached again."""
+    assert discovery.discover_pipeline(project_root=sibling_project) is not None
+    cached = pathlib.Path(importlib.util.cache_from_source(str(sibling_project / "stages.py")))
+    before = cached.stat()
+
+    pipeline = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "alpha"
+    after = cached.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
 
 @pytest.mark.usefixtures("set_project_root")

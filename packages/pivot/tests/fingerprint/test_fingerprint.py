@@ -14,10 +14,12 @@ import sys
 import time
 import types
 import typing
+from collections.abc import Generator
 
 import networkx as nx
 import pydantic
 import pytest
+import xxhash
 from pydantic import BaseModel
 
 from pivot import ast_utils, exceptions, fingerprint, loaders
@@ -787,7 +789,7 @@ def test_is_user_code_stdlib_via_symlink() -> None:
     - sys.base_prefix = /opt/homebrew/opt/python@3.13/... (symlink)
     - Actual stdlib at /opt/homebrew/Cellar/python@3.13/... (resolved)
 
-    The _is_stdlib_path check must resolve symlinks to correctly identify stdlib.
+    The is_library_path check must resolve symlinks to correctly identify stdlib.
     """
     # math module should be identified as NOT user code
     assert fingerprint.is_user_code(math) is False
@@ -1701,12 +1703,10 @@ def test_get_func_source_info_normal_function(monkeypatch: pytest.MonkeyPatch):
     # _helper_for_hash_test_1 is defined in this file
     result = fingerprint._get_func_source_info(_helper_for_hash_test_1)
 
-    assert result is not None
-    rel_path, mtime_ns, size, inode = result
-    assert "test_fingerprint.py" in rel_path
-    assert mtime_ns > 0
-    assert size > 0
-    assert inode > 0
+    assert result == (
+        str(pathlib.Path(__file__).resolve().relative_to(repo_root.resolve())),
+        xxhash.xxh64(pathlib.Path(__file__).read_bytes()).hexdigest(),
+    ), "the file's path in the project and the digest of its content"
 
 
 def test_get_func_source_info_builtin():
@@ -1727,11 +1727,9 @@ def test_get_func_source_info_lambda(monkeypatch: pytest.MonkeyPatch):
 
     # Lambdas in actual source files (like this test file) have source info
     assert result is not None, "Lambda in test file should have source info"
-    rel_path, mtime_ns, size, inode = result
+    rel_path, digest = result
     assert "test_fingerprint.py" in rel_path
-    assert mtime_ns > 0
-    assert size > 0
-    assert inode > 0
+    assert digest == xxhash.xxh64(pathlib.Path(__file__).read_bytes()).hexdigest()
 
 
 def test_flush_ast_hash_cache_empty():
@@ -2070,19 +2068,10 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
     # Manually queue some entries (simulating what hash_function_ast does)
     py_ver = fingerprint._PYTHON_VERSION
     schema_ver = fingerprint._CACHE_SCHEMA_VERSION
-    test_entries: list[tuple[str, int, int, int, str, str, int, str]] = [
-        ("src/a.py", 1000000000, 100, 111, "func_a", py_ver, schema_ver, "aaaa111122223333"),
-        ("src/b.py", 2000000000, 200, 222, "func_b", py_ver, schema_ver, "bbbb444455556666"),
-        (
-            "src/c.py",
-            3000000000,
-            300,
-            333,
-            "MyClass.method",
-            py_ver,
-            schema_ver,
-            "cccc777788889999",
-        ),
+    test_entries: list[fingerprint.AstHashEntry] = [
+        ("src/a.py", "0123456789abcdef", "func_a", py_ver, schema_ver, "aaaa111122223333"),
+        ("src/b.py", "1123456789abcdef", "func_b", py_ver, schema_ver, "bbbb444455556666"),
+        ("src/c.py", "2123456789abcdef", "MyClass.method", py_ver, schema_ver, "cccc777788889999"),
     ]
     fingerprint._pending_ast_writes.extend(test_entries)
 
@@ -2091,19 +2080,8 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
 
     # Verify entries were actually written
     with state.StateDB(db_path, readonly=True) as db:
-        for (
-            rel_path,
-            mtime_ns,
-            size,
-            inode,
-            qualname,
-            py_version,
-            schema_version,
-            expected_hash,
-        ) in test_entries:
-            actual_hash = db.get_ast_hash(
-                rel_path, mtime_ns, size, inode, qualname, py_version, schema_version
-            )
+        for rel_path, digest, qualname, py_version, schema_version, expected_hash in test_entries:
+            actual_hash = db.get_ast_hash(rel_path, digest, qualname, py_version, schema_version)
             assert actual_hash == expected_hash, (
                 f"Expected {expected_hash} for {rel_path}:{qualname}, got {actual_hash}"
             )
@@ -2235,15 +2213,10 @@ def my_stage():
         with fingerprint._collecting_sources() as source_map:
             fingerprint.get_stage_fingerprint(module.my_stage)
 
-        # Should have recorded at least the stage's source file
-        assert len(source_map) >= 1
-        assert any("collected_stage.py" in path for path in source_map)
-        # Each entry should have (mtime_ns, size, inode)
-        for _rel_path, stats in source_map.items():
-            mtime_ns, size, ino = stats
-            assert mtime_ns > 0
-            assert size > 0
-            assert ino > 0
+        # Should have recorded the stage's source file, by the digest of its content
+        assert source_map["collected_stage.py"] == (
+            xxhash.xxh64(test_module.read_bytes()).hexdigest()
+        )
     finally:
         sys.modules.pop("collected_stage", None)
 
@@ -2289,28 +2262,29 @@ def test_project_module_scan_is_reused_until_loaded_modules_change(
 
     try:
         importlib.import_module("scan_first")
-        first = dict[str, tuple[int, int, int]]()
+        first = dict[str, str]()
         fingerprint._record_project_modules(first)
         assert "scan_first.py" in first
 
         monkeypatch.setattr(fingerprint, "is_user_code", counting_is_user_code)
-        repeat = dict[str, tuple[int, int, int]]()
+        repeat = dict[str, str]()
         fingerprint._record_project_modules(repeat)
         assert repeat == first
         assert classified == [], "an unchanged sys.modules must not be rescanned"
 
         importlib.import_module("scan_second")
-        after_import = dict[str, tuple[int, int, int]]()
+        after_import = dict[str, str]()
         fingerprint._record_project_modules(after_import)
         assert "scan_second.py" in after_import
 
         (tmp_path / "scan_first.py").write_text("VALUE = 100\n")
         del sys.modules["scan_first"]
         importlib.import_module("scan_first")
-        after_reload = dict[str, tuple[int, int, int]]()
+        after_reload = dict[str, str]()
         fingerprint._record_project_modules(after_reload)
-        stat = (tmp_path / "scan_first.py").stat()
-        assert after_reload["scan_first.py"] == (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        assert after_reload["scan_first.py"] == (
+            xxhash.xxh64((tmp_path / "scan_first.py").read_bytes()).hexdigest()
+        )
     finally:
         sys.modules.pop("scan_first", None)
         sys.modules.pop("scan_second", None)
@@ -2999,21 +2973,26 @@ def test_try_manifest_cache_hit_empty_sources_forces_recompute(tmp_path, monkeyp
         fingerprint._state_db_init_attempted = False
 
 
-def test_try_manifest_cache_hit_corrupted_stats_length(tmp_path, monkeypatch):
-    """Source stats array with wrong length returns None."""
+def test_try_manifest_cache_hit_source_entry_not_a_digest(tmp_path, monkeypatch):
+    """A source entry that is not a content digest, as the (mtime, size, inode) list pivot
+    recorded before it keyed sources by content, returns None."""
     from pivot.storage import state as state_mod
 
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir()
     db_path = state_dir
 
-    # Source file exists but stats array has only 2 elements instead of 3
     src_file = tmp_path / "stage.py"
     src_file.write_text("def stage(): pass\n")
+    stat = src_file.stat()
+    stats = [stat.st_mtime_ns, stat.st_size, stat.st_ino]
 
     with state_mod.StateDB(db_path) as db:
         key = fingerprint._make_manifest_cache_key("bad_stats", _cached_stage)
-        db.put_raw(key, b'{"m":{"self:stage":"hash"},"s":{"stage.py":[1000,200]}}')
+        db.put_raw(
+            key,
+            json.dumps({"m": {"self:stage": "hash"}, "s": {"stage.py": stats}, "r": []}).encode(),
+        )
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
@@ -3023,7 +3002,7 @@ def test_try_manifest_cache_hit_corrupted_stats_length(tmp_path, monkeypatch):
 
     try:
         result = fingerprint._try_manifest_cache_hit("bad_stats", _cached_stage)
-        assert result is None, "Stats array with wrong length should return None"
+        assert result is None, "A source entry that is not a digest should return None"
     finally:
         if fingerprint._state_db is not None:
             fingerprint._state_db.close()
@@ -3042,7 +3021,7 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
     # Test with absolute path
     with state_mod.StateDB(db_path) as db:
         key = fingerprint._make_manifest_cache_key("traversal_abs", _cached_stage)
-        db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"/etc/passwd":[1000,200,555]}}')
+        db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"/etc/passwd":"0123456789abcdef"},"r":[]}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
@@ -3062,7 +3041,9 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
     # Test with ../ traversal
     with state_mod.StateDB(db_path) as db:
         key = fingerprint._make_manifest_cache_key("traversal_dotdot", _cached_stage)
-        db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"../../etc/passwd":[1000,200,555]}}')
+        db.put_raw(
+            key, b'{"m":{"self:x":"hash"},"s":{"../../etc/passwd":"0123456789abcdef"},"r":[]}'
+        )
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3171,21 +3152,21 @@ def test_invalidate_manifests_for_paths_selective(tmp_path, monkeypatch):
         db.put_raw(
             key_a,
             json.dumps(
-                {"m": {"self:stage_a": "hash"}, "s": {"a.py": [1, 2, 3]}},
+                {"m": {"self:stage_a": "hash"}, "s": {"a.py": "0123456789abcdef"}},
                 separators=(",", ":"),
             ).encode(),
         )
         db.put_raw(
             key_b,
             json.dumps(
-                {"m": {"self:stage_b": "hash"}, "s": {"b.py": [1, 2, 3]}},
+                {"m": {"self:stage_b": "hash"}, "s": {"b.py": "0123456789abcdef"}},
                 separators=(",", ":"),
             ).encode(),
         )
         db.put_raw(
             key_c,
             json.dumps(
-                {"m": {"self:stage_c": "hash"}, "s": {"c.py": [1, 2, 3]}},
+                {"m": {"self:stage_c": "hash"}, "s": {"c.py": "0123456789abcdef"}},
                 separators=(",", ":"),
             ).encode(),
         )
@@ -3272,3 +3253,109 @@ def invalidate_stage():
             fingerprint._state_db.close()
         fingerprint._state_db = None
         fingerprint._state_db_init_attempted = False
+
+
+def _helper_rewrite_keeping_stat(path: pathlib.Path, old: str, new: str) -> None:
+    """Replace ``old`` with ``new`` (same length) in ``path`` in place, then give the file back
+    its mtime: its mtime, size and inode are those of the previous content, as after two writes
+    inside one kernel timestamp tick."""
+    before = path.stat()
+    text = path.read_text()
+    assert len(old) == len(new) and old in text
+    path.write_text(text.replace(old, new))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_mtime_ns, after.st_size, after.st_ino) == (
+        before.st_mtime_ns,
+        before.st_size,
+        before.st_ino,
+    )
+
+
+@pytest.fixture
+def same_stat_project(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[pathlib.Path]:
+    """A project root with a StateDB that the fingerprint caches read and flush to; no bytecode
+    is cached, so a module imported again runs its file's current source."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    with state_mod.StateDB(state_dir):
+        pass
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: state_dir)
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    fingerprint._pending_manifest_writes.clear()
+    fingerprint._pending_ast_writes.clear()
+    fingerprint._hash_function_ast_cache.clear()
+    fingerprint._state_db = None
+    fingerprint._state_db_init_attempted = False
+    try:
+        yield tmp_path
+    finally:
+        if fingerprint._state_db is not None:
+            fingerprint._state_db.close()
+        fingerprint._state_db = None
+        fingerprint._state_db_init_attempted = False
+
+
+def _helper_import_fresh(name: str, path: pathlib.Path) -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _helper_reopen_state_db() -> None:
+    """Make the fingerprint caches read what the last flush wrote."""
+    if fingerprint._state_db is not None:
+        fingerprint._state_db.close()
+    fingerprint._state_db = None
+    fingerprint._state_db_init_attempted = False
+
+
+def test_cached_function_hash_misses_when_an_edit_keeps_the_files_stat(
+    same_stat_project: pathlib.Path,
+) -> None:
+    """A function's cached hash is keyed by its file's content: an edit that keeps the file's
+    mtime, size and inode is hashed again, from the edited source, not from the lines
+    ``linecache`` kept for the previous content."""
+    source = same_stat_project / "same_stat_func.py"
+    source.write_text('def build():\n    return "alpha"\n')
+    try:
+        first = fingerprint.hash_function_ast(_helper_import_fresh("same_stat_func", source).build)
+        fingerprint.flush_ast_hash_cache()
+        _helper_reopen_state_db()
+
+        _helper_rewrite_keeping_stat(source, "alpha", "bravo")
+        edited = _helper_import_fresh("same_stat_func", source).build
+        assert edited() == "bravo"
+
+        assert fingerprint.hash_function_ast(edited) != first
+    finally:
+        sys.modules.pop("same_stat_func", None)
+
+
+def test_cached_manifest_misses_when_a_recorded_file_changes_keeping_its_stat(
+    same_stat_project: pathlib.Path,
+) -> None:
+    """A cached manifest records each source file by its content: an edit to one of them that
+    keeps its mtime, size and inode is a miss."""
+    source = same_stat_project / "same_stat_stage.py"
+    source.write_text("def same_stat_stage():\n    return 42\n\n\nNOTE = 'alpha'\n")
+    try:
+        stage = _helper_import_fresh("same_stat_stage", source).same_stat_stage
+        fingerprint.get_stage_fingerprint_cached("same/stage", stage)
+        fingerprint.flush_manifest_cache()
+        _helper_reopen_state_db()
+        assert fingerprint._try_manifest_cache_hit("same/stage", stage) is not None, (
+            "the unedited file hits"
+        )
+
+        _helper_rewrite_keeping_stat(source, "alpha", "bravo")
+
+        assert fingerprint._try_manifest_cache_hit("same/stage", stage) is None
+    finally:
+        sys.modules.pop("same_stat_stage", None)

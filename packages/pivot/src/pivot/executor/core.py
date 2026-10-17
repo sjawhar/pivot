@@ -56,6 +56,26 @@ def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
         f.result()
 
 
+def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.ProcessPoolExecutor:
+    """The reusable loky worker pool.
+
+    While a discovery's import session lasts, every worker imports user code as that session
+    does (``discovery.install_user_code_loader``), so a worker never runs an edited module's
+    previous code. Loky replaces a live pool whose initializer arguments differ.
+    """
+    _ensure_deterministic_environment()
+    _ensure_cleanup_registered()
+    root = discovery.import_session_root()
+    if root is None:
+        return loky.get_reusable_executor(max_workers=max_workers, kill_workers=kill_workers)
+    return loky.get_reusable_executor(
+        max_workers=max_workers,
+        kill_workers=kill_workers,
+        initializer=discovery.install_user_code_loader,
+        initargs=(str(root),),
+    )
+
+
 def prepare_workers(
     stage_count: int, *, parallel: bool = True, max_workers: int | None = None
 ) -> int:
@@ -67,10 +87,7 @@ def prepare_workers(
     if not parallel or stage_count <= 0:
         return 1
     workers = compute_max_workers(stage_count, max_workers)
-    _ensure_deterministic_environment()
-    _ensure_cleanup_registered()
-    pool = loky.get_reusable_executor(max_workers=workers)
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers), workers)
     return workers
 
 
@@ -82,10 +99,7 @@ def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
     if stage_count <= 0:
         return 1
     workers = compute_max_workers(stage_count, max_workers)
-    _ensure_deterministic_environment()
-    _ensure_cleanup_registered()
-    pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers, kill_workers=True), workers)
     return workers
 
 
@@ -294,9 +308,7 @@ def _ensure_deterministic_environment() -> None:
 
 def create_executor(max_workers: int) -> concurrent.futures.Executor:
     """Get reusable loky executor - workers persist across calls for efficiency."""
-    _ensure_deterministic_environment()
-    _ensure_cleanup_registered()
-    return loky.get_reusable_executor(max_workers=max_workers)
+    return _get_executor(max_workers)
 
 
 def prepare_worker_info(

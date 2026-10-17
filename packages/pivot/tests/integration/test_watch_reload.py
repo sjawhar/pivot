@@ -288,16 +288,17 @@ async def test_same_size_edit_within_one_second_reloads_new_code(
 
 
 @pytest.mark.anyio
-async def test_edit_with_read_only_pycache_still_reloads(
+async def test_edit_with_read_only_pycache_still_reloads_new_code(
     watch_project: pathlib.Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A ``__pycache__`` the engine cannot write to warns and reloads; it does not crash watch."""
+    """A same-size edit within one second reloads its new code even when the bytecode cached
+    for the old code cannot be replaced, because ``__pycache__`` is read-only."""
     pipeline_py = watch_project / "pipeline.py"
     pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
     pipeline = _helper_discover(watch_project)
     pycache = watch_project / "__pycache__"
     assert any(pycache.glob("pipeline.*.pyc")), "discovery caches pipeline.py's bytecode"
+    first = pipeline_py.stat()
     recorder = _Recorder()
 
     pycache.chmod(0o555)
@@ -309,17 +310,17 @@ async def test_edit_with_read_only_pycache_still_reloads(
                 tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
                 await _helper_wait_until_watching(eng)
 
-                pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
+                edited = _helper_pipeline_source("-v1", third="renamed")
+                assert len(edited) == first.st_size
+                pipeline_py.write_text(edited)
+                os.utime(pipeline_py, ns=(first.st_atime_ns, first.st_mtime_ns))
                 reload_index = await recorder.wait_for(_helper_is_reload)
                 reload_event = recorder.events[reload_index]
                 assert reload_event["type"] == "pipeline_reloaded"
-                assert reload_event["stages_added"] == ["reload/added"]
+                assert reload_event["stages_added"] == ["reload/renamed"]
                 tg.cancel_scope.cancel()
     finally:
         pycache.chmod(0o755)
-
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert any("pipeline." in m and "stale bytecode" in m for m in warnings), warnings
 
 
 @pytest.mark.anyio

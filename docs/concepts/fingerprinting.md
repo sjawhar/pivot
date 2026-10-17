@@ -170,8 +170,10 @@ the coordinator process). Results are cached at two levels:
 1. **In-memory** — `WeakKeyDictionary` cache avoids re-parsing the same
    function within a single process
 2. **Persistent** — AST hashes and full manifests are cached in StateDB,
-   keyed by `(file_path, mtime, size, inode)`. If the source file hasn't
-   changed, the cached hash is reused without parsing
+   keyed by each source file's path and the digest of its content. If the
+   source file's content hasn't changed, the cached hash is reused without
+   parsing; an edit that keeps the file's mtime, size and inode is still
+   seen
 
 For a project with 125 stages, fingerprinting typically completes in under
 100ms on subsequent runs.
