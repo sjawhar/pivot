@@ -12,6 +12,7 @@ from botocore import exceptions as botocore_exc
 
 from pivot import exceptions
 from pivot.remote import storage as remote_mod
+from pivot.storage import cache
 
 if TYPE_CHECKING:
     import types
@@ -1036,7 +1037,8 @@ async def test_download_batch_keeps_existing_destination(
 
     assert [r["success"] for r in results] == [True]
     assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    assert [p.name for p in tmp_path.iterdir()] == ["entry"], "no download temp file left"
+    left = [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK]
+    assert left == ["entry"], "no download temp file left"
 
 
 @pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
@@ -1075,7 +1077,8 @@ async def test_download_batch_without_hard_links(
     assert dest.read_bytes() == content
     if inode is not None:
         assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    assert [p.name for p in tmp_path.iterdir()] == ["entry"], "no download temp file left"
+    left = [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK]
+    assert left == ["entry"], "no download temp file left"
 
 
 # -----------------------------------------------------------------------------

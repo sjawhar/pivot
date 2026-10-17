@@ -78,15 +78,24 @@ When multiple `pivot` processes share the same StateDB:
   there yet. Nothing there can hardlink an object, but the check and the rename are two steps:
   two writers that both find the name free both rename, the later object wins, and a symlink
   checkout reads the later object's mode.
-- A whole-directory SYMLINK tree is built under a `.pivot_tree_*` temporary name beside its cache
-  name and renamed into place, because a restore symlinks to a tree as soon as its name exists.
-  Each publisher holds a shared `flock` on its prefix directory's `.pivot_trees.lock` while its
-  temporary tree exists; a publisher that gets the exclusive lock first removes every temporary
-  tree there, since none has a live owner. Never judge a temporary entry abandoned by host and
-  pid: a process in another PID namespace, or on another host sharing the cache, looks dead.
-- The tree publisher marks a tree complete (`<tree>.layout-checked`). A restore or commit checks
-  an unmarked tree once, repairs its layout and every missing or wrong-size file from the file's
-  own cache object, then marks it; a tree missing a file whose object is absent restores nothing.
+- Every temporary entry in a prefix directory (a file staged for an object, a download, a tree
+  being copied) is made through `cache.staged_cache_file` or `_staging_in`, named
+  `.pivot_tmp_*`, while the process holds a shared `flock` on the directory's
+  `.pivot_cache.lock`. A process that gets the exclusive lock first (it never waits for it), at
+  most once per `_CACHE_SWEEP_INTERVAL` (the lock's mtime records the last sweep), removes every
+  `.pivot_tmp_*` entry: none has a live owner. An entry it cannot remove is logged and left.
+  Never judge a temporary entry abandoned by host and pid: a process in another PID namespace,
+  or on another host sharing the cache, looks dead.
+- A lock file in the cache is created writable by whoever can write its directory, since NFS
+  takes an exclusive lock only on a file opened for writing; one this user cannot write is
+  opened read-only. Lock files are never deleted.
+- A whole-directory SYMLINK tree is built under a temporary name beside its cache name, renamed
+  into place, then marked (`<tree>.verified`), because a restore symlinks to a tree as soon as
+  its name exists. A restore or commit checks an unmarked tree (exact files, sizes, executable
+  bits and directories) under the tree's exclusive `<tree>.lock`, repairs it in place from the
+  files' own cache objects, then marks it. A tree it cannot repair is not used: a restore goes
+  file by file, a commit fails. `<tree>.layout-checked`, the mark pivot 0.3.4 also gave partial
+  trees, is not trusted.
 
 ## Path Storage
 

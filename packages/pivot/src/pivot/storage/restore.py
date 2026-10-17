@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import contextlib
 import enum
 import logging
 import os
 import pathlib
-import tempfile
 from typing import TYPE_CHECKING, TypedDict, TypeGuard
 
 import xxhash
@@ -334,16 +332,10 @@ def restore_file(
             # is kept: another process may be linking it (cache.publish_cache_object).
             try:
                 cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-                cached_path.parent.mkdir(parents=True, exist_ok=True)
-                fd, staged = tempfile.mkstemp(dir=cached_path.parent, suffix=".tmp")
-                try:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(remote_content)
+                with cache.staged_cache_file(cached_path) as staged:
+                    staged.write_bytes(remote_content)
                     os.chmod(staged, 0o444)
                     _ = cache.publish_cache_object(staged, cached_path)
-                finally:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(staged)
             except OSError:
                 pass  # Caching failure is non-fatal
             return RestoreResult(

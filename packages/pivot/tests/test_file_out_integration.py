@@ -162,7 +162,12 @@ def test_cache_files_are_readonly_and_properly_structured(
     cache_dir = root / ".pivot/cache/files"
     prefix_dirs = [path for path in cache_dir.iterdir() if path.is_dir()]
     assert prefix_dirs, "Cache should contain hash-prefix directories"
-    cached_files = [path for prefix in prefix_dirs for path in prefix.iterdir()]
+    cached_files = [
+        path
+        for prefix in prefix_dirs
+        for path in prefix.iterdir()
+        if cache.is_valid_hash(prefix.name + path.name)
+    ]
     assert cached_files
 
     cache_file = cached_files[0]

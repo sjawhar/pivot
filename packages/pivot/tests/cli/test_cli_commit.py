@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from conftest import isolated_pivot_dir
 from pivot import cli, compose, executor, types
-from pivot.storage import lock
+from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
     import click.testing
@@ -47,7 +47,7 @@ def _cache_file_count(pipeline: compose.Pipeline) -> int:
     files_dir = pipeline.state_dir / "cache" / "files"
     if not files_dir.exists():
         return 0
-    return sum(1 for f in files_dir.rglob("*") if f.is_file())
+    return sum(1 for f in files_dir.glob("*/*") if cache.is_valid_hash(f.parent.name + f.name))
 
 
 # =============================================================================

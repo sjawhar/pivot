@@ -531,6 +531,117 @@ def publish_cache_object(
     return True
 
 
+# Every temporary entry pivot makes in a cache prefix directory carries this prefix.
+_CACHE_TEMP_PREFIX = ".pivot_tmp_"
+# Taken shared by every process while its temporary entries exist in the prefix directory, and
+# exclusive by the sweep. Never a cache key (cache scans skip it), and never deleted.
+_PREFIX_LOCK = ".pivot_cache.lock"
+# The sweep of one prefix directory runs at most this often; the lock file's mtime records it.
+_CACHE_SWEEP_INTERVAL = 3600
+# Opening or creating a lock fails this way in a cache directory this user cannot write.
+_CANNOT_WRITE_ERRNO = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+
+
+def _open_cache_lock(path: pathlib.Path) -> int:
+    """Open the lock file at ``path`` in a cache directory, creating it if needed.
+
+    A cache directory can be shared by several users. The file is created writable by exactly
+    those who can write its directory (they could delete it anyway), so each of them can take
+    an exclusive lock on it, which NFS allows only on a file opened for writing. A lock file
+    this user cannot write is opened read-only: a local filesystem locks it all the same. A new
+    lock file's mtime is the epoch: its directory has never been swept.
+    """
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+    except FileExistsError:
+        try:
+            return os.open(path, os.O_RDWR)
+        except PermissionError:
+            return os.open(path, os.O_RDONLY)
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o444 | (path.parent.stat().st_mode & 0o222))
+    with contextlib.suppress(OSError):
+        os.utime(fd, (0, 0))
+    return fd
+
+
+def _sweep_cache_temps(prefix_dir: pathlib.Path) -> None:
+    """Remove the temporary entries killed processes left in prefix_dir.
+
+    The caller holds prefix_dir's lock exclusively, so no ``_CACHE_TEMP_PREFIX`` entry has a
+    live owner. An older pivot's temporaries (``tmp*.tmp`` files, ``.pivot_download_*``) were
+    made without the lock; one is removed once it is untouched for ``_CACHE_SWEEP_INTERVAL``,
+    as a write in progress keeps its ctime current. An entry the sweep cannot remove (another
+    user's) is reported and left.
+    """
+    cutoff = time.time() - _CACHE_SWEEP_INTERVAL
+    for entry in os.scandir(prefix_dir):
+        name = entry.name
+        if name.startswith(_CACHE_TEMP_PREFIX):
+            stale = True
+        elif (name.startswith("tmp") and name.endswith(".tmp")) or name.startswith(
+            ".pivot_download_"
+        ):
+            stale = entry.stat(follow_symlinks=False).st_ctime < cutoff
+        else:
+            continue
+        if not stale:
+            continue
+        try:
+            _clear_path(pathlib.Path(entry.path))
+        except OSError as e:
+            logger.warning(
+                "Cannot remove %s, a temporary entry a killed pivot left in the cache (%s); "
+                + "remove it by hand",
+                entry.path,
+                e,
+            )
+
+
+@contextlib.contextmanager
+def _staging_in(prefix_dir: pathlib.Path) -> Generator[None]:
+    """Hold prefix_dir's lock shared, so this process's temporary entries there survive the
+    sweep, after sweeping when no other process holds the lock and the last sweep is older than
+    ``_CACHE_SWEEP_INTERVAL``.
+
+    The exclusive lock is only tried, never waited for, and a lock the filesystem refuses (NFS
+    and a read-only file) only skips the sweep. The kernel drops a killed process's lock with its
+    file descriptors. Converting the exclusive lock to shared may release it first; this process
+    has made no temporary entry yet.
+    """
+    fd = _open_cache_lock(prefix_dir / _PREFIX_LOCK)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            pass
+        else:
+            if time.time() - os.fstat(fd).st_mtime >= _CACHE_SWEEP_INTERVAL:
+                _sweep_cache_temps(prefix_dir)
+                with contextlib.suppress(OSError):
+                    os.utime(fd)
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def staged_cache_file(cache_path: pathlib.Path) -> Generator[pathlib.Path]:
+    """An empty temporary file beside cache object ``cache_path`` to publish it from
+    (``publish_cache_object``), removed on exit. A killed process's is swept (``_staging_in``).
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with _staging_in(cache_path.parent):
+        fd, name = tempfile.mkstemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_path.parent)
+        os.close(fd)
+        staged = pathlib.Path(name)
+        try:
+            yield staged
+        finally:
+            staged.unlink(missing_ok=True)
+
+
 def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bool = False) -> None:
     """Atomically copy file to cache with read-only permissions.
 
@@ -546,16 +657,10 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
     if cache_path.exists():
         return
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=cache_path.parent, suffix=".tmp")
-    tmp = pathlib.Path(tmp_path)
-    try:
-        os.close(fd)
-        shutil.copy2(src, tmp_path)
-        os.chmod(tmp_path, 0o555 if executable else 0o444)
-        _ = publish_cache_object(tmp, cache_path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    with staged_cache_file(cache_path) as staged:
+        shutil.copy2(src, staged)
+        os.chmod(staged, 0o555 if executable else 0o444)
+        _ = publish_cache_object(staged, cache_path)
 
 
 # A link the filesystem cannot make (across devices, refused, unsupported, or past the
@@ -642,8 +747,8 @@ def _cache_object_isexec(cache_path: pathlib.Path) -> bool | None:
 
 
 def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirManifestEntry]) -> None:
-    """Chmod any exec-marked file in a whole-directory SYMLINK cache tree that is missing
-    its executable bit, to 0o555.
+    """Chmod each file in a whole-directory SYMLINK cache tree whose executable bit is not the
+    one its manifest entry records, to 0o555 or 0o444.
 
     A tree an older pivot built (every file chmod'd 0o444 regardless of isexec) keeps being
     reused across an upgrade: its tree hash already incorporates isexec, so it never changes
@@ -658,18 +763,22 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
     """
     resolved_tree = cache_dir_path.resolve()
     for entry in manifest:
-        if not entry["isexec"]:
-            continue
         f = cache_dir_path / entry["relpath"]
         if not f.resolve().is_relative_to(resolved_tree):
             raise exceptions.SecurityValidationError(
                 f"Manifest contains path traversal: {entry['relpath']!r}"
             )
-        if _cache_object_isexec(f) is False:
-            os.chmod(f, 0o555)
+        isexec = _cache_object_isexec(f)
+        if isexec is not None and isexec != entry["isexec"]:
+            os.chmod(f, 0o555 if entry["isexec"] else 0o444)
 
 
-_TREE_LAYOUT_MARKER_SUFFIX = ".layout-checked"
+# The marker's earlier name, which pivot 0.3.4 touched after checking only a tree's layout,
+# partial trees included: every tree is checked once more and the old marker dropped.
+_TREE_LAYOUT_MARKER_SUFFIX = ".verified"
+_LEGACY_TREE_MARKER_SUFFIX = ".layout-checked"
+# Held exclusively while a tree is checked and repaired; never deleted.
+_TREE_LOCK_SUFFIX = ".lock"
 
 
 def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
@@ -679,28 +788,101 @@ def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
     return cache_dir_path.with_name(cache_dir_path.name + _TREE_LAYOUT_MARKER_SUFFIX)
 
 
-def _ensure_tree_dir_layout(
+def _mark_tree(cache_dir_path: pathlib.Path) -> None:
+    """Mark a tree known to hold exactly what its hash records. The marker only saves a check,
+    so a cache the user cannot write still restores without one."""
+    with contextlib.suppress(OSError):
+        _tree_layout_marker(cache_dir_path).touch()
+    with contextlib.suppress(OSError):
+        cache_dir_path.with_name(cache_dir_path.name + _LEGACY_TREE_MARKER_SUFFIX).unlink(
+            missing_ok=True
+        )
+
+
+def _tree_matches(
+    cache_dir_path: pathlib.Path, output_hash: DirHash, scanned: tuple[list[str], list[str]]
+) -> bool:
+    """Whether a whole-directory SYMLINK cache tree holds exactly the files (each regular, at its
+    recorded size and executable bit) and the directories ``output_hash`` records. ``scanned``
+    is ``_scan_entries(cache_dir_path)``. A recorded path leading outside the tree raises:
+    ``output_hash`` may come straight from a lock file."""
+    manifest = output_hash["manifest"]
+    resolved_tree = cache_dir_path.resolve()
+    for entry in manifest:
+        if not (cache_dir_path / entry["relpath"]).resolve().is_relative_to(resolved_tree):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {entry['relpath']!r}"
+            )
+    empty_dirs = _recorded_empty_dirs(output_hash)
+    for relpath in empty_dirs:
+        _ = _empty_dir_path(cache_dir_path, relpath)
+    found_files, found = scanned
+    found_dirs = set(found)
+    if set(found_files) != {entry["relpath"] for entry in manifest}:
+        return False
+    if found_dirs - _restored_dirs(output_hash) or not found_dirs.issuperset(empty_dirs):
+        return False
+    for entry in manifest:
+        found_stat = os.lstat(cache_dir_path / entry["relpath"])
+        if (
+            not stat.S_ISREG(found_stat.st_mode)
+            or found_stat.st_size != entry["size"]
+            or bool(found_stat.st_mode & stat.S_IXUSR) != entry["isexec"]
+        ):
+            return False
+    return True
+
+
+def _ensure_tree_complete(
     cache_dir_path: pathlib.Path, output_hash: DirHash, cache_dir: pathlib.Path
 ) -> bool:
-    """Check a whole-directory SYMLINK cache tree once, not on every restore, and repair it to
-    hold exactly the files and directories its hash records. Return False when a file is wrong
-    and its cache object is absent: the tree can be neither trusted nor repaired.
+    """Return whether a whole-directory SYMLINK cache tree holds exactly what ``output_hash``
+    records, checking a tree once and repairing it in place from its files' own cache objects.
 
-    The tree publisher marks a tree once it is complete (``_publish_tree``). Any tree without
-    the mark is checked, then marked: one an older pivot built, which may hold entries its hash
-    does not record, or which an older pivot copied straight to its name and was killed while
-    copying, leaving files missing or cut short under a name a restore trusts.
+    The tree publisher marks a tree once it is complete (``_publish_tree``). A tree without the
+    mark is checked: one an older pivot built, which can hold entries its hash does not record
+    and 0o444-everywhere files, or one it copied straight to its name and was killed while
+    copying, leaving files missing or cut short under a name a restore trusts. The check, the
+    repair and the mark run under the tree's exclusive lock, so two repairers never change the
+    tree's directory modes under each other. Returns False, the tree unmarked, when the tree
+    differs and cannot be repaired: a file's object is absent, or this user cannot write the
+    tree or take its lock.
     """
     marker = _tree_layout_marker(cache_dir_path)
     if marker.exists():
         return True
-    _repair_tree_dir_layout(cache_dir_path, output_hash)
-    if not _repair_tree_dir_files(cache_dir_path, output_hash["manifest"], cache_dir):
-        return False
-    # The marker only saves a walk; a cache the restoring user cannot write still restores.
-    with contextlib.suppress(OSError):
-        marker.touch()
-    return True
+    fd: int | None
+    try:
+        fd = _open_cache_lock(cache_dir_path.with_name(cache_dir_path.name + _TREE_LOCK_SUFFIX))
+    except OSError as e:
+        if e.errno not in _CANNOT_WRITE_ERRNO:
+            raise
+        fd = None
+    try:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:  # NFS refuses an exclusive lock on a file opened read-only
+                os.close(fd)
+                fd = None
+        if marker.exists():
+            return True
+        scanned = _scan_entries(cache_dir_path)
+        if not _tree_matches(cache_dir_path, output_hash, scanned):
+            if fd is None:
+                return False
+            try:
+                _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
+                _repair_tree_dir_layout(cache_dir_path, output_hash, scanned)
+                if not _repair_tree_dir_files(cache_dir_path, output_hash["manifest"], cache_dir):
+                    return False
+            except PermissionError:  # another user's tree
+                return False
+        _mark_tree(cache_dir_path)
+        return True
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _repair_tree_dir_files(
@@ -712,7 +894,7 @@ def _repair_tree_dir_files(
 
     Each repaired file is copied beside its name and renamed in, so a reader of the tree never
     sees part of one. Changing the tree in place is safe for the reason
-    ``_repair_tree_dir_isexec`` gives. A stat per file, done once per tree (the layout marker).
+    ``_repair_tree_dir_isexec`` gives; the caller holds the tree's lock (``_ensure_tree_complete``).
     """
     resolved_tree = cache_dir_path.resolve()
     wrong = list[tuple[DirManifestEntry, pathlib.Path]]()
@@ -750,7 +932,7 @@ def _repair_tree_dir_files(
             _make_writable(existing)
             target.parent.mkdir(parents=True, exist_ok=True)
             _make_writable(target.parent)
-            fd, staged = tempfile.mkstemp(prefix=_TREE_TEMP_PREFIX, dir=target.parent)
+            fd, staged = tempfile.mkstemp(prefix=_CACHE_TEMP_PREFIX, dir=target.parent)
             os.close(fd)
             try:
                 shutil.copyfile(obj, staged)
@@ -765,18 +947,21 @@ def _repair_tree_dir_files(
     return True
 
 
-def _repair_tree_dir_layout(cache_dir_path: pathlib.Path, output_hash: DirHash) -> None:
+def _repair_tree_dir_layout(
+    cache_dir_path: pathlib.Path, output_hash: DirHash, scanned: tuple[list[str], list[str]]
+) -> None:
     """Give a whole-directory SYMLINK cache tree exactly the files and directories
-    ``output_hash`` records.
+    ``output_hash`` records. ``scanned`` is ``_scan_entries(cache_dir_path)``.
 
     A tree an older pivot built can hold entries its hash does not record: directories its hash
-    left out because they were empty, and copies of the targets of symlinks its hash left out.
-    The tree's name never changes, so neither _store_directory's ``not cache_dir_path.exists()``
-    branch nor the symlink_fast_path restore would otherwise revisit it, and an output restored
-    through it would not hash to the hash it was restored for. Changing the tree in place is
-    safe for the reason ``_repair_tree_dir_isexec`` gives.
+    left out because they were empty, and copies of the targets of symlinks its hash left out;
+    a repair killed midway leaves a temporary file in it. The tree's name never changes, so
+    neither _store_directory's ``not cache_dir_path.exists()`` branch nor the symlink_fast_path
+    restore would otherwise revisit it, and an output restored through it would not hash to the
+    hash it was restored for. Changing the tree in place is safe for the reason
+    ``_repair_tree_dir_isexec`` gives; the caller holds the tree's lock.
     """
-    found_files, found = _scan_entries(cache_dir_path)
+    found_files, found = scanned
     found_dirs = set(found)
     unlisted = set(found_files) - {entry["relpath"] for entry in output_hash["manifest"]}
     extra_dirs = found_dirs - _restored_dirs(output_hash)
@@ -1017,40 +1202,6 @@ def _save_directory_to_cache(
     return output_hash
 
 
-_TREE_TEMP_PREFIX = ".pivot_tree_"
-# Never a cache key and never a temporary tree's name, so cache scans and the sweep both skip it.
-_TREE_PUBLISH_LOCK = ".pivot_trees.lock"
-
-
-@contextlib.contextmanager
-def _tree_publish_lock(prefix_dir: pathlib.Path) -> Generator[None]:
-    """Hold a shared flock on prefix_dir's tree publish lock for a publish, after removing the
-    temporary trees killed publishers left there.
-
-    Every live publisher in prefix_dir holds the shared lock while its temporary tree exists,
-    so whoever takes the exclusive lock knows no temporary tree there has a live owner, in any
-    PID namespace or on any host whose flock reaches the file. The kernel drops a killed
-    publisher's lock with its file descriptors. The exclusive lock is only tried, never waited
-    for: when another publish is running, the sweep waits for a later publish. The lock file is
-    never deleted (see ``restore_lock``).
-    """
-    fd = os.open(prefix_dir / _TREE_PUBLISH_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            pass
-        else:
-            for entry in os.scandir(prefix_dir):
-                if entry.name.startswith(_TREE_TEMP_PREFIX):
-                    _clear_path(pathlib.Path(entry.path))
-        # Converting the exclusive lock may release it first; no temporary tree of ours exists yet.
-        fcntl.flock(fd, fcntl.LOCK_SH)
-        yield
-    finally:
-        os.close(fd)
-
-
 def _publish_tree(
     path: pathlib.Path,
     cache_dir_path: pathlib.Path,
@@ -1061,10 +1212,10 @@ def _publish_tree(
     ``cache_dir_path``.
 
     A restore symlinks to a tree as soon as its name exists, so the tree is built under a
-    temporary name beside it and renamed into place complete. rename() will not replace a
-    directory that holds anything, so a tree another writer published first is kept and this
-    copy dropped. A later publish into the same prefix directory removes the copy a killed
-    publisher left (``_tree_publish_lock``).
+    temporary name beside it and renamed into place complete, then marked. rename() will not
+    replace a directory that holds anything, so a tree another writer published first is kept
+    and this copy dropped. A later publish into the same prefix directory removes the copy a
+    killed publisher left (``_staging_in``).
     """
 
     def _user_symlinks(directory: str, names: list[str]) -> list[str]:
@@ -1077,8 +1228,10 @@ def _publish_tree(
         ]
 
     cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
-    with _tree_publish_lock(cache_dir_path.parent):
-        staged = pathlib.Path(tempfile.mkdtemp(prefix=_TREE_TEMP_PREFIX, dir=cache_dir_path.parent))
+    with _staging_in(cache_dir_path.parent):
+        staged = pathlib.Path(
+            tempfile.mkdtemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_dir_path.parent)
+        )
         try:
             shutil.copytree(path, staged, ignore=_user_symlinks, dirs_exist_ok=True)
             isexec_by_relpath = {entry["relpath"]: entry["isexec"] for entry in manifest}
@@ -1094,8 +1247,7 @@ def _publish_tree(
                 if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
                     raise
                 return
-            with contextlib.suppress(OSError):
-                _tree_layout_marker(cache_dir_path).touch()
+            _mark_tree(cache_dir_path)
         finally:
             _clear_path(staged)
 
@@ -1126,10 +1278,11 @@ def _store_directory(
             # A tree an older pivot built keeps its 0o444-everywhere files, entries its hash does
             # not record, or files missing from a copy it was killed in, forever otherwise: its name
             # never changes, so this branch never revisits an existing tree directory above.
-            _repair_tree_dir_isexec(cache_dir_path, manifest)
-            if not _ensure_tree_dir_layout(cache_dir_path, output_hash, cache_dir):
+            if not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
                 raise exceptions.CacheRestoreError(
-                    f"Cache tree {cache_dir_path} is missing files whose cache objects are absent"
+                    f"Cache tree {cache_dir_path} differs from what its hash records and cannot "
+                    + "be repaired (a file's cache object is missing, or another user owns it); "
+                    + "remove the tree to let this commit publish it again"
                 )
 
             _clear_path(path)
@@ -1302,14 +1455,21 @@ def _restore_directory_from_cache(
         _cleanup_fresh_restore_orphans(path, target_token)
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
+    if symlink_fast_path and not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
+        # Same check as _store_directory. A tree this user cannot repair is not used: the
+        # output is restored file by file from the objects instead, if they are cached.
+        logger.warning(
+            "Cache tree %s differs from what its hash records and cannot be repaired; "
+            + "restoring %s file by file",
+            cache_dir_path,
+            path,
+        )
+        symlink_fast_path = False
+        for entry in output_hash["manifest"]:
+            if not get_cache_path(cache_dir, entry["hash"]).exists():
+                return False
+
     if symlink_fast_path:
-        # Same repairs as _store_directory: a tree an older pivot built keeps its
-        # 0o444-everywhere files, entries its hash does not record, or files missing from a copy
-        # it was killed in, forever otherwise, since this path never rebuilds an existing tree.
-        # A tree missing a file whose object is not cached cannot restore the output.
-        _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
-        if not _ensure_tree_dir_layout(cache_dir_path, output_hash, cache_dir):
-            return False
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             temp_symlink.symlink_to(cache_dir_path.resolve())

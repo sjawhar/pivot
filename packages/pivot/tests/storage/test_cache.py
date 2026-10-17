@@ -23,6 +23,15 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
 
+def _helper_entries(directory: pathlib.Path) -> list[str]:
+    """The sorted names in a cache prefix directory, less its lock files, which persist."""
+    return sorted(
+        p.name
+        for p in directory.iterdir()
+        if p.name != cache._PREFIX_LOCK and not p.name.endswith(cache._TREE_LOCK_SUFFIX)
+    )
+
+
 def _helper_assert_no_temp_dirs(
     parent: pathlib.Path,
     *,
@@ -526,7 +535,7 @@ def test_save_atomic_no_partial(tmp_path: pathlib.Path) -> None:
 
     cache.save_to_cache(test_file, cache_dir)
 
-    tmp_files = list(cache_dir.rglob("*.tmp"))
+    tmp_files = [*cache_dir.rglob("*.tmp"), *cache_dir.rglob(f"{cache._CACHE_TEMP_PREFIX}*")]
     assert len(tmp_files) == 0
 
 
@@ -2119,12 +2128,13 @@ def test_restore_from_cache_repairs_legacy_symlink_tree_isexec(tmp_path: pathlib
     assert isinstance(output_hash, dict) and "manifest" in output_hash
 
     # Simulate a tree an older pivot built: force every file in the tree cache dir back to
-    # 0o444, as pivot 0.3.2 did regardless of isexec. The tree hash (which already includes
-    # isexec) is unchanged, so nothing else needs to.
+    # 0o444, as pivot 0.3.2 did regardless of isexec, and drop the mark this pivot gives a tree
+    # it built. The tree hash (which already includes isexec) is unchanged.
     tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
     for f in tree_path.rglob("*"):
         if f.is_file() and not f.is_symlink():
             os.chmod(f, 0o444)
+    cache._tree_layout_marker(tree_path).unlink()
 
     cache.remove_output(output)
     assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
@@ -2152,6 +2162,7 @@ def test_save_to_cache_symlink_repairs_legacy_tree_isexec(tmp_path: pathlib.Path
     for f in tree_path.rglob("*"):
         if f.is_file() and not f.is_symlink():
             os.chmod(f, 0o444)
+    cache._tree_layout_marker(tree_path).unlink()
 
     second_output = tmp_path / "second"
     second_output.mkdir()
@@ -2204,8 +2215,8 @@ def test_restore_from_cache_symlink_fast_path_rejects_manifest_traversal(
     tmp_path: pathlib.Path,
 ) -> None:
     """The symlink fast path in `_restore_directory_from_cache` must reject a lock-supplied
-    manifest with a traversal relpath before the tree-repair chmod runs, the same way the
-    file-by-file branch already does."""
+    manifest with a traversal relpath before it checks or repairs a tree it did not mark, the
+    same way the file-by-file branch already does."""
     from pivot import exceptions
     from pivot.types import DirHash, DirManifestEntry
 
@@ -2223,6 +2234,7 @@ def test_restore_from_cache_symlink_fast_path_rejects_manifest_traversal(
     victim.chmod(0o644)
 
     tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    cache._tree_layout_marker(tree_path).unlink()
     relpath = os.path.relpath(victim, tree_path)
     tampered_hash = DirHash(
         hash=output_hash["hash"],
@@ -2467,7 +2479,7 @@ def test_copy_to_cache_keeps_a_non_executable_object_when_executable_requested(
 
     assert cache_path.stat().st_ino == inode
     assert cache_path.stat().st_mode & 0o777 == 0o444
-    assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
+    assert _helper_entries(cache_path.parent) == [cache_path.name], "no temp file left"
 
 
 def test_copy_to_cache_leaves_executable_object_alone_when_non_executable_requested(
@@ -2513,7 +2525,7 @@ def test_copy_to_cache_keeps_an_object_another_writer_published_first(
     cache.copy_to_cache(src, cache_path)
 
     assert cache_path.stat().st_ino == published[0]
-    assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
+    assert _helper_entries(cache_path.parent) == [cache_path.name], "no temp file left"
 
 
 @pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP, errno.ENOSYS])
@@ -2557,7 +2569,7 @@ def test_copy_to_cache_without_hard_links(
     assert cache_path.stat().st_mode & 0o777 == expected_mode
     if inode is not None:
         assert cache_path.stat().st_ino == inode
-    assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
+    assert _helper_entries(cache_path.parent) == [cache_path.name], "no temp file left"
 
 
 @pytest.mark.parametrize("link_errno", [errno.EIO, errno.ENOSPC])
@@ -2579,7 +2591,7 @@ def test_copy_to_cache_raises_a_failed_link(
         cache.copy_to_cache(src, cache_path)
 
     assert raised.value.errno == link_errno
-    assert list(cache_path.parent.iterdir()) == [], "nothing published, no temp file left"
+    assert _helper_entries(cache_path.parent) == [], "nothing published, no temp file left"
 
 
 @pytest.mark.parametrize("link_errno", [errno.ENOSYS, errno.ENOTSUP, errno.EMLINK])
@@ -2682,8 +2694,8 @@ def test_symlink_tree_keeps_a_tree_another_writer_published_first(
     assert first.resolve() == second.resolve() == tree.resolve()
     assert (second / "sub" / "f.txt").read_text() == "same"
     assert os.access(second / "run.sh", os.X_OK)
-    assert sorted(p.name for p in tree.parent.iterdir()) == sorted(
-        [tree.name, cache._tree_layout_marker(tree).name, cache._TREE_PUBLISH_LOCK]
+    assert _helper_entries(tree.parent) == sorted(
+        [tree.name, cache._tree_layout_marker(tree).name]
     ), "no temporary tree left"
 
 
@@ -2740,15 +2752,15 @@ def test_symlink_tree_publish_removes_a_killed_publishers_copy(tmp_path: pathlib
 
     assert process.exitcode == 73
     assert not tree.exists()
-    left = [p.name for p in tree.parent.iterdir() if p.name != cache._TREE_PUBLISH_LOCK]
-    assert len(left) == 1 and left[0].startswith(cache._TREE_TEMP_PREFIX), "the killed copy"
+    left = _helper_entries(tree.parent)
+    assert len(left) == 1 and left[0].startswith(cache._CACHE_TEMP_PREFIX), "the killed copy"
+    # The sweep of one prefix directory runs at most once per _CACHE_SWEEP_INTERVAL.
+    os.utime(tree.parent / cache._PREFIX_LOCK, (0, 0))
 
     cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
 
     assert out.resolve() == tree.resolve()
-    assert sorted(p.name for p in tree.parent.iterdir()) == sorted(
-        [tree.name, cache._tree_layout_marker(tree).name, cache._TREE_PUBLISH_LOCK]
-    )
+    assert _helper_entries(tree.parent) == sorted([tree.name, cache._tree_layout_marker(tree).name])
 
 
 def _helper_publish_tree_unseen(
@@ -2813,7 +2825,7 @@ def test_symlink_tree_publish_keeps_a_live_publishers_copy_it_cannot_see(
     assert publisher.exitcode == 0
     assert cache.hash_directory(prefix / "cdef0123456789") == theirs
     assert cache.hash_directory(prefix / "99990123456789") == ours
-    assert not [p for p in prefix.iterdir() if p.name.startswith(cache._TREE_TEMP_PREFIX)]
+    assert not [p for p in prefix.iterdir() if p.name.startswith(cache._CACHE_TEMP_PREFIX)]
 
 
 def _helper_tree_with_files_missing(
@@ -2866,6 +2878,216 @@ def test_symlink_restore_refuses_a_tree_it_cannot_repair(tmp_path: pathlib.Path)
 
     assert not out.exists()
     assert not cache._tree_layout_marker(tree).exists()
+
+
+def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pivot 0.3.4 marked a tree after checking only its layout, so its mark sits beside partial
+    trees too. The restore checks such a tree again, repairs it, and replaces the old mark."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    old_mark = tree.with_name(tree.name + ".layout-checked")
+    old_mark.touch()
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert cache._tree_layout_marker(tree).exists()
+    assert not old_mark.exists()
+
+
+def _helper_damaged_tree(root: pathlib.Path, files: int) -> tuple[pathlib.Path, DirHash]:
+    """A flat tree of ``files`` cached files as an older pivot left it: every file but one
+    missing, a read-only root, no mark. Return the cache dir and the output's hash."""
+    cache_dir = root / "cache"
+    src = root / "src"
+    src.mkdir()
+    for i in range(files):
+        (src / f"f{i:03d}.txt").write_text(f"file {i}\n" * 50)
+    output_hash = cache.save_to_cache(src, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(output_hash)
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    tree.mkdir(parents=True)
+    shutil.copy2(src / "f000.txt", tree / "f000.txt")
+    (tree / "f000.txt").chmod(0o444)
+    tree.chmod(0o555)
+    return cache_dir, output_hash
+
+
+def _helper_restore_at_barrier(
+    out: pathlib.Path, output_hash: DirHash, cache_dir: pathlib.Path, barrier: Barrier
+) -> str:
+    barrier.wait()
+    try:
+        restored = cache.restore_from_cache(
+            out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+        )
+    except OSError as e:
+        return f"{type(e).__name__}: {e}"
+    return "ok" if restored else "not restored"
+
+
+def test_concurrent_restores_repair_one_damaged_tree_once(tmp_path: pathlib.Path) -> None:
+    """Several processes restoring through one damaged tree with a read-only root repair it one
+    at a time: each restore succeeds, the tree ends exactly what its hash records, its root
+    read-only again, with no repair's temporary file left inside it."""
+    n_procs = 8
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        for r in range(3):
+            root = tmp_path / f"round{r}"
+            root.mkdir()
+            cache_dir, output_hash = _helper_damaged_tree(root, 400)
+            tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+            barrier = manager.Barrier(n_procs, timeout=60)
+            results = pool.starmap(
+                _helper_restore_at_barrier,
+                [(root / f"out{i}", output_hash, cache_dir, barrier) for i in range(n_procs)],
+            )
+
+            assert results == ["ok"] * n_procs
+            assert sorted(p.name for p in tree.iterdir()) == sorted(
+                e["relpath"] for e in output_hash["manifest"]
+            )
+            assert cache.hash_directory(tree)["hash"] == output_hash["hash"]
+            assert tree.stat().st_mode & 0o777 == 0o555
+            for i in range(n_procs):
+                assert cache.hash_directory(root / f"out{i}", cache_dir=cache_dir) == output_hash
+
+
+def _helper_tree_hash(src: pathlib.Path) -> DirHash:
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "f.txt").write_text(f"{src.name}\n")
+    return cache.hash_directory(src)
+
+
+def test_tree_publish_uses_a_prefix_lock_this_user_cannot_write(tmp_path: pathlib.Path) -> None:
+    """A shared cache directory can hold lock files another user created, which this user can
+    read but not write. A tree publish into that directory still works: a lock file this user
+    cannot write is locked read-only."""
+    cache_dir = tmp_path / "cache"
+    prefix = cache_dir / "ab"
+    first, second = tmp_path / "first", tmp_path / "second"
+    cache._publish_tree(
+        first, prefix / "00000000000001", _helper_tree_hash(first)["manifest"], cache_dir
+    )
+    for lock in prefix.glob("*.lock"):
+        lock.chmod(0o444)
+
+    second_hash = _helper_tree_hash(second)
+    cache._publish_tree(second, prefix / "00000000000002", second_hash["manifest"], cache_dir)
+
+    assert cache.hash_directory(prefix / "00000000000002") == second_hash
+
+
+def test_prefix_lock_is_writable_by_whoever_can_write_its_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The lock file a publish creates carries its directory's write bits, so every user who
+    can create entries in a shared prefix directory can also take its exclusive lock (NFS locks
+    exclusively only a file opened for writing)."""
+    cache_dir = tmp_path / "cache"
+    prefix = cache_dir / "ab"
+    prefix.mkdir(parents=True)
+    prefix.chmod(0o777)
+    src = tmp_path / "src"
+
+    cache._publish_tree(
+        src, prefix / "00000000000001", _helper_tree_hash(src)["manifest"], cache_dir
+    )
+
+    (lock,) = prefix.glob("*.lock")
+    assert lock.stat().st_mode & 0o777 == 0o666
+
+
+def test_sweep_reports_and_skips_a_temporary_entry_it_cannot_remove(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A temporary tree another user's killed pivot left cannot be removed; the sweep reports it
+    and the publish goes on."""
+    cache_dir = tmp_path / "cache"
+    prefix = cache_dir / "ab"
+    stuck = prefix / f"{cache._CACHE_TEMP_PREFIX}theirs"
+    (stuck / "sub").mkdir(parents=True)
+    real_clear = cache._clear_path
+
+    def _clear_unless_theirs(path: pathlib.Path) -> None:
+        if path == stuck:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path / "sub"))
+        real_clear(path)
+
+    monkeypatch.setattr(cache, "_clear_path", _clear_unless_theirs)
+    src = tmp_path / "src"
+    src_hash = _helper_tree_hash(src)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        cache._publish_tree(src, prefix / "00000000000001", src_hash["manifest"], cache_dir)
+
+    assert cache.hash_directory(prefix / "00000000000001") == src_hash
+    assert stuck.is_dir()
+    assert str(stuck) in caplog.text
+
+
+def _helper_crash_during_object_copy(src: pathlib.Path, cache_path: pathlib.Path) -> None:
+    """Simulate a kill while copying a file into the cache."""
+    real_copy2 = shutil.copy2
+
+    def _copy_and_crash(source: str, dest: str) -> None:
+        real_copy2(source, dest)
+        os._exit(73)
+
+    shutil.copy2 = _copy_and_crash
+    cache.copy_to_cache(src, cache_path)
+
+
+def test_copy_to_cache_removes_a_killed_copy_beside_its_objects(tmp_path: pathlib.Path) -> None:
+    """A process killed while copying a file into the cache leaves its temporary file in the
+    prefix directory; a later copy into that directory removes it."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    prefix = tmp_path / "cache" / "ab"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_helper_crash_during_object_copy, args=(src, prefix / "00000000000001")
+    )
+    process.start()
+    process.join(timeout=60)
+    assert process.exitcode == 73
+    assert [n[: len(cache._CACHE_TEMP_PREFIX)] for n in _helper_entries(prefix)] == [
+        cache._CACHE_TEMP_PREFIX
+    ]
+    # The sweep of one prefix directory runs at most once per _CACHE_SWEEP_INTERVAL.
+    os.utime(prefix / cache._PREFIX_LOCK, (0, 0))
+
+    cache.copy_to_cache(src, prefix / "00000000000002")
+
+    assert _helper_entries(prefix) == ["00000000000002"]
+
+
+def test_sweep_removes_an_older_pivots_temporary_files_once_untouched_for_an_hour(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older pivot made its temporaries without the lock, so one may belong to a copy still
+    running: it is removed only once untouched for the sweep interval."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    prefix = tmp_path / "cache" / "ab"
+    prefix.mkdir(parents=True)
+    legacy = ["tmpk3j2h1g0.tmp", ".pivot_download_x9y8z7"]
+    for name in legacy:
+        (prefix / name).write_text("partial")
+
+    cache.copy_to_cache(src, prefix / "00000000000001")
+    assert _helper_entries(prefix) == sorted([*legacy, "00000000000001"])
+
+    os.utime(prefix / cache._PREFIX_LOCK, (0, 0))
+    later = time.time() + 2 * cache._CACHE_SWEEP_INTERVAL
+    monkeypatch.setattr(time, "time", lambda: later)
+    cache.copy_to_cache(src, prefix / "00000000000002")
+
+    assert _helper_entries(prefix) == ["00000000000001", "00000000000002"]
 
 
 # === _make_writable_and_retry Tests ===

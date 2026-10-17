@@ -18,6 +18,7 @@ records each output's content hash.
     files/
       a1/
         b2c3d4e5f6g7h8     # cached file (content-addressed)
+        .pivot_cache.lock  # lock file pivot keeps in each prefix directory
       ...
   stages/
     demo/
@@ -25,6 +26,13 @@ records each output's content hash.
       train.lock           # lock file for stage "demo/train"
   state.lmdb/              # LMDB database
 ```
+
+Each prefix directory also holds a `.pivot_cache.lock` file, and while a file
+or directory is being cached a `.pivot_tmp_*` entry; in `symlink` checkout
+mode, each cached directory tree has a `<hash>.verified` marker and may have
+a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
+`.pivot_tmp_*` entries a killed process leaves (at most once an hour per
+prefix directory). Do not delete these files while pivot runs.
 
 Because the cache is content-addressed:
 
