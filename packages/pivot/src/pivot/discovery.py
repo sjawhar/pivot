@@ -7,14 +7,19 @@ import importlib.machinery
 import importlib.util
 import logging
 import pathlib
+import py_compile
 import sys
 import types as _stdlib_types
-from typing import Final
+from typing import TYPE_CHECKING, Final, override
 
 import cloudpickle
 
 from pivot import exceptions, fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from importlib.abc import PathEntryFinder
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,91 @@ class DiscoveryError(Exception):
 # displaced or inserted, while the active pipeline stays importable for fingerprinting/workers.
 _MISSING_MODULE = object()
 
+# A cached bytecode file's flags word (PEP 552): bit 0 marks it hash-based, bit 1 has every
+# import check that hash against the source.
+_CHECKED_HASH_PYC_FLAGS: Final = 0b11
+
+
+def _is_checked_hash_pyc(path: str) -> bool:
+    """Whether ``path`` holds bytecode for this Python that every import checks by source hash."""
+    try:
+        with open(path, "rb") as cached:
+            header = cached.read(8)
+    except OSError:
+        return False
+    return (
+        header[:4] == importlib.util.MAGIC_NUMBER
+        and int.from_bytes(header[4:8], "little") == _CHECKED_HASH_PYC_FLAGS
+    )
+
+
+class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
+    """Load a project file from bytecode checked against its source's content, not its mtime.
+
+    CPython's default bytecode cache is checked only by the source's size and whole-second mtime,
+    so an edit that keeps the size, made in the second the previous version was written and
+    cached, imports the previous version's code. A checked-hash cache (PEP 552) is checked by the
+    source's content on every import. Other bytecode for the file is replaced with one before the
+    import. The file is compiled from source instead when Python is told not to write bytecode
+    (``sys.dont_write_bytecode``), when the cache cannot be written (a read-only
+    ``__pycache__``), or when the source does not compile, which then reports its syntax error.
+    """
+
+    @override
+    def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
+        source = self.get_filename(fullname)
+        cached = importlib.util.cache_from_source(source)
+        if not _is_checked_hash_pyc(cached):
+            if sys.dont_write_bytecode:
+                return self.source_to_code(self.get_data(source), source)
+            try:
+                py_compile.compile(
+                    source,
+                    cfile=cached,
+                    doraise=True,
+                    invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+                )
+            except (py_compile.PyCompileError, OSError):
+                return self.source_to_code(self.get_data(source), source)
+        return super().get_code(fullname)
+
+
+_project_finder_for = importlib.machinery.FileFinder.path_hook(
+    (importlib.machinery.ExtensionFileLoader, importlib.machinery.EXTENSION_SUFFIXES),
+    (_ProjectSourceLoader, importlib.machinery.SOURCE_SUFFIXES),
+    (importlib.machinery.SourcelessFileLoader, importlib.machinery.BYTECODE_SUFFIXES),
+)
+
+
+def _is_project_dir(path: str, root: pathlib.Path) -> bool:
+    """Whether import path entry ``path`` is a directory of project code under root: not one of
+    the library and tooling directories discovery skips (a virtualenv inside the root)."""
+    try:
+        relative = pathlib.Path(path or ".").resolve().relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return _SCAN_EXCLUDE_DIRS.isdisjoint(relative.parts)
+
+
+def _project_path_hook(root: pathlib.Path) -> Callable[[str], PathEntryFinder]:
+    """A ``sys.path_hooks`` entry that imports project code under root with
+    ``_ProjectSourceLoader`` and declines every other path entry."""
+
+    def hook(path: str) -> PathEntryFinder:
+        if not _is_project_dir(path, root):
+            raise ImportError(f"{path} is not a project directory")
+        return _project_finder_for(path)
+
+    return hook
+
+
+def _forget_project_finders(root: pathlib.Path) -> None:
+    """Drop the import finders cached for project directories under root, so the next import
+    from one asks ``sys.path_hooks`` again."""
+    for entry in list(sys.path_importer_cache):
+        if _is_project_dir(entry, root):
+            del sys.path_importer_cache[entry]
+
 
 @dataclasses.dataclass
 class _ImportSession:
@@ -37,6 +127,7 @@ class _ImportSession:
     path_entry: str
     caller_path_entries: list[tuple[int, str]]
     preexisting_root_modules: dict[str, _stdlib_types.ModuleType]
+    path_hook: Callable[[str], PathEntryFinder]
     # Whether each module file lies under root; every scan of sys.modules shares one resolve.
     file_under_root: dict[str, bool] = dataclasses.field(default_factory=dict)
     owned_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(default_factory=dict)
@@ -69,6 +160,9 @@ def _end_import_session(session: _ImportSession) -> None:
         sys.path.remove(session.path_entry)
     for index, entry in session.caller_path_entries:
         sys.path.insert(min(index, len(sys.path)), entry)
+    if session.path_hook in sys.path_hooks:
+        sys.path_hooks.remove(session.path_hook)
+    _forget_project_finders(session.root)
     importlib.invalidate_caches()
 
 
@@ -93,14 +187,19 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     for index, _entry in reversed(caller_path_entries):
         del sys.path[index]
     sys.path.insert(0, root_str)
+    path_hook = _project_path_hook(root)
     _import_session = _ImportSession(
         root,
         root_str,
         caller_path_entries,
         preexisting_root_modules,
+        path_hook,
         file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
     )
+    # Project code imports through _ProjectSourceLoader while the session lasts.
+    sys.path_hooks.insert(0, path_hook)
+    _forget_project_finders(root)
     importlib.invalidate_caches()
     return _import_session
 
@@ -384,7 +483,11 @@ def _load_pipeline_from_module(
     try:
         if module is None:
             _ensure_parent_modules(module_name, session)
-            spec = importlib.util.spec_from_file_location(module_name, resolved_path)
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                resolved_path,
+                loader=_ProjectSourceLoader(module_name, str(resolved_path)),
+            )
             if spec is None or spec.loader is None:
                 raise DiscoveryError(f"Unable to create import spec for {path}")
             module = importlib.util.module_from_spec(spec)

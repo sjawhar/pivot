@@ -38,6 +38,10 @@ def filter_positive(x: float) -> bool:
     return x > 0.5
 ```
 
+### Project Code Never Loads Through Mtime-Checked Bytecode
+
+CPython reuses a cached `.pyc` while the source's size and whole-second mtime match the ones it recorded, so an edit that keeps a file's size, written in the second its previous version was written and cached, imports the previous code. Discovery loads every file under the project root through `discovery._ProjectSourceLoader`, which caches checked-hash bytecode (PEP 552) instead, checked against the source's content on every import. Code that imports project files itself, outside discovery, gets CPython's default loader back: a test that rewrites a module and imports it again with `importlib.util.spec_from_file_location` should remove `importlib.util.cache_from_source(path)` first.
+
 ## Multiprocessing
 
 ### loky Can't Pickle `mp.Queue()`

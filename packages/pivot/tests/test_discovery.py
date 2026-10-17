@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
+import os
 import pathlib
+import py_compile
 import sys
 import types as _stdlib_types
 
@@ -339,6 +342,116 @@ def test_direct_pipeline_load_starts_fresh_import_session(tmp_path: pathlib.Path
     assert first_pipeline is not None
     assert second_pipeline is not None
     assert second_pipeline.get_stage("second/build")["func"]() == "b"
+
+
+def _helper_rewrite_in_one_second(path: pathlib.Path, text: str) -> None:
+    """Rewrite ``path`` with ``text``, of the same size, as if its previous write, that write's
+    cached bytecode and this write all fell in one whole second: CPython checks cached bytecode
+    only by the source's size and whole-second mtime."""
+    old = path.stat()
+    cached = pathlib.Path(importlib.util.cache_from_source(str(path)))
+    assert cached.is_file(), "the first discovery caches the file's bytecode"
+    assert len(text.encode()) == old.st_size
+    path.write_text(text)
+    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+    os.utime(cached, ns=(old.st_atime_ns, old.st_mtime_ns))
+
+
+@pytest.fixture
+def sibling_project(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """A project whose pipeline.py imports ``VALUE = "alpha"`` from its sibling stages.py."""
+    root = _write_sibling_stage_project(tmp_path / "project", "alpha").parent
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    return root
+
+
+def test_discovery_loads_a_same_size_edit_of_pipeline_py_made_in_the_same_second(
+    sibling_project: pathlib.Path,
+) -> None:
+    """An edit to pipeline.py that keeps its size, made in the second its previous version was
+    written and compiled, is loaded, not the previous version's cached bytecode."""
+    pipeline_path = sibling_project / "pipeline.py"
+    first = discovery.discover_pipeline(project_root=sibling_project)
+    assert first is not None
+    assert first.list_stages() == ["project/build"]
+
+    _helper_rewrite_in_one_second(
+        pipeline_path, pipeline_path.read_text().replace("build", "built")
+    )
+    second = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert second is not None
+    assert second.list_stages() == ["project/built"]
+
+
+def test_discovery_loads_a_same_size_edit_of_an_imported_module_made_in_the_same_second(
+    sibling_project: pathlib.Path,
+) -> None:
+    """The same holds for a project module pipeline.py imports."""
+    first = discovery.discover_pipeline(project_root=sibling_project)
+    assert first is not None
+    assert first.get_stage("project/build")["func"]() == "alpha"
+
+    _helper_rewrite_in_one_second(sibling_project / "stages.py", 'VALUE = "bravo"\n')
+    second = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert second is not None
+    assert second.get_stage("project/build")["func"]() == "bravo"
+
+
+@pytest.mark.parametrize("cache_case", ["pycache", "read-only-pycache", "dont-write-bytecode"])
+def test_discovery_loads_an_edit_over_bytecode_another_tool_cached_in_the_same_second(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, cache_case: str
+) -> None:
+    """Bytecode checked by mtime that an older pivot or a plain ``python`` import cached does not
+    hide a same-size edit made in its second either, even when that bytecode cannot be replaced:
+    ``__pycache__`` is read-only, or Python is told not to write bytecode."""
+    stages = sibling_project / "stages.py"
+    py_compile.compile(str(stages), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    _helper_rewrite_in_one_second(stages, 'VALUE = "bravo"\n')
+    pycache = sibling_project / "__pycache__"
+    if cache_case == "read-only-pycache":
+        pycache.chmod(0o555)
+    if cache_case == "dont-write-bytecode":
+        monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    try:
+        pipeline = discovery.discover_pipeline(project_root=sibling_project)
+    finally:
+        pycache.chmod(0o755)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "bravo"
+
+
+def test_discovery_writes_no_project_bytecode_when_python_is_told_not_to(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``sys.dont_write_bytecode`` (``PYTHONDONTWRITEBYTECODE``, ``python -B``) keeps project
+    directories free of ``__pycache__``, as it does for any import."""
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    pipeline = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "alpha"
+    assert not (sibling_project / "__pycache__").exists()
+
+
+def test_discovery_reuses_the_bytecode_of_an_unchanged_project_file(
+    sibling_project: pathlib.Path,
+) -> None:
+    """A project file that has not changed since discovery cached its bytecode is loaded from
+    that bytecode, not compiled and cached again."""
+    assert discovery.discover_pipeline(project_root=sibling_project) is not None
+    cached = pathlib.Path(importlib.util.cache_from_source(str(sibling_project / "stages.py")))
+    before = cached.stat()
+
+    pipeline = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "alpha"
+    after = cached.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
 
 @pytest.mark.usefixtures("set_project_root")

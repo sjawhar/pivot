@@ -5,7 +5,6 @@ import concurrent.futures
 import contextlib
 import contextvars
 import importlib
-import importlib.util
 import itertools
 import linecache
 import logging
@@ -2469,22 +2468,6 @@ class Engine:
 
         # Invalidate manifest cache entries for changed source files
         fingerprint.invalidate_manifests_for_paths(event["paths"])
-
-        # CPython reuses cached bytecode while the source's size and whole-second mtime match,
-        # so a same-size edit within a second of the last write would reload the old code.
-        for path in event["paths"]:
-            if path.endswith(".py"):
-                cached = pathlib.Path(importlib.util.cache_from_source(path))
-                try:
-                    cached.unlink(missing_ok=True)
-                except OSError as exc:
-                    _logger.warning(
-                        "Could not remove %s (%s); its stale bytecode may be reused if %s "
-                        + "kept its size and mtime second",
-                        cached,
-                        exc.strerror,
-                        path,
-                    )
 
         # Reload registry - returns the old stages on success, the error message on failure
         reload_result = await self._reload_registry()
