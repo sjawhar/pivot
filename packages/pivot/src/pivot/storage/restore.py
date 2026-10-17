@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import enum
 import logging
 import os
 import pathlib
+import tempfile
 from typing import TYPE_CHECKING, TypedDict, TypeGuard
 
 import xxhash
@@ -328,15 +330,20 @@ def restore_file(
                     path=path_str,
                     message=f"Error: {dest_path} - failed to write from remote: {e}",
                 )
-            # Cache the fetched content for future use (best effort)
+            # Cache the fetched content for future use (best effort). An object already there
+            # is kept: another process may be linking it (cache.publish_cache_object).
             try:
                 cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-
-                def write_content(fd: int) -> None:
+                cached_path.parent.mkdir(parents=True, exist_ok=True)
+                fd, staged = tempfile.mkstemp(dir=cached_path.parent, suffix=".tmp")
+                try:
                     with os.fdopen(fd, "wb") as f:
                         f.write(remote_content)
-
-                cache.atomic_write_file(cached_path, write_content, mode=0o444)
+                    os.chmod(staged, 0o444)
+                    _ = cache.publish_cache_object(staged, cached_path)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(staged)
             except OSError:
                 pass  # Caching failure is non-fatal
             return RestoreResult(

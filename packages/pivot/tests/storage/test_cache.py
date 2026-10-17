@@ -2072,10 +2072,8 @@ def test_directory_output_isexec_collision_falls_back_to_copy(tmp_path: pathlib.
     """Two files with identical content but different executable bits hash the same and
     share one cache object. HARDLINK/SYMLINK checkout has no mode of its own, so it can only
     ever reproduce whatever executable bit the shared object already carries; checkout for
-    whichever file disagrees with that must still end up correct, either because
-    ``copy_to_cache`` republishes the shared object from the caller's own bytes before
-    checkout runs, or (when no local bytes are available to repair from) by falling back to
-    COPY, instead of silently serving the wrong permissions.
+    whichever file disagrees with that falls back to COPY instead of silently serving the
+    wrong permissions, and the shared object is never changed to suit it.
     """
     cache_dir = tmp_path / "cache"
     modes = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
@@ -2447,57 +2445,34 @@ def test_copy_to_cache_skips_if_exists(tmp_path: pathlib.Path) -> None:
     assert cache_path.read_text() == "existing content"
 
 
-def test_copy_to_cache_republishes_non_executable_object_when_executable_requested(
+def test_copy_to_cache_keeps_a_non_executable_object_when_executable_requested(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An object cached non-executable (by an older pivot, or by a cold `pivot pull`) is
-    republished when a caller has a fresh, executable copy of the same bytes in hand, instead
-    of staying stuck non-executable forever with no way for a later run to repair it."""
+    """An object cached non-executable (by an older pivot, by a cold `pivot pull`, or by a
+    non-executable file with the same bytes) is kept when an executable copy of the same bytes
+    is cached: a symlink checkout of that other file reads its mode through the object's name,
+    and a hardlink checkout may be linking the object right then."""
     cache_path = tmp_path / "cache" / "ab" / "cdef"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_bytes(b"content")
     cache_path.chmod(0o444)
+    inode = cache_path.stat().st_ino
 
     src = tmp_path / "source.txt"
     src.write_text("content")
 
     cache.copy_to_cache(src, cache_path, executable=True)
 
-    assert cache_path.stat().st_mode & 0o777 == 0o555
-    assert cache_path.read_bytes() == b"content"
-
-
-def test_copy_to_cache_republish_never_mutates_existing_hardlinks(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Republishing a stale cache object swaps in a fresh file at the cache path; it must
-    never chmod the old object in place, since an existing HARDLINK checkout shares its
-    inode and would otherwise flip modes for every file already linked to it."""
-    cache_path = tmp_path / "cache" / "ab" / "cdef"
-    cache_path.parent.mkdir(parents=True)
-    cache_path.write_bytes(b"content")
-    cache_path.chmod(0o444)
-
-    linked = tmp_path / "linked.sh"
-    os.link(cache_path, linked)
-    old_ino = cache_path.stat().st_ino
-
-    src = tmp_path / "source.txt"
-    src.write_text("content")
-    cache.copy_to_cache(src, cache_path, executable=True)
-
-    assert cache_path.stat().st_ino != old_ino, (
-        "republish must write a fresh object, not chmod in place"
-    )
-    assert linked.stat().st_ino == old_ino, "an existing hardlink must keep its old inode"
-    assert linked.stat().st_mode & 0o777 == 0o444, "an existing hardlink must keep its old mode"
+    assert cache_path.stat().st_ino == inode
+    assert cache_path.stat().st_mode & 0o777 == 0o444
+    assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
 
 
 def test_copy_to_cache_leaves_executable_object_alone_when_non_executable_requested(
     tmp_path: pathlib.Path,
 ) -> None:
     """An object already cached executable is never demoted by a later non-executable
-    request: only an executable request may repair a wrong-moded object."""
+    request."""
     cache_path = tmp_path / "cache" / "ab" / "cdef"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_bytes(b"content")
@@ -2539,13 +2514,13 @@ def test_copy_to_cache_keeps_an_object_another_writer_published_first(
     assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
 
 
-@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP, errno.ENOSYS])
 @pytest.mark.parametrize(
-    ("existing_mode", "executable", "kept"),
+    ("existing_mode", "executable", "expected_mode"),
     [
-        pytest.param(None, False, False, id="absent"),
-        pytest.param(0o444, False, True, id="present"),
-        pytest.param(0o444, True, False, id="present-needs-exec-bit"),
+        pytest.param(None, False, 0o444, id="absent"),
+        pytest.param(None, True, 0o555, id="absent-executable"),
+        pytest.param(0o444, True, 0o444, id="present"),
     ],
 )
 def test_copy_to_cache_without_hard_links(
@@ -2554,11 +2529,11 @@ def test_copy_to_cache_without_hard_links(
     link_errno: int,
     existing_mode: int | None,
     executable: bool,
-    kept: bool,
+    expected_mode: int,
 ) -> None:
-    """On a filesystem that refuses link() (vfat, many SMB and FUSE mounts), a new object is
-    renamed into place, an existing one is kept, and one missing a needed executable bit is
-    still republished."""
+    """On a filesystem that refuses link() (vfat, many SMB and FUSE mounts; a FUSE mount with
+    no link handler returns ENOSYS before Linux 6.15), a new object is renamed into place and
+    an existing one is kept."""
     src = tmp_path / "out.txt"
     src.write_text("content")
     cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
@@ -2577,113 +2552,93 @@ def test_copy_to_cache_without_hard_links(
     cache.copy_to_cache(src, cache_path, executable=executable)
 
     assert cache_path.read_text() == "content"
-    assert cache_path.stat().st_mode & 0o777 == (0o555 if executable else 0o444)
-    assert (cache_path.stat().st_ino == inode) is kept
+    assert cache_path.stat().st_mode & 0o777 == expected_mode
+    if inode is not None:
+        assert cache_path.stat().st_ino == inode
     assert [p.name for p in cache_path.parent.iterdir()] == [cache_path.name], "no temp file left"
 
 
-def _helper_republish_executable_during_link(
-    monkeypatch: pytest.MonkeyPatch,
-    cache_path: pathlib.Path,
-    workspace: pathlib.Path,
-    *,
-    orphaned: bool,
-) -> list[bool]:
-    """Make the first checkout link into ``workspace`` race an executable republish of
-    ``cache_path``; the returned list holds True once the race has run.
+@pytest.mark.parametrize("link_errno", [errno.EIO, errno.ENOSPC])
+def test_copy_to_cache_raises_a_failed_link(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, link_errno: int
+) -> None:
+    """A link() that fails for any reason but missing hard-link support is an error, and
+    publishes nothing."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
 
-    With ``orphaned``, the republish's rename lands between link()'s lookup of the cache path
-    and the link itself, so link() fails as Linux fails it: the object it found has no name
-    left. Otherwise the rename lands first and link() finds the new object.
-    """
-    real_link = os.link
-    raced = list[bool]()
-    src = workspace.parent / "republish-source"
-    src.write_bytes(cache_path.read_bytes())
+    def _fail_link(source: object, dest: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
 
-    def _link(source: str, dest: str) -> None:
-        if not raced and pathlib.Path(dest).parent == workspace:
-            raced.append(True)
-            cache.copy_to_cache(src, cache_path, executable=True)
-            if orphaned:
-                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(source))
-        real_link(source, dest)
+    monkeypatch.setattr(os, "link", _fail_link)
 
-    monkeypatch.setattr(os, "link", _link)
-    return raced
+    with pytest.raises(OSError) as raised:
+        cache.copy_to_cache(src, cache_path)
+
+    assert raised.value.errno == link_errno
+    assert list(cache_path.parent.iterdir()) == [], "nothing published, no temp file left"
 
 
-def _helper_non_executable_object(tmp_path: pathlib.Path) -> pathlib.Path:
+@pytest.mark.parametrize("link_errno", [errno.ENOSYS, errno.ENOTSUP, errno.EMLINK])
+def test_hardlink_checkout_falls_through_a_link_the_filesystem_cannot_make(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, link_errno: int
+) -> None:
+    """A filesystem without hard-link support (ENOSYS, ENOTSUP), or an object at the
+    filesystem's link limit (EMLINK), moves checkout on to the next mode, as EXDEV does."""
     cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_text("content")
-    cache_path.chmod(0o444)
-    (tmp_path / "data").mkdir()
-    return cache_path
+    target = tmp_path / "target.txt"
 
+    def _refuse_link(source: object, dest: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
 
-def test_hardlink_checkout_links_the_object_republished_under_it(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """link() looks the cache path up, then links the object it found. A republish renaming a
-    new object over the path in between leaves the found object with no name, and Linux
-    refuses the link with ENOENT though the path never stopped naming an object. Checkout
-    links the object that replaced it."""
-    cache_path = _helper_non_executable_object(tmp_path)
-    target = tmp_path / "data" / "out.txt"
-    raced = _helper_republish_executable_during_link(
-        monkeypatch, cache_path, target.parent, orphaned=True
-    )
-
-    cache._checkout_with_fallback(target, cache_path, [cache.CheckoutMode.HARDLINK])
-
-    assert raced == [True]
-    assert target.stat().st_ino == cache_path.stat().st_ino
-
-
-@pytest.mark.parametrize("orphaned", [True, False], ids=["finds-orphan", "finds-new-object"])
-def test_hardlink_checkout_racing_a_republish_keeps_the_entry_mode(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, orphaned: bool
-) -> None:
-    """A directory entry's checkout reads the object's executable bit, then links it. A
-    republish landing in between swaps in an object with the other bit; the entry still gets
-    the mode its manifest records, here by falling back to COPY."""
-    cache_path = _helper_non_executable_object(tmp_path)
-    target = tmp_path / "data" / "run.sh"
-    raced = _helper_republish_executable_during_link(
-        monkeypatch, cache_path, target.parent, orphaned=orphaned
-    )
+    monkeypatch.setattr(os, "link", _refuse_link)
 
     cache._checkout_with_fallback(
-        target,
-        cache_path,
-        [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY],
-        executable=False,
+        target, cache_path, [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY]
     )
 
-    assert raced == [True]
     assert target.read_text() == "content"
-    assert target.stat().st_mode & 0o777 == 0o644
+    assert target.stat().st_ino != cache_path.stat().st_ino
 
 
-def test_hardlink_only_checkout_racing_a_republish_refuses_the_wrong_mode(
+def test_symlinked_entry_keeps_its_mode_when_the_same_bytes_are_cached_executable(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With no COPY to fall back to, a link that ends up with the republished object's other
-    executable bit raises instead of leaving the entry with the wrong mode."""
-    cache_path = _helper_non_executable_object(tmp_path)
-    target = tmp_path / "data" / "run.sh"
-    _ = _helper_republish_executable_during_link(
-        monkeypatch, cache_path, target.parent, orphaned=False
-    )
+    """With the cache on another device, the default checkout order symlinks each directory
+    entry, and the entry reads its mode through the cache object's name. A later directory
+    output holding the same bytes as an executable leaves that object alone: the earlier
+    entry stays non-executable and its directory keeps its hash, and the executable gets a
+    copy of its own."""
+    cache_dir = tmp_path / "cache"
+    real_link = os.link
 
-    with pytest.raises(exceptions.CacheModeCollisionError, match="isexec=False"):
-        cache._checkout_with_fallback(
-            target, cache_path, [cache.CheckoutMode.HARDLINK], executable=False
-        )
+    def _cross_device_link(source: str, dest: str, **kwargs: Any) -> None:
+        if not pathlib.Path(dest).is_relative_to(cache_dir):
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+        real_link(source, dest, **kwargs)
 
-    assert not target.exists()
-    assert [p.name for p in target.parent.iterdir()] == [], "no staged link left"
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    content = "#!/bin/sh\necho hi\n"
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "run.sh").write_text(content)
+    plain_hash = cache.save_to_cache(plain, cache_dir)
+    assert (plain / "run.sh").is_symlink()
+
+    tool = tmp_path / "tool"
+    tool.mkdir()
+    (tool / "run.sh").write_text(content)
+    (tool / "run.sh").chmod(0o755)
+    cache.save_to_cache(tool, cache_dir)
+
+    assert not os.access(plain / "run.sh", os.X_OK)
+    assert cache.hash_directory(plain, cache_dir=cache_dir)["hash"] == plain_hash["hash"]
+    assert os.access(tool / "run.sh", os.X_OK)
+    assert not (tool / "run.sh").is_symlink()
 
 
 def _helper_same_tree_twice(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
@@ -2755,6 +2710,69 @@ def test_symlink_tree_appears_only_once_complete(
     assert out.resolve() == tree.resolve()
     assert (tree / "run.sh").stat().st_mode & 0o777 == 0o555
     assert (tree / "sub" / "f.txt").stat().st_mode & 0o777 == 0o444
+
+
+def _helper_crash_during_tree_copy(out: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    """Simulate a kill while copying a directory output into the cache as a SYMLINK tree."""
+    real_copytree = shutil.copytree
+
+    def _copy_and_crash(source: str, dest: str, *args: Any, **kwargs: Any) -> object:
+        real_copytree(source, dest, *args, **kwargs)
+        os._exit(73)
+
+    shutil.copytree = _copy_and_crash
+    _ = cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+
+def test_symlink_tree_publish_removes_a_killed_publishers_copy(tmp_path: pathlib.Path) -> None:
+    """A process killed while copying a tree into the cache leaves its copy beside the tree's
+    cache name, never under it; the next publish into that directory removes the copy."""
+    cache_dir = tmp_path / "cache"
+    out, _ = _helper_same_tree_twice(tmp_path)
+    tree = cache.get_cache_path(cache_dir, cache.hash_directory(out)["hash"])
+    process = multiprocessing.get_context("spawn").Process(
+        target=_helper_crash_during_tree_copy, args=(out, cache_dir)
+    )
+    process.start()
+    process.join(timeout=60)
+
+    assert process.exitcode == 73
+    assert not tree.exists()
+    assert len(list(tree.parent.iterdir())) == 1, "the killed publisher's copy"
+
+    cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+    assert out.resolve() == tree.resolve()
+    assert sorted(p.name for p in tree.parent.iterdir()) == sorted(
+        [tree.name, cache._tree_layout_marker(tree).name]
+    )
+
+
+def test_symlink_tree_publish_keeps_copies_it_cannot_prove_abandoned(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A copy whose publisher is still running, or that a publisher on another host sharing the
+    cache made, is left alone."""
+    cache_dir = tmp_path / "cache"
+    out, _ = _helper_same_tree_twice(tmp_path)
+    tree = cache.get_cache_path(cache_dir, cache.hash_directory(out)["hash"])
+    exited = multiprocessing.get_context("spawn").Process(target=int)
+    exited.start()
+    exited.join(timeout=60)
+    host = cache._host_tag()
+    other_host = "0" * 8 if host != "0" * 8 else "f" * 8
+    tree.parent.mkdir(parents=True)
+    running = tree.parent / f"{cache._TREE_TEMP_PREFIX}{host}_{os.getpid()}_abc"
+    elsewhere = tree.parent / f"{cache._TREE_TEMP_PREFIX}{other_host}_{exited.pid}_abc"
+    abandoned = tree.parent / f"{cache._TREE_TEMP_PREFIX}{host}_{exited.pid}_abc"
+    for copy in (running, elsewhere, abandoned):
+        copy.mkdir()
+
+    cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+    assert running.is_dir()
+    assert elsewhere.is_dir()
+    assert not abandoned.exists()
 
 
 # === _make_writable_and_retry Tests ===
