@@ -61,22 +61,25 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
     CPython's default bytecode cache is checked only by the source's size and whole-second mtime,
     so an edit that keeps the size, made in the second the previous version was written and
     cached, imports the previous version's code. A checked-hash cache (PEP 552) is checked by the
-    source's content on every import, by this process and by any other that imports the file,
-    such as a worker importing a stage's module by name. Other bytecode for the file is replaced
-    with one before the import.
+    source's content on every import, by this process and by any other that imports the file.
+    Other bytecode for the file is replaced with one before the import, or removed when Python
+    is told not to write bytecode (``sys.dont_write_bytecode``), so no other process reads it.
 
-    The file is compiled from source instead when the cache cannot be written (a read-only
-    ``__pycache__``), when the source does not compile (which reports its syntax error), when
-    Python is told not to write bytecode (``sys.dont_write_bytecode``; other bytecode for the
-    file is then removed, so no other process reads it either), and when Python is told never to
-    check hash-based bytecode (``--check-hash-based-pycs never``).
+    The file is compiled from source when the cache cannot be written (a read-only
+    ``__pycache__``), when the source does not compile (which reports its syntax error), under
+    ``sys.dont_write_bytecode``, and when Python is told never to check hash-based bytecode
+    (``--check-hash-based-pycs never``). Its bytecode is replaced in that last case too: pivot's
+    workers do not inherit the flag, and they read it.
+
+    A file whose resolved path is a library's or pivot's, as a library package symlinked into
+    the project root, loads as CPython loads it, and its bytecode is left alone.
     """
 
     @override
     def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
         source = self.get_filename(fullname)
-        if _imp.check_hash_based_pycs == "never":
-            return self.source_to_code(self.get_data(source), source)
+        if _is_library_or_pivot(pathlib.Path(source).resolve()):
+            return super().get_code(fullname)
         cached = importlib.util.cache_from_source(source)
         if not _is_checked_hash_pyc(cached):
             if sys.dont_write_bytecode:
@@ -92,6 +95,8 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
                 )
             except (py_compile.PyCompileError, OSError):
                 return self.source_to_code(self.get_data(source), source)
+        if _imp.check_hash_based_pycs == "never":
+            return self.source_to_code(self.get_data(source), source)
         return super().get_code(fullname)
 
 
@@ -102,6 +107,12 @@ _project_finder_for = importlib.machinery.FileFinder.path_hook(
 )
 
 _PIVOT_PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def _is_library_or_pivot(resolved: pathlib.Path) -> bool:
+    """Whether resolved file or directory ``resolved`` is a library's
+    (``fingerprint.is_library_path``) or pivot's own source, neither of which is user code."""
+    return fingerprint.is_library_path(resolved) or resolved.is_relative_to(_PIVOT_PACKAGE_DIR)
 
 
 def _holds_user_code(path: str, root: pathlib.Path) -> bool:
@@ -118,7 +129,7 @@ def _holds_user_code(path: str, root: pathlib.Path) -> bool:
         resolved = pathlib.Path(path or ".").resolve()
     except OSError:
         return False
-    if fingerprint.is_library_path(resolved) or resolved.is_relative_to(_PIVOT_PACKAGE_DIR):
+    if _is_library_or_pivot(resolved):
         return False
     if not resolved.is_relative_to(root):
         return True
@@ -143,6 +154,15 @@ def _forget_user_code_finders(root: pathlib.Path) -> None:
     for entry in list(sys.path_importer_cache):
         if _holds_user_code(entry, root):
             del sys.path_importer_cache[entry]
+
+
+def _install_path_hook(root: pathlib.Path) -> Callable[[str], PathEntryFinder]:
+    """Import user code through ``_ProjectSourceLoader`` from now on; return the hook."""
+    path_hook = _project_path_hook(root)
+    sys.path_hooks.insert(0, path_hook)
+    _forget_user_code_finders(root)
+    importlib.invalidate_caches()
+    return path_hook
 
 
 @dataclasses.dataclass
@@ -211,21 +231,33 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     for index, _entry in reversed(caller_path_entries):
         del sys.path[index]
     sys.path.insert(0, root_str)
-    path_hook = _project_path_hook(root)
     _import_session = _ImportSession(
         root,
         root_str,
         caller_path_entries,
         preexisting_root_modules,
-        path_hook,
+        # User code imports through _ProjectSourceLoader while the session lasts.
+        _install_path_hook(root),
         file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
     )
-    # User code imports through _ProjectSourceLoader while the session lasts.
-    sys.path_hooks.insert(0, path_hook)
-    _forget_user_code_finders(root)
-    importlib.invalidate_caches()
     return _import_session
+
+
+def import_session_root() -> pathlib.Path | None:
+    """The project root of the import session the last discovery started, if it lasts."""
+    return None if _import_session is None else _import_session.root
+
+
+def install_user_code_loader(root: str) -> None:
+    """Import user code through ``_ProjectSourceLoader`` in this process from now on, as the
+    import session for ``root`` does: the initializer of each worker (``executor.core``).
+
+    A worker imports user code by name: a stage's module that discovery could not send by
+    value (one outside the root, or under it in a ``src`` layout) and any module a stage body
+    imports. The session's loader is installed only in the process that discovered.
+    """
+    _install_path_hook(pathlib.Path(root))
 
 
 def _displace_module(module_name: str, session: _ImportSession) -> None:

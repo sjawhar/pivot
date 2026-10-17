@@ -1,6 +1,6 @@
 # Pivot Executor - Development Guidelines
 
-Workers execute in separate processes via `loky.get_reusable_executor()`.
+Workers execute in separate processes via `loky.get_reusable_executor()`, which pivot calls through `core._get_executor()` to create or reuse the pool: while a discovery's import session lasts, the pool's initializer (`discovery.install_user_code_loader`) has each worker import user code through discovery's checked loader, and loky replaces a live pool whose initializer arguments differ.
 
 ## WorkerStageInfo Contract
 

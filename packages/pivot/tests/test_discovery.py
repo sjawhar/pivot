@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import py_compile
+import subprocess
 import sys
 import types as _stdlib_types
 from typing import TYPE_CHECKING
@@ -465,6 +466,33 @@ def test_discovery_compiles_from_source_when_hash_based_bytecode_is_never_checke
     assert pipeline.get_stage("project/build")["func"]() == "bravo"
 
 
+def test_never_checked_mode_still_replaces_bytecode_another_tool_cached(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``--check-hash-based-pycs never`` discovery compiles from source, and it still
+    replaces the mtime-checked bytecode another tool cached: pivot's workers do not inherit the
+    flag, and another process importing the module by name, as a worker does, reads that
+    bytecode."""
+    stages = sibling_project / "stages.py"
+    py_compile.compile(str(stages), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    _helper_rewrite_in_one_second(stages, 'VALUE = "bravo"\n')
+    monkeypatch.setattr(_imp, "check_hash_based_pycs", "never")
+
+    pipeline = discovery.discover_pipeline(project_root=sibling_project)
+
+    assert pipeline is not None
+    assert pipeline.get_stage("project/build")["func"]() == "bravo"
+    assert discovery._is_checked_hash_pyc(importlib.util.cache_from_source(str(stages)))
+    other_process = subprocess.run(
+        [sys.executable, "-c", "import stages; print(stages.VALUE)"],
+        cwd=sibling_project,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert other_process.stdout.strip() == "bravo"
+
+
 _MODULES_BY_KIND = {
     "nested package": "pkg.sub.mod",
     "namespace package": "nspkg.inner.leaf",
@@ -536,6 +564,39 @@ def test_discovery_loads_user_code_and_only_user_code_through_the_checked_loader
         source = sys.modules[_MODULES_BY_KIND[kind]].__file__
         assert source is not None
         assert not discovery._is_checked_hash_pyc(importlib.util.cache_from_source(source)), kind
+
+
+@pytest.mark.parametrize("dont_write_bytecode", [False, True], ids=["write", "dont-write"])
+def test_library_package_symlinked_into_the_root_keeps_its_bytecode(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, dont_write_bytecode: bool
+) -> None:
+    """A library package symlinked into the root is found on the root's import path, but its
+    files resolve into site-packages: it loads as CPython loads it, and the bytecode its
+    install cached there is neither rewritten as checked-hash bytecode nor removed."""
+    package = tmp_path / "env" / "lib" / "python3.13" / "site-packages" / "symlinked_lib"
+    package.mkdir(parents=True)
+    init = package / "__init__.py"
+    init.write_text('VALUE = "lib"\n')
+    py_compile.compile(str(init), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    library_bytecode = pathlib.Path(importlib.util.cache_from_source(str(init)))
+    installed = library_bytecode.read_bytes()
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "symlinked_lib").symlink_to(package, target_is_directory=True)
+    (root / "pipeline.py").write_text(
+        "import symlinked_lib\n\nfrom pivot.compose import Pipeline\n\n"
+        + "with Pipeline('layout') as pipeline:\n    pass\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    monkeypatch.setattr(sys, "dont_write_bytecode", dont_write_bytecode)
+    try:
+        assert discovery.discover_pipeline(project_root=root) is not None
+        assert sys.modules["symlinked_lib"].VALUE == "lib"
+    finally:
+        sys.modules.pop("symlinked_lib", None)
+
+    assert library_bytecode.is_file(), "the library's bytecode is not removed"
+    assert library_bytecode.read_bytes() == installed, "nor rewritten"
 
 
 def test_user_code_rule_skips_libraries_the_stdlib_and_pivot(
