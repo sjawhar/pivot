@@ -66,6 +66,18 @@ When multiple `pivot` processes share the same StateDB:
   temporary directory and swap it. Both run under the target's restore lock, and each
   first removes the token-tagged entries a killed restore of the same target left.
 
+## Publishing Cache Objects
+
+- Publish a new cache object with `cache.publish_cache_object`, which links it into place and
+  never replaces an object already there. Never rename over a published object's name: a
+  hardlink checkout looks the name up, then links the inode it found, and once a rename takes
+  that inode's last name Linux fails the link with ENOENT, though the name never went missing.
+- The one replace is `copy_to_cache`'s executable republish; a hardlink checkout that loses its
+  object to it looks the name up again (`_link_cache_object`) and checks the executable bit of
+  the object it actually linked.
+- A whole-directory SYMLINK tree is built under a temporary name beside its cache name and
+  renamed into place, because a restore symlinks to a tree as soon as its name exists.
+
 ## Path Storage
 
 All paths stored in the database must be **relative** to ensure portability across machines and correct cache behavior.

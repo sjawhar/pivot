@@ -497,6 +497,37 @@ def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str 
         return None  # Includes ELOOP for circular symlinks
 
 
+# link() errors on filesystems without hard links (vfat, exFAT, many SMB and FUSE mounts).
+_NO_HARDLINK_ERRNO = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP})
+
+
+def publish_cache_object(
+    staged: str | os.PathLike[str], cache_path: str | os.PathLike[str]
+) -> bool:
+    """Publish the complete file ``staged`` as the cache object ``cache_path`` unless an object
+    is already published there; return whether ``staged`` was published.
+
+    Objects are content-addressed, so one already there holds the same bytes. It is never
+    replaced: a checkout hardlinking it has looked ``cache_path`` up and is about to link the
+    inode it found, and Linux refuses that link with ENOENT once a rename over ``cache_path``
+    has taken the inode's last name, though the name itself never went missing. link()
+    publishes without replacing. The caller removes ``staged`` afterwards.
+    """
+    try:
+        os.link(staged, cache_path)
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        if exc.errno not in _NO_HARDLINK_ERRNO:
+            raise
+        # No hard links here, so nothing can be hardlinking the object either:
+        # rename unless another process already published it.
+        if os.path.exists(cache_path):
+            return False
+        os.replace(staged, cache_path)
+    return True
+
+
 def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bool = False) -> None:
     """Atomically copy file to cache with read-only permissions.
 
@@ -505,11 +536,15 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
     straight through to whatever mode the cache object carries, and only COPY checkout
     re-chmods afterwards (see ``_stage_checkout``).
 
+    A new object is published with ``publish_cache_object``, so a writer that finds another
+    writer's copy of the same bytes already published keeps that one.
+
     An existing object missing the executable bit is republished (a fresh temp file atomically
     replacing the old one, never a chmod in place: existing hardlinks keep the old inode and
     its mode) when ``executable`` is True, so an object an older pivot or a remote pull cached
     non-executable can still be repaired by a caller who has the right bytes in hand. An
-    object already executable, or a non-executable request, is left alone.
+    object already executable, or a non-executable request, is left alone. A hardlink checkout
+    racing the republish links the old object or the new one (``_link_cache_object``).
     """
     if cache_path.exists() and (not executable or _cache_object_isexec(cache_path)):
         return
@@ -521,13 +556,53 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
         os.close(fd)
         shutil.copy2(src, tmp_path)
         os.chmod(tmp_path, 0o555 if executable else 0o444)
-        tmp.replace(cache_path)
-    except BaseException:
+        if (
+            not publish_cache_object(tmp, cache_path)
+            and executable
+            and not _cache_object_isexec(cache_path)
+        ):
+            tmp.replace(cache_path)
+    finally:
         tmp.unlink(missing_ok=True)
-        raise
 
 
 FALLBACK_ERRNO = frozenset({errno.EXDEV, errno.EPERM, errno.EACCES})
+
+
+def _link_cache_object(cache_path: pathlib.Path, link_path: pathlib.Path) -> None:
+    """Hardlink the object published at cache_path to link_path.
+
+    link() looks cache_path up, then links the inode it found. When a republish
+    (``copy_to_cache``) renames a new object over cache_path in between, that inode has lost its
+    last name and Linux refuses the link with ENOENT, though cache_path names an object
+    throughout. Looking the name up again links the object that replaced it; failing again
+    takes another republish, and each one leaves an object that needs none.
+    """
+    while True:
+        try:
+            os.link(cache_path, link_path)
+            return
+        except FileNotFoundError:
+            if not cache_path.exists() or not link_path.parent.is_dir():
+                raise
+
+
+class _ObjectModeMismatchError(Exception):
+    """A cache object's executable bit is not the one a directory entry's checkout needs."""
+
+    isexec: bool
+
+    def __init__(self, isexec: bool) -> None:
+        super().__init__(isexec)
+        self.isexec = isexec
+
+
+def _require_object_mode(path: pathlib.Path, executable: bool) -> None:
+    """Raise ``_ObjectModeMismatchError`` if the file at path (a cache object, or a hardlink to
+    one) is present with an executable bit other than ``executable``."""
+    isexec = _cache_object_isexec(path)
+    if isexec is not None and isexec != executable:
+        raise _ObjectModeMismatchError(isexec)
 
 
 def _stage_checkout(
@@ -541,7 +616,11 @@ def _stage_checkout(
     if checkout_mode == CheckoutMode.SYMLINK:
         tmp_path.symlink_to(cache_path.resolve())
     elif checkout_mode == CheckoutMode.HARDLINK:
-        os.link(cache_path, tmp_path)
+        _link_cache_object(cache_path, tmp_path)
+        if executable is not None:
+            # The link holds whichever object cache_path named when link() looked it up, which
+            # a republish since the caller checked the mode may have swapped for the other one.
+            _require_object_mode(tmp_path, executable)
     else:
         shutil.copy2(cache_path, tmp_path)
         os.chmod(tmp_path, 0o755 if executable else 0o644)
@@ -739,7 +818,8 @@ def _checkout_with_fallback(
     content-only), and a cache object a remote pull populated by hash alone carries no
     executable bit at all. Either way the shared object cannot represent two permissions at
     once, so checkout falls through to the next mode; only COPY makes a private copy and can
-    always re-chmod it correctly.
+    always re-chmod it correctly. A HARDLINK checks the object it linked as well, since a
+    republish between the check and the link can swap in an object with the other bit.
 
     ``display_path`` names the file in a raised error when ``path`` is a restore-only staging
     location (a caller checking out into a scratch directory before an atomic swap); it
@@ -752,25 +832,24 @@ def _checkout_with_fallback(
         is_last = i == len(checkout_modes) - 1
         if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
             return
-        if executable is not None and mode in (CheckoutMode.HARDLINK, CheckoutMode.SYMLINK):
-            cached_isexec = _cache_object_isexec(cache_path)
-            if cached_isexec is not None and cached_isexec != executable:
-                if is_last:
-                    cached_state = "executable" if cached_isexec else "non-executable"
-                    raise exceptions.CacheModeCollisionError(
-                        f"Cache object {cache_path} is recorded {cached_state}, but {display} "
-                        + f"needs isexec={executable}."
-                    )
-                logger.debug(
-                    f"Cache object {cache_path} is executable={cached_isexec}, "
-                    + f"need {executable}; skipping {mode.value}"
-                )
-                continue
         try:
+            if executable is not None and mode in (CheckoutMode.HARDLINK, CheckoutMode.SYMLINK):
+                _require_object_mode(cache_path, executable)
             _checkout_from_cache(
                 path, cache_path, mode, executable=executable, staging_path=staging_path
             )
             return
+        except _ObjectModeMismatchError as mismatch:
+            if is_last:
+                cached_state = "executable" if mismatch.isexec else "non-executable"
+                raise exceptions.CacheModeCollisionError(
+                    f"Cache object {cache_path} is recorded {cached_state}, but {display} "
+                    + f"needs isexec={executable}."
+                ) from None
+            logger.debug(
+                f"Cache object {cache_path} is executable={mismatch.isexec}, "
+                + f"need {executable}; skipping {mode.value}"
+            )
         except OSError as e:
             if e.errno not in FALLBACK_ERRNO or is_last:
                 raise
@@ -914,6 +993,53 @@ def _save_directory_to_cache(
     return output_hash
 
 
+def _publish_tree(
+    path: pathlib.Path,
+    cache_dir_path: pathlib.Path,
+    manifest: list[DirManifestEntry],
+    cache_dir: pathlib.Path,
+) -> None:
+    """Copy directory output ``path`` into the cache as the whole-directory SYMLINK tree
+    ``cache_dir_path``.
+
+    A restore symlinks to a tree as soon as its name exists, so the tree is built under a
+    temporary name beside it and renamed into place complete. rename() will not replace a
+    directory that holds anything, so a tree another writer published first is kept and this
+    copy dropped.
+    """
+
+    def _user_symlinks(directory: str, names: list[str]) -> list[str]:
+        # Not stored (see _scandir_recursive); copytree would copy each target.
+        return [
+            name
+            for name in names
+            if (link := pathlib.Path(directory, name)).is_symlink()
+            and _cache_object_key(link, cache_dir) is None
+        ]
+
+    cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
+    staged = pathlib.Path(tempfile.mkdtemp(dir=cache_dir_path.parent, suffix=".tmp"))
+    try:
+        shutil.copytree(path, staged, ignore=_user_symlinks, dirs_exist_ok=True)
+        isexec_by_relpath = {entry["relpath"]: entry["isexec"] for entry in manifest}
+        for f in staged.rglob("*"):
+            # Skip symlinks to avoid changing permissions on target files outside cache
+            if f.is_file() and not f.is_symlink():
+                executable = isexec_by_relpath.get(str(f.relative_to(staged)), False)
+                os.chmod(f, 0o555 if executable else 0o444)
+        os.chmod(staged, 0o555)
+        try:
+            staged.rename(cache_dir_path)
+        except OSError as e:
+            if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
+            return
+        with contextlib.suppress(OSError):
+            _tree_layout_marker(cache_dir_path).touch()
+    finally:
+        _clear_path(staged)
+
+
 def _store_directory(
     path: pathlib.Path,
     output_hash: DirHash,
@@ -935,28 +1061,7 @@ def _store_directory(
             # SYMLINK mode: cache entire directory, symlink to it
             cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
             if not cache_dir_path.exists():
-                cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
-
-                def _user_symlinks(directory: str, names: list[str]) -> list[str]:
-                    # Not stored (see _scandir_recursive); copytree would copy each target.
-                    return [
-                        name
-                        for name in names
-                        if (link := pathlib.Path(directory, name)).is_symlink()
-                        and _cache_object_key(link, cache_dir) is None
-                    ]
-
-                shutil.copytree(path, cache_dir_path, ignore=_user_symlinks)
-                isexec_by_relpath = {entry["relpath"]: entry["isexec"] for entry in manifest}
-                for f in cache_dir_path.rglob("*"):
-                    # Skip symlinks to avoid changing permissions on target files outside cache
-                    if f.is_file() and not f.is_symlink():
-                        relpath = str(f.relative_to(cache_dir_path))
-                        executable = isexec_by_relpath.get(relpath, False)
-                        os.chmod(f, 0o555 if executable else 0o444)
-                os.chmod(cache_dir_path, 0o555)
-                with contextlib.suppress(OSError):
-                    _tree_layout_marker(cache_dir_path).touch()
+                _publish_tree(path, cache_dir_path, manifest, cache_dir)
 
             # A tree an older pivot built keeps its 0o444-everywhere files, and entries its hash
             # does not record, forever otherwise: its name never changes, so this branch never

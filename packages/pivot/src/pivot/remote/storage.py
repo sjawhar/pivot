@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import errno
 import logging
 import os
 import re
@@ -13,6 +12,7 @@ import xxhash
 
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
+from pivot.storage import cache
 from pivot.types import TransferResult
 
 if TYPE_CHECKING:
@@ -37,9 +37,6 @@ STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 BULK_EXISTS_LIST_THRESHOLD = 50
 
 _HEX_PATTERN = re.compile(r"^[a-f0-9]{16}$")
-
-# link() errors on filesystems without hard links (vfat, exFAT, many SMB and FUSE mounts).
-_NO_HARDLINK_ERRNO = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 # Cached S3 config to avoid re-parsing config on every call.
 # Safe without locking - asyncio is single-threaded, worst case race just
@@ -236,7 +233,6 @@ async def _atomic_download(
     """
     local_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
-    move_succeeded = False
     try:
         try:
             response = await s3.get_object(Bucket=bucket, Key=key)
@@ -269,26 +265,12 @@ async def _atomic_download(
             os.chmod(tmp_path, 0o444)
         if overwrite:
             os.replace(tmp_path, local_path)
-            move_succeeded = True
         else:
-            # link() refuses an existing name, so a concurrent reader never sees the
-            # entry disappear. The temp file is removed below either way.
-            try:
-                os.link(tmp_path, local_path)
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                if exc.errno not in _NO_HARDLINK_ERRNO:
-                    raise
-                # No hard links here, so nothing can be hardlinking the entry either:
-                # rename unless another process already promoted it.
-                if not os.path.exists(local_path):
-                    os.replace(tmp_path, local_path)
-                    move_succeeded = True
+            _ = cache.publish_cache_object(tmp_path, local_path)
     finally:
         if fd >= 0:
             os.close(fd)
-        if not move_succeeded and os.path.exists(tmp_path):
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_path)
 
 
