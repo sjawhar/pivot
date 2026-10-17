@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.3.6 (2026-10-17)
+
+### Bug Fixes
+
+- **executor**: Run a stage whose old lock cannot record the empty directories its output holds
+  ([#483](https://github.com/sjawhar/pivot/pull/483),
+  [`8bb8e4f`](https://github.com/sjawhar/pivot/commit/8bb8e4f4ec80a44e4edb1aeb3a21fe63449bda31))
+
+### Documentation
+
+- **storage**: State where flock leaves temporary entries unprotected; pin the vanished-temp test
+  ([#481](https://github.com/sjawhar/pivot/pull/481),
+  [`acf266b`](https://github.com/sjawhar/pivot/commit/acf266b63027e7995e4f15e78103ef765367706b))
+
+
 ## v0.3.5 (2026-10-17)
 
 ### Bug Fixes
