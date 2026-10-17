@@ -540,6 +540,9 @@ _PREFIX_LOCK = ".pivot_cache.lock"
 _CACHE_SWEEP_INTERVAL = 3600
 # Opening or creating a lock fails this way in a cache directory this user cannot write.
 _CANNOT_WRITE_ERRNO = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+# flock() fails this way on a filesystem that refuses it: Lustre mounted without `flock`
+# (ENOSYS), NFS when its lock manager does not answer (ENOLCK), some FUSE filesystems.
+_NO_FLOCK_ERRNO = frozenset({errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
 def _open_cache_lock(path: pathlib.Path) -> int:
@@ -577,18 +580,20 @@ def _sweep_cache_temps(prefix_dir: pathlib.Path) -> None:
     cutoff = time.time() - _CACHE_SWEEP_INTERVAL
     for entry in os.scandir(prefix_dir):
         name = entry.name
-        if name.startswith(_CACHE_TEMP_PREFIX):
-            stale = True
-        elif (name.startswith("tmp") and name.endswith(".tmp")) or name.startswith(
-            ".pivot_download_"
-        ):
-            stale = entry.stat(follow_symlinks=False).st_ctime < cutoff
-        else:
-            continue
-        if not stale:
-            continue
         try:
-            _clear_path(pathlib.Path(entry.path))
+            if name.startswith(_CACHE_TEMP_PREFIX):
+                stale = True
+            elif (name.startswith("tmp") and name.endswith(".tmp")) or name.startswith(
+                ".pivot_download_"
+            ):
+                # An older pivot renames its temporary file away once its copy is complete.
+                stale = entry.stat(follow_symlinks=False).st_ctime < cutoff
+            else:
+                continue
+            if stale:
+                _clear_path(pathlib.Path(entry.path))
+        except FileNotFoundError:
+            continue
         except OSError as e:
             logger.warning(
                 "Cannot remove %s, a temporary entry a killed pivot left in the cache (%s); "
@@ -604,8 +609,10 @@ def _staging_in(prefix_dir: pathlib.Path) -> Generator[None]:
     sweep, after sweeping when no other process holds the lock and the last sweep is older than
     ``_CACHE_SWEEP_INTERVAL``.
 
-    The exclusive lock is only tried, never waited for, and a lock the filesystem refuses (NFS
-    and a read-only file) only skips the sweep. The kernel drops a killed process's lock with its
+    The exclusive lock is only tried, never waited for; a lock the filesystem refuses (NFS on a
+    read-only file, or a filesystem that refuses flock() outright) only skips the sweep. Where
+    flock() is refused outright the shared lock is skipped too: nothing there can take the
+    exclusive lock to sweep (storage/AGENTS.md). The kernel drops a killed process's lock with its
     file descriptors. Converting the exclusive lock to shared may release it first; this process
     has made no temporary entry yet.
     """
@@ -620,7 +627,11 @@ def _staging_in(prefix_dir: pathlib.Path) -> Generator[None]:
                 _sweep_cache_temps(prefix_dir)
                 with contextlib.suppress(OSError):
                     os.utime(fd)
-        fcntl.flock(fd, fcntl.LOCK_SH)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        except OSError as e:
+            if e.errno not in _NO_FLOCK_ERRNO:
+                raise
         yield
     finally:
         os.close(fd)
@@ -1205,18 +1216,25 @@ def _save_directory_to_cache(
 def _publish_tree(
     path: pathlib.Path,
     cache_dir_path: pathlib.Path,
-    manifest: list[DirManifestEntry],
+    output_hash: DirHash,
     cache_dir: pathlib.Path,
 ) -> None:
     """Copy directory output ``path`` into the cache as the whole-directory SYMLINK tree
-    ``cache_dir_path``.
+    ``cache_dir_path`` its hash ``output_hash`` names.
 
     A restore symlinks to a tree as soon as its name exists, so the tree is built under a
-    temporary name beside it and renamed into place complete, then marked. rename() will not
-    replace a directory that holds anything, so a tree another writer published first is kept
-    and this copy dropped. A later publish into the same prefix directory removes the copy a
-    killed publisher left (``_staging_in``).
+    temporary name beside it and renamed into place complete. rename() will not replace a
+    directory that holds anything, so a tree another writer published first is kept and this
+    copy dropped; an empty output's tree, which holds nothing, can replace another writer's,
+    which is the same empty tree. A later publish into the same prefix directory removes the copy
+    a killed publisher left (``_staging_in``).
+
+    The tree is marked only once it is checked to hold what ``output_hash`` records: a sweep on
+    another host whose flock is not coherent with this host's can remove files from the copy
+    while it is built (see storage/AGENTS.md). An unmarked tree is checked and repaired by the
+    next commit or restore through it (``_ensure_tree_complete``).
     """
+    manifest = output_hash["manifest"]
 
     def _user_symlinks(directory: str, names: list[str]) -> list[str]:
         # Not stored (see _scandir_recursive); copytree would copy each target.
@@ -1247,7 +1265,8 @@ def _publish_tree(
                 if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
                     raise
                 return
-            _mark_tree(cache_dir_path)
+            if _tree_matches(cache_dir_path, output_hash, _scan_entries(cache_dir_path)):
+                _mark_tree(cache_dir_path)
         finally:
             _clear_path(staged)
 
@@ -1273,7 +1292,7 @@ def _store_directory(
             # SYMLINK mode: cache entire directory, symlink to it
             cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
             if not cache_dir_path.exists():
-                _publish_tree(path, cache_dir_path, manifest, cache_dir)
+                _publish_tree(path, cache_dir_path, output_hash, cache_dir)
 
             # A tree an older pivot built keeps its 0o444-everywhere files, entries its hash does
             # not record, or files missing from a copy it was killed in, forever otherwise: its name
@@ -1282,7 +1301,8 @@ def _store_directory(
                 raise exceptions.CacheRestoreError(
                     f"Cache tree {cache_dir_path} differs from what its hash records and cannot "
                     + "be repaired (a file's cache object is missing, or another user owns it); "
-                    + "remove the tree to let this commit publish it again"
+                    + "remove the tree, or have its owner remove it, to let this commit publish "
+                    + "it again"
                 )
 
             _clear_path(path)

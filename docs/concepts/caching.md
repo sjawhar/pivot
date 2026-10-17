@@ -34,6 +34,12 @@ a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
 `.pivot_tmp_*` entries a killed process leaves (at most once an hour per
 prefix directory). Do not delete these files while pivot runs.
 
+A cache several machines share (a `cache.dir` on a network filesystem) needs
+file locks that work across those machines: NFSv4, or NFSv3 with its lock
+manager. With locks local to each machine (NFS mounted `nolock` or with
+`local_lock`, Lustre with `localflock`), pivot on one machine can delete or
+change files another machine is still writing into the cache.
+
 Because the cache is content-addressed:
 
 - Identical files are stored once, regardless of which stage produced them

@@ -86,16 +86,23 @@ When multiple `pivot` processes share the same StateDB:
   `.pivot_tmp_*` entry: none has a live owner. An entry it cannot remove is logged and left.
   Never judge a temporary entry abandoned by host and pid: a process in another PID namespace,
   or on another host sharing the cache, looks dead.
+- Sharing a cache across hosts needs `flock` that is coherent across them (NFSv4, or NFSv3 with
+  NLM). With host-local locks (NFS `nolock` or `local_lock=flock`/`all`, Lustre `localflock`)
+  the locks here exclude nothing across hosts: one host's sweep can remove another host's live
+  temporary entry, and two hosts can repair one tree at once. A publisher checks its tree before
+  marking it, so a copy that lost files is not marked. On a filesystem that refuses `flock()`
+  (Lustre without `flock`: ENOSYS; NFS when its lock manager does not answer: ENOLCK) nothing
+  sweeps and nothing repairs a tree, and staging goes on without the shared lock.
 - A lock file in the cache is created writable by whoever can write its directory, since NFS
   takes an exclusive lock only on a file opened for writing; one this user cannot write is
   opened read-only. Lock files are never deleted.
 - A whole-directory SYMLINK tree is built under a temporary name beside its cache name, renamed
-  into place, then marked (`<tree>.verified`), because a restore symlinks to a tree as soon as
-  its name exists. A restore or commit checks an unmarked tree (exact files, sizes, executable
-  bits and directories) under the tree's exclusive `<tree>.lock`, repairs it in place from the
-  files' own cache objects, then marks it. A tree it cannot repair is not used: a restore goes
-  file by file, a commit fails. `<tree>.layout-checked`, the mark pivot 0.3.4 also gave partial
-  trees, is not trusted.
+  into place, checked, then marked (`<tree>.verified`), because a restore symlinks to a tree as
+  soon as its name exists. A restore or commit checks an unmarked tree (exact files, sizes,
+  executable bits and directories) under the tree's exclusive `<tree>.lock`, repairs it in place
+  from the files' own cache objects, then marks it. A tree it cannot repair is not used: a
+  restore goes file by file, a commit fails. `<tree>.layout-checked`, the mark pivot 0.3.4 also
+  gave partial trees, is not trusted.
 
 ## Path Storage
 
