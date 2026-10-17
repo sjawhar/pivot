@@ -4,9 +4,11 @@ import atexit
 import contextlib
 import functools
 import logging
+import multiprocessing as mp
 import os
 import pathlib
 import threading
+from multiprocessing import managers
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
 import loky
@@ -35,7 +37,7 @@ def _noop() -> None:
 
 
 def _exit_when_parent_dies(parent_pid: int) -> None:
-    """Exit an indefinitely-warm worker after its owning Pivot process dies."""
+    """Exit a long-lived child (worker or manager) after its owning Pivot process dies."""
 
     def _watch_parent() -> None:
         poll = threading.Event()
@@ -83,6 +85,13 @@ def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.Proce
         initializer=_exit_when_parent_dies,
         initargs=(os.getpid(),),
     )
+
+
+def create_manager() -> managers.SyncManager:
+    """Start a spawn-context manager that exits when this process dies."""
+    manager = managers.SyncManager(ctx=mp.get_context("spawn"))
+    manager.start(initializer=_exit_when_parent_dies, initargs=(os.getpid(),))
+    return manager
 
 
 def prepare_workers(

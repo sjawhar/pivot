@@ -95,6 +95,11 @@ ensuring updated imports are loaded.
 The Engine shuts its workers and manager down when it exits. An atexit fallback remains useful
 when code creates a reusable executor outside an Engine context.
 
+Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler), and
+workers use `timeout=None`, so nothing else would end them. Every worker and the output-queue
+manager therefore start with `_exit_when_parent_dies`, a thread that exits the child once its
+parent pid changes. Start any new long-lived child process with the same initializer.
+
 ## Key Insight
 
 The standard library's `ProcessPoolExecutor` is designed for batch workloads where pool creation is amortized over many tasks. For iterative workflows with frequent re-runs, the per-run overhead dominates.

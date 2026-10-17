@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import multiprocessing as mp
 import pathlib
 import threading
 import typing
@@ -24,6 +23,7 @@ def _file_stamp(path: str) -> _FileStamp | None:
 
 if typing.TYPE_CHECKING:
     import concurrent.futures
+    import multiprocessing as mp
     from multiprocessing.managers import SyncManager
 
     import loky
@@ -63,8 +63,7 @@ class WorkerPool:
             self._code_changed = False
         self._executor = executor
         if self._manager is None:
-            spawn_ctx = mp.get_context("spawn")
-            self._manager = spawn_ctx.Manager()
+            self._manager = executor_core.create_manager()
         raw_queue = self._manager.Queue()
         queue_obj = typing.cast("object", raw_queue)
         self._output_queue = typing.cast("mp.Queue[OutputMessage]", queue_obj)

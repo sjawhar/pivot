@@ -7,9 +7,14 @@ helper module returned.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
+import pathlib
+import signal
+import subprocess
 import sys
+import time
 import uuid
 from typing import TYPE_CHECKING
 
@@ -25,7 +30,6 @@ from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Callable
 
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -215,6 +219,101 @@ async def test_consecutive_runs_in_one_engine_reuse_the_same_worker(
         if event["type"] == "log_line" and event["line"] == "WARNING: warm worker log"
     ]
     assert len(log_lines) == 2, "each run's fresh output queue forwards worker logs"
+
+
+def _helper_process_table() -> dict[int, tuple[int, str]]:
+    """Map every live, non-zombie pid to (parent pid, start time) from /proc."""
+    table = dict[int, tuple[int, str]]()
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if fields[0] == "Z":
+            continue
+        table[int(entry.name)] = (int(fields[1]), fields[19])
+    return table
+
+
+def _helper_descendants(root_pid: int) -> dict[int, str]:
+    """Return {pid: start time} for every live descendant of ``root_pid``."""
+    table = _helper_process_table()
+    found = dict[int, str]()
+    frontier = [root_pid]
+    while frontier:
+        parent = frontier.pop()
+        for pid, (ppid, started) in table.items():
+            if ppid == parent and pid not in found:
+                found[pid] = started
+                frontier.append(pid)
+    return found
+
+
+def _helper_cmdline(pid: int) -> str:
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return "<exited>"
+    return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the /proc process table")
+def test_killed_pivot_leaves_no_child_processes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGKILLing a serving pivot leaves no worker, manager or tracker running without it."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _PID_PIPELINE)
+    output = _helper_output_path(root, pipeline, "warm/worker_pid")
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+    proc = subprocess.Popen(
+        [str(pathlib.Path(sys.executable).parent / "pivot"), "repro", "--watch", "--serve"],
+        cwd=root,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    children = dict[int, str]()
+    survivors = dict[int, str]()
+    try:
+        deadline = time.monotonic() + 60
+        while not output.exists():
+            assert proc.poll() is None, f"pivot exited early with {proc.returncode}"
+            assert time.monotonic() < deadline, "the first watch run did not finish"
+            time.sleep(0.1)
+        children = _helper_descendants(proc.pid)
+        assert any("loky" in _helper_cmdline(pid) for pid in children), (
+            "the serving pivot should hold a warm worker when it is killed"
+        )
+
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=10)
+
+        deadline = time.monotonic() + 15
+        while True:
+            table = _helper_process_table()
+            survivors = {
+                pid: started
+                for pid, started in children.items()
+                if pid in table and table[pid][1] == started
+            }
+            if not survivors or time.monotonic() > deadline:
+                break
+            time.sleep(0.25)
+        assert not survivors, "child processes outlived pivot:\n" + "\n".join(
+            f"{pid}: {_helper_cmdline(pid)}" for pid in survivors
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for pid in survivors:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 @pytest.mark.anyio
