@@ -1,11 +1,13 @@
 # pyright: reportMissingImports=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
 
 from pivot.engine.worker_pool import WorkerPool
+from pivot.executor import core as executor_core
 
 
 def _helper_identity(value: int) -> int:
@@ -14,6 +16,36 @@ def _helper_identity(value: int) -> int:
 
 def _helper_sleep(seconds: float) -> None:
     time.sleep(seconds)
+
+
+def _helper_pid() -> int:
+    return os.getpid()
+
+
+def test_restart_workers_replaces_live_workers() -> None:
+    """A code reload must replace workers rather than returning loky's live singleton."""
+    executor_core.restart_workers(1, 1)
+    first = executor_core.create_executor(1).submit(_helper_pid).result(timeout=60)
+
+    executor_core.restart_workers(1, 1)
+    second = executor_core.create_executor(1).submit(_helper_pid).result(timeout=60)
+
+    assert second != first, "restart_workers should replace every live worker"
+    executor_core._cleanup_worker_pool()
+
+
+@pytest.mark.slow
+def test_warm_workers_survive_lokys_default_idle_timeout() -> None:
+    """Interactive runs stay warm even when a user pauses longer than loky's 10 s default."""
+    executor_core.restart_workers(1, 1)
+    executor = executor_core.create_executor(1)
+    first = executor.submit(_helper_pid).result(timeout=60)
+
+    time.sleep(11)
+
+    second = executor.submit(_helper_pid).result(timeout=60)
+    assert second == first, "the idle worker should remain ready until Engine shutdown"
+    executor_core._cleanup_worker_pool()
 
 
 def test_worker_pool_stop_accepting_rejects_new_submissions() -> None:

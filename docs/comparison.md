@@ -84,7 +84,8 @@ Per-stage locks enable parallel-safe writes and avoid the monolithic lock file b
 
 ### Warm Workers
 
-Pivot uses `loky.get_reusable_executor()` to keep worker processes alive between runs. This avoids the startup cost of reimporting large libraries like numpy and pandas on each execution.
+In a long-lived Engine, Pivot keeps `loky.get_reusable_executor()` workers alive across runs.
+This avoids reimporting large libraries such as numpy and pandas on each execution.
 
 ### Watch Mode
 

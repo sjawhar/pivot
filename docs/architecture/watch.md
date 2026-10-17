@@ -136,7 +136,9 @@ The Engine performs a **full module clear** before restart:
 
 ### Warm Workers
 
-Workers are warm within a single run (stages reuse the same pool). Watch mode creates a fresh pool per run; code reloads can trigger a restart via `executor_core.restart_workers()` (only in parallel mode, per WatchCoordinator policy).
+One watch Engine keeps its workers warm across re-runs. Before reusing those workers, Pivot
+checks the user-code modules they imported and replaces the pool when a source file changed.
+Code reloads also replace workers so they execute the reloaded pipeline.
 
 ## Debouncing
 

@@ -6,7 +6,8 @@ import functools
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+import threading
+from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
 import loky
 
@@ -25,10 +26,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_WORKER_IDLE_TIMEOUT_S: Final[float | None] = None
+
 
 def _noop() -> None:
     """Module-level for pickling."""
     pass
+
+
+def _exit_when_parent_dies(parent_pid: int) -> None:
+    """Exit an indefinitely-warm worker after its owning Pivot process dies."""
+
+    def _watch_parent() -> None:
+        poll = threading.Event()
+        while os.getppid() == parent_pid:
+            poll.wait(1)
+        os._exit(0)
+
+    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
 
 
 def configured_worker_count(override: int | None = None) -> int:
@@ -56,6 +71,20 @@ def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
         f.result()
 
 
+def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.ProcessPoolExecutor:
+    """Return Pivot's reusable executor with one worker-lifetime policy."""
+    _ensure_deterministic_environment()
+    _ensure_cleanup_registered()
+    return loky.get_reusable_executor(
+        max_workers=max_workers,
+        timeout=_WORKER_IDLE_TIMEOUT_S,
+        kill_workers=kill_workers,
+        reuse=False if kill_workers else "auto",
+        initializer=_exit_when_parent_dies,
+        initargs=(os.getpid(),),
+    )
+
+
 def prepare_workers(
     stage_count: int, *, parallel: bool = True, max_workers: int | None = None
 ) -> int:
@@ -67,10 +96,7 @@ def prepare_workers(
     if not parallel or stage_count <= 0:
         return 1
     workers = compute_max_workers(stage_count, max_workers)
-    _ensure_deterministic_environment()
-    _ensure_cleanup_registered()
-    pool = loky.get_reusable_executor(max_workers=workers)
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers), workers)
     return workers
 
 
@@ -82,17 +108,14 @@ def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
     if stage_count <= 0:
         return 1
     workers = compute_max_workers(stage_count, max_workers)
-    _ensure_deterministic_environment()
-    _ensure_cleanup_registered()
-    pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers, kill_workers=True), workers)
     return workers
 
 
 def _cleanup_worker_pool() -> None:
     """Kill loky worker pool on process exit to prevent orphaned workers."""
     with contextlib.suppress(Exception):
-        loky.get_reusable_executor(max_workers=1, kill_workers=True)
+        _get_executor(1, kill_workers=True)
 
 
 @functools.cache  # Ensures single atexit registration across threads
@@ -293,10 +316,8 @@ def _ensure_deterministic_environment() -> None:
 
 
 def create_executor(max_workers: int) -> concurrent.futures.Executor:
-    """Get reusable loky executor - workers persist across calls for efficiency."""
-    _ensure_deterministic_environment()
-    _ensure_cleanup_registered()
-    return loky.get_reusable_executor(max_workers=max_workers)
+    """Get Pivot's reusable executor, keeping its workers warm between runs."""
+    return _get_executor(max_workers)
 
 
 def prepare_worker_info(

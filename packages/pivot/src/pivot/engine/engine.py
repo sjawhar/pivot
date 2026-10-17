@@ -380,6 +380,15 @@ class Engine:
         Closes send channels first to signal receivers, then receive channels.
         This ordering prevents ClosedResourceError in iterating tasks.
         """
+        if self._worker_pool is not None:
+            worker_pool = self._worker_pool
+            self._worker_pool = None
+            try:
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(worker_pool.shutdown)
+            except (OSError, BrokenPipeError) as exc:
+                _logger.debug("WorkerPool shutdown failed (may already be dead): %s", exc)
+
         # Close send channels first to signal end-of-stream to receivers
         if self._input_send:
             await self._input_send.aclose()
@@ -1177,9 +1186,8 @@ class Engine:
                 results=results,
             )
 
-            # Only start drain thread and main loop if workers were dispatched.
-            # When all stages skip in the coordinator, the pool is never created.
-            if self._worker_pool is not None:
+            # Only start drain thread and main loop if workers were dispatched in this run.
+            if self._worker_pool is not None and self._worker_pool.in_run:
                 output_queue = self._worker_pool.output_queue()
                 shutdown_event = self._worker_pool.shutdown_event()
 
@@ -1210,6 +1218,14 @@ class Engine:
 
                                 try:
                                     result = future.result()
+                                    if (
+                                        "user_code_files" in result
+                                        and "user_code_started_ns" in result
+                                    ):
+                                        self._worker_pool.record_user_code_files(
+                                            result["user_code_files"],
+                                            result["user_code_started_ns"],
+                                        )
                                     duration_ms = await self._handle_stage_completion(
                                         stage_name,
                                         result,
@@ -1373,23 +1389,14 @@ class Engine:
                 await self._finalize_cancelled_stages(results, run_id)
 
         finally:
-            # Close StateDBs first (lightweight), then shut down worker pool.
+            # Close StateDBs first, then release this run's output queue after its drain exits.
             with anyio.CancelScope(shield=True):
                 for db in state_dbs.values():
                     db.close()
                 state_dbs.clear()
 
-            # WorkerPool shutdown handles executor + manager cleanup.
-            # Must happen after sentinel send so drain thread exits first.
-            # Wrapped in outer finally to ensure it always executes, even if task group raises.
-            if self._worker_pool is not None:
-                worker_pool = self._worker_pool
-                self._worker_pool = None
-                try:
-                    with anyio.CancelScope(shield=True):
-                        await anyio.to_thread.run_sync(worker_pool.shutdown)
-                except (OSError, BrokenPipeError) as exc:
-                    _logger.debug("WorkerPool shutdown failed (may already be dead): %s", exc)
+            if self._worker_pool is not None and self._worker_pool.in_run:
+                self._worker_pool.end_run()
 
         # Write run history after execution completes
         ended_at = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1584,9 +1591,10 @@ class Engine:
         return self._scheduler.can_start(stage_name)
 
     def _ensure_worker_pool(self) -> worker_pool_mod.WorkerPool:
-        """Lazily create and start the worker pool on first worker dispatch."""
+        """Lazily begin this run's worker pool on first worker dispatch."""
         if self._worker_pool is None:
             self._worker_pool = worker_pool_mod.WorkerPool()
+        if not self._worker_pool.in_run:
             self._worker_pool.start(max_workers=self._effective_max_workers)
         return self._worker_pool
 

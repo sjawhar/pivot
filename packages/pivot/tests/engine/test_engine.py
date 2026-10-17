@@ -1833,7 +1833,8 @@ async def test_coordinator_skip_avoids_worker_dispatch(
         await engine._initialize_orchestration([stage_name], max_workers=1)
         engine._scheduler.acquire_resources(stage_name)
         await engine._set_stage_state(stage_name, StageExecutionState.PREPARING)
-        engine._worker_pool = MagicMock()
+        pool = MagicMock()
+        engine._worker_pool = pool
 
         skipped = await engine._try_skip_in_coordinator(
             stage_name=stage_name,
@@ -1849,7 +1850,7 @@ async def test_coordinator_skip_avoids_worker_dispatch(
 
     assert skipped is True
     assert results[stage_name]["status"] == StageStatus.CACHED
-    engine._worker_pool.submit.assert_not_called()
+    pool.submit.assert_not_called()
 
 
 @pytest.mark.anyio
@@ -1909,7 +1910,8 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
         await engine._initialize_orchestration([stage_name], max_workers=1)
         engine._scheduler.acquire_resources(stage_name)
         await engine._set_stage_state(stage_name, StageExecutionState.PREPARING)
-        engine._worker_pool = MagicMock()
+        pool = MagicMock()
+        engine._worker_pool = pool
 
         skipped = await engine._try_skip_in_coordinator(
             stage_name=stage_name,
@@ -1926,4 +1928,4 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
     assert skipped is True
     assert results[stage_name]["status"] == StageStatus.CACHED
     assert results[stage_name]["reason"] == "unchanged"
-    engine._worker_pool.submit.assert_not_called()
+    pool.submit.assert_not_called()

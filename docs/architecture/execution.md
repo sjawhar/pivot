@@ -94,9 +94,9 @@ During watch mode, the Engine filters filesystem events based on stage state:
 
 ## Worker Pool
 
-Pivot uses `loky.get_reusable_executor()` for warm workers with `spawn` context.
-The Engine wraps it in `WorkerPool`, which also manages a manager-backed output
-queue for log streaming and a shutdown event for the drain thread.
+Pivot uses `loky.get_reusable_executor()` with `spawn` context. `WorkerPool` owns workers and
+the manager process for the Engine lifetime. Each run gets its own manager-backed output queue
+and drain shutdown event, so logs cannot cross run boundaries.
 
 ### Why ProcessPoolExecutor?
 
@@ -112,7 +112,9 @@ queue for log streaming and a shutdown event for the drain thread.
 
 ### Warm Workers
 
-Workers stay alive between stages, so expensive imports (numpy, pandas) only happen once per worker, not once per stage.
+Workers stay alive across runs in one Engine, so imports from earlier stages remain available.
+Before a later run reuses workers, Pivot replaces them if a user-code module they imported
+changed.
 
 ## Stage resources
 
