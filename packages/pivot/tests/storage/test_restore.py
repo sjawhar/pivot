@@ -787,6 +787,50 @@ def test_restore_file_from_remote_caches_with_readonly_permissions(
     assert mode == 0o444, f"Cache file should have 0o444 permissions, got {oct(mode)}"
 
 
+def test_restore_file_from_remote_keeps_an_object_already_cached(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Caching remote content never replaces an object a concurrent commit published first:
+    a checkout may be linking or symlinking it, and its executable bit belongs to it."""
+    import xxhash
+
+    repo_path, commit = git_repo
+    cache_dir = repo_path / ".pivot" / "cache"
+    content = b"#!/bin/sh\necho from remote\n"
+    file_hash = xxhash.xxh64(content).hexdigest()
+    (repo_path / "tool.pvt").write_text(
+        yaml.dump({"path": "tool", "hash": file_hash, "size": len(content)})
+    )
+    sha = commit("add pvt file")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
+
+    def _fetch_while_a_commit_publishes(_hash: str) -> bytes:
+        cached_path.parent.mkdir(parents=True)
+        cached_path.write_bytes(content)
+        cached_path.chmod(0o555)
+        return content
+
+    monkeypatch.setattr(
+        "pivot.storage.restore.remote.fetch_from_remote", _fetch_while_a_commit_publishes
+    )
+
+    _, success = restore.restore_targets_from_revision(
+        targets=["tool"],
+        rev=sha[:7],
+        output=repo_path / "restored_tool",
+        cache_dir=cache_dir,
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+    )
+
+    assert success
+    assert cached_path.stat().st_mode & 0o777 == 0o555, "the published object was replaced"
+    left = [p.name for p in cached_path.parent.iterdir() if p.name != cache._PREFIX_LOCK]
+    assert left == [cached_path.name], "no temp file left"
+
+
 def test_restore_file_from_remote_hash_mismatch(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:

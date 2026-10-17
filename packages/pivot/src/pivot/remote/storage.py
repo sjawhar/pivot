@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import errno
 import logging
 import os
 import re
@@ -13,6 +12,7 @@ import xxhash
 
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
+from pivot.storage import cache
 from pivot.types import TransferResult
 
 if TYPE_CHECKING:
@@ -37,9 +37,6 @@ STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 BULK_EXISTS_LIST_THRESHOLD = 50
 
 _HEX_PATTERN = re.compile(r"^[a-f0-9]{16}$")
-
-# link() errors on filesystems without hard links (vfat, exFAT, many SMB and FUSE mounts).
-_NO_HARDLINK_ERRNO = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 # Cached S3 config to avoid re-parsing config on every call.
 # Safe without locking - asyncio is single-threaded, worst case race just
@@ -230,66 +227,61 @@ async def _atomic_download(
     authenticate remote content.
 
     Args:
-        overwrite: Replace an existing file at local_path. When False, an existing file is
-            kept: a content-addressed cache entry another process may be hardlinking.
+        overwrite: Replace an existing file at local_path. When False, local_path is a cache
+            object: an existing one is kept (another process may be hardlinking it), and the
+            download is staged so a killed one is swept (``cache.staged_cache_file``).
         readonly: If True, set file permissions to 0o444 (for cache files).
     """
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
-    move_succeeded = False
-    try:
-        try:
-            response = await s3.get_object(Bucket=bucket, Key=key)
-        except Exception as exc:
-            error_str = str(exc)
-            if "NoSuchKey" in error_str or "404" in error_str:
-                raise exceptions.RemoteError(
-                    f"Remote cache file not found: {bucket}/{key}"
-                ) from exc
-            if "AccessDenied" in error_str or "403" in error_str:
-                raise exceptions.RemoteError(
-                    f"Access denied to {bucket}/{key}. Check AWS credentials."
-                ) from exc
-            raise exceptions.RemoteError(f"Failed to download from S3: {exc}") from exc
-        actual_hash = await _stream_download_to_fd(response, fd)
-        os.close(fd)
-        fd = -1  # Mark as closed
-        if actual_hash != expected_hash:
-            raise exceptions.RemoteError(
-                f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
-                + f"for {bucket}/{key}. Delete {bucket}/{key} from the remote, then run "
-                + "`pivot push` on a machine whose cache has a good copy and has not run "
-                + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
-                + "against this remote for this object. Pivot records hashes those commands "
-                + "upload, download, or find, then skips recorded hashes. If every machine "
-                + "with a good copy has recorded it, delete `.pivot/state.lmdb/` before "
-                + "pushing; this also clears run history and local caches."
-            )
+    with contextlib.ExitStack() as stack:
+        if overwrite:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
+            os.close(fd)
+            tmp_path = local_path.with_name(os.path.basename(name))
+            stack.callback(tmp_path.unlink, missing_ok=True)
+        else:
+            tmp_path = stack.enter_context(cache.staged_cache_file(local_path))
+        await _download_verified(s3, bucket, key, tmp_path, expected_hash)
         if readonly:
             os.chmod(tmp_path, 0o444)
         if overwrite:
             os.replace(tmp_path, local_path)
-            move_succeeded = True
         else:
-            # link() refuses an existing name, so a concurrent reader never sees the
-            # entry disappear. The temp file is removed below either way.
-            try:
-                os.link(tmp_path, local_path)
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                if exc.errno not in _NO_HARDLINK_ERRNO:
-                    raise
-                # No hard links here, so nothing can be hardlinking the entry either:
-                # rename unless another process already promoted it.
-                if not os.path.exists(local_path):
-                    os.replace(tmp_path, local_path)
-                    move_succeeded = True
+            _ = cache.publish_cache_object(tmp_path, local_path)
+
+
+async def _download_verified(
+    s3: S3Client, bucket: str, key: str, dest: Path, expected_hash: str
+) -> None:
+    """Stream bucket/key into the existing file ``dest`` and check its xxh64 digest."""
+    try:
+        response = await s3.get_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        error_str = str(exc)
+        if "NoSuchKey" in error_str or "404" in error_str:
+            raise exceptions.RemoteError(f"Remote cache file not found: {bucket}/{key}") from exc
+        if "AccessDenied" in error_str or "403" in error_str:
+            raise exceptions.RemoteError(
+                f"Access denied to {bucket}/{key}. Check AWS credentials."
+            ) from exc
+        raise exceptions.RemoteError(f"Failed to download from S3: {exc}") from exc
+    fd = os.open(dest, os.O_WRONLY | os.O_TRUNC)
+    try:
+        actual_hash = await _stream_download_to_fd(response, fd)
     finally:
-        if fd >= 0:
+        with contextlib.suppress(OSError):
             os.close(fd)
-        if not move_succeeded and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+    if actual_hash != expected_hash:
+        raise exceptions.RemoteError(
+            f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
+            + f"for {bucket}/{key}. Delete {bucket}/{key} from the remote, then run "
+            + "`pivot push` on a machine whose cache has a good copy and has not run "
+            + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
+            + "against this remote for this object. Pivot records hashes those commands "
+            + "upload, download, or find, then skips recorded hashes. If every machine "
+            + "with a good copy has recorded it, delete `.pivot/state.lmdb/` before "
+            + "pushing; this also clears run history and local caches."
+        )
 
 
 async def _stream_upload(

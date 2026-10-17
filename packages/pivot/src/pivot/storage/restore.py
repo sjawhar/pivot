@@ -328,15 +328,14 @@ def restore_file(
                     path=path_str,
                     message=f"Error: {dest_path} - failed to write from remote: {e}",
                 )
-            # Cache the fetched content for future use (best effort)
+            # Cache the fetched content for future use (best effort). An object already there
+            # is kept: another process may be linking it (cache.publish_cache_object).
             try:
                 cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-
-                def write_content(fd: int) -> None:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(remote_content)
-
-                cache.atomic_write_file(cached_path, write_content, mode=0o444)
+                with cache.staged_cache_file(cached_path) as staged:
+                    staged.write_bytes(remote_content)
+                    os.chmod(staged, 0o444)
+                    _ = cache.publish_cache_object(staged, cached_path)
             except OSError:
                 pass  # Caching failure is non-fatal
             return RestoreResult(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from typing import TYPE_CHECKING, TypedDict
 
 from conftest import isolated_pivot_dir
@@ -127,14 +128,15 @@ def test_track_force_overwrites(
     assert pvt_data_updated["hash"] != original_hash
 
 
-def test_track_force_repairs_legacy_nonexecutable_cache_object(
+def test_track_force_keeps_a_non_executable_object_and_checkout_copies_the_script(
     mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
-    """`pivot track --force` must repair a cache object an older pivot cached
-    non-executable: the outer `exists()` guard this command used to wrap `copy_to_cache` in
-    skipped the republish copy_to_cache now does for an executable entry, leaving tracked
-    directories with no way to recover a stale object short of deleting it by hand."""
+    """A cache object never changes once published, even one an older pivot (or `pivot pull`)
+    cached non-executable for bytes a tracked directory holds as an executable: a symlink
+    checkout of another file with those bytes reads its mode through the object's name.
+    `pivot track --force` keeps the object, and checkout gives the script its executable bit
+    with a private copy."""
     data_dir = mock_discovery.root / "tools"
     data_dir.mkdir()
     script = data_dir / "run.sh"
@@ -152,13 +154,18 @@ def test_track_force_repairs_legacy_nonexecutable_cache_object(
     cache_dir = config.get_cache_dir() / "files"
     cache_path = cache.get_cache_path(cache_dir, entry_hash)
     os.chmod(cache_path, 0o444)
+    inode = cache_path.stat().st_ino
 
     result = runner.invoke(cli.cli, ["track", "--force", "tools"])
     assert result.exit_code == 0, result.output
+    assert cache_path.stat().st_ino == inode
+    assert cache_path.stat().st_mode & 0o777 == 0o444
 
-    assert os.access(cache_path, os.X_OK), (
-        "track --force must republish a stale non-executable cache object"
-    )
+    shutil.rmtree(data_dir)
+    result = runner.invoke(cli.cli, ["checkout", "tools"])
+    assert result.exit_code == 0, result.output
+    assert os.access(script, os.X_OK)
+    assert not script.is_symlink() and script.stat().st_ino != inode
 
 
 def test_track_already_tracked_suggests_force(

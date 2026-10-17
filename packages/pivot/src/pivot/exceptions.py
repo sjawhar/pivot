@@ -221,6 +221,8 @@ class CacheModeCollisionError(CacheError):
     This happens when two files with identical content disagree on their executable bit (the
     cache key is content-only) or when a cache object was populated by a path that does not
     know a file's intended executable bit (e.g. `pivot pull`, which downloads by hash alone).
+    Pivot never changes a published cache object, so only a private copy, or the object deleted
+    and published again from bytes that carry the right bit, can give the file its bit.
     """
 
     @override
@@ -228,10 +230,10 @@ class CacheModeCollisionError(CacheError):
         return (
             "Add CheckoutMode.COPY to checkout_modes (cache: checkout_mode: [..., copy] in "
             ".pivot/config.yaml) so checkout can fall back to a private, correctly-permissioned "
-            "copy instead of sharing the cache object's own permissions; or, if you have the "
-            "source bytes in hand, re-running what produced them (`pivot repro --force "
-            "<stage>`, `pivot track --force <path>`) republishes the cache object with the "
-            "right bit"
+            "copy instead of sharing the cache object's own permissions; or delete the cache "
+            "object the error names, then re-run what produced the file (`pivot repro --force "
+            "<stage>`, `pivot track --force <path>`) to publish it with the right bit; until it "
+            "is published again, any workspace file symlinked to it is broken"
         )
 
 

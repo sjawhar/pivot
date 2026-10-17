@@ -161,10 +161,6 @@ def _track_single_path(
         total_size = sum(e["size"] for e in manifest)
         num_files = len(manifest)
 
-        # copy_to_cache is idempotent and already checks existence itself; letting it see
-        # every entry (not just ones missing from the cache) is what lets it republish an
-        # object `pivot track --force` finds cached non-executable by an older pivot or a
-        # cold `pivot pull`, when this entry's bytes should be executable.
         for entry in manifest:
             file_path = path / entry["relpath"]
             file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])

@@ -1,24 +1,36 @@
 from __future__ import annotations
 
 import concurrent.futures
+import errno
+import fcntl
 import logging
 import mmap
 import multiprocessing
 import os
 import pathlib
 import queue
+import shutil
 import stat
 import time
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from pivot import exceptions
 from pivot.storage import cache, state
-from pivot.types import DirHash, HashInfo, is_dir_hash
+from pivot.types import DirHash, FileHash, HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
+
+
+def _helper_entries(directory: pathlib.Path) -> list[str]:
+    """The sorted names in a cache prefix directory, less its lock files, which persist."""
+    return sorted(
+        p.name
+        for p in directory.iterdir()
+        if p.name != cache._PREFIX_LOCK and not p.name.endswith(cache._TREE_LOCK_SUFFIX)
+    )
 
 
 def _helper_assert_no_temp_dirs(
@@ -50,9 +62,7 @@ def _helper_assert_no_temp_dirs(
 if TYPE_CHECKING:
     from collections.abc import Generator
     from multiprocessing.managers import SyncManager
-    from threading import Barrier
-
-    from pivot.types import FileHash
+    from threading import Barrier, Event
 
 
 @pytest.fixture
@@ -524,7 +534,7 @@ def test_save_atomic_no_partial(tmp_path: pathlib.Path) -> None:
 
     cache.save_to_cache(test_file, cache_dir)
 
-    tmp_files = list(cache_dir.rglob("*.tmp"))
+    tmp_files = [*cache_dir.rglob("*.tmp"), *cache_dir.rglob(f"{cache._CACHE_TEMP_PREFIX}*")]
     assert len(tmp_files) == 0
 
 
@@ -1218,6 +1228,84 @@ def test_concurrent_repeated_restores_of_one_directory(tmp_path: pathlib.Path) -
     assert [f for result in results for f in result] == []
     assert sorted(p.name for p in target.iterdir()) == [f"f{j}.txt" for j in range(5)]
     _helper_assert_no_temp_dirs(target.parent)
+
+
+def _helper_commit_same_new_outputs_at_barrier(
+    root: pathlib.Path,
+    worker: int,
+    kind: str,
+    mode: cache.CheckoutMode,
+    rounds: int,
+    barrier: Barrier,
+) -> list[str]:
+    """Each round, write an output every worker writes byte for byte, none of it cached yet,
+    then commit it as a stage does; return one line per failed commit."""
+    cache_dir = root / "cache"
+    failures = list[str]()
+    for r in range(rounds):
+        content = f"round {r}\n"
+        out = root / f"worker{worker}" / f"out{r}"
+        output_hash: HashInfo
+        if kind == "file":
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(content)
+            output_hash = FileHash(hash=cache.hash_file(out)[0])
+        else:
+            (out / "sub").mkdir(parents=True)
+            (out / "sub" / "tool").write_text(content)
+            executable = kind == "dir-mixed-exec" and worker % 2 == 0
+            (out / "sub" / "tool").chmod(0o755 if executable else 0o644)
+            output_hash = cache.hash_directory(out)
+        barrier.wait()
+        try:
+            cache.store_hashed_output(
+                out,
+                output_hash,
+                cache_dir,
+                [mode, cache.CheckoutMode.COPY],
+                state_dir=root / ".pivot",
+            )
+        except OSError as e:
+            failures.append(f"round {r}: {type(e).__name__}: {e}")
+    return failures
+
+
+@pytest.mark.parametrize(
+    ("kind", "mode"),
+    [
+        pytest.param("file", cache.CheckoutMode.HARDLINK, id="file-hardlink"),
+        pytest.param("dir-mixed-exec", cache.CheckoutMode.HARDLINK, id="dir-hardlink-mixed-exec"),
+        pytest.param("dir", cache.CheckoutMode.SYMLINK, id="dir-symlink"),
+    ],
+)
+def test_concurrent_commits_of_the_same_new_output(
+    tmp_path: pathlib.Path, kind: str, mode: cache.CheckoutMode
+) -> None:
+    """Parallel stages whose outputs hold the same new bytes all commit them.
+
+    Each finds no cache object and publishes one. A writer that renamed its copy over an
+    object another had just published took that object's last name while the other was
+    hardlinking it, and link() failed with ENOENT; two writers copying one directory tree to
+    its cache name collided with EEXIST.
+    """
+    n_procs = 8
+    rounds = 50
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        barrier = manager.Barrier(n_procs, timeout=60)
+        results = pool.starmap(
+            _helper_commit_same_new_outputs_at_barrier,
+            [(tmp_path, worker, kind, mode, rounds, barrier) for worker in range(n_procs)],
+        )
+
+    assert [f for result in results for f in result] == []
+    for worker in range(n_procs):
+        for r in range(rounds):
+            out = tmp_path / f"worker{worker}" / f"out{r}"
+            read = out if kind == "file" else out / "sub" / "tool"
+            assert read.read_text() == f"round {r}\n"
+            executable = kind == "dir-mixed-exec" and worker % 2 == 0
+            assert os.access(read, os.X_OK) is executable, f"worker {worker} round {r}"
 
 
 def _helper_crash_after_backup_rename(
@@ -1996,10 +2084,8 @@ def test_directory_output_isexec_collision_falls_back_to_copy(tmp_path: pathlib.
     """Two files with identical content but different executable bits hash the same and
     share one cache object. HARDLINK/SYMLINK checkout has no mode of its own, so it can only
     ever reproduce whatever executable bit the shared object already carries; checkout for
-    whichever file disagrees with that must still end up correct, either because
-    ``copy_to_cache`` republishes the shared object from the caller's own bytes before
-    checkout runs, or (when no local bytes are available to repair from) by falling back to
-    COPY, instead of silently serving the wrong permissions.
+    whichever file disagrees with that falls back to COPY instead of silently serving the
+    wrong permissions, and the shared object is never changed to suit it.
     """
     cache_dir = tmp_path / "cache"
     modes = [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
@@ -2043,12 +2129,13 @@ def test_restore_from_cache_repairs_legacy_symlink_tree_isexec(tmp_path: pathlib
     assert isinstance(output_hash, dict) and "manifest" in output_hash
 
     # Simulate a tree an older pivot built: force every file in the tree cache dir back to
-    # 0o444, as pivot 0.3.2 did regardless of isexec. The tree hash (which already includes
-    # isexec) is unchanged, so nothing else needs to.
+    # 0o444, as pivot 0.3.2 did regardless of isexec, and drop the mark this pivot gives a tree
+    # it built. The tree hash (which already includes isexec) is unchanged.
     tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
     for f in tree_path.rglob("*"):
         if f.is_file() and not f.is_symlink():
             os.chmod(f, 0o444)
+    cache._tree_layout_marker(tree_path).unlink()
 
     cache.remove_output(output)
     assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
@@ -2076,6 +2163,7 @@ def test_save_to_cache_symlink_repairs_legacy_tree_isexec(tmp_path: pathlib.Path
     for f in tree_path.rglob("*"):
         if f.is_file() and not f.is_symlink():
             os.chmod(f, 0o444)
+    cache._tree_layout_marker(tree_path).unlink()
 
     second_output = tmp_path / "second"
     second_output.mkdir()
@@ -2128,8 +2216,8 @@ def test_restore_from_cache_symlink_fast_path_rejects_manifest_traversal(
     tmp_path: pathlib.Path,
 ) -> None:
     """The symlink fast path in `_restore_directory_from_cache` must reject a lock-supplied
-    manifest with a traversal relpath before the tree-repair chmod runs, the same way the
-    file-by-file branch already does."""
+    manifest with a traversal relpath before it checks or repairs a tree it did not mark, the
+    same way the file-by-file branch already does."""
     from pivot import exceptions
     from pivot.types import DirHash, DirManifestEntry
 
@@ -2147,6 +2235,7 @@ def test_restore_from_cache_symlink_fast_path_rejects_manifest_traversal(
     victim.chmod(0o644)
 
     tree_path = cache.get_cache_path(cache_dir, output_hash["hash"])
+    cache._tree_layout_marker(tree_path).unlink()
     relpath = os.path.relpath(victim, tree_path)
     tampered_hash = DirHash(
         hash=output_hash["hash"],
@@ -2371,57 +2460,34 @@ def test_copy_to_cache_skips_if_exists(tmp_path: pathlib.Path) -> None:
     assert cache_path.read_text() == "existing content"
 
 
-def test_copy_to_cache_republishes_non_executable_object_when_executable_requested(
+def test_copy_to_cache_keeps_a_non_executable_object_when_executable_requested(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An object cached non-executable (by an older pivot, or by a cold `pivot pull`) is
-    republished when a caller has a fresh, executable copy of the same bytes in hand, instead
-    of staying stuck non-executable forever with no way for a later run to repair it."""
+    """An object cached non-executable (by an older pivot, by a cold `pivot pull`, or by a
+    non-executable file with the same bytes) is kept when an executable copy of the same bytes
+    is cached: a symlink checkout of that other file reads its mode through the object's name,
+    and a hardlink checkout may be linking the object right then."""
     cache_path = tmp_path / "cache" / "ab" / "cdef"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_bytes(b"content")
     cache_path.chmod(0o444)
+    inode = cache_path.stat().st_ino
 
     src = tmp_path / "source.txt"
     src.write_text("content")
 
     cache.copy_to_cache(src, cache_path, executable=True)
 
-    assert cache_path.stat().st_mode & 0o777 == 0o555
-    assert cache_path.read_bytes() == b"content"
-
-
-def test_copy_to_cache_republish_never_mutates_existing_hardlinks(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Republishing a stale cache object swaps in a fresh file at the cache path; it must
-    never chmod the old object in place, since an existing HARDLINK checkout shares its
-    inode and would otherwise flip modes for every file already linked to it."""
-    cache_path = tmp_path / "cache" / "ab" / "cdef"
-    cache_path.parent.mkdir(parents=True)
-    cache_path.write_bytes(b"content")
-    cache_path.chmod(0o444)
-
-    linked = tmp_path / "linked.sh"
-    os.link(cache_path, linked)
-    old_ino = cache_path.stat().st_ino
-
-    src = tmp_path / "source.txt"
-    src.write_text("content")
-    cache.copy_to_cache(src, cache_path, executable=True)
-
-    assert cache_path.stat().st_ino != old_ino, (
-        "republish must write a fresh object, not chmod in place"
-    )
-    assert linked.stat().st_ino == old_ino, "an existing hardlink must keep its old inode"
-    assert linked.stat().st_mode & 0o777 == 0o444, "an existing hardlink must keep its old mode"
+    assert cache_path.stat().st_ino == inode
+    assert cache_path.stat().st_mode & 0o777 == 0o444
+    assert _helper_entries(cache_path.parent) == [cache_path.name], "no temp file left"
 
 
 def test_copy_to_cache_leaves_executable_object_alone_when_non_executable_requested(
     tmp_path: pathlib.Path,
 ) -> None:
     """An object already cached executable is never demoted by a later non-executable
-    request: only an executable request may repair a wrong-moded object."""
+    request."""
     cache_path = tmp_path / "cache" / "ab" / "cdef"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_bytes(b"content")
@@ -2433,6 +2499,743 @@ def test_copy_to_cache_leaves_executable_object_alone_when_non_executable_reques
     cache.copy_to_cache(src, cache_path, executable=False)
 
     assert cache_path.stat().st_mode & 0o777 == 0o555
+
+
+def test_copy_to_cache_keeps_an_object_another_writer_published_first(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two writers caching the same new bytes both find no object, and both copy them. The
+    one that finishes second leaves the first one's object in place instead of renaming its
+    own copy over it: a checkout may be hardlinking that object right then, and link() fails
+    with ENOENT once a rename has taken the object's last name."""
+    src = tmp_path / "out.txt"
+    src.write_text("same bytes")
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
+    real_copy2 = shutil.copy2
+    published = list[int]()
+
+    def _copy2_while_another_writer_publishes(source: str, dest: str) -> object:
+        if not published:
+            published.append(-1)
+            cache.copy_to_cache(src, cache_path)
+            published[0] = cache_path.stat().st_ino
+        return real_copy2(source, dest)
+
+    monkeypatch.setattr(shutil, "copy2", _copy2_while_another_writer_publishes)
+
+    cache.copy_to_cache(src, cache_path)
+
+    assert cache_path.stat().st_ino == published[0]
+    assert _helper_entries(cache_path.parent) == [cache_path.name], "no temp file left"
+
+
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP, errno.ENOSYS])
+@pytest.mark.parametrize(
+    ("existing_mode", "executable", "expected_mode"),
+    [
+        pytest.param(None, False, 0o444, id="absent"),
+        pytest.param(None, True, 0o555, id="absent-executable"),
+        pytest.param(0o444, True, 0o444, id="present"),
+    ],
+)
+def test_copy_to_cache_without_hard_links(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_errno: int,
+    existing_mode: int | None,
+    executable: bool,
+    expected_mode: int,
+) -> None:
+    """On a filesystem that refuses link() (vfat, many SMB and FUSE mounts; a FUSE mount with
+    no link handler returns ENOSYS before Linux 6.15), a new object is renamed into place and
+    an existing one is kept."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
+    inode = None
+    if existing_mode is not None:
+        cache_path.parent.mkdir(parents=True)
+        cache_path.write_text("content")
+        cache_path.chmod(existing_mode)
+        inode = cache_path.stat().st_ino
+
+    def _refuse_link(source: object, dest: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    cache.copy_to_cache(src, cache_path, executable=executable)
+
+    assert cache_path.read_text() == "content"
+    assert cache_path.stat().st_mode & 0o777 == expected_mode
+    if inode is not None:
+        assert cache_path.stat().st_ino == inode
+    assert _helper_entries(cache_path.parent) == [cache_path.name], "no temp file left"
+
+
+@pytest.mark.parametrize("link_errno", [errno.EIO, errno.ENOSPC])
+def test_copy_to_cache_raises_a_failed_link(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, link_errno: int
+) -> None:
+    """A link() that fails for any reason but missing hard-link support is an error, and
+    publishes nothing."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
+
+    def _fail_link(source: object, dest: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
+
+    monkeypatch.setattr(os, "link", _fail_link)
+
+    with pytest.raises(OSError) as raised:
+        cache.copy_to_cache(src, cache_path)
+
+    assert raised.value.errno == link_errno
+    assert _helper_entries(cache_path.parent) == [], "nothing published, no temp file left"
+
+
+@pytest.mark.parametrize("link_errno", [errno.ENOSYS, errno.ENOTSUP, errno.EMLINK])
+def test_hardlink_checkout_falls_through_a_link_the_filesystem_cannot_make(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, link_errno: int
+) -> None:
+    """A filesystem without hard-link support (ENOSYS, ENOTSUP), or an object at the
+    filesystem's link limit (EMLINK), moves checkout on to the next mode, as EXDEV does."""
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("content")
+    target = tmp_path / "target.txt"
+
+    def _refuse_link(source: object, dest: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    cache._checkout_with_fallback(
+        target, cache_path, [cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY]
+    )
+
+    assert target.read_text() == "content"
+    assert target.stat().st_ino != cache_path.stat().st_ino
+
+
+def test_symlinked_entry_keeps_its_mode_when_the_same_bytes_are_cached_executable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the cache on another device, the default checkout order symlinks each directory
+    entry, and the entry reads its mode through the cache object's name. A later directory
+    output holding the same bytes as an executable leaves that object alone: the earlier
+    entry stays non-executable and its directory keeps its hash, and the executable gets a
+    copy of its own."""
+    cache_dir = tmp_path / "cache"
+    real_link = os.link
+
+    def _cross_device_link(source: str, dest: str, **kwargs: Any) -> None:
+        if not pathlib.Path(dest).is_relative_to(cache_dir):
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+        real_link(source, dest, **kwargs)
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    content = "#!/bin/sh\necho hi\n"
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "run.sh").write_text(content)
+    plain_hash = cache.save_to_cache(plain, cache_dir)
+    assert (plain / "run.sh").is_symlink()
+
+    tool = tmp_path / "tool"
+    tool.mkdir()
+    (tool / "run.sh").write_text(content)
+    (tool / "run.sh").chmod(0o755)
+    cache.save_to_cache(tool, cache_dir)
+
+    assert not os.access(plain / "run.sh", os.X_OK)
+    assert cache.hash_directory(plain, cache_dir=cache_dir)["hash"] == plain_hash["hash"]
+    assert os.access(tool / "run.sh", os.X_OK)
+    assert not (tool / "run.sh").is_symlink()
+
+
+def _helper_same_tree_twice(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    first, second = tmp_path / "first", tmp_path / "second"
+    for out in (first, second):
+        (out / "sub").mkdir(parents=True)
+        (out / "sub" / "f.txt").write_text("same")
+        (out / "run.sh").write_text("#!/bin/sh\n")
+        (out / "run.sh").chmod(0o755)
+    return first, second
+
+
+def test_symlink_tree_keeps_a_tree_another_writer_published_first(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two outputs with the same directory content, saved in SYMLINK mode at once, both find
+    no cache tree and both copy one. The one that finishes second neither fails on nor
+    touches the tree the first published."""
+    cache_dir = tmp_path / "cache"
+    first, second = _helper_same_tree_twice(tmp_path)
+    tree = cache.get_cache_path(cache_dir, cache.hash_directory(second)["hash"])
+    real_copytree = shutil.copytree
+    published = list[int]()
+
+    def _copytree_while_another_writer_publishes(
+        source: str, dest: str, *args: Any, **kwargs: Any
+    ) -> object:
+        if not published:
+            published.append(-1)
+            cache.save_to_cache(first, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+            published[0] = tree.stat().st_ino
+        return real_copytree(source, dest, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copytree", _copytree_while_another_writer_publishes)
+
+    cache.save_to_cache(second, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+    assert tree.stat().st_ino == published[0]
+    assert first.resolve() == second.resolve() == tree.resolve()
+    assert (second / "sub" / "f.txt").read_text() == "same"
+    assert os.access(second / "run.sh", os.X_OK)
+    assert _helper_entries(tree.parent) == sorted(
+        [tree.name, cache._tree_layout_marker(tree).name]
+    ), "no temporary tree left"
+
+
+def test_symlink_tree_appears_only_once_complete(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restore that finds a tree's cache name symlinks to it at once, so the name exists
+    only once every file is in place with its final mode."""
+    cache_dir = tmp_path / "cache"
+    out, _ = _helper_same_tree_twice(tmp_path)
+    tree = cache.get_cache_path(cache_dir, cache.hash_directory(out)["hash"])
+    real_copytree = shutil.copytree
+    tree_named_after_copy = list[bool]()
+
+    def _copytree_then_look(source: str, dest: str, *args: Any, **kwargs: Any) -> object:
+        result = real_copytree(source, dest, *args, **kwargs)
+        if pathlib.Path(source) == out:  # not copytree's own call for a subdirectory
+            tree_named_after_copy.append(tree.exists())
+        return result
+
+    monkeypatch.setattr(shutil, "copytree", _copytree_then_look)
+
+    cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+    assert tree_named_after_copy == [False]
+    assert out.resolve() == tree.resolve()
+    assert (tree / "run.sh").stat().st_mode & 0o777 == 0o555
+    assert (tree / "sub" / "f.txt").stat().st_mode & 0o777 == 0o444
+
+
+def _helper_crash_during_tree_copy(out: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    """Simulate a kill while copying a directory output into the cache as a SYMLINK tree."""
+    real_copytree = shutil.copytree
+
+    def _copy_and_crash(source: str, dest: str, *args: Any, **kwargs: Any) -> object:
+        real_copytree(source, dest, *args, **kwargs)
+        os._exit(73)
+
+    shutil.copytree = _copy_and_crash
+    _ = cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+
+def test_symlink_tree_publish_removes_a_killed_publishers_copy(tmp_path: pathlib.Path) -> None:
+    """A process killed while copying a tree into the cache leaves its copy beside the tree's
+    cache name, never under it; the next publish into that directory removes the copy."""
+    cache_dir = tmp_path / "cache"
+    out, _ = _helper_same_tree_twice(tmp_path)
+    tree = cache.get_cache_path(cache_dir, cache.hash_directory(out)["hash"])
+    process = multiprocessing.get_context("spawn").Process(
+        target=_helper_crash_during_tree_copy, args=(out, cache_dir)
+    )
+    process.start()
+    process.join(timeout=60)
+
+    assert process.exitcode == 73
+    assert not tree.exists()
+    left = _helper_entries(tree.parent)
+    assert len(left) == 1 and left[0].startswith(cache._CACHE_TEMP_PREFIX), "the killed copy"
+    # The sweep of one prefix directory runs at most once per _CACHE_SWEEP_INTERVAL.
+    os.utime(tree.parent / cache._PREFIX_LOCK, (0, 0))
+
+    cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+    assert out.resolve() == tree.resolve()
+    assert _helper_entries(tree.parent) == sorted([tree.name, cache._tree_layout_marker(tree).name])
+
+
+def _helper_publish_tree_unseen(
+    src: pathlib.Path,
+    tree: pathlib.Path,
+    output_hash: DirHash,
+    cache_dir: pathlib.Path,
+    unseen_pid: int,
+    copied: Event,
+    release: Event,
+) -> None:
+    """Publish ``tree`` as a process the caller cannot see: one whose PID, from the caller's PID
+    namespace or host, belongs to no running process. It pauses once its copy is complete,
+    before renaming it into place, until ``release`` is set."""
+    os.getpid = lambda: unseen_pid
+    real_copytree = shutil.copytree
+
+    def _copy_then_pause(source: str, dest: str, *args: Any, **kwargs: Any) -> object:
+        result = real_copytree(source, dest, *args, **kwargs)
+        if pathlib.Path(source) == src:
+            copied.set()
+            assert release.wait(60)
+        return result
+
+    shutil.copytree = _copy_then_pause
+    cache._publish_tree(src, tree, output_hash, cache_dir)
+
+
+def test_symlink_tree_publish_keeps_a_live_publishers_copy_it_cannot_see(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A publisher in another PID namespace (a bwrap or `unshare --pid` sandbox), or on another
+    host sharing the cache, has a PID this process sees as dead. Another tree published into the
+    same prefix directory meanwhile leaves its copy alone, and its tree is published whole."""
+    cache_dir = tmp_path / "cache"
+    prefix = cache_dir / "ab"
+    prefix.mkdir(parents=True)
+    src = tmp_path / "theirs"
+    for i in range(200):
+        (src / f"d{i % 10}").mkdir(parents=True, exist_ok=True)
+        (src / f"d{i % 10}" / f"f{i}.txt").write_text(f"{i}\n")
+    theirs = cache.hash_directory(src)
+    ours_src, _ = _helper_same_tree_twice(tmp_path)
+    ours = cache.hash_directory(ours_src)
+    ctx = multiprocessing.get_context("spawn")
+    exited = ctx.Process(target=int)
+    exited.start()
+    exited.join(timeout=60)
+    with ctx.Manager() as manager:
+        copied, release = manager.Event(), manager.Event()
+        publisher = ctx.Process(
+            target=_helper_publish_tree_unseen,
+            args=(src, prefix / "cdef0123456789", theirs, cache_dir, exited.pid)
+            + (copied, release),
+        )
+        publisher.start()
+        assert copied.wait(60)
+        cache._publish_tree(ours_src, prefix / "99990123456789", ours, cache_dir)
+        release.set()
+        publisher.join(timeout=60)
+
+    assert publisher.exitcode == 0
+    assert cache.hash_directory(prefix / "cdef0123456789") == theirs
+    assert cache.hash_directory(prefix / "99990123456789") == ours
+    assert not [p for p in prefix.iterdir() if p.name.startswith(cache._CACHE_TEMP_PREFIX)]
+
+
+def _helper_tree_with_files_missing(
+    tmp_path: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, DirHash]:
+    """A SYMLINK cache tree as an older pivot left it when killed while copying it straight to its
+    cache name: one file missing, one cut short, no layout marker. Its file objects are cached."""
+    cache_dir = tmp_path / "cache"
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (out / name).write_text(f"{name} " * 100)
+    output_hash = cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(output_hash)
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    tree.mkdir(parents=True)
+    (tree / "a.txt").write_text("a.txt " * 100)
+    (tree / "b.txt").write_text("b.txt ")
+    shutil.rmtree(out)
+    return cache_dir, tree, output_hash
+
+
+def test_symlink_restore_repairs_a_tree_left_with_files_missing(tmp_path: pathlib.Path) -> None:
+    """A tree whose name exists but which lacks files is not trusted: the restore repairs it from
+    the file objects, so the output hashes to the hash it was restored for."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert out.resolve() == tree.resolve()
+    assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert (tree / "c.txt").stat().st_mode & 0o777 == 0o444
+    assert cache._tree_layout_marker(tree).exists()
+
+
+def test_symlink_restore_refuses_a_tree_it_cannot_repair(tmp_path: pathlib.Path) -> None:
+    """With a missing file's object gone too, the tree can restore nothing; the restore reports a
+    cache miss instead of symlinking to it."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    c_hash = next(e["hash"] for e in output_hash["manifest"] if e["relpath"] == "c.txt")
+    cache.get_cache_path(cache_dir, c_hash).unlink()
+    out = tmp_path / "out"
+
+    assert not cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert not out.exists()
+    assert not cache._tree_layout_marker(tree).exists()
+
+
+def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pivot 0.3.4 marked a tree after checking only its layout, so its mark sits beside partial
+    trees too. The restore checks such a tree again, repairs it, and replaces the old mark."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    old_mark = tree.with_name(tree.name + ".layout-checked")
+    old_mark.touch()
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert cache._tree_layout_marker(tree).exists()
+    assert not old_mark.exists()
+
+
+def test_symlink_restore_repairs_a_tree_with_a_file_cut_short(tmp_path: pathlib.Path) -> None:
+    """A tree holding every file it records, one of them cut short, is not trusted either."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    (tree / "c.txt").write_text("c.txt " * 100)
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert out.resolve() == tree.resolve()
+    assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+
+
+def test_symlink_restore_goes_file_by_file_past_a_damaged_tree_it_cannot_lock(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A damaged tree this user can neither lock nor so repair (another user's, in a shared
+    cache) is not used: the output is restored file by file from the cached objects, and the
+    tree is left unmarked."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    real_open = cache._open_cache_lock
+
+    def _tree_lock_not_writable(path: pathlib.Path) -> int:
+        if path.name.endswith(cache._TREE_LOCK_SUFFIX) and path.name != cache._PREFIX_LOCK:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+        return real_open(path)
+
+    monkeypatch.setattr(cache, "_open_cache_lock", _tree_lock_not_writable)
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert not out.is_symlink()
+    assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert not (tree / "c.txt").exists()
+    assert not cache._tree_layout_marker(tree).exists()
+
+
+def test_symlink_commit_repairs_a_tree_that_lost_a_file_while_it_was_copied(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tree copy that loses a file before it is renamed into place (a sweep on another host
+    whose flock is not coherent with this one's) is not marked complete; the commit then checks
+    the tree and repairs it from the file objects before it symlinks the output to it."""
+    out, _ = _helper_same_tree_twice(tmp_path)
+    cache_dir = tmp_path / "cache"
+    real_copytree = shutil.copytree
+
+    def _copy_then_lose_a_file(source: str, dest: str, *args: Any, **kwargs: Any) -> object:
+        result = real_copytree(source, dest, *args, **kwargs)
+        if pathlib.Path(source) == out:  # not copytree's own call for a subdirectory
+            (pathlib.Path(dest) / "sub" / "f.txt").unlink()
+        return result
+
+    monkeypatch.setattr(shutil, "copytree", _copy_then_lose_a_file)
+
+    output_hash = cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    assert out.resolve() == tree.resolve()
+    assert (tree / "sub" / "f.txt").read_text() == "same"
+    assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert cache._tree_layout_marker(tree).exists()
+
+
+def _helper_damaged_tree(root: pathlib.Path, files: int) -> tuple[pathlib.Path, DirHash]:
+    """A flat tree of ``files`` cached files as an older pivot left it: every file but one
+    missing, a read-only root, no mark. Return the cache dir and the output's hash."""
+    cache_dir = root / "cache"
+    src = root / "src"
+    src.mkdir()
+    for i in range(files):
+        (src / f"f{i:03d}.txt").write_text(f"file {i}\n" * 50)
+    output_hash = cache.save_to_cache(src, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(output_hash)
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    tree.mkdir(parents=True)
+    shutil.copy2(src / "f000.txt", tree / "f000.txt")
+    (tree / "f000.txt").chmod(0o444)
+    tree.chmod(0o555)
+    return cache_dir, output_hash
+
+
+def _helper_restore_at_barrier(
+    out: pathlib.Path, output_hash: DirHash, cache_dir: pathlib.Path, barrier: Barrier
+) -> str:
+    barrier.wait()
+    try:
+        restored = cache.restore_from_cache(
+            out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+        )
+    except OSError as e:
+        return f"{type(e).__name__}: {e}"
+    return "ok" if restored else "not restored"
+
+
+def test_concurrent_restores_repair_one_damaged_tree_once(tmp_path: pathlib.Path) -> None:
+    """Several processes restoring through one damaged tree with a read-only root repair it one
+    at a time: each restore succeeds, the tree ends exactly what its hash records, its root
+    read-only again, with no repair's temporary file left inside it."""
+    n_procs = 8
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        for r in range(3):
+            root = tmp_path / f"round{r}"
+            root.mkdir()
+            cache_dir, output_hash = _helper_damaged_tree(root, 400)
+            tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+            barrier = manager.Barrier(n_procs, timeout=60)
+            results = pool.starmap(
+                _helper_restore_at_barrier,
+                [(root / f"out{i}", output_hash, cache_dir, barrier) for i in range(n_procs)],
+            )
+
+            assert results == ["ok"] * n_procs
+            assert sorted(p.name for p in tree.iterdir()) == sorted(
+                e["relpath"] for e in output_hash["manifest"]
+            )
+            assert cache.hash_directory(tree)["hash"] == output_hash["hash"]
+            assert tree.stat().st_mode & 0o777 == 0o555
+            for i in range(n_procs):
+                assert cache.hash_directory(root / f"out{i}", cache_dir=cache_dir) == output_hash
+
+
+def _helper_tree_hash(src: pathlib.Path) -> DirHash:
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "f.txt").write_text(f"{src.name}\n")
+    return cache.hash_directory(src)
+
+
+def test_tree_publish_uses_a_prefix_lock_this_user_cannot_write(tmp_path: pathlib.Path) -> None:
+    """A shared cache directory can hold lock files another user created, which this user can
+    read but not write. A tree publish into that directory still works: a lock file this user
+    cannot write is locked read-only."""
+    cache_dir = tmp_path / "cache"
+    prefix = cache_dir / "ab"
+    first, second = tmp_path / "first", tmp_path / "second"
+    cache._publish_tree(first, prefix / "00000000000001", _helper_tree_hash(first), cache_dir)
+    for lock in prefix.glob("*.lock"):
+        lock.chmod(0o444)
+
+    second_hash = _helper_tree_hash(second)
+    cache._publish_tree(second, prefix / "00000000000002", second_hash, cache_dir)
+
+    assert cache.hash_directory(prefix / "00000000000002") == second_hash
+
+
+def test_prefix_lock_is_writable_by_whoever_can_write_its_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The lock file a publish creates carries its directory's write bits, so every user who
+    can create entries in a shared prefix directory can also take its exclusive lock (NFS locks
+    exclusively only a file opened for writing)."""
+    cache_dir = tmp_path / "cache"
+    prefix = cache_dir / "ab"
+    prefix.mkdir(parents=True)
+    prefix.chmod(0o777)
+    src = tmp_path / "src"
+
+    cache._publish_tree(src, prefix / "00000000000001", _helper_tree_hash(src), cache_dir)
+
+    (lock,) = prefix.glob("*.lock")
+    assert lock.stat().st_mode & 0o777 == 0o666
+
+
+def test_sweep_reports_and_skips_a_temporary_entry_it_cannot_remove(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A temporary tree another user's killed pivot left cannot be removed; the sweep reports it
+    and the publish goes on."""
+    cache_dir = tmp_path / "cache"
+    prefix = cache_dir / "ab"
+    stuck = prefix / f"{cache._CACHE_TEMP_PREFIX}theirs"
+    (stuck / "sub").mkdir(parents=True)
+    real_clear = cache._clear_path
+
+    def _clear_unless_theirs(path: pathlib.Path) -> None:
+        if path == stuck:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path / "sub"))
+        real_clear(path)
+
+    monkeypatch.setattr(cache, "_clear_path", _clear_unless_theirs)
+    src = tmp_path / "src"
+    src_hash = _helper_tree_hash(src)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        cache._publish_tree(src, prefix / "00000000000001", src_hash, cache_dir)
+
+    assert cache.hash_directory(prefix / "00000000000001") == src_hash
+    assert stuck.is_dir()
+    assert str(stuck) in caplog.text
+
+
+def _helper_crash_during_object_copy(src: pathlib.Path, cache_path: pathlib.Path) -> None:
+    """Simulate a kill while copying a file into the cache."""
+    real_copy2 = shutil.copy2
+
+    def _copy_and_crash(source: str, dest: str) -> None:
+        real_copy2(source, dest)
+        os._exit(73)
+
+    shutil.copy2 = _copy_and_crash
+    cache.copy_to_cache(src, cache_path)
+
+
+def test_copy_to_cache_removes_a_killed_copy_beside_its_objects(tmp_path: pathlib.Path) -> None:
+    """A process killed while copying a file into the cache leaves its temporary file in the
+    prefix directory; a later copy into that directory removes it."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    prefix = tmp_path / "cache" / "ab"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_helper_crash_during_object_copy, args=(src, prefix / "00000000000001")
+    )
+    process.start()
+    process.join(timeout=60)
+    assert process.exitcode == 73
+    assert [n[: len(cache._CACHE_TEMP_PREFIX)] for n in _helper_entries(prefix)] == [
+        cache._CACHE_TEMP_PREFIX
+    ]
+    # The sweep of one prefix directory runs at most once per _CACHE_SWEEP_INTERVAL.
+    os.utime(prefix / cache._PREFIX_LOCK, (0, 0))
+
+    cache.copy_to_cache(src, prefix / "00000000000002")
+
+    assert _helper_entries(prefix) == ["00000000000002"]
+
+
+def test_sweep_removes_an_older_pivots_temporary_files_once_untouched_for_an_hour(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older pivot made its temporaries without the lock, so one may belong to a copy still
+    running: it is removed only once untouched for the sweep interval."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    prefix = tmp_path / "cache" / "ab"
+    prefix.mkdir(parents=True)
+    legacy = ["tmpk3j2h1g0.tmp", ".pivot_download_x9y8z7"]
+    for name in legacy:
+        (prefix / name).write_text("partial")
+
+    cache.copy_to_cache(src, prefix / "00000000000001")
+    assert _helper_entries(prefix) == sorted([*legacy, "00000000000001"])
+
+    os.utime(prefix / cache._PREFIX_LOCK, (0, 0))
+    later = time.time() + 2 * cache._CACHE_SWEEP_INTERVAL
+    monkeypatch.setattr(time, "time", lambda: later)
+    cache.copy_to_cache(src, prefix / "00000000000002")
+
+    assert _helper_entries(prefix) == ["00000000000001", "00000000000002"]
+
+
+def test_sweep_skips_an_older_pivots_temporary_file_that_vanishes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older pivot sharing the cache renames its temporary file into place whenever its copy
+    is done, so the file can vanish between the sweep listing it and looking at it; the sweep
+    moves on and the copy is published."""
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    prefix = tmp_path / "cache" / "ab"
+    prefix.mkdir(parents=True)
+    legacy = prefix / "tmpk3j2h1g0.tmp"
+    legacy.write_text("partial")
+    real_scandir = os.scandir
+    renamed = list[bool]()
+
+    def _list_then_rename_away(path: Any) -> Any:
+        if path != prefix or renamed:
+            return real_scandir(path)
+        with real_scandir(path) as listing:
+            entries = list(listing)
+        legacy.rename(prefix / "0000000000000f")
+        renamed.append(True)
+        return iter(entries)
+
+    monkeypatch.setattr(os, "scandir", _list_then_rename_away)
+
+    cache.copy_to_cache(src, prefix / "00000000000001")
+
+    assert renamed == [True], "the sweep listed the directory"
+    assert _helper_entries(prefix) == ["00000000000001", "0000000000000f"]
+
+
+@pytest.mark.parametrize("flock_errno", [errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP])
+def test_cache_writes_go_on_where_the_filesystem_refuses_flock(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, flock_errno: int
+) -> None:
+    """A cache on a filesystem that refuses flock() (Lustre without `flock`, an NFS mount whose
+    lock manager does not answer) still takes new file objects and SYMLINK trees: nothing there
+    can take the exclusive lock to sweep, so staging goes on without the shared one."""
+
+    def _refuse(fd: int, operation: int) -> None:
+        raise OSError(flock_errno, os.strerror(flock_errno))
+
+    monkeypatch.setattr(fcntl, "flock", _refuse)
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "00000000000001"
+    out, _ = _helper_same_tree_twice(tmp_path)
+
+    cache.copy_to_cache(src, cache_path)
+    output_hash = cache.save_to_cache(
+        out, tmp_path / "cache", checkout_mode=cache.CheckoutMode.SYMLINK
+    )
+
+    assert cache_path.read_text() == "content"
+    tree = cache.get_cache_path(tmp_path / "cache", output_hash["hash"])
+    assert out.resolve() == tree.resolve()
+    assert cache.hash_directory(out, cache_dir=tmp_path / "cache")["hash"] == output_hash["hash"]
+
+
+def test_cache_write_raises_a_flock_failure_that_is_not_a_refusal(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a filesystem's refusal of flock() is passed over; any other failure of the shared
+    lock is raised, and nothing is published."""
+    real_flock = fcntl.flock
+
+    def _shared_fails(fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_SH:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", _shared_fails)
+    src = tmp_path / "out.txt"
+    src.write_text("content")
+    cache_path = tmp_path / "cache" / "ab" / "00000000000001"
+
+    with pytest.raises(OSError, match="Input/output error"):
+        cache.copy_to_cache(src, cache_path)
+
+    assert not cache_path.exists()
 
 
 # === _make_writable_and_retry Tests ===
