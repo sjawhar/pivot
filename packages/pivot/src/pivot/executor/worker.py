@@ -517,8 +517,9 @@ def unrecorded_empty_dirs_only(expected: HashInfo, actual: HashInfo) -> bool:
     recorded for a directory that had no empty directories looks the same: lock files carry no
     pivot version to tell them apart. Restoring an output to such a hash deletes the empty
     directories on disk, and the stages that read the output then hash the stripped tree to the
-    old value and stay cached, though a fresh build would hold the directories. Running the
-    stage instead costs one run where the directories were only added by hand.
+    old value and stay cached, though a fresh build of a stage that makes the directories would
+    hold them. Running the stage instead costs one run where the directories were only added by
+    hand; that run rebuilds the output without them.
     """
     return (
         is_dir_hash(expected)

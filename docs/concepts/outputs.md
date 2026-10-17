@@ -129,26 +129,34 @@ ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
 them changes the directory hash, and all of them return on restore.
 
 Empty directories are part of a directory artifact too: adding or removing one
-changes the directory hash, and every one comes back on restore, so a restored
-artifact holds the same directories as the one the stage built, in every
-checkout mode.
+changes the directory hash, and every one the hash records comes back on
+restore, so an artifact restored from a hash Pivot 0.3.4 or later recorded
+holds the same directories as the one the stage built, in every checkout mode.
 
 A directory hash Pivot 0.3.3 or earlier recorded lists no empty directories,
-and neither does any hash of a directory that had none. When a stage output
-holds the files such a lock records plus empty directories it does not, Pivot
-does not restore the output to the lock, which would delete them. `pivot
-status` shows the stage stale ("Output holds empty directories its lock does
-not record"), and `pivot repro` runs it, or takes its outputs from a run-cache
-entry that records the directories, so its lock records them from then on. An
-empty directory you add inside such an output yourself makes the stage run
-once the same way.
+and neither does any hash of a directory that had none. The two look the same,
+so Pivot cannot tell whether such a directory had any. Restoring an output from
+such a lock where none is on disk (in a fresh clone, with `pivot checkout`, or
+with `pivot repro` after the output was deleted) leaves its empty directories
+out, and the stage stays cached.
 
-Pivot 0.3.4 and 0.3.5 restored such an output to its old lock, deleting the
-empty directories and keeping the stage cached. An output that lost them that
-way matches its old lock again and stays cached: re-run the stages that write
-the directories (`pivot run --force <stage>`, then `pivot repro`) so their
-locks record them. To re-record a tracked directory, run `pivot track --force
-<path>`.
+When an output on disk holds the files such a lock records plus empty
+directories it does not, `pivot repro` does not restore the output to the lock,
+which would delete them. `pivot status` shows the stage stale ("Output holds
+empty directories its lock does not record"), and `pivot repro` runs it, or
+takes its outputs from a run-cache entry that records the directories, so its
+lock records them from then on. An empty directory you add inside such an
+output yourself makes the stage run once, and the output the stage builds
+replaces yours, without that directory. `pivot checkout` leaves such an output
+as it is; `pivot checkout --force` is the exception that restores it to the
+lock, deleting its empty directories, and the stage stays cached.
+
+An output that lacks the empty directories its stage makes matches its old lock
+and stays cached, whether it was restored from that lock as above or Pivot
+0.3.4 or 0.3.5 deleted them (those versions restored such an output to its old
+lock). To repair it, re-run the stages that write the directories (`pivot run
+--force <stage>`, then `pivot repro`) so their locks record them. To re-record
+a tracked directory, run `pivot track --force <path>`.
 
 A symlink inside a directory artifact is not stored: it is left out of the
 manifest and does not come back on restore. When a stage writes the artifact,
