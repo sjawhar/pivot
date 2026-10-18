@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.3.10 (2026-10-18)
+
+### Bug Fixes
+
+- **engine**: Decide a cached stage's skip under shared locks on its outputs
+  ([#487](https://github.com/sjawhar/pivot/pull/487),
+  [`1c2d1c2`](https://github.com/sjawhar/pivot/commit/1c2d1c27961dad54dd6e4afcc0261ec372cf7c54))
+
+
 ## v0.3.9 (2026-10-18)
 
 ### Bug Fixes
