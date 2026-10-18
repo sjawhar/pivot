@@ -89,12 +89,12 @@ class WorkerPool:
         self._in_run = True
 
     def _new_output_queue(self) -> object:
-        """Return a fresh queue from the engine-lifetime manager, replacing it if it died."""
+        """Return a fresh queue from the engine-lifetime manager, replacing it if unreachable."""
         if self._manager is not None:
             try:
                 return self._manager.Queue()
-            except (ConnectionError, EOFError):
-                _logger.warning("Output-queue manager stopped between runs; starting a new one")
+            except (OSError, EOFError):
+                _logger.warning("Output-queue manager unreachable between runs; starting a new one")
                 self._manager.shutdown()
         self._manager = executor_core.create_manager()
         return self._manager.Queue()

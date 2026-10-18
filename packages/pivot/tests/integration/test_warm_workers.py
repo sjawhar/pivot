@@ -481,8 +481,10 @@ def _helper_cmdline(pid: int) -> str:
     return raw.replace(b"\0", b" ").decode(errors="replace").strip()
 
 
-def test_manager_that_died_between_runs_is_replaced() -> None:
-    """A dead output-queue manager is replaced at the next run instead of ending the session."""
+@pytest.mark.parametrize("failure", ["killed", "socket_removed"])
+def test_unreachable_manager_is_replaced_between_runs(failure: str) -> None:
+    """A manager that died, or whose socket a temp cleaner removed, is replaced at the next run
+    instead of ending the session."""
     executor_core.restart_workers(1, 1)
     pool = WorkerPool()
     try:
@@ -490,10 +492,13 @@ def test_manager_that_died_between_runs_is_replaced() -> None:
         pool.end_run()
         manager = pool._manager
         assert manager is not None
-        process = cast("BaseProcess", manager._process)  # pyright: ignore[reportAttributeAccessIssue] - not in typeshed
-        assert process.pid is not None
-        os.kill(process.pid, signal.SIGKILL)
-        process.join(timeout=10)
+        if failure == "killed":
+            process = cast("BaseProcess", manager._process)  # pyright: ignore[reportAttributeAccessIssue] - not in typeshed
+            assert process.pid is not None
+            os.kill(process.pid, signal.SIGKILL)
+            process.join(timeout=10)
+        else:
+            os.unlink(cast("str", manager.address))
 
         pool.start(max_workers=1)
         pool.output_queue().put_nowait(None)

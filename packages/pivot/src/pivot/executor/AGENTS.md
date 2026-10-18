@@ -2,7 +2,7 @@
 
 Workers execute in separate processes via `loky.get_reusable_executor()`. An Engine keeps its
 workers and manager alive across its runs; each run receives a fresh manager queue for output,
-and a manager that died between runs is replaced then.
+and a manager that cannot be reached when a run starts is replaced then.
 The loky initializer and the manager's initializer start the parent-death watcher, so a
 worker or manager exits when its Pivot process dies. Keep `timeout=None` and
 `reuse=False if kill_workers else "auto"` in the shared executor policy.

@@ -96,8 +96,8 @@ During watch mode, the Engine filters filesystem events based on stage state:
 
 Pivot uses `loky.get_reusable_executor()` with `spawn` context. `WorkerPool` owns workers and
 the manager process for the Engine lifetime. Each run gets its own manager-backed output queue
-and drain shutdown event, so logs cannot cross run boundaries. A manager that died between runs
-is replaced when the next run asks it for a queue.
+and drain shutdown event, so logs cannot cross run boundaries. A manager that cannot be reached
+when a run starts (it died, or its socket was removed) is replaced then.
 
 ### Why ProcessPoolExecutor?
 
