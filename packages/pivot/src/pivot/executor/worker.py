@@ -110,7 +110,8 @@ _stop = _StopState()
 
 
 def kill_descendants(pid: int) -> None:
-    """SIGKILL every live descendant of process ``pid``."""
+    """SIGKILL every live descendant of process ``pid``. A process that detached from that
+    tree (double-forked, or orphaned when its parent exited) is not one."""
     try:
         descendants = psutil.Process(pid).children(recursive=True)
     except psutil.Error:
@@ -121,9 +122,9 @@ def kill_descendants(pid: int) -> None:
 
 
 def _exit_worker(code: int) -> NoReturn:
-    """Exit this worker, first killing the processes it started that are still running, which
-    would otherwise be left to init (a stage's ``Popen`` with no cleanup, or one whose cleanup
-    was cut off)."""
+    """Exit this worker, first killing the processes still descended from it, which would
+    otherwise be left to init (a stage's ``Popen`` with no cleanup, or one whose cleanup was
+    cut off)."""
     kill_descendants(os.getpid())
     os._exit(code)
 
@@ -185,10 +186,14 @@ def unwind_when_stopped(parent_pid: int) -> None:
     main thread SIGTERM (a signal to that thread interrupts a blocking call there) and exits
     the worker after ``TERMINATION_GRACE_S`` itself, in case the stage replaced the SIGTERM
     handler or is blocked where no signal reaches it. Every exit first kills the processes
-    the worker started.
+    still descended from the worker.
+
+    A SIGINT the worker inherited as ignored (pivot run as a background job of a
+    non-interactive shell) stays ignored, as it does for pivot itself.
     """
     signal.signal(signal.SIGTERM, _stop_worker)
-    signal.signal(signal.SIGINT, _interrupt_stage)
+    if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+        signal.signal(signal.SIGINT, _interrupt_stage)
     main_thread = threading.main_thread().ident
     assert main_thread is not None
 

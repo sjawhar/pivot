@@ -134,7 +134,7 @@ finally:
     subprocess.run(["docker", "rm", "--force", name], check=False)
 ```
 
-- The cleanup has 10 seconds; then the worker exits regardless and kills every process it started. Use `docker rm --force`, not `docker stop`, which waits 10 seconds by default.
+- The cleanup has 10 seconds; then the worker exits regardless and kills every process still descended from it. A detached process (double-forked, a daemon, or orphaned when its parent exited) and a container are not among those: stop them in the cleanup. Use `docker rm --force`, not `docker stop`, which waits 10 seconds by default.
 - Do not catch `BaseException` or `KeyboardInterrupt` to carry on: the stage fails anyway, and nothing it returns is committed.
 - An RPC or TUI cancel is different: it lets running stages finish and skips the rest.
 
