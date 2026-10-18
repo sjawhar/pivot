@@ -12,6 +12,11 @@ _T = typing.TypeVar("_T")
 
 _FileStamp = tuple[int, int, int, int]
 
+# File timestamps can lag the wall clock: kernels with coarse timestamps stamp a write up to
+# one scheduler tick (10 ms at HZ=100) before a clock read taken earlier. A file stamped this
+# close to the run's start may have changed after a worker imported it, so it counts as changed.
+_TIMESTAMP_SLACK_NS = 20_000_000
+
 
 def _file_stamp(path: str) -> _FileStamp | None:
     """Return the stat fields that change when imported user code changes."""
@@ -88,7 +93,7 @@ class WorkerPool:
         Both timestamps come from the coordinator before the worker can deserialize code. The
         run-start value also protects direct WorkerPool callers that do not pass submit time.
         """
-        comparison_ns = min(dispatched_ns, self._run_started_ns)
+        comparison_ns = min(dispatched_ns, self._run_started_ns) - _TIMESTAMP_SLACK_NS
         for path in paths:
             stamp = _file_stamp(path)
             if stamp is None:

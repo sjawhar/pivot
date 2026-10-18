@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import os
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
 from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
+
+if TYPE_CHECKING:
+    import pathlib
 
 
 def _helper_identity(value: int) -> int:
@@ -86,3 +90,22 @@ def test_worker_pool_output_queue_requires_start() -> None:
 
     with pytest.raises(RuntimeError, match="not started"):
         pool.output_queue()
+
+
+def test_source_stamped_within_clock_granularity_of_dispatch_counts_as_changed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A coarse file clock can stamp an edit slightly before an earlier coordinator clock read."""
+    source = tmp_path / "helper.py"
+    source.write_text("x = 1\n")
+    changed_ns = source.stat().st_ctime_ns
+
+    recent = WorkerPool()
+    recent._run_started_ns = changed_ns + 5_000_000
+    recent.record_user_code_files([str(source)], changed_ns + 5_000_000)
+    assert recent._code_changed, "an edit 5 ms before dispatch may postdate the worker's import"
+
+    old = WorkerPool()
+    old._run_started_ns = changed_ns + 1_000_000_000
+    old.record_user_code_files([str(source)], changed_ns + 1_000_000_000)
+    assert not old._code_changed, "a file unchanged for a second before dispatch is current"
