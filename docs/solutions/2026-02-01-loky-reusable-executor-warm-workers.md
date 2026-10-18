@@ -89,9 +89,16 @@ The Engine shuts its workers and manager down when it exits. An atexit fallback 
 when code creates a reusable executor outside an Engine context.
 
 Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler), and
-workers use `timeout=None`, so nothing else would end them. Every worker and the output-queue
-manager therefore start with `_exit_when_parent_dies`, a thread that exits the child once its
-parent pid changes. Start any new long-lived child process with the same initializer.
+workers use `timeout=None`, so nothing else would end them. The output-queue manager therefore
+starts with `_exit_when_parent_dies`, a thread that exits it once its parent pid changes. Every
+worker starts with `worker.unwind_when_stopped`: when its parent pid changes, a thread sends the
+worker's main thread SIGTERM, and SIGTERM or SIGINT raises `worker.WorkerTerminated` in the
+running stage, so the stage's `finally` blocks and context managers run (stopping a child
+process or a detached container it started) before the worker exits. A stop signal received
+later is ignored, and an unwinding still running after `worker.TERMINATION_GRACE_S` (10 s) is
+cut off with `os._exit`. `WorkerPool.hard_cancel` (an Engine leaving on an exception, such as
+Ctrl-C) stops workers the same way: SIGTERM, up to the same grace, then SIGKILL of any worker
+left and its descendants. Start any new long-lived child process with one of these initializers.
 
 ## Key Insight
 

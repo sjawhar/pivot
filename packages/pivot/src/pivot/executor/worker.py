@@ -10,11 +10,13 @@ import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
+import contextvars
 import logging
 import os
 import pathlib
 import queue
 import random
+import signal
 import sys
 import threading
 import traceback
@@ -58,7 +60,72 @@ if TYPE_CHECKING:
     from multiprocessing import Queue
     from types import TracebackType
 
+
 logger = logging.getLogger(__name__)
+
+# How long a terminated worker's running stage may take to unwind before the worker exits.
+TERMINATION_GRACE_S = 10.0
+
+
+class WorkerTerminated(BaseException):  # noqa: N818 - names the event, as KeyboardInterrupt does
+    """Raised in a worker's main thread when the worker is told to stop mid-stage.
+
+    It derives from BaseException, so a stage's ``except Exception`` does not stop it: the
+    stage's ``finally`` blocks and context managers run, and then the worker exits.
+    """
+
+
+# Whether this process's main thread is running a stage (``execute_stage``).
+_running_stage: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_running_stage", default=False
+)
+
+
+def _ignore_signal(_signum: int, _frame: object) -> None:
+    """Swallow a second stop signal, so it cannot interrupt the unwinding of the first."""
+
+
+def _exit_after_grace() -> None:
+    threading.Event().wait(TERMINATION_GRACE_S)
+    os._exit(1)
+
+
+def _stop_worker(_signum: int, _frame: object) -> None:
+    """SIGTERM or SIGINT handler of a worker: unwind the running stage, then exit.
+
+    Later stop signals are swallowed, so Ctrl-C at a terminal (SIGINT to pivot and its
+    workers) followed by pivot cancelling the worker (SIGTERM) unwinds the stage once. An
+    unwinding that has not finished within ``TERMINATION_GRACE_S`` is cut off.
+    """
+    signal.signal(signal.SIGTERM, _ignore_signal)
+    signal.signal(signal.SIGINT, _ignore_signal)
+    threading.Thread(target=_exit_after_grace, daemon=True, name="pivot-stop-grace").start()
+    if not _running_stage.get():
+        os._exit(0)
+    raise WorkerTerminated
+
+
+def unwind_when_stopped(parent_pid: int) -> None:
+    """Loky worker initializer: stop this worker when it is told to or its parent dies.
+
+    SIGTERM (``WorkerPool.hard_cancel``) or SIGINT (Ctrl-C at a terminal) raises
+    ``WorkerTerminated`` in the running stage, so its ``finally`` blocks run (stopping the
+    processes or containers it started) before the worker exits. When the Pivot process that
+    started the worker dies, as when it is SIGKILLed, a watchdog thread sends this worker's
+    main thread SIGTERM; a signal to the thread itself interrupts a blocking call there.
+    """
+    signal.signal(signal.SIGTERM, _stop_worker)
+    signal.signal(signal.SIGINT, _stop_worker)
+    main_thread = threading.main_thread().ident
+    assert main_thread is not None
+
+    def _watch_parent() -> None:
+        poll = threading.Event()
+        while os.getppid() == parent_pid:
+            poll.wait(1)
+        signal.pthread_kill(main_thread, signal.SIGTERM)
+
+    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
 
 
 class _QueueLoggingHandler(logging.Handler):
@@ -515,8 +582,17 @@ def execute_stage(
     cache_dir: pathlib.Path,
     output_queue: Queue[OutputMessage],
 ) -> StageResult:
-    """Execute a stage and report every user-code module resident in this worker."""
-    result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
+    """Execute a stage and report every user-code module resident in this worker.
+
+    A worker stopped mid-stage (``unwind_when_stopped``) exits once the stage has unwound.
+    """
+    token = _running_stage.set(True)
+    try:
+        result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
+    except WorkerTerminated:
+        os._exit(1)
+    finally:
+        _running_stage.reset(token)
     result["user_code_files"] = user_code_files()
     return result
 

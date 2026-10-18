@@ -37,7 +37,10 @@ def _noop() -> None:
 
 
 def _exit_when_parent_dies(parent_pid: int) -> None:
-    """Exit a long-lived child (worker or manager) after its owning Pivot process dies."""
+    """Exit the output-queue manager after its owning Pivot process dies.
+
+    Workers use ``worker.unwind_when_stopped`` instead, which lets the running stage unwind.
+    """
 
     def _watch_parent() -> None:
         poll = threading.Event()
@@ -82,7 +85,7 @@ def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.Proce
         timeout=_WORKER_IDLE_TIMEOUT_S,
         kill_workers=kill_workers,
         reuse=False if kill_workers else "auto",
-        initializer=_exit_when_parent_dies,
+        initializer=worker.unwind_when_stopped,
         initargs=(os.getpid(),),
     )
 

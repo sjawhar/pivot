@@ -502,8 +502,8 @@ def test_ensure_cleanup_registered_registers_atexit(mocker: MockerFixture) -> No
         executor_core._ensure_cleanup_registered()
 
 
-def test_worker_parent_watchdog_exits_after_parent_death(mocker: MockerFixture) -> None:
-    """Workers with no idle timeout do not become permanent orphans after a hard parent exit."""
+def test_manager_parent_watchdog_exits_after_parent_death(mocker: MockerFixture) -> None:
+    """The output-queue manager does not become a permanent orphan after a hard parent exit."""
     thread = mocker.patch.object(threading, "Thread")
     exit_process = mocker.patch.object(os, "_exit", side_effect=SystemExit)
     mocker.patch.object(os, "getppid", return_value=1)

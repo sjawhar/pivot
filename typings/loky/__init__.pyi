@@ -3,12 +3,15 @@
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
 from multiprocessing.context import BaseContext
+from multiprocessing.process import BaseProcess
 from typing import Any, Literal, TypeVar
 
 _T = TypeVar("_T")
 
 class ProcessPoolExecutor(Executor):
     """Process pool executor that can be used with concurrent.futures."""
+
+    _processes: dict[int, BaseProcess]
 
     def __init__(
         self,
