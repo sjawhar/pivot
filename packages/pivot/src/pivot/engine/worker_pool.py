@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import threading
+import time
 import typing
 from dataclasses import dataclass, field
 
@@ -41,23 +42,28 @@ class WorkerPool:
     _shutdown_event: threading.Event | None = None
     _accepting: bool = True
     _in_run: bool = False
+    _run_started_ns: int = 0
+    _max_workers: int = 0
     _user_code_files: dict[str, _FileStamp] = field(default_factory=dict)
     _code_changed: bool = False
 
     def start(self, *, max_workers: int) -> None:
-        """Start a run with the reusable executor and a fresh output queue."""
+        """Start a run without shrinking workers warmed by earlier runs."""
         if self._in_run:
             return
+        self._run_started_ns = time.time_ns()
+        self._max_workers = max(self._max_workers, max_workers)
         executor = typing.cast(
-            "loky.ProcessPoolExecutor", executor_core.create_executor(max_workers)
+            "loky.ProcessPoolExecutor", executor_core.create_executor(self._max_workers)
         )
         if self._executor is not None and executor is not self._executor:
             self._user_code_files.clear()
             self._code_changed = False
         if self._executor is executor and self._has_stale_user_code():
-            executor_core.restart_workers(max_workers, max_workers)
+            executor_core.restart_workers(self._max_workers, self._max_workers)
             executor = typing.cast(
-                "loky.ProcessPoolExecutor", executor_core.create_executor(max_workers)
+                "loky.ProcessPoolExecutor",
+                executor_core.create_executor(self._max_workers),
             )
             self._user_code_files.clear()
             self._code_changed = False
@@ -76,18 +82,20 @@ class WorkerPool:
         """Whether this pool has a queue and accepts dispatches for the current run."""
         return self._in_run
 
-    def record_user_code_files(self, paths: list[str], started_ns: int) -> None:
+    def record_user_code_files(self, paths: list[str], dispatched_ns: int) -> None:
         """Record source files a worker imported while executing a stage.
 
-        A first-seen file modified after the task started may have changed after that worker
-        imported it, so the next run refreshes the pool rather than trusting its cached module.
+        Both timestamps come from the coordinator before the worker can deserialize code. The
+        run-start value also protects direct WorkerPool callers that do not pass submit time.
         """
+        comparison_ns = min(dispatched_ns, self._run_started_ns)
         for path in paths:
             stamp = _file_stamp(path)
             if stamp is None:
+                self._code_changed = True
                 continue
             existing = self._user_code_files.setdefault(path, stamp)
-            if existing != stamp or (existing == stamp and stamp[3] >= started_ns):
+            if existing != stamp or stamp[3] >= comparison_ns:
                 self._code_changed = True
 
     def _has_stale_user_code(self) -> bool:

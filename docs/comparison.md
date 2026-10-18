@@ -8,7 +8,7 @@ How Pivot compares to other pipeline and workflow tools.
 |---------|-------|-----|---------|---------|
 | **Local Iteration Speed** | | | | |
 | Watch mode | Auto-rerun on file change | Manual `dvc repro` | Manual trigger | Manual materialize |
-| Warm workers | Workers persist across runs | Cold start each run | Cold start | Cold start |
+| Warm workers | Within one long-lived Engine | Cold start each run | Cold start | Cold start |
 | **Code Change Detection** | | | | |
 | Function-level tracking | AST + getclosurevars | Command string hash | Input hash only | Config hash only |
 | Transitive dependencies | Automatic | Manual declaration | Manual | Manual |

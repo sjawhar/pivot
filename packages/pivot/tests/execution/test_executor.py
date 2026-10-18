@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import pytest
 
-from pivot import compose, config, exceptions, executor, loaders, project
+from pivot import compose, config, discovery, exceptions, executor, loaders, project
 from pivot.executor import core as executor_core
 from tests import helpers
 
@@ -514,6 +514,17 @@ def test_worker_parent_watchdog_exits_after_parent_death(mocker: MockerFixture) 
     with pytest.raises(SystemExit):
         target()
     exit_process.assert_called_once_with(0)
+
+
+def test_child_initializer_combines_watchdog_and_user_loader(mocker: MockerFixture) -> None:
+    """The one loky initializer retains both long-lived-child responsibilities."""
+    watch = mocker.patch.object(executor_core, "_exit_when_parent_dies")
+    loader = mocker.patch.object(discovery, "install_user_code_loader", create=True)
+
+    executor_core._initialize_pivot_child(42, "/project")
+
+    watch.assert_called_once_with(42)
+    loader.assert_called_once_with("/project")
 
 
 def _resource_root(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:

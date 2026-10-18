@@ -22,6 +22,7 @@ from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
+    from collections.abc import Callable
 
     from pivot.engine import types as engine_types
     from pivot.registry import RegistryStageInfo
@@ -46,6 +47,17 @@ def _exit_when_parent_dies(parent_pid: int) -> None:
         os._exit(0)
 
     threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
+
+
+def _initialize_pivot_child(parent_pid: int, root: str | None) -> None:
+    """Install every per-process policy required by Pivot's long-lived children."""
+    _exit_when_parent_dies(parent_pid)
+    loader = cast(
+        "Callable[[str], None] | None",
+        getattr(discovery, "install_user_code_loader", None),
+    )
+    if root is not None and loader is not None:
+        loader(root)
 
 
 def configured_worker_count(override: int | None = None) -> int:
@@ -77,20 +89,25 @@ def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.Proce
     """Return Pivot's reusable executor with one worker-lifetime policy."""
     _ensure_deterministic_environment()
     _ensure_cleanup_registered()
+    get_root = cast(
+        "Callable[[], pathlib.Path | None] | None",
+        getattr(discovery, "import_session_root", None),
+    )
+    root = get_root() if get_root is not None else None
     return loky.get_reusable_executor(
         max_workers=max_workers,
         timeout=_WORKER_IDLE_TIMEOUT_S,
         kill_workers=kill_workers,
         reuse=False if kill_workers else "auto",
-        initializer=_exit_when_parent_dies,
-        initargs=(os.getpid(),),
+        initializer=_initialize_pivot_child,
+        initargs=(os.getpid(), None if root is None else str(root)),
     )
 
 
 def create_manager() -> managers.SyncManager:
     """Start a spawn-context manager that exits when this process dies."""
     manager = managers.SyncManager(ctx=mp.get_context("spawn"))
-    manager.start(initializer=_exit_when_parent_dies, initargs=(os.getpid(),))
+    manager.start(initializer=_initialize_pivot_child, initargs=(os.getpid(), None))
     return manager
 
 
@@ -110,10 +127,9 @@ def prepare_workers(
 
 
 def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
-    """Kill existing workers and spawn fresh ones. For code reload in watch mode.
+    """Kill and warm fresh workers after code reload or stale-source detection."""
 
-    Unlike prepare_workers(), this kills existing workers first, then warms the new pool.
-    """
+    # A reusable executor with matching kwargs would otherwise keep live workers.
     if stage_count <= 0:
         return 1
     workers = compute_max_workers(stage_count, max_workers)

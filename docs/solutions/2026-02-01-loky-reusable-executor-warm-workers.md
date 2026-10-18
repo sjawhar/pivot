@@ -28,20 +28,19 @@ def run_stages():
 
 ## Solution
 
-Use `loky.get_reusable_executor()` which maintains a singleton worker pool across calls:
+Use Pivot's `_get_executor()` policy, which sets the shared timeout, child initializer and
+reuse mode:
 
 ```python
-import loky
-
 def create_executor(max_workers: int) -> Executor:
-    """Get reusable loky executor - workers persist across calls."""
-    return loky.get_reusable_executor(max_workers=max_workers)
+    """Get Pivot's reusable executor."""
+    return _get_executor(max_workers)
 ```
 
 The key behaviors:
 
-1. **First call** - Creates worker pool, spawns processes
-2. **Subsequent calls** - Returns the existing pool if compatible (same `max_workers`)
+1. **First call** - Creates the reusable executor, then spawns processes on warm-up or submit
+2. **Later compatible calls** - Reuse the executor; loky may resize if requested capacity grows
 3. **Workers stay alive** - Between runs in a long-lived Engine, workers idle and remain ready
 4. **Imports cached** - Libraries imported by stages remain loaded for each worker lifetime
 
@@ -61,10 +60,9 @@ def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
         f.result()
 
 def prepare_workers(stage_count: int, max_workers: int | None = None) -> int:
-    """Pre-warm loky worker pool before TUI startup."""
+    """Pre-warm Pivot's configured reusable worker pool before TUI startup."""
     workers = compute_max_workers(stage_count, max_workers)
-    pool = loky.get_reusable_executor(max_workers=workers)
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers), workers)
     return workers
 ```
 
@@ -78,12 +76,7 @@ In watch mode, code changes require fresh workers with updated imports:
 def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
     """Kill existing workers and spawn fresh ones."""
     workers = compute_max_workers(stage_count, max_workers)
-    pool = loky.get_reusable_executor(
-        max_workers=workers,
-        kill_workers=True,
-        reuse=False,
-    )
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers, kill_workers=True), workers)
     return workers
 ```
 
@@ -110,7 +103,7 @@ infrastructure rather than per-invocation ephemera:
 | Aspect | Standard ProcessPoolExecutor | Pivot reusable executor |
 |---|---|---|
 | Pool lifetime | Per `with` block | Engine lifetime |
-| Worker spawn | Every run | Once, then after a code restart |
+| Worker spawn | Every run | Once, after a code restart, or when capacity grows |
 | Import overhead | Every worker spawn | Once per worker lifetime |
 | Idle workers | Terminated | Wait for next task until Engine exit |
 

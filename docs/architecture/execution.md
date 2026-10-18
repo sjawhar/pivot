@@ -114,7 +114,8 @@ and drain shutdown event, so logs cannot cross run boundaries.
 
 Workers stay alive across runs in one Engine, so imports from earlier stages remain available.
 Before a later run reuses workers, Pivot replaces them if a user-code module they imported
-changed.
+changed. Worker capacity grows for a larger run but does not shrink for a smaller one: the
+scheduler still limits that run's parallelism, while a later full run reuses every warm worker.
 
 ## Stage resources
 

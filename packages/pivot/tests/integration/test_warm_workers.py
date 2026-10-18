@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
 import os
 import pathlib
 import signal
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 import pytest
@@ -25,6 +26,7 @@ from pivot import discovery, project
 from pivot.engine import engine as engine_mod
 from pivot.engine import sources
 from pivot.engine.types import EngineState, OutputEvent, RunRequested
+from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
 from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
@@ -82,16 +84,22 @@ class _RunRequests:
         async for event in self._recv:
             await send.send(event)
 
-    async def request_forced_run(self) -> None:
+    async def request_forced_run(
+        self,
+        *,
+        stages: list[str] | None = None,
+        single_stage: bool = False,
+        max_workers: int = 1,
+    ) -> None:
         await self._send.send(
             RunRequested(
                 type="run_requested",
-                stages=None,
+                stages=stages,
                 force=True,
                 reason="test",
-                single_stage=False,
+                single_stage=single_stage,
                 parallel=True,
-                max_workers=1,
+                max_workers=max_workers,
                 resource_capacity={},
                 no_commit=False,
                 on_error=OnError.FAIL,
@@ -186,6 +194,67 @@ with Pipeline("warm") as pipeline:
 """
 
 
+_THREE_PID_PIPELINE = """\
+import os
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def a() -> str:
+    return str(os.getpid())
+
+
+@stage
+def b() -> str:
+    return str(os.getpid())
+
+
+@stage
+def c() -> str:
+    return str(os.getpid())
+
+
+with Pipeline("warm") as pipeline:
+    a()
+    b()
+    c()
+"""
+
+
+def _helper_call_user_function(func: Callable[[], str]) -> tuple[int, str, list[str]]:
+    """Call a user function after loky deserializes it, then report resident imports."""
+    from pivot.executor import worker
+
+    return os.getpid(), func(), worker._user_code_files()
+
+
+def _helper_import_user_module(module_name: str, marker: str) -> tuple[int, str, list[str]]:
+    """Import a module in the worker, giving the coordinator time to edit or delete it."""
+    from pivot.executor import worker
+
+    module = importlib.import_module(module_name)
+    pathlib.Path(marker).write_text("imported")
+    time.sleep(0.5)
+    return os.getpid(), module.value(), worker._user_code_files()
+
+
+def _helper_wait_for_path(path: pathlib.Path) -> None:
+    deadline = time.monotonic() + 60
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path} was not created"
+        time.sleep(0.01)
+
+
+def _helper_pid() -> int:
+    return os.getpid()
+
+
+def _helper_slow_pid() -> int:
+    time.sleep(0.2)
+    return os.getpid()
+
+
 @pytest.mark.anyio
 async def test_consecutive_runs_in_one_engine_reuse_the_same_worker(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -219,6 +288,112 @@ async def test_consecutive_runs_in_one_engine_reuse_the_same_worker(
         if event["type"] == "log_line" and event["line"] == "WARNING: warm worker log"
     ]
     assert len(log_lines) == 2, "each run's fresh output queue forwards worker logs"
+
+
+def test_smaller_run_does_not_shrink_warm_worker_pool() -> None:
+    """A one-stage run retains the N warmed workers a later full run needs."""
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=3)
+        for future in [pool.submit(_helper_slow_pid) for _ in range(3)]:
+            future.result(timeout=60)
+        assert pool._executor is not None
+        executor = cast("Any", pool._executor)
+        process_pids = set(executor._processes)
+        assert len(process_pids) == 3
+
+        pool.end_run()
+        pool.start(max_workers=1)
+        assert pool.submit(_helper_slow_pid).result(timeout=60) in process_pids
+        assert set(executor._processes) == process_pids
+
+        pool.end_run()
+        pool.start(max_workers=3)
+        assert set(executor._processes) == process_pids
+    finally:
+        pool.shutdown()
+
+
+def test_deserialization_import_change_restarts_before_next_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An edit during loky's callable deserialization cannot become a trusted first stamp."""
+    module_name = f"warm_deserialize_{uuid.uuid4().hex}"
+    helpers = tmp_path / "helpers"
+    helpers.mkdir()
+    marker = helpers / "imported"
+    helper = helpers / f"{module_name}.py"
+
+    def write_source(value: str) -> None:
+        helper.write_text(
+            "import pathlib\n"
+            + "import time\n"
+            + f"pathlib.Path({str(marker)!r}).write_text('imported')\n"
+            + "time.sleep(0.5)\n\n"
+            + "def value() -> str:\n"
+            + f"    return {value!r}\n"
+        )
+
+    write_source("alpha")
+    monkeypatch.syspath_prepend(str(helpers))
+    module = importlib.import_module(module_name)
+    marker.unlink()
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1)
+        dispatched_ns = time.time_ns()
+        first_future = pool.submit(_helper_call_user_function, module.value)
+        _helper_wait_for_path(marker)
+        write_source("bravo-two")
+        first_pid, first_value, files = first_future.result(timeout=60)
+        pool.record_user_code_files(files, dispatched_ns)
+        assert first_value == "alpha"
+        assert pool._code_changed
+
+        pool.end_run()
+        pool.start(max_workers=1)
+        second_pid, second_value, _ = pool.submit(_helper_call_user_function, module.value).result(
+            timeout=60
+        )
+        assert second_pid != first_pid
+        assert second_value == "bravo-two"
+    finally:
+        pool.shutdown()
+        sys.modules.pop(module_name, None)
+
+
+def test_deleted_worker_module_restarts_instead_of_reusing_cached_code(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unstatable path is stale, so a fresh worker fails the deleted import."""
+    module_name = f"warm_deleted_{uuid.uuid4().hex}"
+    helpers = tmp_path / "helpers"
+    helpers.mkdir()
+    marker = helpers / "imported"
+    helper = helpers / f"{module_name}.py"
+    helper.write_text('def value() -> str:\n    return "alpha"\n')
+    monkeypatch.syspath_prepend(str(helpers))
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1)
+        dispatched_ns = time.time_ns()
+        first_future = pool.submit(_helper_import_user_module, module_name, str(marker))
+        _helper_wait_for_path(marker)
+        helper.unlink()
+        first_pid, first_value, files = first_future.result(timeout=60)
+        pool.record_user_code_files(files, dispatched_ns)
+        assert first_value == "alpha"
+        assert pool._code_changed
+
+        pool.end_run()
+        pool.start(max_workers=1)
+        replacement_pid = pool.submit(_helper_pid).result(timeout=60)
+        assert replacement_pid != first_pid
+        with pytest.raises(ModuleNotFoundError):
+            pool.submit(_helper_import_user_module, module_name, str(marker)).result(timeout=60)
+    finally:
+        pool.shutdown()
+        sys.modules.pop(module_name, None)
 
 
 def _helper_process_table() -> dict[int, tuple[int, str]]:

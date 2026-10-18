@@ -491,7 +491,11 @@ def _execute_stage(
 
 
 def _user_code_files() -> list[str]:
-    """Return stat-able source files for user modules this worker has loaded."""
+    """Return source paths for user modules this worker has loaded.
+
+    A path that was deleted after import is still reported: the coordinator must restart
+    instead of letting the worker keep executing the cached module.
+    """
     files = set[str]()
     for module in tuple(sys.modules.values()):
         if not fingerprint.is_user_code(module):
@@ -500,11 +504,9 @@ def _user_code_files() -> list[str]:
         if not isinstance(module_file, str):
             continue
         try:
-            path = pathlib.Path(module_file).resolve(strict=True)
+            files.add(str(pathlib.Path(module_file).resolve(strict=False)))
         except OSError:
-            continue
-        if path.is_file():
-            files.add(str(path))
+            files.add(str(pathlib.Path(module_file).absolute()))
     return sorted(files)
 
 
@@ -513,12 +515,12 @@ def execute_stage(
     stage_info: WorkerStageInfo,
     cache_dir: pathlib.Path,
     output_queue: Queue[OutputMessage],
+    dispatched_ns: int | None = None,
 ) -> StageResult:
     """Execute a stage and report every user-code module resident in this worker."""
-    started_ns = time.time_ns()
     result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
     result["user_code_files"] = _user_code_files()
-    result["user_code_started_ns"] = started_ns
+    result["user_code_dispatched_ns"] = time.time_ns() if dispatched_ns is None else dispatched_ns
     return result
 
 

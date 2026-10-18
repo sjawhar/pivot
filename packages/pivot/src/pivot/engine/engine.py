@@ -385,7 +385,12 @@ class Engine:
             self._worker_pool = None
             try:
                 with anyio.CancelScope(shield=True):
-                    await anyio.to_thread.run_sync(worker_pool.shutdown)
+                    shutdown = (
+                        worker_pool.hard_cancel
+                        if _exc and _exc[0] is not None
+                        else worker_pool.shutdown
+                    )
+                    await anyio.to_thread.run_sync(shutdown)
             except (OSError, BrokenPipeError) as exc:
                 _logger.debug("WorkerPool shutdown failed (may already be dead): %s", exc)
 
@@ -1220,11 +1225,11 @@ class Engine:
                                     result = future.result()
                                     if (
                                         "user_code_files" in result
-                                        and "user_code_started_ns" in result
+                                        and "user_code_dispatched_ns" in result
                                     ):
                                         self._worker_pool.record_user_code_files(
                                             result["user_code_files"],
-                                            result["user_code_started_ns"],
+                                            result["user_code_dispatched_ns"],
                                         )
                                     duration_ms = await self._handle_stage_completion(
                                         stage_name,
@@ -1702,12 +1707,14 @@ class Engine:
                     store_spec=store_spec,
                 )
 
+                dispatched_ns = time.time_ns()
                 future = pool.submit(
                     worker.execute_stage,
                     stage_name,
                     worker_info,
                     cache_dir,
                     pool.output_queue(),
+                    dispatched_ns,
                 )
                 self._futures[future] = stage_name
 
@@ -2532,8 +2539,8 @@ class Engine:
         if stages:
             # Restart worker pool so workers pick up reloaded code.
             # Run in thread to avoid blocking the event loop during process kill/spawn.
-            # Catch errors so a failed restart doesn't kill the watch session;
-            # create_executor() in _orchestrate_execution will retry pool creation.
+            # Catch errors so dispatch-time source validation can rebuild the pool on its
+            # next use.
             coordinator = self._get_watch_coordinator()
             if coordinator is not None and coordinator.should_restart_workers(
                 parallel=self._stored_parallel

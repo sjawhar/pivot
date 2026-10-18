@@ -2,6 +2,10 @@
 
 Workers execute in separate processes via `loky.get_reusable_executor()`. An Engine keeps its
 workers and manager alive across its runs; each run receives a fresh manager queue for output.
+The single loky initializer must start the parent-death watcher and, when
+`discovery.import_session_root()` is non-null, call
+`discovery.install_user_code_loader(str(root))`. Keep `timeout=None` and
+`reuse=False if kill_workers else "auto"` in the shared executor policy.
 
 ## WorkerStageInfo Contract
 
