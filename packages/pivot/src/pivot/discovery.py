@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import _imp
 import contextlib
 import dataclasses
 import importlib
 import importlib.machinery
 import importlib.util
 import logging
+import os
 import pathlib
+import py_compile
 import sys
 import types as _stdlib_types
-from typing import Final
+from typing import TYPE_CHECKING, Final, override
 
 import cloudpickle
 
 from pivot import exceptions, fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from importlib.abc import PathEntryFinder
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +37,133 @@ class DiscoveryError(Exception):
 # displaced or inserted, while the active pipeline stays importable for fingerprinting/workers.
 _MISSING_MODULE = object()
 
+# A cached bytecode file's flags word (PEP 552): bit 0 marks it hash-based, bit 1 has every
+# import check that hash against the source.
+_CHECKED_HASH_PYC_FLAGS: Final = 0b11
+
+
+def _is_checked_hash_pyc(path: str) -> bool:
+    """Whether ``path`` holds bytecode for this Python that every import checks by source hash."""
+    try:
+        with open(path, "rb") as cached:
+            header = cached.read(8)
+    except OSError:
+        return False
+    return (
+        header[:4] == importlib.util.MAGIC_NUMBER
+        and int.from_bytes(header[4:8], "little") == _CHECKED_HASH_PYC_FLAGS
+    )
+
+
+class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
+    """Load a user-code file from bytecode checked against its source's content, not its mtime.
+
+    CPython's default bytecode cache is checked only by the source's size and whole-second mtime,
+    so an edit that keeps the size, made in the second the previous version was written and
+    cached, imports the previous version's code. A checked-hash cache (PEP 552) is checked by the
+    source's content on every import, by this process and by any other that imports the file.
+    Other bytecode for the file is replaced with one before the import, or removed when Python
+    is told not to write bytecode (``sys.dont_write_bytecode``), so no other process reads it.
+
+    The file is compiled from source when the cache cannot be written (a read-only
+    ``__pycache__``), when the source does not compile (which reports its syntax error), under
+    ``sys.dont_write_bytecode``, and when Python is told never to check hash-based bytecode
+    (``--check-hash-based-pycs never``). Its bytecode is replaced in that last case too: pivot's
+    workers do not inherit the flag, and they read it.
+
+    A file whose resolved path is a library's or pivot's, as a library package symlinked into
+    the project root, loads as CPython loads it, and its bytecode is left alone.
+    """
+
+    @override
+    def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
+        source = self.get_filename(fullname)
+        if _is_library_or_pivot(pathlib.Path(source).resolve()):
+            return super().get_code(fullname)
+        cached = importlib.util.cache_from_source(source)
+        if not _is_checked_hash_pyc(cached):
+            if sys.dont_write_bytecode:
+                with contextlib.suppress(OSError):
+                    os.unlink(cached)
+                return self.source_to_code(self.get_data(source), source)
+            try:
+                py_compile.compile(
+                    source,
+                    cfile=cached,
+                    doraise=True,
+                    invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+                )
+            except (py_compile.PyCompileError, OSError):
+                return self.source_to_code(self.get_data(source), source)
+        if _imp.check_hash_based_pycs == "never":
+            return self.source_to_code(self.get_data(source), source)
+        return super().get_code(fullname)
+
+
+_project_finder_for = importlib.machinery.FileFinder.path_hook(
+    (importlib.machinery.ExtensionFileLoader, importlib.machinery.EXTENSION_SUFFIXES),
+    (_ProjectSourceLoader, importlib.machinery.SOURCE_SUFFIXES),
+    (importlib.machinery.SourcelessFileLoader, importlib.machinery.BYTECODE_SUFFIXES),
+)
+
+_PIVOT_PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def _is_library_or_pivot(resolved: pathlib.Path) -> bool:
+    """Whether resolved file or directory ``resolved`` is a library's
+    (``fingerprint.is_library_path``) or pivot's own source, neither of which is user code."""
+    return fingerprint.is_library_path(resolved) or resolved.is_relative_to(_PIVOT_PACKAGE_DIR)
+
+
+def _holds_user_code(path: str, root: pathlib.Path) -> bool:
+    """Whether import path entry ``path`` is a directory of code fingerprinting treats as the
+    user's, imported through ``_ProjectSourceLoader``.
+
+    That is every directory but a library's (``fingerprint.is_library_path``: the interpreter's
+    prefix, so the stdlib even when the interpreter lives under the root, and site-packages or
+    dist-packages) and pivot's own source, minus, under the project root, the library and tooling
+    directories discovery skips. A stage's module outside the root, as a package installed from
+    a source checkout, is user code.
+    """
+    try:
+        resolved = pathlib.Path(path or ".").resolve()
+    except OSError:
+        return False
+    if _is_library_or_pivot(resolved):
+        return False
+    if not resolved.is_relative_to(root):
+        return True
+    return _SCAN_EXCLUDE_DIRS.isdisjoint(resolved.relative_to(root).parts)
+
+
+def _project_path_hook(root: pathlib.Path) -> Callable[[str], PathEntryFinder]:
+    """A ``sys.path_hooks`` entry that imports user code with ``_ProjectSourceLoader`` and
+    declines every other path entry."""
+
+    def hook(path: str) -> PathEntryFinder:
+        if not _holds_user_code(path, root):
+            raise ImportError(f"{path} holds no user code")
+        return _project_finder_for(path)
+
+    return hook
+
+
+def _forget_user_code_finders(root: pathlib.Path) -> None:
+    """Drop the import finders cached for user-code directories, so the next import from one
+    asks ``sys.path_hooks`` again."""
+    for entry in list(sys.path_importer_cache):
+        if _holds_user_code(entry, root):
+            del sys.path_importer_cache[entry]
+
+
+def _install_path_hook(root: pathlib.Path) -> Callable[[str], PathEntryFinder]:
+    """Import user code through ``_ProjectSourceLoader`` from now on; return the hook."""
+    path_hook = _project_path_hook(root)
+    sys.path_hooks.insert(0, path_hook)
+    _forget_user_code_finders(root)
+    importlib.invalidate_caches()
+    return path_hook
+
 
 @dataclasses.dataclass
 class _ImportSession:
@@ -37,6 +171,7 @@ class _ImportSession:
     path_entry: str
     caller_path_entries: list[tuple[int, str]]
     preexisting_root_modules: dict[str, _stdlib_types.ModuleType]
+    path_hook: Callable[[str], PathEntryFinder]
     # Whether each module file lies under root; every scan of sys.modules shares one resolve.
     file_under_root: dict[str, bool] = dataclasses.field(default_factory=dict)
     owned_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(default_factory=dict)
@@ -69,6 +204,9 @@ def _end_import_session(session: _ImportSession) -> None:
         sys.path.remove(session.path_entry)
     for index, entry in session.caller_path_entries:
         sys.path.insert(min(index, len(sys.path)), entry)
+    if session.path_hook in sys.path_hooks:
+        sys.path_hooks.remove(session.path_hook)
+    _forget_user_code_finders(session.root)
     importlib.invalidate_caches()
 
 
@@ -98,11 +236,28 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         root_str,
         caller_path_entries,
         preexisting_root_modules,
+        # User code imports through _ProjectSourceLoader while the session lasts.
+        _install_path_hook(root),
         file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
     )
-    importlib.invalidate_caches()
     return _import_session
+
+
+def import_session_root() -> pathlib.Path | None:
+    """The project root of the import session the last discovery started, if it lasts."""
+    return None if _import_session is None else _import_session.root
+
+
+def install_user_code_loader(root: str) -> None:
+    """Import user code through ``_ProjectSourceLoader`` in this process from now on, as the
+    import session for ``root`` does: the initializer of each worker (``executor.core``).
+
+    A worker imports user code by name: a stage's module that discovery could not send by
+    value (one outside the root, or under it in a ``src`` layout) and any module a stage body
+    imports. The session's loader is installed only in the process that discovered.
+    """
+    _install_path_hook(pathlib.Path(root))
 
 
 def _displace_module(module_name: str, session: _ImportSession) -> None:
@@ -384,7 +539,11 @@ def _load_pipeline_from_module(
     try:
         if module is None:
             _ensure_parent_modules(module_name, session)
-            spec = importlib.util.spec_from_file_location(module_name, resolved_path)
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                resolved_path,
+                loader=_ProjectSourceLoader(module_name, str(resolved_path)),
+            )
             if spec is None or spec.loader is None:
                 raise DiscoveryError(f"Unable to create import spec for {path}")
             module = importlib.util.module_from_spec(spec)

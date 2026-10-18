@@ -91,7 +91,8 @@ when code creates a reusable executor outside an Engine context.
 Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler), and
 workers use `timeout=None`, so nothing else would end them. The output-queue manager therefore
 starts with `_exit_when_parent_dies`, a thread that exits it once its parent pid changes. Every
-worker starts with `worker.unwind_when_stopped`:
+worker starts with `core._init_worker`, which runs `worker.unwind_when_stopped` (and, while a
+discovery's import session lasts, installs discovery's checked loader):
 
 - SIGTERM raises `worker.WorkerTerminated` (a `KeyboardInterrupt`) in the running stage, so its
   cleanup runs, and the worker exits once the stage has unwound, or after

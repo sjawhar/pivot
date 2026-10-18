@@ -77,17 +77,33 @@ def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
 
 
 def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.ProcessPoolExecutor:
-    """Return Pivot's reusable executor with one worker-lifetime policy."""
+    """Return Pivot's reusable executor with one worker-lifetime policy.
+
+    Every worker starts with ``_init_worker``. While a discovery's import session lasts, it
+    also imports user code as that session does (``discovery.install_user_code_loader``), so a
+    worker never runs an edited module's previous code; loky replaces a live pool whose
+    initializer arguments differ.
+    """
     _ensure_deterministic_environment()
     _ensure_cleanup_registered()
+    root = discovery.import_session_root()
     return loky.get_reusable_executor(
         max_workers=max_workers,
         timeout=_WORKER_IDLE_TIMEOUT_S,
         kill_workers=kill_workers,
         reuse=False if kill_workers else "auto",
-        initializer=worker.unwind_when_stopped,
-        initargs=(os.getpid(),),
+        initializer=_init_worker,
+        initargs=(os.getpid(), None if root is None else str(root)),
     )
+
+
+def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
+    """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
+    (``worker.unwind_when_stopped``), and import user code through discovery's checked loader
+    when a discovery's import session for ``user_code_root`` lasts."""
+    worker.unwind_when_stopped(parent_pid)
+    if user_code_root is not None:
+        discovery.install_user_code_loader(user_code_root)
 
 
 def create_manager() -> managers.SyncManager:

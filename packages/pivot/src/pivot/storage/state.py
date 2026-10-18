@@ -263,17 +263,16 @@ class InvalidAstHashKeyError(Exception):
 
 def _make_key_ast_hash(
     rel_path: str,
-    mtime_ns: int,
-    size: int,
-    inode: int,
+    source_digest: str,
     qualname: str,
     py_version: str,
     schema_version: int,
 ) -> bytes:
     """Create LMDB key for AST hash entry.
 
-    Key format: fp:{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}\x00{py_version}\x00{schema_version}
-    Uses null byte separator (can't appear in paths or qualnames).
+    Key format: fp:{rel_path}\x00{source_digest}\x00{qualname}\x00{py_version}\x00{schema_version}
+    Uses null byte separator (can't appear in paths or qualnames). ``source_digest`` is the
+    digest of the source file's content: an edit can keep the file's mtime, size and inode.
 
     Raises:
         InvalidAstHashKeyError: If rel_path, qualname, or py_version contains null bytes or is empty
@@ -293,7 +292,7 @@ def _make_key_ast_hash(
 
     key = (
         _FP_PREFIX
-        + f"{rel_path}\x00{mtime_ns}\x00{size}\x00{inode}\x00{qualname}\x00{py_version}\x00{schema_version}".encode()
+        + f"{rel_path}\x00{source_digest}\x00{qualname}\x00{py_version}\x00{schema_version}".encode()
     )
     if len(key) > _MAX_KEY_SIZE:
         raise InvalidAstHashKeyError(f"key exceeds {_MAX_KEY_SIZE} bytes: {len(key)}")
@@ -494,9 +493,7 @@ class StateDB:
     def get_ast_hash(
         self,
         rel_path: str,
-        mtime_ns: int,
-        size: int,
-        inode: int,
+        source_digest: str,
         qualname: str,
         py_version: str,
         schema_version: int,
@@ -504,9 +501,7 @@ class StateDB:
         """Get cached AST hash; returns None if not found or key is invalid."""
         self._check_closed()
         try:
-            key = _make_key_ast_hash(
-                rel_path, mtime_ns, size, inode, qualname, py_version, schema_version
-            )
+            key = _make_key_ast_hash(rel_path, source_digest, qualname, py_version, schema_version)
         except InvalidAstHashKeyError:
             return None
         with self._read_transaction() as txn:
@@ -525,9 +520,7 @@ class StateDB:
             with self._write_transaction(timeout=self._write_timeout) as txn:
                 for (
                     rel_path,
-                    mtime_ns,
-                    size,
-                    inode,
+                    source_digest,
                     qualname,
                     py_version,
                     schema_version,
@@ -535,7 +528,7 @@ class StateDB:
                 ) in entries:
                     try:
                         key = _make_key_ast_hash(
-                            rel_path, mtime_ns, size, inode, qualname, py_version, schema_version
+                            rel_path, source_digest, qualname, py_version, schema_version
                         )
                     except InvalidAstHashKeyError:
                         continue  # Skip invalid entries

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import py_compile
 import shutil
 import subprocess
 import sys
@@ -1744,3 +1745,169 @@ def test_directory_output_keeps_every_file_through_checkout(tmp_path: pathlib.Pa
     out = _ok(_pivot(root, "checkout"))
 
     assert _tree_contents(bundle) == expected, out
+
+
+def _helper_cache_stale_bytecode(path: pathlib.Path, old: str, new: str) -> None:
+    """Write ``old`` to ``path`` and cache its bytecode checked by mtime, as a plain ``python``
+    import or an older pivot does, then write ``new``, of the same size, and give the file its
+    previous mtime: CPython's check of that bytecode by size and whole-second mtime passes, as
+    for an edit made in the second the previous version was written."""
+    assert len(old) == len(new)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(old)
+    py_compile.compile(str(path), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    before = path.stat()
+    path.write_text(new)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+
+def _helper_env_with_path(entry: pathlib.Path) -> dict[str, str]:
+    env = _env()
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(entry), env.get("PYTHONPATH")]))
+    return env
+
+
+_BY_NAME_PIPELINE = """\
+from pivot import Pipeline, stage
+
+{import_helper}
+
+
+@stage
+def build() -> str:
+    return helper.VALUE
+
+
+with Pipeline("w") as pipeline:
+    build()
+"""
+
+
+@pytest.mark.parametrize("layout", ["outside-root", "src-layout"])
+@pytest.mark.parametrize("bytecode", ["read-only-pycache", "never-checked"])
+def test_worker_runs_the_edited_code_of_a_module_it_imports_by_name(
+    tmp_path: pathlib.Path, layout: str, bytecode: str
+) -> None:
+    """A worker imports by name a module discovery does not send by value (one outside the
+    root, or under it in a ``src`` layout), and runs its edited code, not the mtime-checked
+    bytecode cached for the previous version: when ``__pycache__`` is read-only so the bytecode
+    cannot be replaced, and when pivot runs under ``--check-hash-based-pycs never``, which the
+    workers do not inherit."""
+    root = tmp_path / "project"
+    root.mkdir()
+    if layout == "outside-root":
+        import_root = tmp_path / "outside"
+        helper = import_root / "edited_helper.py"
+        import_helper = "import edited_helper as helper"
+    else:
+        import_root = root / "src"
+        helper = import_root / "edited_pkg" / "helper.py"
+        import_helper = "from edited_pkg import helper"
+        helper.parent.mkdir(parents=True)
+        (helper.parent / "__init__.py").write_text("")
+    _project(root, {"pipeline.py": _BY_NAME_PIPELINE.format(import_helper=import_helper)})
+    _helper_cache_stale_bytecode(helper, 'VALUE = "alpha"\n', 'VALUE = "bravo"\n')
+    pycache = helper.parent / "__pycache__"
+    command = [_PIVOT, "repro"]
+    if bytecode == "never-checked":
+        command = [sys.executable, "--check-hash-based-pycs", "never", *command]
+    else:
+        pycache.chmod(0o555)
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=root,
+            env=_helper_env_with_path(import_root),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    finally:
+        pycache.chmod(0o755)
+    out = _ok(proc)
+
+    assert (root / "data" / "w" / "build.txt").read_text() == "bravo", out
+
+
+_LAZY_IMPORT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def build(raw: str) -> str:
+    import lazy_helper
+
+    return raw.strip() + "-" + lazy_helper.VALUE
+
+
+with Pipeline("w") as pipeline:
+    build(pipeline.input("in.txt"))
+"""
+
+
+def test_worker_runs_the_edited_code_of_a_module_a_stage_body_imports(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A module only a stage body imports is imported by the worker alone. The worker caches
+    bytecode for it checked by content, so an edit made in the second the previous version was
+    written and cached is run when the stage next runs."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _project(root, {"pipeline.py": _LAZY_IMPORT_PIPELINE, "data/raw/in.txt": "x"})
+    helper = tmp_path / "outside" / "lazy_helper.py"
+    helper.parent.mkdir()
+    helper.write_text('VALUE = "alpha"\n')
+    env = _helper_env_with_path(helper.parent)
+    output = root / "data" / "w" / "build.txt"
+    _ok(_pivot(root, "repro", env=env))
+    assert output.read_text() == "x-alpha"
+    before = helper.stat()
+    helper.write_text('VALUE = "bravo"\n')
+    os.utime(helper, ns=(before.st_atime_ns, before.st_mtime_ns))
+    (root / "data" / "raw" / "in.txt").write_text("y")
+
+    out = _ok(_pivot(root, "repro", env=env))
+
+    assert output.read_text() == "y-bravo", out
+
+
+_STAGE_BODY_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def build() -> str:
+    return "alpha"
+
+
+with Pipeline("w") as pipeline:
+    build()
+"""
+
+
+def test_repro_runs_a_stage_whose_edit_keeps_the_files_mtime_size_and_inode(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An edit can keep a file's mtime to the nanosecond, its size and its inode (two writes
+    inside one kernel timestamp tick, or a tool that restores the mtime). Pivot's caches of
+    function hashes and stage manifests check the file's content, so the edited stage runs."""
+    root = _project(tmp_path, {"pipeline.py": _STAGE_BODY_PIPELINE})
+    output = root / "data" / "w" / "build.txt"
+    _ok(_pivot(root, "repro"))
+    assert output.read_text() == "alpha"
+    pipeline_py = root / "pipeline.py"
+    before = pipeline_py.stat()
+    pipeline_py.write_text(_STAGE_BODY_PIPELINE.replace("alpha", "bravo"))
+    os.utime(pipeline_py, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = pipeline_py.stat()
+    assert (after.st_mtime_ns, after.st_size, after.st_ino) == (
+        before.st_mtime_ns,
+        before.st_size,
+        before.st_ino,
+    )
+
+    out = _ok(_pivot(root, "repro"))
+
+    assert output.read_text() == "bravo", out

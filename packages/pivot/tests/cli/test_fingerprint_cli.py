@@ -25,8 +25,8 @@ def test_fingerprint_reset_clears_statedb_entries(
         with state.StateDB(db_path, readonly=False) as db:
             db.save_ast_hash_many(
                 [
-                    ("src/a.py", 1000, 100, 111, "func_a", "3.13", 1, "aaaa1111"),
-                    ("src/b.py", 2000, 200, 222, "func_b", "3.13", 1, "bbbb2222"),
+                    ("src/a.py", "0123456789abcdef", "func_a", "3.13", 1, "aaaa1111"),
+                    ("src/b.py", "fedcba9876543210", "func_b", "3.13", 1, "bbbb2222"),
                 ]
             )
 
@@ -38,8 +38,8 @@ def test_fingerprint_reset_clears_statedb_entries(
         # Verify entries are actually gone
         with state.StateDB(db_path, readonly=True) as db:
             # Entries should not be found
-            assert db.get_ast_hash("src/a.py", 1000, 100, 111, "func_a", "3.13", 1) is None
-            assert db.get_ast_hash("src/b.py", 2000, 200, 222, "func_b", "3.13", 1) is None
+            assert db.get_ast_hash("src/a.py", "0123456789abcdef", "func_a", "3.13", 1) is None
+            assert db.get_ast_hash("src/b.py", "fedcba9876543210", "func_b", "3.13", 1) is None
 
 
 def test_fingerprint_reset_clears_stage_manifest_cache(
