@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
+from contextlib import AbstractContextManager
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from typing import Any, Literal, TypeVar
@@ -12,6 +13,8 @@ class ProcessPoolExecutor(Executor):
     """Process pool executor that can be used with concurrent.futures."""
 
     _processes: dict[int, BaseProcess]
+    # None once the executor has been shut down.
+    _processes_management_lock: AbstractContextManager[object] | None
 
     def __init__(
         self,

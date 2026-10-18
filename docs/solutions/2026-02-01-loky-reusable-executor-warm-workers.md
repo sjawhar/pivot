@@ -91,14 +91,26 @@ when code creates a reusable executor outside an Engine context.
 Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler), and
 workers use `timeout=None`, so nothing else would end them. The output-queue manager therefore
 starts with `_exit_when_parent_dies`, a thread that exits it once its parent pid changes. Every
-worker starts with `worker.unwind_when_stopped`: when its parent pid changes, a thread sends the
-worker's main thread SIGTERM, and SIGTERM or SIGINT raises `worker.WorkerTerminated` in the
-running stage, so the stage's `finally` blocks and context managers run (stopping a child
-process or a detached container it started) before the worker exits. A stop signal received
-later is ignored, and an unwinding still running after `worker.TERMINATION_GRACE_S` (10 s) is
-cut off with `os._exit`. `WorkerPool.hard_cancel` (an Engine leaving on an exception, such as
-Ctrl-C) stops workers the same way: SIGTERM, up to the same grace, then SIGKILL of any worker
-left and its descendants. Start any new long-lived child process with one of these initializers.
+worker starts with `worker.unwind_when_stopped`:
+
+- SIGTERM raises `worker.WorkerTerminated` (a `KeyboardInterrupt`) in the running stage, so its
+  cleanup runs, and the worker exits once the stage has unwound, or after
+  `worker.TERMINATION_GRACE_S` (10 s) whatever the stage does. An idle worker exits at once.
+- SIGINT (Ctrl-C at a terminal reaches the coordinator and its workers together) only raises
+  `WorkerTerminated` in the running stage; the worker stays up until the coordinator stops it.
+  loky's manager thread takes a worker that exits unasked for a broken pool and SIGKILLs every
+  worker it still lists, so a worker exiting on SIGINT would cut the others' cleanup off.
+- When the parent pid changes, a thread sends the main thread SIGTERM and exits the worker
+  after the same grace itself, in case the stage replaced the handler or is blocked.
+- `WorkerTerminated` is raised into a stage once; later stop signals do not interrupt its
+  cleanup. A stage that catches it and returns has its result discarded before any output is
+  written.
+- Every exit first SIGKILLs the processes the worker started that are still running.
+
+`WorkerPool.hard_cancel` (an Engine leaving on an exception, such as Ctrl-C) takes the workers
+out of the executor's `_processes` first, for the reason above, then sends each SIGTERM, waits up
+to the same grace, and SIGKILLs any worker left with its descendants. Start any new long-lived
+child process with one of these initializers.
 
 ## Key Insight
 

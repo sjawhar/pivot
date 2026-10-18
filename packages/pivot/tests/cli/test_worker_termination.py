@@ -1,23 +1,30 @@
-"""A worker whose Pivot process dies or cancels unwinds the running stage before it exits.
+"""A worker whose Pivot process dies or is interrupted unwinds its running stage, then exits.
 
-Each test drives the installed `pivot` binary in a fresh project, as a user does, with a stage
-that starts a child process and stops it in a ``finally`` block, the way a stage that starts a
-detached container removes it.
+Each test drives the installed `pivot` binary in a fresh project, as a user does. The project
+has two stages and two workers: `hold` starts a child process (in its own session, so only the
+stage or Pivot can stop it) and waits; `quick` returns at once, leaving its worker idle. `hold`
+stops its child the way the test's ``cleanup`` says, as a stage that starts a detached container
+removes it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import pathlib
 import signal
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
 from pivot.executor import worker
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -28,33 +35,71 @@ pytestmark = pytest.mark.skipif(
 _PIPELINE = """\
 import os
 import pathlib
+import signal
 import subprocess
 import time
 
 from pivot import Pipeline, stage
 
+MARKERS = {markers!r}
+CLEANUP = {cleanup!r}
+
+
+def _mark(name, text=""):
+    (pathlib.Path(MARKERS) / name).write_text(text)
+
+
+def _stop_child(child):
+    child.kill()
+    child.wait()
+    time.sleep(2)  # cleanup takes a while, as `docker rm --force` does
+
 
 @stage
 def hold() -> str:
-    markers = pathlib.Path({markers!r})
-    child = subprocess.Popen(["sleep", "300"])
-    (markers / "worker.pid").write_text(str(os.getpid()))
-    (markers / "child.pid").write_text(str(child.pid))
-    (markers / "started").write_text("")
+    if CLEANUP == "own-sigterm-handler":
+        signal.signal(signal.SIGTERM, lambda *_: None)
+    child = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    _mark("worker.pid", str(os.getpid()))
+    _mark("child.pid", str(child.pid))
+    _mark("started")
+    if CLEANUP in ("none", "own-sigterm-handler"):
+        time.sleep(300)
+        return "done"
+    if CLEANUP == "except-keyboard-interrupt":
+        try:
+            time.sleep(300)
+        except KeyboardInterrupt:
+            _stop_child(child)
+            _mark("cleaned")
+            raise
+        return "done"
+    if CLEANUP == "swallow":
+        try:
+            time.sleep(300)
+        except BaseException:
+            _stop_child(child)
+        return "fallback"
     try:
         time.sleep(300)
         return "done"
     finally:
-        child.kill()
-        child.wait()
-        time.sleep(1)  # cleanup takes a while, as `docker rm --force` does
-        (markers / "finally").write_text("")
-        if {hang_in_finally!r}:
+        if CLEANUP == "hang":
+            _mark("cleanup-started")
             time.sleep(600)
+        _stop_child(child)
+        _mark("cleaned")
+
+
+@stage
+def quick() -> str:
+    _mark("quick.pid", str(os.getpid()))
+    return "quick"
 
 
 with Pipeline("t") as pipeline:
     hold()
+    quick()
 """
 
 
@@ -67,118 +112,156 @@ def _helper_alive(pid: int) -> bool:
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
-def _helper_wait_until(predicate: object, timeout: float) -> bool:
+def _helper_wait_until(predicate: Callable[[], bool], timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if callable(predicate) and predicate():
+        if predicate():
             return True
         time.sleep(0.1)
-    return callable(predicate) and bool(predicate())
+    return predicate()
 
 
-def _helper_start_stage(
-    tmp_path: pathlib.Path, *, hang_in_finally: bool
-) -> tuple[subprocess.Popen[bytes], pathlib.Path]:
-    """Start `pivot repro` in its own session on a project whose one stage is running, and
-    return the process and the directory the stage writes its markers to."""
+@dataclasses.dataclass
+class _Run:
+    """A `pivot repro` in its own session, with both stages started."""
+
+    proc: subprocess.Popen[bytes]
+    root: pathlib.Path
+    markers: pathlib.Path
+
+    def pid(self, name: str) -> int:
+        return int((self.markers / f"{name}.pid").read_text())
+
+    def stop(self, how: str) -> None:
+        """SIGKILL pivot alone, SIGINT pivot alone (its cancel), or SIGINT pivot's whole
+        process group (Ctrl-C at a terminal); then wait for pivot to exit."""
+        if how == "kill":
+            self.proc.send_signal(signal.SIGKILL)
+        elif how == "interrupt":
+            self.proc.send_signal(signal.SIGINT)
+        else:
+            assert how == "ctrl-c"
+            os.killpg(self.proc.pid, signal.SIGINT)
+        self.proc.wait(timeout=worker.TERMINATION_GRACE_S + 20)
+
+    def assert_workers_and_child_gone(self) -> None:
+        for name in ("worker", "quick", "child"):
+            pid = self.pid(name)
+            assert _helper_wait_until(
+                lambda pid=pid: not _helper_alive(pid), worker.TERMINATION_GRACE_S + 5
+            ), f"{name} process {pid} survived"
+
+
+@contextlib.contextmanager
+def _helper_running(tmp_path: pathlib.Path, cleanup: str, *, watch: bool = False) -> Iterator[_Run]:
     root = tmp_path / "project"
     markers = tmp_path / "markers"
     root.mkdir()
     markers.mkdir()
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    subprocess.run([_PIVOT, "init"], cwd=root, env=env, check=True, capture_output=True)
-    (root / "pipeline.py").write_text(
-        _PIPELINE.format(markers=str(markers), hang_in_finally=hang_in_finally)
-    )
-    proc = subprocess.Popen(
-        [_PIVOT, "repro"],
-        cwd=root,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    if not _helper_wait_until(lambda: (markers / "started").exists(), 120):
-        os.killpg(proc.pid, signal.SIGKILL)
-        pytest.fail("the stage never started")
-    return proc, markers
-
-
-@contextlib.contextmanager
-def _helper_running_stage(tmp_path: pathlib.Path, *, hang_in_finally: bool = False):  # noqa: ANN202 - test helper
-    proc, markers = _helper_start_stage(tmp_path, hang_in_finally=hang_in_finally)
-    pids = [int((markers / name).read_text()) for name in ("worker.pid", "child.pid")]
+    for args in (["init"], ["config", "set", "core.max_workers", "2"]):
+        subprocess.run([_PIVOT, *args], cwd=root, env=env, check=True, capture_output=True)
+    (root / "pipeline.py").write_text(_PIPELINE.format(markers=str(markers), cleanup=cleanup))
+    log = tmp_path / "pivot.log"
+    with log.open("wb") as output:
+        proc = subprocess.Popen(
+            [_PIVOT, "repro", *(["--watch"] if watch else [])],
+            cwd=root,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    run = _Run(proc, root, markers)
     try:
-        yield proc, markers
+        started = _helper_wait_until(
+            lambda: proc.poll() is not None
+            or ((markers / "started").exists() and (markers / "quick.pid").exists()),
+            120,
+        )
+        assert started and proc.poll() is None, f"the stages never started:\n{log.read_text()}"
+        time.sleep(0.5)  # `quick`'s worker reports its result and goes idle
+        yield run
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
-        for pid in pids:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
+        for name in ("worker", "quick", "child"):
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(run.pid(name), signal.SIGKILL)
         proc.wait(timeout=10)
 
 
-def _helper_pids(markers: pathlib.Path) -> tuple[int, int]:
-    return int((markers / "worker.pid").read_text()), int((markers / "child.pid").read_text())
+@pytest.mark.parametrize("how", ["kill", "interrupt", "ctrl-c"])
+@pytest.mark.parametrize("cleanup", ["finally", "except-keyboard-interrupt"])
+def test_stopped_pivot_lets_the_running_stage_clean_up(
+    tmp_path: pathlib.Path, cleanup: str, how: str
+) -> None:
+    """However pivot stops, the running stage's ``finally`` block or ``except
+    KeyboardInterrupt`` cleanup runs to its end, though the other worker is idle and exits at
+    once; then both workers exit, and the stage's child is gone."""
+    with _helper_running(tmp_path, cleanup) as run:
+        run.stop(how)
 
-
-def test_killed_pivot_lets_the_running_stage_clean_up(tmp_path: pathlib.Path) -> None:
-    """SIGKILL of `pivot repro` alone: the worker unwinds its running stage, so the stage's
-    ``finally`` block runs and stops the child it started, and then the worker exits."""
-    with _helper_running_stage(tmp_path) as (proc, markers):
-        worker_pid, child_pid = _helper_pids(markers)
-
-        proc.send_signal(signal.SIGKILL)
-        proc.wait(timeout=10)
-
-        assert _helper_wait_until(lambda: (markers / "finally").exists(), 15), (
-            "the stage's finally block never ran"
+        assert _helper_wait_until(lambda: (run.markers / "cleaned").exists(), 15), (
+            "the stage's cleanup never finished"
         )
-        assert _helper_wait_until(lambda: not _helper_alive(worker_pid), 10), "worker survived"
-        assert not _helper_alive(child_pid), "the stage's child survived"
+        run.assert_workers_and_child_gone()
 
 
-def test_killed_pivot_cuts_off_a_finally_block_that_hangs(tmp_path: pathlib.Path) -> None:
-    """A ``finally`` block that never returns does not keep the worker alive: it is cut off
-    once ``worker.TERMINATION_GRACE_S`` has passed."""
-    with _helper_running_stage(tmp_path, hang_in_finally=True) as (proc, markers):
-        worker_pid, _child_pid = _helper_pids(markers)
+def test_ctrl_c_in_watch_mode_lets_the_running_stage_clean_up(tmp_path: pathlib.Path) -> None:
+    """`pivot repro --watch` stops its startup run the same way on Ctrl-C at a terminal."""
+    with _helper_running(tmp_path, "finally", watch=True) as run:
+        run.stop("ctrl-c")
 
-        proc.send_signal(signal.SIGKILL)
-        proc.wait(timeout=10)
-
-        assert _helper_wait_until(lambda: (markers / "finally").exists(), 15)
-        assert _helper_alive(worker_pid), "the worker is still in the stage's finally block"
-        assert _helper_wait_until(
-            lambda: not _helper_alive(worker_pid), worker.TERMINATION_GRACE_S + 5
-        ), "the hung finally block kept the worker alive past the grace"
+        assert _helper_wait_until(lambda: (run.markers / "cleaned").exists(), 15), (
+            "the stage's cleanup never finished"
+        )
+        run.assert_workers_and_child_gone()
 
 
-def test_interrupted_pivot_lets_the_running_stage_clean_up(tmp_path: pathlib.Path) -> None:
-    """Ctrl-C (SIGINT to `pivot repro`, which cancels its workers) also unwinds the running
-    stage before its worker is stopped, instead of killing the worker mid-stage."""
-    with _helper_running_stage(tmp_path) as (proc, markers):
-        worker_pid, child_pid = _helper_pids(markers)
+@pytest.mark.parametrize("how", ["kill", "interrupt"])
+def test_cleanup_that_hangs_is_cut_off_and_its_child_killed(
+    tmp_path: pathlib.Path, how: str
+) -> None:
+    """A cleanup that never returns, before it stops the stage's child, does not keep the
+    worker alive past ``worker.TERMINATION_GRACE_S``, and the child dies with the worker."""
+    with _helper_running(tmp_path, "hang") as run:
+        run.stop(how)
 
-        proc.send_signal(signal.SIGINT)
-        proc.wait(timeout=worker.TERMINATION_GRACE_S + 15)
-
-        assert (markers / "finally").exists(), "the stage's finally block never ran"
-        assert _helper_wait_until(lambda: not _helper_alive(worker_pid), 10), "worker survived"
-        assert not _helper_alive(child_pid), "the stage's child survived"
+        assert _helper_wait_until(lambda: (run.markers / "cleanup-started").exists(), 15)
+        run.assert_workers_and_child_gone()
 
 
-def test_ctrl_c_at_the_terminal_lets_the_running_stage_clean_up(tmp_path: pathlib.Path) -> None:
-    """Ctrl-C at a terminal sends SIGINT to pivot and its workers at once; the stage's
-    ``finally`` block still runs to its end while pivot cancels the worker."""
-    with _helper_running_stage(tmp_path) as (proc, markers):
-        worker_pid, child_pid = _helper_pids(markers)
+@pytest.mark.parametrize("how", ["kill", "interrupt"])
+def test_child_of_a_stage_without_cleanup_dies_with_its_worker(
+    tmp_path: pathlib.Path, how: str
+) -> None:
+    """A child a stage starts and never stops is killed when its worker exits, not left to
+    init."""
+    with _helper_running(tmp_path, "none") as run:
+        run.stop(how)
 
-        os.killpg(proc.pid, signal.SIGINT)
-        proc.wait(timeout=worker.TERMINATION_GRACE_S + 15)
+        run.assert_workers_and_child_gone()
 
-        assert (markers / "finally").exists(), "the stage's finally block never ran"
-        assert _helper_wait_until(lambda: not _helper_alive(worker_pid), 10), "worker survived"
-        assert not _helper_alive(child_pid), "the stage's child survived"
+
+def test_stage_that_replaces_the_sigterm_handler_is_stopped_after_the_grace(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When pivot dies, a worker whose stage installed its own SIGTERM handler still exits
+    within ``worker.TERMINATION_GRACE_S``, killing the stage's child."""
+    with _helper_running(tmp_path, "own-sigterm-handler") as run:
+        run.stop("kill")
+
+        run.assert_workers_and_child_gone()
+
+
+def test_stage_that_swallows_the_stop_commits_nothing(tmp_path: pathlib.Path) -> None:
+    """A stage that catches the stop and returns a value has that value discarded: it is not
+    written as the stage's output, and no lock is written for it."""
+    with _helper_running(tmp_path, "swallow") as run:
+        run.stop("kill")
+
+        run.assert_workers_and_child_gone()
+        assert not (run.root / "data" / "t" / "hold.txt").exists()
+        assert not (run.root / ".pivot" / "stages" / "t" / "hold.lock").exists()

@@ -200,15 +200,24 @@ class WorkerPool:
         """Stop workers mid-stage and signal the drain thread to stop.
 
         Each worker is sent SIGTERM, which unwinds its running stage
-        (``worker.unwind_when_stopped``) so the stage's ``finally`` blocks run, and is given
+        (``worker.unwind_when_stopped``) so the stage's cleanup runs, and is given
         ``worker.TERMINATION_GRACE_S`` to exit; a worker still alive then is killed with its
         descendants.
+
+        The workers are first taken out of loky's executor. Its manager thread takes a worker
+        that exits without being asked to for a broken pool and SIGKILLs every worker the
+        executor still lists, so the first worker to exit would cut the others' cleanup off.
         """
         self._accepting = False
         self._in_run = False
         if self._executor is not None:
-            # loky exposes no public list of its worker processes.
-            processes = list(self._executor._processes.values())
+            executor = self._executor
+            self._executor = None
+            # loky exposes no public list of its worker processes. A watch reload may have
+            # replaced this executor already, which leaves it no lock and no workers.
+            with executor._processes_management_lock or contextlib.nullcontext():
+                processes = list(executor._processes.values())
+                executor._processes.clear()
             for process in processes:
                 if process.pid is not None:
                     with contextlib.suppress(ProcessLookupError):
@@ -216,8 +225,12 @@ class WorkerPool:
             deadline = time.monotonic() + worker.TERMINATION_GRACE_S
             for process in processes:
                 process.join(max(0.0, deadline - time.monotonic()))
-            self._executor.shutdown(wait=False, kill_workers=True)
-            self._executor = None
+            for process in processes:
+                if process.pid is not None and process.exitcode is None:
+                    worker.kill_descendants(process.pid)
+                    process.kill()
+                    process.join()
+            executor.shutdown(wait=False, kill_workers=True)
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
