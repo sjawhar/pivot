@@ -132,7 +132,7 @@ Runs stages in worker processes:
 
 - `WorkerPool` wraps a loky `ProcessPoolExecutor` with `spawn` context
 - Uses a manager-backed output queue for worker log streaming
-- Warm workers with preloaded imports (reusable executor)
+- Warm workers retain stage imports across runs in one Engine
 - True parallelism (not limited by GIL)
 
 ### Lock Files
@@ -203,9 +203,11 @@ Files are stored by their content hash:
 
 ### Warm Worker Pool
 
-**Problem:** Importing numpy/pandas takes seconds per stage.
+**Problem:** Importing numpy/pandas takes seconds per worker.
 
-**Solution:** `loky.get_reusable_executor()` keeps workers alive across stage executions within a run. The first stage execution imports heavy dependencies; subsequent stages reuse those imports. In watch mode, each run creates a fresh pool, and code reloads trigger an explicit restart via `executor_core.restart_workers()`.
+**Solution:** `loky.get_reusable_executor()` keeps workers alive for the Engine's lifetime.
+Each run gets a fresh output queue, while workers retain imports from earlier runs. Pivot replaces
+workers before a later run when a user-code module they imported changed.
 
 ### Trie for Path Validation
 

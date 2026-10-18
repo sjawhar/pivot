@@ -13,7 +13,7 @@ Pivot is a Python pipeline tool with automatic code change detection. Stages are
 - **Automatic code change detection** using Python introspection
 - **No paths in pipeline code**: Pivot chooses where every output is stored
 - **Per-stage lock files** for fast parallel writes
-- **Warm worker pools** with preloaded imports
+- **Warm worker pools** that retain stage imports across runs
 - **Content-addressable caching** with S3 remote storage
 
 ---

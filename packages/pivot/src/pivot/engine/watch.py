@@ -222,9 +222,9 @@ class WatchCoordinator:
         return engine_graph.get_producer(self._graph, identity)
 
     def should_restart_workers(self, *, parallel: bool) -> bool:
-        """Decide whether worker pool should restart after code/config change.
+        """Decide whether an eager reload restart should pre-warm multiple workers.
 
-        Workers should restart to pick up reloaded code, but only when
-        running in parallel mode (sequential mode has no persistent pool).
+        A sequential Engine retains one worker too; its dispatch-time source guard replaces
+        that worker when needed.
         """
         return parallel

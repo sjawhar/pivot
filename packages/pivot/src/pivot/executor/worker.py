@@ -26,6 +26,7 @@ import pydantic
 from pivot import (
     config,
     exceptions,
+    fingerprint,
     loaders,
     metrics,
     parameters,
@@ -178,7 +179,7 @@ def _make_result(
     return result
 
 
-def execute_stage(
+def _execute_stage(
     stage_name: str,
     stage_info: WorkerStageInfo,
     cache_dir: pathlib.Path,
@@ -486,6 +487,38 @@ def execute_stage(
                 ring_buffer,
                 input_hash=input_hash,
             )
+
+
+def user_code_files() -> list[str]:
+    """Return source paths for user modules this process has loaded.
+
+    A path that was deleted after import is still reported: the coordinator must restart
+    instead of letting the worker keep executing the cached module.
+    """
+    files = set[str]()
+    for module in tuple(sys.modules.values()):
+        if not fingerprint.is_user_code(module):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(module_file, str):
+            continue
+        try:
+            files.add(str(pathlib.Path(module_file).resolve(strict=False)))
+        except OSError:
+            files.add(str(pathlib.Path(module_file).absolute()))
+    return sorted(files)
+
+
+def execute_stage(
+    stage_name: str,
+    stage_info: WorkerStageInfo,
+    cache_dir: pathlib.Path,
+    output_queue: Queue[OutputMessage],
+) -> StageResult:
+    """Execute a stage and report every user-code module resident in this worker."""
+    result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
+    result["user_code_files"] = user_code_files()
+    return result
 
 
 def _to_identity_hashes(hashes: dict[str, HashInfo]) -> dict[types.ArtifactIdentity, HashInfo]:

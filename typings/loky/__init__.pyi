@@ -3,7 +3,7 @@
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
 from multiprocessing.context import BaseContext
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 _T = TypeVar("_T")
 
@@ -28,9 +28,9 @@ class ProcessPoolExecutor(Executor):
 def get_reusable_executor(
     max_workers: int | None = None,
     context: BaseContext | None = None,
-    timeout: int = 10,
+    timeout: float | None = 10,
     kill_workers: bool = False,
-    reuse: str = "auto",
+    reuse: bool | Literal["auto"] = "auto",
     job_reducers: Mapping[type, Callable[[Any], Any]] | None = None,
     result_reducers: Mapping[type, Callable[[Any], Any]] | None = None,
     initializer: Callable[..., object] | None = None,
