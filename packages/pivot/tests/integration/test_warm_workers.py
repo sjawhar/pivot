@@ -226,7 +226,7 @@ def _helper_call_user_function(func: Callable[[], str]) -> tuple[int, str, list[
     """Call a user function after loky deserializes it, then report resident imports."""
     from pivot.executor import worker
 
-    return os.getpid(), func(), worker._user_code_files()
+    return os.getpid(), func(), worker.user_code_files()
 
 
 def _helper_import_user_module(module_name: str, marker: str) -> tuple[int, str, list[str]]:
@@ -236,7 +236,7 @@ def _helper_import_user_module(module_name: str, marker: str) -> tuple[int, str,
     module = importlib.import_module(module_name)
     pathlib.Path(marker).write_text("imported")
     time.sleep(0.5)
-    return os.getpid(), module.value(), worker._user_code_files()
+    return os.getpid(), module.value(), worker.user_code_files()
 
 
 def _helper_wait_for_path(path: pathlib.Path) -> None:
@@ -292,6 +292,7 @@ async def test_consecutive_runs_in_one_engine_reuse_the_same_worker(
 
 def test_smaller_run_does_not_shrink_warm_worker_pool() -> None:
     """A one-stage run retains the N warmed workers a later full run needs."""
+    executor_core.restart_workers(1, 1)
     pool = WorkerPool()
     try:
         pool.start(max_workers=3)
@@ -338,17 +339,16 @@ def test_deserialization_import_change_restarts_before_next_run(
     monkeypatch.syspath_prepend(str(helpers))
     module = importlib.import_module(module_name)
     marker.unlink()
+    executor_core.restart_workers(1, 1)
     pool = WorkerPool()
     try:
         pool.start(max_workers=1)
-        dispatched_ns = time.time_ns()
         first_future = pool.submit(_helper_call_user_function, module.value)
         _helper_wait_for_path(marker)
         write_source("bravo-two")
         first_pid, first_value, files = first_future.result(timeout=60)
-        pool.record_user_code_files(files, dispatched_ns)
+        pool.record_user_code_files(files)
         assert first_value == "alpha"
-        assert pool._code_changed
 
         pool.end_run()
         pool.start(max_workers=1)
@@ -373,17 +373,16 @@ def test_deleted_worker_module_restarts_instead_of_reusing_cached_code(
     helper = helpers / f"{module_name}.py"
     helper.write_text('def value() -> str:\n    return "alpha"\n')
     monkeypatch.syspath_prepend(str(helpers))
+    executor_core.restart_workers(1, 1)
     pool = WorkerPool()
     try:
         pool.start(max_workers=1)
-        dispatched_ns = time.time_ns()
         first_future = pool.submit(_helper_import_user_module, module_name, str(marker))
         _helper_wait_for_path(marker)
         helper.unlink()
         first_pid, first_value, files = first_future.result(timeout=60)
-        pool.record_user_code_files(files, dispatched_ns)
+        pool.record_user_code_files(files)
         assert first_value == "alpha"
-        assert pool._code_changed
 
         pool.end_run()
         pool.start(max_workers=1)
@@ -391,6 +390,52 @@ def test_deleted_worker_module_restarts_instead_of_reusing_cached_code(
         assert replacement_pid != first_pid
         with pytest.raises(ModuleNotFoundError):
             pool.submit(_helper_import_user_module, module_name, str(marker)).result(timeout=60)
+    finally:
+        pool.shutdown()
+        sys.modules.pop(module_name, None)
+
+
+def test_edit_that_keeps_file_timestamps_restarts_before_next_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An edit whose timestamps do not move, as on a coarse or lagging filesystem clock, still
+    replaces the worker that imported the previous code."""
+    module_name = f"warm_frozen_{uuid.uuid4().hex}"
+    helpers = tmp_path / "helpers"
+    helpers.mkdir()
+    helper = helpers / f"{module_name}.py"
+    helper.write_text('def value() -> str:\n    return "alpha"\n')
+    monkeypatch.syspath_prepend(str(helpers))
+    module = importlib.import_module(module_name)
+    executor_core.restart_workers(1, 1)
+    target = str(helper.resolve())
+    frozen = os.stat(target)
+    real_stat = os.stat
+
+    def stat_with_frozen_timestamps(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real_stat(path, *args, **kwargs)
+        return frozen if os.fspath(path) == target else result
+
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1)
+        first_pid, first_value, files = pool.submit(
+            _helper_call_user_function, module.value
+        ).result(timeout=60)
+        pool.record_user_code_files(files)
+        assert first_value == "alpha"
+
+        monkeypatch.setattr(os, "stat", stat_with_frozen_timestamps)
+        helper.write_text('def value() -> str:\n    return "bravo"\n')
+        assert os.stat(target) == frozen, "the edit must be invisible to stat"
+
+        pool.end_run()
+        pool.start(max_workers=1)
+        second_pid, second_value, _ = pool.submit(_helper_call_user_function, module.value).result(
+            timeout=60
+        )
+        assert second_pid != first_pid
+        assert second_value == "bravo"
     finally:
         pool.shutdown()
         sys.modules.pop(module_name, None)

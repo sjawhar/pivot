@@ -1223,13 +1223,9 @@ class Engine:
 
                                 try:
                                     result = future.result()
-                                    if (
-                                        "user_code_files" in result
-                                        and "user_code_dispatched_ns" in result
-                                    ):
+                                    if "user_code_files" in result:
                                         self._worker_pool.record_user_code_files(
-                                            result["user_code_files"],
-                                            result["user_code_dispatched_ns"],
+                                            result["user_code_files"]
                                         )
                                     duration_ms = await self._handle_stage_completion(
                                         stage_name,
@@ -1267,6 +1263,7 @@ class Engine:
 
                                 except Exception as e:
                                     _logger.exception("Stage %s failed with exception", stage_name)
+                                    self._worker_pool.mark_workers_unverified()
                                     failed_result = StageResult(
                                         status=StageStatus.FAILED,
                                         reason=str(e),
@@ -1707,14 +1704,12 @@ class Engine:
                     store_spec=store_spec,
                 )
 
-                dispatched_ns = time.time_ns()
                 future = pool.submit(
                     worker.execute_stage,
                     stage_name,
                     worker_info,
                     cache_dir,
                     pool.output_queue(),
-                    dispatched_ns,
                 )
                 self._futures[future] = stage_name
 

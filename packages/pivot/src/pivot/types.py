@@ -173,7 +173,6 @@ class StageResult(TypedDict):
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
     user_code_files: NotRequired[list[str]]  # Absolute source paths workers imported
-    user_code_dispatched_ns: NotRequired[int]  # Coordinator clock immediately before submit
 
 
 # =============================================================================

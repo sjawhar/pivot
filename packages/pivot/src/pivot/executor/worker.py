@@ -17,7 +17,6 @@ import queue
 import random
 import sys
 import threading
-import time
 import traceback
 import warnings
 from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast, overload, override
@@ -490,8 +489,8 @@ def _execute_stage(
             )
 
 
-def _user_code_files() -> list[str]:
-    """Return source paths for user modules this worker has loaded.
+def user_code_files() -> list[str]:
+    """Return source paths for user modules this process has loaded.
 
     A path that was deleted after import is still reported: the coordinator must restart
     instead of letting the worker keep executing the cached module.
@@ -515,12 +514,10 @@ def execute_stage(
     stage_info: WorkerStageInfo,
     cache_dir: pathlib.Path,
     output_queue: Queue[OutputMessage],
-    dispatched_ns: int | None = None,
 ) -> StageResult:
     """Execute a stage and report every user-code module resident in this worker."""
     result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
-    result["user_code_files"] = _user_code_files()
-    result["user_code_dispatched_ns"] = time.time_ns() if dispatched_ns is None else dispatched_ns
+    result["user_code_files"] = user_code_files()
     return result
 
 
