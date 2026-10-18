@@ -141,16 +141,28 @@ _CASES = {
             + '        s(pipeline.input("t.csv"))\n'
         },
     ),
-    "directory-out": _Case(
-        doc="`has unsupported Annotated metadata 'DirectoryOut'`",
-        observed="the return value has unsupported Annotated metadata 'DirectoryOut'",
+    "directory-not-a-dict": _Case(
+        doc="`is tagged directory but its type is <type>`",
+        observed="the return value is tagged directory but its type is DataFrame",
         files={
             "pipeline.py": "from typing import Annotated\n\n"
-            + _HEAD
-            + "from pivot.outputs import DirectoryOut\n\n\n"
-            + "@stage\ndef s(raw: pd.DataFrame) -> Annotated[\n"
-            + '    dict, DirectoryOut("p/", loaders.YAML())\n]:\n    return {}\n\n\n'
+            + "import pandas as pd\n\nfrom pivot import Pipeline, directory, stage\n\n\n"
+            + "@stage\ndef s(raw: pd.DataFrame) -> Annotated[pd.DataFrame, directory]:\n"
+            + "    return raw\n\n\n"
             + 'with Pipeline("demo") as pipeline:\n    s(pipeline.input("t.csv"))\n'
+        },
+    ),
+    "write-only-consumer": _Case(
+        doc="`whose loader <loader> cannot read it back`",
+        observed="whose loader MatplotlibFigure cannot read it back",
+        files={
+            "pipeline.py": "from typing import Annotated\n\n"
+            + "import matplotlib.figure\nimport pandas as pd\n\n"
+            + "from pivot import Pipeline, plot, stage\n\n\n"
+            + "@stage\ndef chart(raw: pd.DataFrame) -> Annotated[matplotlib.figure.Figure, plot]:\n"
+            + "    return matplotlib.figure.Figure()\n\n\n"
+            + "@stage\ndef use(chart: object) -> dict:\n    return {}\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n    use(chart(pipeline.input("t.csv")))\n'
         },
     ),
     "two-inputs-one-file": _Case(

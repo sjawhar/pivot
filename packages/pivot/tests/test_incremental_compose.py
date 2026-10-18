@@ -4,7 +4,7 @@ from typing import Annotated, TypedDict
 import pytest
 
 import pivot
-from pivot import compose, exceptions, loaders, outputs, project, types
+from pivot import compose, exceptions, loaders, project, types
 
 
 def _incremental_tag() -> object:
@@ -209,11 +209,6 @@ class Dep:
 @pytest.mark.parametrize(
     ("metadata", "class_name"),
     [
-        pytest.param(
-            outputs.DirectoryOut("directory/", loaders.JSON[dict[str, int]]()),
-            "DirectoryOut",
-            id="directory-output",
-        ),
         pytest.param(Dep(), "Dep", id="legacy-dependency"),
         pytest.param(object(), "object", id="unknown-object"),
     ],
@@ -229,45 +224,3 @@ def test_return_type_rejects_unknown_annotated_metadata(metadata: object, class_
         match=rf"unknown_metadata.*the return value.*{class_name}",
     ):
         compose._analyze_return_type(unknown_metadata)
-
-
-def test_directory_out_on_return_value_names_it_and_suggests_a_path() -> None:
-    """The single output is 'the return value' to users, and a directory is a returned Path."""
-
-    def split() -> Annotated[
-        dict[str, dict[str, int]],
-        outputs.DirectoryOut("parts/", loaders.YAML[dict[str, int]]()),
-    ]:
-        return {}
-
-    with pytest.raises(exceptions.StageDefinitionError) as exc_info:
-        compose._analyze_return_type(split)
-
-    message = str(exc_info.value)
-    assert compose.SINGLE_OUTPUT_KEY not in message, message
-    assert (
-        "Stage 'split': the return value has unsupported Annotated metadata 'DirectoryOut'."
-        in message
-    ), message
-    assert "return a pathlib.Path" in message, message
-
-
-class _SplitResult(TypedDict):
-    parts: Annotated[
-        dict[str, dict[str, int]],
-        outputs.DirectoryOut("parts/", loaders.YAML[dict[str, int]]()),
-    ]
-
-
-def test_directory_out_on_typed_dict_field_names_the_field_and_suggests_a_path() -> None:
-    """A TypedDict field keeps its own name in the error and gets the same next step."""
-
-    def split() -> _SplitResult:
-        raise AssertionError("annotations are analyzed without calling the stage")
-
-    with pytest.raises(exceptions.StageDefinitionError) as exc_info:
-        compose._analyze_return_type(split)
-
-    message = str(exc_info.value)
-    assert "Stage 'split': output 'parts' has unsupported Annotated metadata" in message, message
-    assert "return a pathlib.Path" in message, message

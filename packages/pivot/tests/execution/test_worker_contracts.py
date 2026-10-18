@@ -531,6 +531,42 @@ def _returns_int_key(data: str) -> dict[int, str]:
 _DIRECTORY_OUT = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
 
 
+def _returns_keys_equal_after_normalization(data: str) -> dict[str, str]:
+    return {"foo/bar.txt": data, "foo//bar.txt": data}
+
+
+def _returns_keys_differing_by_case(data: str) -> dict[str, str]:
+    return {"File.txt": data, "file.txt": data}
+
+
+def _returns_nested_keys_differing_by_case(data: str) -> dict[str, str]:
+    return {"Foo/bar.txt": data, "foo/bar.txt": data}
+
+
+def _returns_traversal_key(data: str) -> dict[str, str]:
+    return {"../escape.txt": data}
+
+
+def _returns_absolute_key(data: str) -> dict[str, str]:
+    return {"/etc/passwd.txt": data}
+
+
+def _returns_key_without_extension(data: str) -> dict[str, str]:
+    return {"no_extension": data}
+
+
+def _returns_hidden_key_without_extension(data: str) -> dict[str, str]:
+    return {".hiddenfile": data}
+
+
+def _returns_whitespace_stem_key(data: str) -> dict[str, str]:
+    return {"   .txt": data}
+
+
+def _returns_empty_key(data: str) -> dict[str, str]:
+    return {"": data}
+
+
 @pytest.mark.parametrize(
     ("func", "outs", "cause"),
     [
@@ -544,6 +580,51 @@ _DIRECTORY_OUT = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
         pytest.param(_returns_value, [_DIRECTORY_OUT], "dict", id="str-for-a-directory"),
         pytest.param(_returns_empty_dict, [_DIRECTORY_OUT], "non-empty", id="empty-directory"),
         pytest.param(_returns_int_key, [_DIRECTORY_OUT], "strings", id="non-string-member-name"),
+        pytest.param(
+            _returns_keys_equal_after_normalization,
+            [_DIRECTORY_OUT],
+            "'foo//bar.txt' and 'foo/bar.txt' both normalize to 'foo/bar.txt'",
+            id="duplicate-after-normalization",
+        ),
+        pytest.param(
+            _returns_keys_differing_by_case,
+            [_DIRECTORY_OUT],
+            "keys would collide on case-insensitive filesystems: 'File.txt' and 'file.txt'",
+            id="case-collision",
+        ),
+        pytest.param(
+            _returns_nested_keys_differing_by_case,
+            [_DIRECTORY_OUT],
+            "keys would collide on case-insensitive filesystems: 'Foo/bar.txt' and 'foo/bar.txt'",
+            id="nested-case-collision",
+        ),
+        pytest.param(
+            _returns_traversal_key, [_DIRECTORY_OUT], "path traversal not allowed", id="traversal"
+        ),
+        pytest.param(
+            _returns_absolute_key, [_DIRECTORY_OUT], "absolute path not allowed", id="absolute"
+        ),
+        pytest.param(
+            _returns_key_without_extension,
+            [_DIRECTORY_OUT],
+            "must include file extension",
+            id="no-extension",
+        ),
+        pytest.param(
+            _returns_hidden_key_without_extension,
+            [_DIRECTORY_OUT],
+            "must include file extension",
+            id="hidden-file-without-extension",
+        ),
+        pytest.param(
+            _returns_whitespace_stem_key,
+            [_DIRECTORY_OUT],
+            "filename cannot be empty or whitespace-only",
+            id="whitespace-stem",
+        ),
+        pytest.param(
+            _returns_empty_key, [_DIRECTORY_OUT], "empty or whitespace-only", id="empty-key"
+        ),
     ],
 )
 def test_return_value_that_does_not_fit_the_outputs_fails_with_the_cause(

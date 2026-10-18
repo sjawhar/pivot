@@ -28,6 +28,7 @@ from pivot.compose import (
     _MetricTag,
     _OutputSpec,
     _StageNode,
+    directory,
     metric,
     plot,
     stage,
@@ -694,7 +695,7 @@ def test_external_input_produces_bindings(tmp_path: pathlib.Path) -> None:
 class _HelperTaggedOutputs(TypedDict):
     data: pd.DataFrame
     metrics: Annotated[dict, metric]
-    chart: Annotated[pd.DataFrame, plot]
+    chart: Annotated[pd.DataFrame, plot, loaders.CSV()]
 
 
 @stage
@@ -739,6 +740,51 @@ def test_consumer_dep_carries_the_producer_out_tag(tmp_path: pathlib.Path) -> No
 
     assert deps["metrics"].tag is out_tags["metrics"] is types.ArtifactTag.METRIC
     assert deps["chart"].tag is out_tags["chart"] is types.ArtifactTag.PLOT
+
+
+class _HelperUnreadableOutputs(TypedDict):
+    chart: Annotated[pd.DataFrame, plot]
+    figures: Annotated[dict[str, pd.DataFrame], directory, loaders.MatplotlibFigure()]
+
+
+@stage
+def _helper_build_unreadable() -> _HelperUnreadableOutputs:
+    return {"chart": pd.DataFrame(), "figures": {}}
+
+
+@stage
+def _helper_read_any(data: object) -> dict:
+    return {}
+
+
+@stage
+def _helper_read_path(data: pathlib.Path) -> dict:
+    return {}
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [pytest.param(_helper_read_any, id="object"), pytest.param(_helper_read_path, id="path")],
+)
+@pytest.mark.parametrize(
+    "key", [pytest.param("chart", id="plot"), pytest.param("figures", id="directory")]
+)
+def test_consumer_of_a_write_only_output_is_refused_at_build(
+    tmp_path: pathlib.Path, key: str, consumer: Callable[..., object]
+) -> None:
+    """A loader without load() cannot hand its output to a stage, so building refuses it.
+
+    A consumer typed ``pathlib.Path`` is no exception: it reads with the producer's loader.
+    """
+    with pytest.raises(TypeError) as exc_info, Pipeline("unreadable", root=tmp_path):
+        built = _helper_build_unreadable()
+        consumer(built[key])
+
+    message = str(exc_info.value)
+    assert f"Stage 'unreadable/{inspect.unwrap(consumer).__name__}'" in message, message
+    assert f"output '{key}' of stage 'unreadable/_helper_build_unreadable'" in message, message
+    assert "MatplotlibFigure" in message, message
+    assert "cannot read" in message, message
 
 
 def test_validate_artifact_identity_rejects_path_separators() -> None:

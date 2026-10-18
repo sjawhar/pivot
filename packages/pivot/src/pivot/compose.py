@@ -21,7 +21,6 @@ from typing_extensions import is_typeddict
 from . import (
     exceptions,
     fingerprint,
-    outputs,
     parameters,
     path_policy,
     project,
@@ -53,9 +52,16 @@ class _IncrementalTag:
     pass
 
 
+class _DirectoryTag:
+    pass
+
+
 metric = _MetricTag()
 plot = _PlotTag()
 incremental = _IncrementalTag()
+directory = _DirectoryTag()
+
+_OutputTag = _MetricTag | _PlotTag | _IncrementalTag | _DirectoryTag
 
 SINGLE_OUTPUT_KEY = stage_def.SINGLE_OUTPUT_KEY
 _T = TypeVar("_T")
@@ -68,6 +74,7 @@ class CollectionKind(enum.StrEnum):
 
 __all__ = [
     "ArtifactHandle",
+    "directory",
     "incremental",
     "metric",
     "plot",
@@ -78,13 +85,11 @@ __all__ = [
     "_format_extension",
     "_infer_format",
     "_infer_format_from_extension",
-    "metric",
-    "plot",
     "stage",
 ]
 
 
-def _artifact_tag(tag: _MetricTag | _PlotTag | _IncrementalTag | None) -> types.ArtifactTag:
+def _artifact_tag(tag: _OutputTag | None) -> types.ArtifactTag:
     """The engine tag for an output's compose tag; a dep and an out of one output share it."""
     if isinstance(tag, _MetricTag):
         return types.ArtifactTag.METRIC
@@ -92,6 +97,8 @@ def _artifact_tag(tag: _MetricTag | _PlotTag | _IncrementalTag | None) -> types.
         return types.ArtifactTag.PLOT
     if isinstance(tag, _IncrementalTag):
         return types.ArtifactTag.INCREMENTAL
+    if isinstance(tag, _DirectoryTag):
+        return types.ArtifactTag.DIRECTORY
     return types.ArtifactTag.DATA
 
 
@@ -127,6 +134,14 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
             )
         output_spec = matched
         output_key = output_spec.key
+
+    if not isinstance(output_spec.format, loaders_mod.Reader):
+        raise TypeError(
+            f"Stage '{consumer_name}' depends on {_output_label(output_spec.key)} of stage "
+            + f"'{qualified_name}', whose loader {type(output_spec.format).__name__} cannot read "
+            + "it back: it only writes. Give that output a loaders.Loader, which reads and "
+            + "writes, or do not pass it to a stage."
+        )
 
     identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
     types.validate_artifact_identity(identity)
@@ -1187,11 +1202,11 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
 
     args = get_args(hint)
     base_type = args[0]
-    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
+    tag: _OutputTag | None = None
     fmt: loaders_mod.Writer[object] | None = None
     label = _output_label(key)
     for metadata in args[1:]:
-        if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
+        if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag, _DirectoryTag)):
             if tag is not None:
                 raise exceptions.StageDefinitionError(
                     f"Stage '{stage_name}': {label} cannot combine "
@@ -1209,18 +1224,16 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
             metadata_name = (
                 metadata.__name__ if isinstance(metadata, type) else type(metadata).__name__
             )
-            message = (
+            raise exceptions.StageDefinitionError(
                 f"Stage '{stage_name}': {label} has unsupported Annotated metadata "
                 + f"'{metadata_name}'."
             )
-            if isinstance(metadata, outputs.DirectoryOut):
-                message += (
-                    " For a directory output, create the directory outside the project and "
-                    + "return a pathlib.Path to it."
-                )
-            raise exceptions.StageDefinitionError(message)
 
-    if fmt is None:
+    if isinstance(tag, _DirectoryTag):
+        file_type = _directory_file_type(base_type, label, stage_name)
+        if fmt is None:
+            fmt = _infer_format(file_type)
+    elif fmt is None:
         if isinstance(tag, _PlotTag):
             fmt = typing.cast("loaders_mod.Writer[object]", loaders_mod.MatplotlibFigure())
         elif isinstance(tag, _MetricTag):
@@ -1234,6 +1247,19 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
             + f"'{type(fmt).__name__}' does not implement empty()."
         )
     return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
+
+
+def _directory_file_type(base_type: Any, label: str, stage_name: str) -> type:
+    """The type ``T`` of each file of a ``directory`` output, which must be ``dict[str, T]``."""
+    file_args = get_args(base_type)
+    if get_origin(base_type) is not dict or len(file_args) != 2 or file_args[0] is not str:
+        shown = base_type.__name__ if isinstance(base_type, type) else base_type
+        raise exceptions.StageDefinitionError(
+            f"Stage '{stage_name}': {label} is tagged directory but its type is {shown}. "
+            + "A directory output is a dict[str, T] from each file's path inside the "
+            + "directory to the value written there."
+        )
+    return file_args[1]
 
 
 def _implements_empty(fmt: object) -> bool:
@@ -1352,7 +1378,7 @@ class _OutputSpec:
     key: str
     python_type: type
     format: loaders_mod.Writer[object]
-    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
+    tag: _OutputTag | None = None
 
 
 @dataclasses.dataclass

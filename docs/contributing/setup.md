@@ -66,7 +66,6 @@ src/pivot/
 ├── discovery.py         # Pipeline discovery
 ├── fingerprint.py       # Code fingerprinting
 ├── loaders.py           # Data loaders
-├── outputs.py           # Output type definitions
 ├── registry.py          # Stage registry
 ├── stage_def.py         # Stage definitions
 └── types.py             # Type definitions

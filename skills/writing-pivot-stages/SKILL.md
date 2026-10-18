@@ -163,14 +163,17 @@ The return type decides the format. Annotate only the **return type**; parameter
 | `Annotated[dict, metric]` | YAML, under `metrics/` | `.yaml` |
 | `Annotated[Figure, plot]` (matplotlib) | PNG, under `plots/` | `.png` |
 | `Annotated[T, incremental]` | the type's `Loader`, restored before the stage runs | its extension |
+| `Annotated[dict[str, T], directory]` | a directory, one file per key, each written as a `T` output would be (or by `Annotated[..., directory, loaders.X()]`) | none: `data/<pipeline>/<stage>/` |
 | a `TypedDict` | one output per field, each field typed as above | one file per field |
 
 Any other type fails with `Cannot infer serialization format for type int`; wrap it (`-> dict`) or annotate a loader (`Annotated[int, loaders.JSON()]`).
 
-- Import tags from `pivot`: `from pivot import incremental, metric, plot`.
+- Import tags from `pivot`: `from pivot import directory, incremental, metric, plot`.
 - Paths are chosen by Pivot: `data/<pipeline>/<stage>.<ext>`, or `data/<pipeline>/<stage>/<field>.<ext>` for `TypedDict` fields; `metrics/` and `plots/` replace `data/` for tagged outputs. Do not write directly to those managed paths. Two outputs may not resolve to the same path, or one inside another's directory (pipeline `demo` stage `x` field `y` and pipeline `demo/x` stage `y` both map to `data/demo/x/y.jsonl`), and a `pipeline.input()` may not be bound to an output's path (pipeline `raw`'s stage `s` writes `data/raw/s.jsonl`, the default path of `pipeline.input("s.jsonl")`); pass the stage's handle instead. Loading such a pipeline fails with `Output path conflict` naming both.
 - An incremental output receives the loader's `empty()` value on the first run and a writable copy of its previous cached value on later runs. Bind it with `pipeline.previous()` for a single output or `pipeline.previous("key")` for a tagged `TypedDict` field. The marker creates no DAG edge, can bind one parameter only, and requires a full `Loader` with `load()`, `save()`, and `empty()`.
 - For a `pathlib.Path` return, create a file or directory outside the project (for example in a temporary directory) and return that path. Pivot moves it to the managed output path; returning a path already inside the project is rejected because Pivot does not take ownership of user files.
+- A `directory` output returns a dict from each file's path inside the directory to its value: `return {"train.jsonl": df_a, "test.jsonl": df_b}`. The loader comes from `T` or the explicit loader, never from a key's extension, so name keys to match it. Keys are relative paths with an extension (subdirectories allowed); an empty dict, `..`, an absolute path, two keys that normalize to one path, and two keys that differ only by case fail the stage. The directory holds exactly the returned files each run, and is cached, restored, pushed and pulled as one artifact. A stage that takes the handle receives the whole directory as a `dict[str, T]`, read with the same loader. `directory` cannot be combined with `metric`, `plot` or `incremental`. For a number of files fixed when `pipeline.py` is written, prefer a `TypedDict` with one field per file, so each file is its own handle.
+- A stage cannot take an output whose loader only writes (a `plot`, or anything saved with `MatplotlibFigure()`); the pipeline fails to build, naming both stages and the loader.
 - A multi-output handle must be narrowed before use: `cleaned.rows` or `cleaned["rows"]`. Passing `cleaned` itself fails with `received handle from multi-output stage ... without selecting an output`.
 - A `dict` or `list` output is written as YAML: numpy scalars and arrays are converted to plain Python numbers and lists. A DataFrame, a dataclass, or any other object inside it is written in a form Pivot cannot read back, with a warning under the stage in the `pivot repro` report; convert it first (`df.to_dict()`, `dataclasses.asdict(x)`). A later release will fail the stage instead.
 - Loaders: `pivot.loaders.CSV`, `JSON`, `YAML`, `Text`, `JSONL`, `DataFrameJSONL`, `Pickle`, `MatplotlibFigure` (`pip install "pivot[matplotlib]"`). A custom loader is a module-level `@dataclasses.dataclass(frozen=True)` subclass of `loaders.Writer[T]` (`save`) or `loaders.Loader[T]` (`load`, `save`, and `empty`).
@@ -291,7 +294,8 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock fil
 | `depends on input '<name>' (path data/raw/<name>), which does not exist` | Put the file at `data/raw/<name>` or pass `path=` |
 | `must have a return type annotation` | Annotate the return; `-> None` stages have no outputs |
 | `Invalid variant name 'big one': use only letters, digits and the characters _ . -` | Rename the variant; `/`, `@` and spaces are not allowed |
-| `has unsupported Annotated metadata 'DirectoryOut'` | Create the directory outside the project and return a `pathlib.Path` to it |
+| `is tagged directory but its type is <type>` | A `directory` output's type is `dict[str, T]`, from file path to value |
+| `whose loader <loader> cannot read it back` | Give that output a full `Loader`, or stop passing its handle to a stage |
 | `Input binding conflict: inputs 'a' and 'b' are both bound to '<path>'` | Use one `pipeline.input()` name per file |
 | `Output path conflict: 'p/x/y' and 'p/x:y' both write data/p/x/y.jsonl` | Rename a stage, pipeline or `TypedDict` field so each output has its own path |
 | `wrote its YAML output in a form Pivot cannot read back` (a warning) | Convert the value before returning it: `df.to_dict()`, `dataclasses.asdict(x)`, or pick a format with `Annotated[T, loaders.X()]` |

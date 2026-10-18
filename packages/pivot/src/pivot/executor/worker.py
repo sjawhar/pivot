@@ -1141,30 +1141,12 @@ def _write_output_with_store(
                 )
 
     if ref.tag is types.ArtifactTag.DIRECTORY:
-        if not isinstance(value, dict):
-            raise RuntimeError(
-                f"Directory output for '{ref.identity.producer}' expects dict, got {type(value).__name__}"
-            )
-        if not value:
-            raise ValueError(f"Directory output '{ref.identity.producer}': dict must be non-empty")
-        # Cast needed: isinstance narrows Any to dict[Unknown, Unknown]; keys are checked below
-        value_dict = cast("dict[object, Any]", value)
-        members = list[tuple[pathlib.Path, Any]]()
-        for key, item_value in value_dict.items():
-            if not isinstance(key, str):
-                raise ValueError(
-                    f"Directory output for '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
-                )
-            normalized = stage_def.validate_directory_out_key(key, ref.identity.producer)
-            if isinstance(ref.format, loaders.PathOnly):
-                _reject_path_inside_project(
-                    ref,
-                    cast("object", item_value),
-                    project_root,
-                    dependency_paths,
-                )
-            members.append((output_path / normalized, item_value))
-        for full_path, item_value in members:
+        members = stage_def.directory_out_members(value, types.identity_key(ref.identity))
+        if isinstance(ref.format, loaders.PathOnly):
+            for _, item_value in members:
+                _reject_path_inside_project(ref, item_value, project_root, dependency_paths)
+        for relpath, item_value in members:
+            full_path = output_path / relpath
             full_path.parent.mkdir(parents=True, exist_ok=True)
             save_output(item_value, full_path)
         return output_path

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import unicodedata
-from typing import ClassVar
+from typing import Any, ClassVar, cast
 
 import pydantic
 
@@ -38,9 +38,9 @@ class StageParams(pydantic.BaseModel):
 def validate_directory_out_key(key: str, output_name: str) -> str:
     """Validate and normalize one key of a directory output's dict (a path inside the directory).
 
-    A directory output is a stage return value of ``dict[str, T]``; each key names a file the
-    worker writes under the output directory. Returns the normalized key (redundant
-    separators removed, Unicode NFC normalized).
+    A directory output is a stage return value of ``dict[str, T]`` tagged ``directory``; each
+    key names a file the worker writes under the output directory. Returns the normalized key
+    (redundant separators and ``.`` segments removed, Unicode NFC normalized).
 
     Raises:
         ValueError: If key is invalid (empty, whitespace-only, absolute, contains .., no extension)
@@ -81,3 +81,50 @@ def validate_directory_out_key(key: str, output_name: str) -> str:
         )
 
     return normalized
+
+
+def directory_out_members(value: object, output_name: str) -> list[tuple[str, Any]]:
+    """Check a directory output's returned dict and pair each normalized key with its value.
+
+    Refuses a value that is not a dict, an empty dict, a non-string key, any key
+    ``validate_directory_out_key`` refuses, two keys that normalize to one path, and two keys
+    that differ only by case (they would name one file on a case-insensitive filesystem).
+    """
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"Directory output '{output_name}' expects dict, got {type(value).__name__}"
+        )
+    if not value:
+        raise ValueError(f"Directory output '{output_name}': dict must be non-empty")
+
+    # Cast needed: isinstance narrows object to dict[Unknown, Unknown]; keys are checked below
+    value_dict = cast("dict[object, Any]", value)
+    members = list[tuple[str, Any]]()
+    seen_normalized = dict[str, str]()  # normalized -> original
+    seen_lowercase = dict[str, str]()  # lowercase -> normalized
+    for key, item_value in value_dict.items():
+        if not isinstance(key, str):
+            raise ValueError(
+                f"Directory output '{output_name}': keys must be strings, got {type(key).__name__}"
+            )
+        normalized = validate_directory_out_key(key, output_name)
+
+        if normalized in seen_normalized:
+            first, second = sorted([key, seen_normalized[normalized]])
+            raise ValueError(
+                f"Directory output '{output_name}': duplicate key after normalization: "
+                + f"{first!r} and {second!r} both normalize to {normalized!r}"
+            )
+        seen_normalized[normalized] = key
+
+        lowercase = normalized.lower()
+        if lowercase in seen_lowercase:
+            first, second = sorted([normalized, seen_lowercase[lowercase]])
+            raise ValueError(
+                f"Directory output '{output_name}': keys would collide on case-insensitive "
+                + f"filesystems: {first!r} and {second!r}"
+            )
+        seen_lowercase[lowercase] = normalized
+
+        members.append((normalized, item_value))
+    return members

@@ -260,10 +260,10 @@ See [CLI Development](../contributing/cli.md)
 
 See [Adding Loaders](../contributing/loaders.md)
 
-### New Output Type
+### New Output Tag
 
-1. Add to `packages/pivot/src/pivot/outputs.py`
-2. Define handling in `packages/pivot/src/pivot/executor/commit.py`
+1. Add the tag to `packages/pivot/src/pivot/compose.py` (beside `metric`, `plot`, `incremental` and `directory`) and its `types.ArtifactTag`
+2. Handle the tag where outputs are placed, written and cached (`storage/store.py`, `executor/worker.py`)
 3. Add tests
 
 ## See Also

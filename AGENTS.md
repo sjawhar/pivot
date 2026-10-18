@@ -17,13 +17,12 @@ packages/pivot/src/pivot/
 ├── executor/      # Worker process execution (see executor/AGENTS.md)
 ├── remote/        # S3/remote storage
 ├── storage/       # StateDB, lock files, cache management (see storage/AGENTS.md)
-├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot tags, format inference
+├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot/incremental/directory tags, format inference
 ├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection
 ├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
 ├── stage_def.py   # StageParams, output writing helpers
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
-├── outputs.py     # DirectoryOut marker (compose does not accept DirectoryOut yet; restoring it is tracked in Dispatch BET-58)
 └── types.py       # TypedDicts, enums, type aliases, ArtifactIdentity
 
 packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
