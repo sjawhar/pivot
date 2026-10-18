@@ -33,6 +33,7 @@ from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from multiprocessing.process import BaseProcess
 
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
@@ -478,6 +479,27 @@ def _helper_cmdline(pid: int) -> str:
     except OSError:
         return "<exited>"
     return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+def test_manager_that_died_between_runs_is_replaced() -> None:
+    """A dead output-queue manager is replaced at the next run instead of ending the session."""
+    executor_core.restart_workers(1, 1)
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1)
+        pool.end_run()
+        manager = pool._manager
+        assert manager is not None
+        process = cast("BaseProcess", manager._process)  # pyright: ignore[reportAttributeAccessIssue] - not in typeshed
+        assert process.pid is not None
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(timeout=10)
+
+        pool.start(max_workers=1)
+        pool.output_queue().put_nowait(None)
+        assert pool.output_queue().get(timeout=10) is None
+    finally:
+        pool.shutdown()
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the /proc process table")

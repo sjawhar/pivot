@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import threading
@@ -12,6 +13,8 @@ from pivot.executor import core as executor_core
 from pivot.executor import worker
 
 _T = typing.TypeVar("_T")
+
+_logger = logging.getLogger(__name__)
 
 _FileStamp = tuple[int, int, int, int, int]
 
@@ -80,14 +83,21 @@ class WorkerPool:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
         self._executor = executor
-        if self._manager is None:
-            self._manager = executor_core.create_manager()
-        raw_queue = self._manager.Queue()
-        queue_obj = typing.cast("object", raw_queue)
-        self._output_queue = typing.cast("mp.Queue[OutputMessage]", queue_obj)
+        self._output_queue = typing.cast("mp.Queue[OutputMessage]", self._new_output_queue())
         self._shutdown_event = threading.Event()
         self._accepting = True
         self._in_run = True
+
+    def _new_output_queue(self) -> object:
+        """Return a fresh queue from the engine-lifetime manager, replacing it if it died."""
+        if self._manager is not None:
+            try:
+                return self._manager.Queue()
+            except (ConnectionError, EOFError):
+                _logger.warning("Output-queue manager stopped between runs; starting a new one")
+                self._manager.shutdown()
+        self._manager = executor_core.create_manager()
+        return self._manager.Queue()
 
     @property
     def in_run(self) -> bool:

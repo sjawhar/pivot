@@ -75,12 +75,7 @@ When designing multiprocessing systems with loky:
 3. **Manager lifecycle matters** - keep the manager alive as long as workers need the queue
 
 In Pivot, the WorkerPool owns a Manager for the Engine lifetime and obtains a fresh proxy queue
-for every run:
-
-```python
-# From src/pivot/engine/worker_pool.py
-local_manager = executor_core.create_manager()
-output_queue: mp.Queue[OutputMessage] = local_manager.Queue()
-```
+for every run, starting a new Manager if the old one died between runs
+(`WorkerPool._new_output_queue` in `src/pivot/engine/worker_pool.py`).
 
 This allows workers to send log output and status messages back to the coordinator process for display in the TUI.
