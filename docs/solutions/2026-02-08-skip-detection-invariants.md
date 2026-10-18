@@ -40,7 +40,9 @@ If **any** of these fail, the generation check returns `False` and execution fal
 
 This requires hashing all dependency files, hence O(n) in the number/size of dependencies.
 The coordinator reads the stage lock only after holding the stage's artifact locks, so a waiting
-run evaluates the state committed by the writer ahead of it.
+run evaluates the state committed by the writer ahead of it. It takes READ on the outputs to
+decide, and WRITE (released READ first, then decided again) only to restore one from the cache;
+see `docs/architecture/execution.md` ("Artifact Locks").
 
 ### Tier 3: Run Cache Lookup
 

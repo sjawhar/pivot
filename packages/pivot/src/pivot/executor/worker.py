@@ -706,15 +706,19 @@ class OutputRestoreResult(NamedTuple):
     ``unavailable`` lists outputs that neither match their locked hash nor can be restored
     from the cache. ``empty_dirs_unrecorded`` lists outputs that hold every file their locked
     hash records plus empty directories it records none of (``unrecorded_empty_dirs_only``):
-    restoring such an output would delete the directories, so the stage runs instead. A check
-    (``restore=False``) lists every such output; a restore stops at the first, since the stage
-    must run anyway.
+    restoring such an output would delete the directories, so the stage runs instead.
+    ``to_restore`` lists outputs that differ from their locked hash and that the cache holds:
+    a restore writes them from the cache, a check only names them, so a check whose result is
+    available with nothing to restore writes nothing when restored. A check
+    (``restore=False``) lists every such output; a restore stops at the first unusable one,
+    since the stage must run anyway.
     """
 
     available: bool
     outputs_restored: bool
     unavailable: list[types.ArtifactRef]
     empty_dirs_unrecorded: list[types.ArtifactRef]
+    to_restore: list[types.ArtifactRef]
 
 
 def unrecorded_empty_dirs_only(expected: HashInfo, actual: HashInfo) -> bool:
@@ -798,6 +802,7 @@ def restore_outputs_to_hashes(
     """
     unavailable = list[types.ArtifactRef]()
     empty_dirs_unrecorded = list[types.ArtifactRef]()
+    to_restore = list[types.ArtifactRef]()
     outputs_restored = False
     if not isinstance(store, store_mod.WorkspaceStore):
         unavailable = [ref for ref in outs if not store.exists(ref)]
@@ -820,6 +825,7 @@ def restore_outputs_to_hashes(
                         break
                     continue
                 if store.cache_contains(ref, expected_hash):
+                    to_restore.append(ref)
                     if not restore:
                         continue
                     if store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
@@ -839,6 +845,7 @@ def restore_outputs_to_hashes(
             outputs_restored=outputs_restored,
             unavailable=unavailable,
             empty_dirs_unrecorded=empty_dirs_unrecorded,
+            to_restore=to_restore,
         )
     return available
 

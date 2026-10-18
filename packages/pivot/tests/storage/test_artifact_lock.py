@@ -27,6 +27,8 @@ class _ArtifactLockModule(Protocol):
         deps: dict[str, types.ArtifactRef],
         outs: list[types.ArtifactRef],
         project_root: pathlib.Path,
+        *,
+        outs_mode: _LockMode = ...,
     ) -> list[dict[str, object]]: ...
 
 
@@ -91,6 +93,33 @@ def test_write_dominates_read() -> None:
 
     lock_map = _helper_lock_map(result)
     assert lock_map["stage:output"] is artifact_lock.LockMode.WRITE
+
+
+def test_read_outs_mode_reads_outputs_and_deps() -> None:
+    """A check that only reads outputs (the coordinator's skip check) asks READ on them too,
+    so it shares them with every run reading them as deps."""
+    project_root = pathlib.Path("/project")
+    dep = types.ArtifactRef(
+        identity=types.ArtifactIdentity("upstream", "output"),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
+    )
+    out = types.ArtifactRef(
+        identity=types.ArtifactIdentity("stage", "output"),
+        format=loaders.JSON(),
+        python_type=dict,
+        tag=types.ArtifactTag.DATA,
+    )
+
+    result = artifact_lock.expand_lock_requests(
+        {"dep": dep}, [out], project_root, outs_mode=artifact_lock.LockMode.READ
+    )
+
+    assert _helper_lock_map(result) == {
+        "upstream:output": artifact_lock.LockMode.READ,
+        "stage:output": artifact_lock.LockMode.READ,
+    }
 
 
 def test_deterministic_sort() -> None:

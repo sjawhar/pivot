@@ -277,51 +277,25 @@ Generation counters enable the O(1) skip check. If a stage recorded dependencies
 
 ## Concurrency Safety
 
-Pivot uses a "check-lock-recheck" pattern to prevent TOCTOU (Time-of-Check-Time-of-Use) race conditions in parallel execution.
+Pivot uses a "check-lock-recheck" pattern to prevent TOCTOU (Time-of-Check-Time-of-Use) race conditions between concurrent `pivot` processes on one project.
 
 ### The Problem
 
-Without proper locking, parallel stage execution can race: two processes could both read the lock file, both determine the stage is unchanged, both start executing, and conflict on output writes.
+Without locking, two processes could both read a stage's lock file, both decide the stage must run (or that a missing output must be restored), and conflict on output writes; or one could overwrite an output while another process's stage is reading it.
 
-### The Solution: Execution Locks
+### Artifact Locks
 
-All change detection and cache operations happen inside an execution lock. The lock is acquired before reading the lock file and held through execution and lock file update.
+Each artifact has a lock file under the stage state directory's `locks/`, taken with `flock` (`storage/artifact_lock.py`): READ is `LOCK_SH`, WRITE is `LOCK_EX`. `expand_lock_requests` turns a stage's deps and outs into requests, one per artifact at the strongest mode asked for, and `acquire_many` takes them in sorted key order (no lock-order deadlocks), retrying a non-blocking `flock` until it succeeds.
 
-### Lock Implementation
+| Who | Deps | Outs | Held |
+|-----|------|------|------|
+| A worker running a stage | READ | WRITE | for the whole run, through the lock file write |
+| The coordinator deciding whether a cached stage skips | READ | READ | for the check |
+| The coordinator restoring a cached stage's outputs from the cache | READ | WRITE | for the check and the restore |
 
-Execution locks use PID-based sentinel files with atomic creation via `O_CREAT | O_EXCL`. See `src/pivot/storage/lock.py:execution_lock()`.
+A stage lock is read only after its artifact locks are held, so a waiting process evaluates the state committed by the writer ahead of it.
 
-Key properties:
-
-- **Atomic creation** - `O_CREAT | O_EXCL` guarantees only one process wins
-- **Crash recovery** - Stale locks detected via PID checking
-- **Cross-platform** - Works on Linux and macOS
-- **Visible state** - Lock files can be inspected for debugging
-
-### Design Decision: Simple Locks vs Reader-Writer Locks
-
-Two approaches were considered for TOCTOU prevention:
-
-| Approach | Description | Overhead |
-|----------|-------------|----------|
-| **Simple (chosen)** | Move operations inside existing execution lock | ~0ms |
-| **RWLock** | Separate reader-writer locks per path (like DVC) | Higher |
-
-**Benchmark results** (57-stage pipeline, 10 runs each, warmup excluded):
-
-| Metric | Baseline | With TOCTOU Fix |
-|--------|----------|-----------------|
-| Mean | 8.944s ± 0.333s | 8.899s ± 0.282s |
-| Overhead | - | -0.5% (not significant) |
-
-The simple approach was chosen because:
-
-1. **Zero measurable overhead** - Lock acquisition via `O_CREAT|O_EXCL` is ~μs
-2. **No new dependencies** - Uses existing OS primitives
-3. **Simpler code** - No separate lock coordination layer
-4. **DVC's RWLock has issues** - JSON-based lock file requires full rewrite on every operation; LMDB alternative has global write lock that serializes all lock operations
-
-The RWLock approach would only benefit workloads with many concurrent readers of the same paths, which is rare in practice since Pivot's DAG ensures dependencies complete before dependents run.
+A cached stage's skip check takes READ on its outputs, so it does not wait for the runs reading them as deps: a widely read output is held READ by every running consumer, and WRITE would wait until none is running. When the check finds an output that differs from the lock but is in the cache, it releases its locks, takes WRITE on the outputs, and decides again from the start, since another process may have restored or rebuilt them in between. Locks are never upgraded in place: two processes each holding READ and waiting for WRITE would wait on each other.
 
 ## Multi-Process Safety
 
@@ -349,7 +323,7 @@ This avoids write contention between workers while maintaining consistency.
 
 | Scenario | Result |
 |----------|--------|
-| Two `pivot repro`, same stage | Execution lock prevents concurrent execution |
+| Two `pivot repro`, same stage | WRITE on its outputs lets one run it; the other waits, then finds it cached |
 | Two `pivot repro`, different stages | Both execute independently, writes serialize |
 | `pivot repro --no-commit` + `pivot commit` | Independent operations, no lock needed |
 | Cache writes by both processes | Idempotent (check exists before writing) |

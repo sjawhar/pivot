@@ -125,6 +125,75 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
 """
 
 
+# `make` is a widely read cached stage: `slow_use` reads it for as long as the test wants (it
+# waits for `release_slow_use`), `quick_use` reads it and returns at once.
+_PIPELINE_SHARED_OUTPUT = """\
+import pathlib
+import time
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def make() -> str:
+    return "made"
+
+
+@stage
+def slow_use(made: str) -> str:
+    pathlib.Path("slow_use_started").touch()
+    deadline = time.monotonic() + 120
+    while not pathlib.Path("release_slow_use").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return f"slow saw {made}"
+
+
+@stage
+def quick_use(made: str) -> str:
+    return f"quick saw {made}"
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    made = make()
+    slow_use(made)
+    quick_use(made)
+"""
+
+# Loaded by every pivot process the hook directory is on PYTHONPATH for: logs each lock
+# request that asks for WRITE, and each restore of an output from the cache, with the pid.
+_LOCK_AND_RESTORE_LOG_HOOK = """\
+import os
+import pathlib
+
+from pivot.storage import artifact_lock, store
+
+_log = pathlib.Path(os.environ["PIVOT_TEST_HOOK_LOG"])
+_acquire_many = artifact_lock.LocalFlockLockService.acquire_many
+_restore_from_cache = store.WorkspaceStore.restore_from_cache
+
+
+def _record(line):
+    with _log.open("a") as log:
+        log.write(f"{os.getpid()} {line}\\n")
+
+
+def acquire_many(self, requests, on_status=None):
+    written = [r["key"] for r in requests if r["mode"] is artifact_lock.LockMode.WRITE]
+    if written:
+        _record("write " + ",".join(written))
+    return _acquire_many(self, requests, on_status)
+
+
+def restore_from_cache(self, ref, output_hash, **kwargs):
+    _record("restore")
+    return _restore_from_cache(self, ref, output_hash, **kwargs)
+
+
+artifact_lock.LocalFlockLockService.acquire_many = acquire_many
+store.WorkspaceStore.restore_from_cache = restore_from_cache
+"""
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -330,3 +399,111 @@ def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
     )
     combined_c = stdout_c.decode() + stderr_c.decode()
     assert "waiting for artifact lock" not in combined_c.lower()
+
+
+def _helper_built_shared_output_project(tmp_path: pathlib.Path) -> None:
+    """Build `_PIPELINE_SHARED_OUTPUT` once, so every stage is cached."""
+    _helper_setup_project(tmp_path, _PIPELINE_SHARED_OUTPUT)
+    (tmp_path / "release_slow_use").touch()
+    built = subprocess.run([_PIVOT_BIN, "repro"], cwd=tmp_path, capture_output=True, timeout=180)
+    assert built.returncode == 0, built.stdout.decode() + built.stderr.decode()
+    (tmp_path / "release_slow_use").unlink()
+    (tmp_path / "slow_use_started").unlink()
+
+
+def _helper_start_slow_consumer(tmp_path: pathlib.Path) -> subprocess.Popen[bytes]:
+    """Run `slow_use` again in its own pivot process and wait until it is inside the stage,
+    holding READ on `make`'s output for as long as the test withholds `release_slow_use`."""
+    slow = _helper_run_pivot(tmp_path, "slow_use")
+    _helper_wait_for_path(tmp_path / "slow_use_started", timeout=120)
+    return slow
+
+
+def _helper_finish(process: subprocess.Popen[bytes], timeout: float) -> tuple[str, bool]:
+    """Wait up to ``timeout`` for ``process``; return its output and whether it finished."""
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        return stdout.decode() + stderr.decode(), False
+    return stdout.decode() + stderr.decode(), True
+
+
+def test_skip_of_a_cached_stage_does_not_wait_for_its_running_consumers(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A repro whose closure holds a widely read cached stage skips it at once, though another
+    pivot run is executing one of its consumers: deciding to skip only reads the output, so
+    it does not wait for the READ every running consumer holds on it."""
+    _helper_built_shared_output_project(tmp_path)
+    slow = _helper_start_slow_consumer(tmp_path)
+    try:
+        quick = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "test/quick_use"],
+            cwd=tmp_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        quick_out, quick_finished = _helper_finish(quick, timeout=30)
+    finally:
+        (tmp_path / "release_slow_use").touch()
+        slow_out, slow_finished = _helper_finish(slow, timeout=60)
+
+    assert quick_finished, f"the cached repro waited for the running consumer:\n{quick_out}"
+    assert quick.returncode == 0, quick_out
+    assert "0 ran, 2 cached" in quick_out, quick_out
+    assert slow_finished and slow.returncode == 0, slow_out
+    assert _helper_output(tmp_path, "slow_use").read_text() == "slow saw made"
+
+
+def test_racing_skips_restore_a_missing_cached_output_once(tmp_path: pathlib.Path) -> None:
+    """Two repros that both find a cached stage's output missing restore it from the cache
+    exactly once. Each waits for WRITE on the output, held off here by a running consumer's
+    READ, and decides again once it has WRITE: the second finds the output the first restored."""
+    _helper_built_shared_output_project(tmp_path)
+    hook_dir = tmp_path / "hook"
+    hook_dir.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(_LOCK_AND_RESTORE_LOG_HOOK)
+    hook_log = tmp_path / "hook.log"
+    hook_log.touch()
+    env = _helper_make_env(PIVOT_TEST_HOOK_LOG=str(hook_log))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(hook_dir), env.get("PYTHONPATH")]))
+    output = _helper_output(tmp_path, "make")
+
+    slow = _helper_start_slow_consumer(tmp_path)
+    racers = list[subprocess.Popen[bytes]]()
+    try:
+        output.unlink()
+        racers = [
+            subprocess.Popen(
+                [_PIVOT_BIN, "repro", "test/make"],
+                cwd=tmp_path,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _ in range(2)
+        ]
+
+        def _waiting_for_write() -> set[str]:
+            lines = hook_log.read_text().splitlines()
+            return {line.split()[0] for line in lines if line.split()[1] == "write"}
+
+        deadline = time.monotonic() + 120
+        while len(_waiting_for_write()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(_waiting_for_write()) == 2, hook_log.read_text()
+        time.sleep(1)  # both are now retrying WRITE behind the consumer's READ
+    finally:
+        (tmp_path / "release_slow_use").touch()
+        slow_out, slow_finished = _helper_finish(slow, timeout=60)
+        racer_results = [_helper_finish(racer, timeout=60) for racer in racers]
+
+    assert slow_finished and slow.returncode == 0, slow_out
+    for racer, (racer_out, finished) in zip(racers, racer_results, strict=True):
+        assert finished and racer.returncode == 0, racer_out
+        assert "0 ran, 1 cached" in racer_out, racer_out
+    restores = [line for line in hook_log.read_text().splitlines() if line.endswith(" restore")]
+    assert len(restores) == 1, hook_log.read_text()
+    assert output.read_text() == "made"

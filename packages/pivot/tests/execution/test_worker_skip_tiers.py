@@ -254,7 +254,11 @@ def test_restore_reports_matching_outputs_available_without_writing(
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=True, outputs_restored=False, unavailable=[], empty_dirs_unrecorded=[]
+        available=True,
+        outputs_restored=False,
+        unavailable=[],
+        empty_dirs_unrecorded=[],
+        to_restore=[],
     )
 
 
@@ -268,7 +272,11 @@ def test_restore_verifies_directory_output(project: pathlib.Path, state_db: stat
     result = _restore(store, [ref], {ref.identity: output_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=True, outputs_restored=False, unavailable=[], empty_dirs_unrecorded=[]
+        available=True,
+        outputs_restored=False,
+        unavailable=[],
+        empty_dirs_unrecorded=[],
+        to_restore=[],
     )
 
 
@@ -283,7 +291,11 @@ def test_restore_brings_back_deleted_output_from_cache(
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=True, outputs_restored=True, unavailable=[], empty_dirs_unrecorded=[]
+        available=True,
+        outputs_restored=True,
+        unavailable=[],
+        empty_dirs_unrecorded=[],
+        to_restore=[ref],
     )
     assert path.read_text() == "cached out"
 
@@ -299,7 +311,11 @@ def test_restore_reports_output_without_recorded_hash_unavailable(
     result = _restore(store, [unrecorded, recorded], {recorded.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[unrecorded], empty_dirs_unrecorded=[]
+        available=False,
+        outputs_restored=False,
+        unavailable=[unrecorded],
+        empty_dirs_unrecorded=[],
+        to_restore=[],
     )
 
 
@@ -316,7 +332,11 @@ def test_restore_reports_output_missing_from_cache_unavailable(
     result = _restore(store, [ref], {ref.identity: FileHash(hash=file_hash)}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[ref], empty_dirs_unrecorded=[]
+        available=False,
+        outputs_restored=False,
+        unavailable=[ref],
+        empty_dirs_unrecorded=[],
+        to_restore=[],
     )
     assert not path.exists()
 
@@ -337,7 +357,11 @@ def test_restore_reports_failed_restore_unavailable(
     result = _restore(store, [ref], {ref.identity: file_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[ref], empty_dirs_unrecorded=[]
+        available=False,
+        outputs_restored=False,
+        unavailable=[ref],
+        empty_dirs_unrecorded=[],
+        to_restore=[ref],
     )
 
 
@@ -346,8 +370,8 @@ def test_check_lists_every_unavailable_output_and_writes_nothing(
 ) -> None:
     """``pivot status`` (explain.py) checks with restore=False and names every unavailable output.
 
-    A cached output counts as available without being restored; a restore stops at the first
-    unavailable output instead.
+    A cached output counts as available without being restored, and the check names it as one
+    a restore would write; a restore stops at the first unavailable output instead.
     """
     store = _workspace(project, {})
     restorable = _ref(_STAGE, "restorable")
@@ -372,9 +396,14 @@ def test_check_lists_every_unavailable_output_and_writes_nothing(
         outputs_restored=False,
         unavailable=[unrecorded, uncached],
         empty_dirs_unrecorded=[],
+        to_restore=[restorable],
     )
     assert restored == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[unrecorded], empty_dirs_unrecorded=[]
+        available=False,
+        outputs_restored=False,
+        unavailable=[unrecorded],
+        empty_dirs_unrecorded=[],
+        to_restore=[],
     )
     assert not restorable_path.exists()
 
@@ -401,7 +430,11 @@ def test_restore_keeps_checking_outputs_after_restoring_one(
     )
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=True, unavailable=[uncached], empty_dirs_unrecorded=[]
+        available=False,
+        outputs_restored=True,
+        unavailable=[uncached],
+        empty_dirs_unrecorded=[],
+        to_restore=[restorable],
     )
     assert restorable_path.read_text() == "cached"
 
@@ -440,7 +473,11 @@ def test_old_lock_without_empty_dirs_makes_the_stage_run_instead_of_stripping_th
     )
 
     assert result == worker.OutputRestoreResult(
-        available=False, outputs_restored=False, unavailable=[], empty_dirs_unrecorded=[ref]
+        available=False,
+        outputs_restored=False,
+        unavailable=[],
+        empty_dirs_unrecorded=[ref],
+        to_restore=[],
     )
     assert (directory / "logs").is_dir()
 
@@ -458,7 +495,11 @@ def test_old_lock_still_restores_a_directory_whose_files_changed(
     result = _restore(store, [ref], {ref.identity: old_hash}, state_db)
 
     assert result == worker.OutputRestoreResult(
-        available=True, outputs_restored=True, unavailable=[], empty_dirs_unrecorded=[]
+        available=True,
+        outputs_restored=True,
+        unavailable=[],
+        empty_dirs_unrecorded=[],
+        to_restore=[ref],
     )
     assert (directory / "a.txt").read_text() == "a"
 
