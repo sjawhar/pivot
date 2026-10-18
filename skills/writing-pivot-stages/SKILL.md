@@ -122,6 +122,22 @@ Resource names are case-insensitive. Resources control admission only: a waiting
 
 - `joblib.Parallel` defaults to threads inside a stage; for CPU-bound Python work, run `PIVOT_NESTED_PARALLELISM=processes pivot repro` and declare `@stage(resources={"cpu": "all"})` so nested process pools do not overlap.
 
+## Cleanup when a run is stopped
+
+`Ctrl+C` at the terminal, or the death of the `pivot` process, raises `pivot.executor.worker.WorkerTerminated` (a `KeyboardInterrupt`) inside every running stage. A stage that starts something outside itself (a detached container, a server, a child process it does not wait for) stops it in a `finally` block or a context manager:
+
+```python
+subprocess.run(["docker", "run", "--detach", "--rm", "--name", name, image, "sleep", "infinity"], check=True)
+try:
+    ...
+finally:
+    subprocess.run(["docker", "rm", "--force", name], check=False)
+```
+
+- The cleanup has 10 seconds; then the worker exits regardless and kills every process still descended from it. A detached process (double-forked, a daemon, or orphaned when its parent exited) and a container are not among those: stop them in the cleanup. Use `docker rm --force`, not `docker stop`, which waits 10 seconds by default.
+- Do not catch `BaseException` or `KeyboardInterrupt` to carry on: the stage fails anyway, and nothing it returns is committed.
+- An RPC or TUI cancel is different: it lets running stages finish and skips the rest.
+
 ## Pipelines and inputs
 
 - `pipeline.py` must bind the pipeline to a module variable named `pipeline`. Pivot finds `pipeline.py` in the current directory or the project root (the top-most directory containing `.pivot/`).

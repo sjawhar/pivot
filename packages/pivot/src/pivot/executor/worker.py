@@ -10,17 +10,31 @@ import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
+import dataclasses
 import logging
 import os
 import pathlib
 import queue
 import random
+import signal
 import sys
 import threading
 import traceback
 import warnings
-from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast, overload, override
+from typing import (
+    IO,
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NamedTuple,
+    NoReturn,
+    TypedDict,
+    cast,
+    overload,
+    override,
+)
 
+import psutil
 import pydantic
 
 from pivot import (
@@ -58,7 +72,141 @@ if TYPE_CHECKING:
     from multiprocessing import Queue
     from types import TracebackType
 
+
 logger = logging.getLogger(__name__)
+
+# How long a stopped worker's running stage may take to unwind before the worker exits.
+TERMINATION_GRACE_S = 10.0
+
+
+class WorkerTerminated(KeyboardInterrupt):  # noqa: N818 - names the event, as KeyboardInterrupt does
+    """Raised in a worker's running stage when its run is cancelled or its Pivot process dies.
+
+    It is a KeyboardInterrupt, as Ctrl-C raises at a terminal: a stage's ``except Exception``
+    does not stop it, and its ``except KeyboardInterrupt`` cleanup, ``finally`` blocks and
+    context managers run. A stage that catches it and carries on has its result discarded.
+    """
+
+
+@dataclasses.dataclass(slots=True)
+class _StopState:
+    """Process-wide stop state of a worker, set by its signal handlers and its watchdog.
+
+    Signals and the parent watchdog act on the whole process, so this state is too.
+    """
+
+    stage_running: bool = False
+    # The running stage's run was cancelled: its result must not be committed.
+    stop_requested: bool = False
+    # WorkerTerminated was raised into the running stage; never raise it again mid-cleanup.
+    interrupted: bool = False
+    # The worker exits once the running stage has unwound (SIGTERM or parent death).
+    exit_requested: bool = False
+    exit_timer_started: bool = False
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+_stop = _StopState()
+
+
+def kill_descendants(pid: int) -> None:
+    """SIGKILL every live descendant of process ``pid``. A process that detached from that
+    tree (double-forked, or orphaned when its parent exited) is not one."""
+    try:
+        descendants = psutil.Process(pid).children(recursive=True)
+    except psutil.Error:
+        return
+    for descendant in descendants:
+        with contextlib.suppress(psutil.Error):
+            descendant.kill()
+
+
+def _exit_worker(code: int) -> NoReturn:
+    """Exit this worker, first killing the processes still descended from it, which would
+    otherwise be left to init (a stage's ``Popen`` with no cleanup, or one whose cleanup was
+    cut off)."""
+    kill_descendants(os.getpid())
+    os._exit(code)
+
+
+def _exit_after_grace() -> None:
+    threading.Event().wait(TERMINATION_GRACE_S)
+    _exit_worker(1)
+
+
+def _start_exit_timer() -> None:
+    """Exit this worker ``TERMINATION_GRACE_S`` from now, whatever its running stage does."""
+    with _stop.lock:
+        if _stop.exit_timer_started:
+            return
+        _stop.exit_timer_started = True
+    threading.Thread(target=_exit_after_grace, daemon=True, name="pivot-stop-grace").start()
+
+
+def _interrupt_stage(_signum: int, _frame: object) -> None:
+    """SIGINT handler of a worker: Ctrl-C at a terminal, which reaches Pivot and its workers at
+    once. Interrupt the running stage once, so its cleanup runs, and keep the worker up until
+    Pivot stops it: loky takes a worker that exits on its own for a broken pool and SIGKILLs
+    every other worker, cutting their cleanup off."""
+    if not _stop.stage_running or _stop.interrupted:
+        return
+    _stop.stop_requested = True
+    _stop.interrupted = True
+    raise WorkerTerminated
+
+
+def _stop_worker(_signum: int, _frame: object) -> None:
+    """SIGTERM handler of a worker: interrupt the running stage once, exit once it has unwound,
+    and exit regardless after ``TERMINATION_GRACE_S``. An idle worker exits at once."""
+    _stop.stop_requested = True
+    _stop.exit_requested = True
+    _start_exit_timer()
+    if not _stop.stage_running:
+        _exit_worker(0)
+    if _stop.interrupted:
+        return
+    _stop.interrupted = True
+    raise WorkerTerminated
+
+
+def _raise_if_stopped() -> None:
+    """Refuse to commit the result of a stage whose run was cancelled, which can only be here
+    because the stage caught ``WorkerTerminated`` and carried on."""
+    if _stop.stop_requested:
+        raise WorkerTerminated
+
+
+def unwind_when_stopped(parent_pid: int) -> None:
+    """Loky worker initializer: stop this worker when it is told to or its parent dies.
+
+    SIGTERM (``WorkerPool.hard_cancel``) or SIGINT (Ctrl-C at a terminal) raises
+    ``WorkerTerminated`` in the running stage, so its cleanup runs (stopping the processes or
+    containers it started); after SIGTERM the worker then exits. When the Pivot process that
+    started the worker dies, as when it is SIGKILLed, a watchdog thread sends this worker's
+    main thread SIGTERM (a signal to that thread interrupts a blocking call there) and exits
+    the worker after ``TERMINATION_GRACE_S`` itself, in case the stage replaced the SIGTERM
+    handler or is blocked where no signal reaches it. Every exit first kills the processes
+    still descended from the worker.
+
+    A SIGINT the worker inherited as ignored (pivot run as a background job of a
+    non-interactive shell) stays ignored, as it does for pivot itself.
+    """
+    signal.signal(signal.SIGTERM, _stop_worker)
+    if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+        signal.signal(signal.SIGINT, _interrupt_stage)
+    main_thread = threading.main_thread().ident
+    assert main_thread is not None
+
+    def _watch_parent() -> None:
+        poll = threading.Event()
+        while os.getppid() == parent_pid:
+            poll.wait(1)
+        _stop.exit_requested = True  # first: a stage starting now keeps stop_requested set
+        _stop.stop_requested = True
+        _start_exit_timer()
+        signal.pthread_kill(main_thread, signal.SIGTERM)
+
+    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
 
 
 class _QueueLoggingHandler(logging.Handler):
@@ -375,6 +523,7 @@ def _execute_stage(
                                 ),
                                 output_paths=lock_output_paths(stage_outs, store, project_root),
                             )
+                            _raise_if_stopped()
                             deferred = _commit_lock_and_build_deferred(
                                 stage_info,
                                 new_lock_data,
@@ -447,6 +596,7 @@ def _execute_stage(
 
                 # Single StateDB open for post-execution work
                 with state.StateDB(state_dir, readonly=True) as state_db:
+                    _raise_if_stopped()
                     deferred = _commit_lock_and_build_deferred(
                         stage_info,
                         new_lock_data,
@@ -509,14 +659,39 @@ def user_code_files() -> list[str]:
     return sorted(files)
 
 
+def _begin_stage() -> None:
+    """Mark a stage running, clearing a Ctrl-C that interrupted the previous one. The running
+    flag is set last, so a stop signal before it is handled as one to an idle worker."""
+    _stop.interrupted = False
+    if not _stop.exit_requested:
+        _stop.stop_requested = False
+    _stop.stage_running = True
+
+
 def execute_stage(
     stage_name: str,
     stage_info: WorkerStageInfo,
     cache_dir: pathlib.Path,
     output_queue: Queue[OutputMessage],
 ) -> StageResult:
-    """Execute a stage and report every user-code module resident in this worker."""
-    result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
+    """Execute a stage and report every user-code module resident in this worker.
+
+    A stage interrupted by a stop signal (``unwind_when_stopped``) fails without committing
+    anything. After SIGTERM or the death of its Pivot process, the worker exits once the stage
+    has unwound instead of returning.
+    """
+    try:
+        _begin_stage()
+        result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
+    except WorkerTerminated:
+        # Raised outside the stage's own error handling, as while its logging is set up.
+        result = StageResult(
+            status=StageStatus.FAILED, reason="KeyboardInterrupt", input_hash=None, output_lines=[]
+        )
+    finally:
+        _stop.stage_running = False
+    if _stop.exit_requested:
+        _exit_worker(1)
     result["user_code_files"] = user_code_files()
     return result
 
@@ -1116,6 +1291,7 @@ def _run_stage_function_with_store(
         _set_deterministic_seeds()
 
         result = _execute_with_joblib_protection(func, kwargs)
+        _raise_if_stopped()
 
         output_values = _resolve_output_values(result, outs, stage_name)
         output_paths = dict[types.ArtifactRef, pathlib.Path]()

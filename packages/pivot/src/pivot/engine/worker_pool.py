@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
 import pathlib
+import signal
 import threading
+import time
 import typing
 from dataclasses import dataclass, field
 
@@ -16,6 +19,9 @@ from pivot.executor import worker
 _T = typing.TypeVar("_T")
 
 _logger = logging.getLogger(__name__)
+
+# How long hard_cancel waits for a SIGKILLed worker to be reaped; it never blocks pivot's exit.
+_KILLED_WORKER_JOIN_S = 5.0
 
 _FileStamp = tuple[int, int, int, int, int]
 
@@ -194,16 +200,57 @@ class WorkerPool:
         self._shutdown_event = None
 
     def hard_cancel(self) -> None:
-        """Forcefully shut down workers and signal drain thread to stop."""
+        """Stop workers mid-stage and signal the drain thread to stop.
+
+        Each worker is sent SIGTERM, which unwinds its running stage
+        (``worker.unwind_when_stopped``) so the stage's cleanup runs, and is given
+        ``worker.TERMINATION_GRACE_S`` to exit; a worker still alive then is killed with its
+        descendants.
+
+        The workers are first taken out of loky's executor. Its manager thread takes a worker
+        that exits without being asked to for a broken pool and SIGKILLs every worker the
+        executor still lists, so the first worker to exit would cut the others' cleanup off.
+        """
         self._accepting = False
         self._in_run = False
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, kill_workers=True)
-            self._executor = None
-        if self._manager is not None:
-            self._manager.shutdown()
-            self._manager = None
-        if self._shutdown_event is not None:
-            self._shutdown_event.set()
-        self._output_queue = None
-        self._shutdown_event = None
+        try:
+            if self._executor is not None:
+                executor = self._executor
+                self._executor = None
+                try:
+                    self._stop_workers(executor)
+                finally:
+                    # Only shutdown wakes loky's manager thread once its workers are gone.
+                    executor.shutdown(wait=False, kill_workers=True)
+        finally:
+            if self._manager is not None:
+                self._manager.shutdown()
+                self._manager = None
+            if self._shutdown_event is not None:
+                self._shutdown_event.set()
+            self._output_queue = None
+            self._shutdown_event = None
+
+    @staticmethod
+    def _stop_workers(executor: loky.ProcessPoolExecutor) -> None:
+        """Take ``executor``'s workers out of it, send each SIGTERM, and SIGKILL with its
+        descendants any worker still alive after ``worker.TERMINATION_GRACE_S``."""
+        # loky exposes no public list of its worker processes. A watch reload may have
+        # replaced this executor already, which leaves it no lock and no workers.
+        with executor._processes_management_lock or contextlib.nullcontext():
+            processes = list(executor._processes.values())
+            executor._processes.clear()
+        for process in processes:
+            if process.pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + worker.TERMINATION_GRACE_S
+        for process in processes:
+            process.join(max(0.0, deadline - time.monotonic()))
+        for process in processes:
+            if process.pid is not None and process.exitcode is None:
+                worker.kill_descendants(process.pid)
+                # loky's process object has no kill(); signal the pid directly.
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(process.pid, signal.SIGKILL)
+                process.join(_KILLED_WORKER_JOIN_S)
