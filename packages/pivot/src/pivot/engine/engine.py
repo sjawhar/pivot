@@ -112,6 +112,14 @@ class _RunState(Enum):
     CANCELLING = "cancelling"
 
 
+class _SkipOutcome(Enum):
+    """What the coordinator's skip check decided for one stage."""
+
+    RUN = "run"  # dispatch the stage to a worker
+    SKIPPED = "skipped"  # recorded cached; its outputs already match the lock
+    NEEDS_RESTORE = "needs_restore"  # cached, but outputs must first be written from the cache
+
+
 @dataclass(slots=True)
 class _SinkRuntime:
     sink: EventSink
@@ -1784,39 +1792,53 @@ class Engine:
 
         out_paths = [types.identity_key(ref.identity) for ref in stage_info["outs"]]
 
-        # Acquire artifact locks (READ on deps, WRITE on outs) to prevent
-        # concurrent pivot runs from racing during skip check + output restore.
-        await self._set_stage_state(stage_name, StageExecutionState.WAITING_ON_LOCK)
+        async def _skip_under_locks(outs_mode: artifact_lock.LockMode) -> _SkipOutcome:
+            """Take READ on deps and ``outs_mode`` on outs, so no concurrent pivot run writes
+            them mid-check, then decide afresh from the lock file as it is now."""
+            await self._set_stage_state(stage_name, StageExecutionState.WAITING_ON_LOCK)
 
-        def _acquire_artifact_locks() -> artifact_lock.LockHandle:
-            lock_requests = artifact_lock.expand_lock_requests(
-                stage_info["deps"], stage_info["outs"], project_root
-            )
-            lock_service = artifact_lock.LocalFlockLockService(stage_state_dir / "locks")
-            return lock_service.acquire_many(lock_requests)
+            def _acquire_artifact_locks() -> artifact_lock.LockHandle:
+                lock_requests = artifact_lock.expand_lock_requests(
+                    stage_info["deps"], stage_info["outs"], project_root, outs_mode=outs_mode
+                )
+                lock_service = artifact_lock.LocalFlockLockService(stage_state_dir / "locks")
+                return lock_service.acquire_many(lock_requests)
 
-        lock_handle = await anyio.to_thread.run_sync(_acquire_artifact_locks)
-        try:
-            lock_data = await anyio.to_thread.run_sync(_read_lock)
-            if lock_data is None:
-                return False
-            await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
-            return await self._try_skip_with_locks(
-                stage_name,
-                stage_info,
-                lock_data,
-                current_fingerprint,
-                current_params,
-                out_paths,
-                store,
-                stage_state_dir,
-                state_dir,
-                results,
-                run_id,
-                skip_state_dbs,
-            )
-        finally:
-            lock_handle.release()
+            lock_handle = await anyio.to_thread.run_sync(_acquire_artifact_locks)
+            try:
+                locked_data = await anyio.to_thread.run_sync(_read_lock)
+                if locked_data is None:
+                    return _SkipOutcome.RUN
+                await self._set_stage_state(stage_name, StageExecutionState.PREPARING)
+                return await self._try_skip_with_locks(
+                    stage_name,
+                    stage_info,
+                    locked_data,
+                    current_fingerprint,
+                    current_params,
+                    out_paths,
+                    store,
+                    stage_state_dir,
+                    state_dir,
+                    results,
+                    run_id,
+                    skip_state_dbs,
+                    restore=outs_mode is artifact_lock.LockMode.WRITE,
+                )
+            finally:
+                lock_handle.release()
+
+        # Deciding that a cached stage can skip only reads its outputs, so READ on them is
+        # enough, and the check does not wait for runs that read them as deps (a widely read
+        # output is held READ by every running consumer). Only an output that must be written
+        # from the cache needs WRITE. READ is released before WRITE is requested, never
+        # upgraded in place (two upgrading holders would wait on each other), and the whole
+        # decision is made again under WRITE: another run may have restored or rebuilt the
+        # outputs in between.
+        outcome = await _skip_under_locks(artifact_lock.LockMode.READ)
+        if outcome is _SkipOutcome.NEEDS_RESTORE:
+            outcome = await _skip_under_locks(artifact_lock.LockMode.WRITE)
+        return outcome is _SkipOutcome.SKIPPED
 
     async def _try_skip_with_locks(
         self,
@@ -1832,14 +1854,34 @@ class Engine:
         results: dict[str, executor_core.ExecutionSummary],
         run_id: str,
         skip_state_dbs: dict[pathlib.Path, state_mod.StateDB] | None,
-    ) -> bool:
-        """Perform skip detection while artifact locks are held."""
+        *,
+        restore: bool,
+    ) -> _SkipOutcome:
+        """Perform skip detection while artifact locks are held.
+
+        With ``restore``, outputs that differ from the lock are written from the cache, which
+        needs WRITE on them. Without it, nothing is written: a cached stage whose outputs
+        need restoring returns ``NEEDS_RESTORE``, for the caller to decide again under WRITE.
+        """
         from pivot import run_history
         from pivot import skip as skip_mod
 
         deps = stage_info["deps"]
 
-        def _restore_outputs_to_lock(state_db: state_mod.StateDB) -> bool:
+        def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
+            if not restore:
+                checked = worker.restore_outputs_to_hashes(
+                    store,
+                    stage_info["outs"],
+                    lock_data["output_hashes"],
+                    state_db,
+                    state_dir=state_dir,
+                    restore=False,
+                    report_changes=True,
+                )
+                if not checked.available:
+                    return _SkipOutcome.RUN
+                return _SkipOutcome.NEEDS_RESTORE if checked.to_restore else _SkipOutcome.SKIPPED
             restored_entries = list[tuple[str, int, int, int, str]]()
             restored = worker.restore_outputs_to_hashes(
                 store,
@@ -1854,7 +1896,7 @@ class Engine:
                     writable_db.apply_deferred_writes(
                         stage_name, [], DeferredWrites(file_hash_entries=restored_entries)
                     )
-            return restored
+            return _SkipOutcome.SKIPPED if restored else _SkipOutcome.RUN
 
         def _get_skip_state_db() -> state_mod.StateDB:
             if skip_state_dbs is not None:
@@ -1865,7 +1907,7 @@ class Engine:
                 return skip_state_dbs[stage_state_dir]
             return state_mod.StateDB(stage_state_dir, readonly=True)
 
-        def _try_generation_skip() -> tuple[bool, str | None]:
+        def _try_generation_skip() -> tuple[_SkipOutcome, str | None]:
             state_db = _get_skip_state_db()
             try:
                 can_skip = worker.can_skip_via_generation(
@@ -1879,7 +1921,7 @@ class Engine:
                     store=store,
                 )
                 if not can_skip:
-                    return False, None
+                    return _SkipOutcome.RUN, None
                 input_hash = run_history.stage_input_hash(
                     current_fingerprint,
                     current_params,
@@ -1887,15 +1929,17 @@ class Engine:
                     lock_data["dep_hashes"],
                     stage_info["outs"],
                 )
-                if not _restore_outputs_to_lock(state_db):
-                    return False, None
-                return True, input_hash
+                return _use_outputs(state_db), input_hash
             finally:
                 if skip_state_dbs is None:
                     state_db.close()
 
-        skipped, generation_input_hash = await anyio.to_thread.run_sync(_try_generation_skip)
-        if skipped:
+        generation_outcome, generation_input_hash = await anyio.to_thread.run_sync(
+            _try_generation_skip
+        )
+        if generation_outcome is _SkipOutcome.NEEDS_RESTORE:
+            return generation_outcome
+        if generation_outcome is _SkipOutcome.SKIPPED:
             await self._record_cached_stage(
                 stage_name,
                 "unchanged (generation)",
@@ -1904,7 +1948,7 @@ class Engine:
                 results,
                 run_id=run_id,
             )
-            return True
+            return generation_outcome
 
         def _hash_deps() -> tuple[
             dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]
@@ -1923,7 +1967,7 @@ class Engine:
             types.identity_from_key(key): info for key, info in dep_hashes.items()
         }
         if missing or unreadable:
-            return False
+            return _SkipOutcome.RUN
 
         out_identities = [out.identity for out in stage_info["outs"]]
         decision = skip_mod.check_stage(
@@ -1936,7 +1980,7 @@ class Engine:
             force=False,
         )
         if decision["changed"]:
-            return False
+            return _SkipOutcome.RUN
 
         input_hash = run_history.stage_input_hash(
             current_fingerprint,
@@ -1946,17 +1990,17 @@ class Engine:
             stage_info["outs"],
         )
 
-        def _restore_lock_outputs() -> bool:
+        def _use_lock_outputs() -> _SkipOutcome:
             state_db = _get_skip_state_db()
             try:
-                return _restore_outputs_to_lock(state_db)
+                return _use_outputs(state_db)
             finally:
                 if skip_state_dbs is None:
                     state_db.close()
 
-        restored = await anyio.to_thread.run_sync(_restore_lock_outputs)
-        if not restored:
-            return False
+        outcome = await anyio.to_thread.run_sync(_use_lock_outputs)
+        if outcome is not _SkipOutcome.SKIPPED:
+            return outcome
 
         await self._record_cached_stage(
             stage_name,
@@ -1966,7 +2010,7 @@ class Engine:
             results,
             run_id=run_id,
         )
-        return True
+        return outcome
 
     async def _record_cached_stage(
         self,

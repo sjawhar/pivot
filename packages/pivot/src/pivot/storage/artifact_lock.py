@@ -37,8 +37,15 @@ def expand_lock_requests(
     deps: dict[str, types.ArtifactRef],
     outs: list[types.ArtifactRef],
     project_root: pathlib.Path,
+    *,
+    outs_mode: LockMode = LockMode.WRITE,
 ) -> list[LockRequest]:
-    """Expand deps/outs into lock requests."""
+    """Expand deps/outs into lock requests: READ on each dep, ``outs_mode`` on each out.
+
+    A stage that writes its outputs takes WRITE on them. A check that only reads them (the
+    coordinator deciding whether a cached stage can skip) takes READ, so it does not wait for
+    the runs reading those outputs as their deps.
+    """
     _ = project_root
     key_to_mode = dict[str, LockMode]()
 
@@ -50,7 +57,7 @@ def expand_lock_requests(
 
     for out_ref in outs:
         key = _lock_key(out_ref)
-        key_to_mode[key] = LockMode.WRITE
+        key_to_mode[key] = max(key_to_mode.get(key, LockMode.READ), outs_mode)
 
     return [LockRequest(key=key, mode=key_to_mode[key]) for key in sorted(key_to_mode)]
 
