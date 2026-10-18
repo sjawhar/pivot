@@ -2,6 +2,45 @@
 
 <!-- version list -->
 
+## v0.3.9 (2026-10-18)
+
+### Bug Fixes
+
+- **discovery**: Load all user code through the checked loader, never the stdlib or a library
+  ([#482](https://github.com/sjawhar/pivot/pull/482),
+  [`d0a5ad2`](https://github.com/sjawhar/pivot/commit/d0a5ad2bb17c88458aec657c03bbd2904bf971cb))
+
+- **discovery**: Load and fingerprint an edit to user code even when it keeps the file's size and
+  mtime ([#482](https://github.com/sjawhar/pivot/pull/482),
+  [`d0a5ad2`](https://github.com/sjawhar/pivot/commit/d0a5ad2bb17c88458aec657c03bbd2904bf971cb))
+
+- **discovery**: Load edited user code in workers, keep never-mode bytecode current, leave symlinked
+  libraries alone ([#482](https://github.com/sjawhar/pivot/pull/482),
+  [`d0a5ad2`](https://github.com/sjawhar/pivot/commit/d0a5ad2bb17c88458aec657c03bbd2904bf971cb))
+
+- **discovery**: Load project code from bytecode checked by content, not mtime
+  ([#482](https://github.com/sjawhar/pivot/pull/482),
+  [`d0a5ad2`](https://github.com/sjawhar/pivot/commit/d0a5ad2bb17c88458aec657c03bbd2904bf971cb))
+
+- **fingerprint**: Key cached function hashes and manifest sources by file content
+  ([#482](https://github.com/sjawhar/pivot/pull/482),
+  [`d0a5ad2`](https://github.com/sjawhar/pivot/commit/d0a5ad2bb17c88458aec657c03bbd2904bf971cb))
+
+### Documentation
+
+- **outputs**: Say that restoring a lock with no empty directories onto an empty path leaves them
+  out ([#484](https://github.com/sjawhar/pivot/pull/484),
+  [`aa33a3a`](https://github.com/sjawhar/pivot/commit/aa33a3ac8cd46426a498e1826b96052e91d356e0))
+
+- **outputs**: Say what pivot does with a lock that records no empty directories, and how to repair
+  a stripped output ([#484](https://github.com/sjawhar/pivot/pull/484),
+  [`aa33a3a`](https://github.com/sjawhar/pivot/commit/aa33a3ac8cd46426a498e1826b96052e91d356e0))
+
+- **outputs**: Say when pivot runs a stage over unrecorded empty directories, and how to repair a
+  stripped one ([#484](https://github.com/sjawhar/pivot/pull/484),
+  [`aa33a3a`](https://github.com/sjawhar/pivot/commit/aa33a3ac8cd46426a498e1826b96052e91d356e0))
+
+
 ## v0.3.8 (2026-10-18)
 
 ### Bug Fixes
