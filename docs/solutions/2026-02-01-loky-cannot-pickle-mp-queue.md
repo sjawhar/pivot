@@ -48,11 +48,12 @@ future = executor.submit(worker, queue)
 future.result()  # Works!
 ```
 
-For explicit spawn context (recommended for consistency):
+For Pivot's explicit spawn context and parent-death cleanup:
 
 ```python
-spawn_ctx = mp.get_context("spawn")
-local_manager = spawn_ctx.Manager()
+from pivot.executor import core as executor_core
+
+local_manager = executor_core.create_manager()
 output_queue = local_manager.Queue()
 ```
 
@@ -73,13 +74,8 @@ When designing multiprocessing systems with loky:
 2. **Manager objects add latency** - IPC to the manager server, but this is usually negligible compared to the work being done
 3. **Manager lifecycle matters** - keep the manager alive as long as workers need the queue
 
-In Pivot, the engine creates a Manager-based queue for collecting output messages from worker processes:
-
-```python
-# From src/pivot/engine/engine.py
-spawn_ctx = mp.get_context("spawn")
-local_manager = spawn_ctx.Manager()
-output_queue: mp.Queue[OutputMessage] = local_manager.Queue()
-```
+In Pivot, the WorkerPool owns a Manager for the Engine lifetime and obtains a fresh proxy queue
+for every run, starting a new Manager if the old one cannot be reached
+(`WorkerPool._new_output_queue` in `src/pivot/engine/worker_pool.py`).
 
 This allows workers to send log output and status messages back to the coordinator process for display in the TUI.

@@ -136,7 +136,9 @@ The Engine performs a **full module clear** before restart:
 
 ### Warm Workers
 
-Workers are warm within a single run (stages reuse the same pool). Watch mode creates a fresh pool per run; code reloads can trigger a restart via `executor_core.restart_workers()` (only in parallel mode, per WatchCoordinator policy).
+One watch Engine keeps its workers warm across re-runs. Before reusing those workers, Pivot
+checks the user-code modules they imported and replaces the pool when a source file changed.
+Code reloads also replace workers so they execute the reloaded pipeline.
 
 ## Debouncing
 
@@ -157,10 +159,10 @@ Syntax errors or circular dependencies are reported and the Engine waits for a f
 
 ## Graceful Shutdown
 
-On `Ctrl+C`:
+On `Ctrl+C` at the terminal:
 
-1. Engine sets shutdown flag
-2. Current execution completes (not interrupted)
+1. Running stages are interrupted mid-stage: each gets `WorkerTerminated` (a `KeyboardInterrupt`), its cleanup runs, and nothing it produced is committed (see [Stopping mid-stage](./execution.md#stopping-mid-stage))
+2. Pivot waits up to 10 s for the workers to exit, then kills any left with their child processes
 3. FilesystemSource stops watching
 4. Resources are released
 
@@ -176,7 +178,7 @@ On `Ctrl+C`:
 ## Limitations
 
 - **Worker restart latency**: Code changes have ~300ms overhead for worker restart
-- **No mid-stage cancellation**: Running stages complete before cancellation takes effect
+- **Stage-level cancellation over RPC**: an RPC `cancel` lets running stages complete; only `Ctrl+C` at the terminal, or the death of the Pivot process, stops them mid-stage
 - **Single machine**: Not designed for distributed execution
 
 ## See Also

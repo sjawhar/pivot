@@ -379,6 +379,20 @@ class Engine:
         Closes send channels first to signal receivers, then receive channels.
         This ordering prevents ClosedResourceError in iterating tasks.
         """
+        if self._worker_pool is not None:
+            worker_pool = self._worker_pool
+            self._worker_pool = None
+            try:
+                with anyio.CancelScope(shield=True):
+                    shutdown = (
+                        worker_pool.hard_cancel
+                        if _exc and _exc[0] is not None
+                        else worker_pool.shutdown
+                    )
+                    await anyio.to_thread.run_sync(shutdown)
+            except (OSError, BrokenPipeError) as exc:
+                _logger.debug("WorkerPool shutdown failed (may already be dead): %s", exc)
+
         # Close send channels first to signal end-of-stream to receivers
         if self._input_send:
             await self._input_send.aclose()
@@ -1176,9 +1190,8 @@ class Engine:
                 results=results,
             )
 
-            # Only start drain thread and main loop if workers were dispatched.
-            # When all stages skip in the coordinator, the pool is never created.
-            if self._worker_pool is not None:
+            # Only start drain thread and main loop if workers were dispatched in this run.
+            if self._worker_pool is not None and self._worker_pool.in_run:
                 output_queue = self._worker_pool.output_queue()
                 shutdown_event = self._worker_pool.shutdown_event()
 
@@ -1209,6 +1222,10 @@ class Engine:
 
                                 try:
                                     result = future.result()
+                                    if "user_code_files" in result:
+                                        self._worker_pool.record_user_code_files(
+                                            result["user_code_files"]
+                                        )
                                     duration_ms = await self._handle_stage_completion(
                                         stage_name,
                                         result,
@@ -1245,6 +1262,7 @@ class Engine:
 
                                 except Exception as e:
                                     _logger.exception("Stage %s failed with exception", stage_name)
+                                    self._worker_pool.mark_workers_unverified()
                                     failed_result = StageResult(
                                         status=StageStatus.FAILED,
                                         reason=str(e),
@@ -1372,23 +1390,14 @@ class Engine:
                 await self._finalize_cancelled_stages(results, run_id)
 
         finally:
-            # Close StateDBs first (lightweight), then shut down worker pool.
+            # Close StateDBs first, then release this run's output queue after its drain exits.
             with anyio.CancelScope(shield=True):
                 for db in state_dbs.values():
                     db.close()
                 state_dbs.clear()
 
-            # WorkerPool shutdown handles executor + manager cleanup.
-            # Must happen after sentinel send so drain thread exits first.
-            # Wrapped in outer finally to ensure it always executes, even if task group raises.
-            if self._worker_pool is not None:
-                worker_pool = self._worker_pool
-                self._worker_pool = None
-                try:
-                    with anyio.CancelScope(shield=True):
-                        await anyio.to_thread.run_sync(worker_pool.shutdown)
-                except (OSError, BrokenPipeError) as exc:
-                    _logger.debug("WorkerPool shutdown failed (may already be dead): %s", exc)
+            if self._worker_pool is not None and self._worker_pool.in_run:
+                self._worker_pool.end_run()
 
         # Write run history after execution completes
         ended_at = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1583,9 +1592,10 @@ class Engine:
         return self._scheduler.can_start(stage_name)
 
     def _ensure_worker_pool(self) -> worker_pool_mod.WorkerPool:
-        """Lazily create and start the worker pool on first worker dispatch."""
+        """Lazily begin this run's worker pool on first worker dispatch."""
         if self._worker_pool is None:
             self._worker_pool = worker_pool_mod.WorkerPool()
+        if not self._worker_pool.in_run:
             self._worker_pool.start(max_workers=self._effective_max_workers)
         return self._worker_pool
 
@@ -2507,8 +2517,8 @@ class Engine:
         if stages:
             # Restart worker pool so workers pick up reloaded code.
             # Run in thread to avoid blocking the event loop during process kill/spawn.
-            # Catch errors so a failed restart doesn't kill the watch session;
-            # create_executor() in _orchestrate_execution will retry pool creation.
+            # Catch errors so dispatch-time source validation can rebuild the pool on its
+            # next use.
             coordinator = self._get_watch_coordinator()
             if coordinator is not None and coordinator.should_restart_workers(
                 parallel=self._stored_parallel

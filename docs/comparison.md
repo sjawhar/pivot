@@ -8,7 +8,7 @@ How Pivot compares to other pipeline and workflow tools.
 |---------|-------|-----|---------|---------|
 | **Local Iteration Speed** | | | | |
 | Watch mode | Auto-rerun on file change | Manual `dvc repro` | Manual trigger | Manual materialize |
-| Warm workers | Workers persist across runs | Cold start each run | Cold start | Cold start |
+| Warm workers | Within one long-lived Engine | Cold start each run | Cold start | Cold start |
 | **Code Change Detection** | | | | |
 | Function-level tracking | AST + getclosurevars | Command string hash | Input hash only | Config hash only |
 | Transitive dependencies | Automatic | Manual declaration | Manual | Manual |
@@ -84,7 +84,8 @@ Per-stage locks enable parallel-safe writes and avoid the monolithic lock file b
 
 ### Warm Workers
 
-Pivot uses `loky.get_reusable_executor()` to keep worker processes alive between runs. This avoids the startup cost of reimporting large libraries like numpy and pandas on each execution.
+In a long-lived Engine, Pivot keeps `loky.get_reusable_executor()` workers alive across runs.
+This avoids reimporting large libraries such as numpy and pandas on each execution.
 
 ### Watch Mode
 

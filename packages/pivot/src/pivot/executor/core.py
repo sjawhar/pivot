@@ -4,9 +4,12 @@ import atexit
 import contextlib
 import functools
 import logging
+import multiprocessing as mp
 import os
 import pathlib
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+import threading
+from multiprocessing import managers
+from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
 import loky
 
@@ -25,10 +28,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_WORKER_IDLE_TIMEOUT_S: Final[float | None] = None
+
 
 def _noop() -> None:
     """Module-level for pickling."""
     pass
+
+
+def _exit_when_parent_dies(parent_pid: int) -> None:
+    """Exit the output-queue manager after its owning Pivot process dies.
+
+    Workers use ``worker.unwind_when_stopped`` instead, which lets the running stage unwind.
+    """
+
+    def _watch_parent() -> None:
+        poll = threading.Event()
+        while os.getppid() == parent_pid:
+            poll.wait(1)
+        os._exit(0)
+
+    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
 
 
 def configured_worker_count(override: int | None = None) -> int:
@@ -57,23 +77,40 @@ def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
 
 
 def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.ProcessPoolExecutor:
-    """The reusable loky worker pool.
+    """Return Pivot's reusable executor with one worker-lifetime policy.
 
-    While a discovery's import session lasts, every worker imports user code as that session
-    does (``discovery.install_user_code_loader``), so a worker never runs an edited module's
-    previous code. Loky replaces a live pool whose initializer arguments differ.
+    Every worker starts with ``_init_worker``. While a discovery's import session lasts, it
+    also imports user code as that session does (``discovery.install_user_code_loader``), so a
+    worker never runs an edited module's previous code; loky replaces a live pool whose
+    initializer arguments differ.
     """
     _ensure_deterministic_environment()
     _ensure_cleanup_registered()
     root = discovery.import_session_root()
-    if root is None:
-        return loky.get_reusable_executor(max_workers=max_workers, kill_workers=kill_workers)
     return loky.get_reusable_executor(
         max_workers=max_workers,
+        timeout=_WORKER_IDLE_TIMEOUT_S,
         kill_workers=kill_workers,
-        initializer=discovery.install_user_code_loader,
-        initargs=(str(root),),
+        reuse=False if kill_workers else "auto",
+        initializer=_init_worker,
+        initargs=(os.getpid(), None if root is None else str(root)),
     )
+
+
+def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
+    """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
+    (``worker.unwind_when_stopped``), and import user code through discovery's checked loader
+    when a discovery's import session for ``user_code_root`` lasts."""
+    worker.unwind_when_stopped(parent_pid)
+    if user_code_root is not None:
+        discovery.install_user_code_loader(user_code_root)
+
+
+def create_manager() -> managers.SyncManager:
+    """Start a spawn-context manager that exits when this process dies."""
+    manager = managers.SyncManager(ctx=mp.get_context("spawn"))
+    manager.start(initializer=_exit_when_parent_dies, initargs=(os.getpid(),))
+    return manager
 
 
 def prepare_workers(
@@ -92,10 +129,9 @@ def prepare_workers(
 
 
 def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
-    """Kill existing workers and spawn fresh ones. For code reload in watch mode.
+    """Kill and warm fresh workers after code reload or stale-source detection."""
 
-    Unlike prepare_workers(), this kills existing workers first, then warms the new pool.
-    """
+    # A reusable executor with matching kwargs would otherwise keep live workers.
     if stage_count <= 0:
         return 1
     workers = compute_max_workers(stage_count, max_workers)
@@ -106,7 +142,7 @@ def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
 def _cleanup_worker_pool() -> None:
     """Kill loky worker pool on process exit to prevent orphaned workers."""
     with contextlib.suppress(Exception):
-        loky.get_reusable_executor(max_workers=1, kill_workers=True)
+        _get_executor(1, kill_workers=True)
 
 
 @functools.cache  # Ensures single atexit registration across threads
@@ -307,7 +343,7 @@ def _ensure_deterministic_environment() -> None:
 
 
 def create_executor(max_workers: int) -> concurrent.futures.Executor:
-    """Get reusable loky executor - workers persist across calls for efficiency."""
+    """Get Pivot's reusable executor, keeping its workers warm between runs."""
     return _get_executor(max_workers)
 
 

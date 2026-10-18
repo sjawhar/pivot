@@ -1,6 +1,6 @@
 [project]
 name = "pivot"
-version = "0.3.6"
+version = "0.3.8"
 description = "High-performance Python pipeline tool with automatic code change detection"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
@@ -27,6 +27,7 @@ dependencies = [
   "networkx>=3.0",
   "pathspec>=0.12.0",
   "pandas>=2.0",
+  "psutil>=7.0",
   "pydantic>=2.13",
   "pygtrie>=2.5.0",
   "pyyaml>=6.0",
@@ -76,6 +77,7 @@ dev = [
   "pytest>=7.0",
   "ruff>=0.8.0",
   "types-aioboto3[all]>=13.0.0",
+  "types-psutil>=7.0",
 ]
 
 [project.scripts]

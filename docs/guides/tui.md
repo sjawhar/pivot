@@ -145,7 +145,7 @@ In run mode, the header title updates with progress (e.g., `pivot run (3/5)`). I
 
 ## Run Mode vs Watch Mode
 
-**Run mode** (`pivot repro --tui`) executes the pipeline once. The TUI shows progress and exits automatically when all stages complete. If you press `q` while stages are running, a confirmation dialog asks whether to kill workers.
+**Run mode** (`pivot repro --tui`) executes the pipeline once. The TUI shows progress and exits automatically when all stages complete. If you press `q` while stages are running, a confirmation dialog asks whether to stop starting further stages; stages already running finish.
 
 **Watch mode** (`pivot repro --watch --tui`) monitors the filesystem for changes and re-runs affected stages. The TUI stays open until you press `q`. Additional features in watch mode:
 

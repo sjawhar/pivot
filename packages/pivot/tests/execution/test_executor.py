@@ -9,8 +9,10 @@ locks, generated outputs, and targeting.
 from __future__ import annotations
 
 import atexit
+import os
 import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
@@ -498,6 +500,20 @@ def test_ensure_cleanup_registered_registers_atexit(mocker: MockerFixture) -> No
     finally:
         executor_core._ensure_cleanup_registered.cache_clear()
         executor_core._ensure_cleanup_registered()
+
+
+def test_manager_parent_watchdog_exits_after_parent_death(mocker: MockerFixture) -> None:
+    """The output-queue manager does not become a permanent orphan after a hard parent exit."""
+    thread = mocker.patch.object(threading, "Thread")
+    exit_process = mocker.patch.object(os, "_exit", side_effect=SystemExit)
+    mocker.patch.object(os, "getppid", return_value=1)
+
+    executor_core._exit_when_parent_dies(42)
+
+    target = thread.call_args.kwargs["target"]
+    with pytest.raises(SystemExit):
+        target()
+    exit_process.assert_called_once_with(0)
 
 
 def _resource_root(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:

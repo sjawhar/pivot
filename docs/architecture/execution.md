@@ -94,9 +94,10 @@ During watch mode, the Engine filters filesystem events based on stage state:
 
 ## Worker Pool
 
-Pivot uses `loky.get_reusable_executor()` for warm workers with `spawn` context.
-The Engine wraps it in `WorkerPool`, which also manages a manager-backed output
-queue for log streaming and a shutdown event for the drain thread.
+Pivot uses `loky.get_reusable_executor()` with `spawn` context. `WorkerPool` owns workers and
+the manager process for the Engine lifetime. Each run gets its own manager-backed output queue
+and drain shutdown event, so logs cannot cross run boundaries. A manager that cannot be reached
+when a run starts (it died, or its socket was removed) is replaced then.
 
 ### Why ProcessPoolExecutor?
 
@@ -112,7 +113,10 @@ queue for log streaming and a shutdown event for the drain thread.
 
 ### Warm Workers
 
-Workers stay alive between stages, so expensive imports (numpy, pandas) only happen once per worker, not once per stage.
+Workers stay alive across runs in one Engine, so imports from earlier stages remain available.
+Before a later run reuses workers, Pivot replaces them if a user-code module they imported
+changed. Worker capacity grows for a larger run but does not shrink for a smaller one: the
+scheduler still limits that run's parallelism, while a later full run reuses every warm worker.
 
 ## Stage resources
 
@@ -369,9 +373,19 @@ The engine supports graceful cancellation via a `CancelRequested` event. When se
 2. **Pending stages are skipped** - No new stages are started
 3. **Results include cancellation** - Skipped stages report reason "cancelled"
 
-Cancellation is **stage-level**, not mid-stage. This ensures outputs are always in a consistent state (either fully written or not started).
+This cancellation is **stage-level**, not mid-stage. This ensures outputs are always in a consistent state (either fully written or not started).
 
 In watch mode, the Agent RPC `cancel` command sends a `CancelRequested` event, allowing external tools to stop execution between stages. The TUI also uses this for `Ctrl+C` handling.
+
+### Stopping mid-stage
+
+`Ctrl+C` at a terminal (outside the TUI), and the death of the Pivot process (`SIGKILL`, or `SIGTERM`, which Pivot does not handle), stop running stages mid-stage. Each running stage gets `pivot.executor.worker.WorkerTerminated`, a `KeyboardInterrupt`, raised where it is, so its `except KeyboardInterrupt` cleanup, `finally` blocks and context managers run, as they would for `Ctrl+C` in a plain Python program. Then:
+
+- The stage fails and nothing it produced is committed: no output enters the cache and no lock is written, even if the stage caught the exception and returned a value.
+- The worker exits once the stage has unwound, and no later than `worker.TERMINATION_GRACE_S` (10 s) after it was told to stop, whatever the stage does. Before exiting, it kills every process still descended from it. A process that detached (double-forked, a daemon, or orphaned when its parent exited) is not reached; the stage's cleanup must stop it, as it must stop a container, which the Docker daemon runs.
+- Pivot itself (on `Ctrl+C`) waits up to the same 10 s for its workers, then kills any left with their child processes.
+
+A cleanup that must finish therefore has 10 s: remove a container with `docker rm --force`, which takes about a second, not `docker stop`, which waits 10 s for the container by default.
 
 ## Explain Mode
 

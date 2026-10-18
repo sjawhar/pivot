@@ -28,22 +28,21 @@ def run_stages():
 
 ## Solution
 
-Use `loky.get_reusable_executor()` which maintains a singleton worker pool across calls:
+Use Pivot's `_get_executor()` policy, which sets the shared timeout, child initializer and
+reuse mode:
 
 ```python
-import loky
-
 def create_executor(max_workers: int) -> Executor:
-    """Get reusable loky executor - workers persist across calls."""
-    return loky.get_reusable_executor(max_workers=max_workers)
+    """Get Pivot's reusable executor."""
+    return _get_executor(max_workers)
 ```
 
 The key behaviors:
 
-1. **First call** - Creates worker pool, spawns processes
-2. **Subsequent calls** - Returns the existing pool if compatible (same `max_workers`)
-3. **Workers stay alive** - Between stage executions, workers idle but remain ready
-4. **Imports cached** - Heavy libraries imported once per worker lifetime, not per stage
+1. **First call** - Creates the reusable executor, then spawns processes on warm-up or submit
+2. **Later compatible calls** - Reuse the executor; loky may resize if requested capacity grows
+3. **Workers stay alive** - Between runs in a long-lived Engine, workers idle and remain ready
+4. **Imports cached** - Libraries imported by stages remain loaded for each worker lifetime
 
 ### Pre-warming Workers
 
@@ -61,10 +60,9 @@ def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
         f.result()
 
 def prepare_workers(stage_count: int, max_workers: int | None = None) -> int:
-    """Pre-warm loky worker pool before TUI startup."""
+    """Pre-warm Pivot's configured reusable worker pool before TUI startup."""
     workers = compute_max_workers(stage_count, max_workers)
-    pool = loky.get_reusable_executor(max_workers=workers)
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers), workers)
     return workers
 ```
 
@@ -78,43 +76,60 @@ In watch mode, code changes require fresh workers with updated imports:
 def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
     """Kill existing workers and spawn fresh ones."""
     workers = compute_max_workers(stage_count, max_workers)
-    pool = loky.get_reusable_executor(max_workers=workers, kill_workers=True)
-    _warm_workers(pool, workers)
+    _warm_workers(_get_executor(workers, kill_workers=True), workers)
     return workers
 ```
 
-The `kill_workers=True` flag terminates existing workers before creating new ones, ensuring updated code is loaded.
+`reuse=False` makes loky replace a compatible live executor instead of returning it unchanged,
+ensuring updated imports are loaded.
 
 ### Cleanup on Exit
 
-Register an atexit handler to prevent orphaned workers:
+The Engine shuts its workers and manager down when it exits. An atexit fallback remains useful
+when code creates a reusable executor outside an Engine context.
 
-```python
-import atexit
-import functools
+Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler), and
+workers use `timeout=None`, so nothing else would end them. The output-queue manager therefore
+starts with `_exit_when_parent_dies`, a thread that exits it once its parent pid changes. Every
+worker starts with `core._init_worker`, which runs `worker.unwind_when_stopped` (and, while a
+discovery's import session lasts, installs discovery's checked loader):
 
-def _cleanup_worker_pool() -> None:
-    """Kill loky worker pool on process exit."""
-    with contextlib.suppress(Exception):
-        loky.get_reusable_executor(max_workers=1, kill_workers=True)
+- SIGTERM raises `worker.WorkerTerminated` (a `KeyboardInterrupt`) in the running stage, so its
+  cleanup runs, and the worker exits once the stage has unwound, or after
+  `worker.TERMINATION_GRACE_S` (10 s) whatever the stage does. An idle worker exits at once.
+- SIGINT (Ctrl-C at a terminal reaches the coordinator and its workers together) only raises
+  `WorkerTerminated` in the running stage; the worker stays up until the coordinator stops it.
+  loky's manager thread takes a worker that exits unasked for a broken pool and SIGKILLs every
+  worker it still lists, so a worker exiting on SIGINT would cut the others' cleanup off. A
+  SIGINT inherited as ignored (a background job of a non-interactive shell) stays ignored.
+- When the parent pid changes, a thread sends the main thread SIGTERM and exits the worker
+  after the same grace itself, in case the stage replaced the handler or is blocked.
+- `WorkerTerminated` is raised into a stage once; later stop signals do not interrupt its
+  cleanup. A stage that catches it and returns has its result discarded before any output is
+  written.
+- Every exit first SIGKILLs the processes still descended from the worker (psutil). A process
+  that detached from that tree is not reached.
 
-@functools.cache  # Single registration across threads
-def _ensure_cleanup_registered() -> None:
-    atexit.register(_cleanup_worker_pool)
-```
+`WorkerPool.hard_cancel` (an Engine leaving on an exception, such as Ctrl-C) takes the workers
+out of the executor's `_processes` first, for the reason above, then sends each SIGTERM, waits up
+to the same grace, and SIGKILLs any worker left with its descendants (by pid: loky's process
+object has no `kill()`). Once `_processes` is cleared, only `executor.shutdown` wakes loky's
+manager thread, so `hard_cancel` calls it in a `finally`: a coordinator whose manager thread is
+left waiting never exits. Start any new long-lived child process with one of these initializers.
 
 ## Key Insight
 
 The standard library's `ProcessPoolExecutor` is designed for batch workloads where pool creation is amortized over many tasks. For iterative workflows with frequent re-runs, the per-run overhead dominates.
 
-`loky.get_reusable_executor()` inverts this by treating the worker pool as long-lived infrastructure rather than per-invocation ephemera:
+`loky.get_reusable_executor()` inverts this by treating the worker pool as long-lived
+infrastructure rather than per-invocation ephemera:
 
-| Aspect | Standard ProcessPoolExecutor | loky Reusable Executor |
-|--------|------------------------------|------------------------|
-| Pool lifetime | Per `with` block | Process lifetime |
-| Worker spawn | Every run | Once (or on resize/kill) |
+| Aspect | Standard ProcessPoolExecutor | Pivot reusable executor |
+|---|---|---|
+| Pool lifetime | Per `with` block | Engine lifetime |
+| Worker spawn | Every run | Once, after a code restart, or when capacity grows |
 | Import overhead | Every worker spawn | Once per worker lifetime |
-| Idle workers | Terminated | Wait for next task |
+| Idle workers | Terminated | Wait for next task until Engine exit |
 
 The tradeoff is memory: idle workers consume RAM. For pipelines where iteration speed matters more than memory footprint, warm workers provide significant latency reduction.
 

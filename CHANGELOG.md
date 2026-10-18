@@ -2,6 +2,60 @@
 
 <!-- version list -->
 
+## v0.3.8 (2026-10-18)
+
+### Bug Fixes
+
+- **engine**: Let an interrupted pivot exit when a worker outlives the grace
+  ([#486](https://github.com/sjawhar/pivot/pull/486),
+  [`098d8b2`](https://github.com/sjawhar/pivot/commit/098d8b2d6fcd7b012da41a8c43995abfae8cd846))
+
+- **executor**: Keep every worker's cleanup alive on Ctrl-C, kill stage children, bound parent death
+  ([#486](https://github.com/sjawhar/pivot/pull/486),
+  [`098d8b2`](https://github.com/sjawhar/pivot/commit/098d8b2d6fcd7b012da41a8c43995abfae8cd846))
+
+- **executor**: Let a stopped worker's running stage unwind before the worker exits
+  ([#486](https://github.com/sjawhar/pivot/pull/486),
+  [`098d8b2`](https://github.com/sjawhar/pivot/commit/098d8b2d6fcd7b012da41a8c43995abfae8cd846))
+
+
+## v0.3.7 (2026-10-18)
+
+### Bug Fixes
+
+- **engine**: Compare user-code stamps with stamps, never with a clock
+  ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+- **engine**: Drop the unused #482 initializer shim and allow file-clock slack in the staleness
+  guard ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+- **engine**: Exit the output-queue manager when pivot dies
+  ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+- **engine**: Keep the pool usable after a failed manager start; let EMFILE propagate
+  ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+- **engine**: Keep warm workers across runs and restart them when user code changes
+  ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+- **engine**: Preserve warm capacity and child cleanup
+  ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+- **engine**: Replace an output-queue manager that died between runs
+  ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+- **engine**: Replace an output-queue manager whose socket is gone
+  ([#485](https://github.com/sjawhar/pivot/pull/485),
+  [`ac80b6f`](https://github.com/sjawhar/pivot/commit/ac80b6f8fd9e9e2be4f88e8c1dc085c11c76b5eb))
+
+
 ## v0.3.6 (2026-10-17)
 
 ### Bug Fixes

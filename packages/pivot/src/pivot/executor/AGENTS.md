@@ -1,6 +1,17 @@
 # Pivot Executor - Development Guidelines
 
-Workers execute in separate processes via `loky.get_reusable_executor()`, which pivot calls through `core._get_executor()` to create or reuse the pool: while a discovery's import session lasts, the pool's initializer (`discovery.install_user_code_loader`) has each worker import user code through discovery's checked loader, and loky replaces a live pool whose initializer arguments differ.
+Workers execute in separate processes via `loky.get_reusable_executor()`. An Engine keeps its
+workers and manager alive across its runs; each run receives a fresh manager queue for output,
+and a manager that cannot be reached when a run starts is replaced then.
+The loky initializer (`core._init_worker`, which runs `worker.unwind_when_stopped`) and the manager's initializer
+(`core._exit_when_parent_dies`) start the parent-death watcher, so a worker or manager exits
+when its Pivot process dies; a worker first unwinds its running stage so its `finally` blocks
+run, within `worker.TERMINATION_GRACE_S`. Keep `timeout=None` and
+`reuse=False if kill_workers else "auto"` in the shared executor policy.
+While a discovery's import session lasts, the worker initializer (`core._init_worker`) also
+has each worker import user code through discovery's checked loader
+(`discovery.install_user_code_loader`); loky replaces a live pool whose initializer arguments
+differ.
 
 ## WorkerStageInfo Contract
 

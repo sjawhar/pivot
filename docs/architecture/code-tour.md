@@ -74,7 +74,8 @@ This guide maps Pivot's architectural concepts to actual file paths, helping you
 - `packages/pivot/src/pivot/engine/types.py` - Event types and stage states
 - `packages/pivot/src/pivot/engine/sources.py` - Event sources (FilesystemSource, OneShotSource)
 - `packages/pivot/src/pivot/engine/sinks.py` - Event sinks (StaticConsoleSink, LiveConsoleSink, ResultCollectorSink)
-- `packages/pivot/src/pivot/executor/core.py` - Worker pool management
+- `packages/pivot/src/pivot/engine/worker_pool.py` - Engine-lifetime worker pool and queue lifecycle
+- `packages/pivot/src/pivot/executor/core.py` - Reusable loky executor and child-process policy
 - `packages/pivot/src/pivot/executor/worker.py` - Worker process code
 - `packages/pivot/src/pivot/storage/store.py` - `WorkspaceStore`: maps artifact identities to workspace paths (`data/<pipeline>/<stage>.<ext>`)
 
