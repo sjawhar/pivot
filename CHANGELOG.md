@@ -2,6 +2,23 @@
 
 <!-- version list -->
 
+## v0.3.8 (2026-10-18)
+
+### Bug Fixes
+
+- **engine**: Let an interrupted pivot exit when a worker outlives the grace
+  ([#486](https://github.com/sjawhar/pivot/pull/486),
+  [`098d8b2`](https://github.com/sjawhar/pivot/commit/098d8b2d6fcd7b012da41a8c43995abfae8cd846))
+
+- **executor**: Keep every worker's cleanup alive on Ctrl-C, kill stage children, bound parent death
+  ([#486](https://github.com/sjawhar/pivot/pull/486),
+  [`098d8b2`](https://github.com/sjawhar/pivot/commit/098d8b2d6fcd7b012da41a8c43995abfae8cd846))
+
+- **executor**: Let a stopped worker's running stage unwind before the worker exits
+  ([#486](https://github.com/sjawhar/pivot/pull/486),
+  [`098d8b2`](https://github.com/sjawhar/pivot/commit/098d8b2d6fcd7b012da41a8c43995abfae8cd846))
+
+
 ## v0.3.7 (2026-10-18)
 
 ### Bug Fixes
