@@ -1,13 +1,20 @@
 # pyright: reportMissingImports=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
+import errno
 import os
+import signal
 import time
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from pivot.engine import worker_pool
 from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
+
+if TYPE_CHECKING:
+    from multiprocessing.process import BaseProcess
 
 
 def _helper_identity(value: int) -> int:
@@ -86,3 +93,49 @@ def test_worker_pool_output_queue_requires_start() -> None:
 
     with pytest.raises(RuntimeError, match="not started"):
         pool.output_queue()
+
+
+def test_file_stamp_propagates_descriptor_exhaustion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Running out of descriptors must not read as an unreadable (changed) user-code file."""
+
+    def _no_descriptors(*_args: object, **_kwargs: object) -> os.stat_result:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(os, "stat", _no_descriptors)
+    with pytest.raises(OSError, match="Too many open files"):
+        worker_pool._file_stamp(__file__)
+
+
+def test_failed_manager_replacement_does_not_poison_later_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run whose new manager fails to start leaves the pool able to start the next run."""
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1)
+        pool.end_run()
+        manager = pool._manager
+        assert manager is not None
+        process = cast("BaseProcess", manager._process)  # pyright: ignore[reportAttributeAccessIssue] - not in typeshed
+        assert process.pid is not None
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(timeout=10)
+
+        real_create = executor_core.create_manager
+        calls = list[int]()
+
+        def _fail_once() -> object:
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+            return real_create()
+
+        monkeypatch.setattr(executor_core, "create_manager", _fail_once)
+        with pytest.raises(OSError, match="Resource temporarily unavailable"):
+            pool.start(max_workers=1)
+
+        pool.start(max_workers=1)
+        pool.output_queue().put_nowait(None)
+        assert pool.output_queue().get(timeout=10) is None
+    finally:
+        pool.shutdown()

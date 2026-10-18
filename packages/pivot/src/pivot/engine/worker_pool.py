@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import pathlib
@@ -24,11 +25,14 @@ def _file_stamp(path: str) -> _FileStamp | None:
 
     The digest catches an edit that leaves every timestamp unchanged: a filesystem with coarse
     timestamps, or one whose server clock lags, can stamp an edit with the time it already had.
+    Running out of file descriptors is not an unreadable file, so it propagates.
     """
     try:
         stat = os.stat(path)
         digest = xxhash.xxh64_intdigest(pathlib.Path(path).read_bytes())
-    except OSError:
+    except OSError as e:
+        if e.errno in (errno.EMFILE, errno.ENFILE):
+            raise
         return None
     return stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_ctime_ns, digest
 
@@ -93,9 +97,12 @@ class WorkerPool:
         if self._manager is not None:
             try:
                 return self._manager.Queue()
-            except (OSError, EOFError):
-                _logger.warning("Output-queue manager unreachable between runs; starting a new one")
+            except (OSError, EOFError) as e:
+                _logger.warning(
+                    "Output-queue manager unreachable between runs (%r); starting a new one", e
+                )
                 self._manager.shutdown()
+                self._manager = None
         self._manager = executor_core.create_manager()
         return self._manager.Queue()
 
