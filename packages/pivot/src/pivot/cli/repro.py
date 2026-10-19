@@ -12,6 +12,7 @@ import datetime
 import json
 import logging
 import pathlib
+import signal
 import threading
 import time
 import uuid
@@ -41,6 +42,8 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    import types
+
     import networkx as nx
 
     from pivot.cli import console as tui_console
@@ -563,9 +566,22 @@ def _run_serve_mode(
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)
 
-    # Run the async event loop
-    with contextlib.suppress(KeyboardInterrupt):
-        anyio.run(serve_main)
+    # A service manager stops a server with SIGTERM; stop as Ctrl-C does, through whatever SIGINT
+    # handler is live: while the loop runs, asyncio's runner cancels the main task, so the engine
+    # unwinds, removes the socket and shuts down the worker pool's manager, and the exit code is 0.
+    def _stop_as_ctrl_c(_signum: int, frame: types.FrameType | None) -> None:
+        handler = signal.getsignal(signal.SIGINT)
+        if callable(handler):
+            handler(signal.SIGINT, frame)
+        else:
+            raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, _stop_as_ctrl_c)
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            anyio.run(serve_main)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _run_oneshot_mode(

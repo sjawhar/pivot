@@ -8,10 +8,12 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from typing import TYPE_CHECKING
 
@@ -494,6 +496,75 @@ with pipeline:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def test_serve_mode_stopped_by_sigterm_exits_cleanly_and_leaves_nothing_behind(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM, as a service manager stops a server, shuts serve mode down as Ctrl-C does: it
+    exits 0, leaves no task failing during shutdown, and removes its socket and
+    multiprocessing's manager directory."""
+    project = tmp_path / "project"
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text("""\
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def noop_stage() -> None:
+    pass
+
+
+with pipeline:
+    noop_stage()
+""")
+    socket_path = project / ".pivot" / "agent.sock"
+    # Short, because multiprocessing binds its manager's socket under TMPDIR.
+    private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
+    stderr_path = tmp_path / "serve.stderr"
+    env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    try:
+        with stderr_path.open("wb") as stderr_file:
+            proc = subprocess.Popen(
+                [_PIVOT_BIN, "repro", "--watch", "--serve"],
+                cwd=project,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+            )
+        monkeypatch.chdir(project)
+        try:
+            response: dict[str, object] | None = None
+            deadline = time.monotonic() + 30
+            while response is None and proc.poll() is None and time.monotonic() < deadline:
+                try:
+                    response = send_rpc(pathlib.Path(".pivot", "agent.sock"), "status")
+                except (ConnectionRefusedError, FileNotFoundError):
+                    time.sleep(0.1)
+            assert response is not None, f"serve mode did not answer (exit {proc.poll()})"
+            proc.send_signal(signal.SIGTERM)
+            exit_code = proc.wait(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        stderr = stderr_path.read_text(errors="replace")
+        assert exit_code == 0, f"serve mode exited {exit_code} on SIGTERM:\n{stderr}"
+        assert "unhandled exception during asyncio.run() shutdown" not in stderr, (
+            f"a task failed while serve mode shut down on SIGTERM:\n{stderr}"
+        )
+        assert not socket_path.exists(), "serve mode left .pivot/agent.sock behind"
+        left = sorted(str(p.relative_to(private_tmp)) for p in private_tmp.rglob("*"))
+        assert not left, f"serve mode left {left} in TMPDIR"
+    finally:
+        shutil.rmtree(private_tmp)
 
 
 # =============================================================================
