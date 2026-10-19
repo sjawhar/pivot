@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
+import hypothesis
 import pytest
 import yaml
+from botocore import handlers as botocore_handlers
+from hypothesis import strategies as st
 
 from pivot import exceptions, project
 from pivot.remote import config as remote_config
@@ -92,14 +96,18 @@ def test_validate_remote_url_accepts_every_scheme(scheme: remote_config.RemoteSc
 @pytest.mark.parametrize(
     "url",
     [
-        pytest.param("s3://My-Bucket/p", id="s3-uppercase"),
         pytest.param("gs://My-Bucket/p", id="gs-uppercase"),
-        pytest.param("gs://bucket?alt=json/p", id="query"),
-        pytest.param("s3://bucket#frag/p", id="fragment"),
-        pytest.param("gs://-bucket/p", id="leading-hyphen"),
-        pytest.param("s3://bucket./p", id="trailing-dot"),
-        pytest.param("s3://my_bucket/p", id="s3-underscore"),
-        pytest.param("gs://buck%2Fet/p", id="percent"),
+        pytest.param("gs://bucket?alt=json/p", id="gs-query"),
+        pytest.param("s3://bucket?x=1/p", id="s3-query"),
+        pytest.param("s3://bucket#frag/p", id="s3-fragment"),
+        pytest.param("gs://-bucket/p", id="gs-leading-hyphen"),
+        pytest.param("gs://bucket./p", id="gs-trailing-dot"),
+        pytest.param("gs://buck%2Fet/p", id="gs-percent"),
+        pytest.param("s3://buck%2Fet/p", id="s3-percent"),
+        pytest.param("s3://my bucket/p", id="s3-space"),
+        pytest.param("s3://" + "a" * 256 + "/p", id="s3-256-characters"),
+        pytest.param("s3://bucket\n", id="s3-trailing-newline"),
+        pytest.param("gs://bucket\n", id="gs-trailing-newline"),
     ],
 )
 def test_validate_remote_url_rejects_invalid_bucket_names(url: str) -> None:
@@ -114,11 +122,41 @@ def test_validate_remote_url_rejects_invalid_bucket_names(url: str) -> None:
         pytest.param("gs://my_bucket.v2-a/p", "my_bucket.v2-a", id="gs-underscore-dot-hyphen"),
         pytest.param("s3://my.bucket-1/p", "my.bucket-1", id="s3-dot-hyphen"),
         pytest.param("s3://b/p", "b", id="one-character"),
+        pytest.param(
+            "s3://My_Legacy_Bucket/p", "My_Legacy_Bucket", id="s3-legacy-upper-underscore"
+        ),
+        pytest.param("s3://" + "A_b." * 63 + "c-d/p", "A_b." * 63 + "c-d", id="s3-legacy-255"),
+        pytest.param("s3://bucket./p", "bucket.", id="s3-legacy-trailing-dot"),
     ],
 )
 def test_validate_remote_url_accepts_valid_bucket_names(url: str, bucket: str) -> None:
     _, parsed_bucket, _ = remote_config.validate_remote_url(url)
     assert parsed_bucket == bucket
+
+
+_BASE_S3_URL = re.compile(r"^s3://([^/]+)(/.*)?$")  # The S3 URL grammar before gs:// remotes
+
+
+@hypothesis.settings(deadline=None)
+@hypothesis.given(
+    bucket=st.from_regex(botocore_handlers.VALID_BUCKET, fullmatch=True),
+    prefix=st.one_of(
+        st.just(""),
+        st.text(alphabet=st.characters(exclude_characters="\n")).map(lambda p: "/" + p),
+    ),
+)
+def test_s3_url_accepted_before_is_still_accepted_when_botocore_accepts_its_bucket(
+    bucket: str, prefix: str
+) -> None:
+    """Every s3:// URL the old grammar accepted, with a bucket botocore accepts, parses the same."""
+    url = f"s3://{bucket}{prefix}"
+    old = _BASE_S3_URL.match(url)
+    assert old is not None
+    assert remote_config.validate_remote_url(url) == (
+        remote_config.RemoteScheme.S3,
+        old.group(1),
+        (old.group(2) or "").lstrip("/"),
+    )
 
 
 def test_invalid_remote_url_suggests_only_supported_schemes() -> None:

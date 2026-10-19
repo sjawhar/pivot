@@ -29,15 +29,19 @@ _REMOTE_URL_PATTERN = re.compile(
     rf"^({'|'.join(re.escape(scheme) for scheme in RemoteScheme)})://([^/]+)(/.*)?$"
 )
 
-# Each cloud's bucket naming rules: these characters only, starting and ending with a letter or
-# digit. Refusing anything else keeps a bucket from bending the request path (``?``, ``#``, ``%``).
+# The bucket names each backend accepts. Both refuse ``?``, ``#``, ``%``, whitespace and newlines,
+# so a bucket cannot bend the request path. S3 takes what botocore accepts
+# (``botocore.handlers.VALID_BUCKET``), which includes legacy us-east-1 names with uppercase
+# letters and underscores; GCS takes Cloud Storage's naming rules, because gcloud-aio-storage puts
+# the bucket into the request path unquoted. Matched with ``fullmatch``.
 _BUCKET_PATTERNS = {
-    RemoteScheme.S3: re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$"),
-    RemoteScheme.GS: re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"),
+    RemoteScheme.S3: re.compile(r"[A-Za-z0-9._-]{1,255}"),
+    RemoteScheme.GS: re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?"),
 }
-_BUCKET_CHARACTERS = {
-    RemoteScheme.S3: "lowercase letters, digits, '.' and '-'",
-    RemoteScheme.GS: "lowercase letters, digits, '.', '-' and '_'",
+_BUCKET_RULES = {
+    RemoteScheme.S3: "letters, digits, '.', '-' and '_', at most 255 characters",
+    RemoteScheme.GS: "lowercase letters, digits, '.', '-' and '_', "
+    + "starting and ending with a letter or digit",
 }
 
 
@@ -89,11 +93,10 @@ def validate_remote_url(url: str) -> tuple[RemoteScheme, str, str]:
         )
     scheme = RemoteScheme(match.group(1))
     bucket = match.group(2)
-    if not _BUCKET_PATTERNS[scheme].match(bucket):
+    if not _BUCKET_PATTERNS[scheme].fullmatch(bucket):
         raise exceptions.InvalidRemoteURLError(
-            f"Invalid remote URL: {url}. Bucket name '{bucket}' may contain only "
-            + f"{_BUCKET_CHARACTERS[scheme]}, starting and ending with a letter or digit. "
-            + f"Expected format: {REMOTE_URL_FORMATS}"
+            f"Invalid remote URL: {url!r}. Bucket name {bucket!r} may contain only "
+            + f"{_BUCKET_RULES[scheme]}. Expected format: {REMOTE_URL_FORMATS}"
         )
     prefix = (match.group(3) or "").lstrip("/")
     return scheme, bucket, prefix
