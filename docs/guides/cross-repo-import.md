@@ -178,7 +178,7 @@ pivot repro             # Run serving pipeline
 
 ## Limitations
 
-- **Individual files only.** A directory output cannot be imported whole; import one file of it by the name `pivot list` gives it there (`pipeline/stage:path`, or `pipeline/stage:field/path` for a `TypedDict` field). Pivot 0.3.10 and earlier named a file of a stage's return value `pipeline/stage/path`. A `.pvt` that records that name fails `pivot status --check-imports`, `pivot update --dry-run` and `pivot update`, each naming the new name and the `pivot import … --force` command that re-imports it under the new name.
+- **Individual files only.** A directory output cannot be imported whole; import one file of it by the name `pivot list` gives it there (`pipeline/stage:path`, or `pipeline/stage:field/path` for a `TypedDict` field). An import made before Pivot used these names records a file of a stage's return value as `pipeline/stage/path`. Such a `.pvt` fails `pivot status --check-imports`, `pivot update --dry-run` and `pivot update`, each naming the new name and the `pivot import … --force` command that re-imports it under the new name.
 - **Requires source remote access.** The importing project needs network access to the source's S3 bucket.
 - **GitHub and generic git.** GitHub repos use the API for metadata; other git hosts fall back to `git archive`.
 
