@@ -54,7 +54,7 @@ def _run(args: list[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]
 
 @pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
 def test_wheel_installed_in_fresh_venv_runs_init_repro_status_dag(tmp_path: pathlib.Path) -> None:
-    uv = shutil.which("uv")
+    uv = shutil.which("uv")  # searches PATH: CI installs uv, and this test runs only in CI
     assert uv is not None, "CI installs uv before running tests"
     dist = tmp_path / "dist"
     build = _run([uv, "build", "--package", "pivot", "--wheel", "--out-dir", str(dist)], _REPO_ROOT)
