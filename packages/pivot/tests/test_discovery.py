@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import cloudpickle
 import pytest
 
+import pivot_tui
 from pivot import discovery, fingerprint, project
 from tests import conftest
 
@@ -604,12 +605,14 @@ def test_user_code_rule_skips_libraries_the_stdlib_and_pivot(
 ) -> None:
     """The directories the loader takes are the ones fingerprinting treats as user code: not
     the interpreter's prefix (the stdlib, even with the interpreter installed under the root),
-    not site-packages, not pivot's own source, and under the root not the tooling directories
-    discovery skips."""
+    not site-packages, not pivot's own packages (pivot, and pivot_tui, which pivot's workspace
+    installs from its source checkout outside site-packages), and under the root not the
+    tooling directories discovery skips."""
     root = tmp_path / "project"
     env = root / "env"
     monkeypatch.setattr(fingerprint, "_STDLIB_PATHS", (*fingerprint._STDLIB_PATHS, env))
     pivot_dir = pathlib.Path(discovery.__file__).resolve().parent
+    tui_dir = pathlib.Path(pivot_tui.__file__).resolve().parent
 
     holds = {
         str(path): discovery._holds_user_code(str(path), root)
@@ -624,6 +627,8 @@ def test_user_code_rule_skips_libraries_the_stdlib_and_pivot(
             pathlib.Path(cloudpickle.__file__).resolve().parent,
             pivot_dir,
             pivot_dir / "storage",
+            tui_dir,
+            tui_dir / "widgets",
         )
     }
 
@@ -632,6 +637,46 @@ def test_user_code_rule_skips_libraries_the_stdlib_and_pivot(
         str(root / "pkg" / "sub"),
         str(tmp_path / "outside"),
     ]
+
+
+def _helper_pivot_tui_modules() -> dict[str, _stdlib_types.ModuleType]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "pivot_tui" or name.startswith("pivot_tui.")
+    }
+
+
+@pytest.mark.parametrize("dont_write_bytecode", [False, True], ids=["write", "dont-write"])
+def test_pivot_tui_imported_during_a_session_keeps_its_bytecode(
+    sibling_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, dont_write_bytecode: bool
+) -> None:
+    """pivot_tui is pivot's own package, not user code, also when it is installed from a source
+    checkout outside site-packages, as pivot's workspace installs it: imported while a
+    discovery's session lasts, it loads as CPython loads it, and the bytecode cached for it is
+    neither rewritten as checked-hash bytecode nor removed."""
+    tui_dir = pathlib.Path(pivot_tui.__file__).resolve().parent
+    assert "site-packages" not in tui_dir.parts, "pivot_tui is installed from its checkout"
+    cached = list[pathlib.Path]()
+    for source in (tui_dir / "__init__.py", tui_dir / "stats.py"):
+        py_compile.compile(str(source), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+        cached.append(pathlib.Path(importlib.util.cache_from_source(str(source))))
+    monkeypatch.setattr(sys, "dont_write_bytecode", dont_write_bytecode)
+    assert discovery.discover_pipeline(project_root=sibling_project) is not None
+    loaded = _helper_pivot_tui_modules()
+    for name in loaded:
+        del sys.modules[name]
+    try:
+        loader = importlib.import_module("pivot_tui.stats").__loader__
+    finally:
+        for name in _helper_pivot_tui_modules():
+            del sys.modules[name]
+        sys.modules.update(loaded)
+
+    for bytecode in cached:
+        assert bytecode.is_file(), f"{bytecode} is not removed"
+        assert not discovery._is_checked_hash_pyc(str(bytecode)), f"{bytecode} is not rewritten"
+    assert type(loader) is importlib.machinery.SourceFileLoader
 
 
 def test_session_end_gives_user_code_cpythons_loader_back(

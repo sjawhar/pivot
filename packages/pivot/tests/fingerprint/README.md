@@ -151,6 +151,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Third-party function (e.g., `numpy.array`) | 🚫        | `test_fingerprint.py::test_is_user_code_non_user` (pytest.fixture tested) |
 | Third-party package version change         | ❌        | **NO TEST** - versions not tracked                                        |
 | Pivot framework code (`StageParams`, etc.) | 🚫        | `test_fingerprint.py::test_is_user_code_pivot_is_framework`               |
+| `pivot_tui` installed from a source checkout | 🚫      | `test_fingerprint.py::test_pivot_tui_installed_from_a_checkout_is_framework` |
+| A user module or package named `pivot_tui` | ✅        | `test_fingerprint.py::test_pivot_tui_is_pivot_s_package_only_where_the_pivot_tui_distribution_installed_it`, `cli/test_cli_acceptance.py::test_editing_a_project_package_named_pivot_tui_reruns_its_stage` |
 | Builtin function (`len`, `print`)          | 🚫        | `test_fingerprint.py::test_fingerprint_builtin_function_skipped`          |
 
 ---
@@ -415,9 +417,9 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_fingerprint.py::test_invalidate_manifests_for_paths_selective`, `test_fingerprint.py::test_invalidate_manifests_for_paths_recomputes_affected_stage`, `test_fingerprint.py::test_invalidate_manifests_for_paths_cold_start`
 
-17. **Pivot framework excluded from `is_user_code`**: Modules in the `pivot` package are treated as framework code, not user code. This prevents framework internals (e.g., `StageParams`, `stage`, `Pipeline`) from appearing in manifests when using editable installs where pivot isn't in `site-packages`.
+17. **Pivot framework excluded from `is_user_code`**: Files under pivot's own packages (`pivot`, and `pivot_tui` when pivot-tui is installed) are library code to `fingerprint.is_library_path`, wherever they are installed. This keeps framework internals (e.g., `StageParams`, `stage`, `Pipeline`, the TUI) out of manifests under an editable install, where neither package is in `site-packages`. `pivot`'s directory is the one `fingerprint` itself is loaded from. `pivot_tui`'s come from the installed pivot-tui distribution (its site directory, and the directories its `.pth` file adds for an editable install), never from looking the name up on `sys.path`, so a user's own module or package named `pivot_tui` is user code. Any other package installed from a source checkout is user code. A namespace package is library code when one of its directories is library code by the same rule.
 
-    Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`
+    Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`, `test_fingerprint.py::test_pivot_tui_installed_from_a_checkout_is_framework`, `test_fingerprint.py::test_pivot_tui_is_pivot_s_package_only_where_the_pivot_tui_distribution_installed_it`, `test_fingerprint.py::test_is_user_code_namespace_package_in_a_library_directory`
 
 18. **Non-scalar closure values are refused**: Values outside the permitted scalar,
     one-level immutable collection, and compiled-regex set raise `StageDefinitionError`.

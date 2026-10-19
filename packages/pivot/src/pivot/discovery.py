@@ -71,14 +71,15 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
     (``--check-hash-based-pycs never``). Its bytecode is replaced in that last case too: pivot's
     workers do not inherit the flag, and they read it.
 
-    A file whose resolved path is a library's or pivot's, as a library package symlinked into
-    the project root, loads as CPython loads it, and its bytecode is left alone.
+    A file whose resolved path is a library's (``fingerprint.is_library_path``: pivot's own
+    packages included), as a library package symlinked into the project root, loads as CPython
+    loads it, and its bytecode is left alone.
     """
 
     @override
     def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
         source = self.get_filename(fullname)
-        if _is_library_or_pivot(pathlib.Path(source).resolve()):
+        if fingerprint.is_library_path(pathlib.Path(source).resolve()):
             return super().get_code(fullname)
         cached = importlib.util.cache_from_source(source)
         if not _is_checked_hash_pyc(cached):
@@ -106,30 +107,22 @@ _project_finder_for = importlib.machinery.FileFinder.path_hook(
     (importlib.machinery.SourcelessFileLoader, importlib.machinery.BYTECODE_SUFFIXES),
 )
 
-_PIVOT_PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
-
-
-def _is_library_or_pivot(resolved: pathlib.Path) -> bool:
-    """Whether resolved file or directory ``resolved`` is a library's
-    (``fingerprint.is_library_path``) or pivot's own source, neither of which is user code."""
-    return fingerprint.is_library_path(resolved) or resolved.is_relative_to(_PIVOT_PACKAGE_DIR)
-
 
 def _holds_user_code(path: str, root: pathlib.Path) -> bool:
     """Whether import path entry ``path`` is a directory of code fingerprinting treats as the
     user's, imported through ``_ProjectSourceLoader``.
 
     That is every directory but a library's (``fingerprint.is_library_path``: the interpreter's
-    prefix, so the stdlib even when the interpreter lives under the root, and site-packages or
-    dist-packages) and pivot's own source, minus, under the project root, the library and tooling
-    directories discovery skips. A stage's module outside the root, as a package installed from
-    a source checkout, is user code.
+    prefix, so the stdlib even when the interpreter lives under the root, site-packages or
+    dist-packages, and pivot's own packages wherever they are installed), minus, under the
+    project root, the library and tooling directories discovery skips. A stage's module outside
+    the root, as a package installed from a source checkout, is user code.
     """
     try:
         resolved = pathlib.Path(path or ".").resolve()
     except OSError:
         return False
-    if _is_library_or_pivot(resolved):
+    if fingerprint.is_library_path(resolved):
         return False
     if not resolved.is_relative_to(root):
         return True
@@ -220,9 +213,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     preexisting_root_modules = {
         module_name: module
         for module_name, module in sys.modules.items()
-        if module_name != "pivot"
-        and not module_name.startswith("pivot.")
-        and _module_is_under_root(module, root, file_under_root)
+        if _module_is_under_root(module, root, file_under_root)
     }
     root_str = str(root)
     caller_path_entries = [
@@ -316,8 +307,6 @@ def _module_name_matches_root_path(
 def _track_root_modules(session: _ImportSession) -> None:
     """Track all current user imports under root so the next session can remove them."""
     for module_name, module in list(sys.modules.items()):
-        if module_name == "pivot" or module_name.startswith("pivot."):
-            continue
         if not _module_is_under_root(module, session.root, session.file_under_root):
             continue
         if session.preexisting_root_modules.get(module_name) is not module:
