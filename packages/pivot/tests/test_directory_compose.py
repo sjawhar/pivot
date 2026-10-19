@@ -118,7 +118,7 @@ def test_directory_on_anything_but_a_str_keyed_dict_is_refused(
         compose.stage(split)()  # pyright: ignore[reportUnknownArgumentType] - parametrized type
 
     message = str(exc_info.value)
-    assert "Stage 'split': the return value is tagged directory" in message, message
+    assert "Stage 'p/split': the return value is tagged directory" in message, message
     assert "dict[str, T]" in message, message
 
 
@@ -157,7 +157,7 @@ def test_directory_combined_with_another_tag_is_refused(
         compose.stage(split)()
 
     message = str(exc_info.value)
-    assert "Stage 'split': output 'parts' cannot combine directory with" in message, message
+    assert "Stage 'p/split': output 'parts' cannot combine directory with" in message, message
 
 
 def test_typed_dict_directory_field_is_a_directory_artifact(tmp_path: pathlib.Path) -> None:
@@ -339,7 +339,9 @@ def test_indexing_a_non_directory_output_by_a_file_name_keeps_the_no_such_output
 
 def test_one_file_handle_has_no_files_of_its_own(tmp_path: pathlib.Path) -> None:
     with (
-        pytest.raises(KeyError, match="'a.json' is one file of a directory output"),
+        pytest.raises(
+            KeyError, match="'a.json' is one file of a directory output of stage 'p/_helper_parts'"
+        ),
         compose.Pipeline("p", root=tmp_path),
     ):
         built = _helper_parts()
@@ -374,6 +376,6 @@ def test_output_named_like_a_file_of_a_directory_output_is_refused_at_build(
         _helper_read_one(built["parts/a.json"])
 
     message = str(exc_info.value)
-    assert "Stage '_helper_file_named_field'" in message, message
+    assert "Stage 'p/_helper_file_named_field'" in message, message
     assert "output 'parts/a.json'" in message, message
     assert "directory output 'parts'" in message, message

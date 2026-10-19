@@ -821,7 +821,7 @@ class Pipeline:
         self,
         original_func: Callable[..., object],
         stage_wrapper: Callable[..., object],
-        output_specs: list[_OutputSpec],
+        get_output_specs: Callable[[str], list[_OutputSpec]],
         resources: dict[str, int | str],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -842,6 +842,7 @@ class Pipeline:
         reason = lock.stage_name_error(qualified_name)
         if reason is not None:
             raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
+        output_specs = get_output_specs(qualified_name)
 
         sig = inspect.signature(original_func)
         try:
@@ -1310,8 +1311,11 @@ def _refuse_outputs_named_like_directory_files(specs: list[_OutputSpec], stage_n
                 )
 
 
-def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
-    """Extract output specs from a function's return type annotation."""
+def _analyze_return_type(func: Callable[..., object], stage_name: str) -> list[_OutputSpec]:
+    """Extract output specs from a function's return type annotation.
+
+    ``stage_name`` is the qualified name (``pipeline/function``) messages give the stage.
+    """
     hints = get_type_hints(func, include_extras=True)
     return_hint = hints.get("return")
     if return_hint is None:
@@ -1319,7 +1323,7 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
         raise exceptions.StageDefinitionError(msg)
     if return_hint is type(None):
         return []
-    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY, func.__name__)
+    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY, stage_name)
 
 
 # --- @stage decorator ---
@@ -1395,10 +1399,10 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
     normalized_resources = _normalize_stage_resources(resources)
     _cached_specs: list[_OutputSpec] | None = None
 
-    def _get_output_specs() -> list[_OutputSpec]:
+    def _get_output_specs(stage_name: str) -> list[_OutputSpec]:
         nonlocal _cached_specs
         if _cached_specs is None:
-            _cached_specs = _analyze_return_type(func)
+            _cached_specs = _analyze_return_type(func, stage_name)
         return _cached_specs
 
     @functools.wraps(func)
@@ -1407,7 +1411,7 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
         if pipeline is None:
             return func(*args, **kwargs)
         return pipeline._record_stage(  # pyright: ignore[reportPrivateUsage] - the @stage wrapper is Pipeline's recording entry point
-            func, wrapper, _get_output_specs(), normalized_resources, args, kwargs
+            func, wrapper, _get_output_specs, normalized_resources, args, kwargs
         )
 
     return wrapper
@@ -1497,7 +1501,9 @@ class ArtifactHandle:
         directory_spec = self._selected_directory()
         if directory_spec is not None:
             file_type = _directory_file_type(
-                directory_spec.python_type, _output_label(directory_spec.key), self._source.name
+                directory_spec.python_type,
+                _output_label(directory_spec.key),
+                self._qualified_source_name(),
             )
             return ArtifactHandle(
                 self._pipeline, self._source, self._output_key, file_type, member=key
@@ -1507,12 +1513,15 @@ class ArtifactHandle:
             raise KeyError(_no_such_output_message(self._source, key))
         return ArtifactHandle(self._pipeline, self._source, key, spec.python_type)
 
-    def _member_has_no_parts_message(self) -> str:
+    def _qualified_source_name(self) -> str:
         assert isinstance(self._source, _StageNode)
+        return f"{self._pipeline.name}/{self._source.name}"
+
+    def _member_has_no_parts_message(self) -> str:
         return (
             f"{self._member!r} is one file of a directory output of stage "
-            + f"'{self._source.name}'; it has no outputs or files of its own. Pass the handle "
-            + "itself."
+            + f"'{self._qualified_source_name()}'; it has no outputs or files of its own. "
+            + "Pass the handle itself."
         )
 
     def _selected_directory(self) -> _OutputSpec | None:

@@ -695,7 +695,7 @@ pivot import REPO_URL ARTIFACT --out PATH [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--rev REV` | Git ref to import from (branch, tag, commit; default: main) |
-| `--out PATH` | Local path to write the file to (without it, the identity string is used as the path) |
+| `--out PATH` | Local path to write the file to (without it, the artifact's name with `/` for `:`, so `prep/split:test` writes `prep/split/test`) |
 | `--force` | Overwrite existing files |
 | `--no-download` | Create .pvt metadata without downloading |
 

@@ -163,9 +163,9 @@ def test_incremental_output_requires_a_full_loader() -> None:
         return {}
 
     with pytest.raises(
-        exceptions.StageDefinitionError, match="non_loader.*the return value.*MatplotlibFigure"
+        exceptions.StageDefinitionError, match="p/non_loader.*the return value.*MatplotlibFigure"
     ):
-        compose._analyze_return_type(non_loader)
+        compose._analyze_return_type(non_loader, "p/non_loader")
 
 
 @pytest.mark.parametrize(
@@ -184,9 +184,9 @@ def test_incremental_output_requires_a_loader_with_an_empty_value(loader: object
 
     with pytest.raises(
         exceptions.StageDefinitionError,
-        match=rf"unsupported_empty_loader.*the return value.*{type(loader).__name__}",
+        match=rf"p/unsupported_empty_loader.*the return value.*{type(loader).__name__}",
     ):
-        compose._analyze_return_type(unsupported_empty_loader)
+        compose._analyze_return_type(unsupported_empty_loader, "p/unsupported_empty_loader")
 
 
 def test_incremental_output_rejects_metric_combination() -> None:
@@ -197,9 +197,9 @@ def test_incremental_output_rejects_metric_combination() -> None:
         return {}
 
     with pytest.raises(
-        exceptions.StageDefinitionError, match="metric_incremental.*the return value.*metric"
+        exceptions.StageDefinitionError, match="p/metric_incremental.*the return value.*metric"
     ):
-        compose._analyze_return_type(metric_incremental)
+        compose._analyze_return_type(metric_incremental, "p/metric_incremental")
 
 
 class Dep:
@@ -221,6 +221,6 @@ def test_return_type_rejects_unknown_annotated_metadata(metadata: object, class_
 
     with pytest.raises(
         exceptions.StageDefinitionError,
-        match=rf"unknown_metadata.*the return value.*{class_name}",
+        match=rf"p/unknown_metadata.*the return value.*{class_name}",
     ):
-        compose._analyze_return_type(unknown_metadata)
+        compose._analyze_return_type(unknown_metadata, "p/unknown_metadata")

@@ -236,7 +236,7 @@ def test_cli_update_dry_run(
     assert "Update available:" in result.output
     assert "old11111" in result.output
     assert "new33333" in result.output
-    mock_check.assert_called_once_with(pvt_data)
+    mock_check.assert_called_once_with(tmp_path / "data.csv.pvt", pvt_data)
     mock_update.assert_not_called()
 
 

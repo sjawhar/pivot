@@ -522,21 +522,21 @@ async def _check_imports_batch(
     import_pvts: dict[str, track.PvtData],
     project_root: pathlib.Path,
 ) -> list[ImportStatusInfo]:
-    tasks = list[tuple[str, track.PvtData]]()
+    tasks = list[tuple[str, pathlib.Path, track.PvtData]]()
     for data_path, pvt_data in sorted(import_pvts.items()):
         try:
             rel_path = str(pathlib.Path(data_path).relative_to(project_root))
         except ValueError:
             rel_path = data_path
-        tasks.append((rel_path, pvt_data))
+        tasks.append((rel_path, track.get_pvt_path(pathlib.Path(data_path)), pvt_data))
 
     checks = await asyncio.gather(
-        *[import_artifact.check_for_update(pvt_data) for _, pvt_data in tasks],
+        *[import_artifact.check_for_update(pvt_path, pvt_data) for _, pvt_path, pvt_data in tasks],
         return_exceptions=True,
     )
 
     results = list[ImportStatusInfo]()
-    for (rel_path, _), check_or_exc in zip(tasks, checks, strict=True):
+    for (rel_path, _, _), check_or_exc in zip(tasks, checks, strict=True):
         if isinstance(check_or_exc, Exception):
             logger.warning("Failed to check import %s: %s", rel_path, check_or_exc)
             results.append(

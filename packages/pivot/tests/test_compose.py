@@ -312,7 +312,7 @@ def _helper_typing_optional_params_stage(
 
 
 def test_analyze_return_type_single() -> None:
-    specs = _analyze_return_type(_helper_single_output)
+    specs = _analyze_return_type(_helper_single_output, "p/s")
     assert len(specs) == 1
     assert specs[0].python_type is pd.DataFrame
     assert isinstance(specs[0].format, loaders.DataFrameJSONL)
@@ -320,25 +320,25 @@ def test_analyze_return_type_single() -> None:
 
 
 def test_analyze_return_type_annotated_override() -> None:
-    specs = _analyze_return_type(_helper_annotated_csv)
+    specs = _analyze_return_type(_helper_annotated_csv, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].format, loaders.CSV)
 
 
 def test_analyze_return_type_metric_tag() -> None:
-    specs = _analyze_return_type(_helper_metric_tag)
+    specs = _analyze_return_type(_helper_metric_tag, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].tag, _MetricTag)
 
 
 def test_analyze_return_type_plot_tag() -> None:
-    specs = _analyze_return_type(_helper_plot_tag)
+    specs = _analyze_return_type(_helper_plot_tag, "p/s")
     assert len(specs) == 1
     assert specs[0].tag is plot
 
 
 def test_analyze_return_type_typeddict() -> None:
-    specs = _analyze_return_type(_helper_multi_output)
+    specs = _analyze_return_type(_helper_multi_output, "p/s")
     assert len(specs) == 2
     assert specs[0].key == "data"
     assert specs[0].python_type is pd.DataFrame
@@ -350,7 +350,7 @@ def test_analyze_return_type_typeddict() -> None:
 def test_analyze_return_type_single_field_typeddict_with_metric() -> None:
     def _helper() -> _HelperSingleMetricTypedDict: ...
 
-    specs = _analyze_return_type(_helper)
+    specs = _analyze_return_type(_helper, "p/s")
     assert len(specs) == 1
     assert specs[0].key == "accuracy"
     assert isinstance(specs[0].tag, _MetricTag)
@@ -360,7 +360,7 @@ def test_analyze_return_type_rejects_reserved_key() -> None:
     def _helper() -> _HelperReservedKeyTypedDict: ...
 
     with pytest.raises(ValueError, match=f"{SINGLE_OUTPUT_KEY!r} is reserved"):
-        _analyze_return_type(_helper)
+        _analyze_return_type(_helper, "p/s")
 
 
 # --- Extension-based format inference ---
@@ -1388,7 +1388,7 @@ def test_loader_fingerprint_csv_config_change_detected() -> None:
 
 def test_analyze_return_type_metric_with_explicit_csv() -> None:
     """Metric + explicit CSV loader should use CSV, not default YAML."""
-    specs = _analyze_return_type(_helper_metric_with_csv)
+    specs = _analyze_return_type(_helper_metric_with_csv, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].tag, _MetricTag), "Should be tagged as metric"
     assert isinstance(specs[0].format, loaders.CSV), "Should use explicit CSV, not default YAML"
@@ -1396,7 +1396,7 @@ def test_analyze_return_type_metric_with_explicit_csv() -> None:
 
 def test_analyze_return_type_metric_default_yaml() -> None:
     """Metric without explicit loader should default to YAML."""
-    specs = _analyze_return_type(_helper_metric_default_yaml)
+    specs = _analyze_return_type(_helper_metric_default_yaml, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].tag, _MetricTag)
     assert isinstance(specs[0].format, loaders.YAML), "Metric default should be YAML"
@@ -1590,7 +1590,7 @@ def test_engine_methods_raise_during_construction(tmp_path: pathlib.Path) -> Non
 
 def test_typeddict_required_fields_unwrapped() -> None:
     """Required/NotRequired wrappers don't break output parsing."""
-    specs = _analyze_return_type(_helper_required_not_required)
+    specs = _analyze_return_type(_helper_required_not_required, "p/s")
     assert len(specs) == 2
     keys = {s.key for s in specs}
     assert keys == {"data", "config"}

@@ -299,13 +299,19 @@ output, the type and where it sits. Convert it first (`df.to_dict()`,
 
 After a stage returns, Pivot:
 
-1. Checks that a `TypedDict` return value contains every declared key
-2. Writes each value with its writer to the path above, creating directories
+1. Checks that a `TypedDict` return value contains every declared key, and
+   checks every output's value (a directory output's keys, and that a returned
+   `pathlib.Path` lies outside the project) before writing any of them
+2. Replaces each previous output with the new value, written by its writer to
+   the path above, creating directories
 3. Hashes each file and copies it into `.pivot/cache/` (except metrics)
 4. Records the hashes in the stage's lock file under `.pivot/stages/`
 
-Pivot deletes the previous output before the stage runs, so a stage never sees
-its own stale output.
+The previous output stays on disk while the stage runs, so a stage that reads
+its own output path sees the last run's file. Read a previous output through
+`pipeline.previous()` on an `incremental` output instead. If a check in step 1
+fails, the stage fails and the previous outputs, cache and lock stay as they
+were.
 
 ---
 
