@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
@@ -21,11 +22,14 @@ __all__ = [
     "stage_node",
     "build_graph",
     "validate_dependency_sources",
+    "skips_missing_dependencies",
+    "get_runnable_stages",
     "get_consumers",
     "get_producer",
     "get_downstream_stages",
     "get_upstream_stages",
     "get_stage_dag",
+    "get_width",
     "update_stage",
     "get_artifact_consumers",
     "get_execution_order",
@@ -287,6 +291,38 @@ def get_downstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:
     return downstream
 
 
+def skips_missing_dependencies(*, all_pipelines: bool, on_error: pivot_types.OnError) -> bool:
+    """Whether a run leaves out stages with a missing dependency instead of stopping: one
+    across all pipelines that keeps going past failures."""
+    return all_pipelines and on_error == pivot_types.OnError.KEEP_GOING
+
+
+def get_runnable_stages(
+    stages: dict[str, RegistryStageInfo],
+    store: Store,
+    *,
+    all_pipelines: bool,
+    on_error: pivot_types.OnError,
+) -> tuple[dict[str, RegistryStageInfo] | None, list[DependencyNotFoundError]]:
+    """Return the stages a run executes, with the missing dependencies found.
+
+    A run across all pipelines that keeps going past failures leaves out each stage with a
+    missing dependency and every stage downstream of it. Any other run stops at a missing
+    dependency, and the stages are None.
+    """
+    errors = validate_dependency_sources(stages, store=store)
+    if not errors:
+        return stages, errors
+    if not skips_missing_dependencies(all_pipelines=all_pipelines, on_error=on_error):
+        return None, errors
+    graph = build_graph(stages)
+    broken = set[str]()
+    for error in errors:
+        broken.add(error.stage)
+        broken.update(get_downstream_stages(graph, error.stage))
+    return {name: info for name, info in stages.items() if name not in broken}, errors
+
+
 def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInfo) -> None:
     """Incrementally update graph when a stage's definition changes.
 
@@ -389,6 +425,179 @@ def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
                     stage_dag.add_edge(consumer_name, stage_name)
 
     return stage_dag
+
+
+def get_width(stage_dag: nx.DiGraph[str], stages: list[str], *, limit: int) -> int:
+    """Return the most of ``stages`` that can run at once, or ``limit`` if that is fewer.
+
+    The scheduler starts a stage once the stages of the run it consumes from have finished,
+    so stages can run together exactly when no chain of run stages connects any two of them.
+    The largest such set is the stage count minus a maximum matching that pairs each stage
+    with one stage it transitively depends on (Dilworth's theorem, by Konig's).
+
+    The widest topological level is such a set, so once it holds ``limit`` stages the matching
+    is skipped. Below ``limit`` the result is exact, unless the search for the matching runs
+    out of steps; then it is an upper bound on the width, never fewer than the stages that can
+    run at once. The stages are numbered from their names and dependencies alone, so the result
+    does not depend on the order of ``stages``.
+
+    Args:
+        stage_dag: Stage-only DAG (from get_stage_dag)
+        stages: The stages of the run; dependencies through stages outside it do not count
+        limit: The most workers the pool may have
+    """
+    names = sorted(set(stages))
+    count = len(names)
+    index = dict(zip(names, range(count), strict=True))
+    upstream = [[index[up] for up in stage_dag.successors(name) if up in index] for name in names]
+    downstream = [list[int]() for _ in names]
+    for i, producers in enumerate(upstream):
+        for j in producers:
+            downstream[j].append(i)
+    # Producers first, in an order fixed by the names and dependencies alone; a stage's level is
+    # one more than its deepest dependency's.
+    waiting = [len(producers) for producers in upstream]
+    topological = [i for i, pending in enumerate(waiting) if pending == 0]
+    level = [0] * count
+    for i in topological:
+        deeper = level[i] + 1
+        for k in downstream[i]:
+            if level[k] < deeper:
+                level[k] = deeper
+            waiting[k] -= 1
+            if not waiting[k]:
+                topological.append(k)
+    # Stages on one level, counted from the producers or from the last consumers, never reach
+    # each other, so the widest level is a lower bound on the width.
+    remaining = [0] * count
+    for i in reversed(topological):
+        deeper = remaining[i] + 1
+        for j in upstream[i]:
+            if remaining[j] < deeper:
+                remaining[j] = deeper
+    widest = max(
+        max(collections.Counter(level).values(), default=0),
+        max(collections.Counter(remaining).values(), default=0),
+    )
+    if widest >= limit:
+        return limit
+
+    # Renumber consumers first, so stage i depends only on stages numbered above i. Each
+    # stage lists its dependencies deepest first, the ones a chain of stages most likely runs
+    # through, ties by number.
+    consumers_first = topological[::-1]
+    number = [0] * count
+    for position, i in enumerate(consumers_first):
+        number[i] = position
+    direct = [list[int]() for _ in names]
+    # A stable sort keeps equal levels in consumers-first order, that is, by number.
+    for j in sorted(consumers_first, key=level.__getitem__, reverse=True):
+        numbered = number[j]
+        for i in downstream[j]:
+            direct[number[i]].append(numbered)
+    order = range(count - 1, -1, -1)  # producers first
+
+    # The stages a matching leaves unmatched are an upper bound on the width.
+    owner = [-1] * count  # the stage each dependency is matched to
+    unmatched = list[int]()
+    for i in reversed(order):
+        for j in direct[i]:
+            if owner[j] == -1:
+                owner[j] = i
+                break
+        else:
+            unmatched.append(i)
+    if len(unmatched) == widest:
+        return widest
+    matched_bits = bytearray((count + 7) // 8)
+    for j, stage in enumerate(owner):
+        if stage != -1:
+            matched_bits[j >> 3] |= 1 << (j & 7)
+    taken = int.from_bytes(matched_bits, "little")  # bitset of matched dependencies
+
+    # Bitset of the run stages each stage transitively depends on, built from each
+    # dependency's own set with the dependency added.
+    reach = [0] * len(names)
+    closed = [0] * len(names)
+    for i in order:
+        bits = 0
+        for j in direct[i]:
+            bits |= closed[j]
+        reach[i] = bits
+        closed[i] = bits | (1 << i)
+    still_unmatched = list[int]()
+    for i in unmatched:
+        free_bits = reach[i] & ~taken
+        if free_bits:
+            free = (free_bits & -free_bits).bit_length() - 1
+            owner[free] = i
+            taken |= 1 << free
+        else:
+            still_unmatched.append(i)
+
+    # Augment in rounds. Within a round no search explores a dependency an earlier search
+    # explored. That can hide an augmenting path once a search succeeds, so rounds repeat until
+    # one matches no stage: the matching did not change during that round, so no stage it left
+    # unmatched has an augmenting path, and the matching is maximum. The searches share a
+    # budget of steps; once it runs out, the stages still unmatched bound the width from above,
+    # so the pool may be larger than the width but never smaller.
+    budget = _AUGMENT_STEPS
+    unmatched_count = len(still_unmatched)
+    while unmatched_count > widest:
+        seen = 0
+        left = list[int]()
+        for start in still_unmatched:
+            matched, seen, budget = _augment(start, reach, owner, seen, budget)
+            if matched:
+                unmatched_count -= 1
+                if unmatched_count == widest:
+                    return widest
+            elif budget == 0:
+                return min(unmatched_count, limit)
+            else:
+                left.append(start)
+        if len(left) == len(still_unmatched):
+            break
+        still_unmatched = left
+    return min(unmatched_count, limit)
+
+
+# Steps of augmenting-path search `get_width` takes before it settles for an upper bound. A
+# count, not a clock, so one graph and limit always give one size.
+_AUGMENT_STEPS = 10_000
+
+
+def _augment(
+    start: int, reach: list[int], owner: list[int], seen: int, budget: int
+) -> tuple[bool, int, int]:
+    """Match ``start`` along an augmenting path, if one exists, without recursion.
+
+    ``seen`` holds dependencies known to lead to no augmenting path. Returns whether ``start``
+    was matched, ``seen`` with the dependencies this search explored, and the steps left of
+    ``budget``; a search that runs out of steps returns unmatched with none left.
+    """
+    path = [start]  # stages on the path; path[k + 1] owns dependencies[k]
+    dependencies = list[int]()
+    while path:
+        if budget == 0:
+            return False, seen, 0
+        budget -= 1
+        candidates = reach[path[-1]] & ~seen
+        if not candidates:
+            path.pop()
+            if dependencies:
+                dependencies.pop()
+            continue
+        lowest = candidates & -candidates
+        seen |= lowest
+        dependency = lowest.bit_length() - 1
+        dependencies.append(dependency)
+        if owner[dependency] == -1:
+            for stage, matched in zip(path, dependencies, strict=True):
+                owner[matched] = stage
+            return True, seen, budget
+        path.append(owner[dependency])
+    return False, seen, budget
 
 
 def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:

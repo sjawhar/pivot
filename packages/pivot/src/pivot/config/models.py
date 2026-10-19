@@ -158,7 +158,7 @@ class PivotConfig(pydantic.BaseModel):
 CONFIG_KEY_DESCRIPTIONS: dict[str, str] = {
     "cache.dir": "Local cache directory",
     "cache.checkout_mode": "Checkout strategy (hardlink,symlink,copy)",
-    "core.max_workers": "Parallel execution workers",
+    "core.max_workers": "Most parallel execution workers",
     "core.state_dir": "State directory path",
     "core.run_history_retention": "Keep last N runs",
     "core.unsafe_fingerprinting": "Allow mutable closure captures (unsafe)",

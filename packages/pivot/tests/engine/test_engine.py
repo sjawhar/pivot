@@ -1425,11 +1425,27 @@ async def _helper_reload_failed() -> str:
     return "Failed to load pipeline.py"
 
 
+def _helper_bipartite_chain(names: list[str]) -> nx.DiGraph[str]:
+    """Bipartite graph in which each stage consumes the output of the stage before it."""
+    g: nx.DiGraph[str] = nx.DiGraph()
+    for previous, name in zip([None, *names], names, strict=False):
+        stage_node = engine_graph.stage_node(name)
+        output = engine_graph.artifact_node(types.ArtifactIdentity(name, None))
+        g.add_node(stage_node, type=NodeType.STAGE)
+        g.add_node(output, type=NodeType.ARTIFACT)
+        g.add_edge(stage_node, output)
+        if previous is not None:
+            g.add_edge(
+                engine_graph.artifact_node(types.ArtifactIdentity(previous, None)), stage_node
+            )
+    return g
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("parallel", "max_workers", "expected_restart_calls"),
     [
-        pytest.param(True, 4, [(3, 4)], id="parallel-restarts-workers"),
+        pytest.param(True, 4, [(1, 1)], id="parallel-restarts-workers"),
         pytest.param(False, None, [], id="non-parallel-skips-restart"),
     ],
 )
@@ -1439,12 +1455,13 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
     max_workers: int | None,
     expected_restart_calls: list[tuple[int, int | None]],
 ) -> None:
-    """_handle_code_or_config_changed restarts workers only in parallel mode."""
+    """A reload restarts workers only in parallel mode, one for each stage of the reloaded
+    pipeline that can run at once, and no fewer than the pool held: a chain of three needs one."""
     restart_calls = list[tuple[int, int | None]]()
 
-    def mock_restart_workers(stage_count: int, max_workers: int | None = None) -> int:
-        restart_calls.append((stage_count, max_workers))
-        return stage_count
+    def mock_restart_workers(width: int, max_workers: int | None = None) -> int:
+        restart_calls.append((width, max_workers))
+        return width
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 
@@ -1471,7 +1488,7 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
         engine._execute_affected_stages = mock_execute_affected  # pyright: ignore[reportAttributeAccessIssue] - test seam
 
         def mock_build_graph(*_args: object) -> nx.DiGraph[str]:
-            return nx.DiGraph()
+            return _helper_bipartite_chain(["a", "b", "c"])
 
         monkeypatch.setattr("pivot.engine.engine.engine_graph.build_graph", mock_build_graph)
         await engine._handle_code_or_config_changed(
@@ -1548,7 +1565,7 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
 ) -> None:
     """_handle_code_or_config_changed continues if restart_workers raises."""
 
-    def mock_restart_workers(stage_count: int, max_workers: int | None = None) -> int:
+    def mock_restart_workers(width: int, max_workers: int | None = None) -> int:
         raise RuntimeError("loky pool broken")
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)

@@ -24,6 +24,7 @@ import pytest
 
 from pivot import discovery, project
 from pivot.engine import engine as engine_mod
+from pivot.engine import graph as engine_graph
 from pivot.engine import sources
 from pivot.engine.types import EngineState, OutputEvent, RunRequested
 from pivot.engine.worker_pool import WorkerPool
@@ -695,3 +696,438 @@ with Pipeline("warm") as pipeline:
                 tg.cancel_scope.cancel()
     finally:
         sys.modules.pop(module_name, None)
+
+
+_CHAIN_PIPELINE = """\
+import os
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def first() -> str:
+    return str(os.getpid())
+
+
+@stage
+def step(previous: str) -> str:
+    return str(os.getpid())
+
+
+with Pipeline("chain") as pipeline:
+    pid = first()
+    for _ in range(11):
+        pid = step(pid)
+"""
+
+# Levels {lone, source} and {left, right}: the widest level is 2, but lone, left and right can
+# all run at once.
+_WIDTH_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def lone() -> str:
+    return "lone"
+
+
+@stage
+def source() -> str:
+    return "source"
+
+
+@stage
+def left(value: str) -> str:
+    return value + " left"
+
+
+@stage
+def right(value: str) -> str:
+    return value + " right"
+
+
+with Pipeline("width") as pipeline:
+    lone()
+    shared = source()
+    left(shared)
+    right(shared)
+"""
+
+# Imported by every Python process the command starts: each loky worker records when it started,
+# and the pivot process records when it starts the Textual TUI.
+_WORKER_LOG_HOOK = """\
+import os
+import sys
+import time
+
+
+def _log(event):
+    with open(os.environ["PIVOT_TEST_WORKER_LOG"], "a") as log:
+        log.write(f"{event} {time.time()}\\n")
+
+
+if sys.orig_argv[1:3] == ["-m", "loky.backend.popen_loky_posix"]:
+    _log("worker")
+elif len(sys.orig_argv) > 1 and os.path.basename(sys.orig_argv[1]) == "pivot":
+    from pivot.cli import _run_common
+
+    _run_tui_with_engine = _run_common.run_tui_with_engine
+
+    def _logged_run_tui_with_engine(*args, **kwargs):
+        _log("tui")
+        return _run_tui_with_engine(*args, **kwargs)
+
+    _run_common.run_tui_with_engine = _logged_run_tui_with_engine
+"""
+
+
+def _helper_logging_env(tmp_path: pathlib.Path) -> tuple[dict[str, str], pathlib.Path]:
+    """Environment that runs the worker-log hook in every process the command starts."""
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+    env["TERM"] = "xterm-256color"
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_WORKER_LOG_HOOK)
+    worker_log = tmp_path / "workers.log"
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(hook), env.get("PYTHONPATH")]))
+    env["PIVOT_TEST_WORKER_LOG"] = str(worker_log)
+    return env, worker_log
+
+
+def _helper_started_workers(worker_log: pathlib.Path, command: list[str]) -> int:
+    """Count the workers the command started, requiring each to start before any TUI did."""
+    events = [line.split() for line in worker_log.read_text().splitlines()]
+    workers = [float(at) for event, at in events if event == "worker"]
+    tuis = [float(at) for event, at in events if event == "tui"]
+    late = [at for at in workers if tuis and at > tuis[0]]
+    assert not late, f"{' '.join(command)}: {len(late)} of {len(workers)} workers started late"
+    return len(workers)
+
+
+def _helper_pivot(root: pathlib.Path, env: dict[str, str], *args: str) -> str:
+    """Run the installed ``pivot`` command in ``root``, require it to succeed, return its output."""
+    proc = subprocess.run(
+        [str(pathlib.Path(sys.executable).parent / "pivot"), *args],
+        cwd=root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout + proc.stderr
+
+
+def _helper_configure_workers(root: pathlib.Path, max_workers: int) -> None:
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  max_workers: {max_workers}\n")
+
+
+def test_repro_runs_a_chain_of_stages_on_one_worker(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chain runs one stage at a time, so `pivot repro` runs all twelve stages in one warm
+    worker even when the configuration allows twelve."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _CHAIN_PIPELINE)
+    _helper_configure_workers(root, 12)
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    _helper_pivot(root, env, "repro")
+
+    stages = pipeline.list_stages()
+    assert len(stages) == 12
+    pids = {_helper_output_path(root, pipeline, stage).read_text() for stage in stages}
+    assert len(pids) == 1, f"the chain ran on {len(pids)} workers: {sorted(pids)}"
+
+
+@pytest.mark.parametrize(
+    ("max_workers", "command", "workers"),
+    [
+        pytest.param(8, ["repro"], 3, id="repro"),
+        pytest.param(8, ["repro", "--tui"], 3, id="repro-tui-prewarm"),
+        pytest.param(2, ["repro"], 2, id="repro-configured-cap"),
+        # `pivot run` orders left and right after source, so two of the three run at once.
+        pytest.param(8, ["run", "--force", "source", "left", "right"], 2, id="run"),
+        pytest.param(
+            8, ["run", "--tui", "--force", "source", "left", "right"], 2, id="run-tui-prewarm"
+        ),
+    ],
+)
+def test_command_starts_as_many_workers_as_stages_can_run_at_once(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_workers: int,
+    command: list[str],
+    workers: int,
+) -> None:
+    """A command starts one worker per stage that can run at once, up to the configured worker
+    count; a TUI's pre-warm starts the same workers its engine then uses."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _WIDTH_PIPELINE)
+    _helper_configure_workers(root, max_workers)
+    env, worker_log = _helper_logging_env(tmp_path)
+
+    _helper_pivot(root, env, *command)
+
+    started = _helper_started_workers(worker_log, command)
+    assert started == workers, f"{' '.join(command)} started {started} workers"
+
+
+# `lone` reads a tracked input, so the run can restore it from the cache.
+_TRACKED_WIDTH_PIPELINE = _WIDTH_PIPELINE.replace(
+    'def lone() -> str:\n    return "lone"', "def lone(raw: str) -> str:\n    return raw"
+).replace("    lone()\n", '    lone(pipeline.input("x.txt", t=str))\n')
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["repro", "--tui", "--checkout-missing"], id="repro"),
+        pytest.param(
+            ["run", "--tui", "--checkout-missing", "--force", "lone", "source", "left", "right"],
+            id="run",
+        ),
+    ],
+)
+def test_tui_starts_its_workers_before_the_tui_when_a_tracked_input_is_restored(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """The pre-warm restores a missing tracked input before it sizes the pool, as the engine
+    does, so no worker starts after Textual does."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
+    _helper_configure_workers(root, 8)
+    env, worker_log = _helper_logging_env(tmp_path)
+    tracked = root / "data" / "raw" / "x.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("tracked")
+    _helper_pivot(root, env, "track", "data/raw/x.txt")
+    tracked.unlink()
+    worker_log.unlink(missing_ok=True)
+
+    _helper_pivot(root, env, *command)
+
+    assert (root / "data" / "width" / "lone.txt").read_text() == "tracked"
+    started = _helper_started_workers(worker_log, command)
+    assert started == 3, f"{' '.join(command)} started {started} workers"
+
+
+def test_tui_checkout_missing_warns_once_about_a_changed_tracked_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-warm only restores missing tracked files; checking the others stays the
+    engine's, so a tracked file edited since `pivot track` is reported once."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
+    env, _ = _helper_logging_env(tmp_path)
+    tracked = root / "data" / "raw" / "x.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("tracked")
+    _helper_pivot(root, env, "track", "data/raw/x.txt")
+    tracked.write_text("edited")
+
+    output = _helper_pivot(root, env, "repro", "--tui", "--checkout-missing")
+
+    assert output.count("has changed since tracking") == 1, output
+
+
+@pytest.mark.anyio
+async def test_watch_reload_checks_dependencies_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload of a single pipeline leaves checking for missing dependencies to the run it
+    starts, which checks them once."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _THREE_PID_PIPELINE)
+    recorder = _Recorder()
+    checks = list[int]()
+    validate = engine_graph.validate_dependency_sources
+
+    def counting_validate(*args: Any, **kwargs: Any) -> Any:
+        checks.append(1)
+        return validate(*args, **kwargs)
+
+    monkeypatch.setattr(engine_graph, "validate_dependency_sources", counting_validate)
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[root], debounce_ms=50))
+        eng.add_source(sources.OneShotSource(stages=None, force=True, reason="test", max_workers=8))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_engine_state(EngineState.IDLE))
+            checks.clear()
+            (root / "pipeline.py").write_text(_CHAIN_OF_THREE_PIPELINE)
+            reload = await recorder.wait_for(
+                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                start=first_idle,
+            )
+            await recorder.wait_for(_helper_engine_state(EngineState.IDLE), start=reload)
+            tg.cancel_scope.cancel()
+
+    assert len(checks) == 1, f"a reload and its run checked dependencies {len(checks)} times"
+
+
+_BROKEN_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def first(raw: str) -> str:
+    return raw
+
+
+@stage
+def second(raw: str) -> str:
+    return raw
+
+
+with Pipeline("broken") as pipeline:
+    missing = pipeline.input("missing.txt", t=str)
+    first(missing)
+    second(missing)
+"""
+
+
+def test_repro_tui_prewarm_leaves_out_the_stages_a_keep_going_run_skips(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Across all pipelines with keep-going, the engine leaves out stages with a missing
+    dependency; the TUI's pre-warm leaves them out too, so it starts only the workers the
+    engine then uses."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
+        (root / name).mkdir(parents=True)
+        (root / name / "pipeline.py").write_text(source)
+    (root / ".pivot").mkdir()
+    (root / ".git").mkdir()
+    _helper_configure_workers(root, 8)
+    env, worker_log = _helper_logging_env(tmp_path)
+    command = ["repro", "--all", "--keep-going", "--tui"]
+
+    _helper_pivot(root, env, *command)
+
+    assert (root / "data" / "width" / "left.txt").read_text() == "source left"
+    started = _helper_started_workers(worker_log, command)
+    assert started == 3, f"{' '.join(command)} started {started} workers"
+
+
+_CHAIN_OF_THREE_PIPELINE = """\
+import os
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def a() -> str:
+    return str(os.getpid())
+
+
+@stage
+def b(previous: str) -> str:
+    return str(os.getpid())
+
+
+@stage
+def c(previous: str) -> str:
+    return str(os.getpid())
+
+
+with Pipeline("warm") as pipeline:
+    c(b(a()))
+"""
+
+
+def _helper_live_worker_pids() -> set[int]:
+    """The worker processes of Pivot's reusable loky executor."""
+    reusable_executor = importlib.import_module("loky.reusable_executor")
+    return set(cast("Any", reusable_executor)._executor._processes)
+
+
+@pytest.mark.anyio
+async def test_watch_reload_restarts_the_workers_the_next_run_uses(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload that narrows the pipeline restarts as many workers as the warm pool holds, so
+    the run after it starts no other worker."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _THREE_PID_PIPELINE)
+    recorder = _Recorder()
+    restarted = list[set[int]]()
+    after_run = set[int]()
+    restart_workers = executor_core.restart_workers
+
+    def recording_restart(width: int, max_workers: int | None = None) -> int:
+        workers = restart_workers(width, max_workers)
+        restarted.append(_helper_live_worker_pids())
+        return workers
+
+    monkeypatch.setattr(executor_core, "restart_workers", recording_restart)
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[root], debounce_ms=50))
+        eng.add_source(sources.OneShotSource(stages=None, force=True, reason="test", max_workers=8))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_engine_state(EngineState.IDLE))
+            (root / "pipeline.py").write_text(_CHAIN_OF_THREE_PIPELINE)
+            reload = await recorder.wait_for(
+                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                start=first_idle,
+            )
+            await recorder.wait_for(_helper_engine_state(EngineState.IDLE), start=reload)
+            after_run = _helper_live_worker_pids()
+            tg.cancel_scope.cancel()
+
+    assert [len(pids) for pids in restarted] == [3], "the reload restarts the warm pool's size"
+    assert after_run == restarted[0], "the run after the reload started other workers"
+
+
+@pytest.mark.anyio
+async def test_watch_reload_keeps_going_past_a_pipeline_with_a_missing_input(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Across all pipelines with keep-going, a reload re-runs the stages the first run could
+    run and leaves out the ones a missing input breaks."""
+    root = tmp_path.resolve() / "p"
+    for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
+        (root / name).mkdir(parents=True)
+        (root / name / "pipeline.py").write_text(source)
+    (root / ".pivot").mkdir()
+    (root / ".git").mkdir()
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    pipeline = discovery.discover_pipeline(root, all_pipelines=True)
+    assert pipeline is not None, "the project should define pipelines"
+    left = root / "data" / "width" / "left.txt"
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline, all_pipelines=True) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[root], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(
+                stages=None, force=True, reason="test", max_workers=8, on_error=OnError.KEEP_GOING
+            )
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_engine_state(EngineState.IDLE))
+            assert left.read_text() == "source left"
+            (root / "width" / "pipeline.py").write_text(
+                _WIDTH_PIPELINE.replace('" left"', '" LEFT"')
+            )
+            reload = await recorder.wait_for(
+                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                start=first_idle,
+            )
+            await recorder.wait_for(_helper_engine_state(EngineState.IDLE), start=reload)
+            assert left.read_text() == "source LEFT"
+            tg.cancel_scope.cancel()

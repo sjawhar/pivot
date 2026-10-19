@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from pivot import cli
 from pivot.storage import lock
 from tests.conftest import isolated_pivot_dir
@@ -142,3 +144,70 @@ def test_all_flag_with_single_pipeline(runner: CliRunner, tmp_path: pathlib.Path
 
         assert result.exit_code == 0, f"status --all failed: {result.output}"
         assert "alpha/stage_a" in result.output
+
+
+def _helper_broken_pipeline_code(stages: int) -> str:
+    """Return a pipeline.py whose ``stages`` stages each read an input that does not exist."""
+    definitions = "".join(
+        f"\n\n@stage\ndef read_{i}(raw: str) -> str:\n    return raw\n" for i in range(stages)
+    )
+    calls = "".join(f"    read_{i}(missing)\n" for i in range(stages))
+    return (
+        f"from pivot.compose import Pipeline, stage\n{definitions}\n\n"
+        + 'with Pipeline("broken") as pipeline:\n'
+        + '    missing = pipeline.input("missing.txt", t=str)\n'
+        + calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("broken_stages", "healthy", "keep_going", "skipped", "error"),
+    [
+        pytest.param(
+            1, False, True, 1, "1 missing dependency error(s):", id="keep-going-none-left"
+        ),
+        pytest.param(
+            2, False, True, 2, "2 missing dependency error(s):", id="keep-going-none-left-2"
+        ),
+        pytest.param(2, True, True, 2, None, id="keep-going-partial"),
+        pytest.param(
+            1,
+            False,
+            False,
+            0,
+            "Error: Stage 'broken/read_0' depends on input 'missing.txt'",
+            id="fail-fast",
+        ),
+        pytest.param(2, True, False, 0, "2 missing dependency error(s):", id="fail-fast-2"),
+    ],
+)
+def test_repro_all_reports_each_missing_dependency(
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    broken_stages: int,
+    healthy: bool,
+    keep_going: bool,
+    skipped: int,
+    error: str | None,
+) -> None:
+    """Keep-going across all pipelines warns about every stage it skips for a missing input and
+    reports every missing input when no stage is left; fail-fast reports them without skipping."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / "broken").mkdir()
+        (cwd / "broken" / "pipeline.py").write_text(_helper_broken_pipeline_code(broken_stages))
+        if healthy:
+            (cwd / "alpha").mkdir()
+            (cwd / "alpha" / "pipeline.py").write_text(_helper_pipeline_code("alpha", "stage_a"))
+
+        result = runner.invoke(
+            cli.cli, ["repro", "--all", *(["--keep-going"] if keep_going else [])]
+        )
+
+        assert result.output.count("Skipping: Stage 'broken/read_") == skipped, result.output
+        if error is None:
+            assert result.exit_code == 0, result.output
+            assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
+        else:
+            assert result.exit_code == 1, result.output
+            assert error in result.output, result.output
+            assert ("missing dependency error(s)" in result.output) == ("error(s)" in error)

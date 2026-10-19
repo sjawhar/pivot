@@ -98,6 +98,14 @@ class WorkerPool:
         self._accepting = True
         self._in_run = True
 
+    def restart(self, *, max_workers: int) -> int:
+        """Replace every worker with a fresh one, as many as the next ``start`` asks for.
+
+        Returns the worker count, which never shrinks below the pool's earlier size.
+        """
+        self._max_workers = max(self._max_workers, max_workers)
+        return executor_core.restart_workers(self._max_workers, self._max_workers)
+
     def _new_output_queue(self) -> object:
         """Return a fresh queue from the engine-lifetime manager, replacing it if unreachable."""
         if self._manager is not None:

@@ -118,7 +118,11 @@ Note: JsonlSink translates internal engine events to the existing `pivot repro -
 
 ### Code Change Handling
 
-When Python files change, the worker pool is restarted via `executor_core.restart_workers()`:
+When Python files change, the worker pool is restarted via `WorkerPool.restart()`, at the larger
+of the reloaded pipeline's width and the pool's earlier size (see
+[Pool Size](execution.md#pool-size) and [Warm Workers](execution.md#warm-workers)). Across all
+pipelines with `--keep-going`, the reload re-runs only the stages a missing dependency leaves
+runnable:
 
 **Why restart instead of hot reload?**
 

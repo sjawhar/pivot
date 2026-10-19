@@ -96,10 +96,19 @@ def _run_with_tui(
 
     from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 
-    # Pre-warm loky executor before starting Textual TUI.
+    # Pre-warm loky executor before starting Textual TUI, as many workers as the engine will use.
     # Textual manipulates terminal file descriptors which breaks loky's
     # resource tracker if spawned after Textual starts.
-    prepare_workers(len(stages_list))
+    # `run`'s engine is not told about --all, so it skips no stage for a missing dependency.
+    prepare_workers(
+        _run_common.tui_prewarm_width(
+            stages_list,
+            single_stage=True,
+            all_pipelines=False,
+            on_error=on_error,
+            checkout_missing=checkout_missing,
+        )
+    )
 
     cancel_event = threading.Event()
     pipeline = cli_decorators.get_pipeline_from_context()

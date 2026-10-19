@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
+import random
 from typing import TYPE_CHECKING
 
+import networkx as nx
 import pytest
 
 from pivot import exceptions, loaders
 from pivot.engine import graph, types
 from pivot.registry import RegistryStageInfo
 from pivot.storage import store as store_mod
-from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, OnError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -445,6 +447,44 @@ def test_validate_dependency_sources_reports_missing_pipeline_input_path(
         "Stage 'demo/combine' depends on input 'extra.csv' "
         "(path missing/extra.csv), which does not exist"
     )
+
+
+@pytest.mark.parametrize(
+    ("all_pipelines", "on_error", "runnable"),
+    [
+        pytest.param(True, OnError.KEEP_GOING, {"ok/a"}, id="all-keep-going"),
+        pytest.param(True, OnError.FAIL, None, id="all-fail"),
+        pytest.param(False, OnError.KEEP_GOING, None, id="one-keep-going"),
+    ],
+)
+def test_get_runnable_stages_leaves_out_stages_downstream_of_a_missing_dependency(
+    set_project_root: Path,
+    all_pipelines: bool,
+    on_error: OnError,
+    runnable: set[str] | None,
+) -> None:
+    """Only a keep-going run across all pipelines runs the stages a missing dependency
+    leaves runnable, leaving out the broken stage and every stage downstream of it; any other
+    run stops."""
+    stages = {
+        "ok/a": _create_stage("ok/a", [], [ArtifactIdentity("ok/a", None)]),
+        "bad/b": _create_stage(
+            "bad/b", [ArtifactIdentity("missing.csv", None)], [ArtifactIdentity("bad/b", None)]
+        ),
+        "bad/c": _create_stage(
+            "bad/c", [ArtifactIdentity("bad/b", None)], [ArtifactIdentity("bad/c", None)]
+        ),
+    }
+    store = store_mod.WorkspaceStore(
+        project_root=set_project_root, pipeline_name="bad", input_bindings={}
+    )
+
+    result, errors = graph.get_runnable_stages(
+        stages, store, all_pipelines=all_pipelines, on_error=on_error
+    )
+
+    assert (None if result is None else set(result)) == runnable
+    assert [error.stage for error in errors] == ["bad/b"]
 
 
 def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:
@@ -951,3 +991,93 @@ def test_extract_graph_view_complex_diamond_with_edge_verification(tmp_path: Pat
 
     # Exact count
     assert len(artifact_edges) == 4
+
+
+# --- Width tests ---
+
+
+def _helper_stage_dag(dependencies: dict[str, list[str]]) -> nx.DiGraph[str]:
+    """Stage DAG in which each stage consumes the output of every stage it lists."""
+    stages = {
+        name: _create_stage(
+            name,
+            [ArtifactIdentity(dep, "out.csv") for dep in deps],
+            [ArtifactIdentity(name, "out.csv")],
+        )
+        for name, deps in dependencies.items()
+    }
+    return graph.get_stage_dag(graph.build_graph(stages))
+
+
+@pytest.mark.parametrize(
+    ("dependencies", "run", "width"),
+    [
+        pytest.param({"a": [], "b": ["a"], "c": ["b"], "d": ["c"]}, None, 1, id="chain"),
+        pytest.param(
+            {"src": [], **{f"m{i}": ["src"] for i in range(5)}}, None, 5, id="fan-out-of-5"
+        ),
+        pytest.param(
+            {"top": [], "left": ["top"], "right": ["top"], "bottom": ["left", "right"]},
+            None,
+            2,
+            id="diamond",
+        ),
+        # Levels {s0, s1} and {s2, s3}: the widest level is 2, but s0, s2 and s3 run together.
+        pytest.param(
+            {"s0": [], "s1": [], "s2": ["s1"], "s3": ["s1"]},
+            None,
+            3,
+            id="widest-level-undercounts",
+        ),
+        # `pivot run a b` orders b after a only through x, which is not in the run.
+        pytest.param({"a": [], "x": ["a"], "b": ["x"]}, ["a", "b"], 2, id="path-outside-run"),
+        pytest.param({"a": [], "x": ["a"], "b": ["x"]}, ["b", "a", "x"], 1, id="path-inside-run"),
+        pytest.param({"a": [], "b": []}, ["a", "a"], 1, id="repeated-stage"),
+    ],
+)
+def test_get_width_is_the_most_stages_that_can_run_at_once(
+    dependencies: dict[str, list[str]], run: list[str] | None, width: int
+) -> None:
+    stage_dag = _helper_stage_dag(dependencies)
+    stages = list(dependencies) if run is None else run
+    assert graph.get_width(stage_dag, stages, limit=len(stages) + 1) == width
+    assert graph.get_width(stage_dag, stages, limit=1) == 1
+
+
+def _helper_two_dimensional_order(count: int, spread: float) -> nx.DiGraph[str]:
+    """Stage DAG of a 2-dimensional order: a stage depends on each earlier stage whose second
+    coordinate is also smaller, kept to the direct dependencies. Its topological levels are
+    narrower than its width, so the search for the width has work to do."""
+    rng = random.Random(count)
+    xs = sorted(rng.random() * count for _ in range(count))
+    points = [(x, x + spread * rng.random()) for x in xs]
+    stage_dag: nx.DiGraph[str] = nx.DiGraph()
+    for i in range(count):
+        stage_dag.add_node(f"s{i:03d}")
+    for b in range(count):
+        highest = float("-inf")
+        for a in range(b - 1, -1, -1):
+            if points[a][0] + spread < highest:
+                break
+            if highest < points[a][1] < points[b][1]:
+                stage_dag.add_edge(f"s{b:03d}", f"s{a:03d}")
+                highest = points[a][1]
+    return stage_dag
+
+
+@pytest.mark.parametrize(("count", "spread", "steps"), [(12, 6.0, 0), (30, 12.0, 0), (60, 20.0, 5)])
+def test_get_width_does_not_depend_on_the_order_of_stages(
+    count: int, spread: float, steps: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every order of one run's stages gives one pool size, also when the search for the width
+    runs out of steps, so the pool does not change with the process's hash seed."""
+    stage_dag = _helper_two_dimensional_order(count, spread)
+    stages = sorted(stage_dag.nodes())
+    monkeypatch.setattr(graph, "_AUGMENT_STEPS", steps)
+
+    widths = {
+        graph.get_width(stage_dag, random.Random(seed).sample(stages, count), limit=count + 1)
+        for seed in range(20)
+    }
+
+    assert len(widths) == 1, f"orders of one run gave pool sizes {sorted(widths)}"

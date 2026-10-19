@@ -105,7 +105,7 @@ def train(rows: pd.DataFrame, params: TrainParams) -> dict:
     return {"rows": len(rows)}
 ```
 
-Every scheduled stage holds one CPU unit. `@stage(resources={"cpu": "all"})` reserves all effective worker capacity and therefore runs alone. Other resource names default to capacity 1. Set capacities in `.pivot/config.yaml`:
+Every scheduled stage holds one CPU unit. `@stage(resources={"cpu": "all"})` reserves every CPU unit, as many as the configured worker count (`core.max_workers`), and therefore runs alone. Other resource names default to capacity 1. Set capacities in `.pivot/config.yaml`:
 
 ```yaml
 resources:

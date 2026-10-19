@@ -59,23 +59,23 @@ def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
     for f in futures:
         f.result()
 
-def prepare_workers(stage_count: int, max_workers: int | None = None) -> int:
+def prepare_workers(width: int, max_workers: int | None = None) -> int:
     """Pre-warm Pivot's configured reusable worker pool before TUI startup."""
-    workers = compute_max_workers(stage_count, max_workers)
+    workers = compute_max_workers(width, max_workers)
     _warm_workers(_get_executor(workers), workers)
     return workers
 ```
 
-Pre-warming is important when using a TUI: Textual inherits file descriptors at startup, and loky workers created after TUI initialization can inherit TUI's PTY descriptors, causing display corruption.
+Pre-warming is important when using a TUI: Textual inherits file descriptors at startup, and loky workers created after TUI initialization can inherit TUI's PTY descriptors, causing display corruption. The caller passes the width the engine will compute for the run (`engine.graph.get_width`), so the engine reuses the pre-warmed workers instead of resizing the pool.
 
 ### Killing Workers for Code Reload
 
 In watch mode, code changes require fresh workers with updated imports:
 
 ```python
-def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
+def restart_workers(width: int, max_workers: int | None = None) -> int:
     """Kill existing workers and spawn fresh ones."""
-    workers = compute_max_workers(stage_count, max_workers)
+    workers = compute_max_workers(width, max_workers)
     _warm_workers(_get_executor(workers, kill_workers=True), workers)
     return workers
 ```
