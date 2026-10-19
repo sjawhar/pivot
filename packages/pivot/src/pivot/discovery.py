@@ -319,6 +319,18 @@ def _track_root_modules(session: _ImportSession) -> None:
             session.pickle_by_value_modules[module_name] = module
 
 
+def track_user_imports() -> None:
+    """Record the user modules imported since discovery loaded the pipeline, as discovery
+    records the ones loading it imported (``_track_root_modules``).
+
+    Fingerprinting imports each module a stage body imports (``fingerprint._body_imports``);
+    the next discovery then removes the modules under the root and imports them again, so an
+    edit to one is seen.
+    """
+    if _import_session is not None:
+        _track_root_modules(_import_session)
+
+
 def _module_name_for_path(path: pathlib.Path, root: pathlib.Path) -> str:
     """Return the stable dotted module name for a pipeline.py path below root."""
     try:

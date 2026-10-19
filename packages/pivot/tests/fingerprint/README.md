@@ -63,6 +63,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global primitive constant change                     | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
 | Global tuple, frozenset of scalars, or compiled regex | ✅ | `test_safe_fingerprinting.py::test_immutable_capture_is_tracked_by_value`, `test_safe_fingerprinting.py::test_editing_immutable_capture_changes_fingerprint`, `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage` |
 | Global list, dict, set, nested tuple, enum, or class instance | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises` |
+| Unsafe fingerprinting (refusal downgraded to a warning): result kept out of the run cache, by `pivot repro` and `pivot commit` | ✅ | `test_safe_fingerprinting.py::test_unsafe_result_is_kept_out_of_the_run_cache`, control `test_safe_fingerprinting.py::test_safe_result_is_filed_in_the_run_cache` |
+| `pivot config set core.unsafe_fingerprinting true` | ✅ | `test_safe_fingerprinting.py::test_config_set_accepts_unsafe_fingerprinting` |
 | Non-scalar module attribute                          | ✅ (error) | `test_integration.py::test_non_scalar_module_attribute_raises`                                                                      |
 | Method bound to an instance (`Scaler(3).apply`, `default_rng(0).normal`) as a global, cell, partial argument, loader field or `module.NAME` | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`, `test_integration.py::test_non_scalar_module_attribute_raises`, `test_manifest_cache_cli.py::test_method_bound_to_an_instance_is_an_error` |
 | Method bound to a Logger, a scalar, a class or a library module's own state (`np.random.normal`) | 🚫 | `test_safe_fingerprinting.py::test_methods_bound_to_a_logger_scalar_or_library_are_allowed`, `test_manifest_cache_cli.py::test_method_bound_to_a_scalar_class_or_library_is_allowed` |
@@ -78,6 +80,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                  |
+| Global read only inside a method of a user class (`Scaler().apply` reads `SCALE`) | ✅ | `test_change_detection.py::test_method_global_change_causes_miss` |
+| Compiled regex read only inside a method, class imported from another module (`ScopeWalk().step`) | ✅ | `test_change_detection.py::test_method_regex_change_causes_miss` |
+| Helper called only from a classmethod (`Runner.go` calls `bump`) | ✅ | `test_change_detection.py::test_method_helper_change_causes_miss` |
 | Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                         |
 | Class base/field annotation dependencies             | ✅        | `test_fingerprint.py::test_process_class_body_dependencies_tracks_bases_and_annotations`                                           |
 | StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                           |
@@ -126,9 +131,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                          | Detected? | Test Reference                                                       |
 | ------------------------------------ | --------- | -------------------------------------------------------------------- |
-| `from X import func` inside function | ❌        | `test_change_detection.py::test_lazy_import_change_detected` (xfail) |
-| `import X` inside function           | ❌        | **NO TEST** - same limitation                                        |
-| Conditional import inside function   | ❌        | **NO TEST** - same limitation                                        |
+| `from X import func` inside function | ✅        | `test_change_detection.py::test_lazy_import_change_detected`         |
+| `import X as alias` inside function  | ✅        | `test_change_detection.py::test_in_body_import_change_causes_miss`   |
+| Conditional import inside function   | ✅        | Same walk: every import statement in the body is resolved            |
 
 ---
 
@@ -167,9 +172,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `globals()` / `locals()`                 | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_globals`                                                                  |
 | `func_dict[key]()` dispatch              | ✅        | `test_change_detection.py::test_dynamic_dispatch_change_detected`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
 | `eval()` / `exec()`                      | ❌        | **NO TEST** - can't analyze dynamically                                                                                                       |
-| `importlib.import_module(string)`        | ❌        | **NO TEST** - can't resolve statically                                                                                                        |
+| `importlib.import_module(string)`        | ✅ (error) | `test_fingerprint.py::test_dynamic_import_is_refused[attribute-import-module]`                                                         |
+| `import_module` under an alias, `__import__(...)` | ✅ (error) | `test_fingerprint.py::test_dynamic_import_is_refused[aliased-import-module]`, `test_fingerprint.py::test_dynamic_import_is_refused[dunder-import]` |
 | `importlib.import_module(...)` (call)    | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_import_module`                                                           |
-| Method call on instance (`obj.method()`) | ❌        | `test_change_detection.py::test_class_instance_method_change_detected` (xfail)                                                                |
+| Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss`         |
 | Callback/function passed as argument     | ❌        | **NO TEST** - not tracked                                                                                                                     |
 | Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source)                                                            |
 
@@ -300,7 +306,6 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 | ------------------------------------------------ | -------- | ----------------------------- |
 | Decorator on stage function not tracked          | Medium   | Easy                          |
 | Nested module attribute (`X.sub.func`) full test | Low      | Easy                          |
-| `import X` inside function not tracked           | Low      | Easy (already documented)     |
 | `eval()`/`exec()` limitation                     | Low      | Easy                          |
 | Third-party package version tracking             | Medium   | Hard (would need new feature) |
 | Type alias change with `from __future__`         | Low      | Hard (alias only in string annotation, not in bytecode) |
@@ -317,7 +322,7 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
 4. **Docstrings/comments ignored**: These don't affect behavior, so they're stripped from AST.
 
-5. **Lazy imports not tracked**: Imports inside function bodies are not detected. Recommended pattern: use module-level imports.
+5. **Imports inside function bodies are walked**: each `import` and `from ... import` statement in a user function's body is resolved (a relative one against the function's package) and what it binds is walked as a module-level import would be. A dynamic import (`importlib.import_module` under any name, `__import__`) is refused.
 
 6. **Non-scalar module values are refused**: A stage may capture module-level `bool`, `int`,
    `float`, `str`, `bytes`, and `None` values, a `tuple` or `frozenset` whose members are all

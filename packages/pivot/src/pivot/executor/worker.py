@@ -305,6 +305,8 @@ class WorkerStageInfo(TypedDict):
     project_state_dir: pathlib.Path
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
+    # The fingerprint downgraded a refusal to a warning: the run cache is neither read nor written.
+    unsafe_fingerprint: bool
 
 
 def _make_result(
@@ -879,7 +881,8 @@ def _check_skip_or_run(
         params=current_params,
         dep_hashes=dep_hashes_by_identity,
         out_paths=out_identities,
-        run_cache_allowed=not bool(stage_info["incremental_inputs"]),
+        run_cache_allowed=not stage_info["incremental_inputs"]
+        and not stage_info["unsafe_fingerprint"],
     )
     if decision["changed"]:
         return None, decision["reason"], input_hash, decision["run_cache_allowed"]
@@ -1731,7 +1734,8 @@ def _build_deferred_writes(
         for path, oh in output_hashes.items()
         if path in cached_paths
     ]
-    if output_entries:
+    # An unsafe fingerprint may match a run whose captured values differed; never file it.
+    if output_entries and not stage_info["unsafe_fingerprint"]:
         result["run_cache_input_hash"] = input_hash
         result["run_cache_entry"] = run_history.RunCacheEntry(
             run_id=stage_info["run_id"],

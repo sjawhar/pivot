@@ -60,6 +60,7 @@ def _helper_make_stage_info(
         no_fingerprint=False,
         code_deps=[],
         input_paths={},
+        unsafe_fingerprint=False,
     )
 
 

@@ -111,6 +111,7 @@ def _worker_info(
         project_state_dir=tmp_path / ".pivot",
         collection_params={},
         incremental_inputs={"previous": output.identity},
+        unsafe_fingerprint=False,
     )
 
 

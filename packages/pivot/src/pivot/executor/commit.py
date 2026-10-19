@@ -218,7 +218,8 @@ def commit_stages(
             deferred = DeferredWrites()
             if dep_gen_map:
                 deferred["dep_generations"] = dep_gen_map
-            if output_entries:
+            # An unsafe fingerprint may match a run whose captured values differed; never file it.
+            if output_entries and not stage_info["unsafe_fingerprint"]:
                 deferred["run_cache_input_hash"] = input_hash
                 deferred["run_cache_entry"] = run_history.RunCacheEntry(
                     run_id=run_id,

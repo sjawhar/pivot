@@ -24,8 +24,10 @@ differ.
 | `deps` | Input dependency paths |
 | `outs` | Output artifact references |
 | `incremental_inputs` | Parameter-to-own-output identities for prior incremental values |
+| `unsafe_fingerprint` | The fingerprint downgraded a refusal to a warning; the run cache is neither read nor written |
 | `project_root` | Absolute path to project root |
 | `state_dir` | Absolute path to `.pivot/` directory |
+
 ## Path Derivation
 
 Workers derive all paths from `project_root` and `state_dir` in `WorkerStageInfo`:

@@ -368,9 +368,8 @@ def test_underscore_helper_change_detected(module_dir: pathlib.Path) -> None:
     )
 
 
-@pytest.mark.xfail(reason="Lazy imports inside function body not analyzed by getclosurevars()")
 def test_lazy_import_change_detected(module_dir: pathlib.Path) -> None:
-    """Imports inside function body should be tracked for change detection."""
+    """A function imported inside the stage body is tracked as a helper."""
     helpers_py = module_dir / "test_limit_helpers_lazy.py"
     helpers_py.write_text("def helper(x):\n    return x * 2\n")
 
@@ -768,3 +767,78 @@ def stage():
     assert "func:test_nested_attr_collision.upper" in fp, (
         "Attribute name colliding with global should be over-included (benign)"
     )
+
+
+def test_method_global_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """A module global read inside a user class's method is part of the stage's identity."""
+    mod_py = module_dir / "test_change_method_global.py"
+    body = (
+        "class Scaler:\n"
+        "    def apply(self, v):\n"
+        "        return v * SCALE\n"
+        "def stage():\n"
+        "    return Scaler().apply(1)\n"
+    )
+    mod_py.write_text("SCALE = 2\n" + body)
+    fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_method_global").stage)
+    # Different size, so Python's mtime+size bytecode check cannot reuse stale bytecode.
+    mod_py.write_text("SCALE = 30\n" + body)
+    fp2 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_method_global").stage)
+    assert fp1 != fp2, "editing a global a method reads must change the stage fingerprint"
+
+
+def test_method_regex_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """A module-level compiled regex read only inside a method of a user class, which the stage
+    calls through an instance of that class imported from another module, is part of the
+    stage's identity."""
+    lib_py = module_dir / "test_change_method_regex_lib.py"
+    body = (
+        "class ScopeWalk:\n"
+        "    def step(self, code):\n"
+        "        return LOCALITY.match(code) is not None\n"
+    )
+    lib_py.write_text("import re\nLOCALITY = re.compile(r'^Local\\s+Set')\n" + body)
+    (module_dir / "test_change_method_regex.py").write_text(
+        "from test_change_method_regex_lib import ScopeWalk\n"
+        + "def stage():\n"
+        + "    return ScopeWalk().step('Local Set')\n"
+    )
+    fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_method_regex").stage)
+    lib_py.write_text("import re\nLOCALITY = re.compile(r'^NEVER')\n" + body)
+    _import_fresh("test_change_method_regex_lib")
+    fp2 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_method_regex").stage)
+    assert fp1 != fp2, "editing the regex a method reads must change the stage fingerprint"
+
+
+def test_method_helper_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """A helper called only from a user class's method is part of the stage's identity."""
+    helper_py = module_dir / "test_change_method_helper_lib.py"
+    helper_py.write_text("def bump(v):\n    return v + 1\n")
+    (module_dir / "test_change_method_helper.py").write_text(
+        "from test_change_method_helper_lib import bump\n"
+        + "class Runner:\n"
+        + "    @classmethod\n"
+        + "    def go(cls):\n"
+        + "        return bump(1)\n"
+        + "def stage():\n"
+        + "    return Runner.go()\n"
+    )
+    fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_method_helper").stage)
+    helper_py.write_text("def bump(v):\n    return v + 100\n")
+    _import_fresh("test_change_method_helper_lib")
+    fp2 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_method_helper").stage)
+    assert fp1 != fp2, "editing a helper a method calls must change the stage fingerprint"
+
+
+def test_in_body_import_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """A module imported inside the stage body is a dependency."""
+    helper_py = module_dir / "test_change_inbody_lib.py"
+    helper_py.write_text("def value():\n    return 2\n")
+    (module_dir / "test_change_inbody.py").write_text(
+        "def stage():\n    import test_change_inbody_lib as lib\n    return lib.value()\n"
+    )
+    fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_inbody").stage)
+    helper_py.write_text("def value():\n    return 101\n")
+    _import_fresh("test_change_inbody_lib")
+    fp2 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_inbody").stage)
+    assert fp1 != fp2, "editing a module the stage imports in its body must change it"

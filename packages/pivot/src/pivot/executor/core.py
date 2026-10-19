@@ -368,9 +368,11 @@ def prepare_worker_info(
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
 
+    # The fingerprint is computed first: it sets `unsafe_fingerprint`.
+    fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
     return worker.WorkerStageInfo(
         func=stage_info["func"],
-        fingerprint=pipeline.ensure_fingerprint(stage_info["name"]),
+        fingerprint=fingerprint,
         deps=stage_info["deps"],
         outs=stage_info["outs"],
         store_spec=store_spec,
@@ -387,6 +389,7 @@ def prepare_worker_info(
         state_dir=state_dir,
         project_state_dir=default_state_dir,
         collection_params=stage_info["collection_params"],
+        unsafe_fingerprint=stage_info["unsafe_fingerprint"],
     )
 
 

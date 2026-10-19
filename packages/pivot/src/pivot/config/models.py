@@ -9,7 +9,7 @@ _REMOTES_PREFIX = "remotes."
 # Valid remote name pattern (alphanumeric, hyphens, underscores) - public for completion module
 VALID_REMOTE_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-ConfigValue = str | int | list[str] | dict[str, str] | dict[str, int] | None
+ConfigValue = bool | str | int | list[str] | dict[str, str] | dict[str, int] | None
 
 
 class CheckoutMode(enum.StrEnum):
@@ -303,6 +303,13 @@ def validate_config_value(key: str, value: Any) -> ConfigValue:
             except pydantic.ValidationError as e:
                 msg = "; ".join(err["msg"] for err in e.errors())
                 raise exceptions.ConfigValidationError(f"'{key}': {msg}") from None
+
+        case "core.unsafe_fingerprinting":
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.lower() in ("true", "false"):
+                return value.lower() == "true"
+            raise exceptions.ConfigValidationError(f"'{key}' must be true or false")
 
         case _:
             raise exceptions.ConfigValidationError(f"Unknown config key: '{key}'")

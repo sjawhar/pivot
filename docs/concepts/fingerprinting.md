@@ -34,10 +34,16 @@ For each stage function, Pivot:
    and nonlocals the function references
 3. **Recurses transitively** — every user-code callable found in step 2
    gets the same treatment, and *its* dependencies are merged into the
-   manifest
-4. **Inspects type hints** — user-defined classes in annotations
+   manifest. A user class the stage reaches has each method its source
+   defines walked the same way, so a module value or helper read only
+   inside a method (`ScopeWalk().step(...)` reading a module-level regex)
+   is tracked
+4. **Follows imports in the function body** — `import helpers` or
+   `from helpers import scale` inside a stage or helper is walked as if it
+   were a module-level import; a library module adds nothing
+5. **Inspects type hints** — user-defined classes in annotations
    (including Pydantic models) are fingerprinted
-5. **Hashes Pydantic schemas** — `model_json_schema()` captures field
+6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
    types, defaults, and validators
 
 The manifest is stored in the per-stage lock file. On the next run, the
@@ -121,8 +127,12 @@ Fix: move a mutable or nested value into the stage's [StageParams](parameters.md
 Configuration in module-level mutable collections is not supported.
 
 To suppress the check (at your own risk), set
-`core.unsafe_fingerprinting = true` in your Pivot config or
-`PIVOT_UNSAFE_FINGERPRINTING=1` in the environment.
+`core.unsafe_fingerprinting = true` in your Pivot config
+(`pivot config set core.unsafe_fingerprinting true`) or
+`PIVOT_UNSAFE_FINGERPRINTING=1` in the environment. A stage whose fingerprint
+needed that downgrade still runs, but its result is never filed in the run
+cache or restored from it: the captured value may differ next time while the
+fingerprint stays the same.
 
 ### Dynamic Name Access
 
@@ -130,7 +140,8 @@ Pivot rejects patterns that bypass static analysis:
 
 - `globals()` / `locals()` — runtime namespace access
 - `getattr(obj, variable)` — dynamic attribute lookup
-- `importlib.import_module()` — dynamic imports
+- `importlib.import_module()` under any name (`from importlib import
+  import_module as load`) and `__import__()` — dynamic imports
 
 All of these silently introduce dependencies that fingerprinting can't
 track. Use direct attribute access and static imports instead.
