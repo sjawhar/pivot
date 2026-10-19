@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v0.4.1 (2026-10-19)
+
+### Bug Fixes
+
+- **discovery**: Treat pivot's own packages as library code when installed from a checkout
+  ([#491](https://github.com/sjawhar/pivot/pull/491),
+  [`47ab55c`](https://github.com/sjawhar/pivot/commit/47ab55c3d40fdaca333d66590c9cf4c5fcf7bf34))
+
+### Documentation
+
+- **agents**: Removing something users reach needs sjawhar's approval
+  ([#492](https://github.com/sjawhar/pivot/pull/492),
+  [`4ce2069`](https://github.com/sjawhar/pivot/commit/4ce2069a96fb678e2cd40d92b499be5bb5ccdc7b))
+
+- **fingerprint**: Name the setuptools layouts that keep pivot_tui user code
+  ([#491](https://github.com/sjawhar/pivot/pull/491),
+  [`47ab55c`](https://github.com/sjawhar/pivot/commit/47ab55c3d40fdaca333d66590c9cf4c5fcf7bf34))
+
+- **fingerprint**: Say which pivot-tui installs count as pivot's own
+  ([#491](https://github.com/sjawhar/pivot/pull/491),
+  [`47ab55c`](https://github.com/sjawhar/pivot/commit/47ab55c3d40fdaca333d66590c9cf4c5fcf7bf34))
+
+### Testing
+
+- **engine**: Check the pool size against stage-DAG order and every step budget
+  ([#494](https://github.com/sjawhar/pivot/pull/494),
+  [`11567a3`](https://github.com/sjawhar/pivot/commit/11567a34517546c0db6fa17a958e8ce6bfe46427))
+
+- **engine**: Sweep step budgets until every order finishes, not to a fixed count
+  ([#494](https://github.com/sjawhar/pivot/pull/494),
+  [`11567a3`](https://github.com/sjawhar/pivot/commit/11567a34517546c0db6fa17a958e8ce6bfe46427))
+
+
 ## v0.4.0 (2026-10-19)
 
 ### Features
