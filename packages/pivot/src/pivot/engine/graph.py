@@ -22,6 +22,7 @@ __all__ = [
     "stage_node",
     "build_graph",
     "validate_dependency_sources",
+    "skips_missing_dependencies",
     "get_runnable_stages",
     "get_consumers",
     "get_producer",
@@ -290,6 +291,12 @@ def get_downstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:
     return downstream
 
 
+def skips_missing_dependencies(*, all_pipelines: bool, on_error: pivot_types.OnError) -> bool:
+    """Whether a run leaves out stages with a missing dependency instead of stopping: one
+    across all pipelines that keeps going past failures."""
+    return all_pipelines and on_error == pivot_types.OnError.KEEP_GOING
+
+
 def get_runnable_stages(
     stages: dict[str, RegistryStageInfo],
     store: Store,
@@ -306,7 +313,7 @@ def get_runnable_stages(
     errors = validate_dependency_sources(stages, store=store)
     if not errors:
         return stages, errors
-    if not (all_pipelines and on_error == pivot_types.OnError.KEEP_GOING):
+    if not skips_missing_dependencies(all_pipelines=all_pipelines, on_error=on_error):
         return None, errors
     graph = build_graph(stages)
     broken = set[str]()
@@ -498,29 +505,50 @@ def get_width(stage_dag: nx.DiGraph[str], stages: list[str], *, limit: int) -> i
     # Augment in rounds. Within a round no search explores a dependency an earlier search
     # explored. That can hide an augmenting path once a search succeeds, so rounds repeat until
     # one matches no stage: the matching did not change during that round, so no stage it left
-    # unmatched has an augmenting path, and the matching is maximum.
-    while len(still_unmatched) > widest:
+    # unmatched has an augmenting path, and the matching is maximum. The searches share a
+    # budget of steps; once it runs out, the stages still unmatched bound the width from above,
+    # so the pool may be larger than the width but never smaller.
+    budget = _AUGMENT_STEPS
+    unmatched_count = len(still_unmatched)
+    while unmatched_count > widest:
         seen = 0
         left = list[int]()
         for start in still_unmatched:
-            matched, seen = _augment(start, reach, owner, seen)
-            if not matched:
+            matched, seen, budget = _augment(start, reach, owner, seen, budget)
+            if matched:
+                unmatched_count -= 1
+                if unmatched_count == widest:
+                    return widest
+            elif budget == 0:
+                return min(unmatched_count, limit)
+            else:
                 left.append(start)
         if len(left) == len(still_unmatched):
             break
         still_unmatched = left
-    return min(len(still_unmatched), limit)
+    return min(unmatched_count, limit)
 
 
-def _augment(start: int, reach: list[int], owner: list[int], seen: int) -> tuple[bool, int]:
+# Steps of augmenting-path search `get_width` takes before it settles for an upper bound: about
+# 30 ms of search at 5,000 stages.
+_AUGMENT_STEPS = 20_000
+
+
+def _augment(
+    start: int, reach: list[int], owner: list[int], seen: int, budget: int
+) -> tuple[bool, int, int]:
     """Match ``start`` along an augmenting path, if one exists, without recursion.
 
     ``seen`` holds dependencies known to lead to no augmenting path. Returns whether ``start``
-    was matched, and ``seen`` with the dependencies this search explored.
+    was matched, ``seen`` with the dependencies this search explored, and the steps left of
+    ``budget``; a search that runs out of steps returns unmatched with none left.
     """
     path = [start]  # stages on the path; path[k + 1] owns dependencies[k]
     dependencies = list[int]()
     while path:
+        if budget == 0:
+            return False, seen, 0
+        budget -= 1
         candidates = reach[path[-1]] & ~seen
         if not candidates:
             path.pop()
@@ -534,9 +562,9 @@ def _augment(start: int, reach: list[int], owner: list[int], seen: int) -> tuple
         if owner[dependency] == -1:
             for stage, matched in zip(path, dependencies, strict=True):
                 owner[matched] = stage
-            return True, seen
+            return True, seen, budget
         path.append(owner[dependency])
-    return False, seen
+    return False, seen, budget
 
 
 def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:

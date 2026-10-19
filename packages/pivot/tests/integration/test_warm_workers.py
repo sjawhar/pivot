@@ -24,6 +24,7 @@ import pytest
 
 from pivot import discovery, project
 from pivot.engine import engine as engine_mod
+from pivot.engine import graph as engine_graph
 from pivot.engine import sources
 from pivot.engine.types import EngineState, OutputEvent, RunRequested
 from pivot.engine.worker_pool import WorkerPool
@@ -804,8 +805,8 @@ def _helper_started_workers(worker_log: pathlib.Path, command: list[str]) -> int
     return len(workers)
 
 
-def _helper_pivot(root: pathlib.Path, env: dict[str, str], *args: str) -> None:
-    """Run the installed ``pivot`` command in ``root`` and require it to succeed."""
+def _helper_pivot(root: pathlib.Path, env: dict[str, str], *args: str) -> str:
+    """Run the installed ``pivot`` command in ``root``, require it to succeed, return its output."""
     proc = subprocess.run(
         [str(pathlib.Path(sys.executable).parent / "pivot"), *args],
         cwd=root,
@@ -817,6 +818,7 @@ def _helper_pivot(root: pathlib.Path, env: dict[str, str], *args: str) -> None:
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout + proc.stderr
 
 
 def _helper_configure_workers(root: pathlib.Path, max_workers: int) -> None:
@@ -914,6 +916,62 @@ def test_tui_starts_its_workers_before_the_tui_when_a_tracked_input_is_restored(
     assert (root / "data" / "width" / "lone.txt").read_text() == "tracked"
     started = _helper_started_workers(worker_log, command)
     assert started == 3, f"{' '.join(command)} started {started} workers"
+
+
+def test_tui_checkout_missing_warns_once_about_a_changed_tracked_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-warm only restores missing tracked files; checking the others stays the
+    engine's, so a tracked file edited since `pivot track` is reported once."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
+    env, _ = _helper_logging_env(tmp_path)
+    tracked = root / "data" / "raw" / "x.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("tracked")
+    _helper_pivot(root, env, "track", "data/raw/x.txt")
+    tracked.write_text("edited")
+
+    output = _helper_pivot(root, env, "repro", "--tui", "--checkout-missing")
+
+    assert output.count("has changed since tracking") == 1, output
+
+
+@pytest.mark.anyio
+async def test_watch_reload_checks_dependencies_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload of a single pipeline leaves checking for missing dependencies to the run it
+    starts, which checks them once."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _THREE_PID_PIPELINE)
+    recorder = _Recorder()
+    checks = list[int]()
+    validate = engine_graph.validate_dependency_sources
+
+    def counting_validate(*args: Any, **kwargs: Any) -> Any:
+        checks.append(1)
+        return validate(*args, **kwargs)
+
+    monkeypatch.setattr(engine_graph, "validate_dependency_sources", counting_validate)
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[root], debounce_ms=50))
+        eng.add_source(sources.OneShotSource(stages=None, force=True, reason="test", max_workers=8))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_engine_state(EngineState.IDLE))
+            checks.clear()
+            (root / "pipeline.py").write_text(_CHAIN_OF_THREE_PIPELINE)
+            reload = await recorder.wait_for(
+                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                start=first_idle,
+            )
+            await recorder.wait_for(_helper_engine_state(EngineState.IDLE), start=reload)
+            tg.cancel_scope.cancel()
+
+    assert len(checks) == 1, f"a reload and its run checked dependencies {len(checks)} times"
 
 
 _BROKEN_PIPELINE = """\

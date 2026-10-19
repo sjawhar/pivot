@@ -56,9 +56,6 @@ def ancestors[Node](
     G: DiGraph[Node],  # noqa: N803 - matches networkx API
     source: Node,
 ) -> set[Node]: ...
-def topological_sort[Node](
-    G: DiGraph[Node],  # noqa: N803 - matches networkx API
-) -> Generator[Node]: ...
 def antichains[Node](
     G: DiGraph[Node],  # noqa: N803 - matches networkx API
     topo_order: Iterable[Node] | None = None,

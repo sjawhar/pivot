@@ -2533,7 +2533,8 @@ class Engine:
         fingerprint.flush_manifest_cache()
 
         all_stages = self._get_all_stages()
-        # Hot-reload: skip dependency validation — deps may be temporarily missing while user edits
+        # Hot-reload: build the graph without checking dependencies, which may be missing while
+        # the user edits
         self._graph = engine_graph.build_graph(all_stages)
 
         # Update watch paths if we have a FilesystemSource.
@@ -2549,19 +2550,23 @@ class Engine:
                 if isinstance(source, FilesystemSource):
                     source.set_watch_paths(watch_paths)
 
-        # Re-run every stage the run can execute: across all pipelines with keep-going, that
-        # leaves out the stages a missing dependency breaks. With no runnable stage, the run
-        # re-runs them all and reports the missing dependencies when it starts.
-        pipeline = self._require_pipeline()
-        store = store_mod.WorkspaceStore(
-            project_root=project.get_project_root(),
-            pipeline_name=pipeline.name,
-            input_bindings=pipeline.input_bindings,
-        )
-        runnable, _ = engine_graph.get_runnable_stages(
-            all_stages, store, all_pipelines=self._all_pipelines, on_error=self._stored_on_error
-        )
-        stages = list(runnable or all_stages)
+        # Re-run every stage. Across all pipelines with keep-going, leave out the stages a
+        # missing dependency breaks, unless none is left; any other run checks dependencies
+        # when it starts.
+        stages = list(all_stages)
+        if engine_graph.skips_missing_dependencies(
+            all_pipelines=self._all_pipelines, on_error=self._stored_on_error
+        ):
+            pipeline = self._require_pipeline()
+            store = store_mod.WorkspaceStore(
+                project_root=project.get_project_root(),
+                pipeline_name=pipeline.name,
+                input_bindings=pipeline.input_bindings,
+            )
+            runnable, _ = engine_graph.get_runnable_stages(
+                all_stages, store, all_pipelines=True, on_error=self._stored_on_error
+            )
+            stages = list(runnable or all_stages)
 
         if stages:
             # Restart worker pool so workers pick up reloaded code, at the size the next run

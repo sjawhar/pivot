@@ -199,10 +199,11 @@ def tui_prewarm_width(
 
     Like the engine, it first restores missing tracked files when asked to, then sizes the
     pool over the stages the engine runs (``engine_graph.get_runnable_stages``), so the pool
-    warmed before Textual starts is the pool the engine then uses.
+    warmed before Textual starts is the pool the engine then uses. Checking the tracked files
+    that exist stays the engine's.
     """
     if checkout_missing:
-        executor_core.verify_tracked_files(project.get_project_root(), checkout_missing=True)
+        executor_core.restore_missing_tracked_files(project.get_project_root())
     runnable, _ = engine_graph.get_runnable_stages(
         cli_helpers.get_all_stages(),
         cli_helpers.require_workspace_store(),

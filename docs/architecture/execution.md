@@ -121,7 +121,9 @@ of the run, including stages that will skip, so a partial run starts as many wor
 one. The widest topological level can be smaller: with stages A and S, and B and C that both
 read S, the levels {A, S} and {B, C} hold two stages each, but A, B and C can all run together,
 so the width is three. The widest level is still a lower bound, so once it reaches
-`core.max_workers` the pool takes the cap without computing the width.
+`core.max_workers` the pool takes the cap without computing the width. Below the cap, the search
+for the width takes a fixed number of steps; a pipeline it does not settle in that many gets an
+upper bound on the width instead, never fewer workers than its stages that can run at once.
 
 A TUI pre-warms the same number of workers before Textual starts. It restores missing tracked
 files first when `--checkout-missing` asks for it, and it counts the stages the engine will run
