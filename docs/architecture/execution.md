@@ -121,7 +121,9 @@ of the run, including stages that will skip. The widest topological level can be
 stages A and S, and B and C that both read S, the levels {A, S} and {B, C} hold two stages each,
 but A, B and C can all run together, so the width is three.
 
-A TUI pre-warms the same number of workers before Textual starts, and a watch-mode code reload
+A TUI pre-warms the same number of workers before Textual starts, computed over the stages the
+engine will run (`get_runnable_stages`): with `--all --keep-going`, a stage with a missing
+dependency and everything downstream of it are left out of both. A watch-mode code reload
 restarts the pool at the reloaded pipeline's width. `pivot run` runs its named stages in the
 given order and starts a stage once the named stages it consumes from have finished, so its
 width is that of the named stages alone.

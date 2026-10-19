@@ -21,6 +21,7 @@ __all__ = [
     "stage_node",
     "build_graph",
     "validate_dependency_sources",
+    "get_runnable_stages",
     "get_consumers",
     "get_producer",
     "get_downstream_stages",
@@ -286,6 +287,32 @@ def get_downstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:
         if g.nodes[descendant]["type"] == NodeType.STAGE:
             downstream.append(parse_node(descendant)[1])
     return downstream
+
+
+def get_runnable_stages(
+    stages: dict[str, RegistryStageInfo],
+    store: Store,
+    *,
+    all_pipelines: bool,
+    on_error: pivot_types.OnError,
+) -> tuple[dict[str, RegistryStageInfo], list[DependencyNotFoundError]]:
+    """Return the stages a run executes, with the missing dependencies found.
+
+    A run across all pipelines that keeps going past failures leaves out each stage with a
+    missing dependency and every stage downstream of it. Any other run with a missing
+    dependency executes no stage.
+    """
+    errors = validate_dependency_sources(stages, store=store)
+    if not errors:
+        return stages, errors
+    if not (all_pipelines and on_error == pivot_types.OnError.KEEP_GOING):
+        return {}, errors
+    graph = build_graph(stages)
+    broken = set[str]()
+    for error in errors:
+        broken.add(error.stage)
+        broken.update(get_downstream_stages(graph, error.stage))
+    return {name: info for name, info in stages.items() if name not in broken}, errors
 
 
 def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInfo) -> None:

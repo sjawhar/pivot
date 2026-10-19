@@ -1056,27 +1056,17 @@ class Engine:
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
         )
-        dep_errors = engine_graph.validate_dependency_sources(all_stages, store=store)
+        all_stages, dep_errors = engine_graph.get_runnable_stages(
+            all_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
+        )
+        if dep_errors and not all_stages:
+            if len(dep_errors) == 1:
+                raise dep_errors[0]
+            raise pivot_exceptions.MultipleDependencyError(dep_errors)
         if dep_errors:
-            if self._all_pipelines and on_error == OnError.KEEP_GOING:
-                # Skip broken stages but continue with healthy pipelines
-                broken_stages = {err.stage for err in dep_errors}
-                for err in dep_errors:
-                    _logger.warning("Skipping: %s", err.format_user_message())
-                # Also skip downstream dependents of broken stages
-                to_remove = set[str]()
-                for broken in broken_stages:
-                    to_remove.add(broken)
-                    to_remove.update(engine_graph.get_downstream_stages(graph, broken))
-                all_stages = {k: v for k, v in all_stages.items() if k not in to_remove}
-                if not all_stages:
-                    raise pivot_exceptions.MultipleDependencyError(dep_errors)
-                # Rebuild graph without broken stages
-                graph = engine_graph.build_graph(all_stages)
-            else:
-                if len(dep_errors) == 1:
-                    raise dep_errors[0]
-                raise pivot_exceptions.MultipleDependencyError(dep_errors)
+            for err in dep_errors:
+                _logger.warning("Skipping: %s", err.format_user_message())
+            graph = engine_graph.build_graph(all_stages)
         self._graph = graph
 
         # Extract stage-only DAG for execution order

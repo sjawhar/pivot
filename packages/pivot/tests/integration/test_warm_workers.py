@@ -841,3 +841,55 @@ def test_command_starts_as_many_workers_as_stages_can_run_at_once(
 
     started = worker_log.read_text().split()
     assert len(started) == workers, f"{' '.join(command)} started {len(started)} workers"
+
+
+_BROKEN_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def first(raw: str) -> str:
+    return raw
+
+
+@stage
+def second(raw: str) -> str:
+    return raw
+
+
+with Pipeline("broken") as pipeline:
+    missing = pipeline.input("missing.txt", t=str)
+    first(missing)
+    second(missing)
+"""
+
+
+def test_repro_tui_prewarm_leaves_out_the_stages_a_keep_going_run_skips(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Across all pipelines with keep-going, the engine leaves out stages with a missing
+    dependency; the TUI's pre-warm leaves them out too, so it starts only the workers the
+    engine then uses."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
+        (root / name).mkdir(parents=True)
+        (root / name / "pipeline.py").write_text(source)
+    (root / ".pivot").mkdir()
+    (root / ".git").mkdir()
+    _helper_configure_workers(root, 8)
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+    env["TERM"] = "xterm-256color"
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_WORKER_LOG_HOOK)
+    worker_log = tmp_path / "workers.log"
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(hook), env.get("PYTHONPATH")]))
+    env["PIVOT_TEST_WORKER_LOG"] = str(worker_log)
+
+    _helper_pivot(root, env, "repro", "--all", "--keep-going", "--tui")
+
+    assert (root / "data" / "width" / "left.txt").read_text() == "source left"
+    started = worker_log.read_text().split()
+    assert len(started) == 3, f"repro --all --keep-going --tui started {len(started)} workers"

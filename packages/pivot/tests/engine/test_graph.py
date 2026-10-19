@@ -11,7 +11,7 @@ from pivot import exceptions, loaders
 from pivot.engine import graph, types
 from pivot.registry import RegistryStageInfo
 from pivot.storage import store as store_mod
-from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
+from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, OnError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -447,6 +447,43 @@ def test_validate_dependency_sources_reports_missing_pipeline_input_path(
         "Stage 'demo/combine' depends on input 'extra.csv' "
         "(path missing/extra.csv), which does not exist"
     )
+
+
+@pytest.mark.parametrize(
+    ("all_pipelines", "on_error", "runnable"),
+    [
+        pytest.param(True, OnError.KEEP_GOING, {"ok/a"}, id="all-keep-going"),
+        pytest.param(True, OnError.FAIL, set[str](), id="all-fail"),
+        pytest.param(False, OnError.KEEP_GOING, set[str](), id="one-keep-going"),
+    ],
+)
+def test_get_runnable_stages_leaves_out_stages_downstream_of_a_missing_dependency(
+    set_project_root: Path,
+    all_pipelines: bool,
+    on_error: OnError,
+    runnable: set[str],
+) -> None:
+    """Only a keep-going run across all pipelines runs the stages a missing dependency
+    leaves runnable; it leaves out the broken stage and every stage downstream of it."""
+    stages = {
+        "ok/a": _create_stage("ok/a", [], [ArtifactIdentity("ok/a", None)]),
+        "bad/b": _create_stage(
+            "bad/b", [ArtifactIdentity("missing.csv", None)], [ArtifactIdentity("bad/b", None)]
+        ),
+        "bad/c": _create_stage(
+            "bad/c", [ArtifactIdentity("bad/b", None)], [ArtifactIdentity("bad/c", None)]
+        ),
+    }
+    store = store_mod.WorkspaceStore(
+        project_root=set_project_root, pipeline_name="bad", input_bindings={}
+    )
+
+    result, errors = graph.get_runnable_stages(
+        stages, store, all_pipelines=all_pipelines, on_error=on_error
+    )
+
+    assert set(result) == runnable
+    assert [error.stage for error in errors] == ["bad/b"]
 
 
 def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:

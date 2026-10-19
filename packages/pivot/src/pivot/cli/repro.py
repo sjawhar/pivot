@@ -240,7 +240,7 @@ def _run_pipeline(
             SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
         )
 
-    # Build DAG and get execution order for TUI display and worker pre-warming
+    # Build DAG and get execution order for TUI display
     graph = cli_helpers.build_dag()
     execution_order = engine_graph.get_execution_order(graph, stages_list, single_stage=False)
 
@@ -262,7 +262,14 @@ def _run_pipeline(
 
     # Pre-warm loky executor before starting Textual TUI, as many workers as the engine will use
     if tui:
-        prepare_workers(engine_graph.get_width(graph, execution_order) if execution_order else 1)
+        prepare_workers(
+            _run_common.tui_prewarm_width(
+                stages_list,
+                single_stage=False,
+                all_pipelines=cli_decorators.get_all_pipelines_from_context(),
+                on_error=on_error,
+            )
+        )
 
     # Set up run_id if using TUI
     run_id: str | None = None

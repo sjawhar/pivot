@@ -14,7 +14,9 @@ import click
 
 from pivot import discovery
 from pivot.cli import decorators as cli_decorators
+from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
+from pivot.engine import graph as engine_graph
 from pivot.types import OnError
 
 if TYPE_CHECKING:
@@ -182,6 +184,28 @@ def resolve_on_error(fail_fast: bool, keep_going: bool) -> OnError:
     if fail_fast and keep_going:
         raise click.ClickException("--fail-fast and --keep-going are mutually exclusive")
     return OnError.KEEP_GOING if keep_going else OnError.FAIL
+
+
+def tui_prewarm_width(
+    stages: list[str] | None, *, single_stage: bool, all_pipelines: bool, on_error: OnError
+) -> int:
+    """Return the width the engine will compute for this run, for the TUI's worker pre-warm.
+
+    The stages are those the engine runs (``engine_graph.get_runnable_stages``), so the pool
+    warmed before Textual starts is the pool the engine then uses.
+    """
+    runnable, _ = engine_graph.get_runnable_stages(
+        cli_helpers.get_all_stages(),
+        cli_helpers.require_workspace_store(),
+        all_pipelines=all_pipelines,
+        on_error=on_error,
+    )
+    stage_dag = engine_graph.get_stage_dag(engine_graph.build_graph(runnable))
+    targets = [stage for stage in stages if stage in stage_dag] if stages else None
+    if stages and not targets:
+        return 1
+    order = engine_graph.get_execution_order(stage_dag, targets, single_stage=single_stage)
+    return max(1, engine_graph.get_width(stage_dag, order))
 
 
 class DryRunJsonStageOutput(TypedDict):
