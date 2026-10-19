@@ -310,6 +310,26 @@ def test_width_cut_short_never_undersizes_the_pool(
     assert min(largest, limit) <= width <= limit
 
 
+@_SETTINGS
+@hypothesis.given(_acyclic_edges(), st.data())
+def test_width_does_not_depend_on_the_order_of_the_run_stages(
+    case: tuple[int, list[set[int]]], data: st.DataObject
+) -> None:
+    """Any order of the same stages gives the same pool size, including when the search for
+    the width runs out of steps, so every process sizes one run's pool alike."""
+    count, deps = case
+    stages = _stages_from_edges(count, deps)
+    stage_dag = engine_graph.get_stage_dag(engine_graph.build_graph(stages))
+    run = sorted(stages)
+    shuffled = data.draw(st.permutations(run))
+    limit = data.draw(st.integers(1, count + 1))
+    steps = data.draw(st.integers(0, 20))
+    with mock.patch.object(engine_graph, "_AUGMENT_STEPS", steps):
+        assert engine_graph.get_width(stage_dag, shuffled, limit=limit) == (
+            engine_graph.get_width(stage_dag, run, limit=limit)
+        )
+
+
 # =============================================================================
 # Run-cache input hash
 # =============================================================================

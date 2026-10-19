@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import random
 from typing import TYPE_CHECKING
 
+import networkx as nx
 import pytest
 
 from pivot import exceptions, loaders
@@ -15,8 +17,6 @@ from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, OnError
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import networkx as nx
 
 
 def _artifact_ref(identity: ArtifactIdentity) -> ArtifactRef:
@@ -1042,3 +1042,42 @@ def test_get_width_is_the_most_stages_that_can_run_at_once(
     stages = list(dependencies) if run is None else run
     assert graph.get_width(stage_dag, stages, limit=len(stages) + 1) == width
     assert graph.get_width(stage_dag, stages, limit=1) == 1
+
+
+def _helper_two_dimensional_order(count: int, spread: float) -> nx.DiGraph[str]:
+    """Stage DAG of a 2-dimensional order: a stage depends on each earlier stage whose second
+    coordinate is also smaller, kept to the direct dependencies. Its topological levels are
+    narrower than its width, so the search for the width has work to do."""
+    rng = random.Random(count)
+    xs = sorted(rng.random() * count for _ in range(count))
+    points = [(x, x + spread * rng.random()) for x in xs]
+    stage_dag: nx.DiGraph[str] = nx.DiGraph()
+    for i in range(count):
+        stage_dag.add_node(f"s{i:03d}")
+    for b in range(count):
+        highest = float("-inf")
+        for a in range(b - 1, -1, -1):
+            if points[a][0] + spread < highest:
+                break
+            if highest < points[a][1] < points[b][1]:
+                stage_dag.add_edge(f"s{b:03d}", f"s{a:03d}")
+                highest = points[a][1]
+    return stage_dag
+
+
+@pytest.mark.parametrize(("count", "spread", "steps"), [(12, 6.0, 0), (30, 12.0, 0), (60, 20.0, 5)])
+def test_get_width_does_not_depend_on_the_order_of_stages(
+    count: int, spread: float, steps: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every order of one run's stages gives one pool size, also when the search for the width
+    runs out of steps, so the pool does not change with the process's hash seed."""
+    stage_dag = _helper_two_dimensional_order(count, spread)
+    stages = sorted(stage_dag.nodes())
+    monkeypatch.setattr(graph, "_AUGMENT_STEPS", steps)
+
+    widths = {
+        graph.get_width(stage_dag, random.Random(seed).sample(stages, count), limit=count + 1)
+        for seed in range(20)
+    }
+
+    assert len(widths) == 1, f"orders of one run gave pool sizes {sorted(widths)}"

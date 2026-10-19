@@ -436,36 +436,45 @@ def get_width(stage_dag: nx.DiGraph[str], stages: list[str], *, limit: int) -> i
     with one stage it transitively depends on (Dilworth's theorem, by Konig's).
 
     The widest topological level is such a set, so once it holds ``limit`` stages the matching
-    is skipped; below ``limit`` the result is exact.
+    is skipped. Below ``limit`` the result is exact, unless the search for the matching runs
+    out of steps; then it is an upper bound on the width, never fewer than the stages that can
+    run at once. The stages are numbered from their names and dependencies alone, so the result
+    does not depend on the order of ``stages``.
 
     Args:
         stage_dag: Stage-only DAG (from get_stage_dag)
         stages: The stages of the run; dependencies through stages outside it do not count
         limit: The most workers the pool may have
     """
-    names = list(dict.fromkeys(stages))
-    index = {name: i for i, name in enumerate(names)}
-    direct = [[index[up] for up in stage_dag.successors(name) if up in index] for name in names]
-    dependents = [list[int]() for _ in names]
-    for i, upstream in enumerate(direct):
-        for j in upstream:
-            dependents[j].append(i)
-    # Producers first; a stage's level is one more than its deepest dependency's.
-    waiting = [len(upstream) for upstream in direct]
-    order = [i for i, count in enumerate(waiting) if count == 0]
-    level = [0] * len(names)
-    for i in order:
-        for k in dependents[i]:
-            level[k] = max(level[k], level[i] + 1)
+    names = sorted(set(stages))
+    count = len(names)
+    index = dict(zip(names, range(count), strict=True))
+    upstream = [[index[up] for up in stage_dag.successors(name) if up in index] for name in names]
+    downstream = [list[int]() for _ in names]
+    for i, producers in enumerate(upstream):
+        for j in producers:
+            downstream[j].append(i)
+    # Producers first, in an order fixed by the names and dependencies alone; a stage's level is
+    # one more than its deepest dependency's.
+    waiting = [len(producers) for producers in upstream]
+    topological = [i for i, pending in enumerate(waiting) if pending == 0]
+    level = [0] * count
+    for i in topological:
+        deeper = level[i] + 1
+        for k in downstream[i]:
+            if level[k] < deeper:
+                level[k] = deeper
             waiting[k] -= 1
-            if waiting[k] == 0:
-                order.append(k)
+            if not waiting[k]:
+                topological.append(k)
     # Stages on one level, counted from the producers or from the last consumers, never reach
     # each other, so the widest level is a lower bound on the width.
-    remaining = [0] * len(names)
-    for i in reversed(order):
-        for j in direct[i]:
-            remaining[j] = max(remaining[j], remaining[i] + 1)
+    remaining = [0] * count
+    for i in reversed(topological):
+        deeper = remaining[i] + 1
+        for j in upstream[i]:
+            if remaining[j] < deeper:
+                remaining[j] = deeper
     widest = max(
         max(collections.Counter(level).values(), default=0),
         max(collections.Counter(remaining).values(), default=0),
@@ -473,25 +482,49 @@ def get_width(stage_dag: nx.DiGraph[str], stages: list[str], *, limit: int) -> i
     if widest >= limit:
         return limit
 
+    # Renumber consumers first, so stage i depends only on stages numbered above i. Each
+    # stage lists its dependencies deepest first, the ones a chain of stages most likely runs
+    # through, ties by number.
+    consumers_first = topological[::-1]
+    number = [0] * count
+    for position, i in enumerate(consumers_first):
+        number[i] = position
+    direct = [list[int]() for _ in names]
+    # A stable sort keeps equal levels in consumers-first order, that is, by number.
+    for j in sorted(consumers_first, key=level.__getitem__, reverse=True):
+        numbered = number[j]
+        for i in downstream[j]:
+            direct[number[i]].append(numbered)
+    order = range(count - 1, -1, -1)  # producers first
+
     # The stages a matching leaves unmatched are an upper bound on the width.
-    owner = [-1] * len(names)  # the stage each dependency is matched to
-    taken = 0  # bitset of matched dependencies
+    owner = [-1] * count  # the stage each dependency is matched to
     unmatched = list[int]()
     for i in reversed(order):
-        free = next((j for j in direct[i] if owner[j] == -1), None)
-        if free is None:
-            unmatched.append(i)
+        for j in direct[i]:
+            if owner[j] == -1:
+                owner[j] = i
+                break
         else:
-            owner[free] = i
-            taken |= 1 << free
+            unmatched.append(i)
     if len(unmatched) == widest:
         return widest
+    matched_bits = bytearray((count + 7) // 8)
+    for j, stage in enumerate(owner):
+        if stage != -1:
+            matched_bits[j >> 3] |= 1 << (j & 7)
+    taken = int.from_bytes(matched_bits, "little")  # bitset of matched dependencies
 
-    # Bitset of the run stages each stage transitively depends on.
+    # Bitset of the run stages each stage transitively depends on, built from each
+    # dependency's own set with the dependency added.
     reach = [0] * len(names)
+    closed = [0] * len(names)
     for i in order:
+        bits = 0
         for j in direct[i]:
-            reach[i] |= reach[j] | (1 << j)
+            bits |= closed[j]
+        reach[i] = bits
+        closed[i] = bits | (1 << i)
     still_unmatched = list[int]()
     for i in unmatched:
         free_bits = reach[i] & ~taken
@@ -529,9 +562,9 @@ def get_width(stage_dag: nx.DiGraph[str], stages: list[str], *, limit: int) -> i
     return min(unmatched_count, limit)
 
 
-# Steps of augmenting-path search `get_width` takes before it settles for an upper bound: about
-# 30 ms of search at 5,000 stages.
-_AUGMENT_STEPS = 20_000
+# Steps of augmenting-path search `get_width` takes before it settles for an upper bound. A
+# count, not a clock, so one graph and limit always give one size.
+_AUGMENT_STEPS = 10_000
 
 
 def _augment(
