@@ -1,9 +1,13 @@
 """Unix sockets at any path, including paths longer than the kernel accepts as an address.
 
 A socket address (``sockaddr_un.sun_path``) holds 108 bytes on Linux and 104 on macOS,
-terminating NUL included. A deeper socket is bound and reached through a symlink to its
-directory, made in a private temporary directory for the length of the call; the socket
-itself stays at its path.
+terminating NUL included. A deeper socket is bound and reached through a short name for its
+directory; the socket itself stays at its path.
+
+On Linux that name is ``/proc/self/fd/<fd>``, a descriptor of the directory that the kernel
+closes with the process, so nothing is written outside the socket's directory. Elsewhere it is
+a symlink in a private temporary directory, removed when the call returns; a process killed
+during the call leaves that directory behind. The non-Linux branch has not been run on macOS.
 """
 
 from __future__ import annotations
@@ -22,7 +26,8 @@ if TYPE_CHECKING:
 
     from anyio.abc import SocketListener, SocketStream
 
-_SUN_PATH_MAX = 108 if sys.platform.startswith("linux") else 104
+_LINUX = sys.platform.startswith("linux")
+_SUN_PATH_MAX = 108 if _LINUX else 104
 
 
 @contextlib.contextmanager
@@ -30,6 +35,13 @@ def _address(path: pathlib.Path) -> Iterator[str]:
     """Yield an address the kernel accepts for the socket at ``path``."""
     if len(os.fsencode(path)) < _SUN_PATH_MAX:
         yield str(path)
+        return
+    if _LINUX:
+        directory = os.open(path.parent, os.O_PATH | os.O_DIRECTORY)
+        try:
+            yield f"/proc/self/fd/{directory}/{path.name}"
+        finally:
+            os.close(directory)
         return
     # The directory is private (mode 0700), so no other user can swap the symlink.
     with tempfile.TemporaryDirectory(prefix="pivot-") as alias_dir:
