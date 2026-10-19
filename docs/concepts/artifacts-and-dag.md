@@ -85,10 +85,18 @@ Each artifact is identified by its producer and, for multi-output stages, a key:
 | `clean`'s return value | `etl/clean` | `data/etl/clean.jsonl` |
 | `train`'s `model` field | `etl/train:model` | `data/etl/train/model.pkl` |
 | `train`'s `metrics` field (tagged `metric`) | `etl/train:metrics` | `metrics/etl/train/metrics.yaml` |
+| `split`'s return value (tagged `directory`) | `etl/split` | `data/etl/split/` |
+| file `train.csv` of `split`'s directory, as a dependency | `etl/split:train.csv` | `data/etl/split/train.csv` |
 
 Pivot chooses the storage path from the pipeline name, the stage name, the
 output key and the [format](outputs.md). You never write a path for a stage
 output, and a stage never opens a file to read an input or write an output.
+
+A [directory output](outputs.md#directory-outputs) is one artifact with one
+producer. A stage that takes one of its files (`fit(parts["train.csv"])`)
+gets an edge from the producer in the DAG like any consumer, but its lock
+records only that file's hash, so a change to another file in the directory
+does not re-run it.
 
 ## What triggers a re-run
 

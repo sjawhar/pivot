@@ -240,16 +240,18 @@ When all three match the current file's `stat()` result, the cached hash is retu
 
 The fastest check uses monotonic generation counters to detect changes without comparing hashes:
 
-- Each output file has a **generation counter** in StateDB, incremented every time that file is written
+- Each output has a **generation counter** in StateDB, keyed by its artifact identity and incremented every time the output is written
 - When a stage runs, it **records the generation** of each dependency at that moment
 - On next run: if `recorded_generation == current_generation` for all deps → nothing changed → skip
 
-**Example:** Stage `train` depends on `data/clean.csv` (produced by `preprocess`).
+A dependency on one file of a directory output follows its directory's counter, which moves whenever any of its files are written; when it moved, the file's own hash in Tier 2 decides.
 
-1. `preprocess` runs, writes `data/clean.csv` → generation becomes 5
-2. `train` runs, records `dep_generations: {"data/clean.csv": 5}`
-3. Next run: `clean.csv` generation is still 5 → generations match → skip `train`
-4. `preprocess` runs again → `clean.csv` generation becomes 6
+**Example:** Stage `train` depends on `demo/preprocess`'s output.
+
+1. `preprocess` runs and writes its output → generation becomes 5
+2. `train` runs, records `dep_generations: {"demo/preprocess": 5}`
+3. Next run: the generation is still 5 → generations match → skip `train`
+4. `preprocess` runs again → generation becomes 6
 5. Next run: `train` recorded 5, current is 6 → mismatch → fall through to Tier 2
 
 This provides instant O(1) skip detection when nothing has changed.

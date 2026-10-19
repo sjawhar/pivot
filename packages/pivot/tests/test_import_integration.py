@@ -300,7 +300,7 @@ async def test_import_from_local_repo_then_update(
     key_v2 = remote_mod._hash_to_key("cache/", v2_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v2, Body=v2_content)
 
-    check = await import_artifact.check_for_update(pvt_data)
+    check = await import_artifact.check_for_update(pvt_path, pvt_data)
     assert check["available"] is True, "Should detect update after new commit"
 
     update_result = await import_artifact.update_import(pvt_path)
@@ -424,7 +424,7 @@ async def test_full_import_flow_mocked(
 
     resolve_ref_mock.return_value = "sha_v1"
 
-    check = await import_artifact.check_for_update(pvt_data)
+    check = await import_artifact.check_for_update(pvt_path, pvt_data)
 
     assert check["available"] is False, "No update when rev_lock matches"
 
@@ -432,7 +432,7 @@ async def test_full_import_flow_mocked(
 
     resolve_ref_mock.return_value = "sha_v2"
 
-    check = await import_artifact.check_for_update(pvt_data)
+    check = await import_artifact.check_for_update(pvt_path, pvt_data)
 
     assert check["available"] is True, "Update available when rev_lock differs"
     assert check["current_rev"] == "sha_v1"

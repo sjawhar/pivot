@@ -21,7 +21,6 @@ from typing_extensions import is_typeddict
 from . import (
     exceptions,
     fingerprint,
-    outputs,
     parameters,
     path_policy,
     project,
@@ -53,9 +52,16 @@ class _IncrementalTag:
     pass
 
 
+class _DirectoryTag:
+    pass
+
+
 metric = _MetricTag()
 plot = _PlotTag()
 incremental = _IncrementalTag()
+directory = _DirectoryTag()
+
+_OutputTag = _MetricTag | _PlotTag | _IncrementalTag | _DirectoryTag
 
 SINGLE_OUTPUT_KEY = stage_def.SINGLE_OUTPUT_KEY
 _T = TypeVar("_T")
@@ -68,6 +74,7 @@ class CollectionKind(enum.StrEnum):
 
 __all__ = [
     "ArtifactHandle",
+    "directory",
     "incremental",
     "metric",
     "plot",
@@ -78,13 +85,11 @@ __all__ = [
     "_format_extension",
     "_infer_format",
     "_infer_format_from_extension",
-    "metric",
-    "plot",
     "stage",
 ]
 
 
-def _artifact_tag(tag: _MetricTag | _PlotTag | _IncrementalTag | None) -> types.ArtifactTag:
+def _artifact_tag(tag: _OutputTag | None) -> types.ArtifactTag:
     """The engine tag for an output's compose tag; a dep and an out of one output share it."""
     if isinstance(tag, _MetricTag):
         return types.ArtifactTag.METRIC
@@ -92,6 +97,8 @@ def _artifact_tag(tag: _MetricTag | _PlotTag | _IncrementalTag | None) -> types.
         return types.ArtifactTag.PLOT
     if isinstance(tag, _IncrementalTag):
         return types.ArtifactTag.INCREMENTAL
+    if isinstance(tag, _DirectoryTag):
+        return types.ArtifactTag.DIRECTORY
     return types.ArtifactTag.DATA
 
 
@@ -128,14 +135,44 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         output_spec = matched
         output_key = output_spec.key
 
+    if not isinstance(output_spec.format, loaders_mod.Reader):
+        raise TypeError(
+            f"Stage '{consumer_name}' depends on {_output_label(output_spec.key)} of stage "
+            + f"'{qualified_name}', whose loader {type(output_spec.format).__name__} cannot read "
+            + "it back: it only writes. Give that output a loaders.Loader, which reads and "
+            + "writes, or do not pass it to a stage."
+        )
+
     identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
+    member = handle._member  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+    if member is not None:
+        identity, member = _directory_file_identity(identity, member, consumer_name)
     types.validate_artifact_identity(identity)
     return types.ArtifactRef(
         identity=identity,
         format=output_spec.format,
         python_type=handle._python_type,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         tag=_artifact_tag(output_spec.tag),
+        member=member,
     )
+
+
+def _directory_file_identity(
+    directory: types.ArtifactIdentity, key: str, consumer_name: str
+) -> tuple[types.ArtifactIdentity, str]:
+    """Name one file of a directory output: its identity and its normalized path inside it.
+
+    The key is checked by the rules for a directory output's keys, so a consumer can only name
+    a file the producer could write.
+    """
+    try:
+        member = stage_def.normalize_directory_out_key(key)
+    except ValueError as error:
+        raise ValueError(
+            f"Stage '{consumer_name}' depends on file {key!r} of stage '{directory.producer}': "
+            + f"{error}"
+        ) from None
+    return types.directory_file_identity(directory, member), member
 
 
 def _iter_stage_handles(node: _StageNode) -> list[ArtifactHandle]:
@@ -784,7 +821,7 @@ class Pipeline:
         self,
         original_func: Callable[..., object],
         stage_wrapper: Callable[..., object],
-        output_specs: list[_OutputSpec],
+        get_output_specs: Callable[[str], list[_OutputSpec]],
         resources: dict[str, int | str],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -805,6 +842,7 @@ class Pipeline:
         reason = lock.stage_name_error(qualified_name)
         if reason is not None:
             raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
+        output_specs = get_output_specs(qualified_name)
 
         sig = inspect.signature(original_func)
         try:
@@ -1180,6 +1218,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
                     + f"Rename the field in {hint.__name__}."
                 )
             specs.extend(_parse_output_type(field_hint, field_name, stage_name))
+        _refuse_outputs_named_like_directory_files(specs, stage_name)
         return specs
 
     if get_origin(hint) is not Annotated:
@@ -1187,11 +1226,11 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
 
     args = get_args(hint)
     base_type = args[0]
-    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
+    tag: _OutputTag | None = None
     fmt: loaders_mod.Writer[object] | None = None
     label = _output_label(key)
     for metadata in args[1:]:
-        if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag)):
+        if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag, _DirectoryTag)):
             if tag is not None:
                 raise exceptions.StageDefinitionError(
                     f"Stage '{stage_name}': {label} cannot combine "
@@ -1209,18 +1248,16 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
             metadata_name = (
                 metadata.__name__ if isinstance(metadata, type) else type(metadata).__name__
             )
-            message = (
+            raise exceptions.StageDefinitionError(
                 f"Stage '{stage_name}': {label} has unsupported Annotated metadata "
                 + f"'{metadata_name}'."
             )
-            if isinstance(metadata, outputs.DirectoryOut):
-                message += (
-                    " For a directory output, create the directory outside the project and "
-                    + "return a pathlib.Path to it."
-                )
-            raise exceptions.StageDefinitionError(message)
 
-    if fmt is None:
+    if isinstance(tag, _DirectoryTag):
+        file_type = _directory_file_type(base_type, label, stage_name)
+        if fmt is None:
+            fmt = _infer_format(file_type)
+    elif fmt is None:
         if isinstance(tag, _PlotTag):
             fmt = typing.cast("loaders_mod.Writer[object]", loaders_mod.MatplotlibFigure())
         elif isinstance(tag, _MetricTag):
@@ -1236,6 +1273,19 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
     return [_OutputSpec(key=key, python_type=base_type, format=fmt, tag=tag)]
 
 
+def _directory_file_type(base_type: Any, label: str, stage_name: str) -> type:
+    """The type ``T`` of each file of a ``directory`` output, which must be ``dict[str, T]``."""
+    file_args = get_args(base_type)
+    if get_origin(base_type) is not dict or len(file_args) != 2 or file_args[0] is not str:
+        shown = base_type.__name__ if isinstance(base_type, type) else base_type
+        raise exceptions.StageDefinitionError(
+            f"Stage '{stage_name}': {label} is tagged directory but its type is {shown}. "
+            + "A directory output is a dict[str, T] from each file's path inside the "
+            + "directory to the value written there."
+        )
+    return file_args[1]
+
+
 def _implements_empty(fmt: object) -> bool:
     """Whether a loader can give an incremental output's first-run value (overrides empty())."""
     base: object = loaders_mod.Loader
@@ -1244,8 +1294,28 @@ def _implements_empty(fmt: object) -> bool:
     ) is not inspect.getattr_static(base, "empty")
 
 
-def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
-    """Extract output specs from a function's return type annotation."""
+def _refuse_outputs_named_like_directory_files(specs: list[_OutputSpec], stage_name: str) -> None:
+    """Refuse an output whose key starts with a directory output's key and ``/``.
+
+    One file of directory output ``parts`` is named ``parts/<path>``, so an output keyed
+    ``parts/a.json`` would share its name with file ``a.json`` of ``parts``.
+    """
+    directories = [spec.key for spec in specs if isinstance(spec.tag, _DirectoryTag)]
+    for spec in specs:
+        for directory_key in directories:
+            if spec.key.startswith(f"{directory_key}/"):
+                raise exceptions.StageDefinitionError(
+                    f"Stage '{stage_name}': output '{spec.key}' has the name of a file of "
+                    + f"directory output '{directory_key}', so a stage depending on one could "
+                    + "not be told from a stage depending on the other. Rename the field."
+                )
+
+
+def _analyze_return_type(func: Callable[..., object], stage_name: str) -> list[_OutputSpec]:
+    """Extract output specs from a function's return type annotation.
+
+    ``stage_name`` is the qualified name (``pipeline/function``) messages give the stage.
+    """
     hints = get_type_hints(func, include_extras=True)
     return_hint = hints.get("return")
     if return_hint is None:
@@ -1253,7 +1323,7 @@ def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
         raise exceptions.StageDefinitionError(msg)
     if return_hint is type(None):
         return []
-    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY, func.__name__)
+    return _parse_output_type(return_hint, SINGLE_OUTPUT_KEY, stage_name)
 
 
 # --- @stage decorator ---
@@ -1329,10 +1399,10 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
     normalized_resources = _normalize_stage_resources(resources)
     _cached_specs: list[_OutputSpec] | None = None
 
-    def _get_output_specs() -> list[_OutputSpec]:
+    def _get_output_specs(stage_name: str) -> list[_OutputSpec]:
         nonlocal _cached_specs
         if _cached_specs is None:
-            _cached_specs = _analyze_return_type(func)
+            _cached_specs = _analyze_return_type(func, stage_name)
         return _cached_specs
 
     @functools.wraps(func)
@@ -1341,7 +1411,7 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
         if pipeline is None:
             return func(*args, **kwargs)
         return pipeline._record_stage(  # pyright: ignore[reportPrivateUsage] - the @stage wrapper is Pipeline's recording entry point
-            func, wrapper, _get_output_specs(), normalized_resources, args, kwargs
+            func, wrapper, _get_output_specs, normalized_resources, args, kwargs
         )
 
     return wrapper
@@ -1352,7 +1422,7 @@ class _OutputSpec:
     key: str
     python_type: type
     format: loaders_mod.Writer[object]
-    tag: _MetricTag | _PlotTag | _IncrementalTag | None = None
+    tag: _OutputTag | None = None
 
 
 @dataclasses.dataclass
@@ -1393,6 +1463,7 @@ class ArtifactHandle:
     _source: _StageNode | _InputNode
     _output_key: str | None
     _python_type: type
+    _member: str | None
 
     def __init__(
         self,
@@ -1400,29 +1471,72 @@ class ArtifactHandle:
         source: _StageNode | _InputNode,
         output_key: str | None,
         python_type: type,
+        member: str | None = None,
     ) -> None:
+        """``member`` is the path of one file inside a directory output, as the user wrote it."""
         self._pipeline = pipeline
         self._source = source
         self._output_key = output_key
         self._python_type = python_type
+        self._member = member
 
     def __getattr__(self, name: str) -> ArtifactHandle:
         if name.startswith("_"):
             raise AttributeError(name)
         if not isinstance(self._source, _StageNode):
             raise AttributeError(f"Input '{self._source.name}' has no sub-outputs")
+        if self._member is not None:
+            raise AttributeError(self._member_has_no_parts_message())
         spec = _select_output(self._source.output_specs, name)
         if spec is None:
             raise AttributeError(_no_such_output_message(self._source, name))
         return ArtifactHandle(self._pipeline, self._source, name, spec.python_type)
 
     def __getitem__(self, key: str) -> ArtifactHandle:
+        """Select an output of a multi-output stage, or one file of a directory output."""
         if not isinstance(self._source, _StageNode):
             raise KeyError(f"Input '{self._source.name}' has no sub-outputs")
+        if self._member is not None:
+            raise KeyError(self._member_has_no_parts_message())
+        directory_spec = self._selected_directory()
+        if directory_spec is not None:
+            file_type = _directory_file_type(
+                directory_spec.python_type,
+                _output_label(directory_spec.key),
+                self._qualified_source_name(),
+            )
+            return ArtifactHandle(
+                self._pipeline, self._source, self._output_key, file_type, member=key
+            )
         spec = _select_output(self._source.output_specs, key)
         if spec is None:
             raise KeyError(_no_such_output_message(self._source, key))
         return ArtifactHandle(self._pipeline, self._source, key, spec.python_type)
+
+    def _qualified_source_name(self) -> str:
+        assert isinstance(self._source, _StageNode)
+        return f"{self._pipeline.name}/{self._source.name}"
+
+    def _member_has_no_parts_message(self) -> str:
+        return (
+            f"{self._member!r} is one file of a directory output of stage "
+            + f"'{self._qualified_source_name()}'; it has no outputs or files of its own. "
+            + "Pass the handle itself."
+        )
+
+    def _selected_directory(self) -> _OutputSpec | None:
+        """The directory output this handle stands for, or None when it stands for another.
+
+        A stage's own handle stands for its return value only when that is a single output;
+        a TypedDict field is selected by name before its files are.
+        """
+        assert isinstance(self._source, _StageNode)
+        specs = self._source.output_specs
+        if self._output_key is not None:
+            spec = _select_output(specs, self._output_key)
+        else:
+            spec = _select_output(specs, SINGLE_OUTPUT_KEY)
+        return spec if spec is not None and isinstance(spec.tag, _DirectoryTag) else None
 
 
 def _select_output(output_specs: list[_OutputSpec], key: str | None) -> _OutputSpec | None:

@@ -73,11 +73,22 @@ def read_locks(
 def producer_output_hashes(
     locks: Iterable[LockData | None],
 ) -> dict[ArtifactIdentity, HashInfo]:
-    """Merge the locked output hashes of already-read producer locks."""
+    """Merge the locked output hashes of already-read producer locks.
+
+    Each file of a directory output is also listed under its own identity (the directory's
+    key with the file's path appended), so a stage that reads one file finds its hash.
+    """
     hashes = dict[ArtifactIdentity, HashInfo]()
     for lock_data in locks:
-        if lock_data is not None:
-            hashes.update(lock_data["output_hashes"])
+        if lock_data is None:
+            continue
+        for identity, hash_info in lock_data["output_hashes"].items():
+            hashes[identity] = hash_info
+            if not types.is_dir_hash(hash_info):
+                continue
+            for entry in hash_info["manifest"]:
+                file_identity = types.directory_file_identity(identity, entry["relpath"])
+                hashes[file_identity] = types.FileHash(hash=entry["hash"])
     return hashes
 
 

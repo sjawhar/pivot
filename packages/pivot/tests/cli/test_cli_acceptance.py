@@ -1911,3 +1911,144 @@ def test_repro_runs_a_stage_whose_edit_keeps_the_files_mtime_size_and_inode(
     out = _ok(_pivot(root, "repro"))
 
     assert output.read_text() == "bravo", out
+
+
+_ONE_FILE_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory]:
+    return {"train.jsonl": raw.iloc[:2], "test.jsonl": raw.iloc[2:]}
+
+
+@stage
+def count(train: pd.DataFrame) -> dict:
+    return {"rows": int(len(train)), "total": int(train["a"].sum())}
+
+
+with Pipeline("s") as pipeline:
+    count(split(pipeline.input("t.csv"))["train.jsonl"])
+"""
+
+
+def test_one_file_consumer_reruns_only_when_its_own_file_changes(tmp_path: pathlib.Path) -> None:
+    """A stage that reads one file of a directory output skips when only a sibling changes."""
+    root = _project(tmp_path, {"pipeline.py": _ONE_FILE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n3\n"})
+    raw = root / "data" / "raw" / "t.csv"
+    counted = root / "data" / "s" / "count.yaml"
+    _ok(_pivot(root, "repro"))
+    assert yaml.safe_load(counted.read_text()) == {"rows": 2, "total": 3}
+
+    raw.write_text("a\n1\n2\n9\n")
+    sibling_changed = _ok(_pivot(root, "repro"))
+    raw.write_text("a\n5\n2\n9\n")
+    own_changed = _ok(_pivot(root, "repro"))
+
+    assert "1 ran, 1 cached" in sibling_changed, sibling_changed
+    assert "2 ran, 0 cached" in own_changed, own_changed
+    assert yaml.safe_load(counted.read_text()) == {"rows": 2, "total": 7}
+
+
+def test_status_takes_a_one_file_dependency_from_the_producers_lock_when_it_is_deleted(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With the directory deleted, status reads the file's hash from the producer's lock."""
+    root = _project(tmp_path, {"pipeline.py": _ONE_FILE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n3\n"})
+    _ok(_pivot(root, "repro"))
+    shutil.rmtree(root / "data" / "s" / "split")
+
+    status = _ok(_pivot(root, "status"))
+    restored = _ok(_pivot(root, "repro"))
+
+    assert "2 cached, 0 stale" in status, status
+    assert "0 ran, 2 cached" in restored, restored
+    assert (root / "data" / "s" / "split" / "train.jsonl").is_file()
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+
+
+_RENAMED_FILE_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, StageParams, directory, stage
+
+
+class SplitParams(StageParams):
+    name: str = "a.yaml"
+
+
+@stage
+def split(params: SplitParams) -> Annotated[dict[str, dict], directory]:
+    return {params.name: {"name": params.name}}
+
+
+with Pipeline("r") as pipeline:
+    split(params=SplitParams())
+"""
+
+
+def _helper_snapshot(root: pathlib.Path) -> dict[str, bytes]:
+    """Every file under the outputs, the cache and the locks, by path."""
+    tops = [root / "data", root / ".pivot" / "cache", root / ".pivot" / "stages"]
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for top in tops
+        for path in sorted(top.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_refused_directory_key_on_a_rerun_keeps_the_last_good_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A refused key fails the stage in one line and changes no output, cache file or lock."""
+    root = _project(tmp_path, {"pipeline.py": _RENAMED_FILE_PIPELINE})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("r/split:\n  name: ../b.yaml\n")
+    before = _helper_snapshot(root)
+    status_before = _ok(_pivot(root, "status"))
+
+    refused = _pivot(root, "repro")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert "Stage 'r/split': the return value has key '../b.yaml'" in out, out
+    assert "Traceback" not in out, out
+    assert _helper_snapshot(root) == before
+    assert (root / "data" / "r" / "split" / "a.yaml").is_file()
+    assert _ok(_pivot(root, "status")) == status_before
+
+
+_THREE_FILES_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b", "sub/c.txt": "c"}
+
+
+with Pipeline("n") as pipeline:
+    split()
+"""
+
+
+def test_checkout_counts_the_files_it_restores(tmp_path: pathlib.Path) -> None:
+    """A directory output counts one per file it holds, as a tracked file counts one."""
+    root = _project(tmp_path, {"pipeline.py": _THREE_FILES_PIPELINE, "notes.txt": "n"})
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "track", "notes.txt"))
+    shutil.rmtree(root / "data" / "n" / "split")
+    (root / "notes.txt").unlink()
+
+    restored = _ok(_pivot(root, "checkout"))
+    skipped = _ok(_pivot(root, "checkout"))
+
+    assert "Restored 4 file(s)" in restored, restored
+    assert "Skipped 4 file(s) (already exist)" in skipped, skipped

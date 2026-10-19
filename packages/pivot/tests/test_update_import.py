@@ -60,7 +60,7 @@ def _make_pvt_data(
 # ── check_for_update ──────────────────────────────────────────
 
 
-def test_check_for_update_detects_new_commit(mocker: MockerFixture) -> None:
+def test_check_for_update_detects_new_commit(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -69,14 +69,14 @@ def test_check_for_update_detects_new_commit(mocker: MockerFixture) -> None:
 
     pvt_data = _make_pvt_data(rev_lock="oldsha111")
 
-    result = asyncio.run(import_artifact.check_for_update(pvt_data))
+    result = asyncio.run(import_artifact.check_for_update(tmp_path / "output.csv.pvt", pvt_data))
 
     assert result["available"] is True, "Should detect update when SHAs differ"
     assert result["current_rev"] == "oldsha111"
     assert result["latest_rev"] == "newsha999"
 
 
-def test_check_for_update_no_change(mocker: MockerFixture) -> None:
+def test_check_for_update_no_change(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -85,7 +85,7 @@ def test_check_for_update_no_change(mocker: MockerFixture) -> None:
 
     pvt_data = _make_pvt_data(rev_lock="samesha")
 
-    result = asyncio.run(import_artifact.check_for_update(pvt_data))
+    result = asyncio.run(import_artifact.check_for_update(tmp_path / "output.csv.pvt", pvt_data))
 
     assert result["available"] is False, "Should not detect update when SHAs match"
     assert result["current_rev"] == "samesha"

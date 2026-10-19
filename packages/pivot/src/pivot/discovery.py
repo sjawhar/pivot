@@ -646,7 +646,9 @@ def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> Pipe
         for stage_name in combined.list_stages():
             info = combined.get_stage(stage_name)
             local_outputs.update(types.identity_key(out.identity) for out in info["outs"])
-            all_deps.update(types.identity_key(dep.identity) for dep in info["deps"].values())
+            all_deps.update(
+                types.identity_key(types.source_identity(dep)) for dep in info["deps"].values()
+            )
         unresolved = all_deps - local_outputs
         if unresolved:
             sample = ", ".join(sorted(unresolved)[:5])

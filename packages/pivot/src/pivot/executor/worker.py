@@ -614,8 +614,14 @@ def _execute_stage(
                         metrics=metrics.get_entries(),
                         deferred_writes=deferred,
                     )
-        except (exceptions.OutputMissingError, exceptions.CacheRestoreError) as exc:
-            return _make_result(StageStatus.FAILED, str(exc), ring_buffer, input_hash=input_hash)
+        except (
+            exceptions.OutputMissingError,
+            exceptions.CacheRestoreError,
+            exceptions.StageDefinitionError,
+        ) as exc:
+            return _make_result(
+                StageStatus.FAILED, exc.format_user_message(), ring_buffer, input_hash=input_hash
+            )
         except SystemExit as e:
             return _make_result(
                 StageStatus.FAILED,
@@ -993,7 +999,7 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
 def _load_dep_from_path(ref: types.ArtifactRef, path: pathlib.Path) -> Any:
     """Load an artifact after the caller has resolved its workspace/cache path."""
     loader = cast("Any", ref.format)
-    if ref.tag is types.ArtifactTag.DIRECTORY:
+    if ref.tag is types.ArtifactTag.DIRECTORY and ref.member is None:
         values = dict[str, Any]()
         for file_path in sorted(p for p in path.rglob("*") if p.is_file()):
             rel_key = file_path.relative_to(path).as_posix()
@@ -1093,15 +1099,50 @@ def _reject_path_inside_project(
             )
 
 
-def _write_output_with_store(
+def _check_output_value(
     ref: types.ArtifactRef,
     value: Any,
+    project_root: pathlib.Path,
+    dependency_paths: collections_abc.Collection[pathlib.Path],
+) -> Any:
+    """Refuse an output value that cannot be written, before anything of the stage is written.
+
+    Returns what ``_write_output_with_store`` writes: the value, or for a directory output its
+    checked ``(path inside the directory, value)`` pairs.
+    """
+    if ref.tag is types.ArtifactTag.DIRECTORY:
+        label = "the return value" if ref.identity.key is None else f"output {ref.identity.key!r}"
+        members = stage_def.directory_out_members(value, ref.identity.producer, label)
+        if isinstance(ref.format, loaders.PathOnly):
+            for _, item_value in members:
+                _reject_path_inside_project(ref, item_value, project_root, dependency_paths)
+        return members
+    if isinstance(ref.format, loaders.PathOnly):
+        _reject_path_inside_project(ref, value, project_root, dependency_paths)
+    return value
+
+
+def _write_outputs_with_store(
+    output_values: dict[types.ArtifactRef, Any],
     store: store_mod.Store,
     project_root: pathlib.Path,
     dependency_paths: collections_abc.Collection[pathlib.Path] = (),
+) -> dict[types.ArtifactRef, pathlib.Path]:
+    """Write a stage's outputs once every one of them has passed its checks.
+
+    A refused value (a directory output's key, a PathOnly path inside the project) fails the
+    stage before any output is prepared, so the previous run's outputs stay as they were.
+    """
+    checked = {
+        ref: _check_output_value(ref, value, project_root, dependency_paths)
+        for ref, value in output_values.items()
+    }
+    return {ref: _write_output_with_store(ref, value, store) for ref, value in checked.items()}
+
+
+def _write_output_with_store(
+    ref: types.ArtifactRef, value: Any, store: store_mod.Store
 ) -> pathlib.Path:
-    if isinstance(ref.format, loaders.PathOnly) and ref.tag is not types.ArtifactTag.DIRECTORY:
-        _reject_path_inside_project(ref, value, project_root, dependency_paths)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
 
@@ -1141,30 +1182,10 @@ def _write_output_with_store(
                 )
 
     if ref.tag is types.ArtifactTag.DIRECTORY:
-        if not isinstance(value, dict):
-            raise RuntimeError(
-                f"Directory output for '{ref.identity.producer}' expects dict, got {type(value).__name__}"
-            )
-        if not value:
-            raise ValueError(f"Directory output '{ref.identity.producer}': dict must be non-empty")
-        # Cast needed: isinstance narrows Any to dict[Unknown, Unknown]; keys are checked below
-        value_dict = cast("dict[object, Any]", value)
-        members = list[tuple[pathlib.Path, Any]]()
-        for key, item_value in value_dict.items():
-            if not isinstance(key, str):
-                raise ValueError(
-                    f"Directory output for '{ref.identity.producer}': keys must be strings, got {type(key).__name__}"
-                )
-            normalized = stage_def.validate_directory_out_key(key, ref.identity.producer)
-            if isinstance(ref.format, loaders.PathOnly):
-                _reject_path_inside_project(
-                    ref,
-                    cast("object", item_value),
-                    project_root,
-                    dependency_paths,
-                )
-            members.append((output_path / normalized, item_value))
-        for full_path, item_value in members:
+        # The directory was just created empty and no key lies inside another key's path, so
+        # every directory on the way to a file is one created here, never a returned path
+        for relpath, item_value in cast("list[tuple[str, Any]]", value):
+            full_path = output_path / relpath
             full_path.parent.mkdir(parents=True, exist_ok=True)
             save_output(item_value, full_path)
         return output_path
@@ -1304,17 +1325,7 @@ def _run_stage_function_with_store(
         _raise_if_stopped()
 
         output_values = _resolve_output_values(result, outs, stage_name)
-        output_paths = dict[types.ArtifactRef, pathlib.Path]()
-        for ref, value in output_values.items():
-            output_paths[ref] = _write_output_with_store(
-                ref,
-                value,
-                store,
-                project_root,
-                dependency_paths,
-            )
-
-        return output_paths
+        return _write_outputs_with_store(output_values, store, project_root, dependency_paths)
 
 
 def _hash_output_paths(
@@ -1544,6 +1555,9 @@ def hash_dependencies(
                     )
             except FileNotFoundError:
                 missing.append(key)
+            except IsADirectoryError:
+                # One file of a directory output names a directory the producer wrote there
+                unreadable.append(f"{key} (a directory, not a file)")
             except OSError:
                 unreadable.append(key)
     else:
@@ -1606,29 +1620,36 @@ def can_skip_via_generation(
     recorded_gens = state_db.get_dep_generations(stage_name)
     if not recorded_gens:
         return False
-    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
-    current_gens = state_db.get_many_generations(dep_keys)
+    refs = list(deps.values())
+    gen_keys = [_generation_key(ref) for ref in refs]
+    current_gens = state_db.get_many_generations(gen_keys)
     stats = list[tuple[pathlib.Path, os.stat_result]]()
-    paths_by_key = dict[str, pathlib.Path]()
-    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
+    for gen_key, ref in zip(gen_keys, refs, strict=True):
         expected_hash = lock_data["dep_hashes"].get(ref.identity)
         if expected_hash is None or is_dir_hash(expected_hash):
             return False
-        current_gen = current_gens.get(dep_key)
-        if current_gen is None or current_gen != recorded_gens.get(dep_key):
+        current_gen = current_gens.get(gen_key)
+        if current_gen is None or current_gen != recorded_gens.get(gen_key):
             return False
         try:
             path = store.checkout(ref)
             stats.append((path, path.stat()))
-            paths_by_key[dep_key] = path
         except OSError:
             return False
     cached_hashes = state_db.get_many(stats)
-    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
-        cached_hash = cached_hashes[paths_by_key[dep_key]]
-        if cached_hash != lock_data["dep_hashes"][ref.identity]["hash"]:
+    for (path, _), ref in zip(stats, refs, strict=True):
+        if cached_hashes[path] != lock_data["dep_hashes"][ref.identity]["hash"]:
             return False
     return True
+
+
+def _generation_key(ref: types.ArtifactRef) -> str:
+    """The generation counter a dependency follows: its producer's output, for a directory file.
+
+    A file of a directory output changes only when its directory's generation does; when the
+    generation moved, the file's hash decides.
+    """
+    return types.identity_key(types.source_identity(ref))
 
 
 def compute_dep_generation_map(
@@ -1636,14 +1657,14 @@ def compute_dep_generation_map(
     state_db: state.StateDB,
 ) -> dict[str, int]:
     """Compute dependency identity -> generation map for recording."""
-    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
-    current_gens = state_db.get_many_generations(dep_keys)
+    gen_keys = [_generation_key(ref) for ref in deps.values()]
+    current_gens = state_db.get_many_generations(gen_keys)
 
     gen_record = dict[str, int]()
-    for dep_key in dep_keys:
-        gen = current_gens.get(dep_key)
+    for gen_key in gen_keys:
+        gen = current_gens.get(gen_key)
         if gen is not None:
-            gen_record[dep_key] = gen
+            gen_record[gen_key] = gen
     return gen_record
 
 

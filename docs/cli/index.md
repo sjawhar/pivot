@@ -688,14 +688,14 @@ pivot import REPO_URL ARTIFACT --out PATH [OPTIONS]
 **Arguments:**
 
 - `REPO_URL` - URL of the source Pivot repository (HTTPS, SSH, or `file://`)
-- `ARTIFACT` - Identity of the output in the source repo: `pipeline/stage` for a single-output stage, `pipeline/stage:key` for one field of a multi-output stage, as printed by `pivot list --deps` there
+- `ARTIFACT` - Identity of the output in the source repo: `pipeline/stage` for a single-output stage, `pipeline/stage:key` for one field of a multi-output stage, as printed by `pivot list --deps` there. A directory output is imported one file at a time: `pipeline/stage:path`, or `pipeline/stage:key/path` for a `TypedDict` field
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--rev REV` | Git ref to import from (branch, tag, commit; default: main) |
-| `--out PATH` | Local path to write the file to (without it, the identity string is used as the path) |
+| `--out PATH` | Local path to write the file to (without it, the artifact's name with `/` for `:`, so `prep/split:test` writes `prep/split/test`) |
 | `--force` | Overwrite existing files |
 | `--no-download` | Create .pvt metadata without downloading |
 

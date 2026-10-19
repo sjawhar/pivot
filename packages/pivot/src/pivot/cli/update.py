@@ -20,7 +20,7 @@ async def _batch_check(
     from pivot import import_artifact as ia
 
     return await asyncio.gather(
-        *[ia.check_for_update(pvt_data) for _, pvt_data in pairs],
+        *[ia.check_for_update(pvt_path, pvt_data) for pvt_path, pvt_data in pairs],
         return_exceptions=True,
     )
 

@@ -95,7 +95,8 @@ def _output_identities(
 
 
 def _dep_identity(dep: pivot_types.ArtifactRef) -> pivot_types.ArtifactIdentity:
-    return dep.identity
+    """The artifact node a dependency hangs from: one file of a directory is its directory."""
+    return pivot_types.source_identity(dep)
 
 
 def _build_outputs_map(
@@ -349,7 +350,7 @@ def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInf
     }
 
     # Get new deps and outs from info
-    new_deps = {ref.identity for ref in new_info["deps"].values()}
+    new_deps = {_dep_identity(ref) for ref in new_info["deps"].values()}
     new_outs = {ref.identity for ref in new_info["outs"]}
 
     # Remove old deps

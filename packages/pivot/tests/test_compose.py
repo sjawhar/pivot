@@ -28,6 +28,7 @@ from pivot.compose import (
     _MetricTag,
     _OutputSpec,
     _StageNode,
+    directory,
     metric,
     plot,
     stage,
@@ -311,7 +312,7 @@ def _helper_typing_optional_params_stage(
 
 
 def test_analyze_return_type_single() -> None:
-    specs = _analyze_return_type(_helper_single_output)
+    specs = _analyze_return_type(_helper_single_output, "p/s")
     assert len(specs) == 1
     assert specs[0].python_type is pd.DataFrame
     assert isinstance(specs[0].format, loaders.DataFrameJSONL)
@@ -319,25 +320,25 @@ def test_analyze_return_type_single() -> None:
 
 
 def test_analyze_return_type_annotated_override() -> None:
-    specs = _analyze_return_type(_helper_annotated_csv)
+    specs = _analyze_return_type(_helper_annotated_csv, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].format, loaders.CSV)
 
 
 def test_analyze_return_type_metric_tag() -> None:
-    specs = _analyze_return_type(_helper_metric_tag)
+    specs = _analyze_return_type(_helper_metric_tag, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].tag, _MetricTag)
 
 
 def test_analyze_return_type_plot_tag() -> None:
-    specs = _analyze_return_type(_helper_plot_tag)
+    specs = _analyze_return_type(_helper_plot_tag, "p/s")
     assert len(specs) == 1
     assert specs[0].tag is plot
 
 
 def test_analyze_return_type_typeddict() -> None:
-    specs = _analyze_return_type(_helper_multi_output)
+    specs = _analyze_return_type(_helper_multi_output, "p/s")
     assert len(specs) == 2
     assert specs[0].key == "data"
     assert specs[0].python_type is pd.DataFrame
@@ -349,7 +350,7 @@ def test_analyze_return_type_typeddict() -> None:
 def test_analyze_return_type_single_field_typeddict_with_metric() -> None:
     def _helper() -> _HelperSingleMetricTypedDict: ...
 
-    specs = _analyze_return_type(_helper)
+    specs = _analyze_return_type(_helper, "p/s")
     assert len(specs) == 1
     assert specs[0].key == "accuracy"
     assert isinstance(specs[0].tag, _MetricTag)
@@ -359,7 +360,7 @@ def test_analyze_return_type_rejects_reserved_key() -> None:
     def _helper() -> _HelperReservedKeyTypedDict: ...
 
     with pytest.raises(ValueError, match=f"{SINGLE_OUTPUT_KEY!r} is reserved"):
-        _analyze_return_type(_helper)
+        _analyze_return_type(_helper, "p/s")
 
 
 # --- Extension-based format inference ---
@@ -694,7 +695,7 @@ def test_external_input_produces_bindings(tmp_path: pathlib.Path) -> None:
 class _HelperTaggedOutputs(TypedDict):
     data: pd.DataFrame
     metrics: Annotated[dict, metric]
-    chart: Annotated[pd.DataFrame, plot]
+    chart: Annotated[pd.DataFrame, plot, loaders.CSV()]
 
 
 @stage
@@ -739,6 +740,51 @@ def test_consumer_dep_carries_the_producer_out_tag(tmp_path: pathlib.Path) -> No
 
     assert deps["metrics"].tag is out_tags["metrics"] is types.ArtifactTag.METRIC
     assert deps["chart"].tag is out_tags["chart"] is types.ArtifactTag.PLOT
+
+
+class _HelperUnreadableOutputs(TypedDict):
+    chart: Annotated[pd.DataFrame, plot]
+    figures: Annotated[dict[str, pd.DataFrame], directory, loaders.MatplotlibFigure()]
+
+
+@stage
+def _helper_build_unreadable() -> _HelperUnreadableOutputs:
+    return {"chart": pd.DataFrame(), "figures": {}}
+
+
+@stage
+def _helper_read_any(data: object) -> dict:
+    return {}
+
+
+@stage
+def _helper_read_path(data: pathlib.Path) -> dict:
+    return {}
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [pytest.param(_helper_read_any, id="object"), pytest.param(_helper_read_path, id="path")],
+)
+@pytest.mark.parametrize(
+    "key", [pytest.param("chart", id="plot"), pytest.param("figures", id="directory")]
+)
+def test_consumer_of_a_write_only_output_is_refused_at_build(
+    tmp_path: pathlib.Path, key: str, consumer: Callable[..., object]
+) -> None:
+    """A loader without load() cannot hand its output to a stage, so building refuses it.
+
+    A consumer typed ``pathlib.Path`` is no exception: it reads with the producer's loader.
+    """
+    with pytest.raises(TypeError) as exc_info, Pipeline("unreadable", root=tmp_path):
+        built = _helper_build_unreadable()
+        consumer(built[key])
+
+    message = str(exc_info.value)
+    assert f"Stage 'unreadable/{inspect.unwrap(consumer).__name__}'" in message, message
+    assert f"output '{key}' of stage 'unreadable/_helper_build_unreadable'" in message, message
+    assert "MatplotlibFigure" in message, message
+    assert "cannot read" in message, message
 
 
 def test_validate_artifact_identity_rejects_path_separators() -> None:
@@ -1342,7 +1388,7 @@ def test_loader_fingerprint_csv_config_change_detected() -> None:
 
 def test_analyze_return_type_metric_with_explicit_csv() -> None:
     """Metric + explicit CSV loader should use CSV, not default YAML."""
-    specs = _analyze_return_type(_helper_metric_with_csv)
+    specs = _analyze_return_type(_helper_metric_with_csv, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].tag, _MetricTag), "Should be tagged as metric"
     assert isinstance(specs[0].format, loaders.CSV), "Should use explicit CSV, not default YAML"
@@ -1350,7 +1396,7 @@ def test_analyze_return_type_metric_with_explicit_csv() -> None:
 
 def test_analyze_return_type_metric_default_yaml() -> None:
     """Metric without explicit loader should default to YAML."""
-    specs = _analyze_return_type(_helper_metric_default_yaml)
+    specs = _analyze_return_type(_helper_metric_default_yaml, "p/s")
     assert len(specs) == 1
     assert isinstance(specs[0].tag, _MetricTag)
     assert isinstance(specs[0].format, loaders.YAML), "Metric default should be YAML"
@@ -1544,7 +1590,7 @@ def test_engine_methods_raise_during_construction(tmp_path: pathlib.Path) -> Non
 
 def test_typeddict_required_fields_unwrapped() -> None:
     """Required/NotRequired wrappers don't break output parsing."""
-    specs = _analyze_return_type(_helper_required_not_required)
+    specs = _analyze_return_type(_helper_required_not_required, "p/s")
     assert len(specs) == 2
     keys = {s.key for s in specs}
     assert keys == {"data", "config"}

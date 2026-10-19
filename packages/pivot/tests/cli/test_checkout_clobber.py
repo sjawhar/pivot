@@ -259,7 +259,7 @@ def _helper_restore_layout(root: pathlib.Path) -> tuple[pathlib.Path, types.DirH
 
 def _helper_restore_only_missing(root: pathlib.Path, v2_hash: types.DirHash) -> str:
     """Run the per-target restore `pivot checkout --only-missing` runs for data/ext."""
-    result, _ = checkout_mod._restore_path_sync(
+    outcome = checkout_mod._restore_path_sync(
         root / "data" / "ext",
         v2_hash,
         root / ".pivot" / "cache" / "files",
@@ -267,7 +267,7 @@ def _helper_restore_only_missing(root: pathlib.Path, v2_hash: types.DirHash) -> 
         checkout_mod.CheckoutBehavior.SKIP_EXISTING,
         root / ".pivot",
     )
-    return result
+    return outcome.result
 
 
 def _helper_crash_at_rename(root: pathlib.Path, v2_hash: types.DirHash, crash_at: int) -> None:
@@ -364,7 +364,7 @@ def test_checkout_only_missing_reads_no_content_of_unchanged_hardlinked_director
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
 
     assert result.exit_code == 0, result.output
-    assert "Skipped 1 file(s)" in result.output
+    assert "Skipped 2 file(s)" in result.output
     assert hash_file.call_count == 0
 
 
@@ -380,7 +380,7 @@ def test_checkout_only_missing_takes_unchanged_hashes_from_state_db(
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
 
     assert result.exit_code == 0, result.output
-    assert "Skipped 1 file(s)" in result.output
+    assert "Skipped 2 file(s)" in result.output
     assert opened.call_count == 0
 
 

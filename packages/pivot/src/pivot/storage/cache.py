@@ -1586,7 +1586,8 @@ def remove_output(path: pathlib.Path) -> None:
 class MissingRestore(TypedDict):
     """Outcome of restore_missing_in_directory."""
 
-    restored: int  # missing files and empty directories restored in place
+    restored: int  # missing files restored in place
+    restored_dirs: int  # missing empty directories restored in place
     unavailable: int  # missing files whose blob is not in the cache
     local_changes: list[str]  # changed or extra files whose content the cache lacks
     replace: bool  # directory holds only cached content but not the target: replace it whole
@@ -1726,13 +1727,21 @@ def restore_missing_in_directory(
         )
         if local_changes:
             return MissingRestore(
-                restored=0, unavailable=0, local_changes=local_changes, replace=False
+                restored=0,
+                restored_dirs=0,
+                unavailable=0,
+                local_changes=local_changes,
+                replace=False,
             )
-        return MissingRestore(restored=0, unavailable=0, local_changes=[], replace=True)
+        return MissingRestore(
+            restored=0, restored_dirs=0, unavailable=0, local_changes=[], replace=True
+        )
 
     unavailable = sum(1 for _, _, file_cache_path in missing if not file_cache_path.exists())
     if unavailable:
-        return MissingRestore(restored=0, unavailable=unavailable, local_changes=[], replace=False)
+        return MissingRestore(
+            restored=0, restored_dirs=0, unavailable=unavailable, local_changes=[], replace=False
+        )
 
     for entry, file_path, file_cache_path in missing:
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1743,7 +1752,11 @@ def restore_missing_in_directory(
         dir_path.mkdir(parents=True, exist_ok=True)
 
     return MissingRestore(
-        restored=len(missing) + len(missing_dirs), unavailable=0, local_changes=[], replace=False
+        restored=len(missing),
+        restored_dirs=len(missing_dirs),
+        unavailable=0,
+        local_changes=[],
+        replace=False,
     )
 
 

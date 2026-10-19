@@ -8,6 +8,7 @@ through the CLI in a separate consumer project.
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -145,6 +146,34 @@ def _helper_rev_lock(data_path: pathlib.Path) -> str:
     return pvt_data["source"]["rev_lock"]
 
 
+def _helper_publish_directory(source: _Source, bucket: _Bucket, files: dict[str, bytes]) -> str:
+    """Point smoke/images, a return value tagged directory, at these files; commit; return HEAD."""
+    source.write_config(bucket.url)
+    manifest = [
+        types.DirManifestEntry(
+            relpath=relpath, hash=bucket.put(content), size=len(content), isexec=False
+        )
+        for relpath, content in sorted(files.items())
+    ]
+    source.write_lock(
+        "smoke/images", {None: types.DirHash(hash="0123456789abcdef", manifest=manifest)}
+    )
+    return source.commit("directory output")
+
+
+def _helper_twelve_files() -> dict[str, bytes]:
+    """Twelve files, so `part/z.csv` sorts past the ten names "not found" lists."""
+    files = {f"part/f{index:02d}.csv": f"{index}\n".encode() for index in range(11)}
+    files["part/z.csv"] = b"z\n"
+    return files
+
+
+_OLD_NAME_HINT = (
+    "'smoke/images/part/z.csv' is the old name of file 'part/z.csv' of directory output "
+    + "'smoke/images'; it is now 'smoke/images:part/z.csv'"
+)
+
+
 # =============================================================================
 # import
 # =============================================================================
@@ -167,17 +196,33 @@ def test_import_downloads_artifact_and_records_its_source(
     assert pvt_data["source"]["remote"] == bucket.url
 
 
+@pytest.mark.parametrize(
+    ("key", "artifact", "hint"),
+    [
+        pytest.param(None, "smoke/images:part/a.csv", "smoke/images:{filename}", id="return-value"),
+        pytest.param(
+            "images", "smoke/build:images/part/a.csv", "smoke/build:images/{filename}", id="field"
+        ),
+    ],
+)
 def test_import_file_inside_directory_output(
-    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+    runner: click.testing.CliRunner,
+    source: _Source,
+    bucket: _Bucket,
+    consumer: pathlib.Path,
+    key: str | None,
+    artifact: str,
+    hint: str,
 ) -> None:
-    """A directory output is imported one file at a time, by ``<identity>/<relpath>``."""
+    """A directory output is imported one file at a time, by the name `pivot list` gives it."""
     content = b"a,b\n1,2\n"
     file_hash = bucket.put(content)
+    stage_name = artifact.partition(":")[0]
     source.write_config(bucket.url)
     source.write_lock(
-        "smoke/images",
+        stage_name,
         {
-            None: types.DirHash(
+            key: types.DirHash(
                 hash="0123456789abcdef",
                 manifest=[
                     types.DirManifestEntry(
@@ -188,14 +233,81 @@ def test_import_file_inside_directory_output(
         },
     )
     source.commit("directory output")
+    directory = types.identity_key(types.ArtifactIdentity(stage_name, key))
 
-    whole = runner.invoke(cli.cli, ["import", str(source.root), "smoke/images"])
+    whole = runner.invoke(cli.cli, ["import", str(source.root), directory])
     assert whole.exit_code != 0
-    assert "Cannot import directory output 'smoke/images'" in whole.output
-    assert "smoke/images/{filename}" in whole.output
+    assert f"Cannot import directory output '{directory}'" in whole.output
+    assert hint in whole.output
 
-    data_path = _helper_import(runner, source, "smoke/images/part/a.csv", "a.csv")
+    data_path = _helper_import(runner, source, artifact, "a.csv")
     assert data_path.read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    ("lock_key", "member", "artifact", "default_out"),
+    [
+        pytest.param(
+            None, "part/a.csv", "smoke/images:part/a.csv", "smoke/images/part/a.csv", id="file"
+        ),
+        pytest.param(
+            "images",
+            "part/a.csv",
+            "smoke/build:images/part/a.csv",
+            "smoke/build/images/part/a.csv",
+            id="field-file",
+        ),
+        pytest.param("model", None, "smoke/train:model", "smoke/train/model", id="keyed-output"),
+    ],
+)
+def test_import_without_out_writes_a_path_without_a_colon(
+    runner: click.testing.CliRunner,
+    source: _Source,
+    bucket: _Bucket,
+    consumer: pathlib.Path,
+    lock_key: str | None,
+    member: str | None,
+    artifact: str,
+    default_out: str,
+) -> None:
+    """The default path is the artifact's name with `/` for `:`."""
+    content = b"a,b\n1,2\n"
+    file_hash = bucket.put(content)
+    output: types.HashInfo = types.FileHash(hash=file_hash)
+    if member is not None:
+        output = types.DirHash(
+            hash="0123456789abcdef",
+            manifest=[
+                types.DirManifestEntry(
+                    relpath=member, hash=file_hash, size=len(content), isexec=False
+                )
+            ],
+        )
+    source.write_config(bucket.url)
+    source.write_lock(artifact.partition(":")[0], {lock_key: output})
+    source.commit("output")
+
+    result = runner.invoke(cli.cli, ["import", str(source.root), artifact])
+
+    assert result.exit_code == 0, result.output
+    assert (consumer / default_out).read_bytes() == content
+    assert track.get_pvt_path(consumer / default_out).is_file()
+    assert not [path for path in consumer.rglob("*") if ":" in path.name]
+
+
+def test_import_under_the_old_name_of_a_directory_file_names_the_new_one(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+) -> None:
+    """`pivot import` named one file of a return value tagged directory `stage/path`."""
+    _helper_publish_directory(source, bucket, _helper_twelve_files())
+
+    result = runner.invoke(
+        cli.cli, ["import", str(source.root), "smoke/images/part/z.csv", "--out", "z.csv"]
+    )
+
+    assert result.exit_code != 0
+    assert _OLD_NAME_HINT in result.output, result.output
+    assert not (consumer / "z.csv").exists()
 
 
 @pytest.mark.parametrize(
@@ -326,31 +438,31 @@ def test_import_unknown_artifact_lists_some_available_and_counts_the_rest(
     assert len(shown) + int(more.group(1)) == total
 
 
-def test_import_refuses_path_produced_by_two_stages(
+def test_import_refuses_name_of_two_outputs(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:
-    """``smoke/images/a.csv`` names both a file in a directory output and a stage."""
+    """A lock with field ``images/a.csv`` beside directory field ``images`` names one file twice."""
     source.write_config(bucket.url)
     source.write_lock(
-        "smoke/images",
+        "smoke/build",
         {
-            None: types.DirHash(
+            "images": types.DirHash(
                 hash="0123456789abcdef",
                 manifest=[
                     types.DirManifestEntry(
                         relpath="a.csv", hash="1111111111111111", size=1, isexec=False
                     )
                 ],
-            )
+            ),
+            "images/a.csv": types.FileHash(hash="2222222222222222"),
         },
     )
-    source.write_lock("smoke/images/a.csv", {None: types.FileHash(hash="2222222222222222")})
     source.commit("colliding identities")
 
-    result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/images/a.csv"])
+    result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/build:images/a.csv"])
 
     assert result.exit_code != 0
-    assert "produced by multiple stages: smoke/images, smoke/images/a.csv" in result.output
+    assert "'smoke/build:images/a.csv' names more than one output" in result.output
 
 
 def test_import_never_writes_outside_project_or_over_existing_files(
@@ -556,3 +668,67 @@ def test_update_with_corrupt_remote_keeps_last_good_file(
     assert data_path.exists() and data_path.read_bytes() == b"v1", (
         "the previously imported file must survive a failed update"
     )
+
+
+@pytest.mark.parametrize(
+    "source_moved", [pytest.param(False, id="source-unchanged"), pytest.param(True, id="moved")]
+)
+def test_update_of_an_import_under_the_old_name_of_a_directory_file_names_the_fix(
+    runner: click.testing.CliRunner,
+    source: _Source,
+    bucket: _Bucket,
+    consumer: pathlib.Path,
+    source_moved: bool,
+) -> None:
+    """An import whose .pvt names one file `stage/path` is broken in status, dry run and update.
+
+    Each names the new name `stage:path` and the command that re-imports it, whatever the
+    directory's size; that command makes the import update again.
+    """
+    files = _helper_twelve_files()
+    head = _helper_publish_directory(source, bucket, files)
+    data_path = consumer / "data" / "raw" / "z.csv"
+    data_path.parent.mkdir(parents=True)
+    data_path.write_bytes(b"z\n")
+    track.write_pvt_file(
+        track.get_pvt_path(data_path),
+        track.PvtData(
+            path="z.csv",
+            hash=xxhash.xxh64(b"z\n").hexdigest(),
+            size=2,
+            source=track.ImportSource(
+                repo=str(source.root),
+                rev="main",
+                rev_lock=head,
+                stage="smoke/images",
+                path="smoke/images/part/z.csv",
+                remote=bucket.url,
+            ),
+        ),
+    )
+    if source_moved:
+        files["part/z.csv"] = b"z2\n"
+        _helper_publish_directory(source, bucket, files)
+    fix = (
+        f"pivot import {source.root} smoke/images:part/z.csv --rev main --out data/raw/z.csv "
+        + "--force"
+    )
+
+    status = runner.invoke(cli.cli, ["status", "--check-imports"])
+    dry_run = runner.invoke(cli.cli, ["update", "--dry-run"])
+    update = runner.invoke(cli.cli, ["update"])
+
+    assert "\u2717 data/raw/z.csv: check failed" in status.output, status.output
+    for result in (status, dry_run, update):
+        assert _OLD_NAME_HINT in result.output, result.output
+        assert fix in result.output, result.output
+    assert dry_run.exit_code == 1, dry_run.output
+    assert update.exit_code == 1, update.output
+    assert data_path.read_bytes() == b"z\n"
+
+    reimport = runner.invoke(cli.cli, shlex.split(fix)[1:])
+    assert reimport.exit_code == 0, reimport.output
+    assert data_path.read_bytes() == (b"z2\n" if source_moved else b"z\n")
+    after = runner.invoke(cli.cli, ["update"])
+    assert after.exit_code == 0, after.output
+    assert f"Up to date: {data_path}" in after.output

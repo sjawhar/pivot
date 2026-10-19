@@ -6,6 +6,7 @@ import functools
 import logging
 import os
 import pathlib
+import shlex
 import tempfile
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -251,9 +252,9 @@ async def read_remote_lock_file(
     return data
 
 
-def _entry_identity(stage: str, entry: OutEntry) -> str:
-    """Identity key of a lock output entry: ``stage`` or ``stage:key``."""
-    return types.identity_key(types.ArtifactIdentity(stage, entry["key"]))
+def _entry_identity(stage: str, entry: OutEntry) -> types.ArtifactIdentity:
+    """Identity of a lock output entry: ``stage`` or ``stage:key``."""
+    return types.ArtifactIdentity(stage, entry["key"])
 
 
 def _entry_size(entry: OutEntry, identity: str) -> int:
@@ -265,10 +266,45 @@ def _entry_size(entry: OutEntry, identity: str) -> int:
     return 0
 
 
-def _iter_manifest_paths(identity: str, entry: OutEntry) -> list[tuple[str, DirManifestEntry]]:
+def _iter_manifest_paths(
+    identity: types.ArtifactIdentity, entry: OutEntry
+) -> list[tuple[str, DirManifestEntry]]:
+    """Each file of a directory output, named as a stage depending on it names it."""
     if "manifest" not in entry:
         return []
-    return [(f"{identity}/{m['relpath']}", m) for m in entry["manifest"]]
+    return [
+        (types.identity_key(types.directory_file_identity(identity, m["relpath"])), m)
+        for m in entry["manifest"]
+    ]
+
+
+def _renamed_message(old_name: str, directory: str, relpath: str, new_name: str) -> str:
+    return (
+        f"'{old_name}' is the old name of file '{relpath}' of directory output "
+        + f"'{directory}'; it is now '{new_name}'"
+    )
+
+
+def _refuse_old_directory_file_name(
+    pvt_path: pathlib.Path, source: track.ImportSource, rev: str
+) -> None:
+    """Refuse an import recorded as ``stage/path``, the name of a file of a directory output
+    before it became ``stage:path``; the error gives the command that re-imports it."""
+    prefix = f"{source['stage']}/"
+    if not source["path"].startswith(prefix):
+        return
+    relpath = source["path"].removeprefix(prefix)
+    new_name = types.identity_key(
+        types.directory_file_identity(types.ArtifactIdentity(source["stage"], None), relpath)
+    )
+    out = project.to_relative_path(track.get_data_path(pvt_path))
+    command = shlex.join(
+        ["pivot", "import", source["repo"], new_name, "--rev", rev, "--out", out, "--force"]
+    )
+    raise exceptions.PivotError(
+        _renamed_message(source["path"], source["stage"], relpath, new_name)
+        + f". Re-import it: {command}"
+    )
 
 
 async def resolve_remote_path(
@@ -306,22 +342,27 @@ async def _resolve_remote_path_with_session(
 
     matches = list[tuple[str, str, str, int]]()
     available = set[str]()
+    renamed: str | None = None
 
     for stage, lock_data in zip(stage_names, lock_datas, strict=True):
         if lock_data is None:
             continue
         for entry in lock_data["outs"]:
-            identity = _entry_identity(stage, entry)
-            manifest_paths = _iter_manifest_paths(identity, entry)
+            entry_identity = _entry_identity(stage, entry)
+            identity = types.identity_key(entry_identity)
+            manifest_paths = _iter_manifest_paths(entry_identity, entry)
             available.add(identity)
             available.update(full_path for full_path, _ in manifest_paths)
 
             if identity == path:
                 if "manifest" in entry:
+                    file_example = types.identity_key(
+                        types.directory_file_identity(entry_identity, "{filename}")
+                    )
                     message = (
                         "Cannot import directory output "
                         + f"'{path}'. Import individual files instead, "
-                        + f"e.g., '{path}/{{filename}}'"
+                        + f"e.g., '{file_example}'"
                     )
                     raise exceptions.PivotError(message)
                 matches.append((stage, path, entry["hash"], _entry_size(entry, identity)))
@@ -337,6 +378,11 @@ async def _resolve_remote_path_with_session(
                             int(manifest_entry["size"]),
                         )
                     )
+                elif f"{identity}/{manifest_entry['relpath']}" == path:
+                    renamed = _renamed_message(path, identity, manifest_entry["relpath"], full_path)
+
+    if not matches and renamed is not None:
+        raise exceptions.PivotError(renamed)
 
     if not matches:
         max_shown = 10
@@ -354,7 +400,10 @@ async def _resolve_remote_path_with_session(
 
     if len(matches) > 1:
         stages = ", ".join(sorted({stage for stage, _, _, _ in matches}))
-        raise exceptions.PivotError(f"Path '{path}' is produced by multiple stages: {stages}")
+        raise exceptions.PivotError(
+            f"'{path}' names more than one output (of stage {stages}); "
+            + "the source pipeline must rename one"
+        )
 
     stage, matched_path, hash_, size = matches[0]
     return ResolvedImport(
@@ -382,7 +431,7 @@ async def import_artifact(
     if project_root is None:
         project_root = project.get_project_root()
 
-    dest = out if out is not None else path
+    dest = out if out is not None else path.replace(":", "/")
     data_path = project.normalize_path(dest, base=project_root)
     if not data_path.is_relative_to(project_root.absolute()):
         raise exceptions.PivotError(
@@ -446,11 +495,12 @@ class UpdateResult(TypedDict):
     path: str
 
 
-async def check_for_update(pvt_data: track.PvtData) -> UpdateCheck:
+async def check_for_update(pvt_path: pathlib.Path, pvt_data: track.PvtData) -> UpdateCheck:
     """Check if import has updates. Resolves current ref, compares to rev_lock."""
     if "source" not in pvt_data:
         raise exceptions.PivotError("Not an import")
     source = pvt_data["source"]
+    _refuse_old_directory_file_name(pvt_path, source, source["rev"])
     rev_lock = await _resolve_ref(source["repo"], source["rev"], None)
     if rev_lock is None:
         raise exceptions.RemoteError(f"Cannot resolve ref '{source['rev']}' from {source['repo']}")
@@ -472,6 +522,7 @@ async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -
     source = pvt_data["source"]
     rev = new_rev if new_rev is not None else source["rev"]
     old_rev = source["rev_lock"]
+    _refuse_old_directory_file_name(pvt_path, source, rev)
 
     # Re-resolve at new/current rev
     resolved = await resolve_remote_path(source["repo"], source["path"], rev, None)

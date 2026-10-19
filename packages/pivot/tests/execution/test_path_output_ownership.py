@@ -70,13 +70,13 @@ def test_directory_pathonly_members_cannot_move_project_files(tmp_path: pathlib.
     )
 
     with pytest.raises(exceptions.StageDefinitionError, match="inside the project"):
-        worker._write_output_with_store(
-            _path_ref(types.ArtifactTag.DIRECTORY),
-            {"member.bin": source},
-            store,
-            project_root,
+        worker._write_outputs_with_store(
+            {_path_ref(types.ArtifactTag.DIRECTORY): {"member.bin": source}}, store, project_root
         )
     assert source.read_bytes() == b"input"
+    assert not (project_root / "data" / "pathret" / "test").exists(), (
+        "a refused value is not prepared"
+    )
 
 
 @pytest.mark.parametrize("source_kind", ["equal", "child", "parent"])
