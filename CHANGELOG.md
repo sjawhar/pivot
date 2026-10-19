@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-10-19)
+
+### Features
+
+- **compose**: Restore directory outputs that a stage returns as a dict of files
+  ([#489](https://github.com/sjawhar/pivot/pull/489),
+  [`961e174`](https://github.com/sjawhar/pivot/commit/961e1742ac20fcee71ef17cba3db47924a4b2a2e))
+
+
 ## v0.3.11 (2026-10-19)
 
 ### Bug Fixes
