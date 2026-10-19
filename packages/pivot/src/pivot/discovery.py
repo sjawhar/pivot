@@ -114,9 +114,9 @@ def _holds_user_code(path: str, root: pathlib.Path) -> bool:
 
     That is every directory but a library's (``fingerprint.is_library_path``: the interpreter's
     prefix, so the stdlib even when the interpreter lives under the root, site-packages or
-    dist-packages, and pivot's own packages wherever they are installed), minus, under the
-    project root, the library and tooling directories discovery skips. A stage's module outside
-    the root, as a package installed from a source checkout, is user code.
+    dist-packages, and pivot's own packages, ``fingerprint._PIVOT_PACKAGE_DIRS``), minus, under
+    the project root, the library and tooling directories discovery skips. A stage's module
+    outside the root, as a package installed from a source checkout, is user code.
     """
     try:
         resolved = pathlib.Path(path or ".").resolve()

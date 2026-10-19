@@ -66,8 +66,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 26 records tuples and frozensets of scalars and compiled regexes by value.
 # Version 27 keys cached function hashes and manifest source files by each file's content, not
 # its mtime, size and inode, which an edit can keep.
-# Version 28 treats pivot's own packages as library code wherever they are installed, so a
-# stage calling into pivot_tui installed from a source checkout no longer walks its source, and
+# Version 28 treats pivot's own packages as library code outside site-packages too, so a stage
+# calling into pivot_tui installed editable from its checkout no longer walks its source, and
 # decides a namespace package by the rule that decides a regular module (`is_library_path`).
 _CACHE_SCHEMA_VERSION = 28
 _REPR_SIZE_LIMIT = 10_000
@@ -111,14 +111,17 @@ _STDLIB_PATHS = _init_stdlib_paths()
 
 
 def _init_pivot_package_dirs() -> tuple[pathlib.Path, ...]:
-    """Resolve the directories of pivot's own packages: pivot's, and pivot_tui's when the
-    pivot-tui distribution is installed, wherever they are installed. An editable install, as
-    pivot's workspace makes, puts them in a source checkout outside site-packages.
+    """Resolve the directories of pivot's own packages: pivot's wherever it is installed, and
+    pivot_tui's when the pivot-tui distribution is installed. An editable install, as pivot's
+    workspace makes, puts them in a source checkout outside site-packages.
 
     pivot_tui's directories come from what the installed pivot-tui distribution records: the
     site directory it is installed in (a wheel install) and each directory its ``.pth`` file
-    adds to ``sys.path`` (an editable install). They never come from looking the name up on
-    ``sys.path``, where a user's own module or package named ``pivot_tui`` may come first."""
+    adds to ``sys.path`` (an editable install by its own backend, uv_build). They never come
+    from looking the name up on ``sys.path``, where a user's own module or package named
+    ``pivot_tui`` may come first. An editable install whose ``.pth`` file installs an import hook
+    or adds a link tree records no directory its files resolve into, so pivot_tui stays user
+    code under it."""
     dirs = [pathlib.Path(__file__).resolve().parent]
     try:
         tui = importlib.metadata.distribution("pivot-tui")
