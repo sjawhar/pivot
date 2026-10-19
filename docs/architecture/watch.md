@@ -118,7 +118,8 @@ Note: JsonlSink translates internal engine events to the existing `pivot repro -
 
 ### Code Change Handling
 
-When Python files change, the worker pool is restarted via `executor_core.restart_workers()`:
+When Python files change, the worker pool is restarted via `executor_core.restart_workers()`, at
+the reloaded pipeline's width (see [Pool Size](execution.md#pool-size)):
 
 **Why restart instead of hot reload?**
 

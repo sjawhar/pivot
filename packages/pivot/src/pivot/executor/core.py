@@ -64,9 +64,10 @@ def configured_worker_count(override: int | None = None) -> int:
     return max(1, max_workers)
 
 
-def compute_max_workers(stage_count: int, override: int | None = None) -> int:
-    """Worker pool size: the configured worker count, clamped to the stages to run."""
-    return max(1, min(configured_worker_count(override), stage_count))
+def compute_max_workers(width: int, override: int | None = None) -> int:
+    """Worker pool size: the configured worker count, clamped to the run's width, the most
+    stages that can run at once (``engine.graph.get_width``)."""
+    return max(1, min(configured_worker_count(override), width))
 
 
 def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
@@ -113,28 +114,27 @@ def create_manager() -> managers.SyncManager:
     return manager
 
 
-def prepare_workers(
-    stage_count: int, *, parallel: bool = True, max_workers: int | None = None
-) -> int:
-    """Pre-warm loky worker pool. Returns actual worker count.
+def prepare_workers(width: int, *, parallel: bool = True, max_workers: int | None = None) -> int:
+    """Pre-warm loky worker pool for a run of the given width. Returns actual worker count.
 
-    Call before starting Textual TUI to avoid FD inheritance issues.
+    Call before starting Textual TUI to avoid FD inheritance issues. Pass the width the engine
+    will compute for the run, so the engine reuses these workers instead of resizing the pool.
     Safe to call in non-TUI mode (no downside, slightly faster first execution).
     """
-    if not parallel or stage_count <= 0:
+    if not parallel or width <= 0:
         return 1
-    workers = compute_max_workers(stage_count, max_workers)
+    workers = compute_max_workers(width, max_workers)
     _warm_workers(_get_executor(workers), workers)
     return workers
 
 
-def restart_workers(stage_count: int, max_workers: int | None = None) -> int:
+def restart_workers(width: int, max_workers: int | None = None) -> int:
     """Kill and warm fresh workers after code reload or stale-source detection."""
 
     # A reusable executor with matching kwargs would otherwise keep live workers.
-    if stage_count <= 0:
+    if width <= 0:
         return 1
-    workers = compute_max_workers(stage_count, max_workers)
+    workers = compute_max_workers(width, max_workers)
     _warm_workers(_get_executor(workers, kill_workers=True), workers)
     return workers
 

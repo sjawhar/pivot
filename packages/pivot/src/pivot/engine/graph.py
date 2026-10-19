@@ -26,6 +26,7 @@ __all__ = [
     "get_downstream_stages",
     "get_upstream_stages",
     "get_stage_dag",
+    "get_width",
     "update_stage",
     "get_artifact_consumers",
     "get_execution_order",
@@ -389,6 +390,63 @@ def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
                     stage_dag.add_edge(consumer_name, stage_name)
 
     return stage_dag
+
+
+def get_width(stage_dag: nx.DiGraph[str], stages: list[str]) -> int:
+    """Return the most of ``stages`` that can run at once.
+
+    The scheduler starts a stage once the stages of the run it consumes from have finished,
+    so stages can run together exactly when no chain of run stages connects any two of them.
+    The largest such set is the stage count minus a maximum matching that pairs each stage
+    with one stage it transitively depends on (Dilworth's theorem, by Konig's).
+
+    Args:
+        stage_dag: Stage-only DAG (from get_stage_dag)
+        stages: The stages of the run; dependencies through stages outside it do not count
+    """
+    order = list(nx.topological_sort(stage_dag.subgraph(stages)))
+    index = {name: i for i, name in enumerate(order)}
+    direct = [[index[up] for up in stage_dag.successors(name) if up in index] for name in order]
+    # Bitset of the run stages each stage transitively depends on; dependencies come later.
+    reach = [0] * len(order)
+    for i in reversed(range(len(order))):
+        for j in direct[i]:
+            reach[i] |= reach[j] | (1 << j)
+
+    owner = [-1] * len(order)  # the stage each dependency is matched to
+    unmatched = list[int]()
+    for i, upstream in enumerate(direct):
+        free = next((j for j in upstream if owner[j] == -1), None)
+        if free is None:
+            unmatched.append(i)
+        else:
+            owner[free] = i
+    still_unmatched = [i for i in unmatched if not _augment(i, reach, owner)]
+    return len(still_unmatched)
+
+
+def _augment(start: int, reach: list[int], owner: list[int]) -> bool:
+    """Match ``start`` along an augmenting path, if one exists, without recursion."""
+    seen = 0
+    path = [start]  # stages on the path; path[k + 1] owns dependencies[k]
+    dependencies = list[int]()
+    while path:
+        candidates = reach[path[-1]] & ~seen
+        if not candidates:
+            path.pop()
+            if dependencies:
+                dependencies.pop()
+            continue
+        lowest = candidates & -candidates
+        seen |= lowest
+        dependency = lowest.bit_length() - 1
+        dependencies.append(dependency)
+        if owner[dependency] == -1:
+            for stage, matched in zip(path, dependencies, strict=True):
+                owner[matched] = stage
+            return True
+        path.append(owner[dependency])
+    return False
 
 
 def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:

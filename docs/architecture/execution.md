@@ -111,12 +111,30 @@ when a run starts (it died, or its socket was removed) is replaced then.
 - **Compatibility** - Works on macOS and Linux
 - **Clean state** - Each worker starts fresh without inherited state
 
+### Pool Size
+
+A run starts one worker per stage it can run at once, up to `core.max_workers`: the width of
+the run's stage graph, the largest set of its stages none of which consumes, directly or through
+other stages of the run, another's output (`engine/graph.py` `get_width`). A chain of stages runs
+on one worker; five stages that read one source stage run on five. The width counts every stage
+of the run, including stages that will skip. The widest topological level can be smaller: with
+stages A and S, and B and C that both read S, the levels {A, S} and {B, C} hold two stages each,
+but A, B and C can all run together, so the width is three.
+
+A TUI pre-warms the same number of workers before Textual starts, and a watch-mode code reload
+restarts the pool at the reloaded pipeline's width. `pivot run` runs its named stages in the
+given order and starts a stage once the named stages it consumes from have finished, so its
+width is that of the named stages alone.
+
+The width bounds the pool, not the schedule: stage `resources` still limit how many stages run
+together.
+
 ### Warm Workers
 
 Workers stay alive across runs in one Engine, so imports from earlier stages remain available.
 Before a later run reuses workers, Pivot replaces them if a user-code module they imported
-changed. Worker capacity grows for a larger run but does not shrink for a smaller one: the
-scheduler still limits that run's parallelism, while a later full run reuses every warm worker.
+changed. Worker capacity grows for a wider run but does not shrink for a narrower one: the
+scheduler still limits that run's parallelism, while a later wide run reuses every warm worker.
 
 ## Stage resources
 

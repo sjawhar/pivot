@@ -260,10 +260,9 @@ def _run_pipeline(
             )
         return {}
 
-    # Pre-warm loky executor before starting Textual TUI
-    num_workers = len(execution_order) if execution_order else 1
+    # Pre-warm loky executor before starting Textual TUI, as many workers as the engine will use
     if tui:
-        prepare_workers(num_workers)
+        prepare_workers(engine_graph.get_width(graph, execution_order) if execution_order else 1)
 
     # Set up run_id if using TUI
     run_id: str | None = None

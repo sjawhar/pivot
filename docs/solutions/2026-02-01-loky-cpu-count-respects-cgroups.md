@@ -43,11 +43,11 @@ Use `loky.cpu_count()` which reads cgroup CPU limits:
 ```python
 import loky
 
-def compute_max_workers(stage_count: int, override: int | None = None) -> int:
-    """Compute worker count respecting container limits."""
+def compute_max_workers(width: int, override: int | None = None) -> int:
+    """Compute worker count respecting container limits, clamped to the run's width."""
     cpu_count = loky.cpu_count() or 1  # Container-aware
     max_workers = override if override is not None else cpu_count
-    return max(1, min(max_workers, stage_count))
+    return max(1, min(max_workers, width))
 ```
 
 loky inspects multiple cgroup interfaces:

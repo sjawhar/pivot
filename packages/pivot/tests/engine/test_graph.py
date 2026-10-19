@@ -16,6 +16,8 @@ from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import networkx as nx
+
 
 def _artifact_ref(identity: ArtifactIdentity) -> ArtifactRef:
     return ArtifactRef(
@@ -951,3 +953,53 @@ def test_extract_graph_view_complex_diamond_with_edge_verification(tmp_path: Pat
 
     # Exact count
     assert len(artifact_edges) == 4
+
+
+# --- Width tests ---
+
+
+def _helper_stage_dag(dependencies: dict[str, list[str]]) -> nx.DiGraph[str]:
+    """Stage DAG in which each stage consumes the output of every stage it lists."""
+    stages = {
+        name: _create_stage(
+            name,
+            [ArtifactIdentity(dep, "out.csv") for dep in deps],
+            [ArtifactIdentity(name, "out.csv")],
+        )
+        for name, deps in dependencies.items()
+    }
+    return graph.get_stage_dag(graph.build_graph(stages))
+
+
+@pytest.mark.parametrize(
+    ("dependencies", "run", "width"),
+    [
+        pytest.param({"a": [], "b": ["a"], "c": ["b"], "d": ["c"]}, None, 1, id="chain"),
+        pytest.param(
+            {"src": [], **{f"m{i}": ["src"] for i in range(5)}}, None, 5, id="fan-out-of-5"
+        ),
+        pytest.param(
+            {"top": [], "left": ["top"], "right": ["top"], "bottom": ["left", "right"]},
+            None,
+            2,
+            id="diamond",
+        ),
+        # Levels {s0, s1} and {s2, s3}: the widest level is 2, but s0, s2 and s3 run together.
+        pytest.param(
+            {"s0": [], "s1": [], "s2": ["s1"], "s3": ["s1"]},
+            None,
+            3,
+            id="widest-level-undercounts",
+        ),
+        # `pivot run a b` orders b after a only through x, which is not in the run.
+        pytest.param({"a": [], "x": ["a"], "b": ["x"]}, ["a", "b"], 2, id="path-outside-run"),
+        pytest.param({"a": [], "x": ["a"], "b": ["x"]}, ["b", "a", "x"], 1, id="path-inside-run"),
+        pytest.param({"a": [], "b": []}, ["a", "a"], 1, id="repeated-stage"),
+    ],
+)
+def test_get_width_is_the_most_stages_that_can_run_at_once(
+    dependencies: dict[str, list[str]], run: list[str] | None, width: int
+) -> None:
+    stage_dag = _helper_stage_dag(dependencies)
+    stages = list(dependencies) if run is None else run
+    assert graph.get_width(stage_dag, stages) == width

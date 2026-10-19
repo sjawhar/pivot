@@ -695,3 +695,149 @@ with Pipeline("warm") as pipeline:
                 tg.cancel_scope.cancel()
     finally:
         sys.modules.pop(module_name, None)
+
+
+_CHAIN_PIPELINE = """\
+import os
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def first() -> str:
+    return str(os.getpid())
+
+
+@stage
+def step(previous: str) -> str:
+    return str(os.getpid())
+
+
+with Pipeline("chain") as pipeline:
+    pid = first()
+    for _ in range(11):
+        pid = step(pid)
+"""
+
+# Levels {lone, source} and {left, right}: the widest level is 2, but lone, left and right can
+# all run at once.
+_WIDTH_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def lone() -> str:
+    return "lone"
+
+
+@stage
+def source() -> str:
+    return "source"
+
+
+@stage
+def left(value: str) -> str:
+    return value + " left"
+
+
+@stage
+def right(value: str) -> str:
+    return value + " right"
+
+
+with Pipeline("width") as pipeline:
+    lone()
+    shared = source()
+    left(shared)
+    right(shared)
+"""
+
+# Imported by every Python process the command starts: each loky worker records its pid.
+_WORKER_LOG_HOOK = """\
+import os
+import sys
+
+if sys.orig_argv[1:3] == ["-m", "loky.backend.popen_loky_posix"]:
+    with open(os.environ["PIVOT_TEST_WORKER_LOG"], "a") as log:
+        log.write(f"{os.getpid()}\\n")
+"""
+
+
+def _helper_pivot(root: pathlib.Path, env: dict[str, str], *args: str) -> None:
+    """Run the installed ``pivot`` command in ``root`` and require it to succeed."""
+    proc = subprocess.run(
+        [str(pathlib.Path(sys.executable).parent / "pivot"), *args],
+        cwd=root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def _helper_configure_workers(root: pathlib.Path, max_workers: int) -> None:
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  max_workers: {max_workers}\n")
+
+
+def test_repro_runs_a_chain_of_stages_on_one_worker(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chain runs one stage at a time, so `pivot repro` runs all twelve stages in one warm
+    worker even when the configuration allows twelve."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _CHAIN_PIPELINE)
+    _helper_configure_workers(root, 12)
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    _helper_pivot(root, env, "repro")
+
+    stages = pipeline.list_stages()
+    assert len(stages) == 12
+    pids = {_helper_output_path(root, pipeline, stage).read_text() for stage in stages}
+    assert len(pids) == 1, f"the chain ran on {len(pids)} workers: {sorted(pids)}"
+
+
+@pytest.mark.parametrize(
+    ("max_workers", "command", "workers"),
+    [
+        pytest.param(8, ["repro"], 3, id="repro"),
+        pytest.param(8, ["repro", "--tui"], 3, id="repro-tui-prewarm"),
+        pytest.param(2, ["repro"], 2, id="repro-configured-cap"),
+        # `pivot run` orders left and right after source, so two of the three run at once.
+        pytest.param(8, ["run", "--force", "source", "left", "right"], 2, id="run"),
+        pytest.param(
+            8, ["run", "--tui", "--force", "source", "left", "right"], 2, id="run-tui-prewarm"
+        ),
+    ],
+)
+def test_command_starts_as_many_workers_as_stages_can_run_at_once(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_workers: int,
+    command: list[str],
+    workers: int,
+) -> None:
+    """A command starts one worker per stage that can run at once, up to the configured worker
+    count; a TUI's pre-warm starts the same workers its engine then uses."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _WIDTH_PIPELINE)
+    _helper_configure_workers(root, max_workers)
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+    env["TERM"] = "xterm-256color"
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_WORKER_LOG_HOOK)
+    worker_log = tmp_path / "workers.log"
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(hook), env.get("PYTHONPATH")]))
+    env["PIVOT_TEST_WORKER_LOG"] = str(worker_log)
+
+    _helper_pivot(root, env, *command)
+
+    started = worker_log.read_text().split()
+    assert len(started) == workers, f"{' '.join(command)} started {len(started)} workers"

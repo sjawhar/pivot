@@ -22,6 +22,7 @@ from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine
+from pivot.engine import graph as engine_graph
 from pivot.engine import sources as engine_sources
 from pivot.executor import prepare_workers
 from pivot.types import (
@@ -96,10 +97,10 @@ def _run_with_tui(
 
     from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 
-    # Pre-warm loky executor before starting Textual TUI.
+    # Pre-warm loky executor before starting Textual TUI, as many workers as the engine will use.
     # Textual manipulates terminal file descriptors which breaks loky's
     # resource tracker if spawned after Textual starts.
-    prepare_workers(len(stages_list))
+    prepare_workers(engine_graph.get_width(cli_helpers.build_dag(), stages_list))
 
     cancel_event = threading.Event()
     pipeline = cli_decorators.get_pipeline_from_context()

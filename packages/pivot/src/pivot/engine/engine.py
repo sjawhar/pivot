@@ -1113,12 +1113,14 @@ class Engine:
                     + "files first."
                 )
 
-        # Compute max workers: the pool never needs more workers than stages, but the cpu
+        # The pool never needs more workers than stages that can run at once, but the cpu
         # resource capacity is the configured worker count, whatever this run schedules.
         effective_max_workers = (
             1
             if not parallel
-            else executor_core.compute_max_workers(len(execution_order), max_workers)
+            else executor_core.compute_max_workers(
+                engine_graph.get_width(stage_dag, execution_order), max_workers
+            )
         )
         cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1
 
@@ -2567,13 +2569,13 @@ class Engine:
             if coordinator is not None and coordinator.should_restart_workers(
                 parallel=self._stored_parallel
             ):
-                n_stages = len(stages)
+                width = engine_graph.get_width(engine_graph.get_stage_dag(self._graph), stages)
                 stored_max = self._stored_max_workers
                 try:
-                    await anyio.to_thread.run_sync(
-                        lambda: executor_core.restart_workers(n_stages, stored_max)
+                    workers = await anyio.to_thread.run_sync(
+                        lambda: executor_core.restart_workers(width, stored_max)
                     )
-                    _logger.info("Worker pool restarted for code reload (%d stages)", n_stages)
+                    _logger.info("Worker pool restarted for code reload (%d workers)", workers)
                 except Exception:
                     _logger.warning(
                         "Failed to restart worker pool - continuing with existing workers",

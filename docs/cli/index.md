@@ -870,7 +870,7 @@ pivot config unset default_remote
 |-----|-------------|---------|
 | `cache.dir` | Cache directory | `.pivot/cache` |
 | `cache.checkout_mode` | Checkout mode order | `hardlink,symlink,copy` |
-| `core.max_workers` | Parallel workers (-1 = all CPUs) | `-2` |
+| `core.max_workers` | Most parallel workers (-1 = all CPUs); a run starts fewer when fewer of its stages can run at once | `-2` |
 | `core.run_history_retention` | Keep last N runs | `100` |
 | `core.state_dir` | State directory | `.pivot` |
 | `resources` | Scheduler resource capacities | `{}` |

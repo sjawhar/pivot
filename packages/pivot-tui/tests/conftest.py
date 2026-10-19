@@ -270,7 +270,7 @@ def prewarm_worker_pool() -> Generator[None]:
 
     This eliminates cold-start overhead on the first test that uses workers.
     """
-    executor_core.prepare_workers(stage_count=2, parallel=True, max_workers=2)
+    executor_core.prepare_workers(width=2, parallel=True, max_workers=2)
     yield
 
 

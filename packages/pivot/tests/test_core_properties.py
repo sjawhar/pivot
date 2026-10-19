@@ -7,6 +7,7 @@ import string
 import tempfile
 
 import hypothesis
+import networkx as nx
 import pytest
 import yaml
 from hypothesis import strategies as st
@@ -271,6 +272,21 @@ def test_adding_a_back_edge_is_reported_as_a_cycle(
     deps[producer].add(consumer)  # producer now also consumes the consumer's output
     with pytest.raises(exceptions.CyclicGraphError, match="Circular dependency"):
         engine_graph.build_graph(_stages_from_edges(count, deps))
+
+
+@_SETTINGS
+@hypothesis.given(_acyclic_edges(), st.data())
+def test_width_is_the_largest_set_of_run_stages_none_of_which_reaches_another(
+    case: tuple[int, list[set[int]]], data: st.DataObject
+) -> None:
+    """The width matches networkx's largest antichain of the run's stages, for a whole pipeline
+    and for any subset of its stages, as `pivot run` names them."""
+    count, deps = case
+    stages = _stages_from_edges(count, deps)
+    stage_dag = engine_graph.get_stage_dag(engine_graph.build_graph(stages))
+    run = data.draw(st.lists(st.sampled_from(sorted(stages)), min_size=1, unique=True))
+    largest = max(len(antichain) for antichain in nx.antichains(stage_dag.subgraph(run)))
+    assert engine_graph.get_width(stage_dag, run) == largest
 
 
 # =============================================================================
