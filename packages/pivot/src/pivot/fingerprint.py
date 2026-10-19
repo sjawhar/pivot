@@ -5,6 +5,7 @@ import contextvars
 import dataclasses
 import enum
 import functools
+import importlib.metadata
 import inspect
 import json
 import linecache
@@ -65,7 +66,10 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 26 records tuples and frozensets of scalars and compiled regexes by value.
 # Version 27 keys cached function hashes and manifest source files by each file's content, not
 # its mtime, size and inode, which an edit can keep.
-_CACHE_SCHEMA_VERSION = 27
+# Version 28 treats pivot's own packages as library code outside site-packages too, so a stage
+# calling into pivot_tui installed editable from its checkout no longer walks its source, and
+# decides a namespace package by the rule that decides a regular module (`is_library_path`).
+_CACHE_SCHEMA_VERSION = 28
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -104,6 +108,41 @@ def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
 
 
 _STDLIB_PATHS = _init_stdlib_paths()
+
+
+def _init_pivot_package_dirs() -> tuple[pathlib.Path, ...]:
+    """Resolve the directories of pivot's own packages: pivot's wherever it is installed, and
+    pivot_tui's when the pivot-tui distribution is installed. An editable install, as pivot's
+    workspace makes, puts them in a source checkout outside site-packages.
+
+    pivot_tui's directories come from what the installed pivot-tui distribution records: the
+    site directory it is installed in (a wheel install) and each directory its ``.pth`` file
+    adds to ``sys.path`` (an editable install by its own backend, uv_build). They never come
+    from looking the name up on ``sys.path``, where a user's own module or package named
+    ``pivot_tui`` may come first. An editable install whose ``.pth`` file installs an import hook
+    or adds a link tree records no directory its files resolve into, so pivot_tui stays user
+    code under it."""
+    dirs = [pathlib.Path(__file__).resolve().parent]
+    try:
+        tui = importlib.metadata.distribution("pivot-tui")
+    except importlib.metadata.PackageNotFoundError:
+        return tuple(dirs)
+    site_dir = pathlib.Path(str(tui.locate_file("")))
+    roots = [site_dir]
+    for file in tui.files or ():
+        if file.suffix == ".pth":
+            # Read as site.addpackage reads it: comment, blank and import lines add no path.
+            lines = (line.rstrip() for line in file.read_text().splitlines())
+            roots.extend(
+                site_dir / line
+                for line in lines
+                if line and not line.startswith(("#", "import ", "import\t"))
+            )
+    dirs.extend((root / "pivot_tui").resolve() for root in roots if (root / "pivot_tui").is_dir())
+    return tuple(dirs)
+
+
+_PIVOT_PACKAGE_DIRS = _init_pivot_package_dirs()
 
 # Cache for hash_function_ast results using weak references.
 # This avoids repeated AST parsing for the same function during fingerprinting
@@ -2605,7 +2644,8 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
 
 
 def is_user_code(obj: Any) -> bool:
-    """Check if object is user code (not stdlib/site-packages/builtins)."""
+    """Check if object is user code (not stdlib/site-packages/builtins, nor pivot's own
+    packages: ``is_library_path``)."""
     _t = metrics.start()
     try:
         if obj is None:
@@ -2637,35 +2677,28 @@ def _is_user_code_impl(obj: Any) -> bool:
     if module_name in sys.builtin_module_names:
         return False
 
-    # Pivot's own code is framework, not user code (matters for editable installs
-    # where pivot isn't in site-packages)
-    if module_name == "pivot" or module_name.startswith("pivot."):
-        return False
-
-    # Check for namespace packages (PEP 420): they have __path__ but no __file__
-    # If __path__ points to site-packages, it's a third-party namespace package
+    # A namespace package (PEP 420) has a __path__ but no __file__: it is a library's when one
+    # of its directories is (`is_library_path`, the rule for a regular module's file).
     if not hasattr(module, "__file__") or module.__file__ is None:
         if not hasattr(module, "__path__"):
             return True  # No __file__ and no __path__: user code (exec/notebook/interactive)
-
-        # Namespace package - check if any path is in site-packages
-        for path_entry in module.__path__:
-            parts = pathlib.Path(path_entry).parts
-            for sp in _SITE_PACKAGE_PATHS:
-                if sp in parts:
-                    return False
-        return True  # Namespace package not in site-packages: user code
+        return not any(is_library_path(pathlib.Path(entry).resolve()) for entry in module.__path__)
 
     return not is_library_path(pathlib.Path(module.__file__).resolve())
 
 
 def is_library_path(path: pathlib.Path) -> bool:
     """Whether resolved file or directory ``path`` belongs to a library, not to user code: it
-    lies under the interpreter's prefix (the stdlib, or a virtualenv), or in a site-packages or
-    dist-packages directory."""
+    lies under the interpreter's prefix (the stdlib, or a virtualenv), in a site-packages or
+    dist-packages directory, or in one of pivot's own packages (``_PIVOT_PACKAGE_DIRS``), which
+    an editable install puts outside site-packages."""
     if any(part in _SITE_PACKAGE_PATHS for part in path.parts):
         return True
-    return any(path == prefix or prefix in path.parents for prefix in _STDLIB_PATHS)
+    return any(
+        path == prefix or prefix in path.parents
+        for prefixes in (_STDLIB_PATHS, _PIVOT_PACKAGE_DIRS)
+        for prefix in prefixes
+    )
 
 
 def _get_module(obj: Any) -> types.ModuleType | None:

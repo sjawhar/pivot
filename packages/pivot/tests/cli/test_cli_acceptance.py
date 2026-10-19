@@ -2052,3 +2052,133 @@ def test_checkout_counts_the_files_it_restores(tmp_path: pathlib.Path) -> None:
 
     assert "Restored 4 file(s)" in restored, restored
     assert "Skipped 4 file(s) (already exist)" in skipped, skipped
+
+
+_SHOUT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def shout(text: str) -> str:
+    return text.upper()
+
+
+with Pipeline("shadow") as pipeline:
+    shout(pipeline.input("input.txt", t=str))
+"""
+
+
+@pytest.mark.parametrize(
+    "extra_env",
+    [pytest.param({}, id="plain"), pytest.param({"PYTHONPATH": "."}, id="pythonpath-root")],
+)
+def test_repro_runs_with_a_module_named_pivot_tui_in_the_project_root(
+    tmp_path: pathlib.Path, extra_env: dict[str, str]
+) -> None:
+    """A user file ``pivot_tui.py`` at the project root is user code, though it shares the name
+    of pivot-tui's package. Workers run with the project root on ``sys.path``, and
+    ``PYTHONPATH=.`` puts it there for the coordinator too: pivot still imports and runs."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _SHOUT_PIPELINE,
+            "data/raw/input.txt": "hello\n",
+            "pivot_tui.py": 'NOTE = "a user module that shares the TUI name"\n',
+        },
+    )
+
+    _ok(_pivot(root, "repro", env=_env(**extra_env)))
+
+    assert (root / "data" / "shadow" / "shout.txt").read_text() == "HELLO\n"
+
+
+_PIVOT_TUI_PACKAGE_PIPELINE = """\
+from pivot import Pipeline, stage
+
+import pivot_tui.helpers
+
+
+@stage
+def shout(text: str) -> str:
+    return pivot_tui.helpers.tag(text)
+
+
+with Pipeline("shpkg") as pipeline:
+    shout(pipeline.input("input.txt", t=str))
+"""
+
+
+def test_editing_a_project_package_named_pivot_tui_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A user package ``pivot_tui/`` at the project root, imported ahead of pivot-tui's through
+    ``PYTHONPATH=.``, is user code: a stage that calls it is fingerprinted against it, and an
+    edit to it reruns the stage. Pivot-tui's installed distribution, not whatever ``pivot_tui``
+    names on ``sys.path``, decides what is pivot's code."""
+    helper_source = 'def tag(text: str) -> str:\n    return text.strip().upper() + " {}"\n'
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _PIVOT_TUI_PACKAGE_PIPELINE,
+            "data/raw/input.txt": "hello\n",
+            "pivot_tui/__init__.py": "",
+            "pivot_tui/helpers.py": helper_source.format("u1"),
+        },
+    )
+    env = _env(PYTHONPATH=".")
+    output = root / "data" / "shpkg" / "shout.txt"
+    _ok(_pivot(root, "repro", env=env))
+    assert output.read_text() == "HELLO u1"
+    (root / "pivot_tui" / "helpers.py").write_text(helper_source.format("u2"))
+
+    out = _ok(_pivot(root, "repro", env=env))
+
+    assert output.read_text() == "HELLO u2", out
+
+
+_LAZY_PIVOT_TUI_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def build(raw: str) -> str:
+    import pivot_tui.helpers
+
+    return raw.strip() + "-" + pivot_tui.helpers.VALUE
+
+
+with Pipeline("w") as pipeline:
+    build(pipeline.input("in.txt"))
+"""
+
+
+def test_worker_runs_the_edited_code_of_a_project_package_named_pivot_tui(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A worker runs with the project root on ``sys.path``, so a stage body's ``import
+    pivot_tui.helpers`` imports the project's own package, not pivot-tui's. The worker treats
+    it as user code: it caches its bytecode checked by content, so an edit that keeps the
+    file's size, made in the second the previous version was written and cached, is run when
+    the stage next runs."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _LAZY_PIVOT_TUI_PIPELINE,
+            "data/raw/in.txt": "x",
+            "pivot_tui/__init__.py": "",
+            "pivot_tui/helpers.py": 'VALUE = "alpha"\n',
+        },
+    )
+    env = {k: v for k, v in _env().items() if k != "PYTHONDONTWRITEBYTECODE"}
+    helper = root / "pivot_tui" / "helpers.py"
+    output = root / "data" / "w" / "build.txt"
+    _ok(_pivot(root, "repro", env=env))
+    assert output.read_text() == "x-alpha"
+    before = helper.stat()
+    helper.write_text('VALUE = "bravo"\n')
+    os.utime(helper, ns=(before.st_atime_ns, before.st_mtime_ns))
+    (root / "data" / "raw" / "in.txt").write_text("y")
+
+    out = _ok(_pivot(root, "repro", env=env))
+
+    assert output.read_text() == "y-bravo", out

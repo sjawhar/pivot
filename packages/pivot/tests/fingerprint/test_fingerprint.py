@@ -3,6 +3,7 @@
 import ast
 import dataclasses
 import enum
+import importlib
 import importlib.util
 import inspect
 import json
@@ -22,6 +23,7 @@ import pytest
 import xxhash
 from pydantic import BaseModel
 
+import pivot_tui.stats
 from pivot import ast_utils, exceptions, fingerprint, loaders
 from pivot.storage import state as state_mod
 
@@ -771,6 +773,111 @@ def test_is_user_code_lambda():
 def test_is_user_code_pivot_is_framework():
     """Pivot's own modules are framework code, not user code."""
     assert fingerprint.is_user_code(fingerprint) is False
+
+
+def _helper_reads_pivot_tui() -> float | None:
+    return pivot_tui.stats.get_memory_mb()
+
+
+def test_pivot_tui_installed_from_a_checkout_is_framework() -> None:
+    """pivot_tui is pivot's own package too: installed from a source checkout outside
+    site-packages, as pivot's workspace installs it, it is not user code, and a stage that calls
+    into it is not fingerprinted against its source."""
+    tui_file = pathlib.Path(pivot_tui.stats.__file__).resolve()
+    assert "site-packages" not in tui_file.parts, "pivot_tui is installed from its checkout"
+    assert not tui_file.is_relative_to(pathlib.Path(sys.prefix).resolve())
+
+    assert fingerprint.is_user_code(pivot_tui.stats) is False
+    assert fingerprint.is_user_code(pivot_tui.stats.get_memory_mb) is False
+    assert list(fingerprint.get_stage_fingerprint(_helper_reads_pivot_tui)) == [
+        "self:_helper_reads_pivot_tui"
+    ]
+
+
+def _helper_install_distribution(site_dir: pathlib.Path, name: str, files: dict[str, str]) -> None:
+    """Install distribution ``name`` into ``site_dir`` as an installer records it: its files,
+    and a dist-info directory whose RECORD lists them."""
+    dist_info = f"{name.replace('-', '_')}-1.0.dist-info"
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    files = {**files, f"{dist_info}/METADATA": metadata}
+    for rel, text in files.items():
+        path = site_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    record = [*files, f"{dist_info}/RECORD"]
+    (site_dir / dist_info / "RECORD").write_text("".join(f"{rel},,\n" for rel in record))
+
+
+@pytest.mark.parametrize(
+    ("sys_path", "distributions", "files", "expected"),
+    [
+        pytest.param(
+            ["site"],
+            {"pivot-tui": {"pivot_tui/__init__.py": ""}},
+            {},
+            ["site/pivot_tui"],
+            id="wheel",
+        ),
+        pytest.param(
+            ["site", "checkout/src"],
+            {"pivot-tui": {"pivot_tui.pth": "# a comment\n\nimport os\n{tmp}/checkout/src\n"}},
+            {"checkout/src/pivot_tui/__init__.py": ""},
+            ["checkout/src/pivot_tui"],
+            id="editable",
+        ),
+        pytest.param(["site"], {}, {}, [], id="not-installed"),
+        pytest.param(
+            ["user", "site"],
+            {"pivot-tui": {"pivot_tui/__init__.py": ""}},
+            {"user/pivot_tui.py": ""},
+            ["site/pivot_tui"],
+            id="user-module-ahead-of-pivot-tui",
+        ),
+        pytest.param(
+            ["user", "site", "checkout/src"],
+            {"pivot-tui": {"pivot_tui.pth": "{tmp}/checkout/src\n"}},
+            {"user/pivot_tui/__init__.py": "", "checkout/src/pivot_tui/__init__.py": ""},
+            ["checkout/src/pivot_tui"],
+            id="user-package-ahead-of-editable-pivot-tui",
+        ),
+        pytest.param(
+            ["site", "user/src"],
+            {"mytui": {"mytui.pth": "{tmp}/user/src\n"}},
+            {"user/src/pivot_tui/__init__.py": ""},
+            [],
+            id="user-distribution-provides-pivot_tui",
+        ),
+    ],
+)
+def test_pivot_tui_is_pivot_s_package_only_where_the_pivot_tui_distribution_installed_it(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sys_path: list[str],
+    distributions: dict[str, dict[str, str]],
+    files: dict[str, str],
+    expected: list[str],
+) -> None:
+    """pivot_tui's directories are the ones the installed pivot-tui distribution records: its
+    site directory for a wheel, the directories its ``.pth`` file adds for an editable install,
+    none when it is not installed. A user's module or package named ``pivot_tui``, ahead of
+    pivot-tui's on ``sys.path`` or installed by the user's own distribution, is not among them."""
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(text)
+    for name, dist_files in distributions.items():
+        _helper_install_distribution(
+            tmp_path / "site",
+            name,
+            {rel: text.format(tmp=tmp_path) for rel, text in dist_files.items()},
+        )
+    (tmp_path / "site").mkdir(exist_ok=True)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "path", [str(tmp_path / entry) for entry in sys_path])
+        dirs = fingerprint._init_pivot_package_dirs()
+
+    pivot_dir = pathlib.Path(fingerprint.__file__).resolve().parent
+    assert dirs == (pivot_dir, *((tmp_path / rel).resolve() for rel in expected))
 
 
 def test_is_user_code_non_callable():
@@ -1602,6 +1709,27 @@ def test_is_user_code_path_component_matching_not_substring(
     assert fingerprint.is_user_code(module) is True
 
     sys.modules.pop("tricky_pkg", None)
+
+
+@pytest.mark.parametrize("prefixes", ["_PIVOT_PACKAGE_DIRS", "_STDLIB_PATHS"])
+def test_is_user_code_namespace_package_in_a_library_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, prefixes: str
+) -> None:
+    """A namespace package is decided by the rule that decides a regular module
+    (``is_library_path``): one whose directory lies in pivot's own packages or under the
+    interpreter's prefix is not user code, though no directory of it is site-packages."""
+    library = tmp_path / "library"
+    (library / "ns_in_library").mkdir(parents=True)
+    monkeypatch.setattr(fingerprint, prefixes, (*getattr(fingerprint, prefixes), library.resolve()))
+    monkeypatch.syspath_prepend(str(library))
+    sys.modules.pop("ns_in_library", None)
+    try:
+        module = importlib.import_module("ns_in_library")
+        assert getattr(module, "__file__", None) is None, "a namespace package has no __file__"
+
+        assert fingerprint.is_user_code(module) is False
+    finally:
+        sys.modules.pop("ns_in_library", None)
 
 
 # ==============================================================================
