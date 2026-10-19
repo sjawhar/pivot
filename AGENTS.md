@@ -1,10 +1,10 @@
 # Pivot - Project Rules
 
-**Python 3.13+ | Unix only | 90%+ coverage | Pre-alpha (breaking changes OK)**
+**Python 3.13+ | Unix only | 90%+ coverage | Pre-alpha (breaking changes OK; removing a feature needs approval)**
 
 ## Project Status
 
-**Pre-alpha** - breaking changes acceptable, no migration code or compatibility shims needed.
+**Pre-alpha** - breaking changes acceptable, no migration code or compatibility shims needed. A breaking change may change how a feature or setting works; it may not remove one. Removing a user-facing feature, command, option or setting needs the maintainer's (sjawhar's) approval first, written in the issue or PR that removes it.
 
 ## Project Structure
 
