@@ -27,14 +27,10 @@ class ListJsonOutput(TypedDict):
     stages: list[StageJsonOutput]
 
 
-def _get_output_sources(stage_list: list[str]) -> dict[str, str]:
-    """Build a map from output path to the stage that produces it."""
+def _get_output_sources(stage_list: list[str]) -> dict[types.ArtifactIdentity, str]:
+    """Build a map from each output's identity to the stage that produces it."""
     return {
-        out_path: name
-        for name in stage_list
-        for out_path in [
-            types.identity_key(out.identity) for out in cli_helpers.get_stage(name)["outs"]
-        ]
+        out.identity: name for name in stage_list for out in cli_helpers.get_stage(name)["outs"]
     }
 
 
@@ -85,7 +81,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
     project_root = project.get_project_root()
     for name in stage_list:
         info = cli_helpers.get_stage(name)
-        deps = [types.identity_key(dep.identity) for dep in info["deps"].values()]
+        deps = list(info["deps"].values())
         outs = info["outs"]
         click.echo(f"  {name}")
         resources = info["resources"]
@@ -98,11 +94,13 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
             if deps:
                 click.echo("    deps:")
                 for dep in deps:
-                    source = output_sources.get(dep)
+                    dep_key = types.identity_key(dep.identity)
+                    # One file of a directory output comes from its directory's producer
+                    source = output_sources.get(types.source_identity(dep))
                     if source and source != name:
-                        click.echo(f"      {dep} (from: {source})")
+                        click.echo(f"      {dep_key} (from: {source})")
                     else:
-                        click.echo(f"      {dep}")
+                        click.echo(f"      {dep_key}")
             if outs:
                 click.echo("    outs:")
                 for out in outs:

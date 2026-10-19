@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
 from conftest import isolated_pivot_dir
 from pivot import cli, compose
@@ -35,6 +35,16 @@ def producer(input_file: str) -> str:
 @compose.stage
 def consumer(intermediate_file: str) -> str:
     return "final"
+
+
+@compose.stage
+def files(input_file: str) -> Annotated[dict[str, str], compose.directory]:
+    return {"a.txt": input_file}
+
+
+@compose.stage
+def reads_one(a_file: str) -> str:
+    return a_file
 
 
 def _shared_train(input_file: str) -> str:
@@ -153,6 +163,18 @@ def test_list_deps_shows_source_stage(
     assert "from: test/producer" in result.output
     # A raw input has no producing stage
     assert "input.txt (from:" not in result.output
+
+
+def test_list_deps_shows_the_producer_of_one_file_of_a_directory_output(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
+) -> None:
+    with mock_discovery:
+        reads_one(files(mock_discovery.input("input.txt", t=str))["a.txt"])
+
+    result = runner.invoke(cli.cli, ["list", "--deps"])
+
+    assert result.exit_code == 0, result.output
+    assert "test/files:a.txt (from: test/files)" in result.output
 
 
 # =============================================================================
