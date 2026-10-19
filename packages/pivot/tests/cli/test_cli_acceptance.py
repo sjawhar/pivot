@@ -1911,3 +1911,61 @@ def test_repro_runs_a_stage_whose_edit_keeps_the_files_mtime_size_and_inode(
     out = _ok(_pivot(root, "repro"))
 
     assert output.read_text() == "bravo", out
+
+
+_ONE_FILE_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory]:
+    return {"train.jsonl": raw.iloc[:2], "test.jsonl": raw.iloc[2:]}
+
+
+@stage
+def count(train: pd.DataFrame) -> dict:
+    return {"rows": int(len(train)), "total": int(train["a"].sum())}
+
+
+with Pipeline("s") as pipeline:
+    count(split(pipeline.input("t.csv"))["train.jsonl"])
+"""
+
+
+def test_one_file_consumer_reruns_only_when_its_own_file_changes(tmp_path: pathlib.Path) -> None:
+    """A stage that reads one file of a directory output skips when only a sibling changes."""
+    root = _project(tmp_path, {"pipeline.py": _ONE_FILE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n3\n"})
+    raw = root / "data" / "raw" / "t.csv"
+    counted = root / "data" / "s" / "count.yaml"
+    _ok(_pivot(root, "repro"))
+    assert yaml.safe_load(counted.read_text()) == {"rows": 2, "total": 3}
+
+    raw.write_text("a\n1\n2\n9\n")
+    sibling_changed = _ok(_pivot(root, "repro"))
+    raw.write_text("a\n5\n2\n9\n")
+    own_changed = _ok(_pivot(root, "repro"))
+
+    assert "1 ran, 1 cached" in sibling_changed, sibling_changed
+    assert "2 ran, 0 cached" in own_changed, own_changed
+    assert yaml.safe_load(counted.read_text()) == {"rows": 2, "total": 7}
+
+
+def test_status_takes_a_one_file_dependency_from_the_producers_lock_when_it_is_deleted(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With the directory deleted, status reads the file's hash from the producer's lock."""
+    root = _project(tmp_path, {"pipeline.py": _ONE_FILE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n3\n"})
+    _ok(_pivot(root, "repro"))
+    shutil.rmtree(root / "data" / "s" / "split")
+
+    status = _ok(_pivot(root, "status"))
+    restored = _ok(_pivot(root, "repro"))
+
+    assert "2 cached, 0 stale" in status, status
+    assert "0 ran, 2 cached" in restored, restored
+    assert (root / "data" / "s" / "split" / "train.jsonl").is_file()
+    assert "Verification passed" in _ok(_pivot(root, "verify"))

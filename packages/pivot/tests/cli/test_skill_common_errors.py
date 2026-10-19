@@ -165,6 +165,19 @@ _CASES = {
             + 'with Pipeline("demo") as pipeline:\n    use(chart(pipeline.input("t.csv")))\n'
         },
     ),
+    "directory-file-without-extension": _Case(
+        doc="`depends on file 'x' of stage '<stage>': key must include file extension`",
+        observed="depends on file 'train' of stage 'demo/split': key must include file extension",
+        files={
+            "pipeline.py": "from typing import Annotated\n\n"
+            + "import pandas as pd\n\nfrom pivot import Pipeline, directory, stage\n\n\n"
+            + "@stage\ndef split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory]:\n"
+            + '    return {"train.jsonl": raw}\n\n\n'
+            + "@stage\ndef fit(train: pd.DataFrame) -> dict:\n    return {}\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n'
+            + '    fit(split(pipeline.input("t.csv"))["train"])\n'
+        },
+    ),
     "two-inputs-one-file": _Case(
         doc="`Input binding conflict: inputs 'a' and 'b' are both bound to '<path>'`",
         observed="Input binding conflict: inputs 't.csv' and 'alias' are both bound to "

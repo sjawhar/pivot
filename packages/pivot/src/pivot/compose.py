@@ -144,13 +144,38 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         )
 
     identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
+    member = handle._member  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+    if member is not None:
+        identity, member = _directory_file_identity(identity, member, consumer_name)
     types.validate_artifact_identity(identity)
     return types.ArtifactRef(
         identity=identity,
         format=output_spec.format,
         python_type=handle._python_type,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         tag=_artifact_tag(output_spec.tag),
+        member=member,
     )
+
+
+def _directory_file_identity(
+    directory: types.ArtifactIdentity, key: str, consumer_name: str
+) -> tuple[types.ArtifactIdentity, str]:
+    """Name one file of a directory output: its identity and its normalized path inside it.
+
+    The key is checked by the rules for a directory output's keys, so a consumer can only name
+    a file the producer could write.
+    """
+    try:
+        member = stage_def.normalize_directory_out_key(key)
+        if ":" in member:
+            raise ValueError(f"colons are not allowed in a file a stage depends on: {key!r}")
+    except ValueError as error:
+        raise ValueError(
+            f"Stage '{consumer_name}' depends on file {key!r} of stage '{directory.producer}': "
+            + f"{error}"
+        ) from None
+    file_key = member if directory.key is None else f"{directory.key}/{member}"
+    return types.ArtifactIdentity(directory.producer, file_key), member
 
 
 def _iter_stage_handles(node: _StageNode) -> list[ArtifactHandle]:
@@ -1419,6 +1444,7 @@ class ArtifactHandle:
     _source: _StageNode | _InputNode
     _output_key: str | None
     _python_type: type
+    _member: str | None
 
     def __init__(
         self,
@@ -1426,29 +1452,67 @@ class ArtifactHandle:
         source: _StageNode | _InputNode,
         output_key: str | None,
         python_type: type,
+        member: str | None = None,
     ) -> None:
+        """``member`` is the path of one file inside a directory output, as the user wrote it."""
         self._pipeline = pipeline
         self._source = source
         self._output_key = output_key
         self._python_type = python_type
+        self._member = member
 
     def __getattr__(self, name: str) -> ArtifactHandle:
         if name.startswith("_"):
             raise AttributeError(name)
         if not isinstance(self._source, _StageNode):
             raise AttributeError(f"Input '{self._source.name}' has no sub-outputs")
+        if self._member is not None:
+            raise AttributeError(self._member_has_no_parts_message())
         spec = _select_output(self._source.output_specs, name)
         if spec is None:
             raise AttributeError(_no_such_output_message(self._source, name))
         return ArtifactHandle(self._pipeline, self._source, name, spec.python_type)
 
     def __getitem__(self, key: str) -> ArtifactHandle:
+        """Select an output of a multi-output stage, or one file of a directory output."""
         if not isinstance(self._source, _StageNode):
             raise KeyError(f"Input '{self._source.name}' has no sub-outputs")
+        if self._member is not None:
+            raise KeyError(self._member_has_no_parts_message())
+        directory_spec = self._selected_directory()
+        if directory_spec is not None:
+            file_type = _directory_file_type(
+                directory_spec.python_type, _output_label(directory_spec.key), self._source.name
+            )
+            return ArtifactHandle(
+                self._pipeline, self._source, self._output_key, file_type, member=key
+            )
         spec = _select_output(self._source.output_specs, key)
         if spec is None:
             raise KeyError(_no_such_output_message(self._source, key))
         return ArtifactHandle(self._pipeline, self._source, key, spec.python_type)
+
+    def _member_has_no_parts_message(self) -> str:
+        assert isinstance(self._source, _StageNode)
+        return (
+            f"{self._member!r} is one file of a directory output of stage "
+            + f"'{self._source.name}'; it has no outputs or files of its own. Pass the handle "
+            + "itself."
+        )
+
+    def _selected_directory(self) -> _OutputSpec | None:
+        """The directory output this handle stands for, or None when it stands for another.
+
+        A stage's own handle stands for its return value only when that is a single output;
+        a TypedDict field is selected by name before its files are.
+        """
+        assert isinstance(self._source, _StageNode)
+        specs = self._source.output_specs
+        if self._output_key is not None:
+            spec = _select_output(specs, self._output_key)
+        else:
+            spec = _select_output(specs, SINGLE_OUTPUT_KEY)
+        return spec if spec is not None and isinstance(spec.tag, _DirectoryTag) else None
 
 
 def _select_output(output_specs: list[_OutputSpec], key: str | None) -> _OutputSpec | None:

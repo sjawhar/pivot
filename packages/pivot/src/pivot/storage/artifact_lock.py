@@ -63,7 +63,8 @@ def expand_lock_requests(
 
 
 def _lock_key(ref: types.ArtifactRef) -> str:
-    return types.identity_key(ref.identity)
+    """One file of a directory output is locked as its directory, the unit its producer writes."""
+    return types.identity_key(types.source_identity(ref))
 
 
 # ---------------------------------------------------------------------------

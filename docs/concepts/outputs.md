@@ -19,6 +19,7 @@ Pivot picks a writer from it:
 | `Annotated[dict, metric]` | YAML, stored under `metrics/` | `.yaml` |
 | `Annotated[Figure, plot]` | PNG via `MatplotlibFigure()`, stored under `plots/` | `.png` |
 | `Annotated[T, incremental]` | the type's default `Loader`, restored before the stage runs | the loader's extension |
+| `Annotated[dict[str, T], directory]` | a directory, one file per key, each written by `T`'s writer (or a loader given beside the tag) | none on the directory; each key names its file |
 | a `TypedDict` | one output per field, each field typed as above | per field |
 
 Any other type fails when the pipeline is built:
@@ -35,6 +36,7 @@ the producing stage or from `pipeline.input()`.
 |--------|------|
 | Single output of stage `s` in pipeline `p` | `data/p/s.<ext>` |
 | Field `f` of a `TypedDict` output | `data/p/s/f.<ext>` |
+| Tagged `directory` | `data/p/s/` (or `data/p/s/f/` for a field), one file per key inside it |
 | Tagged `metric` | `metrics/p/...` instead of `data/p/...` |
 | Tagged `plot` | `plots/p/...` instead of `data/p/...` |
 
@@ -121,7 +123,9 @@ Define the `TypedDict` at module level. The field name `_single` is reserved.
 
 A stage can return a `pathlib.Path` to a directory it created outside the
 project. `PathOnly()` moves that directory to Pivot's managed output path and
-Pivot caches it as an artifact.
+Pivot caches it as an artifact. A stage that returns a `dict[str, T]` tagged
+`directory` also makes a directory artifact; see
+[Directory outputs](#directory-outputs).
 
 A directory artifact, input or output, is hashed and cached whole. Every file
 under it counts, including names that code fingerprinting or watch mode may
@@ -168,8 +172,69 @@ symlink-mode checkout links each file to an object in the configured cache
 (`cache.dir`), and that link counts as the file it points to. A link to a
 hash-named file anywhere else is a user symlink.
 
-The declarative `DirectoryOut` annotation for a variable set of files remains
-undecided; do not add that annotation to a compositional pipeline.
+## Directory outputs
+
+Tag a `dict[str, T]` return value with `directory` when a stage writes a
+variable set of files. Each key is a file's path inside the directory and each
+value is written by `T`'s default writer, or by the loader given beside the
+tag. The loader never comes from a key's extension, so give keys the extension
+of the files the loader writes:
+
+```python
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("split")}
+
+
+@stage
+def count(parts: dict[str, pd.DataFrame]) -> dict[str, int]:
+    return {name: len(frame) for name, frame in parts.items()}
+
+
+@stage
+def fit(train: pd.DataFrame) -> dict[str, int]:
+    return {"rows": len(train)}
+
+
+with Pipeline("dirs") as pipeline:
+    parts = split(pipeline.input("values.csv"))
+    count(parts)
+    fit(parts["train.csv"])
+```
+
+After `pivot repro`, `data/dirs/split/` holds one CSV per split. The directory
+is one artifact: it is cached, restored, pushed, pulled, checked out and
+verified whole, and a rerun that returns fewer keys leaves only those files.
+A `TypedDict` field can be tagged `directory` too (`data/p/s/f/`).
+
+A downstream stage takes the directory in one of two ways:
+
+- **The whole directory** (`count(parts)`): the parameter receives a `dict`
+  from each file's path inside the directory to its value, read with the
+  producer's loader. The stage reruns when any file changes.
+- **One file** (`fit(parts["train.csv"])`, or `out.parts["train.csv"]` for a
+  `TypedDict` field): the parameter receives that file's value, or its path
+  when the producer's files are `pathlib.Path`. The consumer's lock records
+  that file's hash alone, so it reruns when that file changes and not when
+  another file in the directory does. A run where the producer did not write
+  the file fails the consumer with `missing deps:` naming the producer and the
+  file; `pivot status` reads the file's hash from the producer's lock when the
+  directory is not on disk.
+
+A key must be a relative path with an extension and no `..`; keys that
+normalize to one path, or differ only by case, fail the producer before any
+file is written. A file named by a consumer is checked by the same rules (and
+may not contain `:`) when the pipeline is built, naming the consumer, the
+producer and the key. A directory of files whose loader only writes, such as
+`MatplotlibFigure()`, is a valid output, but no stage can depend on it or on
+one of its files.
 
 ## Incremental outputs
 

@@ -993,7 +993,7 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
 def _load_dep_from_path(ref: types.ArtifactRef, path: pathlib.Path) -> Any:
     """Load an artifact after the caller has resolved its workspace/cache path."""
     loader = cast("Any", ref.format)
-    if ref.tag is types.ArtifactTag.DIRECTORY:
+    if ref.tag is types.ArtifactTag.DIRECTORY and ref.member is None:
         values = dict[str, Any]()
         for file_path in sorted(p for p in path.rglob("*") if p.is_file()):
             rel_key = file_path.relative_to(path).as_posix()
@@ -1588,29 +1588,36 @@ def can_skip_via_generation(
     recorded_gens = state_db.get_dep_generations(stage_name)
     if not recorded_gens:
         return False
-    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
-    current_gens = state_db.get_many_generations(dep_keys)
+    refs = list(deps.values())
+    gen_keys = [_generation_key(ref) for ref in refs]
+    current_gens = state_db.get_many_generations(gen_keys)
     stats = list[tuple[pathlib.Path, os.stat_result]]()
-    paths_by_key = dict[str, pathlib.Path]()
-    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
+    for gen_key, ref in zip(gen_keys, refs, strict=True):
         expected_hash = lock_data["dep_hashes"].get(ref.identity)
         if expected_hash is None or is_dir_hash(expected_hash):
             return False
-        current_gen = current_gens.get(dep_key)
-        if current_gen is None or current_gen != recorded_gens.get(dep_key):
+        current_gen = current_gens.get(gen_key)
+        if current_gen is None or current_gen != recorded_gens.get(gen_key):
             return False
         try:
             path = store.checkout(ref)
             stats.append((path, path.stat()))
-            paths_by_key[dep_key] = path
         except OSError:
             return False
     cached_hashes = state_db.get_many(stats)
-    for dep_key, ref in zip(dep_keys, deps.values(), strict=True):
-        cached_hash = cached_hashes[paths_by_key[dep_key]]
-        if cached_hash != lock_data["dep_hashes"][ref.identity]["hash"]:
+    for (path, _), ref in zip(stats, refs, strict=True):
+        if cached_hashes[path] != lock_data["dep_hashes"][ref.identity]["hash"]:
             return False
     return True
+
+
+def _generation_key(ref: types.ArtifactRef) -> str:
+    """The generation counter a dependency follows: its producer's output, for a directory file.
+
+    A file of a directory output changes only when its directory's generation does; when the
+    generation moved, the file's hash decides.
+    """
+    return types.identity_key(types.source_identity(ref))
 
 
 def compute_dep_generation_map(
@@ -1618,14 +1625,14 @@ def compute_dep_generation_map(
     state_db: state.StateDB,
 ) -> dict[str, int]:
     """Compute dependency identity -> generation map for recording."""
-    dep_keys = [types.identity_key(ref.identity) for ref in deps.values()]
-    current_gens = state_db.get_many_generations(dep_keys)
+    gen_keys = [_generation_key(ref) for ref in deps.values()]
+    current_gens = state_db.get_many_generations(gen_keys)
 
     gen_record = dict[str, int]()
-    for dep_key in dep_keys:
-        gen = current_gens.get(dep_key)
+    for gen_key in gen_keys:
+        gen = current_gens.get(gen_key)
         if gen is not None:
-            gen_record[dep_key] = gen
+            gen_record[gen_key] = gen
     return gen_record
 
 

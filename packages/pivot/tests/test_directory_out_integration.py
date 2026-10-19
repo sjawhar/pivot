@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import pathlib
 import shutil
+import tempfile
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
 import matplotlib.figure
@@ -114,6 +115,24 @@ def _stage_split_rows(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], c
 
 def _stage_count_rows(parts: dict[str, pd.DataFrame]) -> dict[str, int]:
     return {name: len(frame) for name, frame in parts.items()}
+
+
+def _stage_read_one_file(part: dict[str, _JsonValue]) -> dict[str, _JsonValue]:
+    return part
+
+
+def _stage_writes_text_files() -> Annotated[dict[str, pathlib.Path], compose.directory]:
+    """A directory of files the stage made outside the project, which pivot moves in."""
+    scratch = pathlib.Path(tempfile.mkdtemp())
+    files = dict[str, pathlib.Path]()
+    for name in ("a.txt", "b.txt"):
+        (scratch / name).write_text(name.upper())
+        files[name] = scratch / name
+    return files
+
+
+def _stage_reads_path(path: pathlib.Path) -> dict[str, str]:
+    return {"name": path.name, "directory": path.parent.name, "text": path.read_text()}
 
 
 class _CountParams(stage_def.StageParams):
@@ -573,6 +592,74 @@ def test_consumer_receives_the_whole_directory_as_a_dict(
     assert results["test/count"]["status"] == "ran", results
     counts = yaml.safe_load(helpers.get_output_path("count").read_text())
     assert counts == {"test.jsonl": 3, "train.jsonl": 2}
+
+
+def test_consumer_of_one_typed_dict_directory_file_receives_its_value(
+    mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage that takes one file of a directory field gets that file read with its loader."""
+    _prepare_project(mock_discovery, monkeypatch)
+    produced = helpers.register_test_stage(_stage_produces_abc_with_marker, name="produce")
+    helpers.register_test_stage(
+        _stage_read_one_file, name="read", deps={"part": produced.results["b.json"]}
+    )
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/read"]["status"] == "ran", results
+    assert yaml.safe_load(helpers.get_output_path("read").read_text()) == {"value": 2, "run": 1}
+
+
+def test_one_file_consumer_skips_on_a_rerun_by_generation(
+    mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nothing changed, the one-file consumer skips on its producer's output generation."""
+    _prepare_project(mock_discovery, monkeypatch)
+    produced = helpers.register_test_stage(_stage_produces_abc_with_marker, name="produce")
+    helpers.register_test_stage(
+        _stage_read_one_file, name="read", deps={"part": produced.results["b.json"]}
+    )
+    executor.run(pipeline=mock_discovery)
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/read"]["status"] == "cached", results
+    assert results["test/read"]["reason"] == "unchanged (generation)", results
+
+
+def test_consumer_of_a_file_the_producer_did_not_write_fails_naming_both(
+    mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_project(mock_discovery, monkeypatch)
+    produced = helpers.register_test_stage(_stage_produces_abc_with_marker, name="produce")
+    helpers.register_test_stage(
+        _stage_read_one_file, name="read", deps={"part": produced.results["z.json"]}
+    )
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/produce"]["status"] == "ran", results
+    assert results["test/read"]["status"] == "failed", results
+    reason = results["test/read"]["reason"]
+    assert "test/produce" in reason and "results/z.json" in reason, reason
+
+
+def test_consumer_of_one_file_of_a_path_directory_receives_that_files_path(
+    mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each file of a ``dict[str, pathlib.Path]`` directory reads back as its workspace path."""
+    _prepare_project(mock_discovery, monkeypatch)
+    files = helpers.register_test_stage(_stage_writes_text_files, name="files")
+    helpers.register_test_stage(_stage_reads_path, name="reads", deps={"path": files["b.txt"]})
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/reads"]["status"] == "ran", results
+    assert yaml.safe_load(helpers.get_output_path("reads").read_text()) == {
+        "name": "b.txt",
+        "directory": "files",
+        "text": "B.TXT",
+    }
 
 
 def test_fewer_files_than_last_run_leave_no_stale_file(

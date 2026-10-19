@@ -52,7 +52,7 @@ def build_artifact_paths(
 
     for info in stages.values():
         for dep in info["deps"].values():
-            if dep.identity in output_identities:
+            if pivot_types.source_identity(dep) in output_identities:
                 continue
             path = project.normalize_path(store.checkout(dep))
             paths[path] = dep.identity

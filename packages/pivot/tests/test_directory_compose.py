@@ -1,7 +1,8 @@
-"""Build-time behavior of the ``directory`` return-type tag.
+"""How a pipeline built with the ``directory`` return-type tag is wired.
 
 A ``dict[str, T]`` tagged ``directory`` is one output: a directory whose files are the dict's
-keys, each written by the output's loader (given, or inferred from ``T``).
+keys, each written by the output's loader (given, or inferred from ``T``). Indexing the
+output's handle by a file name makes a dependency on that one file.
 """
 
 import pathlib
@@ -12,8 +13,10 @@ import pandas as pd
 import pytest
 
 import pivot
-from pivot import compose, exceptions, loaders, types
-from pivot.storage import store
+from pivot import compose, exceptions, loaders, registry, types
+from pivot.engine import graph, watch
+from pivot.engine.types import StageExecutionState
+from pivot.storage import artifact_lock, store
 
 
 def _directory_tag() -> object:
@@ -45,6 +48,30 @@ def _helper_parts() -> _HelperParts:
 @compose.stage
 def _helper_read_parts(parts: dict[str, dict[str, int]]) -> dict[str, int]:
     return {name: value["v"] for name, value in parts.items()}
+
+
+@compose.stage
+def _helper_count_one(train: pd.DataFrame) -> dict[str, int]:
+    return {"rows": len(train)}
+
+
+@compose.stage
+def _helper_read_one(part: dict[str, int]) -> dict[str, int]:
+    return part
+
+
+@compose.stage
+def _helper_show_figure(figure: matplotlib.figure.Figure) -> str:
+    return str(figure)
+
+
+class _HelperOnlyParts(TypedDict):
+    parts: Annotated[dict[str, dict[str, int]], compose.directory, loaders.JSON[dict[str, int]]()]
+
+
+@compose.stage
+def _helper_only_parts() -> _HelperOnlyParts:
+    return {"parts": {"a.json": {"v": 1}}}
 
 
 def test_directory_is_exported_from_pivot() -> None:
@@ -195,3 +222,154 @@ def test_directory_of_write_only_files_is_a_valid_leaf_output(tmp_path: pathlib.
     [out] = pipeline.get_stage("p/_helper_figures")["outs"]
 
     assert isinstance(out.format, loaders.MatplotlibFigure)
+
+
+# =============================================================================
+# One file of a directory output as a dependency
+# =============================================================================
+
+
+def _helper_stages(pipeline: compose.Pipeline) -> dict[str, registry.RegistryStageInfo]:
+    return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
+
+
+def test_indexing_a_directory_handle_selects_one_file(tmp_path: pathlib.Path) -> None:
+    """A file of a single directory output and of a directory field each become one dep.
+
+    The dep is placed at that file inside the producer's directory, read with the producer's
+    loader, and its key is normalized as the producer's keys are.
+    """
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        parts = _helper_split(pipeline.input("raw.csv", t=pd.DataFrame))
+        _helper_count_one(parts["sub//train.jsonl"])
+        built = _helper_parts()
+        _helper_read_one(built["parts"]["a.json"])
+
+    count_dep = pipeline.get_stage("p/_helper_count_one")["deps"]["train"]
+    read_dep = pipeline.get_stage("p/_helper_read_one")["deps"]["part"]
+
+    assert count_dep.identity == types.ArtifactIdentity("p/_helper_split", "sub/train.jsonl")
+    assert read_dep.identity == types.ArtifactIdentity("p/_helper_parts", "parts/a.json")
+    assert store.relative_output_path(count_dep) == pathlib.Path(
+        "data/p/_helper_split/sub/train.jsonl"
+    )
+    assert store.relative_output_path(read_dep) == pathlib.Path("data/p/_helper_parts/parts/a.json")
+    assert isinstance(count_dep.format, loaders.DataFrameJSONL)
+    assert isinstance(read_dep.format, loaders.JSON)
+
+
+def test_one_file_consumer_has_an_edge_from_the_producer(tmp_path: pathlib.Path) -> None:
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        parts = _helper_split(pipeline.input("raw.csv", t=pd.DataFrame))
+        _helper_count_one(parts["train.jsonl"])
+    stages = _helper_stages(pipeline)
+
+    stage_graph = graph.build_graph(stages)
+
+    assert graph.get_upstream_stages(stage_graph, "p/_helper_count_one") == ["p/_helper_split"]
+    assert graph.validate_dependency_sources(stages) == []
+
+
+def test_one_file_consumer_takes_the_lock_the_producer_writes_under(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Reading a file excludes the producer rewriting its directory in another process."""
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        parts = _helper_split(pipeline.input("raw.csv", t=pd.DataFrame))
+        _helper_count_one(parts["train.jsonl"])
+    producer = pipeline.get_stage("p/_helper_split")
+    consumer = pipeline.get_stage("p/_helper_count_one")
+
+    [write] = artifact_lock.expand_lock_requests({}, producer["outs"], tmp_path)
+    [read] = artifact_lock.expand_lock_requests(consumer["deps"], [], tmp_path)
+
+    assert (write["mode"], read["mode"]) == (
+        artifact_lock.LockMode.WRITE,
+        artifact_lock.LockMode.READ,
+    )
+    assert read["key"] == write["key"]
+
+
+def test_one_file_of_a_directory_output_routes_as_the_producers_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """In watch mode the producer writing the file is its own write, not an input change."""
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        parts = _helper_split(pipeline.input("raw.csv", t=pd.DataFrame))
+        _helper_count_one(parts["train.jsonl"])
+    stages = _helper_stages(pipeline)
+    workspace = store.WorkspaceStore(tmp_path, "p", pipeline.input_bindings)
+    coordinator = watch.WatchCoordinator(
+        graph.build_graph(stages), watch.build_artifact_paths(stages, workspace)
+    )
+    member = tmp_path / "data" / "p" / "_helper_split" / "train.jsonl"
+
+    assert coordinator.get_producer(member) == "p/_helper_split"
+    assert coordinator.should_filter_path(
+        member, get_stage_state=lambda _stage: StageExecutionState.RUNNING
+    )
+    assert coordinator.get_affected_stages([member]) == ["p/_helper_count_one"]
+
+
+@pytest.mark.parametrize(
+    ("key", "reason"),
+    [
+        pytest.param("../escape.jsonl", "path traversal not allowed", id="traversal"),
+        pytest.param("/abs.jsonl", "absolute path not allowed", id="absolute"),
+        pytest.param("train", "must include file extension", id="no-extension"),
+        pytest.param("a:b.jsonl", "colons", id="colon"),
+    ],
+)
+def test_one_file_key_is_checked_at_build(tmp_path: pathlib.Path, key: str, reason: str) -> None:
+    with pytest.raises(ValueError) as exc_info, compose.Pipeline("p", root=tmp_path) as pipeline:
+        parts = _helper_split(pipeline.input("raw.csv", t=pd.DataFrame))
+        _helper_count_one(parts[key])
+
+    message = str(exc_info.value)
+    assert "Stage 'p/_helper_count_one'" in message, message
+    assert "stage 'p/_helper_split'" in message, message
+    assert repr(key) in message, message
+    assert reason in message, message
+
+
+def test_consumer_of_one_write_only_file_is_refused_at_build(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(TypeError, match="whose loader MatplotlibFigure cannot read it back"),
+        compose.Pipeline("p", root=tmp_path),
+    ):
+        _helper_show_figure(_helper_figures()["a.png"])
+
+
+def test_indexing_a_non_directory_output_by_a_file_name_keeps_the_no_such_output_error(
+    tmp_path: pathlib.Path,
+) -> None:
+    with (
+        pytest.raises(KeyError, match="has no output 'a.json'"),
+        compose.Pipeline("p", root=tmp_path),
+    ):
+        built = _helper_parts()
+        _ = built["summary"]["a.json"]
+
+
+def test_one_file_handle_has_no_files_of_its_own(tmp_path: pathlib.Path) -> None:
+    with (
+        pytest.raises(KeyError, match="'a.json' is one file of a directory output"),
+        compose.Pipeline("p", root=tmp_path),
+    ):
+        built = _helper_parts()
+        _ = built["parts"]["a.json"]["b.json"]
+
+
+def test_a_lone_typed_dict_directory_field_is_selected_by_name_before_its_files(
+    tmp_path: pathlib.Path,
+) -> None:
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        built = _helper_only_parts()
+        _helper_read_parts(built["parts"])
+        _helper_read_one(built["parts"]["a.json"])
+
+    whole = pipeline.get_stage("p/_helper_read_parts")["deps"]["parts"]
+    one = pipeline.get_stage("p/_helper_read_one")["deps"]["part"]
+
+    assert whole.identity == types.ArtifactIdentity("p/_helper_only_parts", "parts")
+    assert one.identity == types.ArtifactIdentity("p/_helper_only_parts", "parts/a.json")

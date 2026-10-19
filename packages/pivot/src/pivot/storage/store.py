@@ -272,7 +272,8 @@ class WorkspaceStore:
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
-        if ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir():
+        whole_directory = ref.tag == types.ArtifactTag.DIRECTORY and ref.member is None
+        if whole_directory or path.is_dir():
             return cache.hash_directory(path, state_db, cache_dir=self._cache_dir)
         file_hash, _ = cache.hash_file(path, state_db)
         return types.FileHash(hash=file_hash)
@@ -321,7 +322,8 @@ def relative_output_path(ref: types.ArtifactRef) -> pathlib.Path:
 
     This is the one rule that places outputs: ``<prefix>/<stage>.<ext>`` for a single output,
     ``<prefix>/<stage>/<key>.<ext>`` for a keyed one, and no extension for a directory. The
-    prefix is ``metrics`` or ``plots`` for tagged outputs and ``data`` otherwise.
+    prefix is ``metrics`` or ``plots`` for tagged outputs and ``data`` otherwise. One file of a
+    directory output is placed at its path inside the directory (its key ends with that path).
     """
     stage_name = ref.identity.producer
     prefix = "data"
