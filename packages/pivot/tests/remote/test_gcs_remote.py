@@ -246,6 +246,35 @@ async def test_gcs_exists_auth_error_no_credentials(
     metadata.assert_not_called()
 
 
+@pytest.mark.parametrize("method", ["upload_batch", "download_batch"])
+async def test_gcs_batch_without_credentials_raises_before_any_transfer(
+    method: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """Unlike S3's per-item failures, a GCS batch with no credentials raises once, up front."""
+    monkeypatch.delenv("STORAGE_EMULATOR_HOST", raising=False)
+    from gcloud.aio import auth as gcloud_auth
+
+    mocker.patch.object(
+        gcloud_auth.Token, "get", new=mocker.AsyncMock(side_effect=OSError("no metadata server"))
+    )
+    upload = mocker.patch.object(gcloud_storage.Storage, "upload")
+    download = mocker.patch.object(gcloud_storage.Storage, "download_stream")
+    f = tmp_path / "f.txt"
+    f.write_text("content")
+    r = gcs.GCSRemote("gs://bucket/prefix")
+
+    with pytest.raises(
+        exceptions.RemoteConnectionError, match="gcloud auth application-default login"
+    ):
+        if method == "upload_batch":
+            await r.upload_batch([(f, "a1b2c3d4e5f6789a")])
+        else:
+            await r.download_batch([("a1b2c3d4e5f6789a", tmp_path / "dest.txt")])
+
+    upload.assert_not_called()
+    download.assert_not_called()
+
+
 async def test_gcs_exists_non_auth_error_still_generic(
     no_retries: None, gcs_remote: gcs.GCSRemote, mocker: MockerFixture
 ) -> None:
@@ -335,7 +364,7 @@ async def test_permanent_error_is_not_retried(
 async def test_requests_use_the_configured_timeouts(
     gcs_remote: gcs.GCSRemote, mocker: MockerFixture
 ) -> None:
-    """Every request gets remote.connect_timeout and the read timeout, not gcloud-aio's 10s total."""
+    """A metadata request gets remote.connect_timeout and the read timeout, not gcloud-aio's 10s total."""
     metadata = mocker.patch.object(
         gcloud_storage.Storage,
         "download_metadata",
@@ -572,11 +601,16 @@ async def test_upload_file_large_uses_resumable(
     cache_hash = "abc123def4567890"
     resumable = mocker.spy(gcloud_storage.Storage, "_upload_resumable")
     simple = mocker.spy(gcloud_storage.Storage, "_upload_simple")
+    data_put = mocker.spy(gcloud_storage.Storage, "_do_upload")
 
     await gcs_remote.upload_file(test_file, cache_hash)
 
     assert resumable.call_count == 1
     assert simple.call_count == 0
+    # The data PUT gets the configured timeouts; gcloud-aio sends the session-start POST before it
+    # with its own fixed 10s total timeout, which upload() does not let a caller change.
+    assert data_put.call_args is not None
+    assert data_put.call_args.kwargs["timeout"] is gcs_remote._timeout
     assert await _get(gcs_client, gcs_remote, cache_hash) == large_payload
 
 

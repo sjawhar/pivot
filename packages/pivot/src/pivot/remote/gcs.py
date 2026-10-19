@@ -132,7 +132,9 @@ class GCSRemote:
         self._prefix = prefix.rstrip("/") + "/" if prefix else ""
         self._retries = config.get_remote_retries()
         # No whole-request deadline: a large object takes as long as it takes, while a stalled
-        # connection or read still fails.
+        # connection or read still fails. Passed to every storage request pivot makes; gcloud-aio
+        # sends two requests with its own fixed 10s total instead (a resumable upload's
+        # session-start POST, and the token request), and upload() exposes no way to change them.
         self._timeout = aiohttp.ClientTimeout(
             total=None,
             sock_connect=config.get_remote_connect_timeout(),
@@ -234,7 +236,11 @@ class GCSRemote:
             params["pageToken"] = str(token)
 
     async def _upload(self, client: Storage, local_path: Path, hash_: str) -> None:
-        """Upload one file: a simple upload up to 8 MiB, a resumable upload above it."""
+        """Upload one file: a simple upload up to 8 MiB, a resumable upload above it.
+
+        The resumable session-start POST carries gcloud-aio's fixed 10s total timeout; the data
+        PUT carries ``self._timeout``.
+        """
         key = keys.hash_to_key(self._prefix, hash_)
         resumable = local_path.stat().st_size > STREAM_CHUNK_SIZE
 
@@ -410,7 +416,11 @@ class GCSRemote:
         concurrency: int = DEFAULT_CONCURRENCY,
         callback: Callable[[int, int, str], None] | None = None,
     ) -> list[TransferResult]:
-        """Upload multiple files in parallel; a failed file is reported, never raised."""
+        """Upload multiple files in parallel; a failed file is reported, never raised.
+
+        Missing or unusable credentials are the exception: they raise one RemoteConnectionError
+        before any transfer starts, rather than a failed result per file.
+        """
         _t = metrics.start()
         if not items:
             metrics.end("gcs.upload_batch", _t)
@@ -452,7 +462,9 @@ class GCSRemote:
         """Download multiple cache entries in parallel with atomic writes and streaming.
 
         A destination that already exists is kept, never replaced: destinations are
-        content-addressed cache entries that other processes may be hardlinking.
+        content-addressed cache entries that other processes may be hardlinking. A failed
+        download is reported in its result, never raised, except that missing or unusable
+        credentials raise one RemoteConnectionError before any transfer starts.
 
         Args:
             readonly: If True, set file permissions to 0o444 (for cache files).

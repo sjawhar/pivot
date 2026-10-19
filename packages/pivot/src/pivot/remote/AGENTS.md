@@ -55,10 +55,14 @@ hash-mismatch error, and the staged atomic download. A change to the hash or the
 - **S3Remote** uses `aioboto3.Session()` — one session per instance, one client per method call;
   batch methods share that client across concurrent tasks.
 - **GCSRemote** opens one `aiohttp.ClientSession` per method call, shared by a batch's concurrent
-  transfers, and fetches the token before the first request. It passes its own
-  `aiohttp.ClientTimeout` to every request (gcloud-aio's defaults are whole-request deadlines of
-  10-30s, too short for large objects) and retries transient failures `remote.retries` times.
-  Uploads above 8 MiB use a resumable upload.
+  transfers, and fetches the token before the first request, so missing credentials raise one
+  `RemoteConnectionError` before any transfer (S3 batches instead report each item failed). It
+  passes its own `aiohttp.ClientTimeout` (no total deadline, `remote.connect_timeout` to connect)
+  to every storage request it makes, because gcloud-aio's defaults are whole-request deadlines of
+  10-30s, too short for large objects. Two requests keep gcloud-aio's fixed 10s total, because
+  its public API exposes no timeout for them: a resumable upload's session-start POST, and the
+  token request. It retries transient failures `remote.retries` times. Uploads above 8 MiB use a
+  resumable upload.
 
 ### Auth Conventions
 

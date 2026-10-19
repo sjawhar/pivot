@@ -25,7 +25,20 @@ class RemoteScheme(enum.StrEnum):
 
 REMOTE_URL_FORMATS = "s3://bucket/prefix or gs://bucket/prefix"
 
-_REMOTE_URL_PATTERN = re.compile(r"^(s3|gs)://([^/]+)(/.*)?$")
+_REMOTE_URL_PATTERN = re.compile(
+    rf"^({'|'.join(re.escape(scheme) for scheme in RemoteScheme)})://([^/]+)(/.*)?$"
+)
+
+# Each cloud's bucket naming rules: these characters only, starting and ending with a letter or
+# digit. Refusing anything else keeps a bucket from bending the request path (``?``, ``#``, ``%``).
+_BUCKET_PATTERNS = {
+    RemoteScheme.S3: re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$"),
+    RemoteScheme.GS: re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"),
+}
+_BUCKET_CHARACTERS = {
+    RemoteScheme.S3: "lowercase letters, digits, '.' and '-'",
+    RemoteScheme.GS: "lowercase letters, digits, '.', '-' and '_'",
+}
 
 
 def _get_config_path() -> Path:
@@ -76,6 +89,12 @@ def validate_remote_url(url: str) -> tuple[RemoteScheme, str, str]:
         )
     scheme = RemoteScheme(match.group(1))
     bucket = match.group(2)
+    if not _BUCKET_PATTERNS[scheme].match(bucket):
+        raise exceptions.InvalidRemoteURLError(
+            f"Invalid remote URL: {url}. Bucket name '{bucket}' may contain only "
+            + f"{_BUCKET_CHARACTERS[scheme]}, starting and ending with a letter or digit. "
+            + f"Expected format: {REMOTE_URL_FORMATS}"
+        )
     prefix = (match.group(3) or "").lstrip("/")
     return scheme, bucket, prefix
 

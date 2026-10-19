@@ -83,6 +83,44 @@ def test_validate_gs_url_rejects(url: str) -> None:
         remote_config.validate_remote_url(url)
 
 
+@pytest.mark.parametrize("scheme", list(remote_config.RemoteScheme))
+def test_validate_remote_url_accepts_every_scheme(scheme: remote_config.RemoteScheme) -> None:
+    """The URL grammar accepts exactly the schemes RemoteScheme names."""
+    assert remote_config.validate_remote_url(f"{scheme}://bucket/p") == (scheme, "bucket", "p")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("s3://My-Bucket/p", id="s3-uppercase"),
+        pytest.param("gs://My-Bucket/p", id="gs-uppercase"),
+        pytest.param("gs://bucket?alt=json/p", id="query"),
+        pytest.param("s3://bucket#frag/p", id="fragment"),
+        pytest.param("gs://-bucket/p", id="leading-hyphen"),
+        pytest.param("s3://bucket./p", id="trailing-dot"),
+        pytest.param("s3://my_bucket/p", id="s3-underscore"),
+        pytest.param("gs://buck%2Fet/p", id="percent"),
+    ],
+)
+def test_validate_remote_url_rejects_invalid_bucket_names(url: str) -> None:
+    """A bucket name outside the cloud's naming rules is refused before any request is built."""
+    with pytest.raises(exceptions.InvalidRemoteURLError, match=f"Bucket name .*{_BOTH_SCHEMES}"):
+        remote_config.validate_remote_url(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "bucket"),
+    [
+        pytest.param("gs://my_bucket.v2-a/p", "my_bucket.v2-a", id="gs-underscore-dot-hyphen"),
+        pytest.param("s3://my.bucket-1/p", "my.bucket-1", id="s3-dot-hyphen"),
+        pytest.param("s3://b/p", "b", id="one-character"),
+    ],
+)
+def test_validate_remote_url_accepts_valid_bucket_names(url: str, bucket: str) -> None:
+    _, parsed_bucket, _ = remote_config.validate_remote_url(url)
+    assert parsed_bucket == bucket
+
+
 def test_invalid_remote_url_suggests_only_supported_schemes() -> None:
     with pytest.raises(exceptions.InvalidRemoteURLError) as exc_info:
         remote_config.validate_remote_url("/local/path")

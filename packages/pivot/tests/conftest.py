@@ -647,7 +647,7 @@ async def moto_s3_bucket(
 # =============================================================================
 
 _FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.56.1"
-_FAKE_GCS_LABEL = "owner=bet40-pivot"
+_FAKE_GCS_LABEL = "owner=pivot-tests"
 _FAKE_GCS_START_TIMEOUT = 60
 
 
