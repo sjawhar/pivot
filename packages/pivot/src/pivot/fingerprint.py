@@ -774,7 +774,7 @@ def _read_step(owner: Any, step: str) -> Any:
             case "s":
                 return sorted(owner, key=_serialize_value_for_hash)[int(arg)]
             case "hc":
-                return _hint_classes(owner)[int(arg)][0]
+                return _hint_classes(owner)[int(arg)]
             case "fc":
                 return _model_field_classes(owner)[int(arg)]
             case _:
@@ -798,7 +798,7 @@ def _read_token(owner: Any, step: str) -> str:
     the value itself.
     """
     if step == "hints":
-        return "|".join(f"{_value_token(cls)}:{whole}" for cls, whole in _hint_classes(owner))
+        return "|".join(_value_token(cls) for cls in _hint_classes(owner))
     if step == "schema":
         if not hasattr(owner, "model_json_schema"):
             return "absent"
@@ -1734,23 +1734,6 @@ def _check_non_scalar_capture(
     errors.append(message)
 
 
-def _check_data_class_methods(cls: type) -> None:
-    allowed = frozenset({"model_post_init", "model_validate", "model_rebuild"})
-    user_methods = [
-        name
-        for name, val in vars(cls).items()
-        if callable(val)
-        and not (name.startswith("__") and name.endswith("__"))
-        and name not in allowed
-    ]
-    if user_methods:
-        message = (
-            f"Data class '{cls.__qualname__}' has methods {user_methods}. "
-            + "Move these to standalone functions for reliable change detection."
-        )
-        raise exceptions.StageDefinitionError(message)
-
-
 def _is_user_class_instance(value: Any) -> bool:
     """Return whether `value` is an instance of a user-defined class."""
     return not isinstance(value, type) and is_user_code(type(value))
@@ -2333,15 +2316,14 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
     return hints
 
 
-def _hint_classes(func: Callable[..., Any]) -> list[tuple[type, bool]]:
-    """Return each user class in `func`'s type hints, with whether it is a whole hint.
-
-    A class that is not a whole hint is the origin of a generic (`MyContainer[int]`). Within
-    one `fingerprint_pass()` each function's hints are collected once.
+def _hint_classes(func: Callable[..., Any]) -> list[type]:
+    """Return each user class in `func`'s type hints, including the origin of a generic
+    (`MyContainer[int]`). Within one `fingerprint_pass()` each function's hints are collected
+    once.
     """
 
-    def collect() -> list[tuple[type, bool]]:
-        found = list[tuple[type, bool]]()
+    def collect() -> list[type]:
+        found = list[type]()
         for hint in _resolved_type_hints(func).values():
             _collect_hint_classes(hint, found)
         return found
@@ -2349,7 +2331,7 @@ def _hint_classes(func: Callable[..., Any]) -> list[tuple[type, bool]]:
     return _memoized("hints", func, collect)
 
 
-def _collect_hint_classes(hint: Any, found: list[tuple[type, bool]]) -> None:
+def _collect_hint_classes(hint: Any, found: list[type]) -> None:
     """Add the user classes in one type hint to `found`, recursing into generics."""
     if hint is type(None):
         return
@@ -2357,12 +2339,12 @@ def _collect_hint_classes(hint: Any, found: list[tuple[type, bool]]) -> None:
     if origin is not None:
         # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
         if isinstance(origin, type) and is_user_code(origin):
-            found.append((cast("type[Any]", origin), False))
+            found.append(cast("type[Any]", origin))
         for arg in typing.get_args(hint):
             _collect_hint_classes(arg, found)
         return
     if isinstance(hint, type) and is_user_code(hint):
-        found.append((cast("type[Any]", hint), True))
+        found.append(cast("type[Any]", hint))
 
 
 def _process_type_hint_dependencies(
@@ -2370,10 +2352,8 @@ def _process_type_hint_dependencies(
 ) -> None:
     """Process user-defined classes in type hints, including Pydantic model defaults."""
     _record_read(func, "hints")
-    for index, (hint_class, whole_hint) in enumerate(_hint_classes(func)):
+    for index, hint_class in enumerate(_hint_classes(func)):
         with _walking(f"hc:{index}"):
-            if whole_hint and dataclasses.is_dataclass(cast("object", hint_class)):
-                _check_data_class_methods(hint_class)
             key = f"class:{_definition_ref(hint_class)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, hint_class, manifest, visited)

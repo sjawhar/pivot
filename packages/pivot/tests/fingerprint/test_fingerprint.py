@@ -1,7 +1,6 @@
 # pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportImplicitOverride=false
 
 import ast
-import dataclasses
 import enum
 import importlib
 import importlib.util
@@ -231,41 +230,6 @@ class _HelperAnnotatedClass(_HelperBase):
         self.field = _HelperFieldType()
         self.inner = _HelperContainer.Inner()
         self.model = _HelperPydanticModel()
-
-
-@dataclasses.dataclass
-class _HelperDataClassNoMethods:
-    value: int
-
-
-@dataclasses.dataclass
-class _HelperDataClassWithMethod:
-    value: int
-
-    def custom(self) -> int:
-        return self.value
-
-
-@dataclasses.dataclass
-class _HelperDataClassWithDunder:
-    value: int
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-
-class _HelperPydanticModelWithAllowedMethod(BaseModel):
-    value: int
-
-    def model_post_init(self, __context: typing.Any) -> None:
-        return None
-
-
-class _HelperPydanticModelWithUserMethod(BaseModel):
-    value: int
-
-    def compute(self) -> int:
-        return self.value + 1
 
 
 def _helper_parse_annotation(expr: str) -> ast.AST:
@@ -1175,22 +1139,6 @@ def test_hash_function_no_code_object():
     # Should fall back to identity hash
     assert isinstance(h, str)
     assert len(h) == 16  # xxhash64 hexdigest
-
-
-def test_check_data_class_methods_allows_dunders_and_pydantic_hooks():
-    """Dunder methods and allowed Pydantic hooks should be allowed."""
-    fingerprint._check_data_class_methods(_HelperDataClassNoMethods)
-    fingerprint._check_data_class_methods(_HelperDataClassWithDunder)
-    fingerprint._check_data_class_methods(_HelperPydanticModelWithAllowedMethod)
-
-
-def test_check_data_class_methods_rejects_user_methods():
-    """User-defined methods on data classes should raise errors."""
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperDataClassWithMethod)
-
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperPydanticModelWithUserMethod)
 
 
 def _helper_check_dynamic(func: typing.Callable[..., object]) -> None:

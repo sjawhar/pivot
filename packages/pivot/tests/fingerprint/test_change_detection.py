@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from pivot import fingerprint
+from pivot import exceptions, fingerprint
 
 # --- Fixtures ---
 
@@ -842,3 +842,55 @@ def test_in_body_import_change_causes_miss(module_dir: pathlib.Path) -> None:
     _import_fresh("test_change_inbody_lib")
     fp2 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_inbody").stage)
     assert fp1 != fp2, "editing a module the stage imports in its body must change it"
+
+
+def test_dataclass_method_reading_global_is_walked(module_dir: pathlib.Path) -> None:
+    """A dataclass in the stage's annotations has its methods walked like any user class's, so
+    a global one of them reads is tracked, not refused as a method on a data class."""
+    mod_py = module_dir / "test_change_dataclass_method.py"
+    body = (
+        "import dataclasses\n"
+        "@dataclasses.dataclass\n"
+        "class Settings:\n"
+        "    width: int = 1\n"
+        "    def slots(self):\n"
+        "        return self.width * FACTOR\n"
+        "def stage(settings: Settings) -> int:\n"
+        "    return settings.slots()\n"
+    )
+    mod_py.write_text("FACTOR = 2\n" + body)
+    fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_dataclass_method").stage)
+    mod_py.write_text("FACTOR = 20\n" + body)
+    fp2 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_dataclass_method").stage)
+    assert fp1 != fp2, "editing a global a dataclass method reads must change the fingerprint"
+
+
+def test_in_body_from_import_of_non_scalar_is_refused(module_dir: pathlib.Path) -> None:
+    """`from X import NAME` in a stage body, where NAME is a mutable module value, is refused
+    as the same value read as a global is."""
+    (module_dir / "test_change_inbody_list_lib.py").write_text("SUFFIXES = ['!']\n")
+    (module_dir / "test_change_inbody_list.py").write_text(
+        "def stage():\n"
+        + "    from test_change_inbody_list_lib import SUFFIXES\n"
+        + "    return SUFFIXES[0]\n"
+    )
+    module = _import_fresh("test_change_inbody_list")
+    with pytest.raises(exceptions.StageDefinitionError, match="SUFFIXES"):
+        fingerprint.get_stage_fingerprint(module.stage)
+
+
+def test_relative_in_body_import_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """`from .sibling import value` in a stage body is resolved against the stage's package."""
+    package = module_dir / "test_change_relpkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    sibling_py = package / "sibling.py"
+    sibling_py.write_text("def value():\n    return 2\n")
+    (package / "stages.py").write_text(
+        "def stage():\n    from .sibling import value\n    return value()\n"
+    )
+    fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_relpkg.stages").stage)
+    sibling_py.write_text("def value():\n    return 101\n")
+    _import_fresh("test_change_relpkg.sibling")
+    fp2 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_relpkg.stages").stage)
+    assert fp1 != fp2, "editing a module a relative in-body import names must change it"

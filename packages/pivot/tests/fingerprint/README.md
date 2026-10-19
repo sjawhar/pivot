@@ -11,7 +11,7 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
 - **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
 - **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
-- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (data class methods, dynamic name access)
+- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (dynamic name access, unsafe fingerprinting and the run cache)
 - **`test_no_fingerprint.py`** - Worker skip/re-run behavior for `@no_fingerprint()` stages (file-level hashing)
 - **`test_fingerprint_properties.py`** - Hypothesis properties over generated stage bodies: fresh-process determinism, formatting insensitivity, one-token sensitivity, and `params.yaml` overrides vs. the run-cache key
 
@@ -83,7 +83,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global read only inside a method of a user class (`Scaler().apply` reads `SCALE`) | ✅ | `test_change_detection.py::test_method_global_change_causes_miss` |
 | Compiled regex read only inside a method, class imported from another module (`ScopeWalk().step`) | ✅ | `test_change_detection.py::test_method_regex_change_causes_miss` |
 | Helper called only from a classmethod (`Runner.go` calls `bump`) | ✅ | `test_change_detection.py::test_method_helper_change_causes_miss` |
-| Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                         |
+| Data class method reading a global (method walked, not refused) | ✅ | `test_change_detection.py::test_dataclass_method_reading_global_is_walked` |
+| In-body `from X import` of a mutable module value | ✅ (error) | `test_change_detection.py::test_in_body_from_import_of_non_scalar_is_refused` |
+| Relative in-body import (`from .sibling import value`) | ✅ | `test_change_detection.py::test_relative_in_body_import_change_causes_miss` |
+| Module first imported by the fingerprint's body-import walk is re-imported by the next discovery | ✅ | `test_discovery.py::test_rediscovery_reimports_a_module_first_imported_by_the_fingerprint` |
 | Class base/field annotation dependencies             | ✅        | `test_fingerprint.py::test_process_class_body_dependencies_tracks_bases_and_annotations`                                           |
 | StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                           |
 | StageParams regular method change                    | ✅        | `test_change_detection.py::test_stageparams_method_change_causes_miss`                                                             |
