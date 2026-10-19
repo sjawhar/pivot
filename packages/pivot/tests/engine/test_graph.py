@@ -1065,19 +1065,46 @@ def _helper_two_dimensional_order(count: int, spread: float) -> nx.DiGraph[str]:
     return stage_dag
 
 
-@pytest.mark.parametrize(("count", "spread", "steps"), [(12, 6.0, 0), (30, 12.0, 0), (60, 20.0, 5)])
+def _helper_reinserted(stage_dag: nx.DiGraph[str], rng: random.Random) -> nx.DiGraph[str]:
+    """The same stage DAG with its stages and edges added in a shuffled order, so it lists each
+    stage's dependencies in another order."""
+    reinserted: nx.DiGraph[str] = nx.DiGraph()
+    nodes, edges = list(stage_dag.nodes), list(stage_dag.edges)
+    for node in rng.sample(nodes, len(nodes)):
+        reinserted.add_node(node)
+    for consumer, producer in rng.sample(edges, len(edges)):
+        reinserted.add_edge(consumer, producer)
+    return reinserted
+
+
+@pytest.mark.parametrize(
+    ("count", "spread", "steps"),
+    [
+        pytest.param(12, 6.0, 12, id="12-stages"),
+        pytest.param(30, 12.0, 30, id="30-stages"),
+        pytest.param(60, 20.0, 60, id="60-stages"),
+        pytest.param(200, 60.0, 100, id="200-stages"),
+    ],
+)
 def test_get_width_does_not_depend_on_the_order_of_stages(
     count: int, spread: float, steps: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every order of one run's stages gives one pool size, also when the search for the width
-    runs out of steps, so the pool does not change with the process's hash seed."""
+    """One run gives one pool size whatever the order of its stages and of the stage DAG's stages
+    and edges, at every step budget below ``steps``, from none up to one the search for the width
+    finishes within, so the pool changes neither with the process's hash seed nor with the order
+    a pipeline registers its stages."""
     stage_dag = _helper_two_dimensional_order(count, spread)
     stages = sorted(stage_dag.nodes())
-    monkeypatch.setattr(graph, "_AUGMENT_STEPS", steps)
+    finished = graph.get_width(stage_dag, stages, limit=count + 1)
+    orders = [(stage_dag, stages)]
+    for seed in range(8):
+        rng = random.Random(seed)
+        orders.append((_helper_reinserted(stage_dag, rng), rng.sample(stages, count)))
 
-    widths = {
-        graph.get_width(stage_dag, random.Random(seed).sample(stages, count), limit=count + 1)
-        for seed in range(20)
-    }
+    widths = set[int]()
+    for budget in range(steps):
+        monkeypatch.setattr(graph, "_AUGMENT_STEPS", budget)
+        widths = {graph.get_width(dag, run, limit=count + 1) for dag, run in orders}
+        assert len(widths) == 1, f"with {budget} steps, orders of one run gave {sorted(widths)}"
 
-    assert len(widths) == 1, f"orders of one run gave pool sizes {sorted(widths)}"
+    assert widths == {finished}, f"the search should finish within {steps - 1} steps"
