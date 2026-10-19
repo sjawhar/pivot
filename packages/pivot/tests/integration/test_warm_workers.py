@@ -866,8 +866,7 @@ def test_command_starts_as_many_workers_as_stages_can_run_at_once(
 ) -> None:
     """A command starts one worker per stage that can run at once, up to the configured worker
     count; a TUI's pre-warm starts the same workers its engine then uses."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _WIDTH_PIPELINE)
     _helper_configure_workers(root, max_workers)
     env, worker_log = _helper_logging_env(tmp_path)
@@ -899,8 +898,7 @@ def test_tui_starts_its_workers_before_the_tui_when_a_tracked_input_is_restored(
 ) -> None:
     """The pre-warm restores a missing tracked input before it sizes the pool, as the engine
     does, so no worker starts after Textual does."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     _helper_configure_workers(root, 8)
     env, worker_log = _helper_logging_env(tmp_path)
@@ -923,8 +921,7 @@ def test_tui_checkout_missing_warns_once_about_a_changed_tracked_file(
 ) -> None:
     """The pre-warm only restores missing tracked files; checking the others stays the
     engine's, so a tracked file edited since `pivot track` is reported once."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env, _ = _helper_logging_env(tmp_path)
     tracked = root / "data" / "raw" / "x.txt"
@@ -1001,8 +998,7 @@ def test_repro_tui_prewarm_leaves_out_the_stages_a_keep_going_run_skips(
     """Across all pipelines with keep-going, the engine leaves out stages with a missing
     dependency; the TUI's pre-warm leaves them out too, so it starts only the workers the
     engine then uses."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
         (root / name).mkdir(parents=True)
         (root / name / "pipeline.py").write_text(source)
@@ -1096,7 +1092,7 @@ async def test_watch_reload_keeps_going_past_a_pipeline_with_a_missing_input(
 ) -> None:
     """Across all pipelines with keep-going, a reload re-runs the stages the first run could
     run and leaves out the ones a missing input breaks."""
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
         (root / name).mkdir(parents=True)
         (root / name / "pipeline.py").write_text(source)

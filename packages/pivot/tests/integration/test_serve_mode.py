@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import signal
 import socket
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -22,11 +24,12 @@ from pivot.engine.engine import Engine
 from pivot.engine.sources import OneShotSource
 from pivot.engine.types import StageStarted
 from tests import helpers
+from tests.conftest import send_rpc
 
 if TYPE_CHECKING:
-    import pathlib
-
     from pivot.registry import PipelineLike as Pipeline
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 def _helper_noop() -> dict[str, str]:
@@ -367,7 +370,7 @@ with pipeline:
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
     proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+        [_PIVOT_BIN, "repro", "--watch", "--serve"],
         cwd=tmp_path,
         env=env,
         stdout=subprocess.PIPE,
@@ -416,6 +419,75 @@ with pipeline:
 
     finally:
         # Clean up subprocess
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def test_serve_mode_serves_a_project_whose_socket_path_exceeds_the_unix_socket_limit(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project at any depth can serve: a Unix socket address holds at most 104 bytes on
+    macOS and 108 on Linux, and this project's ``.pivot/agent.sock`` is longer than both.
+
+    An agent in the project connects to ``.pivot/agent.sock`` by its relative path.
+    """
+    project = tmp_path / ("deep-project-" * 10)
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text("""\
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def noop_stage() -> None:
+    pass
+
+
+with pipeline:
+    noop_stage()
+""")
+    socket_path = project / ".pivot" / "agent.sock"
+    assert len(os.fsencode(socket_path)) > 108, "the socket path must exceed every platform limit"
+    stdout_path = tmp_path / "serve.stdout"
+    stderr_path = tmp_path / "serve.stderr"
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--serve"],
+            cwd=project,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+    monkeypatch.chdir(project)
+    try:
+        response: dict[str, object] | None = None
+        deadline = time.monotonic() + 30
+        while response is None and proc.poll() is None and time.monotonic() < deadline:
+            try:
+                response = send_rpc(pathlib.Path(".pivot", "agent.sock"), "status")
+            except (ConnectionRefusedError, FileNotFoundError):
+                time.sleep(0.1)
+
+        assert response is not None, (
+            f"serve mode did not answer on .pivot/agent.sock (exit code {proc.poll()}).\n"
+            + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+            + f"stderr: {stderr_path.read_text(errors='replace')}"
+        )
+        assert "result" in response, f"Expected status result, got: {response}"
+        assert socket_path.is_socket(), "the socket lives in the project's .pivot directory"
+    finally:
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=5)

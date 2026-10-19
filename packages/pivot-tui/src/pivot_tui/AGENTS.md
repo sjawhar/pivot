@@ -5,7 +5,7 @@ Pure RPC client over the engine's JSON-RPC 2.0 Unix socket.
 ## Boundary Rules
 
 - **No direct state access.** Must not read lock files, cache files, or state files. All state goes through engine RPC.
-- **Import boundary:** May import `pivot.types` (pure type definitions). Must not import runtime modules (`engine`, `storage`, `config`).
+- **Import boundary:** May import `pivot.types` (pure type definitions) and `pivot.unix_socket` (reaching a socket at any path). Must not import runtime modules (`engine`, `storage`, `config`).
 
 ## Lifecycle
 

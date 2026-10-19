@@ -8,7 +8,7 @@ When running in watch mode with the TUI, Pivot starts an Agent Server that expos
 
 ## Protocol
 
-**Transport:** Unix domain socket (path provided by the TUI when starting the server)
+**Transport:** Unix domain socket. `pivot repro --watch --serve` and `--watch --tui` listen on `.pivot/agent.sock` in the project root. A socket address holds at most 108 bytes on Linux and 104 on macOS; Pivot serves a project at any depth, and a client of a deeper project connects by the relative path `.pivot/agent.sock` from the project root, as in the example below.
 
 **Protocol:** JSON-RPC 2.0
 

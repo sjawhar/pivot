@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import anyio
 
+from pivot import unix_socket
 from pivot.types import ArtifactIdentity, ChangeType, DepChange, OutputChange, StageExplanation
 from pivot_tui.client import (
     CommitResult,
@@ -90,7 +91,7 @@ class RpcPivotClient:
             await self.disconnect()
         self._buffer = b""
         self._call_lock = anyio.Lock()
-        self._conn = await anyio.connect_unix(str(socket_path))
+        self._conn = await unix_socket.connect_unix(socket_path)
 
     async def disconnect(self) -> None:
         """Close the connection."""

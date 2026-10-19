@@ -13,7 +13,7 @@ The TUI supports two modes:
 
 ## Communication Architecture
 
-The TUI is a **pure RPC client** — it communicates with the engine exclusively via JSON-RPC 2.0 over a Unix socket. It does not import runtime modules (`engine`, `storage`, `executor`, `config`, etc.); only `pivot.types` is shared for message schemas.
+The TUI is a **pure RPC client** — it communicates with the engine exclusively via JSON-RPC 2.0 over a Unix socket. It does not import runtime modules (`engine`, `storage`, `executor`, `config`, etc.); it shares only `pivot.types` for message schemas and `pivot.unix_socket`, which reaches the socket at any path.
 
 ```
 ┌─────────────┐                  ┌──────────────────┐                  ┌──────────────────┐

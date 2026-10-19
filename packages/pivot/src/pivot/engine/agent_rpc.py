@@ -12,7 +12,7 @@ import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import BaseModel, ValidationError, field_validator
 
-from pivot import exceptions, parameters, project, types
+from pivot import exceptions, parameters, project, types, unix_socket
 from pivot import explain as explain_mod
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
@@ -474,7 +474,7 @@ class AgentRpcSource:
             if self._socket_path.exists():
                 self._socket_path.unlink()
 
-        listener = await anyio.create_unix_listener(self._socket_path)
+        listener = await unix_socket.create_unix_listener(self._socket_path)
 
         try:
             self._socket_path.chmod(0o600)  # Owner-only access
