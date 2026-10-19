@@ -225,14 +225,21 @@ A downstream stage takes the directory in one of two ways:
   that file's hash alone, so it reruns when that file changes and not when
   another file in the directory does. A run where the producer did not write
   the file fails the consumer with `missing deps:` naming the producer and the
-  file; `pivot status` reads the file's hash from the producer's lock when the
-  directory is not on disk.
+  file, and a path that names a directory inside the output fails it with
+  `unreadable deps:`; `pivot status` reads the file's hash from the
+  producer's lock when the directory is not on disk.
 
-A key must be a relative path with an extension and no `..`; keys that
-normalize to one path, or differ only by case, fail the producer before any
-file is written. A file named by a consumer is checked by the same rules (and
-may not contain `:`) when the pipeline is built, naming the consumer, the
-producer and the key. A directory of files whose loader only writes, such as
+A key must be a relative path with an extension, with no `..`, backslash,
+colon or null byte (each file is named `stage:path` as a dependency). Two keys
+that normalize to one path, two that differ only by case, and a key inside
+another key's path (`a.json` beside `a.json/b.json`) are refused too. Every
+output of the stage is checked before any is written, so a refused key fails
+the stage in one line naming it, the output and the key, and leaves the
+previous run's outputs, cache and lock as they were. A file named by a consumer
+is checked by the same rules when the pipeline is built, naming the consumer,
+the producer and the key, and a `TypedDict` field named like a file of a
+directory field (`parts/a.json` beside `parts`) is refused when the stage is
+defined. A directory of files whose loader only writes, such as
 `MatplotlibFigure()`, is a valid output, but no stage can depend on it or on
 one of its files.
 

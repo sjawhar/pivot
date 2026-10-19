@@ -688,7 +688,7 @@ pivot import REPO_URL ARTIFACT --out PATH [OPTIONS]
 **Arguments:**
 
 - `REPO_URL` - URL of the source Pivot repository (HTTPS, SSH, or `file://`)
-- `ARTIFACT` - Identity of the output in the source repo: `pipeline/stage` for a single-output stage, `pipeline/stage:key` for one field of a multi-output stage, as printed by `pivot list --deps` there
+- `ARTIFACT` - Identity of the output in the source repo: `pipeline/stage` for a single-output stage, `pipeline/stage:key` for one field of a multi-output stage, as printed by `pivot list --deps` there. A directory output is imported one file at a time: `pipeline/stage:path`, or `pipeline/stage:key/path` for a `TypedDict` field
 
 **Options:**
 

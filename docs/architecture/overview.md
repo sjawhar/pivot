@@ -71,7 +71,7 @@ preprocess (produces data/clean.csv)
 
 #### Dependency Resolution
 
-The graph builder matches each dependency to its producer by artifact identity: `_build_outputs_map()` maps every output's `ArtifactIdentity` (producing stage plus output key) to that stage, and a dependency handle carries the identity of the output it was created from. A dependency with no producer is a pipeline input, resolved to its bound workspace path by the store. Paths play no part in matching, so two stages can never be linked by an accidental path prefix. Paths still decide where outputs land, so `StageRegistry.add_existing` refuses an output whose workspace path (`storage/store.py` `relative_output_path`) equals, contains, or lies inside another registered output's path.
+The graph builder matches each dependency to its producer by artifact identity: `_build_outputs_map()` maps every output's `ArtifactIdentity` (producing stage plus output key) to that stage, and a dependency handle carries the identity of the output it was created from. A dependency on one file of a directory output carries its own identity (the directory's key with the file's path appended) and hangs from the directory's node (`types.source_identity`), so the edge exists while its lock records only that file. A dependency with no producer is a pipeline input, resolved to its bound workspace path by the store. Paths play no part in matching, so two stages can never be linked by an accidental path prefix. Paths still decide where outputs land, so `StageRegistry.add_existing` refuses an output whose workspace path (`storage/store.py` `relative_output_path`) equals, contains, or lies inside another registered output's path.
 
 ### Scheduler
 

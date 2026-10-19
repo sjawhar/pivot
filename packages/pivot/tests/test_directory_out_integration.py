@@ -182,6 +182,22 @@ def _stage_numbered_files(params: _CountParams) -> Annotated[dict[str, str], com
     return {f"{i}.txt": str(i) for i in range(params.count)}
 
 
+class _OutsideParams(stage_def.StageParams):
+    outside: str = ""
+
+
+def _stage_returns_link_and_a_file_beneath_it(
+    params: _OutsideParams,
+) -> Annotated[dict[str, pathlib.Path], compose.directory]:
+    """A returned directory holding a link to ``outside``, and a key whose file lies beneath it."""
+    scratch = pathlib.Path(tempfile.mkdtemp())
+    tree = scratch / "tree.d"
+    tree.mkdir()
+    (tree / "link").symlink_to(params.outside, target_is_directory=True)
+    (scratch / "x.txt").write_text("x")
+    return {"tree.d": tree, "tree.d/link/x.txt": scratch / "x.txt"}
+
+
 class _MixedResult(TypedDict):
     parts: Annotated[dict[str, dict[str, int]], compose.directory, loaders.JSON[dict[str, int]]()]
     summary: Annotated[dict[str, int], compose.metric]
@@ -741,6 +757,53 @@ def test_rerun_writes_inside_the_output_directory_through_no_symlink_left_there(
     assert list(outside.iterdir()) == [], "nothing was written through the link"
     assert not (results_dir / "sub").is_symlink()
     assert (results_dir / "sub" / "deep" / "deeper.json").resolve().is_relative_to(root.resolve())
+
+
+def test_rerun_replaces_a_symlink_left_at_the_output_path(
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The previous output is removed before the directory is made, a link without its target."""
+    _prepare_project(mock_discovery, monkeypatch)
+    results_dir = _register_producer()
+    executor.run(pipeline=mock_discovery)
+    outside = tmp_path_factory.mktemp("outside")
+    shutil.rmtree(results_dir)
+    results_dir.symlink_to(outside, target_is_directory=True)
+
+    results = executor.run(pipeline=mock_discovery, force=True)
+
+    assert results["test/produce"]["status"] == "ran", results
+    assert list(outside.iterdir()) == [], "nothing was written through the link"
+    assert not results_dir.is_symlink()
+    _assert_files_exist(results_dir, ["a.json", "b.json", "c.json"])
+
+
+def test_returned_path_holding_a_link_cannot_place_another_keys_file_beneath_it(
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A key inside another key's path is refused before anything is moved or written.
+
+    So the only directories on the way to a key's file are ones the worker creates, and a
+    link inside a returned directory is never followed by a later write.
+    """
+    _prepare_project(mock_discovery, monkeypatch)
+    outside = tmp_path_factory.mktemp("outside")
+    helpers.register_test_stage(
+        _stage_returns_link_and_a_file_beneath_it,
+        name="linked",
+        params=_OutsideParams(outside=str(outside)),
+    )
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/linked"]["status"] == "failed", results
+    assert "cannot be both a file and the directory holding" in results["test/linked"]["reason"]
+    assert list(outside.iterdir()) == [], "nothing was written through the link"
+    assert not helpers.get_output_path("linked").exists()
 
 
 def test_keys_are_written_at_their_normal_form(

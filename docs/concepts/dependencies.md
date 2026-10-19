@@ -133,6 +133,16 @@ Passing the whole handle fails: `Stage 'demo/fit' received handle from
 multi-output stage 'demo/split_rows' without selecting an output. Use
 handle.key or handle['key']. Available: ['train', 'test']`.
 
+A [directory output](outputs.md#directory-outputs) is passed whole, as a
+`dict` from each file's path to its value, or one file at a time by indexing
+its handle with that path:
+
+```python
+parts = split(raw)             # returns Annotated[dict[str, pd.DataFrame], directory]
+count(parts)                   # every file: reruns when any of them changes
+fit(parts["train.csv"])        # one file: reruns only when train.csv changes
+```
+
 ## Testing is natural
 
 Outside a `with Pipeline` block a `@stage` function is an ordinary function, so

@@ -138,8 +138,8 @@ with Pipeline("demo") as pipeline:
 ```
 
 - **Inputs**: `pipeline.input(name)` reads `data/raw/<name>`; format from the extension (`compose.py` `_infer_format_from_extension`)
-- **Dependencies**: stage parameters that receive handles (or lists/tuples of handles) at the call site; no annotations on parameters
-- **Outputs**: the return type; format inferred (`DataFrame`→JSONL, `dict`/`list`→YAML, `str`→text) or set with `Annotated[T, loader]`; `TypedDict` for several outputs; `metric`/`plot` tags. Pivot chooses paths (`data/<pipeline>/<stage>.<ext>`)
+- **Dependencies**: stage parameters that receive handles (or lists/tuples of handles) at the call site; no annotations on parameters. `handle["train.csv"]` on a `directory` output depends on that one file
+- **Outputs**: the return type; format inferred (`DataFrame`→JSONL, `dict`/`list`→YAML, `str`→text) or set with `Annotated[T, loader]`; `TypedDict` for several outputs; `metric`/`plot`/`incremental` tags; `Annotated[dict[str, T], directory]` for a variable set of files. Pivot chooses paths (`data/<pipeline>/<stage>.<ext>`, a directory `data/<pipeline>/<stage>/`)
 - **Parameters**: one `StageParams` subclass per stage, defined beside it; `params.yaml` overrides by stage name
 - **Variants**: Python loops, `pipeline.variant("name")`; composition: imported handles, `Pipeline.include()`
 - Stages must be **pure, module-level functions** (workers receive them by pickling); config belongs in `StageParams`, not module-level collections

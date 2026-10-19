@@ -117,7 +117,9 @@ reminder; it is not a security control.
 it takes ownership of a file or directory created outside the project and moves
 it to Pivot's managed path; a path already inside the project is rejected. Use
 it for a binary format or directory artifact that a stage creates itself, not
-for a file under `data/<pipeline>/`.
+for a file under `data/<pipeline>/`. A `dict[str, pathlib.Path]` tagged
+`directory` moves each returned path to its key inside the output directory
+(see [Directory outputs](outputs.md#directory-outputs)).
 
 ## Overriding the format
 

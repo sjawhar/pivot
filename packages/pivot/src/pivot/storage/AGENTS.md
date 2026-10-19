@@ -27,8 +27,8 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | Prefix | Purpose |
 |--------|---------|
 | `hash:` | File content hashes (keyed by resolved/physical path) |
-| `gen:` | Output generation counters (keyed by logical/normpath) |
-| `dep:` | Stage dependency generations (`stage:dep_path` → generation) |
+| `gen:` | Output generation counters (keyed by artifact identity, `stage` or `stage:key`) |
+| `dep:` | Stage dependency generations (`stage:dep_identity` → generation; one file of a directory output records its directory's identity) |
 | `runcache:` | Run cache entries (`stage:input_hash` → output hashes) |
 | `sm:` | Fingerprint manifest cache (stage manifests + source maps) |
 | `run:` | Run history entries |
