@@ -1,10 +1,10 @@
 # Pivot - Project Rules
 
-**Python 3.13+ | Unix only | 90%+ coverage | Pre-alpha (breaking changes OK)**
+**Python 3.13+ | Unix only | 90%+ coverage | Pre-alpha (breaking changes OK; removing a user-facing feature needs sjawhar's approval)**
 
 ## Project Status
 
-**Pre-alpha** - breaking changes acceptable, no migration code or compatibility shims needed.
+**Pre-alpha** - breaking changes acceptable, no migration code or compatibility shims needed: a change may rename a feature or change its syntax, file format or defaults, as long as everything users could do with it still works in the new form. Removing or disabling something users reach directly (a name exported from the top-level `pivot` package or accepted in a stage annotation, or a method or parameter of one; a CLI command, option or option value; a config key or value; a `PIVOT_*` variable; an RPC method), including one your own change stops supporting, needs sjawhar's approval before the PR merges, and so does a new form that cannot do something the old one could, even when it offers another way to get a similar result. Approval is his own act naming what is removed: a comment or review he wrote, his answer to a question, his approval of a document or PR whose text names it, or his own message in the session making the change, quoted in the PR with that session's id; link or quote it from the PR. A plan, issue or PR body an agent wrote, or an agent's relay of his words, is not approval by itself, even when posted under his account. Code users never reach directly is outside this rule, and may be deleted once nothing uses it.
 
 ## Project Structure
 
