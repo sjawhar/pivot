@@ -268,6 +268,8 @@ def _run_pipeline(
                 single_stage=False,
                 all_pipelines=cli_decorators.get_all_pipelines_from_context(),
                 on_error=on_error,
+                # Watch mode's startup run does not restore tracked files.
+                checkout_missing=checkout_missing and not watch,
             )
         )
 

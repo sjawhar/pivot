@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING, Any, TextIO, TypedDict, cast
 import anyio
 import click
 
-from pivot import discovery
+from pivot import discovery, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
 from pivot.engine import graph as engine_graph
+from pivot.executor import core as executor_core
 from pivot.types import OnError
 
 if TYPE_CHECKING:
@@ -187,25 +188,36 @@ def resolve_on_error(fail_fast: bool, keep_going: bool) -> OnError:
 
 
 def tui_prewarm_width(
-    stages: list[str] | None, *, single_stage: bool, all_pipelines: bool, on_error: OnError
+    stages: list[str] | None,
+    *,
+    single_stage: bool,
+    all_pipelines: bool,
+    on_error: OnError,
+    checkout_missing: bool,
 ) -> int:
     """Return the width the engine will compute for this run, for the TUI's worker pre-warm.
 
-    The stages are those the engine runs (``engine_graph.get_runnable_stages``), so the pool
+    Like the engine, it first restores missing tracked files when asked to, then sizes the
+    pool over the stages the engine runs (``engine_graph.get_runnable_stages``), so the pool
     warmed before Textual starts is the pool the engine then uses.
     """
+    if checkout_missing:
+        executor_core.verify_tracked_files(project.get_project_root(), checkout_missing=True)
     runnable, _ = engine_graph.get_runnable_stages(
         cli_helpers.get_all_stages(),
         cli_helpers.require_workspace_store(),
         all_pipelines=all_pipelines,
         on_error=on_error,
     )
+    if not runnable:
+        # The engine stops at the missing dependency before it starts a worker.
+        return 1
     stage_dag = engine_graph.get_stage_dag(engine_graph.build_graph(runnable))
     targets = [stage for stage in stages if stage in stage_dag] if stages else None
     if stages and not targets:
         return 1
     order = engine_graph.get_execution_order(stage_dag, targets, single_stage=single_stage)
-    return max(1, engine_graph.get_width(stage_dag, order))
+    return engine_graph.get_width(stage_dag, order, limit=executor_core.configured_worker_count())
 
 
 class DryRunJsonStageOutput(TypedDict):

@@ -1056,17 +1056,21 @@ class Engine:
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
         )
-        all_stages, dep_errors = engine_graph.get_runnable_stages(
+        runnable, dep_errors = engine_graph.get_runnable_stages(
             all_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
         )
-        if dep_errors and not all_stages:
+        if runnable is None:
             if len(dep_errors) == 1:
                 raise dep_errors[0]
             raise pivot_exceptions.MultipleDependencyError(dep_errors)
         if dep_errors:
+            # Skip broken stages but continue with healthy pipelines
             for err in dep_errors:
                 _logger.warning("Skipping: %s", err.format_user_message())
-            graph = engine_graph.build_graph(all_stages)
+            if not runnable:
+                raise pivot_exceptions.MultipleDependencyError(dep_errors)
+            graph = engine_graph.build_graph(runnable)
+        all_stages = runnable
         self._graph = graph
 
         # Extract stage-only DAG for execution order
@@ -1105,14 +1109,12 @@ class Engine:
 
         # The pool never needs more workers than stages that can run at once, but the cpu
         # resource capacity is the configured worker count, whatever this run schedules.
+        cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1
         effective_max_workers = (
             1
             if not parallel
-            else executor_core.compute_max_workers(
-                engine_graph.get_width(stage_dag, execution_order), max_workers
-            )
+            else engine_graph.get_width(stage_dag, execution_order, limit=cpu_capacity)
         )
-        cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1
 
         try:
             stage_resources, capacities = self._resolve_stage_resources(
@@ -2547,23 +2549,40 @@ class Engine:
                 if isinstance(source, FilesystemSource):
                     source.set_watch_paths(watch_paths)
 
-        # Re-run all stages
-        stages = self._list_stages()
+        # Re-run every stage the run can execute: across all pipelines with keep-going, that
+        # leaves out the stages a missing dependency breaks. With no runnable stage, the run
+        # re-runs them all and reports the missing dependencies when it starts.
+        pipeline = self._require_pipeline()
+        store = store_mod.WorkspaceStore(
+            project_root=project.get_project_root(),
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
+        )
+        runnable, _ = engine_graph.get_runnable_stages(
+            all_stages, store, all_pipelines=self._all_pipelines, on_error=self._stored_on_error
+        )
+        stages = list(runnable or all_stages)
 
         if stages:
-            # Restart worker pool so workers pick up reloaded code.
-            # Run in thread to avoid blocking the event loop during process kill/spawn.
-            # Catch errors so dispatch-time source validation can rebuild the pool on its
-            # next use.
+            # Restart worker pool so workers pick up reloaded code, at the size the next run
+            # asks for. Run in thread to avoid blocking the event loop during process
+            # kill/spawn. Catch errors so dispatch-time source validation can rebuild the pool
+            # on its next use.
             coordinator = self._get_watch_coordinator()
             if coordinator is not None and coordinator.should_restart_workers(
                 parallel=self._stored_parallel
             ):
-                width = engine_graph.get_width(engine_graph.get_stage_dag(self._graph), stages)
-                stored_max = self._stored_max_workers
+                width = engine_graph.get_width(
+                    engine_graph.get_stage_dag(self._graph),
+                    stages,
+                    limit=executor_core.configured_worker_count(self._stored_max_workers),
+                )
+                if self._worker_pool is None:
+                    self._worker_pool = worker_pool_mod.WorkerPool()
+                worker_pool = self._worker_pool
                 try:
                     workers = await anyio.to_thread.run_sync(
-                        lambda: executor_core.restart_workers(width, stored_max)
+                        lambda: worker_pool.restart(max_workers=width)
                     )
                     _logger.info("Worker pool restarted for code reload (%d workers)", workers)
                 except Exception:

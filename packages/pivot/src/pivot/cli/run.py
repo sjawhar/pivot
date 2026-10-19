@@ -102,7 +102,11 @@ def _run_with_tui(
     # `run`'s engine is not told about --all, so it skips no stage for a missing dependency.
     prepare_workers(
         _run_common.tui_prewarm_width(
-            stages_list, single_stage=True, all_pipelines=False, on_error=on_error
+            stages_list,
+            single_stage=True,
+            all_pipelines=False,
+            on_error=on_error,
+            checkout_missing=checkout_missing,
         )
     )
 

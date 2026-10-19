@@ -117,16 +117,18 @@ A run starts one worker per stage it can run at once, up to `core.max_workers`: 
 the run's stage graph, the largest set of its stages none of which consumes, directly or through
 other stages of the run, another's output (`engine/graph.py` `get_width`). A chain of stages runs
 on one worker; five stages that read one source stage run on five. The width counts every stage
-of the run, including stages that will skip. The widest topological level can be smaller: with
-stages A and S, and B and C that both read S, the levels {A, S} and {B, C} hold two stages each,
-but A, B and C can all run together, so the width is three.
+of the run, including stages that will skip, so a partial run starts as many workers as a full
+one. The widest topological level can be smaller: with stages A and S, and B and C that both
+read S, the levels {A, S} and {B, C} hold two stages each, but A, B and C can all run together,
+so the width is three. The widest level is still a lower bound, so once it reaches
+`core.max_workers` the pool takes the cap without computing the width.
 
-A TUI pre-warms the same number of workers before Textual starts, computed over the stages the
-engine will run (`get_runnable_stages`): with `--all --keep-going`, a stage with a missing
-dependency and everything downstream of it are left out of both. A watch-mode code reload
-restarts the pool at the reloaded pipeline's width. `pivot run` runs its named stages in the
-given order and starts a stage once the named stages it consumes from have finished, so its
-width is that of the named stages alone.
+A TUI pre-warms the same number of workers before Textual starts. It restores missing tracked
+files first when `--checkout-missing` asks for it, and it counts the stages the engine will run
+(`get_runnable_stages`): with `--all --keep-going`, a stage with a missing dependency and
+everything downstream of it are left out of both. `pivot run` runs its named stages in the given
+order and starts a stage once the named stages it consumes from have finished, so its width is
+that of the named stages alone.
 
 The width bounds the pool, not the schedule: stage `resources` still limit how many stages run
 together.
@@ -137,6 +139,8 @@ Workers stay alive across runs in one Engine, so imports from earlier stages rem
 Before a later run reuses workers, Pivot replaces them if a user-code module they imported
 changed. Worker capacity grows for a wider run but does not shrink for a narrower one: the
 scheduler still limits that run's parallelism, while a later wide run reuses every warm worker.
+A watch-mode code reload restarts the pool the same way, at the larger of the reloaded
+pipeline's width and the pool's earlier size, so the run after it starts no other worker.
 
 ## Stage resources
 
@@ -151,7 +155,7 @@ def train(data: pd.DataFrame) -> Model: ...
 def compact(data: pd.DataFrame) -> pd.DataFrame: ...
 ```
 
-Resource names are case-insensitive. Every scheduled stage, including bare `@stage` functions, holds one `cpu` unit. The `cpu` capacity is the effective worker count, so `cpu: "all"` runs without another stage. Other resources default to capacity 1, which serializes stages sharing that resource.
+Resource names are case-insensitive. Every scheduled stage, including bare `@stage` functions, holds one `cpu` unit. The `cpu` capacity is the configured worker count (`core.max_workers`), not the pool size, so `cpu: "all"` runs without another stage. Other resources default to capacity 1, which serializes stages sharing that resource.
 
 Set a project capacity in `.pivot/config.yaml` or override it for one command:
 

@@ -280,13 +280,14 @@ def test_width_is_the_largest_set_of_run_stages_none_of_which_reaches_another(
     case: tuple[int, list[set[int]]], data: st.DataObject
 ) -> None:
     """The width matches networkx's largest antichain of the run's stages, for a whole pipeline
-    and for any subset of its stages, as `pivot run` names them."""
+    and for any subset of its stages, as `pivot run` names them, up to the pool's limit."""
     count, deps = case
     stages = _stages_from_edges(count, deps)
     stage_dag = engine_graph.get_stage_dag(engine_graph.build_graph(stages))
     run = data.draw(st.lists(st.sampled_from(sorted(stages)), min_size=1, unique=True))
+    limit = data.draw(st.integers(1, count + 1))
     largest = max(len(antichain) for antichain in nx.antichains(stage_dag.subgraph(run)))
-    assert engine_graph.get_width(stage_dag, run) == largest
+    assert engine_graph.get_width(stage_dag, run, limit=limit) == min(largest, limit)
 
 
 # =============================================================================

@@ -214,7 +214,7 @@ def run(
         single_stage: If True, run only the specified stages without dependencies.
         cache_dir: Directory for lock files. Defaults to .pivot/cache.
         parallel: If True, run independent stages in parallel (default: True).
-        max_workers: Max concurrent stages (default: min(cpu_count, 8)).
+        max_workers: Most workers, and the ``cpu`` resource capacity (default: ``core.max_workers``).
         resource_capacity: Per-run resource capacity overrides.
         on_error: Error handling mode - "fail" or "keep_going".
         allow_uncached_incremental: If True, skip the uncached incremental-output safety check.

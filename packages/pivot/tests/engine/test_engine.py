@@ -1445,7 +1445,7 @@ def _helper_bipartite_chain(names: list[str]) -> nx.DiGraph[str]:
 @pytest.mark.parametrize(
     ("parallel", "max_workers", "expected_restart_calls"),
     [
-        pytest.param(True, 4, [(1, 4)], id="parallel-restarts-workers"),
+        pytest.param(True, 4, [(1, 1)], id="parallel-restarts-workers"),
         pytest.param(False, None, [], id="non-parallel-skips-restart"),
     ],
 )
@@ -1456,7 +1456,7 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
     expected_restart_calls: list[tuple[int, int | None]],
 ) -> None:
     """A reload restarts workers only in parallel mode, one for each stage of the reloaded
-    pipeline that can run at once: a chain of three needs one."""
+    pipeline that can run at once, and no fewer than the pool held: a chain of three needs one."""
     restart_calls = list[tuple[int, int | None]]()
 
     def mock_restart_workers(width: int, max_workers: int | None = None) -> int:

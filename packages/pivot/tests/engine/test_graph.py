@@ -453,18 +453,19 @@ def test_validate_dependency_sources_reports_missing_pipeline_input_path(
     ("all_pipelines", "on_error", "runnable"),
     [
         pytest.param(True, OnError.KEEP_GOING, {"ok/a"}, id="all-keep-going"),
-        pytest.param(True, OnError.FAIL, set[str](), id="all-fail"),
-        pytest.param(False, OnError.KEEP_GOING, set[str](), id="one-keep-going"),
+        pytest.param(True, OnError.FAIL, None, id="all-fail"),
+        pytest.param(False, OnError.KEEP_GOING, None, id="one-keep-going"),
     ],
 )
 def test_get_runnable_stages_leaves_out_stages_downstream_of_a_missing_dependency(
     set_project_root: Path,
     all_pipelines: bool,
     on_error: OnError,
-    runnable: set[str],
+    runnable: set[str] | None,
 ) -> None:
     """Only a keep-going run across all pipelines runs the stages a missing dependency
-    leaves runnable; it leaves out the broken stage and every stage downstream of it."""
+    leaves runnable, leaving out the broken stage and every stage downstream of it; any other
+    run stops."""
     stages = {
         "ok/a": _create_stage("ok/a", [], [ArtifactIdentity("ok/a", None)]),
         "bad/b": _create_stage(
@@ -482,7 +483,7 @@ def test_get_runnable_stages_leaves_out_stages_downstream_of_a_missing_dependenc
         stages, store, all_pipelines=all_pipelines, on_error=on_error
     )
 
-    assert set(result) == runnable
+    assert (None if result is None else set(result)) == runnable
     assert [error.stage for error in errors] == ["bad/b"]
 
 
@@ -1039,4 +1040,5 @@ def test_get_width_is_the_most_stages_that_can_run_at_once(
 ) -> None:
     stage_dag = _helper_stage_dag(dependencies)
     stages = list(dependencies) if run is None else run
-    assert graph.get_width(stage_dag, stages) == width
+    assert graph.get_width(stage_dag, stages, limit=len(stages) + 1) == width
+    assert graph.get_width(stage_dag, stages, limit=1) == 1
