@@ -2,6 +2,43 @@
 
 <!-- version list -->
 
+## v0.3.11 (2026-10-19)
+
+### Bug Fixes
+
+- **cli**: Pre-warm the TUI's pool over the stages the engine runs
+  ([#488](https://github.com/sjawhar/pivot/pull/488),
+  [`014ab27`](https://github.com/sjawhar/pivot/commit/014ab2766756218b2e9f5ab0529120cbe26194aa))
+
+- **engine**: Bound the width search so sizing the pool stays fast below the cap
+  ([#488](https://github.com/sjawhar/pivot/pull/488),
+  [`014ab27`](https://github.com/sjawhar/pivot/commit/014ab2766756218b2e9f5ab0529120cbe26194aa))
+
+- **engine**: Restart and pre-warm the pool at the size the run uses, and stop sizing it at the cap
+  ([#488](https://github.com/sjawhar/pivot/pull/488),
+  [`014ab27`](https://github.com/sjawhar/pivot/commit/014ab2766756218b2e9f5ab0529120cbe26194aa))
+
+- **engine**: Size the pool the same whatever order the run's stages come in
+  ([#488](https://github.com/sjawhar/pivot/pull/488),
+  [`014ab27`](https://github.com/sjawhar/pivot/commit/014ab2766756218b2e9f5ab0529120cbe26194aa))
+
+- **engine**: Size the worker pool to the pipeline's width so a chain reuses one warm worker
+  ([#488](https://github.com/sjawhar/pivot/pull/488),
+  [`014ab27`](https://github.com/sjawhar/pivot/commit/014ab2766756218b2e9f5ab0529120cbe26194aa))
+
+### Documentation
+
+- Keep stage settings in StageParams; say DirectoryOut's return is tracked
+  ([#490](https://github.com/sjawhar/pivot/pull/490),
+  [`9f02ec1`](https://github.com/sjawhar/pivot/commit/9f02ec191c3cdfc096a59cf3bd5a8dd6a476a31e))
+
+### Testing
+
+- **engine**: Drop the Hypothesis order test that cannot fail
+  ([#488](https://github.com/sjawhar/pivot/pull/488),
+  [`014ab27`](https://github.com/sjawhar/pivot/commit/014ab2766756218b2e9f5ab0529120cbe26194aa))
+
+
 ## v0.3.10 (2026-10-18)
 
 ### Bug Fixes
