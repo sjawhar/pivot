@@ -192,7 +192,7 @@ scores/scale@x10:
 
 ## Module-level constants
 
-A stage may read a module-level `bool`, `int`, `float`, `str`, `bytes` or `None`, a tuple or frozenset of those scalars, or a compiled regex; editing it re-runs the stage. Reading any other module-level value (list, dict, set, a tuple holding a tuple, list or object, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`), directly, as `module.NAME`, or as a default argument (`cols=COLUMNS`), is an error that names the variable. Move it into the stage's `StageParams`.
+A stage is a pure function of its inputs and its `StageParams`: every setting it uses is a `StageParams` field, never a module-level value. Pivot fingerprints a module-level scalar, tuple or frozenset of scalars, or compiled regex that a stage reads, so editing one re-runs the stage. It refuses any other module-level value (list, dict, set, a tuple holding a tuple, list or object, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`), read directly, as `module.NAME`, or as a default argument (`cols=COLUMNS`), with an error that names the variable. Neither is how a pipeline carries settings.
 
 ## Variants and fan-out
 
@@ -303,5 +303,5 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock fil
 - [ ] No file paths, `open()`, `read_csv`, or `to_csv` in stages; no `dvc` imports
 - [ ] Inputs come from `pipeline.input()`; edges are handles
 - [ ] `Annotated[...]` appears only on return types and `TypedDict` fields
-- [ ] Module-level values read by stages are scalars, tuples or frozensets of scalars, or compiled regexes
+- [ ] Stages read no module-level configuration; every setting is a `StageParams` field
 - [ ] `pivot list` shows the expected stages, then `pivot repro` passes twice (second run: all cached)
