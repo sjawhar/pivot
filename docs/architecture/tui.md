@@ -30,7 +30,7 @@ The TUI is a **pure RPC client** — it communicates with the engine exclusively
 
 The `run_tui_with_engine()` helper in `_run_common.py` coordinates three threads:
 
-1. **Main thread**: Runs the Textual TUI (`app.run()`). Required for signal handlers. Owns its own `RpcPivotClient` connected in `on_mount()` for UI commands (`run`, `cancel`, `commit`, `set_on_error`, `diff_output`).
+1. **Main thread**: Runs the Textual TUI (`app.run()`). Required for signal handlers. Owns its own `RpcPivotClient` connected in `on_mount()` for UI commands (`run`, `cancel`, `commit`, `set_on_error`, `diff_output`). It runs the app inside `defer_console_logging()`: each root log handler that writes to stdout or stderr prints nothing while the TUI owns the terminal, holds the warnings and errors logged meanwhile on any thread (the engine's tracked-file and `Skipping:` warnings among them), and prints them once `app.run()` returns. Records from `pivot_tui` describe the TUI itself and are dropped.
 
 2. **Engine thread**: Runs `anyio.run(engine_fn)` with the pipeline engine and RPC socket server. Sets `socket_ready` after the Unix socket is listening.
 

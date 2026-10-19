@@ -6,6 +6,7 @@ import concurrent.futures
 import logging
 import pathlib
 import sys
+import threading
 from typing import TYPE_CHECKING, override
 
 import click
@@ -14,8 +15,6 @@ import networkx as nx
 import pytest
 
 if TYPE_CHECKING:
-    import threading
-
     from pytest_mock import MockerFixture
 
 import pivot_tui.event_poller
@@ -119,63 +118,154 @@ class _DoneFuture(concurrent.futures.Future[str]):
 
 
 # =============================================================================
-# suppress_stderr_logging Tests
+# defer_console_logging Tests
 # =============================================================================
 
 
-def test_suppress_stderr_logging_removes_stderr_handlers() -> None:
-    """suppress_stderr_logging removes StreamHandlers writing to stderr."""
+@pytest.mark.parametrize("stream_name", ["stderr", "stdout"])
+def test_defer_console_logging_prints_warnings_once_the_tui_exits(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture, stream_name: str
+) -> None:
+    """A console handler prints nothing while the TUI runs, then the held warnings and errors,
+    in order; the lower levels it drops."""
+    caplog.set_level(logging.INFO, logger="pivot.engine")
+    root = logging.getLogger()
+    handler = logging.StreamHandler(getattr(sys, stream_name))
+    root.addHandler(handler)
+    logger = logging.getLogger("pivot.engine")
+    try:
+        with _run_common.defer_console_logging():
+            logger.warning("tracked file changed")
+            logger.info("progress")
+            logger.error("stage failed")
+            during = capsys.readouterr()
+        after = capsys.readouterr()
+        logger.warning("after the TUI")
+        later = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
+
+    assert during.out + during.err == "", "nothing should reach the terminal while the TUI runs"
+    printed = getattr(after, stream_name[3:])
+    assert printed == "tracked file changed\nstage failed\n", printed
+    assert getattr(later, stream_name[3:]) == "after the TUI\n", "the handler should print again"
+
+
+def test_defer_console_logging_drops_the_tuis_own_records(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Records the TUI logs about itself describe a display that has closed, so they are
+    dropped, not printed after it exits."""
     root = logging.getLogger()
     handler = logging.StreamHandler(sys.stderr)
     root.addHandler(handler)
+    try:
+        with _run_common.defer_console_logging():
+            logging.getLogger("pivot_tui.run").error("Failed to connect to engine socket")
+            logging.getLogger("pivot.executor.core").warning("tracked file changed")
+        after = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
 
-    with _run_common.suppress_stderr_logging():
-        assert handler not in root.handlers
-
-    assert handler in root.handlers
-    root.removeHandler(handler)
+    assert after.err == "tracked file changed\n", after.err
 
 
-def test_suppress_stderr_logging_removes_stdout_handlers() -> None:
-    """suppress_stderr_logging removes StreamHandlers writing to stdout."""
+def test_defer_console_logging_prints_a_repeated_warning_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A watch session checks the tracked files on every run; its warning prints once."""
     root = logging.getLogger()
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(sys.stderr)
     root.addHandler(handler)
+    logger = logging.getLogger("pivot.executor.core")
+    try:
+        with _run_common.defer_console_logging():
+            for _ in range(3):
+                logger.warning("tracked file changed")
+                logger.warning("other file changed")
+        after = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
 
-    with _run_common.suppress_stderr_logging():
-        assert handler not in root.handlers
-
-    assert handler in root.handlers
-    root.removeHandler(handler)
+    assert after.err == "tracked file changed\nother file changed\n", after.err
 
 
-def test_suppress_stderr_logging_preserves_file_handlers(tmp_path: pathlib.Path) -> None:
-    """suppress_stderr_logging preserves handlers not writing to stdout/stderr."""
+def test_defer_console_logging_holds_a_malformed_record_without_raising(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A warning whose arguments do not fit its format string raises nothing on the thread that
+    logs it; the handler reports it once the TUI exits, as it would have at once."""
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    # Only this handler: pytest's own capture handler raises on a malformed record.
+    monkeypatch.setattr(root, "handlers", [handler])
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    logger = logging.getLogger("pivot.engine")
+    with _run_common.defer_console_logging():
+        logger.warning("needs %d", "text")
+        logger.warning("tracked file changed")
+    after = capsys.readouterr()
+
+    assert "--- Logging error ---" in after.err, after.err
+    assert after.err.endswith("tracked file changed\n"), after.err
+
+
+def test_defer_console_logging_prints_a_warning_logged_on_another_thread(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The engine logs on its own thread while the TUI runs on the main thread."""
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    engine_thread = threading.Thread(
+        target=logging.getLogger("pivot.executor.core").warning, args=("tracked file changed",)
+    )
+    try:
+        with _run_common.defer_console_logging():
+            engine_thread.start()
+            engine_thread.join()
+            during = capsys.readouterr()
+        after = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
+
+    assert during.err == "", during.err
+    assert after.err == "tracked file changed\n", after.err
+
+
+def test_defer_console_logging_leaves_file_handlers_alone(tmp_path: pathlib.Path) -> None:
+    """A handler that writes to a file keeps writing while the TUI runs."""
     root = logging.getLogger()
     log_file = tmp_path / "test.log"
     handler = logging.FileHandler(log_file)
     root.addHandler(handler)
+    try:
+        with _run_common.defer_console_logging():
+            logging.getLogger("pivot.engine").warning("tracked file changed")
+            during = log_file.read_text()
+    finally:
+        root.removeHandler(handler)
+        handler.close()
 
-    with _run_common.suppress_stderr_logging():
-        assert handler in root.handlers
-
-    assert handler in root.handlers
-    root.removeHandler(handler)
-    handler.close()
+    assert during == "tracked file changed\n", during
 
 
-def test_suppress_stderr_logging_restores_handlers_on_exception() -> None:
-    """suppress_stderr_logging restores handlers even when exception occurs."""
+def test_defer_console_logging_prints_held_warnings_when_the_tui_raises(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A TUI that ends on an exception still gets its held warnings printed."""
     root = logging.getLogger()
     handler = logging.StreamHandler(sys.stderr)
     root.addHandler(handler)
+    try:
+        with pytest.raises(ValueError), _run_common.defer_console_logging():
+            logging.getLogger("pivot.engine").warning("tracked file changed")
+            raise ValueError("test")
+        after = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
 
-    with pytest.raises(ValueError), _run_common.suppress_stderr_logging():
-        assert handler not in root.handlers
-        raise ValueError("test")
-
-    assert handler in root.handlers
-    root.removeHandler(handler)
+    assert after.err == "tracked file changed\n", after.err
 
 
 # =============================================================================

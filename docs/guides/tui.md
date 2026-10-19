@@ -35,6 +35,10 @@ pivot repro --tui --tui-log messages.jsonl
 
 The TUI requires at least **80 columns by 24 rows**. If your terminal is smaller, a warning notification appears.
 
+### Warnings While the TUI Runs
+
+The TUI owns the terminal while it runs, so Pivot holds the warnings and errors it would print there, such as a tracked file that changed since `pivot track`, and prints each one once the TUI exits. A warning logged before the TUI starts prints at once, as without `--tui`.
+
 ## Layout
 
 The TUI uses a two-panel layout:

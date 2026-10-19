@@ -754,7 +754,9 @@ with Pipeline("width") as pipeline:
 """
 
 # Imported by every Python process the command starts: each loky worker records when it started,
-# and the pivot process records when it starts the Textual TUI.
+# and the pivot process records when it starts the Textual TUI. With PIVOT_TEST_CHECKS_AFTER_TUI
+# set, the pivot process's engine checks the tracked files only once the TUI has mounted, the
+# order a busy machine sometimes gives.
 _WORKER_LOG_HOOK = """\
 import os
 import sys
@@ -778,6 +780,31 @@ elif len(sys.orig_argv) > 1 and os.path.basename(sys.orig_argv[1]) == "pivot":
         return _run_tui_with_engine(*args, **kwargs)
 
     _run_common.run_tui_with_engine = _logged_run_tui_with_engine
+
+    if os.environ.get("PIVOT_TEST_CHECKS_AFTER_TUI"):
+        import threading
+
+        import anyio
+        import pivot_tui.run
+        from pivot.engine import engine
+
+        _mounted = threading.Event()
+        _on_mount = pivot_tui.run.PivotApp.on_mount
+        _orchestrate_execution = engine.Engine._orchestrate_execution
+
+        async def _marked_on_mount(self):
+            _mounted.set()
+            await _on_mount(self)
+
+        async def _orchestrate_execution_after_tui(self, *args, **kwargs):
+            # The run checks the tracked files first, so it checks them after the TUI started.
+            with anyio.fail_after(60):
+                while not _mounted.is_set():
+                    await anyio.sleep(0.01)
+            return await _orchestrate_execution(self, *args, **kwargs)
+
+        pivot_tui.run.PivotApp.on_mount = _marked_on_mount
+        engine.Engine._orchestrate_execution = _orchestrate_execution_after_tui
 """
 
 
@@ -918,11 +945,30 @@ def test_tui_starts_its_workers_before_the_tui_when_a_tracked_input_is_restored(
     assert started == 3, f"{' '.join(command)} started {started} workers"
 
 
-def test_tui_checkout_missing_warns_once_about_a_changed_tracked_file(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["repro", "--tui", "--checkout-missing"], id="repro-checkout-missing"),
+        pytest.param(["repro", "--tui"], id="repro"),
+        pytest.param(["run", "--tui", "--force", "lone"], id="run"),
+    ],
+)
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param({}, id="as-scheduled"),
+        pytest.param({"PIVOT_TEST_CHECKS_AFTER_TUI": "1"}, id="checks-after-tui"),
+    ],
+)
+def test_tui_warns_once_about_a_changed_tracked_file_whenever_the_engine_checks_it(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+    order: dict[str, str],
 ) -> None:
-    """The pre-warm only restores missing tracked files; checking the others stays the
-    engine's, so a tracked file edited since `pivot track` is reported once."""
+    """A tracked file edited since `pivot track` is reported once, outside the TUI's screen,
+    whether the engine checks it before the TUI starts or while the TUI runs. The pre-warm only
+    restores missing tracked files; checking the others stays the engine's."""
     # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
     root = tmp_path.resolve() / "p"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
@@ -933,9 +979,13 @@ def test_tui_checkout_missing_warns_once_about_a_changed_tracked_file(
     _helper_pivot(root, env, "track", "data/raw/x.txt")
     tracked.write_text("edited")
 
-    output = _helper_pivot(root, env, "repro", "--tui", "--checkout-missing")
+    output = _helper_pivot(root, {**env, **order}, *command)
 
     assert output.count("has changed since tracking") == 1, output
+    warning = output.find("has changed since tracking")
+    enter, leave = output.find("\x1b[?1049h"), output.rfind("\x1b[?1049l")
+    assert -1 < enter < leave, f"the TUI never took over the terminal:\n{output}"
+    assert warning < enter or warning > leave, f"the warning landed on the TUI's screen:\n{output}"
 
 
 @pytest.mark.anyio
