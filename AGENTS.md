@@ -23,7 +23,7 @@ packages/pivot/src/pivot/
 ├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
 ├── stage_def.py   # StageParams, output writing helpers
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
-├── outputs.py     # DirectoryOut marker (compose rejects it until directory outputs are designed)
+├── outputs.py     # DirectoryOut marker (compose does not accept DirectoryOut yet; restoring it is tracked in Dispatch BET-58)
 └── types.py       # TypedDicts, enums, type aliases, ArtifactIdentity
 
 packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
