@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from pivot import config, exceptions, metrics, names, project, registry, types
 from pivot.remote import config as remote_config
-from pivot.remote import storage as remote_mod
+from pivot.remote import protocol
 from pivot.storage import cache, lock, track
 from pivot.storage import store as store_mod
 from pivot.types import HashInfo, RemoteStatus, TransferSummary, is_dir_hash
@@ -318,7 +318,7 @@ def get_target_hashes(
 def _check_remote_url(
     state_db: state_mod.StateDB,
     remote_name: str,
-    remote: remote_mod.S3Remote,
+    remote: protocol.RemoteStorage,
 ) -> None:
     """Detect remote URL change and clear stale index."""
     current_url = remote.url
@@ -341,7 +341,7 @@ def _check_remote_url(
 
 async def compare_status(
     local_hashes: set[str],
-    remote: remote_mod.S3Remote,
+    remote: protocol.RemoteStorage,
     state_db: state_mod.StateDB,
     remote_name: str,
     jobs: int | None = None,
@@ -372,7 +372,7 @@ async def compare_status(
 async def _push_async(
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
-    remote: remote_mod.S3Remote,
+    remote: protocol.RemoteStorage,
     state_db: state_mod.StateDB,
     remote_name: str,
     targets: list[str] | None = None,
@@ -435,7 +435,7 @@ async def _push_async(
 def push(
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
-    remote: remote_mod.S3Remote,
+    remote: protocol.RemoteStorage,
     state_db: state_mod.StateDB,
     remote_name: str,
     targets: list[str] | None = None,
@@ -462,7 +462,7 @@ def push(
 async def _pull_async(
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
-    remote: remote_mod.S3Remote,
+    remote: protocol.RemoteStorage,
     state_db: state_mod.StateDB,
     remote_name: str,
     targets: list[str] | None = None,
@@ -520,7 +520,7 @@ async def _pull_async(
 def pull(
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
-    remote: remote_mod.S3Remote,
+    remote: protocol.RemoteStorage,
     state_db: state_mod.StateDB,
     remote_name: str,
     targets: list[str] | None = None,
@@ -544,8 +544,8 @@ def pull(
     )
 
 
-def create_remote_from_name(name: str | None = None) -> tuple[remote_mod.S3Remote, str]:
-    """Create S3Remote from configured remote name. Returns (remote, name)."""
+def create_remote_from_name(name: str | None = None) -> tuple[protocol.RemoteStorage, str]:
+    """Open the configured remote by name (default if None). Returns (remote, name)."""
     url = remote_config.get_remote_url(name)
     resolved_name = name
     if resolved_name is None:
@@ -557,4 +557,4 @@ def create_remote_from_name(name: str | None = None) -> tuple[remote_mod.S3Remot
             else:
                 raise exceptions.RemoteNotFoundError("Could not determine remote name")
 
-    return remote_mod.S3Remote(url), resolved_name
+    return protocol.open_remote(url), resolved_name

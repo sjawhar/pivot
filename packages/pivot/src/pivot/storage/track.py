@@ -35,7 +35,7 @@ class ImportSource(TypedDict):
     rev_lock: str  # Resolved commit SHA
     stage: str  # Source stage name (auto-discovered)
     path: str  # Path within source repo
-    remote: str  # Source's S3 remote URL
+    remote: str  # Source's remote URL (s3:// or gs://)
 
 
 class PvtData(TypedDict):

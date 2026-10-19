@@ -42,6 +42,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dvc = ["dvc>=3.0"]
+gcs = ["gcloud-aio-storage>=9.6.5"]
 matplotlib = ["matplotlib>=3.5"]
 s3 = ["aioboto3>=13.0.0"]
 tui = ["pivot-tui"]
@@ -65,6 +66,7 @@ dev = [
   "mypy>=1.19.1",
   "pandas-stubs>=2.0",
   "pivot[dvc]",
+  "pivot[gcs]",
   "pivot[matplotlib]",
   "pivot[s3]",
   "pytest-aioboto3>=0.1.0",

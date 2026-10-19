@@ -6,7 +6,7 @@ import boto3
 import xxhash
 from moto.server import ThreadedMotoServer
 
-from pivot.remote import storage, sync
+from pivot.remote import keys, storage, sync
 from pivot.storage import cache, state
 
 if TYPE_CHECKING:
@@ -49,7 +49,7 @@ def test_pull_rejects_downloaded_bytes_that_do_not_match_cache_hash(
         s3.create_bucket(Bucket=bucket)
         s3.put_object(
             Bucket=bucket,
-            Key=storage._hash_to_key(prefix, expected_hash),
+            Key=keys.hash_to_key(prefix, expected_hash),
             Body=b"corrupt content",
         )
         remote = storage.S3Remote(f"s3://{bucket}/{prefix.rstrip('/')}")
@@ -61,7 +61,7 @@ def test_pull_rejects_downloaded_bytes_that_do_not_match_cache_hash(
         server.stop()
     assert result["failed"] == 1
     assert any("hash mismatch" in error.lower() for error in result["errors"])
-    key = f"{bucket}/{storage._hash_to_key(prefix, expected_hash)}"
+    key = f"{bucket}/{keys.hash_to_key(prefix, expected_hash)}"
     assert any(
         f"Delete {key} from the remote, then run `pivot push`" in error
         and "has not run `pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote`"

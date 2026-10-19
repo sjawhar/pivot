@@ -57,7 +57,7 @@ src/pivot/
 ├── config/              # Configuration handling
 ├── executor/            # Stage execution
 ├── pipeline/            # Pipeline loading
-├── remote/              # S3 storage
+├── remote/              # S3 and GCS remote storage
 ├── show/                # Display commands
 ├── storage/             # Cache and lock files
 ├── tui/                 # Terminal UI

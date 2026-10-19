@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import logging
 import re
 from typing import TYPE_CHECKING, Any, cast
@@ -14,7 +15,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_S3_URL_PATTERN = re.compile(r"^s3://([^/]+)(/.*)?$")
+
+class RemoteScheme(enum.StrEnum):
+    """URL scheme of a remote cache backend."""
+
+    S3 = "s3"
+    GS = "gs"
+
+
+REMOTE_URL_FORMATS = "s3://bucket/prefix or gs://bucket/prefix"
+
+_REMOTE_URL_PATTERN = re.compile(r"^(s3|gs)://([^/]+)(/.*)?$")
 
 
 def _get_config_path() -> Path:
@@ -56,21 +67,22 @@ def _save_raw_config(data: RawPivotConfig) -> None:
         yaml.dump(dict(data), f, default_flow_style=False, sort_keys=False)
 
 
-def validate_s3_url(url: str) -> tuple[str, str]:
-    """Validate and parse s3://bucket/prefix URL. Returns (bucket, prefix)."""
-    match = _S3_URL_PATTERN.match(url)
+def validate_remote_url(url: str) -> tuple[RemoteScheme, str, str]:
+    """Validate and parse an s3:// or gs:// remote URL. Returns (scheme, bucket, prefix)."""
+    match = _REMOTE_URL_PATTERN.match(url)
     if not match:
         raise exceptions.InvalidRemoteURLError(
-            f"Invalid S3 URL: {url}. Expected format: s3://bucket/prefix"
+            f"Invalid remote URL: {url}. Expected format: {REMOTE_URL_FORMATS}"
         )
-    bucket = match.group(1)
-    prefix = (match.group(2) or "").lstrip("/")
-    return bucket, prefix
+    scheme = RemoteScheme(match.group(1))
+    bucket = match.group(2)
+    prefix = (match.group(3) or "").lstrip("/")
+    return scheme, bucket, prefix
 
 
 def add_remote(name: str, url: str) -> None:
     """Add or update a remote in config."""
-    validate_s3_url(url)
+    validate_remote_url(url)
 
     data = _load_raw_config()
     if "remotes" not in data:

@@ -179,6 +179,14 @@ def test_config_set_remote(runner: click.testing.CliRunner, tmp_path: pathlib.Pa
         assert "s3://my-bucket/cache" in content
 
 
+def test_config_set_gs_remote(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
+    with isolated_pivot_dir(runner, tmp_path):
+        result = runner.invoke(cli.cli, ["config", "set", "remotes.gcs", "gs://my-bucket/cache"])
+
+        assert result.exit_code == 0, result.output
+        assert "gs://my-bucket/cache" in pathlib.Path(".pivot/config.yaml").read_text()
+
+
 def test_config_set_invalid_remote_url(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

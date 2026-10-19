@@ -4,15 +4,11 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
-import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict
-
-import xxhash
 
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
-from pivot.storage import cache
+from pivot.remote import keys
 from pivot.types import TransferResult
 
 if TYPE_CHECKING:
@@ -35,8 +31,6 @@ STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 # LIST is O(prefixes) requests (max 256 for 2-char hex) but returns up to 1000 keys each.
 # At 50 hashes, LIST wins unless hashes are spread across 50+ prefixes (unlikely).
 BULK_EXISTS_LIST_THRESHOLD = 50
-
-_HEX_PATTERN = re.compile(r"^[a-f0-9]{16}$")
 
 # Cached S3 config to avoid re-parsing config on every call.
 # Safe without locking - asyncio is single-threaded, worst case race just
@@ -119,14 +113,6 @@ def _get_s3_config() -> AioConfig:
     return _cached_s3_config
 
 
-def _validate_hash(cache_hash: str) -> None:
-    """Validate hash is exactly 16 lowercase hex characters (xxhash64 format)."""
-    if not _HEX_PATTERN.match(cache_hash):
-        raise exceptions.RemoteError(
-            f"Invalid cache hash '{cache_hash}': expected 16 lowercase hex characters"
-        )
-
-
 def _is_not_found_error(e: ClientError) -> bool:
     """Check if botocore ClientError is a 404 Not Found."""
     return e.response.get("Error", {}).get("Code") == "404"
@@ -155,99 +141,20 @@ def _is_auth_error(e: ClientError) -> bool:
     return e.response.get("Error", {}).get("Code") in _AUTH_ERROR_CODES
 
 
-def _hash_to_key(prefix: str, hash_: str) -> str:
-    """Convert cache hash to S3 key (files/XX/YYYYYYYY...)."""
-    return f"{prefix}files/{hash_[:2]}/{hash_[2:]}"
-
-
-def _key_to_hash(prefix: str, key: str) -> str | None:
-    """Extract valid hash from S3 key, or None if not a valid cache file key.
-
-    Returns None if the key doesn't match the expected structure or if the
-    reconstructed hash isn't a valid 16-char lowercase hex string.
-    """
-    expected_prefix = f"{prefix}files/"
-    if not key.startswith(expected_prefix):
-        return None
-    parts = key[len(expected_prefix) :].split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        return None
-    hash_ = parts[0] + parts[1]
-    if not _HEX_PATTERN.match(hash_):
-        return None
-    return hash_
-
-
-async def _write_all_async(fd: int, data: bytes) -> None:
-    """Write all bytes to fd asynchronously, handling partial writes."""
-    written = 0
-    while written < len(data):
-        n = await asyncio.to_thread(os.write, fd, data[written:])
-        if n == 0:
-            raise OSError("os.write returned 0")
-        written += n
-
-
 async def _stream_download_to_fd(
     response: GetObjectOutputTypeDef,
     fd: int,
 ) -> str:
     """Stream S3 response body to fd and return its xxh64 integrity digest."""
-    hasher = xxhash.xxh64()
     stream = response["Body"]
     try:
-        while True:
-            chunk: bytes = await asyncio.wait_for(
-                stream.read(STREAM_CHUNK_SIZE),
-                timeout=STREAM_READ_TIMEOUT,
-            )
-            if not chunk:
-                break
-            hasher.update(chunk)
-            await _write_all_async(fd, chunk)
+        return await keys.stream_to_fd(
+            lambda: asyncio.wait_for(stream.read(STREAM_CHUNK_SIZE), timeout=STREAM_READ_TIMEOUT),
+            fd,
+        )
     finally:
         with contextlib.suppress(Exception):
             stream.close()  # pyright: ignore[reportUnknownMemberType]
-    return hasher.hexdigest()
-
-
-async def _atomic_download(
-    s3: S3Client,
-    bucket: str,
-    key: str,
-    local_path: Path,
-    expected_hash: str,
-    *,
-    overwrite: bool,
-    readonly: bool = False,
-) -> None:
-    """Download an expected cache blob atomically and verify its xxh64 integrity.
-
-    The digest detects accidental corruption during storage or transfer. It does not
-    authenticate remote content.
-
-    Args:
-        overwrite: Replace an existing file at local_path. When False, local_path is a cache
-            object: an existing one is kept (another process may be hardlinking it), and the
-            download is staged so a killed one is swept (``cache.staged_cache_file``).
-        readonly: If True, set file permissions to 0o444 (for cache files).
-    """
-    with contextlib.ExitStack() as stack:
-        if overwrite:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            fd, name = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
-            os.close(fd)
-            tmp_path = local_path.with_name(os.path.basename(name))
-            stack.callback(tmp_path.unlink, missing_ok=True)
-        else:
-            tmp_path = stack.enter_context(cache.staged_cache_file(local_path))
-        await _download_verified(s3, bucket, key, tmp_path, expected_hash)
-        if readonly:
-            os.chmod(tmp_path, 0o444)
-        if overwrite:
-            os.replace(tmp_path, local_path)
-        else:
-            _ = cache.publish_cache_object(tmp_path, local_path)
 
 
 async def _download_verified(
@@ -271,17 +178,7 @@ async def _download_verified(
     finally:
         with contextlib.suppress(OSError):
             os.close(fd)
-    if actual_hash != expected_hash:
-        raise exceptions.RemoteError(
-            f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
-            + f"for {bucket}/{key}. Delete {bucket}/{key} from the remote, then run "
-            + "`pivot push` on a machine whose cache has a good copy and has not run "
-            + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
-            + "against this remote for this object. Pivot records hashes those commands "
-            + "upload, download, or find, then skips recorded hashes. If every machine "
-            + "with a good copy has recorded it, delete `.pivot/state.lmdb/` before "
-            + "pushing; this also clears run history and local caches."
-        )
+    keys.check_digest(expected_hash, actual_hash, f"{bucket}/{key}")
 
 
 async def _stream_upload(
@@ -357,7 +254,11 @@ class S3Remote:
                 "aioboto3 is required for S3 remote storage. Install with: pip install pivot[s3]"
             ) from None
 
-        bucket, prefix = remote_config.validate_s3_url(url)
+        scheme, bucket, prefix = remote_config.validate_remote_url(url)
+        if scheme is not remote_config.RemoteScheme.S3:
+            raise exceptions.InvalidRemoteURLError(
+                f"Not an S3 URL: {url}. Expected format: s3://bucket/prefix"
+            )
         self._bucket = bucket
         self._prefix = prefix.rstrip("/") + "/" if prefix else ""
         self._session = aioboto3.Session()
@@ -381,12 +282,12 @@ class S3Remote:
         """Check if hash exists on remote via HEAD request."""
         from botocore import exceptions as botocore_exc
 
-        _validate_hash(cache_hash)
+        keys.validate_hash(cache_hash)
         async with self._session.client("s3", config=_get_s3_config()) as s3:
             try:
                 await s3.head_object(
                     Bucket=self._bucket,
-                    Key=_hash_to_key(self._prefix, cache_hash),
+                    Key=keys.hash_to_key(self._prefix, cache_hash),
                 )
                 return True
             except botocore_exc.ClientError as e:
@@ -412,7 +313,7 @@ class S3Remote:
             return {}
 
         for h in hashes:
-            _validate_hash(h)
+            keys.validate_hash(h)
 
         try:
             # Single S3 client for all operations - reuses connection pool
@@ -440,7 +341,7 @@ class S3Remote:
                 try:
                     await s3.head_object(
                         Bucket=self._bucket,
-                        Key=_hash_to_key(self._prefix, hash_),
+                        Key=keys.hash_to_key(self._prefix, hash_),
                     )
                     return (hash_, True)
                 except botocore_exc.ClientError as e:
@@ -497,7 +398,7 @@ class S3Remote:
                             key = obj.get("Key")
                             if key is None:
                                 continue
-                            hash_ = _key_to_hash(self._prefix, key)
+                            hash_ = keys.key_to_hash(self._prefix, key)
                             if hash_ and hash_ in wanted:
                                 found.add(hash_)
                                 # Early exit if we found all we're looking for
@@ -540,7 +441,7 @@ class S3Remote:
                         key = obj.get("Key")
                         if key is None:
                             continue
-                        hash_ = _key_to_hash(self._prefix, key)
+                        hash_ = keys.key_to_hash(self._prefix, key)
                         if hash_ is not None:
                             yield hash_
         except botocore_exc.ClientError as e:
@@ -563,11 +464,11 @@ class S3Remote:
         """Upload a single file to remote with streaming for large files."""
         from botocore import exceptions as botocore_exc
 
-        _validate_hash(cache_hash)
+        keys.validate_hash(cache_hash)
         try:
             async with self._session.client("s3", config=_get_s3_config()) as s3:
                 await _stream_upload(
-                    s3, self._bucket, _hash_to_key(self._prefix, cache_hash), local_path
+                    s3, self._bucket, keys.hash_to_key(self._prefix, cache_hash), local_path
                 )
         except botocore_exc.ClientError as e:
             if _is_auth_error(e):
@@ -582,15 +483,13 @@ class S3Remote:
         """Download a single file from remote (atomic write via temp file, streamed)."""
         from botocore import exceptions as botocore_exc
 
-        _validate_hash(cache_hash)
+        keys.validate_hash(cache_hash)
+        key = keys.hash_to_key(self._prefix, cache_hash)
         try:
             async with self._session.client("s3", config=_get_s3_config()) as s3:
-                await _atomic_download(
-                    s3,
-                    self._bucket,
-                    _hash_to_key(self._prefix, cache_hash),
+                await keys.atomic_download(
                     local_path,
-                    cache_hash,
+                    lambda dest: _download_verified(s3, self._bucket, key, dest, cache_hash),
                     overwrite=True,
                     readonly=readonly,
                 )
@@ -614,7 +513,7 @@ class S3Remote:
             return []
 
         for _, h in items:
-            _validate_hash(h)
+            keys.validate_hash(h)
 
         try:
             semaphore = asyncio.Semaphore(concurrency)
@@ -628,7 +527,7 @@ class S3Remote:
                     async with semaphore:
                         try:
                             await _stream_upload(
-                                s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
+                                s3, self._bucket, keys.hash_to_key(self._prefix, hash_), local_path
                             )
                             completed += 1
                             if callback:
@@ -665,7 +564,7 @@ class S3Remote:
             return []
 
         for h, _ in items:
-            _validate_hash(h)
+            keys.validate_hash(h)
 
         try:
             semaphore = asyncio.Semaphore(concurrency)
@@ -677,13 +576,11 @@ class S3Remote:
                 async def download_one(hash_: str, local_path: Path) -> TransferResult:
                     nonlocal completed
                     async with semaphore:
+                        key = keys.hash_to_key(self._prefix, hash_)
                         try:
-                            await _atomic_download(
-                                s3,
-                                self._bucket,
-                                _hash_to_key(self._prefix, hash_),
+                            await keys.atomic_download(
                                 local_path,
-                                hash_,
+                                lambda dest: _download_verified(s3, self._bucket, key, dest, hash_),
                                 overwrite=False,
                                 readonly=readonly,
                             )

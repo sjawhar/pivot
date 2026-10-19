@@ -247,6 +247,35 @@ def test_validate_remotes_rejects_http_url() -> None:
         config.validate_config_value("remotes.origin", "http://example.com")
 
 
+def test_validate_remotes_accepts_gs_url() -> None:
+    result = config.validate_config_value("remotes.gcs", "gs://my-bucket/prefix")
+    assert result == "gs://my-bucket/prefix"
+
+
+def test_validate_remotes_rejects_unknown_scheme_naming_both_schemes() -> None:
+    with pytest.raises(exceptions.ConfigValidationError) as exc_info:
+        config.validate_config_value("remotes.origin", "gcs://my-bucket/prefix")
+    assert str(exc_info.value) == (
+        "'remotes.origin' must be a valid remote URL "
+        + "(s3://bucket/prefix or gs://bucket/prefix), got: gcs://my-bucket/prefix"
+    )
+
+
+def test_config_load_rejects_unknown_scheme_naming_both_schemes() -> None:
+    """A remote with a wrong scheme fails when the config is loaded, naming both schemes."""
+    with pytest.raises(pydantic.ValidationError) as exc_info:
+        config.PivotConfig(remotes={"origin": "s3://ok/p", "gcs": "gcs://my-bucket/prefix"})
+    assert (
+        "Remote 'gcs' must be a valid remote URL (s3://bucket/prefix or gs://bucket/prefix), "
+        + "got: gcs://my-bucket/prefix"
+    ) in str(exc_info.value)
+
+
+def test_config_load_accepts_gs_remote() -> None:
+    cfg = config.PivotConfig(remotes={"origin": "s3://ok/p", "gcs": "gs://my-bucket/prefix"})
+    assert cfg.remotes == {"origin": "s3://ok/p", "gcs": "gs://my-bucket/prefix"}
+
+
 def test_validate_remotes_rejects_invalid_remote_name_with_dot() -> None:
     # A dot in the remote name creates a 3-part key, which is invalid
     with pytest.raises(exceptions.ConfigValidationError):

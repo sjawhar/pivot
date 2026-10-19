@@ -159,17 +159,20 @@ The TUI is a **pure RPC client** in a separate package (`pivot-tui`). It has zer
 
 **Key files:**
 
-- `packages/pivot/src/pivot/remote/storage.py` - S3 operations
+- `packages/pivot/src/pivot/remote/protocol.py` - `RemoteStorage` interface and `open_remote()` factory
+- `packages/pivot/src/pivot/remote/storage.py` - S3 backend (`S3Remote`)
+- `packages/pivot/src/pivot/remote/gcs.py` - GCS backend (`GCSRemote`)
+- `packages/pivot/src/pivot/remote/keys.py` - Object key layout and download integrity checks both backends share
 - `packages/pivot/src/pivot/remote/sync.py` - Push/pull logic
-- `packages/pivot/src/pivot/remote/config.py` - Remote configuration
+- `packages/pivot/src/pivot/remote/config.py` - Remote configuration and URL validation
 
 **How it works:**
 
-1. `RemoteStorage` abstracts S3 operations
-2. `push_outputs()` uploads cache files to S3
-3. `pull_outputs()` downloads cache files by hash
+1. `open_remote()` picks `S3Remote` (`s3://`) or `GCSRemote` (`gs://`) behind the `RemoteStorage` interface
+2. `push()` uploads cache files the remote lacks
+3. `pull()` downloads missing cache files by hash, verifying each against its hash; the CLI then checks them out
 
-**Start reading:** `packages/pivot/src/pivot/remote/sync.py:push_outputs()`
+**Start reading:** `packages/pivot/src/pivot/remote/sync.py:push()`
 
 ## Data Flow: `pivot repro`
 

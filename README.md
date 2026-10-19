@@ -14,7 +14,7 @@ Pivot is a Python pipeline tool with automatic code change detection. Stages are
 - **No paths in pipeline code**: Pivot chooses where every output is stored
 - **Per-stage lock files** for fast parallel writes
 - **Warm worker pools** that retain stage imports across runs
-- **Content-addressable caching** with S3 remote storage
+- **Content-addressable caching** with S3 or Google Cloud Storage remotes
 
 ---
 
@@ -136,12 +136,12 @@ The first run receives the loader's empty value. Later runs restore a writable
 copy of the last cached output before calling the stage. Use a `Loader` with
 `load()`, `save()`, and `empty()`; writer-only formats are rejected.
 
-### S3 Remote Cache
+### Remote Cache (S3 or GCS)
 
 Share outputs across machines and CI:
 
 ```bash
-pivot config set remotes.origin s3://my-bucket/pivot-cache
+pivot config set remotes.origin s3://my-bucket/pivot-cache   # or gs://my-bucket/pivot-cache
 pivot push                 # Upload to remote
 pivot pull                 # Download and restore outputs
 ```

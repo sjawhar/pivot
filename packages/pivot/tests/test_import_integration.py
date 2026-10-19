@@ -12,6 +12,7 @@ import xxhash
 import yaml
 
 from pivot import exceptions, import_artifact
+from pivot.remote import keys
 from pivot.remote import storage as remote_mod
 from pivot.storage import lock, track
 from tests import conftest
@@ -216,7 +217,7 @@ async def test_import_from_local_git_repo(
         [{"key": None, "tag": "data", "hash": file_hash}],
     )
 
-    key = remote_mod._hash_to_key("cache/", file_hash)
+    key = keys.hash_to_key("cache/", file_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key, Body=content)
 
     result = await import_artifact.import_artifact(
@@ -268,7 +269,7 @@ async def test_import_from_local_repo_then_update(
         [{"key": None, "tag": "data", "hash": v1_hash}],
     )
 
-    key_v1 = remote_mod._hash_to_key("cache/", v1_hash)
+    key_v1 = keys.hash_to_key("cache/", v1_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v1, Body=v1_content)
 
     result = await import_artifact.import_artifact(
@@ -297,7 +298,7 @@ async def test_import_from_local_repo_then_update(
         capture_output=True,
     )
 
-    key_v2 = remote_mod._hash_to_key("cache/", v2_hash)
+    key_v2 = keys.hash_to_key("cache/", v2_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v2, Body=v2_content)
 
     check = await import_artifact.check_for_update(pvt_path, pvt_data)
@@ -396,11 +397,11 @@ async def test_full_import_flow_mocked(
         side_effect=_read_file_v1,
     )
 
-    key_v1 = remote_mod._hash_to_key("test-prefix/", initial_hash)
+    key_v1 = keys.hash_to_key("test-prefix/", initial_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v1, Body=initial_content)
 
     s3_cls = mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         return_value=remote_mod.S3Remote(remote_url),
     )
@@ -453,7 +454,7 @@ async def test_full_import_flow_mocked(
 
     read_file_mock.side_effect = _read_file_v2
 
-    key_v2 = remote_mod._hash_to_key("test-prefix/", updated_hash)
+    key_v2 = keys.hash_to_key("test-prefix/", updated_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v2, Body=updated_content)
 
     s3_cls.return_value = remote_mod.S3Remote(remote_url)

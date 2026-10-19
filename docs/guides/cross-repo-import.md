@@ -61,7 +61,7 @@ model = pipeline.input("model.pkl")
 1. Pivot resolves the git ref to a commit SHA
 2. Reads the source repo's `.pivot/config.yaml` to find its remote storage URL
 3. Reads the source lock files to find the artifact and its content hash
-4. Downloads the file from the source's S3 remote (hash-verified)
+4. Downloads the file from the source's remote, S3 or GCS (hash-verified)
 5. Creates a `.pvt` file tracking the import source
 
 After the first import above, your project has:
@@ -179,11 +179,11 @@ pivot repro             # Run serving pipeline
 ## Limitations
 
 - **Individual files only.** A directory output cannot be imported whole; import one file of it by the name `pivot list` gives it there (`pipeline/stage:path`, or `pipeline/stage:field/path` for a `TypedDict` field). An import made before Pivot used these names records a file of a stage's return value as `pipeline/stage/path`. Such a `.pvt` fails `pivot status --check-imports`, `pivot update --dry-run` and `pivot update`, each naming the new name and the `pivot import … --force` command that re-imports it under the new name.
-- **Requires source remote access.** The importing project needs network access to the source's S3 bucket.
+- **Requires source remote access.** The importing project needs network access and read credentials for the source's bucket (S3 or GCS).
 - **GitHub and generic git.** GitHub repos use the API for metadata; other git hosts fall back to `git archive`.
 
 ## Related
 
-- [Remote Storage](./remote-storage.md): configuring S3 remotes for push/pull
+- [Remote Storage](./remote-storage.md): configuring S3 and GCS remotes for push/pull
 - [Caching](../concepts/caching.md): how content-addressed caching works
 - [Artifacts & DAG](../concepts/artifacts-and-dag.md): artifact identities

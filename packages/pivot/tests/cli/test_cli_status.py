@@ -778,7 +778,10 @@ def test_status_remote_with_unusable_remote_url_fails(
         result = runner.invoke(cli.cli, ["status", "--remote"])
 
     assert result.exit_code != 0
-    assert "Remote 'origin' must be a valid S3 URL" in result.output
+    assert (
+        "Remote 'origin' must be a valid remote URL (s3://bucket/prefix or gs://bucket/prefix)"
+        in result.output
+    )
 
 
 def test_status_remote_without_remotes_still_shows_local_sections(

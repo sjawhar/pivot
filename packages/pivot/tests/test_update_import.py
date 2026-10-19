@@ -9,6 +9,7 @@ import xxhash
 import yaml
 
 from pivot import exceptions, import_artifact
+from pivot.remote import keys
 from pivot.remote import storage as remote_mod
 from pivot.storage import track
 
@@ -166,11 +167,11 @@ async def test_update_import_changed_output(
         rev_lock="newsha",
     )
 
-    key = remote_mod._hash_to_key("test-prefix/", new_hash)
+    key = keys.hash_to_key("test-prefix/", new_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key, Body=new_content)
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         return_value=remote_mod.S3Remote(remote_url),
     )
@@ -219,7 +220,7 @@ def test_update_import_same_hash_no_redownload(
     )
 
     s3_mock = mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         side_effect=AssertionError("S3Remote should not be instantiated when hash unchanged"),
     )
@@ -263,7 +264,7 @@ def test_update_import_with_rev_override(tmp_path: pathlib.Path, mocker: MockerF
     )
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         side_effect=AssertionError("S3Remote should not be instantiated"),
     )

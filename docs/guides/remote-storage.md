@@ -1,22 +1,26 @@
 # Remote Storage
 
-Share cached pipeline outputs across machines using S3. Push outputs from your laptop, pull them in CI or on a teammate's machine — stages with matching [cached](../concepts/caching.md) outputs skip instead of re-running.
+Share cached pipeline outputs across machines using S3 or Google Cloud Storage (GCS). Push outputs from your laptop, pull them in CI or on a teammate's machine — stages with matching [cached](../concepts/caching.md) outputs skip instead of re-running.
 
 ## Prerequisites
 
-Install Pivot with S3 support:
+Install Pivot with the extra for your storage:
 
 ```bash
-uv add "pivot[s3]"
+uv add "pivot[s3]"   # S3, through aioboto3
+uv add "pivot[gcs]"  # GCS, through gcloud-aio-storage
 ```
 
-Pivot uses `aioboto3` under the hood. Standard AWS credentials (env vars, `~/.aws/credentials`, IAM roles) work automatically.
+Credentials come from each cloud's standard chain; see [Credentials](#credentials).
 
 ## Configure a Remote
 
 ```bash
 # Add an S3 remote
 pivot config set remotes.origin s3://my-bucket/pivot-cache
+
+# Or a GCS remote
+pivot config set remotes.origin gs://my-bucket/pivot-cache
 
 # Set it as default
 pivot config set default_remote origin
@@ -28,11 +32,11 @@ Verify with:
 pivot config list
 ```
 
-The remote URL must be an S3 path (`s3://bucket/prefix`). Pivot stores cached files under this prefix, organized by content hash.
+The remote URL is `s3://bucket/prefix` or `gs://bucket/prefix`; any other scheme is rejected when the config is set or loaded. Pivot stores cached files under this prefix, organized by content hash (`<prefix>/files/ab/cdef…` for hash `abcdef…`), the same layout on both clouds.
 
 ## Push Outputs
 
-After running your pipeline locally, upload cached outputs to S3:
+After running your pipeline locally, upload cached outputs to the remote:
 
 ```bash
 pivot repro
@@ -77,7 +81,7 @@ On another machine, download cached outputs and restore them to the workspace:
 pivot pull
 ```
 
-`pivot pull` combines two operations: **fetch** (download from S3 to local cache) and **checkout** (restore files from local cache to workspace). This mirrors `git pull` = `git fetch` + `git merge`.
+`pivot pull` combines two operations: **fetch** (download from the remote to local cache) and **checkout** (restore files from local cache to workspace). This mirrors `git pull` = `git fetch` + `git merge`.
 
 ```
 Fetched from 'origin': 3 transferred, 0 skipped, 0 failed
@@ -148,8 +152,8 @@ Pulling a stage also fetches the outputs of the upstream stages it depends on, a
 ## Multiple Remotes
 
 ```bash
-# Add a second remote
-pivot config set remotes.backup s3://backup-bucket/pivot-cache
+# Add a second remote (remotes may be on different clouds)
+pivot config set remotes.backup gs://backup-bucket/pivot-cache
 
 # Push to a specific remote
 pivot push --remote backup
@@ -164,16 +168,28 @@ List configured remotes:
 pivot remote list
 ```
 
-## AWS Credentials
+## Credentials
 
-Pivot uses the standard AWS credential chain:
+No Pivot-specific credential configuration is needed: each cloud's standard chain applies.
+
+**S3** uses the standard AWS credential chain:
 
 1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
 2. AWS credentials file (`~/.aws/credentials`)
 3. IAM roles (EC2, ECS, Lambda)
 4. SSO/profile via `AWS_PROFILE`
 
-No Pivot-specific credential configuration needed — if `aws s3 ls` works, `pivot push` works.
+If `aws s3 ls` works, `pivot push` works.
+
+**GCS** uses Application Default Credentials:
+
+1. A service account key file named by `GOOGLE_APPLICATION_CREDENTIALS`
+2. Your user credentials from `gcloud auth application-default login`
+3. The attached service account on GCE, GKE, or Cloud Run (metadata server)
+
+Pivot needs `storage.objects.get` and `storage.objects.list` to pull (Storage Object Viewer grants both), plus `storage.objects.create` to push (Storage Object User grants all three). `STORAGE_EMULATOR_HOST` points Pivot at a GCS emulator such as fake-gcs-server, which needs no credentials.
+
+`remote.retries`, `remote.connect_timeout`, and `remote.jobs` apply to both clouds.
 
 ## GitHub Actions
 
@@ -222,9 +238,13 @@ pivot repro       # Instant — everything is cached
 **Push/pull fails with access denied:**
 
 ```bash
-aws sts get-caller-identity     # Verify credentials
-aws s3 ls s3://your-bucket/     # Verify bucket access
+aws sts get-caller-identity              # S3: verify credentials
+aws s3 ls s3://your-bucket/              # S3: verify bucket access
+gcloud auth application-default login    # GCS: refresh Application Default Credentials
+gcloud storage ls gs://your-bucket/      # GCS: verify bucket access
 ```
+
+A GCS permission error names the object and the missing permission, for example `Permission 'storage.objects.create' denied`.
 
 **Cache miss after pull — stages re-run unexpectedly:**
 

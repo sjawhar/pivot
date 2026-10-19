@@ -401,7 +401,7 @@ def get_remote_status(
     if not remotes:
         raise exceptions.RemoteNotConfiguredError("No remotes configured")
 
-    s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
+    remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
     url = remote_config.get_remote_url(resolved_name)
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
@@ -410,7 +410,7 @@ def get_remote_status(
 
     with state_mod.StateDB(config.get_state_dir()) as state_db:
         status = asyncio.run(
-            transfer.compare_status(local_hashes, s3_remote, state_db, resolved_name)
+            transfer.compare_status(local_hashes, remote_storage, state_db, resolved_name)
         )
 
     return RemoteSyncInfo(
