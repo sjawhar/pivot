@@ -74,6 +74,22 @@ def _helper_only_parts() -> _HelperOnlyParts:
     return {"parts": {"a.json": {"v": 1}}}
 
 
+_HelperFileNamedField = TypedDict(
+    "_HelperFileNamedField",
+    {
+        "parts": Annotated[
+            dict[str, dict[str, int]], compose.directory, loaders.JSON[dict[str, int]]()
+        ],
+        "parts/a.json": Annotated[dict[str, int], compose.metric],
+    },
+)
+
+
+@compose.stage
+def _helper_file_named_field() -> _HelperFileNamedField:
+    return {"parts": {"a.json": {"v": 1}}, "parts/a.json": {"m": 2}}
+
+
 def test_directory_is_exported_from_pivot() -> None:
     assert _directory_tag() is compose.directory
 
@@ -317,7 +333,13 @@ def test_one_file_of_a_directory_output_routes_as_the_producers_output(
         pytest.param("../escape.jsonl", "path traversal not allowed", id="traversal"),
         pytest.param("/abs.jsonl", "absolute path not allowed", id="absolute"),
         pytest.param("train", "must include file extension", id="no-extension"),
-        pytest.param("a:b.jsonl", "colons", id="colon"),
+        pytest.param("a:b.jsonl", "backslashes, colons and null bytes are not allowed", id="colon"),
+        pytest.param(
+            "a\\b.jsonl", "backslashes, colons and null bytes are not allowed", id="backslash"
+        ),
+        pytest.param(
+            "a\0b.jsonl", "backslashes, colons and null bytes are not allowed", id="null-byte"
+        ),
     ],
 )
 def test_one_file_key_is_checked_at_build(tmp_path: pathlib.Path, key: str, reason: str) -> None:
@@ -373,3 +395,21 @@ def test_a_lone_typed_dict_directory_field_is_selected_by_name_before_its_files(
 
     assert whole.identity == types.ArtifactIdentity("p/_helper_only_parts", "parts")
     assert one.identity == types.ArtifactIdentity("p/_helper_only_parts", "parts/a.json")
+
+
+def test_output_named_like_a_file_of_a_directory_output_is_refused_at_build(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`parts/a.json` would name both a field and a file of `parts`, so the build stops."""
+    with (
+        pytest.raises(exceptions.StageDefinitionError) as exc_info,
+        compose.Pipeline("p", root=tmp_path),
+    ):
+        built = _helper_file_named_field()
+        _helper_read_one(built["parts"]["a.json"])
+        _helper_read_one(built["parts/a.json"])
+
+    message = str(exc_info.value)
+    assert "Stage '_helper_file_named_field'" in message, message
+    assert "output 'parts/a.json'" in message, message
+    assert "directory output 'parts'" in message, message

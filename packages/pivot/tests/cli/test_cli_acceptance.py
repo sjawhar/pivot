@@ -1969,3 +1969,55 @@ def test_status_takes_a_one_file_dependency_from_the_producers_lock_when_it_is_d
     assert "0 ran, 2 cached" in restored, restored
     assert (root / "data" / "s" / "split" / "train.jsonl").is_file()
     assert "Verification passed" in _ok(_pivot(root, "verify"))
+
+
+_RENAMED_FILE_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, StageParams, directory, stage
+
+
+class SplitParams(StageParams):
+    name: str = "a.yaml"
+
+
+@stage
+def split(params: SplitParams) -> Annotated[dict[str, dict], directory]:
+    return {params.name: {"name": params.name}}
+
+
+with Pipeline("r") as pipeline:
+    split(params=SplitParams())
+"""
+
+
+def _helper_snapshot(root: pathlib.Path) -> dict[str, bytes]:
+    """Every file under the outputs, the cache and the locks, by path."""
+    tops = [root / "data", root / ".pivot" / "cache", root / ".pivot" / "stages"]
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for top in tops
+        for path in sorted(top.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_refused_directory_key_on_a_rerun_keeps_the_last_good_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A refused key fails the stage in one line and changes no output, cache file or lock."""
+    root = _project(tmp_path, {"pipeline.py": _RENAMED_FILE_PIPELINE})
+    _ok(_pivot(root, "repro"))
+    (root / "params.yaml").write_text("r/split:\n  name: ../b.yaml\n")
+    before = _helper_snapshot(root)
+    status_before = _ok(_pivot(root, "status"))
+
+    refused = _pivot(root, "repro")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert "Stage 'r/split': the return value has key '../b.yaml'" in out, out
+    assert "Traceback" not in out, out
+    assert _helper_snapshot(root) == before
+    assert (root / "data" / "r" / "split" / "a.yaml").is_file()
+    assert _ok(_pivot(root, "status")) == status_before

@@ -567,6 +567,18 @@ def _returns_empty_key(data: str) -> dict[str, str]:
     return {"": data}
 
 
+def _returns_key_inside_another_keys_file(data: str) -> dict[str, str]:
+    return {"a.txt": data, "a.txt/b.txt": data}
+
+
+def _returns_backslash_key(data: str) -> dict[str, str]:
+    return {"a\\b.txt": data}
+
+
+def _returns_colon_key(data: str) -> dict[str, str]:
+    return {"a:b.txt": data}
+
+
 @pytest.mark.parametrize(
     ("func", "outs", "cause"),
     [
@@ -577,26 +589,46 @@ def _returns_empty_key(data: str) -> dict[str, str]:
             "mapping",
             id="str-for-several-outputs",
         ),
-        pytest.param(_returns_value, [_DIRECTORY_OUT], "dict", id="str-for-a-directory"),
+        pytest.param(_returns_value, [_DIRECTORY_OUT], "must be a dict", id="str-for-a-directory"),
         pytest.param(_returns_empty_dict, [_DIRECTORY_OUT], "non-empty", id="empty-directory"),
-        pytest.param(_returns_int_key, [_DIRECTORY_OUT], "strings", id="non-string-member-name"),
+        pytest.param(
+            _returns_int_key, [_DIRECTORY_OUT], "keys must be strings", id="non-string-key"
+        ),
         pytest.param(
             _returns_keys_equal_after_normalization,
             [_DIRECTORY_OUT],
-            "'foo//bar.txt' and 'foo/bar.txt' both normalize to 'foo/bar.txt'",
+            "'foo//bar.txt' and 'foo/bar.txt', which both normalize to 'foo/bar.txt'",
             id="duplicate-after-normalization",
         ),
         pytest.param(
             _returns_keys_differing_by_case,
             [_DIRECTORY_OUT],
-            "keys would collide on case-insensitive filesystems: 'File.txt' and 'file.txt'",
+            "'File.txt' and 'file.txt', which would collide on case-insensitive filesystems",
             id="case-collision",
         ),
         pytest.param(
             _returns_nested_keys_differing_by_case,
             [_DIRECTORY_OUT],
-            "keys would collide on case-insensitive filesystems: 'Foo/bar.txt' and 'foo/bar.txt'",
+            "'Foo/bar.txt' and 'foo/bar.txt', which would collide on case-insensitive filesystems",
             id="nested-case-collision",
+        ),
+        pytest.param(
+            _returns_key_inside_another_keys_file,
+            [_DIRECTORY_OUT],
+            "'a.txt' cannot be both a file and the directory holding 'a.txt/b.txt'",
+            id="key-inside-another-keys-file",
+        ),
+        pytest.param(
+            _returns_backslash_key,
+            [_DIRECTORY_OUT],
+            "backslashes, colons and null bytes are not allowed",
+            id="backslash",
+        ),
+        pytest.param(
+            _returns_colon_key,
+            [_DIRECTORY_OUT],
+            "backslashes, colons and null bytes are not allowed",
+            id="colon",
         ),
         pytest.param(
             _returns_traversal_key, [_DIRECTORY_OUT], "path traversal not allowed", id="traversal"
@@ -643,7 +675,78 @@ def test_return_value_that_does_not_fit_the_outputs_fails_with_the_cause(
     error = result["reason"].splitlines()[-1]
     assert _STAGE in error, "the error must name the stage"
     assert cause in error, "the error must say what was wrong with the return value"
-    assert not _output_path(project).exists()
+    assert not (project / "data").exists(), "a refused return value writes no output"
+
+
+@pytest.mark.parametrize(
+    ("func", "key"),
+    [
+        pytest.param(_returns_traversal_key, "../escape.txt", id="traversal"),
+        pytest.param(_returns_key_without_extension, "no_extension", id="no-extension"),
+        pytest.param(_returns_backslash_key, "a\\b.txt", id="backslash"),
+    ],
+)
+def test_directory_key_refusal_is_one_line_naming_the_stage_output_and_key(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    func: Callable[[str], object],
+    key: str,
+) -> None:
+    result = worker.execute_stage(
+        _STAGE,
+        _stage_info(func, project, worker_env, outs=[_DIRECTORY_OUT]),
+        worker_env,
+        output_queue,
+    )
+
+    reason = result["reason"]
+    assert result["status"] == StageStatus.FAILED
+    assert len(reason.strip().splitlines()) == 1, reason
+    assert f"Stage '{_STAGE}': the return value has key {key!r}" in reason, reason
+
+
+def _returns_good_directory_then_bad_directory(data: str) -> dict[str, dict[str, str]]:
+    return {"good": {"a.txt": data}, "bad": {"../escape.txt": data}}
+
+
+def _returns_text_then_bad_directory(data: str) -> dict[str, object]:
+    return {"rows": data, "bad": {"../escape.txt": data}}
+
+
+@pytest.mark.parametrize(
+    ("func", "outs"),
+    [
+        pytest.param(
+            _returns_good_directory_then_bad_directory,
+            [
+                _ref(_STAGE, "good", tag=types.ArtifactTag.DIRECTORY),
+                _ref(_STAGE, "bad", tag=types.ArtifactTag.DIRECTORY),
+            ],
+            id="good-directory-first",
+        ),
+        pytest.param(
+            _returns_text_then_bad_directory,
+            [_ref(_STAGE, "rows"), _ref(_STAGE, "bad", tag=types.ArtifactTag.DIRECTORY)],
+            id="text-output-first",
+        ),
+    ],
+)
+def test_refused_directory_key_writes_no_output_of_the_stage(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    func: Callable[[str], object],
+    outs: list[types.ArtifactRef],
+) -> None:
+    """Every output's keys are checked before any output is prepared or written."""
+    result = worker.execute_stage(
+        _STAGE, _stage_info(func, project, worker_env, outs=outs), worker_env, output_queue
+    )
+
+    assert result["status"] == StageStatus.FAILED
+    assert "path traversal not allowed" in result["reason"], result["reason"]
+    assert not (project / "data").exists(), sorted(p.name for p in (project / "data").rglob("*"))
 
 
 @dataclasses.dataclass(frozen=True)

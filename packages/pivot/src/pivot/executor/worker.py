@@ -614,8 +614,14 @@ def _execute_stage(
                         metrics=metrics.get_entries(),
                         deferred_writes=deferred,
                     )
-        except (exceptions.OutputMissingError, exceptions.CacheRestoreError) as exc:
-            return _make_result(StageStatus.FAILED, str(exc), ring_buffer, input_hash=input_hash)
+        except (
+            exceptions.OutputMissingError,
+            exceptions.CacheRestoreError,
+            exceptions.StageDefinitionError,
+        ) as exc:
+            return _make_result(
+                StageStatus.FAILED, exc.format_user_message(), ring_buffer, input_hash=input_hash
+            )
         except SystemExit as e:
             return _make_result(
                 StageStatus.FAILED,
@@ -1093,15 +1099,50 @@ def _reject_path_inside_project(
             )
 
 
-def _write_output_with_store(
+def _check_output_value(
     ref: types.ArtifactRef,
     value: Any,
+    project_root: pathlib.Path,
+    dependency_paths: collections_abc.Collection[pathlib.Path],
+) -> Any:
+    """Refuse an output value that cannot be written, before anything of the stage is written.
+
+    Returns what ``_write_output_with_store`` writes: the value, or for a directory output its
+    checked ``(path inside the directory, value)`` pairs.
+    """
+    if ref.tag is types.ArtifactTag.DIRECTORY:
+        label = "the return value" if ref.identity.key is None else f"output {ref.identity.key!r}"
+        members = stage_def.directory_out_members(value, ref.identity.producer, label)
+        if isinstance(ref.format, loaders.PathOnly):
+            for _, item_value in members:
+                _reject_path_inside_project(ref, item_value, project_root, dependency_paths)
+        return members
+    if isinstance(ref.format, loaders.PathOnly):
+        _reject_path_inside_project(ref, value, project_root, dependency_paths)
+    return value
+
+
+def _write_outputs_with_store(
+    output_values: dict[types.ArtifactRef, Any],
     store: store_mod.Store,
     project_root: pathlib.Path,
     dependency_paths: collections_abc.Collection[pathlib.Path] = (),
+) -> dict[types.ArtifactRef, pathlib.Path]:
+    """Write a stage's outputs once every one of them has passed its checks.
+
+    A refused value (a directory output's key, a PathOnly path inside the project) fails the
+    stage before any output is prepared, so the previous run's outputs stay as they were.
+    """
+    checked = {
+        ref: _check_output_value(ref, value, project_root, dependency_paths)
+        for ref, value in output_values.items()
+    }
+    return {ref: _write_output_with_store(ref, value, store) for ref, value in checked.items()}
+
+
+def _write_output_with_store(
+    ref: types.ArtifactRef, value: Any, store: store_mod.Store
 ) -> pathlib.Path:
-    if isinstance(ref.format, loaders.PathOnly) and ref.tag is not types.ArtifactTag.DIRECTORY:
-        _reject_path_inside_project(ref, value, project_root, dependency_paths)
     output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
 
@@ -1141,11 +1182,9 @@ def _write_output_with_store(
                 )
 
     if ref.tag is types.ArtifactTag.DIRECTORY:
-        members = stage_def.directory_out_members(value, types.identity_key(ref.identity))
-        if isinstance(ref.format, loaders.PathOnly):
-            for _, item_value in members:
-                _reject_path_inside_project(ref, item_value, project_root, dependency_paths)
-        for relpath, item_value in members:
+        # The directory was just created empty and no key lies inside another key's path, so
+        # every directory on the way to a file is one created here, never a returned path
+        for relpath, item_value in cast("list[tuple[str, Any]]", value):
             full_path = output_path / relpath
             full_path.parent.mkdir(parents=True, exist_ok=True)
             save_output(item_value, full_path)
@@ -1286,17 +1325,7 @@ def _run_stage_function_with_store(
         _raise_if_stopped()
 
         output_values = _resolve_output_values(result, outs, stage_name)
-        output_paths = dict[types.ArtifactRef, pathlib.Path]()
-        for ref, value in output_values.items():
-            output_paths[ref] = _write_output_with_store(
-                ref,
-                value,
-                store,
-                project_root,
-                dependency_paths,
-            )
-
-        return output_paths
+        return _write_outputs_with_store(output_values, store, project_root, dependency_paths)
 
 
 def _hash_output_paths(

@@ -167,8 +167,6 @@ def _directory_file_identity(
     """
     try:
         member = stage_def.normalize_directory_out_key(key)
-        if ":" in member:
-            raise ValueError(f"colons are not allowed in a file a stage depends on: {key!r}")
     except ValueError as error:
         raise ValueError(
             f"Stage '{consumer_name}' depends on file {key!r} of stage '{directory.producer}': "
@@ -1220,6 +1218,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
                     + f"Rename the field in {hint.__name__}."
                 )
             specs.extend(_parse_output_type(field_hint, field_name, stage_name))
+        _refuse_outputs_named_like_directory_files(specs, stage_name)
         return specs
 
     if get_origin(hint) is not Annotated:
@@ -1293,6 +1292,23 @@ def _implements_empty(fmt: object) -> bool:
     return isinstance(fmt, loaders_mod.Loader) and inspect.getattr_static(
         type(fmt), "empty"
     ) is not inspect.getattr_static(base, "empty")
+
+
+def _refuse_outputs_named_like_directory_files(specs: list[_OutputSpec], stage_name: str) -> None:
+    """Refuse an output whose key starts with a directory output's key and ``/``.
+
+    One file of directory output ``parts`` is named ``parts/<path>``, so an output keyed
+    ``parts/a.json`` would share its name with file ``a.json`` of ``parts``.
+    """
+    directories = [spec.key for spec in specs if isinstance(spec.tag, _DirectoryTag)]
+    for spec in specs:
+        for directory_key in directories:
+            if spec.key.startswith(f"{directory_key}/"):
+                raise exceptions.StageDefinitionError(
+                    f"Stage '{stage_name}': output '{spec.key}' has the name of a file of "
+                    + f"directory output '{directory_key}', so a stage depending on one could "
+                    + "not be told from a stage depending on the other. Rename the field."
+                )
 
 
 def _analyze_return_type(func: Callable[..., object]) -> list[_OutputSpec]:
