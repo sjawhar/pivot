@@ -2021,3 +2021,34 @@ def test_refused_directory_key_on_a_rerun_keeps_the_last_good_output(
     assert _helper_snapshot(root) == before
     assert (root / "data" / "r" / "split" / "a.yaml").is_file()
     assert _ok(_pivot(root, "status")) == status_before
+
+
+_THREE_FILES_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b", "sub/c.txt": "c"}
+
+
+with Pipeline("n") as pipeline:
+    split()
+"""
+
+
+def test_checkout_counts_the_files_it_restores(tmp_path: pathlib.Path) -> None:
+    """A directory output counts one per file it holds, as a tracked file counts one."""
+    root = _project(tmp_path, {"pipeline.py": _THREE_FILES_PIPELINE, "notes.txt": "n"})
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "track", "notes.txt"))
+    shutil.rmtree(root / "data" / "n" / "split")
+    (root / "notes.txt").unlink()
+
+    restored = _ok(_pivot(root, "checkout"))
+    skipped = _ok(_pivot(root, "checkout"))
+
+    assert "Restored 4 file(s)" in restored, restored
+    assert "Skipped 4 file(s) (already exist)" in skipped, skipped

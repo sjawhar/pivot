@@ -3740,7 +3740,7 @@ def test_restore_missing_in_directory_recreates_missing_empty_dir(tmp_path: path
     )
 
     assert outcome == cache.MissingRestore(
-        restored=1, unavailable=0, local_changes=[], replace=False
+        restored=0, restored_dirs=1, unavailable=0, local_changes=[], replace=False
     )
     assert (output / "empty").is_dir()
     assert cache.hash_directory(output) == output_hash
@@ -3764,7 +3764,7 @@ def test_restore_missing_in_directory_replaces_directory_holding_extra_empty_dir
     )
 
     assert outcome == cache.MissingRestore(
-        restored=0, unavailable=0, local_changes=[], replace=True
+        restored=0, restored_dirs=0, unavailable=0, local_changes=[], replace=True
     )
 
 
@@ -3786,7 +3786,7 @@ def test_restore_missing_in_directory_keeps_empty_dirs_a_0_3_3_hash_does_not_lis
     )
 
     assert outcome == cache.MissingRestore(
-        restored=0, unavailable=0, local_changes=[], replace=False
+        restored=0, restored_dirs=0, unavailable=0, local_changes=[], replace=False
     )
     assert (output / "cls" / "src").is_dir()
 

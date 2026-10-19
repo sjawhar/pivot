@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import enum
 import pathlib
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import click
 
@@ -22,6 +22,23 @@ if TYPE_CHECKING:
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
+
+
+class RestoreOutcome(NamedTuple):
+    """What restoring one tracked file or stage output did, counted in files.
+
+    A directory counts each file of its manifest; a partial in-place restore counts the files
+    it wrote as restored and the ones already on disk as skipped.
+    """
+
+    result: RestoreResult
+    name: str
+    restored_files: int = 0
+    skipped_files: int = 0
+
+
+def _file_count(output_hash: HashInfo) -> int:
+    return len(output_hash["manifest"]) if is_dir_hash(output_hash) else 1
 
 
 class CheckoutBehavior(enum.StrEnum):
@@ -93,14 +110,14 @@ def _restore_path_sync(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None = None,
-) -> tuple[RestoreResult, str]:
+) -> RestoreOutcome:
     """Restore a file or directory from cache (sync version).
 
     Holds the restore lock for path across the existence check and the restore, so a
     concurrent checkout never compares against, or deletes, a half-restored output.
 
     Returns:
-        Tuple of (result, path_name) for the caller to handle output.
+        What the restore did, for the caller to count and report.
 
     Raises:
         click.ClickException: For immediate failures (path traversal, unknown target,
@@ -121,13 +138,14 @@ def _restore_path_locked(
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None,
     lock_token: str | None,
-) -> tuple[RestoreResult, str]:
+) -> RestoreOutcome:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
+    total = _file_count(output_hash)
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
                 if _on_disk_matches_expected(path, output_hash, cache_dir):
-                    return ("skipped", path.name)
+                    return RestoreOutcome("skipped", path.name, skipped_files=total)
                 raise click.ClickException(
                     f"'{path.name}' already exists with different content. "
                     + "Use --force to overwrite or --only-missing to skip existing files."
@@ -137,7 +155,7 @@ def _restore_path_locked(
                 # target when every differing or extra file is pivot's own cached output.
                 # Never overwrite content the cache lacks (a local change).
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
-                    return ("skipped", path.name)
+                    return RestoreOutcome("skipped", path.name, skipped_files=total)
                 # Reuse hashes `pivot status` and `pivot track` recorded; never create the DB.
                 with (
                     state.StateDB(state_dir, readonly=True)
@@ -154,8 +172,14 @@ def _restore_path_locked(
                     )
                 if not outcome["replace"]:
                     if outcome["unavailable"]:
-                        return ("missing", path.name)
-                    return ("restored" if outcome["restored"] else "skipped", path.name)
+                        return RestoreOutcome("missing", path.name)
+                    wrote = outcome["restored"] or outcome["restored_dirs"]
+                    return RestoreOutcome(
+                        "restored" if wrote else "skipped",
+                        path.name,
+                        restored_files=outcome["restored"],
+                        skipped_files=total - outcome["restored"],
+                    )
             case CheckoutBehavior.FORCE:
                 missing = cache.missing_cache_objects(output_hash, cache_dir, checkout_modes)
                 if missing:
@@ -175,9 +199,9 @@ def _restore_path_locked(
         lock_token=lock_token,
     )
     if not success:
-        return ("missing", path.name)
+        return RestoreOutcome("missing", path.name)
 
-    return ("restored", path.name)
+    return RestoreOutcome("restored", path.name, restored_files=total)
 
 
 async def _checkout_files_async(
@@ -191,8 +215,8 @@ async def _checkout_files_async(
     """Restore files in parallel.
 
     Returns:
-        Tuple of (failures, restored_count, skipped_count) where failures is a list
-        of file names that were missing from cache.
+        Tuple of (failures, restored_count, skipped_count): the names of outputs missing from
+        the cache, and the files restored and already present.
 
     Raises:
         click.ClickException: For immediate failures (aggregated if multiple).
@@ -201,14 +225,15 @@ async def _checkout_files_async(
     failures = list[str]()
     restored = 0
     skipped = 0
+    done = 0
     immediate_errors = list[click.ClickException]()
 
     async def restore_one(abs_path_str: str, output_hash: HashInfo) -> None:
-        nonlocal restored, skipped
+        nonlocal restored, skipped, done
         path = pathlib.Path(abs_path_str)
         try:
             async with semaphore:
-                result, name = await asyncio.to_thread(
+                outcome = await asyncio.to_thread(
                     _restore_path_sync,
                     path,
                     output_hash,
@@ -217,15 +242,13 @@ async def _checkout_files_async(
                     behavior,
                     state_dir,
                 )
-            match result:
-                case "missing":
-                    failures.append(name)
-                case "restored":
-                    restored += 1
-                case "skipped":
-                    skipped += 1
+            if outcome.result == "missing":
+                failures.append(outcome.name)
+            restored += outcome.restored_files
+            skipped += outcome.skipped_files
+            done += 1
             if callback:
-                callback(restored + skipped + len(failures), len(files), name)
+                callback(done, len(files), outcome.name)
         except click.ClickException as e:
             immediate_errors.append(e)
 

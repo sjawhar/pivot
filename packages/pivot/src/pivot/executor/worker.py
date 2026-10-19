@@ -1555,6 +1555,9 @@ def hash_dependencies(
                     )
             except FileNotFoundError:
                 missing.append(key)
+            except IsADirectoryError:
+                # One file of a directory output names a directory the producer wrote there
+                unreadable.append(f"{key} (a directory, not a file)")
             except OSError:
                 unreadable.append(key)
     else:

@@ -55,7 +55,7 @@ def _hold_checkout_restore(
 
     cache._checkout_with_fallback = _checkout_after_release
     try:
-        result, _ = checkout._restore_path_sync(
+        outcome = checkout._restore_path_sync(
             path,
             output_hash,
             cache_dir,
@@ -63,7 +63,7 @@ def _hold_checkout_restore(
             checkout.CheckoutBehavior.FORCE,
             state_dir,
         )
-        result_queue.put(("checkout", result))
+        result_queue.put(("checkout", outcome.result))
     finally:
         cache._checkout_with_fallback = original_checkout
 

@@ -19,12 +19,6 @@ from pivot.engine.types import StageExecutionState
 from pivot.storage import artifact_lock, store
 
 
-def _directory_tag() -> object:
-    tag = getattr(pivot, "directory", None)
-    assert tag is not None, "pivot.directory must be public"
-    return tag
-
-
 @compose.stage
 def _helper_split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], compose.directory]:
     return {"train.jsonl": raw}
@@ -90,53 +84,16 @@ def _helper_file_named_field() -> _HelperFileNamedField:
     return {"parts": {"a.json": {"v": 1}}, "parts/a.json": {"m": 2}}
 
 
-def test_directory_is_exported_from_pivot() -> None:
-    assert _directory_tag() is compose.directory
-
-
-@pytest.mark.parametrize(
-    ("value_type", "loader_class"),
-    [
-        pytest.param(pd.DataFrame, loaders.DataFrameJSONL, id="dataframe"),
-        pytest.param(dict[str, int], loaders.YAML, id="dict"),
-        pytest.param(str, loaders.Text, id="str"),
-        pytest.param(pathlib.Path, loaders.PathOnly, id="path"),
-    ],
-)
-def test_directory_loader_is_inferred_from_the_value_type(
-    value_type: type, loader_class: type
-) -> None:
-    """Each file is written as a single output of the value type would be."""
-    tag = _directory_tag()
-
-    def split() -> Annotated[dict[str, value_type], tag]:  # pyright: ignore[reportInvalidTypeForm, reportUnknownParameterType] - parametrized type
+def test_directory_takes_an_explicit_loader_for_each_file(tmp_path: pathlib.Path) -> None:
+    def split() -> Annotated[dict[str, pd.DataFrame], pivot.directory, loaders.CSV[pd.DataFrame]()]:
         return {}
 
-    [spec] = compose._analyze_return_type(split)  # pyright: ignore[reportUnknownArgumentType] - parametrized type
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        compose.stage(split)()
 
-    assert spec.tag is tag
-    assert type(spec.format) is loader_class
-
-
-def test_directory_takes_an_explicit_loader_for_each_file() -> None:
-    tag = _directory_tag()
-
-    def split() -> Annotated[dict[str, pd.DataFrame], tag, loaders.CSV[pd.DataFrame]()]:
-        return {}
-
-    [spec] = compose._analyze_return_type(split)
-
-    assert isinstance(spec.format, loaders.CSV)
-
-
-def test_untagged_dict_of_values_stays_one_yaml_file() -> None:
-    def split() -> dict[str, pd.DataFrame]:
-        return {}
-
-    [spec] = compose._analyze_return_type(split)
-
-    assert spec.tag is None
-    assert isinstance(spec.format, loaders.YAML)
+    [out] = pipeline.get_stage("p/split")["outs"]
+    assert out.tag is types.ArtifactTag.DIRECTORY
+    assert isinstance(out.format, loaders.CSV)
 
 
 @pytest.mark.parametrize(
@@ -148,28 +105,32 @@ def test_untagged_dict_of_values_stays_one_yaml_file() -> None:
         pytest.param(list[str], id="list"),
     ],
 )
-def test_directory_on_anything_but_a_str_keyed_dict_is_refused(base: type) -> None:
-    tag = _directory_tag()
-
-    def split() -> Annotated[base, tag]:  # pyright: ignore[reportInvalidTypeForm, reportUnknownParameterType] - parametrized type
+def test_directory_on_anything_but_a_str_keyed_dict_is_refused(
+    tmp_path: pathlib.Path, base: type
+) -> None:
+    def split() -> Annotated[base, pivot.directory]:  # pyright: ignore[reportInvalidTypeForm, reportUnknownParameterType] - parametrized type
         return {}
 
-    with pytest.raises(exceptions.StageDefinitionError) as exc_info:
-        compose._analyze_return_type(split)  # pyright: ignore[reportUnknownArgumentType] - parametrized type
+    with (
+        pytest.raises(exceptions.StageDefinitionError) as exc_info,
+        compose.Pipeline("p", root=tmp_path),
+    ):
+        compose.stage(split)()  # pyright: ignore[reportUnknownArgumentType] - parametrized type
 
     message = str(exc_info.value)
     assert "Stage 'split': the return value is tagged directory" in message, message
     assert "dict[str, T]" in message, message
 
 
-def test_directory_value_type_without_a_known_format_is_refused() -> None:
-    tag = _directory_tag()
-
-    def split() -> Annotated[dict[str, int], tag]:
+def test_directory_value_type_without_a_known_format_is_refused(tmp_path: pathlib.Path) -> None:
+    def split() -> Annotated[dict[str, int], pivot.directory]:
         return {}
 
-    with pytest.raises(ValueError, match="Cannot infer serialization format for type int"):
-        compose._analyze_return_type(split)
+    with (
+        pytest.raises(ValueError, match="Cannot infer serialization format for type int"),
+        compose.Pipeline("p", root=tmp_path),
+    ):
+        compose.stage(split)()
 
 
 @pytest.mark.parametrize(
@@ -180,17 +141,20 @@ def test_directory_value_type_without_a_known_format_is_refused() -> None:
         pytest.param(compose.incremental, id="incremental"),
     ],
 )
-def test_directory_combined_with_another_tag_is_refused(other: object) -> None:
-    tag = _directory_tag()
-
+def test_directory_combined_with_another_tag_is_refused(
+    tmp_path: pathlib.Path, other: object
+) -> None:
     class Result(TypedDict):
-        parts: Annotated[dict[str, dict[str, int]], tag, other]
+        parts: Annotated[dict[str, dict[str, int]], pivot.directory, other]
 
     def split() -> Result:
         raise AssertionError("annotations are analyzed without calling the stage")
 
-    with pytest.raises(exceptions.StageDefinitionError) as exc_info:
-        compose._analyze_return_type(split)
+    with (
+        pytest.raises(exceptions.StageDefinitionError) as exc_info,
+        compose.Pipeline("p", root=tmp_path),
+    ):
+        compose.stage(split)()
 
     message = str(exc_info.value)
     assert "Stage 'split': output 'parts' cannot combine directory with" in message, message

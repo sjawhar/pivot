@@ -77,8 +77,8 @@ def _helper_checkout_all_at_barrier(
         exc = future.exception()
         if exc is not None:
             failures.append(f"{type(exc).__name__}: {exc}")
-        elif future.result()[0] == "missing":
-            failures.append(f"missing: {future.result()[1]}")
+        elif future.result().result == "missing":
+            failures.append(f"missing: {future.result().name}")
     return failures
 
 
@@ -128,14 +128,15 @@ def test_checkout_recovers_fresh_crash_orphans_under_outer_lock(tmp_path: pathli
     assert process.exitcode == 73
     assert not target.exists()
 
-    assert checkout_mod._restore_path_sync(
+    outcome = checkout_mod._restore_path_sync(
         target,
         output_hash,
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.SKIP_EXISTING,
         state_dir,
-    ) == ("restored", "out")
+    )
+    assert (outcome.result, outcome.name) == ("restored", "out")
     assert (target / "result.txt").read_text() == "cached content"
     assert not [p.name for p in target.parent.iterdir() if p.name.startswith(".pivot_")]
 
@@ -184,14 +185,15 @@ def test_file_checkout_removes_staging_file_left_by_killed_checkout(
     assert process.exitcode == 73
     assert [p.name for p in data.iterdir() if p.name.startswith(".pivot_")], "nothing staged"
 
-    assert checkout_mod._restore_path_sync(
+    outcome = checkout_mod._restore_path_sync(
         target,
         output_hash,
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,
         state_dir,
-    ) == ("restored", "out.txt")
+    )
+    assert (outcome.result, outcome.name) == ("restored", "out.txt")
 
     assert sorted(p.name for p in data.iterdir()) == ["out.txt"]
     assert target.read_text() == "cached content\n"
@@ -216,14 +218,15 @@ def test_file_checkout_computes_restore_token_once(
 
     monkeypatch.setattr(cache, "_restore_target_token", _counted_token)
 
-    assert checkout_mod._restore_path_sync(
+    outcome = checkout_mod._restore_path_sync(
         target,
         output_hash,
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,
         state_dir,
-    ) == ("restored", "out.txt")
+    )
+    assert (outcome.result, outcome.name) == ("restored", "out.txt")
     assert calls == [target]
 
 

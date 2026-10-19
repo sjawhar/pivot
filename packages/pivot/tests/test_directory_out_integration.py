@@ -8,6 +8,7 @@ restore from the cache apart from a rerun. All tests run real pipelines in tempo
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import tempfile
@@ -133,6 +134,44 @@ def _stage_writes_text_files() -> Annotated[dict[str, pathlib.Path], compose.dir
 
 def _stage_reads_path(path: pathlib.Path) -> dict[str, str]:
     return {"name": path.name, "directory": path.parent.name, "text": path.read_text()}
+
+
+def _stage_nested_files() -> Annotated[
+    dict[str, dict[str, int]], compose.directory, loaders.JSON[dict[str, int]]()
+]:
+    return {"x.d/a.json": {"v": 1}}
+
+
+class _NamedKeysResult(TypedDict):
+    files: Annotated[dict[str, dict[str, str]], compose.directory, loaders.JSON[dict[str, str]]()]
+
+
+def _stage_returns_keys_that_normalize() -> _NamedKeysResult:
+    """Keys that are not in normal form: accents in NFD, a hidden file, and ``.`` segments."""
+    return {
+        "files": {
+            "cafe\u0301.json": {"name": "café"},
+            "données.json": {"name": "données"},
+            "数据.json": {"name": "数据"},
+            ".metadata.json": {"name": "metadata"},
+            "./baz.json": {"name": "baz"},
+            "nested/./file.json": {"name": "file"},
+        }
+    }
+
+
+def _stage_returns_executable_and_empty_directory() -> Annotated[
+    dict[str, pathlib.Path], compose.directory
+]:
+    """An executable script and a directory holding an empty directory, made outside the project."""
+    scratch = pathlib.Path(tempfile.mkdtemp())
+    script = scratch / "run.sh"
+    script.write_text("#!/bin/sh\necho hi\n")
+    script.chmod(0o755)
+    tree = scratch / "tree.d"
+    (tree / "empty").mkdir(parents=True)
+    (tree / "file.txt").write_text("x")
+    return {"run.sh": script, "tree.d": tree}
 
 
 class _CountParams(stage_def.StageParams):
@@ -660,6 +699,84 @@ def test_consumer_of_one_file_of_a_path_directory_receives_that_files_path(
         "directory": "files",
         "text": "B.TXT",
     }
+
+
+def test_consumer_of_a_subdirectory_of_a_directory_output_fails_naming_the_producer_and_path(
+    mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`x.d` is a directory inside the output, not a file, so no loader can read it."""
+    _prepare_project(mock_discovery, monkeypatch)
+    nested = helpers.register_test_stage(_stage_nested_files, name="nest")
+    helpers.register_test_stage(_stage_read_one_file, name="read", deps={"part": nested["x.d"]})
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/nest"]["status"] == "ran", results
+    assert results["test/read"]["status"] == "failed", results
+    reason = results["test/read"]["reason"]
+    assert reason == "unreadable deps: test/nest:x.d (a directory, not a file)", reason
+    assert "Traceback" not in reason, reason
+
+
+def test_rerun_writes_inside_the_output_directory_through_no_symlink_left_there(
+    mock_discovery: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A symlink planted where a key's subdirectory goes is removed with the old output.
+
+    Every directory between the output directory and a file is created by the worker, after it
+    removed the previous output, so a file is never written through a link to outside.
+    """
+    root = _prepare_project(mock_discovery, monkeypatch)
+    results_dir = _register_producer(_stage_produces_nested_with_marker)
+    executor.run(pipeline=mock_discovery)
+    outside = tmp_path_factory.mktemp("outside")
+    shutil.rmtree(results_dir / "sub")
+    (results_dir / "sub").symlink_to(outside, target_is_directory=True)
+
+    results = executor.run(pipeline=mock_discovery, force=True)
+
+    assert results["test/produce"]["status"] == "ran", results
+    assert list(outside.iterdir()) == [], "nothing was written through the link"
+    assert not (results_dir / "sub").is_symlink()
+    assert (results_dir / "sub" / "deep" / "deeper.json").resolve().is_relative_to(root.resolve())
+
+
+def test_keys_are_written_at_their_normal_form(
+    mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unicode keys are NFC, a hidden file with an extension is kept, ``.`` segments drop."""
+    _prepare_project(mock_discovery, monkeypatch)
+    files = _register_producer(_stage_returns_keys_that_normalize, key="files")
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/produce"]["status"] == "ran", results
+    assert sorted(p.relative_to(files).as_posix() for p in files.rglob("*.json")) == sorted(
+        [".metadata.json", "baz.json", "café.json", "données.json", "nested/file.json", "数据.json"]
+    )
+    assert json.loads((files / "caf\u00e9.json").read_text()) == {"name": "café"}
+
+
+def test_executable_bit_and_empty_directory_survive_a_cache_restore(
+    mock_discovery: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_project(mock_discovery, monkeypatch)
+    helpers.register_test_stage(_stage_returns_executable_and_empty_directory, name="tools")
+    output = helpers.get_output_path("tools")
+    executor.run(pipeline=mock_discovery)
+    assert os.access(output / "run.sh", os.X_OK)
+    assert (output / "tree.d" / "empty").is_dir()
+    cache.remove_output(output)
+
+    results = executor.run(pipeline=mock_discovery)
+
+    assert results["test/tools"]["status"] == "cached", results
+    assert os.access(output / "run.sh", os.X_OK), "the executable bit came back from the cache"
+    assert (output / "tree.d" / "empty").is_dir(), "the empty directory came back"
+    assert list((output / "tree.d" / "empty").iterdir()) == []
+    assert (output / "tree.d" / "file.txt").read_text() == "x"
 
 
 def test_fewer_files_than_last_run_leave_no_stale_file(
