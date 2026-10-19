@@ -167,17 +167,33 @@ def test_import_downloads_artifact_and_records_its_source(
     assert pvt_data["source"]["remote"] == bucket.url
 
 
+@pytest.mark.parametrize(
+    ("key", "artifact", "hint"),
+    [
+        pytest.param(None, "smoke/images:part/a.csv", "smoke/images:{filename}", id="return-value"),
+        pytest.param(
+            "images", "smoke/build:images/part/a.csv", "smoke/build:images/{filename}", id="field"
+        ),
+    ],
+)
 def test_import_file_inside_directory_output(
-    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+    runner: click.testing.CliRunner,
+    source: _Source,
+    bucket: _Bucket,
+    consumer: pathlib.Path,
+    key: str | None,
+    artifact: str,
+    hint: str,
 ) -> None:
-    """A directory output is imported one file at a time, by ``<identity>/<relpath>``."""
+    """A directory output is imported one file at a time, by the name `pivot list` gives it."""
     content = b"a,b\n1,2\n"
     file_hash = bucket.put(content)
+    stage_name = artifact.partition(":")[0]
     source.write_config(bucket.url)
     source.write_lock(
-        "smoke/images",
+        stage_name,
         {
-            None: types.DirHash(
+            key: types.DirHash(
                 hash="0123456789abcdef",
                 manifest=[
                     types.DirManifestEntry(
@@ -188,13 +204,14 @@ def test_import_file_inside_directory_output(
         },
     )
     source.commit("directory output")
+    directory = types.identity_key(types.ArtifactIdentity(stage_name, key))
 
-    whole = runner.invoke(cli.cli, ["import", str(source.root), "smoke/images"])
+    whole = runner.invoke(cli.cli, ["import", str(source.root), directory])
     assert whole.exit_code != 0
-    assert "Cannot import directory output 'smoke/images'" in whole.output
-    assert "smoke/images/{filename}" in whole.output
+    assert f"Cannot import directory output '{directory}'" in whole.output
+    assert hint in whole.output
 
-    data_path = _helper_import(runner, source, "smoke/images/part/a.csv", "a.csv")
+    data_path = _helper_import(runner, source, artifact, "a.csv")
     assert data_path.read_bytes() == content
 
 
@@ -326,31 +343,31 @@ def test_import_unknown_artifact_lists_some_available_and_counts_the_rest(
     assert len(shown) + int(more.group(1)) == total
 
 
-def test_import_refuses_path_produced_by_two_stages(
+def test_import_refuses_name_of_two_outputs(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:
-    """``smoke/images/a.csv`` names both a file in a directory output and a stage."""
+    """A lock with field ``images/a.csv`` beside directory field ``images`` names one file twice."""
     source.write_config(bucket.url)
     source.write_lock(
-        "smoke/images",
+        "smoke/build",
         {
-            None: types.DirHash(
+            "images": types.DirHash(
                 hash="0123456789abcdef",
                 manifest=[
                     types.DirManifestEntry(
                         relpath="a.csv", hash="1111111111111111", size=1, isexec=False
                     )
                 ],
-            )
+            ),
+            "images/a.csv": types.FileHash(hash="2222222222222222"),
         },
     )
-    source.write_lock("smoke/images/a.csv", {None: types.FileHash(hash="2222222222222222")})
     source.commit("colliding identities")
 
-    result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/images/a.csv"])
+    result = runner.invoke(cli.cli, ["import", str(source.root), "smoke/build:images/a.csv"])
 
     assert result.exit_code != 0
-    assert "produced by multiple stages: smoke/images, smoke/images/a.csv" in result.output
+    assert "'smoke/build:images/a.csv' names more than one output" in result.output
 
 
 def test_import_never_writes_outside_project_or_over_existing_files(

@@ -172,8 +172,7 @@ def _directory_file_identity(
             f"Stage '{consumer_name}' depends on file {key!r} of stage '{directory.producer}': "
             + f"{error}"
         ) from None
-    file_key = member if directory.key is None else f"{directory.key}/{member}"
-    return types.ArtifactIdentity(directory.producer, file_key), member
+    return types.directory_file_identity(directory, member), member
 
 
 def _iter_stage_handles(node: _StageNode) -> list[ArtifactHandle]:

@@ -87,11 +87,8 @@ def producer_output_hashes(
             if not types.is_dir_hash(hash_info):
                 continue
             for entry in hash_info["manifest"]:
-                relpath = entry["relpath"]
-                file_key = relpath if identity.key is None else f"{identity.key}/{relpath}"
-                hashes[ArtifactIdentity(identity.producer, file_key)] = types.FileHash(
-                    hash=entry["hash"]
-                )
+                file_identity = types.directory_file_identity(identity, entry["relpath"])
+                hashes[file_identity] = types.FileHash(hash=entry["hash"])
     return hashes
 
 

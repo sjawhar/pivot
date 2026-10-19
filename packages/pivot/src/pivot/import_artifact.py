@@ -251,9 +251,9 @@ async def read_remote_lock_file(
     return data
 
 
-def _entry_identity(stage: str, entry: OutEntry) -> str:
-    """Identity key of a lock output entry: ``stage`` or ``stage:key``."""
-    return types.identity_key(types.ArtifactIdentity(stage, entry["key"]))
+def _entry_identity(stage: str, entry: OutEntry) -> types.ArtifactIdentity:
+    """Identity of a lock output entry: ``stage`` or ``stage:key``."""
+    return types.ArtifactIdentity(stage, entry["key"])
 
 
 def _entry_size(entry: OutEntry, identity: str) -> int:
@@ -265,10 +265,16 @@ def _entry_size(entry: OutEntry, identity: str) -> int:
     return 0
 
 
-def _iter_manifest_paths(identity: str, entry: OutEntry) -> list[tuple[str, DirManifestEntry]]:
+def _iter_manifest_paths(
+    identity: types.ArtifactIdentity, entry: OutEntry
+) -> list[tuple[str, DirManifestEntry]]:
+    """Each file of a directory output, named as a stage depending on it names it."""
     if "manifest" not in entry:
         return []
-    return [(f"{identity}/{m['relpath']}", m) for m in entry["manifest"]]
+    return [
+        (types.identity_key(types.directory_file_identity(identity, m["relpath"])), m)
+        for m in entry["manifest"]
+    ]
 
 
 async def resolve_remote_path(
@@ -311,17 +317,21 @@ async def _resolve_remote_path_with_session(
         if lock_data is None:
             continue
         for entry in lock_data["outs"]:
-            identity = _entry_identity(stage, entry)
-            manifest_paths = _iter_manifest_paths(identity, entry)
+            entry_identity = _entry_identity(stage, entry)
+            identity = types.identity_key(entry_identity)
+            manifest_paths = _iter_manifest_paths(entry_identity, entry)
             available.add(identity)
             available.update(full_path for full_path, _ in manifest_paths)
 
             if identity == path:
                 if "manifest" in entry:
+                    file_example = types.identity_key(
+                        types.directory_file_identity(entry_identity, "{filename}")
+                    )
                     message = (
                         "Cannot import directory output "
                         + f"'{path}'. Import individual files instead, "
-                        + f"e.g., '{path}/{{filename}}'"
+                        + f"e.g., '{file_example}'"
                     )
                     raise exceptions.PivotError(message)
                 matches.append((stage, path, entry["hash"], _entry_size(entry, identity)))
@@ -354,7 +364,10 @@ async def _resolve_remote_path_with_session(
 
     if len(matches) > 1:
         stages = ", ".join(sorted({stage for stage, _, _, _ in matches}))
-        raise exceptions.PivotError(f"Path '{path}' is produced by multiple stages: {stages}")
+        raise exceptions.PivotError(
+            f"'{path}' names more than one output (of stage {stages}); "
+            + "the source pipeline must rename one"
+        )
 
     stage, matched_path, hash_, size = matches[0]
     return ResolvedImport(

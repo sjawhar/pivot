@@ -331,6 +331,16 @@ def source_identity(ref: ArtifactRef) -> ArtifactIdentity:
     return ArtifactIdentity(ref.identity.producer, output_key or None)
 
 
+def directory_file_identity(directory: ArtifactIdentity, path: str) -> ArtifactIdentity:
+    """The identity of one file of a directory output: the file's path appended to the key.
+
+    ``stage:path`` for a stage's return value, ``stage:output/path`` for a ``TypedDict`` field.
+    """
+    return ArtifactIdentity(
+        directory.producer, path if directory.key is None else f"{directory.key}/{path}"
+    )
+
+
 def validate_artifact_identity(identity: ArtifactIdentity) -> None:
     if identity.producer.strip() == "":
         raise ValueError("Artifact producer cannot be empty")
