@@ -312,6 +312,9 @@ pivot verify [STAGES...] [OPTIONS]
 
 Checks that all stages are cached (code, params, deps match lock files) and output files exist locally or on remote. Use in CI pre-merge gates to ensure pipeline is reproducible.
 
+For a directory output, `pivot verify` also checks that the workspace path is a directory. A file
+at that path fails verification.
+
 **Arguments:**
 
 - `STAGES` - Stage names to verify (optional, verifies all if not specified)
@@ -391,6 +394,9 @@ pivot checkout [TARGETS...] [OPTIONS]
 | `--force` / `-f` | Overwrite existing files when every required cache object is available; otherwise refuse without changing the workspace file |
 | `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files and empty directories; if a file differs from the target, or an extra file or directory exists, replaces the directory when every such file is pivot's own earlier output (its content is in the cache; an extra empty directory holds nothing to lose), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite |
 | `--all` | Checkout all targets (ignore target filtering) |
+
+Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
+counts separately.
 
 ---
 
@@ -558,8 +564,8 @@ pivot diff TARGETS... [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Data files to compare (required)
-
+- `TARGETS` - Data files or stage outputs to compare (required). A directory output compares its
+  CSV, JSON, and JSONL files one by one.
 **Options:**
 
 | Option | Description |

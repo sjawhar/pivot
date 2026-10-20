@@ -2185,6 +2185,242 @@ def test_checkout_counts_the_files_it_restores(tmp_path: pathlib.Path) -> None:
     assert "Skipped 4 file(s) (already exist)" in skipped, skipped
 
 
+def _helper_drop_cached_file(root: pathlib.Path, lock_path: str, relpath: str) -> None:
+    """Delete the cache blob of one file of a directory output."""
+    lock_data = yaml.safe_load((root / ".pivot" / "stages" / lock_path).read_text())
+    (entry,) = [e for e in lock_data["outs"][0]["manifest"] if e["relpath"] == relpath]
+    (root / ".pivot" / "cache" / "files" / entry["hash"][:2] / entry["hash"][2:]).unlink()
+
+
+def test_checkout_counts_the_files_of_a_missing_directory_output(tmp_path: pathlib.Path) -> None:
+    """Missing, like restored and skipped, counts files: a three-file directory is three."""
+    root = _project(tmp_path, {"pipeline.py": _THREE_FILES_PIPELINE, "notes.txt": "n"})
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "track", "notes.txt"))
+    shutil.rmtree(root / "data" / "n" / "split")
+    for relpath in ("a.txt", "b.txt", "sub/c.txt"):
+        _helper_drop_cached_file(root, "n/split.lock", relpath)
+
+    proc = _pivot(root, "checkout")
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "Skipped 1 file(s) (already exist)" in out, out
+    assert "Missing 3 file(s) from:\n  split\n" in out, out
+
+
+def test_checkout_only_missing_counts_present_files_when_a_blob_is_gone(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An in-place restore that cannot get one file's blob still counts the files on disk."""
+    root = _project(tmp_path, {"pipeline.py": _THREE_FILES_PIPELINE})
+    _ok(_pivot(root, "repro"))
+    (root / "data" / "n" / "split" / "a.txt").unlink()
+    _helper_drop_cached_file(root, "n/split.lock", "a.txt")
+
+    proc = _pivot(root, "checkout", "--only-missing")
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "Skipped 2 file(s) (already exist)" in out, out
+    assert "Missing 1 file(s) from:\n  split\n" in out, out
+
+
+_ALIAS_PIPELINE = """\
+from pivot import Pipeline, stage
+
+from shapes import Shape
+
+
+@stage
+def make(seed: str) -> Shape:
+    return {"a.yaml": {"v": 1}}
+
+
+@stage
+def use(payload: Shape) -> dict[str, int]:
+    return {"n": len(payload)}
+
+
+with Pipeline("t") as pipeline:
+    use(make(pipeline.input("seed.txt")))
+"""
+
+_FILE_SHAPE = "Shape = dict[str, dict[str, int]]\n"
+
+_DIRECTORY_SHAPE = """\
+from typing import Annotated
+
+from pivot import directory, loaders
+
+Shape = Annotated[dict[str, dict[str, int]], directory, loaders.YAML()]
+"""
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "placed", "kind"),
+    [
+        pytest.param(_FILE_SHAPE, _DIRECTORY_SHAPE, "data/t/make", "dir", id="file-to-directory"),
+        pytest.param(
+            _DIRECTORY_SHAPE, _FILE_SHAPE, "data/t/make.yaml", "file", id="directory-to-file"
+        ),
+    ],
+)
+def test_switching_directory_through_a_type_alias_reruns_the_producer(
+    tmp_path: pathlib.Path, before: str, after: str, placed: str, kind: str
+) -> None:
+    """The stage's source is unchanged, but its output moves and changes kind."""
+    root = _project(
+        tmp_path,
+        {"pipeline.py": _ALIAS_PIPELINE, "shapes.py": before, "data/raw/seed.txt": "x\n"},
+    )
+    _ok(_pivot(root, "repro"))
+    (root / "shapes.py").write_text(after)
+
+    status = _ok(_pivot(root, "status"))
+    rerun = _ok(_pivot(root, "repro"))
+
+    assert "0 stale" not in status, status
+    assert "2 ran" in rerun, rerun
+    output = root / placed
+    assert output.is_dir() if kind == "dir" else output.is_file(), sorted(
+        str(p.relative_to(root)) for p in (root / "data" / "t").rglob("*")
+    )
+    _ok(_pivot(root, "verify"))
+
+
+def test_verify_fails_when_a_file_sits_at_a_directory_outputs_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot commit` records whatever is at the path; verify checks the kind matches the stage."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _ALIAS_PIPELINE,
+            "shapes.py": _DIRECTORY_SHAPE,
+            "data/raw/seed.txt": "x\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    shutil.rmtree(root / "data" / "t" / "make")
+    (root / "data" / "t" / "make").write_text("v: 1\n")
+    _ok(_pivot(root, "commit", "t/make"))
+
+    verify = _pivot(root, "verify", "t/make")
+
+    out = verify.stdout + verify.stderr
+    assert verify.returncode == 1, out
+    assert "data/t/make" in out, out
+    assert "directory" in out, out
+
+
+_MEMBERSHIP_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory]:
+    return {"train.jsonl": raw}
+
+
+@stage
+def fit(train: pd.DataFrame) -> dict:
+    return {"rows": int(len(train))}
+
+
+with Pipeline("m") as pipeline:
+    parts = split(pipeline.input("t.csv"))
+    if "train.jsonl" in parts:
+        fit(parts["train.jsonl"])
+"""
+
+
+def test_membership_test_on_a_directory_handle_fails_the_load_at_once(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`in` on a handle must fail pipeline.py's load, not spin: every command loads it first."""
+    root = _project(tmp_path, {"pipeline.py": _MEMBERSHIP_PIPELINE, "data/raw/t.csv": "a\n1\n"})
+
+    try:
+        proc = subprocess.run(
+            [_PIVOT, "list"],
+            cwd=root,
+            env=_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("pivot list was still loading pipeline.py after 30 s")
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "is not iterable" in out, out
+    assert "parts['train.csv']" in out, out
+
+
+_DIFF_PIPELINE = """\
+import pathlib
+import tempfile
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("part")}
+
+
+@stage
+def bundle(raw: pd.DataFrame) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "bundle"
+    out.mkdir()
+    raw.to_csv(out / "all.csv", index=False)
+    return out
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    split(rows)
+    bundle(rows)
+"""
+
+
+def test_diff_on_a_directory_output_compares_each_of_its_files(tmp_path: pathlib.Path) -> None:
+    """A directory output diffs file by file: a changed, a new and a removed file, by stage
+    name or by path, and an unchanged file is not listed."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\nkeep,5\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\nval,4\nkeep,5\n")
+    _ok(_pivot(root, "repro"))
+
+    by_stage = _ok(_pivot(root, "diff", "--no-tui", "d/split"))
+    by_path = _ok(_pivot(root, "diff", "--no-tui", "data/d/split"))
+    path_output = _ok(_pivot(root, "diff", "--no-tui", "d/bundle"))
+
+    assert "data/d/split/train.csv:\n  Rows: 1 -> 2 (+1)" in by_stage, by_stage
+    assert "data/d/split/val.csv:\n  Rows: 1 (added)" in by_stage, by_stage
+    assert "data/d/split/test.csv:\n  Rows: 1 (removed)" in by_stage, by_stage
+    assert "keep.csv" not in by_stage, by_stage
+    assert by_path == by_stage
+    assert "data/d/bundle.dat/all.csv:\n  Rows: 3 -> 4 (+1)" in path_output, path_output
+
+
 _SHOUT_PIPELINE = """\
 from pivot import Pipeline, stage
 

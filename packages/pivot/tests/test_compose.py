@@ -1506,6 +1506,28 @@ def test_output_loader_change_detected(
     assert fp_before != fp_after
 
 
+@pytest.mark.parametrize(
+    "after_tag",
+    [
+        types.ArtifactTag.DIRECTORY,
+        types.ArtifactTag.METRIC,
+        types.ArtifactTag.PLOT,
+        types.ArtifactTag.INCREMENTAL,
+    ],
+)
+def test_output_tag_change_changes_the_fingerprint(after_tag: types.ArtifactTag) -> None:
+    """A tag moves an output (``data/s.yaml`` to ``data/s``, ``metrics/``, ``plots/``) or changes
+    how it is written, and a type alias can change it without touching the stage's source.
+    """
+    before = _make_out("a", loaders.YAML())
+    after = _make_out("a", loaders.YAML(), tag=after_tag)
+
+    fp_before = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=[before]))
+    fp_after = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=[after]))
+
+    assert fp_before != fp_after
+
+
 def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) -> None:
     """@no_fingerprint() file-hash path must also prevent loader config collisions."""
     from pivot.decorators import no_fingerprint

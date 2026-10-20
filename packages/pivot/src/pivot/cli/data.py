@@ -16,6 +16,14 @@ from pivot.types import DataDiffResult, OutputFormat
 logger = logging.getLogger(__name__)
 
 
+def _is_target_path(path: str, targets: set[str]) -> bool:
+    """Whether a target names this file directly or as a file inside a target directory."""
+    return any(
+        target == "." or path == target or path.startswith(f"{target.rstrip('/')}/")
+        for target in targets
+    )
+
+
 @cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, required=True)
 @click.option("--key", "key_cols", help="Comma-separated key columns for row matching")
@@ -88,7 +96,11 @@ def diff(
                 continue
             target_set.add(project.to_relative_path(store.resolve_display_path(ref), proj_root))
 
-    filtered_head_hashes = {k: v for k, v in head_hashes.items() if k in target_set}
+    filtered_head_hashes = {
+        path: file_hash
+        for path, file_hash in head_hashes.items()
+        if _is_target_path(path, target_set)
+    }
 
     # Get workspace hashes
     workspace_hashes = data_module.get_data_hashes_from_workspace(list(target_set))

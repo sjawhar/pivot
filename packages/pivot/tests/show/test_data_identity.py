@@ -136,3 +136,54 @@ outs:
     result = data_module.get_data_hashes_from_head()
 
     assert result == {"data/train.csv": "deadbeef00000000"}
+
+
+def test_get_data_hashes_from_head_expands_directory_manifest(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory output records one head hash per comparable file in its manifest."""
+    _use_store(tmp_path, monkeypatch)
+    _register(
+        monkeypatch,
+        _make_artifact_ref("train", None, types.ArtifactTag.DIRECTORY, loaders.CSV()),
+    )
+    lock_content = b"""
+code_manifest: {}
+params: {}
+deps: []
+outs:
+  - key: null
+    hash: deadbeef00000000
+    manifest:
+      - relpath: first.csv
+        hash: abcd123400000000
+        size: 4
+        isexec: false
+      - relpath: notes.yaml
+        hash: beadfeed00000000
+        size: 5
+        isexec: false
+"""
+    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
+
+    result = data_module.get_data_hashes_from_head()
+
+    assert result == {"data/train/first.csv": "abcd123400000000"}
+
+
+def test_get_data_hashes_from_head_keeps_an_unlocked_path_directory_target(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path output that is currently a directory can later expand its workspace data files."""
+    _use_store(tmp_path, monkeypatch)
+    _register(
+        monkeypatch, _make_artifact_ref("train", None, types.ArtifactTag.DATA, loaders.PathOnly())
+    )
+    directory = tmp_path / "data" / "train.dat"
+    directory.mkdir(parents=True)
+    (directory / "rows.csv").write_text("id\n1\n")
+    _mock_head_files(monkeypatch, {})
+
+    result = data_module.get_data_hashes_from_head()
+
+    assert result == {"data/train.dat": None}

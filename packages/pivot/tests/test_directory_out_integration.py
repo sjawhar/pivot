@@ -43,11 +43,17 @@ class _DirectoryOutResult(TypedDict):
     ]
 
 
-def _stage_produces_abc_with_marker() -> _DirectoryOutResult:
-    """Return files a, b and c, and count each execution in run_marker.txt."""
+def _helper_next_run_count() -> int:
+    """Count one more execution in run_marker.txt and return the new count."""
     marker_path = pathlib.Path("run_marker.txt")
     run_count = int(marker_path.read_text()) + 1 if marker_path.exists() else 1
     marker_path.write_text(str(run_count))
+    return run_count
+
+
+def _stage_produces_abc_with_marker() -> _DirectoryOutResult:
+    """Return files a, b and c, and count each execution in run_marker.txt."""
+    run_count = _helper_next_run_count()
 
     return _DirectoryOutResult(
         results={
@@ -60,9 +66,7 @@ def _stage_produces_abc_with_marker() -> _DirectoryOutResult:
 
 def _stage_produces_nested_with_marker() -> _DirectoryOutResult:
     """Return files in nested subdirectories."""
-    marker_path = pathlib.Path("run_marker.txt")
-    run_count = int(marker_path.read_text()) + 1 if marker_path.exists() else 1
-    marker_path.write_text(str(run_count))
+    run_count = _helper_next_run_count()
 
     return _DirectoryOutResult(
         results={
@@ -75,9 +79,7 @@ def _stage_produces_nested_with_marker() -> _DirectoryOutResult:
 
 def _stage_produces_many_files_with_marker() -> _DirectoryOutResult:
     """Return 50 files: enough to exercise bulk restore without being slow."""
-    marker_path = pathlib.Path("run_marker.txt")
-    run_count = int(marker_path.read_text()) + 1 if marker_path.exists() else 1
-    marker_path.write_text(str(run_count))
+    run_count = _helper_next_run_count()
 
     return _DirectoryOutResult(
         results={f"file_{i:03d}.json": {"index": i, "run": run_count} for i in range(50)}
@@ -99,9 +101,7 @@ class _MultiDirectoryOutResult(TypedDict):
 
 def _stage_produces_multi_directory_with_marker() -> _MultiDirectoryOutResult:
     """Return one file in each of two directory outputs."""
-    marker_path = pathlib.Path("run_marker.txt")
-    run_count = int(marker_path.read_text()) + 1 if marker_path.exists() else 1
-    marker_path.write_text(str(run_count))
+    run_count = _helper_next_run_count()
 
     return _MultiDirectoryOutResult(
         first={"a.json": {"dir": "first", "run": run_count}},

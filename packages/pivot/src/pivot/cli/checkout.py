@@ -28,13 +28,15 @@ class RestoreOutcome(NamedTuple):
     """What restoring one tracked file or stage output did, counted in files.
 
     A directory counts each file of its manifest; a partial in-place restore counts the files
-    it wrote as restored and the ones already on disk as skipped.
+    it wrote as restored, the ones already on disk as skipped and the ones it could not get
+    from the cache as missing.
     """
 
     result: RestoreResult
     name: str
     restored_files: int = 0
     skipped_files: int = 0
+    missing_files: int = 0
 
 
 def _file_count(output_hash: HashInfo) -> int:
@@ -171,11 +173,15 @@ def _restore_path_locked(
                         + f"{', '.join(outcome['local_changes'])}. Use --force to overwrite."
                     )
                 if not outcome["replace"]:
-                    if outcome["unavailable"]:
-                        return RestoreOutcome("missing", path.name)
-                    wrote = outcome["restored"] or outcome["restored_dirs"]
+                    if outcome["missing"]:
+                        return RestoreOutcome(
+                            "missing",
+                            path.name,
+                            skipped_files=total - outcome["missing"],
+                            missing_files=outcome["missing"],
+                        )
                     return RestoreOutcome(
-                        "restored" if wrote else "skipped",
+                        "restored" if outcome["restored"] else "skipped",
                         path.name,
                         restored_files=outcome["restored"],
                         skipped_files=total - outcome["restored"],
@@ -199,7 +205,7 @@ def _restore_path_locked(
         lock_token=lock_token,
     )
     if not success:
-        return RestoreOutcome("missing", path.name)
+        return RestoreOutcome("missing", path.name, missing_files=total)
 
     return RestoreOutcome("restored", path.name, restored_files=total)
 
@@ -211,25 +217,17 @@ async def _checkout_files_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
-) -> tuple[list[str], int, int]:
-    """Restore files in parallel.
-
-    Returns:
-        Tuple of (failures, restored_count, skipped_count): the names of outputs missing from
-        the cache, and the files restored and already present.
+) -> list[RestoreOutcome]:
+    """Restore files in parallel and return what each restore did.
 
     Raises:
         click.ClickException: For immediate failures (aggregated if multiple).
     """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESTORES)
-    failures = list[str]()
-    restored = 0
-    skipped = 0
-    done = 0
+    outcomes = list[RestoreOutcome]()
     immediate_errors = list[click.ClickException]()
 
     async def restore_one(abs_path_str: str, output_hash: HashInfo) -> None:
-        nonlocal restored, skipped, done
         path = pathlib.Path(abs_path_str)
         try:
             async with semaphore:
@@ -242,13 +240,9 @@ async def _checkout_files_async(
                     behavior,
                     state_dir,
                 )
-            if outcome.result == "missing":
-                failures.append(outcome.name)
-            restored += outcome.restored_files
-            skipped += outcome.skipped_files
-            done += 1
+            outcomes.append(outcome)
             if callback:
-                callback(done, len(files), outcome.name)
+                callback(len(outcomes), len(files), outcome.name)
         except click.ClickException as e:
             immediate_errors.append(e)
 
@@ -270,7 +264,7 @@ async def _checkout_files_async(
         msgs = [str(e.message) for e in immediate_errors]
         raise click.ClickException("\n".join(msgs))
 
-    return (failures, restored, skipped)
+    return outcomes
 
 
 def _all_stages_in_context() -> dict[str, registry.RegistryStageInfo]:
@@ -374,12 +368,8 @@ async def _checkout_main_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
-) -> tuple[list[str], int, int]:
-    """Main async checkout logic.
-
-    Returns:
-        Tuple of (failures, restored_count, skipped_count).
-    """
+) -> list[RestoreOutcome]:
+    """Main async checkout logic: what restoring each tracked file and stage output did."""
     if targets:
         unique_targets = _dedupe_targets(targets)
         files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
@@ -427,16 +417,20 @@ async def _checkout_main_async(
                 state_dir=state_dir,
             )
         )
-        (f1, r1, s1), (f2, r2, s2) = await asyncio.gather(t1, t2)
-        return (f1 + f2, r1 + r2, s1 + s2)
+        tracked, outputs = await asyncio.gather(t1, t2)
+        return tracked + outputs
 
 
-def _print_summary(failures: list[str], restored: int, skipped: int, quiet: bool) -> bool:
-    """Print checkout summary.
+def _print_summary(outcomes: list[RestoreOutcome], quiet: bool) -> bool:
+    """Print checkout summary, counting every unit in files.
 
     Returns:
         True if all files were restored successfully, False if any were missing.
     """
+    restored = sum(outcome.restored_files for outcome in outcomes)
+    skipped = sum(outcome.skipped_files for outcome in outcomes)
+    missing = sum(outcome.missing_files for outcome in outcomes)
+    failures = [outcome.name for outcome in outcomes if outcome.result == "missing"]
     if not quiet and (restored or skipped):
         if restored:
             click.echo(f"Restored {restored} file(s)")
@@ -446,7 +440,7 @@ def _print_summary(failures: list[str], restored: int, skipped: int, quiet: bool
     if failures:
         if restored or skipped:
             click.echo("")  # Add blank line after success summary
-        click.echo(f"Missing {len(failures)} file(s):")
+        click.echo(f"Missing {missing} file(s) from:")
         for name in failures[:15]:
             click.echo(f"  {name}")
         if len(failures) > 15:
@@ -518,7 +512,7 @@ def checkout(
 
     # Run async checkout
     with cli_helpers.TransferProgress("Restoring", quiet=quiet) as progress:
-        failures, restored, skipped = asyncio.run(
+        outcomes = asyncio.run(
             _checkout_main_async(
                 targets,
                 tracked_files,
@@ -531,6 +525,6 @@ def checkout(
             )
         )
 
-    success = _print_summary(failures, restored, skipped, quiet)
+    success = _print_summary(outcomes, quiet)
     if not success:
         ctx.exit(1)

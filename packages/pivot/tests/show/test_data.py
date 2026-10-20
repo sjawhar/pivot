@@ -739,6 +739,22 @@ def test_get_data_hashes_from_workspace_missing_file(
     assert result["nonexistent.csv"] is None
 
 
+def test_get_data_hashes_from_workspace_expands_directory_files(
+    tmp_path: Path,
+    set_project_root: Path,
+) -> None:
+    """A directory contributes a hash for each data file, not one invalid hash for the directory."""
+    directory = tmp_path / "results"
+    directory.mkdir()
+    (directory / "one.csv").write_text("id\n1\n")
+    (directory / "notes.yaml").write_text("n: 1\n")
+
+    result = data.get_data_hashes_from_workspace(["results"])
+
+    assert result["results/one.csv"] is not None
+    assert "results/notes.yaml" not in result
+
+
 # =============================================================================
 # Formatting Tests
 # =============================================================================

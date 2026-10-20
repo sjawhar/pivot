@@ -999,7 +999,7 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
 def _load_dep_from_path(ref: types.ArtifactRef, path: pathlib.Path) -> Any:
     """Load an artifact after the caller has resolved its workspace/cache path."""
     loader = cast("Any", ref.format)
-    if ref.tag is types.ArtifactTag.DIRECTORY and ref.member is None:
+    if ref.tag is types.ArtifactTag.DIRECTORY and ref.directory is None:
         values = dict[str, Any]()
         for file_path in sorted(p for p in path.rglob("*") if p.is_file()):
             rel_key = file_path.relative_to(path).as_posix()

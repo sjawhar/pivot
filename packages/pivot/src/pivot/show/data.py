@@ -15,7 +15,7 @@ import tabulate
 
 from pivot import config, loaders, project, types
 from pivot.show import common
-from pivot.storage import cache
+from pivot.storage import cache, lock
 from pivot.types import (
     ChangeType,
     DataDiffResult,
@@ -104,7 +104,7 @@ def _format_from_loader(
         return DataFileFormat.CSV
     if isinstance(loader, loaders.JSON):
         return DataFileFormat.JSON
-    if isinstance(loader, loaders.JSONL):
+    if isinstance(loader, (loaders.JSONL, loaders.DataFrameJSONL)):
         return DataFileFormat.JSONL
     return None
 
@@ -540,31 +540,65 @@ def diff_data_files(
 
 
 def get_data_hashes_from_head() -> dict[str, str | None]:
-    """Map each data output's workspace path to its hash in the lock files at git HEAD."""
+    """Map each comparable workspace data file to its hash in the lock files at git HEAD.
+
+    A directory output contributes one entry per CSV, JSON or JSONL file from its manifest. This
+    lets a directory output and one of its files be diffed as data files, never as a directory.
+    """
     from pivot.cli import helpers as cli_helpers
 
     store = cli_helpers.require_workspace_store()
     proj_root = project.get_project_root()
     outs_by_stage = dict[str, list[types.ArtifactRef]]()
     for stage_name in cli_helpers.list_stages():
-        data_outs = [
+        outs = [
             out
             for out in cli_helpers.get_stage(stage_name)["outs"]
-            if _is_data_output(out, store, proj_root)
+            if out.tag not in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}
         ]
-        if data_outs:
-            outs_by_stage[stage_name] = data_outs
-    return common.output_hashes_from_head(outs_by_stage, store)
+        if outs:
+            outs_by_stage[stage_name] = outs
+
+    lock_data_by_stage = common.read_lock_files_from_head(list(outs_by_stage))
+    result = dict[str, str | None]()
+    for stage_name, outs in outs_by_stage.items():
+        lock_data = lock_data_by_stage[stage_name]
+        entries = {} if lock_data is None else {entry["key"]: entry for entry in lock_data["outs"]}
+        for out in outs:
+            output_path = store.resolve_display_path(out)
+            rel_path = project.to_relative_path(output_path, proj_root)
+            entry = entries.get(out.identity.key)
+            if entry is None:
+                if _is_data_output(out, store, proj_root) or output_path.is_dir():
+                    result[rel_path] = None
+                continue
+            output_hash = lock.entry_hash_info(entry)
+            if types.is_dir_hash(output_hash):
+                for manifest_entry in output_hash["manifest"]:
+                    path = pathlib.Path(rel_path) / manifest_entry["relpath"]
+                    if detect_format(path) is not DataFileFormat.UNKNOWN:
+                        result[path.as_posix()] = manifest_entry["hash"]
+            elif _is_data_output(out, store, proj_root) and not output_path.is_dir():
+                result[rel_path] = output_hash["hash"]
+            elif output_path.is_dir():
+                result[rel_path] = None
+    return result
 
 
 def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None]:
-    """Compute hashes for data files in workspace."""
+    """Compute hashes for workspace data files, expanding each directory into its data files."""
     result = dict[str, str | None]()
     proj_root = project.get_project_root()
 
     for rel_path in paths:
         abs_path = proj_root / rel_path
-        if abs_path.exists():
+        if abs_path.is_dir():
+            for file_path in sorted(path for path in abs_path.rglob("*") if path.is_file()):
+                if detect_format(file_path) is DataFileFormat.UNKNOWN:
+                    continue
+                file_hash, _ = cache.hash_file(file_path)
+                result[project.to_relative_path(file_path, proj_root)] = file_hash
+        elif abs_path.exists():
             file_hash, _ = cache.hash_file(abs_path)
             result[rel_path] = file_hash
         else:

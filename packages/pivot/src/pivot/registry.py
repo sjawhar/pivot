@@ -271,6 +271,9 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
                     result[f"dep:{dep_name}:{key}"] = value
             for out in info["outs"]:
                 out_key = types.identity_key(out.identity)
+                # The tag places the output (data/, metrics/, plots/, a directory) and decides
+                # how it is written, and a type alias can change it without touching the source.
+                result[f"out:{out_key}:tag"] = out.tag.value
                 for key, value in fingerprint.get_loader_fingerprint(out.format).items():
                     result[f"out:{out_key}:{key}"] = value
         return result

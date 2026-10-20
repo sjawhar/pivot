@@ -180,6 +180,9 @@ value is written by `T`'s default writer, or by the loader given beside the
 tag. The loader never comes from a key's extension, so give keys the extension
 of the files the loader writes:
 
+A directory handle is not a collection while `pipeline.py` is loading. Do not iterate it or test
+membership; name one member (`parts["train.csv"]`) or pass the handle itself.
+
 ```python
 from typing import Annotated
 
