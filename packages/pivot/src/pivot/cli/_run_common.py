@@ -73,10 +73,17 @@ class _HoldWhileTuiRuns(logging.Filter):
         self._held = dict[tuple[object, ...], logging.LogRecord]()
         self._released = False
 
+    @staticmethod
+    def _condition(record: logging.LogRecord) -> tuple[str, object] | None:
+        """Return only the condition protocol owned by Pivot's loggers."""
+        if record.name == "pivot" or record.name.startswith("pivot."):
+            return getattr(record, "pivot_condition", None)
+        return None
+
     def _key(self, record: logging.LogRecord) -> tuple[object, ...]:
-        """Include a condition value so a later pipeline error cannot replace an earlier one."""
+        """Include a Pivot-owned condition so a later pipeline error cannot replace an earlier one."""
         key = _record_key(record)
-        condition = getattr(record, "pivot_condition", None)
+        condition = self._condition(record)
         return (*key, condition) if condition is not None else key
 
     @override
@@ -131,7 +138,7 @@ class _HoldWhileTuiRuns(logging.Filter):
         with self._lock:
             self._released = True
             for record in self._held.values():
-                condition = getattr(record, "pivot_condition", None)
+                condition = self._condition(record)
                 if condition is None or conditions.get(condition[0], condition[1]) == condition[1]:
                     original_handle(record)
             self._held.clear()

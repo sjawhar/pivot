@@ -292,6 +292,24 @@ def test_defer_console_logging_never_reuses_a_bad_record_key(
     assert after.err.count("--- Logging error ---") == 40, after.err
 
 
+def test_defer_console_logging_ignores_a_third_party_condition(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A third-party logger can use an unhashable extra named pivot_condition without changing
+    Pivot's deferral or raising in the thread that logged it."""
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    try:
+        with _run_common.defer_console_logging():
+            logging.getLogger("third_party").warning("x", extra={"pivot_condition": []})
+        after = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
+
+    assert after.err == "x\n", after.err
+
+
 # =============================================================================
 # compute_dag_levels Tests
 # =============================================================================
