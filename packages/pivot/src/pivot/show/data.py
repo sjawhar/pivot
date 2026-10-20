@@ -586,9 +586,9 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
 
 
 def get_data_hashes_from_workspace(
-    paths: Sequence[str], *, excluded_paths: set[str] | None = None
+    paths: Sequence[str], *, member_paths: dict[str, pathlib.Path] | None = None
 ) -> dict[str, str | None]:
-    """Compute hashes for workspace data files, expanding each directory into its data files."""
+    """Compute the member-hash map for comparable workspace data files."""
     result = dict[str, str | None]()
     proj_root = project.get_project_root()
 
@@ -597,23 +597,26 @@ def get_data_hashes_from_workspace(
         if abs_path.is_dir():
             left_out = list[pathlib.Path]()
             dirs = list[pathlib.Path]()
-            for entry in cache.scandir_artifact_members(
-                abs_path, config.get_cache_dir() / "files", left_out, dirs
-            ):
+            cache_dir = config.get_cache_dir() / "files"
+            for entry in cache.scandir_artifact_members(abs_path, cache_dir, left_out, dirs):
                 file_path = pathlib.Path(entry.path)
                 if detect_format(file_path) is DataFileFormat.UNKNOWN:
                     continue
                 file_hash, _ = cache.hash_file(file_path)
-                result[project.to_relative_path(file_path, proj_root)] = file_hash
+                if not cache.is_artifact_member_content(file_path, file_hash, cache_dir):
+                    left_out.append(file_path)
+                    continue
+                workspace_path = project.to_relative_path(file_path, proj_root)
+                result[workspace_path] = file_hash
+                if member_paths is not None:
+                    member_paths[workspace_path] = file_path
             if left_out:
                 cache.log_left_out_symlinks(proj_root, left_out)
-                if excluded_paths is not None:
-                    excluded_paths.update(
-                        project.to_relative_path(file_path, proj_root) for file_path in left_out
-                    )
         elif abs_path.exists():
             file_hash, _ = cache.hash_file(abs_path)
             result[rel_path] = file_hash
+            if member_paths is not None:
+                member_paths[rel_path] = abs_path
         else:
             result[rel_path] = None
 

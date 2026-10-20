@@ -10,8 +10,9 @@
   their fingerprint. Stages with no outputs remain cached.
 - **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff`
   resolves them into workspace files.
-- **diff**: Treat checkout symlinks to the configured cache as output members, leave other
-  workspace symlinks out, and reject manifest paths containing control characters.
+- **diff**: Build both frontends from one workspace artifact-member map. Checkout symlinks to
+  the configured cache are members; other workspace symlinks are left out, and manifest paths
+  containing control characters are refused.
 
 
 ## v0.5.1 (2026-10-20)

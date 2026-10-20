@@ -2609,6 +2609,139 @@ def test_diff_supports_data_symlinked_outside_the_project(tmp_path: pathlib.Path
     assert '"path": "data/d/split/train.csv"' in output
 
 
+_NESTED_DIFF_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {"nested/train.csv": raw}
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+_TUI_CAPTURE_MODULE = """\
+import json
+import pathlib
+
+
+def run_diff_app(results):
+    pathlib.Path("tui-results.json").write_text(json.dumps(results))
+"""
+
+
+def _write_tui_capture_module(root: pathlib.Path) -> pathlib.Path:
+    package = root / "pivot_tui"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    capture = package / "diff.py"
+    capture.write_text(_TUI_CAPTURE_MODULE)
+    return root / "tui-results.json"
+
+
+def test_diff_member_map_excludes_descendants_of_a_left_out_directory_symlink(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` never reads a recorded file below a left-out directory symlink."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _NESTED_DIFF_PIPELINE,
+            "data/raw/rows.csv": "value\n1\n",
+        },
+    )
+    tui_capture = _write_tui_capture_module(root)
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    nested = root / "data" / "d" / "make" / "nested"
+    (nested / "train.csv").unlink()
+    nested.rmdir()
+    external = tmp_path.parent / f"{tmp_path.name}-external"
+    external.mkdir()
+    (external / "train.csv").write_text("TOP_SECRET_VALUE\n42\n")
+    nested.symlink_to(external, target_is_directory=True)
+    try:
+        json_output = _ok(_pivot(root, "diff", "--json", "d/make"))
+        text_output = _ok(_pivot(root, "diff", "--no-tui", "d/make"))
+        tui_output = _ok(_pivot(root, "diff", "d/make"))
+        tui_results = tui_capture.read_text()
+    finally:
+        (external / "train.csv").unlink()
+        external.rmdir()
+
+    for output in (json_output, text_output, tui_output, tui_results):
+        assert "leaves out symlink data/d/make/nested" in output or output == tui_results
+        assert "TOP_SECRET_VALUE" not in output
+    assert "data/d/make/nested/train.csv" in tui_results
+
+
+def test_diff_tui_excludes_an_outside_file_symlink(tmp_path: pathlib.Path) -> None:
+    """The TUI receives no data from a left-out file symlink."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    tui_capture = _write_tui_capture_module(root)
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("TOP_SECRET_VALUE\n1\n")
+    member = root / "data" / "d" / "split" / "train.csv"
+    member.unlink()
+    member.symlink_to(secret)
+    try:
+        output = _ok(_pivot(root, "diff", "d/split"))
+        tui_results = tui_capture.read_text()
+    finally:
+        secret.unlink()
+
+    assert "leaves out symlink data/d/split/train.csv" in output
+    assert "TOP_SECRET_VALUE" not in output
+    assert "data/d/split/train.csv" in tui_results
+    assert "TOP_SECRET_VALUE" not in tui_results
+
+
+def test_diff_excludes_a_cache_shaped_symlink_with_wrong_contents(tmp_path: pathlib.Path) -> None:
+    """A symlink to a misnamed cache object is left out like record-time hashing leaves it out."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_dir)))
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    member = root / "data" / "d" / "split" / "train.csv"
+    fake_hash = "0123456789abcdef"
+    fake_cache_object = cache_dir / "files" / fake_hash[:2] / fake_hash[2:]
+    fake_cache_object.parent.mkdir(parents=True)
+    fake_cache_object.write_text("TOP_SECRET_VALUE\n42\n")
+    member.unlink()
+    member.symlink_to(fake_cache_object)
+
+    output = _ok(_pivot(root, "diff", "--json", "d/split"))
+
+    assert "leaves out symlink data/d/split/train.csv" in output
+    assert "TOP_SECRET_VALUE" not in output
+
+
 _SHOUT_PIPELINE = """\
 from pivot import Pipeline, stage
 
