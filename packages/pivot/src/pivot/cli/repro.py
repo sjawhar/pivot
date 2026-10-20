@@ -392,9 +392,16 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             serve=serve,
             socket_path=socket_path,
         )
+        watch_engine: engine.Engine | None = None
+
+        def conditions() -> dict[str, object]:
+            error = watch_engine.pipeline_error if watch_engine is not None else None
+            return {engine.PIPELINE_ERROR_CONDITION: error}
 
         async def watch_engine_fn(socket_ready: threading.Event) -> None:
+            nonlocal watch_engine
             async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
+                watch_engine = eng
                 _run_common.configure_result_collector(eng)
                 _run_common.configure_output_sink(
                     eng,
@@ -431,6 +438,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             app,
             watch_engine_fn,
             socket_path,
+            conditions=conditions,
             oneshot=False,
             suppress_keyboard_interrupt=True,
         )

@@ -90,6 +90,11 @@ __all__ = ["Engine"]
 
 _logger = logging.getLogger(__name__)
 
+# Names the engine's "Pipeline invalid" log records with the error they report
+# (``extra={"pivot_condition": (PIPELINE_ERROR_CONDITION, error)}``), so a TUI session can leave
+# out the records of an error a later reload fixed.
+PIPELINE_ERROR_CONDITION = "pipeline_error"
+
 # Process-lifetime sequence counter for OutputEvent.seq monotonicity across Engine instances
 _seq_counter = itertools.count(1)
 
@@ -2390,10 +2395,11 @@ class Engine:
 
     async def _invalidate_pipeline(self, errors: list[str]) -> None:
         """Mark the loaded pipeline invalid: log and report ``errors``; nothing runs until a fix."""
-        for error in errors:
-            _logger.warning(f"Pipeline invalid: {error}")
-        _logger.error("Pipeline invalid - waiting for fix")
         self._pipeline_error = "\n".join(errors)
+        condition = {"pivot_condition": (PIPELINE_ERROR_CONDITION, self._pipeline_error)}
+        for error in errors:
+            _logger.warning(f"Pipeline invalid: {error}", extra=condition)
+        _logger.error("Pipeline invalid - waiting for fix", extra=condition)
         await self._emit_pipeline_error(self._pipeline_error)
 
     async def _emit_pipeline_error(self, message: str) -> None:
@@ -2541,7 +2547,10 @@ class Engine:
         reload_result = await self._reload_registry()
 
         if isinstance(reload_result, str):
-            _logger.error("Pipeline invalid - waiting for fix")
+            _logger.error(
+                "Pipeline invalid - waiting for fix",
+                extra={"pivot_condition": (PIPELINE_ERROR_CONDITION, reload_result)},
+            )
             await self._emit_pipeline_error(reload_result)
             return
         old_stages = reload_result
@@ -2797,10 +2806,11 @@ class Engine:
 
     def _reject_reload(self, old_pipeline: registry.PipelineLike | None, errors: list[str]) -> str:
         """Keep the last loaded pipeline but mark it invalid; return the error message."""
-        for error in errors:
-            _logger.warning(f"Pipeline invalid: {error}")
         self._pipeline = old_pipeline
         self._pipeline_error = "\n".join(errors)
+        condition = {"pivot_condition": (PIPELINE_ERROR_CONDITION, self._pipeline_error)}
+        for error in errors:
+            _logger.warning(f"Pipeline invalid: {error}", extra=condition)
         return self._pipeline_error
 
     async def _emit_reload_event(self, old_stages: dict[str, RegistryStageInfo]) -> None:
