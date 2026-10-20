@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 
 import boto3
@@ -854,6 +855,44 @@ def test_gcs_remote_push_pull_import_round_trip(
     _ok(_pivot(consumer, "import", str(src), "g/generate", "--out", "generate.txt", env=env))
 
     assert (consumer / "generate.txt").read_bytes() == originals[0]
+
+
+def test_status_remote_rechecks_after_the_remote_url_changes(
+    tmp_path: pathlib.Path, fake_gcs_server: str, gcs_bucket: str
+) -> None:
+    """`status --remote` must query the bucket the remote points at now, not the previous one.
+
+    `push` and `pull` call `sync._check_remote_url`, which clears the cached "known on remote"
+    index when a remote's URL changes. `status.get_remote_status` does not, so after repointing
+    a remote it reports counts for the old bucket: here, "0 to push" while the new bucket is
+    empty and `push` immediately afterwards uploads both objects.
+    """
+    env = _env(STORAGE_EMULATOR_HOST=fake_gcs_server)
+    empty_bucket = f"pivot-test-{uuid.uuid4().hex[:12]}"
+    request = urllib.request.Request(
+        f"{fake_gcs_server}/storage/v1/b?project=pivot-test",
+        data=json.dumps({"name": empty_bucket}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as resp:
+        assert resp.status == 200, resp.read()
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(src, {"pipeline.py": _GCS_PIPELINE, ".gitignore": "/data/g/\n__pycache__/\n"})
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"gs://{gcs_bucket}/cache"))
+    _ok(_pivot(src, "repro", env=env))
+    assert "2 transferred" in _ok(_pivot(src, "push", env=env))
+
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"gs://{empty_bucket}/cache"))
+    # stdout only: clearing a stale index logs a warning to stderr, which is not JSON
+    proc = _pivot(src, "--quiet", "status", "--remote-only", "--json", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    status = json.loads(proc.stdout)
+
+    assert status["remote"]["url"] == f"gs://{empty_bucket}/cache"
+    assert status["remote"]["push_count"] == 2
 
 
 def _dirout_clone_after_teammate_rerun(
