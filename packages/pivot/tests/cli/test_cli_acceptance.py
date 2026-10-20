@@ -2421,6 +2421,48 @@ def test_diff_on_a_directory_output_compares_each_of_its_files(tmp_path: pathlib
     assert "data/d/bundle.dat/all.csv:\n  Rows: 3 -> 4 (+1)" in path_output, path_output
 
 
+def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` refuses a committed directory manifest path outside its project."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("TOP_SECRET_VALUE\n1\n")
+    malicious_relpath = f"../../../../{secret.name}"
+    try:
+        lock_path = root / ".pivot" / "stages" / "d" / "split.lock"
+        lock_data = yaml.safe_load(lock_path.read_text())
+        lock_data["outs"][0]["manifest"] = [
+            {
+                "relpath": malicious_relpath,
+                "hash": "a" * 16,
+                "size": secret.stat().st_size,
+                "isexec": False,
+            }
+        ]
+        lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
+        _commit(root, "malicious lock")
+
+        result = _pivot(root, "diff", "--json", "d/split")
+    finally:
+        secret.unlink()
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert ".pivot/stages/d/split.lock" in output
+    assert malicious_relpath in output
+    assert "TOP_SECRET_VALUE" not in output
+
+
 _SHOUT_PIPELINE = """\
 from pivot import Pipeline, stage
 

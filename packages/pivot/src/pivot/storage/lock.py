@@ -82,16 +82,20 @@ def variant_name_error(name: str) -> str | None:
     return stage_name_error(name)
 
 
+def lock_data_error(data: object) -> str | None:
+    """Return the first reason parsed lock data cannot safely be consumed."""
+    return _lock_shape_error(data)
+
+
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     """Validate that parsed YAML has the storage format's shape, field by field.
 
-    A lock that fails is treated as missing by every caller ("no lock = needs re-run"), so a
-    hand-edited or partially written lock makes the stage stale instead of crashing a reader
-    or letting status and repro disagree. The first failing field is logged at debug.
+    Callers decide whether a rejected lock should be treated as missing or should fail their
+    command. ``lock_data_error`` identifies the first unsafe or malformed field for either case.
     """
-    error = _lock_shape_error(data)
+    error = lock_data_error(data)
     if error is not None:
-        logger.debug("Lock data rejected: field %s has the wrong type or is missing", error)
+        logger.debug("Lock data rejected: %s", error)
         return False
     return True
 
@@ -132,8 +136,9 @@ def _manifest_error(value: object, field: str) -> str | None:
         if not isinstance(raw, dict):
             return entry_field
         entry = cast("dict[str, object]", raw)
-        if not _is_nonempty_str(entry.get("relpath")):
-            return f"{entry_field}.relpath"
+        relpath = entry.get("relpath")
+        if not _is_project_relative_posix_path(relpath):
+            return f"{entry_field}.relpath is not a project-relative POSIX path: {relpath!r}"
         if not cache.is_valid_hash(entry.get("hash")):
             return f"{entry_field}.hash"
         if not _is_int(entry.get("size")):

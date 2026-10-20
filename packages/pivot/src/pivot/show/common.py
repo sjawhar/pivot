@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import tabulate
 import yaml
 
-from pivot import git, project, types, yaml_config
+from pivot import exceptions, git, project, types, yaml_config
 from pivot.storage import lock
 from pivot.types import ChangeType, OutputFormat, StorageLockData
 
@@ -40,8 +40,9 @@ def _parse_lock_contents(
             continue
 
         if not lock.is_lock_data(data):
-            result[stage_name] = None
-            continue
+            error = lock.lock_data_error(data)
+            assert error is not None
+            raise exceptions.SecurityValidationError(f"Invalid lock file {lock_path}: {error}")
 
         result[stage_name] = data
 
