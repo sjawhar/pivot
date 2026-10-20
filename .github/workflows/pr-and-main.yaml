@@ -103,7 +103,7 @@ jobs:
 
   known-regressions:
     # Runs on pushes to main only, so a PR that records or fixes a regression can still merge.
-    if: always()  # TEMPORARY: exercise on the PR run; restored before merge
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
 
     steps:
