@@ -80,7 +80,7 @@ with Pipeline("state") as pipeline:
 """)
 
 
-def test_configuring_state_dir_after_init_moves_generated_gitignore(
+def test_configuring_state_dir_after_init_keeps_marker_gitignore(
     tmp_path: pathlib.Path,
 ) -> None:
     """The documented init/config/repro sequence relocates future state without moving old state."""
@@ -95,26 +95,10 @@ def test_configuring_state_dir_after_init_moves_generated_gitignore(
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
     assert configured.returncode == 0, configured.stdout + configured.stderr
     assert repro.returncode == 0, repro.stdout + repro.stderr
-    assert _pivot_entries(root) == ["config.yaml", "config.yaml.lock", "stages"]
+    assert _pivot_entries(root) == [".gitignore", "config.yaml", "config.yaml.lock", "stages"]
+    assert (root / ".pivot" / ".gitignore").read_text() == project.STATE_GITIGNORE_CONTENT
     assert (root / "altstate" / ".gitignore").is_file()
     assert "no longer used" in configured.stdout + configured.stderr
-
-
-def test_configuring_state_dir_preserves_custom_marker_gitignore(tmp_path: pathlib.Path) -> None:
-    """A hand-maintained marker ignore file is retained and explicitly named."""
-    root = tmp_path / "project"
-    root.mkdir()
-
-    initialized = _run_pivot(root, "init")
-    marker_ignore = root / ".pivot" / ".gitignore"
-    marker_ignore.write_text("custom rule\n")
-    configured = _run_pivot(root, "config", "set", "core.state_dir", "altstate")
-
-    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
-    assert configured.returncode == 0, configured.stdout + configured.stderr
-    assert marker_ignore.read_text() == "custom rule\n"
-    assert (root / "altstate" / ".gitignore").is_file()
-    assert str(marker_ignore) in configured.stdout + configured.stderr
 
 
 def test_repro_after_hand_editing_state_dir_creates_its_gitignore(tmp_path: pathlib.Path) -> None:
@@ -150,7 +134,7 @@ def test_repro_keeps_all_state_in_the_configured_state_dir(
     result = runner.invoke(cli.cli, ["repro"])
 
     assert result.exit_code == 0, result.output
-    assert _pivot_entries(root) == ["config.yaml"]
+    assert _pivot_entries(root) == [".gitignore", "config.yaml"]
     assert (state_dir / "stages" / "test" / "writes_state.lock").is_file()
     assert (state_dir / "state.lmdb").is_dir()
     assert (state_dir / "locks").is_dir()
@@ -309,7 +293,7 @@ def test_init_writes_gitignore_to_the_configured_state_dir(
         result = runner.invoke(cli.cli, ["init", "--force"])
 
         assert result.exit_code == 0, result.output
-        assert _pivot_entries(root) == ["config.yaml"]
+        assert _pivot_entries(root) == [".gitignore", "config.yaml"]
         assert (root / "altstate" / ".gitignore").is_file()
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 
 import click
@@ -36,22 +37,29 @@ def init(ctx: click.Context, force: bool) -> None:
             )
 
     pivot_dir.mkdir(exist_ok=True)
-    state_dir_is_configured = project.state_dir_is_configured(cwd)
-    gitignore_path = project.state_dir_for(cwd) / ".gitignore"
-    try:
-        gitignore_path.lstat()
-        gitignore_existed = True
-    except FileNotFoundError:
-        gitignore_existed = False
-    state_dir = project.ensure_state_dir(cwd)
-
-    if force and not state_dir_is_configured:
-        existing_content = gitignore_path.read_text()
-        if existing_content != project.STATE_GITIGNORE_CONTENT and not quiet:
-            click.echo(f"Warning: Overwriting existing {gitignore_path}", err=True)
-        gitignore_path.write_text(project.STATE_GITIGNORE_CONTENT)
-    elif force and gitignore_existed and not quiet:
-        click.echo(f"Leaving {gitignore_path}; Pivot does not own it.")
+    marker_gitignore = pivot_dir / ".gitignore"
+    created_gitignores = list[pathlib.Path]()
+    if project.state_dir_is_configured(cwd):
+        # .pivot keeps the config and its lock, so it keeps an ignore file; init is its only
+        # writer. Neither ignore file is ever overwritten in a configured layout.
+        if project.create_gitignore_if_absent(marker_gitignore):
+            created_gitignores.append(marker_gitignore)
+        state_gitignore = project.state_dir_for(cwd) / ".gitignore"
+        state_gitignore_existed = os.path.lexists(state_gitignore)
+        state_dir = project.ensure_state_dir(cwd)
+        if not state_gitignore_existed:
+            created_gitignores.append(state_gitignore)
+        elif force and state_gitignore != marker_gitignore and not quiet:
+            click.echo(f"Leaving {state_gitignore}; Pivot does not own it.")
+    else:
+        state_dir = project.ensure_state_dir(cwd)
+        # Warn if overwriting existing .gitignore with custom content
+        if force and marker_gitignore.exists():
+            existing_content = marker_gitignore.read_text()
+            if existing_content != project.STATE_GITIGNORE_CONTENT and not quiet:
+                click.echo("Warning: Overwriting existing .pivot/.gitignore", err=True)
+        marker_gitignore.write_text(project.STATE_GITIGNORE_CONTENT)
+        created_gitignores.append(marker_gitignore)
 
     stages_dir = state_dir / "stages"
     stages_dir.mkdir(exist_ok=True)
@@ -69,15 +77,9 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo()
         click.echo("Created:")
         click.echo("  .pivot/")
-        try:
-            display_stages = stages_dir.relative_to(cwd)
-            display_gitignore = gitignore_path.relative_to(cwd)
-        except ValueError:
-            display_stages = stages_dir
-            display_gitignore = gitignore_path
-        click.echo(f"  {display_stages}/")
-        if not state_dir_is_configured or not gitignore_existed:
-            click.echo(f"  {display_gitignore}")
+        click.echo(f"  {_display_path(stages_dir, cwd)}/")
+        for gitignore_path in dict.fromkeys(created_gitignores):
+            click.echo(f"  {_display_path(gitignore_path, cwd)}")
         if created_pivotignore:
             click.echo("  .pivotignore")
         click.echo()
@@ -85,3 +87,11 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo("  1. Create pipeline.py to define your pipeline stages")
         click.echo("  2. Run 'pivot repro' to execute the pipeline")
         click.echo("  3. See 'pivot --help' for more commands")
+
+
+def _display_path(path: pathlib.Path, cwd: pathlib.Path) -> pathlib.Path:
+    """Show ``path`` relative to the project when it lies inside it."""
+    try:
+        return path.relative_to(cwd)
+    except ValueError:
+        return path

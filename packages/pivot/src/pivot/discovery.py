@@ -687,6 +687,8 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
     """
     resolved_project_root = project_root.resolve()
     resolved_state_dir = project.state_dir_for(project_root).resolve()
+    # A state directory at or above the root would exclude the whole project.
+    exclude_state_dir = not resolved_project_root.is_relative_to(resolved_state_dir)
 
     # Collect all candidate paths grouped by directory
     by_dir = dict[pathlib.Path, list[pathlib.Path]]()
@@ -700,9 +702,7 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
             continue
         if any(part in _SCAN_EXCLUDE_DIRS for part in rel_parts):
             continue
-        if resolved_state_dir != resolved_project_root and path.resolve().is_relative_to(
-            resolved_state_dir
-        ):
+        if exclude_state_dir and path.resolve().is_relative_to(resolved_state_dir):
             continue
         by_dir.setdefault(path.parent, list[pathlib.Path]()).append(path)
 

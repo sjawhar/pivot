@@ -123,23 +123,28 @@ def get_state_dir() -> pathlib.Path:
     return state_dir_for(get_project_root())
 
 
+def create_gitignore_if_absent(path: pathlib.Path) -> bool:
+    """Write the default ignore template to ``path`` only if nothing exists there.
+
+    ``O_EXCL`` fails on any existing entry, including a dangling symlink, and never follows one.
+    Returns whether the file was created.
+    """
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(descriptor, "w") as gitignore:
+        gitignore.write(STATE_GITIGNORE_CONTENT)
+    return True
+
+
 def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
     """Create an initialized project's state directory and default ignore file when absent."""
     state_dir = state_dir_for(root)
     if not (root / ".pivot").is_dir():
         return state_dir
     state_dir.mkdir(parents=True, exist_ok=True)
-    gitignore_path = state_dir / ".gitignore"
-    try:
-        descriptor = os.open(
-            gitignore_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o644,
-        )
-    except FileExistsError:
-        return state_dir
-    with os.fdopen(descriptor, "w") as gitignore:
-        gitignore.write(STATE_GITIGNORE_CONTENT)
+    create_gitignore_if_absent(state_dir / ".gitignore")
     return state_dir
 
 

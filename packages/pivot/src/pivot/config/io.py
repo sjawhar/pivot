@@ -253,53 +253,48 @@ def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
 
 
 def _validate_state_dir_target(value: str) -> None:
-    """Reject state-directory paths that cannot become a directory before persistence."""
+    """Reject state-directory paths that cannot become a directory before persistence.
+
+    The nearest existing entry, found with ``lexists`` so a dangling link counts as existing,
+    decides: a dangling link or a non-directory refuses the path.
+    """
     root = project.get_project_root()
     target = pathlib.Path(value)
     if not target.is_absolute():
         target = root / target
-    if target.is_symlink() and not target.exists():
-        raise exceptions.ConfigValidationError(
-            f"core.state_dir points to a dangling symlink: {target}"
-        )
-    if target.exists() and not target.is_dir():
-        raise exceptions.ConfigValidationError(f"core.state_dir must be a directory: {target}")
 
-    existing_parent = target.parent
-    while not existing_parent.exists():
-        existing_parent = existing_parent.parent
-    if not existing_parent.is_dir():
-        raise exceptions.ConfigValidationError(
-            f"core.state_dir parent must be a directory: {existing_parent}"
-        )
+    for candidate in (target, *target.parents):
+        if not os.path.lexists(candidate):
+            continue
+        role = "core.state_dir" if candidate == target else "core.state_dir parent"
+        if candidate.is_symlink() and not candidate.exists():
+            raise exceptions.ConfigValidationError(f"{role} is a dangling symlink: {candidate}")
+        if not candidate.is_dir():
+            raise exceptions.ConfigValidationError(f"{role} must be a directory: {candidate}")
+        return
 
 
 def _has_runtime_state(state_dir: pathlib.Path) -> bool:
-    """Whether a previous state directory contains more than the project marker files."""
+    """Whether a previous state directory holds more than the project's marker files."""
+    marker_files = {"config.yaml", "config.yaml.lock", ".gitignore"}
     try:
-        return any(path.name not in {"config.yaml", ".gitignore"} for path in state_dir.iterdir())
+        return any(path.name not in marker_files for path in state_dir.iterdir())
     except FileNotFoundError:
         return False
 
 
 def _transition_local_state_dir(old_state_dir: pathlib.Path) -> list[str]:
-    """Initialize the new directory without moving or discarding prior project state."""
+    """Initialize the new directory without moving or discarding prior project state.
+
+    ``.pivot/.gitignore`` is never touched: ``.pivot`` still holds the config and its lock.
+    """
     root = project.get_project_root()
     new_state_dir = project.ensure_state_dir(root)
     if old_state_dir == new_state_dir:
         return []
-
-    messages = list[str]()
-    marker_ignore = root / ".pivot" / ".gitignore"
-    if old_state_dir == root / ".pivot" and marker_ignore.exists():
-        if marker_ignore.read_text() == project.STATE_GITIGNORE_CONTENT:
-            marker_ignore.unlink()
-        else:
-            messages.append(f"Leaving {marker_ignore}; it has custom content.")
-
     if _has_runtime_state(old_state_dir):
-        messages.append(f"Existing state at {old_state_dir} is no longer used.")
-    return messages
+        return [f"Existing state at {old_state_dir} is no longer used."]
+    return []
 
 
 def set_config_value(
