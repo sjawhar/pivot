@@ -26,18 +26,12 @@ _KILLED_WORKER_JOIN_S = 5.0
 _FileStamp = tuple[int, int, int, int, int]
 
 
-class _KeepaliveBarrier(typing.Protocol):
-    """The manager-backed barrier one round of keep-alive pings waits on."""
-
-    def wait(self, timeout: float | None = None) -> int: ...
-
-
 # A ping round normally clears as soon as each idle worker has taken one ping; the timeout only
 # bounds a round whose estimate of idle workers was off by a worker that exited meanwhile.
 _KEEPALIVE_PING_TIMEOUT_S = 0.25
 
 
-def _keepalive_ping(barrier: _KeepaliveBarrier) -> None:
+def _keepalive_ping(barrier: threading.Barrier) -> None:
     """Restart one idle worker's idle clock; the barrier spreads a round over distinct workers."""
     with contextlib.suppress(threading.BrokenBarrierError):
         _ = barrier.wait(_KEEPALIVE_PING_TIMEOUT_S)
@@ -88,7 +82,8 @@ class WorkerPool:
     _in_run: bool = False
     _max_workers: int = 0
     _idle_timeout_s: float | None = None
-    # Deadlines are serviced by the Engine loop. Short parents therefore allocate no thread.
+    # Parent -> (next ping deadline, consumer workers to keep warm). The Engine loop services
+    # the deadlines, so a parent costs no thread.
     _keepalives: dict[str, tuple[float, int]] = field(default_factory=dict)
     # Ping futures are grouped by parent so completion and shutdown cancel queued pings.
     _pings: dict[str, list[concurrent.futures.Future[None]]] = field(default_factory=dict)
@@ -103,16 +98,14 @@ class WorkerPool:
         executor = self._executor
         fresh_workers = False
         if executor is None or self._idle_timeout_s != idle_timeout_s:
-            executor = typing.cast(
-                "loky.ProcessPoolExecutor",
-                executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s),
+            executor = executor_core.create_executor(
+                self._max_workers, idle_timeout_s=idle_timeout_s
             )
             fresh_workers = executor is not self._executor
         if executor is self._executor and self._has_stale_user_code():
             executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
-            executor = typing.cast(
-                "loky.ProcessPoolExecutor",
-                executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s),
+            executor = executor_core.create_executor(
+                self._max_workers, idle_timeout_s=idle_timeout_s
             )
             fresh_workers = True
         if fresh_workers:
@@ -131,9 +124,8 @@ class WorkerPool:
         workers = executor_core.restart_workers(
             self._max_workers, idle_timeout_s=self._idle_timeout_s
         )
-        self._executor = typing.cast(
-            "loky.ProcessPoolExecutor",
-            executor_core.create_executor(self._max_workers, idle_timeout_s=self._idle_timeout_s),
+        self._executor = executor_core.create_executor(
+            self._max_workers, idle_timeout_s=self._idle_timeout_s
         )
         self._restamp_user_code_files()
         return workers
@@ -226,7 +218,11 @@ class WorkerPool:
         )
 
     def keep_consumers_warm(self, parent: str, worker_count: int) -> None:
-        """Schedule keep-alive work for an unusually long parent without starting a thread."""
+        """Keep ``parent``'s pre-started consumer workers from idling out while it runs.
+
+        ``run_due_keepalives`` pings up to ``worker_count`` idle workers every half idle timeout
+        until ``release_consumers(parent)`` or the end of the run.
+        """
         if worker_count <= 0 or self._idle_timeout_s is None:
             return
         if parent in self._keepalives:
@@ -235,6 +231,8 @@ class WorkerPool:
 
     def run_due_keepalives(self) -> None:
         """Ping pre-started idle workers whose parent has crossed the half-timeout deadline."""
+        if not self._keepalives:
+            return
         if self._executor is None or self._manager is None or self._idle_timeout_s is None:
             return
         now = time.monotonic()
@@ -243,7 +241,7 @@ class WorkerPool:
                 continue
             pings = min(worker_count, executor_core.idle_worker_count(self._executor))
             if pings > 0:
-                barrier = typing.cast("_KeepaliveBarrier", self._manager.Barrier(pings))
+                barrier = self._manager.Barrier(pings)
                 self._pings.setdefault(parent, []).extend(
                     executor_core.submit_to_live_workers(self._executor, _keepalive_ping, barrier)
                     for _ in range(pings)

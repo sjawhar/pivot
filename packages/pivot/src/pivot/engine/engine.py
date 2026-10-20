@@ -243,6 +243,7 @@ class Engine:
     _worker_pool: worker_pool_mod.WorkerPool | None
     _effective_max_workers: int
     _worker_idle_timeout_s: float | None
+
     # Run state machine (Task 10/11)
     _run_state: _RunState
     _run_task_group: TaskGroup | None
@@ -308,6 +309,7 @@ class Engine:
         self._worker_pool = None
         self._effective_max_workers = 1
         self._worker_idle_timeout_s = None
+
         # Run state machine (Task 10/11)
         self._run_state = _RunState.IDLE
         self._run_task_group = None
@@ -466,7 +468,7 @@ class Engine:
         # Create fresh dispatch completion event (Events can only be set once)
         self._dispatch_complete = anyio.Event()
         self._worker_idle_timeout_s = (
-            executor_core.one_shot_worker_idle_timeout() if exit_on_completion else None
+            executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S if exit_on_completion else None
         )
 
         async with anyio.create_task_group() as tg:
@@ -2598,10 +2600,10 @@ class Engine:
             stages = list(runnable or all_stages)
 
         if stages:
-            # Restart worker pool so workers pick up reloaded code, at the size the next run
-            # asks for. Run in thread to avoid blocking the event loop during process
-            # kill/spawn. Catch errors so dispatch-time source validation can rebuild the pool
-            # on its next use.
+            # Restart the worker pool with one fresh worker so the next run picks up reloaded
+            # code. Run in thread to avoid blocking the event loop during process kill/spawn.
+            # Catch errors so dispatch-time source validation can rebuild the pool on its next
+            # use.
             coordinator = self._get_watch_coordinator()
             if coordinator is not None and coordinator.should_restart_workers(
                 parallel=self._stored_parallel

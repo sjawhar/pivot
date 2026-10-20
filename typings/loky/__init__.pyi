@@ -17,7 +17,6 @@ class ProcessPoolExecutor(Executor):
     _processes: dict[int, BaseProcess]
     # None once the executor has been shut down.
     _processes_management_lock: AbstractContextManager[object] | None
-    _submit_resize_lock: AbstractContextManager[object]
 
     def __init__(
         self,
@@ -30,7 +29,6 @@ class ProcessPoolExecutor(Executor):
         initargs: tuple[Any, ...] = (),
         env: Mapping[str, str] | None = None,
     ) -> None: ...
-    def _adjust_process_count(self) -> None: ...
     def shutdown(  # pyright: ignore[reportImplicitOverride] - loky adds kill_workers
         self, wait: bool = True, *, kill_workers: bool = False, cancel_futures: bool = False
     ) -> None: ...

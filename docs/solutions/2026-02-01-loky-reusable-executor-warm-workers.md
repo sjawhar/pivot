@@ -34,7 +34,7 @@ reuse mode:
 ```python
 def create_executor(
     max_workers: int, *, idle_timeout_s: float | None = None
-) -> Executor:
+) -> loky.ProcessPoolExecutor:
     """Get Pivot's reusable executor without growing it before work is submitted."""
     return _get_executor(max_workers, idle_timeout_s=idle_timeout_s)
 ```
@@ -43,10 +43,11 @@ The key behaviors:
 
 1. **First dispatch** - `core.submit()` sets loky's private `_max_workers` to the number of
    submitted, unfinished stages, capped by the Engine's limit. The Engine records each direct
-   consumer wave's half-timeout deadline. Its existing 100 ms execution loop, not a per-parent
-   thread, sends a barrier-coordinated ping to each idle pre-started worker only when that
-   deadline passes. Pings stop and queued ping futures are cancelled when the parent resolves,
-   fails, or the run ends; those workers then follow the normal timeout.
+   consumer wave's half-timeout deadline, and its existing 100 ms execution loop services those
+   deadlines, so a parent costs no thread. Once a deadline passes, the loop sends a
+   barrier-coordinated ping to each idle pre-started worker. Pings stop and queued ping futures
+   are cancelled when the parent resolves, fails, or the run ends; those workers then follow
+   the normal timeout.
 2. **Later dispatches** - An existing idle worker takes the stage. A new worker starts only when
    every live worker already has work.
 3. **Idle cleanup** - One-shot Engines give idle workers a 10-second timeout. The timeout is
@@ -57,7 +58,7 @@ The key behaviors:
 
 Pivot constrains Loky to `>=3.5.6,<3.8`: 3.5.0–3.5.5 print `resource_tracker` tracebacks on
 Python 3.13, and the code reads private executor state that a later release may move. It
-handles the legacy `_executor` singleton with `_submit_resize_lock` and 3.7's
+finds the reusable executor in the legacy `_executor` singleton (3.5.6, 3.6) or 3.7's
 `_executor_storage`; an unknown layout raises an error naming the installed Loky version. The
 fresh-wheel test installs 3.5.6, 3.6.0 and 3.7.0 and checks the worker count and idle exit for
 each. An upgrade must recheck reusable-executor lookup plus `_max_workers` and

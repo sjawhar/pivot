@@ -161,10 +161,12 @@ class Scheduler:
         resource_counts = collections.defaultdict(int, self._resource_counts)
         for resource, request in self._stage_resources[stage].items():
             resource_counts[resource] -= request
-        direct_consumers = set(self._downstream.get(stage, []))
+        # ``_downstream`` is transitive. The ``_upstream_unfinished`` check below keeps the
+        # direct consumers whose only unfinished upstream stage is ``stage``.
+        downstream = set(self._downstream.get(stage, []))
         count = 0
         for candidate, state in self._stage_states.items():
-            if candidate not in direct_consumers or state != StageExecutionState.PENDING:
+            if candidate not in downstream or state != StageExecutionState.PENDING:
                 continue
             if self._upstream_unfinished[candidate] != {stage}:
                 continue

@@ -851,10 +851,9 @@ with Pipeline("fan") as pipeline:
 """
 
 
-# Imported by every Python process the command starts: each loky worker records when it started,
-# and the pivot process records when it starts the Textual TUI. With PIVOT_TEST_CHECKS_AFTER_TUI
-# set, the pivot process's engine checks the tracked files only once the TUI has mounted, the
-# order a busy machine sometimes gives.
+# Imported by every Python process the command starts: each loky worker records when it started.
+# With PIVOT_TEST_CHECKS_AFTER_TUI set, the pivot process's engine checks the tracked files only
+# once the TUI has mounted, the order a busy machine sometimes gives.
 _WORKER_LOG_HOOK = """\
 import os
 import sys
@@ -868,42 +867,35 @@ def _log(event):
 
 if sys.orig_argv[1:3] == ["-m", "loky.backend.popen_loky_posix"]:
     _log("worker")
-elif len(sys.orig_argv) > 1 and os.path.basename(sys.orig_argv[1]) == "pivot":
-    from pivot.cli import _run_common
+elif (
+    len(sys.orig_argv) > 1
+    and os.path.basename(sys.orig_argv[1]) == "pivot"
+    and os.environ.get("PIVOT_TEST_CHECKS_AFTER_TUI")
+):
+    import threading
 
-    _run_tui_with_engine = _run_common.run_tui_with_engine
+    import anyio
+    import pivot_tui.run
+    from pivot.engine import engine
 
-    def _logged_run_tui_with_engine(*args, **kwargs):
-        _log("tui")
-        return _run_tui_with_engine(*args, **kwargs)
+    _mounted = threading.Event()
+    _on_mount = pivot_tui.run.PivotApp.on_mount
+    _orchestrate_execution = engine.Engine._orchestrate_execution
 
-    _run_common.run_tui_with_engine = _logged_run_tui_with_engine
+    async def _marked_on_mount(self):
+        _mounted.set()
+        await _on_mount(self)
 
-    if os.environ.get("PIVOT_TEST_CHECKS_AFTER_TUI"):
-        import threading
+    async def _orchestrate_execution_after_tui(self, *args, **kwargs):
+        # The run checks the tracked files first, so it checks them after the TUI started.
+        with anyio.fail_after(60):
+            while not _mounted.is_set():
+                await anyio.sleep(0.01)
+        _log("held")
+        return await _orchestrate_execution(self, *args, **kwargs)
 
-        import anyio
-        import pivot_tui.run
-        from pivot.engine import engine
-
-        _mounted = threading.Event()
-        _on_mount = pivot_tui.run.PivotApp.on_mount
-        _orchestrate_execution = engine.Engine._orchestrate_execution
-
-        async def _marked_on_mount(self):
-            _mounted.set()
-            await _on_mount(self)
-
-        async def _orchestrate_execution_after_tui(self, *args, **kwargs):
-            # The run checks the tracked files first, so it checks them after the TUI started.
-            with anyio.fail_after(60):
-                while not _mounted.is_set():
-                    await anyio.sleep(0.01)
-            _log("held")
-            return await _orchestrate_execution(self, *args, **kwargs)
-
-        pivot_tui.run.PivotApp.on_mount = _marked_on_mount
-        engine.Engine._orchestrate_execution = _orchestrate_execution_after_tui
+    pivot_tui.run.PivotApp.on_mount = _marked_on_mount
+    engine.Engine._orchestrate_execution = _orchestrate_execution_after_tui
 """
 
 
@@ -1011,7 +1003,7 @@ def test_fan_after_parent_longer_than_idle_timeout_starts_each_worker_once(
     """A worker started for a fan while its parent runs must not exit idle before the fan is
     ready and then be started again: the run starts no more workers than the fan has stages."""
     root = tmp_path.resolve() / "project"
-    parent_s = executor_core.one_shot_worker_idle_timeout() + 5
+    parent_s = executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S + 5
     _helper_project(root, monkeypatch, _LONG_PARENT_FAN_PIPELINE.format(parent_s=parent_s))
     _helper_configure_workers(root, 8)
     env, worker_log = _helper_logging_env(tmp_path)
@@ -1032,8 +1024,8 @@ def test_workers_reserved_for_a_failed_parent_exit_within_the_idle_timeout(
     """Workers pre-started for a fan whose parent fails become ordinary idle workers and exit."""
     root = tmp_path.resolve() / "project"
     live_path = tmp_path / "live-workers"
-    parent_s = executor_core.one_shot_worker_idle_timeout() / 2 + 1
-    wait_s = parent_s + executor_core.one_shot_worker_idle_timeout() + 5
+    parent_s = executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S / 2 + 1
+    wait_s = parent_s + executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S + 5
     _helper_project(
         root,
         monkeypatch,
@@ -1153,8 +1145,7 @@ def test_tui_warns_once_about_a_changed_tracked_file_whenever_the_engine_checks_
     order: dict[str, str],
 ) -> None:
     """A tracked file edited since `pivot track` is reported once, outside the TUI's screen,
-    whether the engine checks it before the TUI starts or while the TUI runs. The pre-warm only
-    restores missing tracked files; checking the others stays the engine's."""
+    whether the engine checks it before the TUI starts or while the TUI runs."""
     # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
     root = tmp_path.resolve() / "p"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)

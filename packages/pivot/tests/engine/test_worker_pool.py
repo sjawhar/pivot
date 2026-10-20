@@ -11,6 +11,7 @@ import time
 from typing import TYPE_CHECKING, cast
 
 import loky.reusable_executor
+import psutil
 import pytest
 
 from pivot.engine import worker_pool
@@ -18,8 +19,8 @@ from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
 
 if TYPE_CHECKING:
-    from multiprocessing.managers import SyncManager  # noqa: F401
-    from multiprocessing.process import BaseProcess  # noqa: F401
+    from multiprocessing.managers import SyncManager
+    from multiprocessing.process import BaseProcess
 
 
 def _helper_identity(value: int) -> int:
@@ -43,14 +44,6 @@ def _helper_wait_for_release(ready_dir: str, release: str) -> int:
         assert time.monotonic() < deadline, "test did not release waiting workers"
         time.sleep(0.01)
     return os.getpid()
-
-
-def _helper_process_is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
 
 
 def test_unknown_loky_reusable_executor_layout_names_version(
@@ -131,7 +124,7 @@ def test_keepalive_completion_and_cancellation_leave_no_pending_ping(
 
 @pytest.mark.slow
 def test_idle_workers_exit_while_another_stage_runs(tmp_path: pathlib.Path) -> None:
-    idle_timeout_s = executor_core.one_shot_worker_idle_timeout()
+    idle_timeout_s = executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S
     ready_dir = tmp_path / "ready"
     ready_dir.mkdir()
     release = tmp_path / "release"
@@ -150,7 +143,7 @@ def test_idle_workers_exit_while_another_stage_runs(tmp_path: pathlib.Path) -> N
         idle_pids = {future.result(timeout=60) for future in waiting}
 
         deadline = time.monotonic() + idle_timeout_s + 5
-        while any(_helper_process_is_alive(pid) for pid in idle_pids):
+        while any(psutil.pid_exists(pid) for pid in idle_pids):
             assert not slow.done(), "the slow stage ended before idle workers exited"
             assert time.monotonic() < deadline, "idle workers stayed alive"
             time.sleep(0.01)

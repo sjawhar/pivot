@@ -32,15 +32,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# A 100-stage pandas/NumPy chain on pivot-dirout had a 78.898 ms maximum coordinator
-# handoff gap. Ten seconds is 126 times that gap, while freeing workers during the
-# multi-minute farm waits that motivated idle-worker reclamation.
-_WORKER_IDLE_TIMEOUT_S: Final[float] = 10.0
-
-
-def one_shot_worker_idle_timeout() -> float:
-    """Return the idle timeout for a process that exits after its current run."""
-    return _WORKER_IDLE_TIMEOUT_S
+# Idle timeout for the workers of an Engine that exits after its run. A 100-stage pandas/NumPy
+# chain on pivot-dirout had a 78.898 ms maximum coordinator handoff gap. Ten seconds is 126
+# times that gap, while freeing workers during the multi-minute farm waits that motivated
+# idle-worker reclamation.
+ONE_SHOT_WORKER_IDLE_TIMEOUT_S: Final[float] = 10.0
 
 
 def start_resource_trackers() -> None:
@@ -82,22 +78,18 @@ def configured_worker_count(override: int | None = None) -> int:
     return max(1, max_workers)
 
 
-def _unsupported_loky_layout(detail: str) -> RuntimeError:
-    version = getattr(loky, "__version__", "unknown")
-    return RuntimeError(f"Unsupported loky {version}: {detail}")
-
-
 def _reusable_worker_target(max_workers: int, *, kill_workers: bool) -> int:
     """Keep reuse from invoking loky's blocking ``_resize`` between runs."""
     if hasattr(loky.reusable_executor, "_executor"):
         executor = cast(
             "loky.ProcessPoolExecutor | None",
-            getattr(loky.reusable_executor, "_executor"),  # noqa: B009 - loky 3.5 singleton
+            getattr(loky.reusable_executor, "_executor"),  # noqa: B009 - loky 3.5/3.6 singleton
         )
     else:
-        storage = getattr(loky.reusable_executor, "_executor_storage", None)  # noqa: B009 - loky 3.7 singleton
+        storage = getattr(loky.reusable_executor, "_executor_storage", None)  # loky 3.7 singleton
         if storage is None or not hasattr(storage, "executor"):
-            raise _unsupported_loky_layout("no reusable-executor singleton")
+            version = getattr(loky, "__version__", "unknown")
+            raise RuntimeError(f"Unsupported loky {version}: no reusable-executor singleton")
         executor = cast("loky.ProcessPoolExecutor | None", storage.executor)
     if kill_workers or executor is None:
         return max_workers
@@ -149,13 +141,7 @@ def submit[T](
     pending = len(pool._pending_work_items) - keepalive_pings
     target_workers = max(pending + 1, prestart_target)
     pool._max_workers = min(max_workers, target_workers)
-    resize_lock = getattr(pool, "_submit_resize_lock", None)  # noqa: B009 - absent in loky 3.7
-    if resize_lock is None:
-        if not hasattr(loky.reusable_executor, "_executor_storage"):
-            raise _unsupported_loky_layout("no reusable-executor submission lock")
-        return pool.submit(fn, *args, **kwargs)
-    with resize_lock:
-        return pool.submit(fn, *args, **kwargs)
+    return pool.submit(fn, *args, **kwargs)
 
 
 def submit_to_live_workers[T](
@@ -163,11 +149,7 @@ def submit_to_live_workers[T](
 ) -> concurrent.futures.Future[T]:
     """Submit work that only a worker already alive may take; it never starts a worker."""
     pool._max_workers = len(pool._processes)
-    resize_lock = getattr(pool, "_submit_resize_lock", None)  # noqa: B009 - absent in loky 3.7
-    if resize_lock is None:
-        return pool.submit(fn, *args)
-    with resize_lock:
-        return pool.submit(fn, *args)
+    return pool.submit(fn, *args)
 
 
 def idle_worker_count(pool: loky.ProcessPoolExecutor) -> int:
@@ -403,7 +385,7 @@ def _ensure_deterministic_environment() -> None:
 
 def create_executor(
     max_workers: int, *, idle_timeout_s: float | None = None
-) -> concurrent.futures.Executor:
+) -> loky.ProcessPoolExecutor:
     """Get Pivot's reusable executor without growing it before work is submitted."""
     return _get_executor(max_workers, idle_timeout_s=idle_timeout_s)
 
