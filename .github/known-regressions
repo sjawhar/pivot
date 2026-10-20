@@ -1,3 +1,4 @@
 # Known regressions on main, one line each: what breaks, the PR that caused it, the PR that fixes it.
 # While any line is here, the known-regressions job fails on every push to main, so main's Tests run
 # is red and release.yaml publishes nothing. The fix's PR deletes the line.
+TEMPORARY test line: a regression recorded on main (#505's red-path check)
