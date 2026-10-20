@@ -5,7 +5,7 @@ import click.testing
 import pytest
 
 from conftest import isolated_pivot_dir
-from pivot import cli
+from pivot import cli, project
 
 # --- config list tests ---
 
@@ -89,6 +89,19 @@ def test_config_get_json_output(runner: click.testing.CliRunner, tmp_path: pathl
         assert "source" in data
 
 
+def test_config_get_reports_the_state_relative_cache_default(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An unset cache.dir is the documented state-dir-relative default."""
+    with isolated_pivot_dir(runner, tmp_path):
+        result = runner.invoke(cli.cli, ["config", "get", "cache.dir", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["value"] is None
+    assert data["source"] == "default"
+
+
 def test_config_get_unknown_key_errors(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
@@ -151,6 +164,39 @@ def test_config_set_global_flag(
 
         assert result.exit_code == 0
         assert global_config.exists()
+
+
+def test_config_set_global_rejects_project_state_dir(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """core.state_dir is local because it identifies one project's own state."""
+    global_config = tmp_path / ".config" / "pivot" / "config.yaml"
+
+    from pivot.config import io
+
+    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+
+    with isolated_pivot_dir(runner, tmp_path):
+        result = runner.invoke(cli.cli, ["config", "set", "--global", "core.state_dir", "shared"])
+
+    assert result.exit_code != 0
+    assert "per project" in result.output
+    assert not global_config.exists()
+
+
+def test_config_set_state_dir_updates_the_current_process(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The state resolver drops its old value after config set."""
+    with isolated_pivot_dir(runner, tmp_path):
+        root = pathlib.Path.cwd()
+        assert project.get_state_dir() == root / ".pivot"
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.state_dir", "alternate-state"])
+
+        assert result.exit_code == 0, result.output
+        assert project.get_state_dir() == root / "alternate-state"
+        assert sorted(path.name for path in (root / ".pivot").iterdir()) == ["config.yaml"]
 
 
 def test_config_set_checkout_mode_comma_separated(

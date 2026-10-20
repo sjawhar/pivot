@@ -196,7 +196,8 @@ The Engine uses locks to protect atomic state transitions. When a `run` request 
 
 ## Client Example
 
-Using Python with raw sockets:
+The socket is `<state dir>/agent.sock`, where `core.state_dir` defaults to `.pivot`. Using Python
+with raw sockets:
 
 ```python
 import socket
@@ -204,7 +205,7 @@ import json
 
 def call_agent(method: str, params: dict | None = None) -> dict:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(".pivot/agent.sock")
+    sock.connect("<state dir>/agent.sock")
 
     request = {
         "jsonrpc": "2.0",

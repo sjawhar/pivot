@@ -456,7 +456,7 @@ def test_repro_allows_data_symlinked_outside_the_project(tmp_path: pathlib.Path)
 
 
 def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> None:
-    """Config lock, artifact locks and the agent socket must not show up as untracked files."""
+    """Artifact locks and the agent socket must not show up as untracked files."""
     root = _project(tmp_path, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
     _ok(_pivot(root, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
     _ok(_pivot(root, "repro"))
@@ -465,7 +465,6 @@ def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> 
     created = sorted(
         str(p.relative_to(root)) for p in (root / ".pivot").iterdir() if p.name != ".gitignore"
     )
-    assert ".pivot/config.yaml.lock" in created, created
     assert ".pivot/locks" in created, created
 
     status = subprocess.run(

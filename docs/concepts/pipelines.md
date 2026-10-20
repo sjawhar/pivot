@@ -105,9 +105,9 @@ variant and a full name overrides one (see [Parameters](parameters.md)).
 
 ## Several Pipelines
 
-Pipeline names must be unique within a project. A pipeline's name is the
-directory of its lock files (`.pivot/stages/<pipeline>/`) and outputs
-(`data/<pipeline>/`), so two pipelines with one name would share both.
+Pipeline names must be unique within a project. A pipeline's name is the directory of its lock
+files (`<state dir>/stages/<pipeline>/`) and outputs (`data/<pipeline>/`), so two pipelines with
+one name would share both.
 `pivot repro --all` refuses two `pipeline.py` files that declare the same
 name, and names both files.
 
@@ -149,9 +149,14 @@ itself.
 
 ## State and Cache Layout
 
+`core.state_dir` selects the state directory and defaults to `.pivot`. The `.pivot/` marker stays
+at the project root and holds the project configuration.
+
 ```
 <project_root>/
   .pivot/
+    config.yaml
+  <state_dir>/
     cache/files/       # Content-addressable cache (shared across pipelines)
     stages/<pipeline>/ # Per-stage lock files (commit these)
     state.lmdb/        # LMDB database (hashes, generations, run cache)

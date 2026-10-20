@@ -394,7 +394,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
         from pivot import project
         from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 
-        state_dir = project.get_project_root() / ".pivot"
+        state_dir = project.get_state_dir()
         socket_path = state_dir / "agent.sock"
         state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -512,8 +512,7 @@ def _run_serve_mode(
     from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 
     # Get project paths
-    project_root = project.get_project_root()
-    state_dir = project_root / ".pivot"
+    state_dir = project.get_state_dir()
     socket_path = state_dir / "agent.sock"
 
     # Ensure state directory exists
@@ -818,7 +817,7 @@ def _run_oneshot_mode(
 @click.option(
     "--serve",
     is_flag=True,
-    help="Start RPC server for agent control (requires --watch). Creates Unix socket at .pivot/agent.sock",
+    help="Start RPC server for agent control (requires --watch). Creates a Unix socket in the state directory",
 )
 @click.option(
     "--allow-uncached-incremental",

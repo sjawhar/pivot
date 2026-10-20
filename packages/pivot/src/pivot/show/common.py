@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import tabulate
 import yaml
 
-from pivot import git, project, types, yaml_config
+from pivot import exceptions, git, project, types, yaml_config
 from pivot.storage import lock
 from pivot.types import ChangeType, OutputFormat, StorageLockData
 
@@ -22,11 +22,12 @@ logger = logging.getLogger(__name__)
 def _parse_lock_contents(
     stage_names: Sequence[str],
     lock_contents: dict[str, bytes],
+    stages_dir: str,
 ) -> dict[str, StorageLockData | None]:
     """Parse lock file contents into StorageLockData."""
     result = dict[str, StorageLockData | None]()
     for stage_name in stage_names:
-        lock_path = f"{lock.STAGES_REL_PATH}/{stage_name}.lock"
+        lock_path = f"{stages_dir}/{stage_name}.lock"
         content = lock_contents.get(lock_path)
         if content is None:
             result[stage_name] = None
@@ -54,9 +55,15 @@ def read_lock_files_from_head(
     """Batch read and parse lock files from git HEAD."""
     if not stage_names:
         return {}
-    lock_paths = [f"{lock.STAGES_REL_PATH}/{name}.lock" for name in stage_names]
+    try:
+        stages_dir = lock.stages_rel_path(project.get_state_dir(), project.get_project_root())
+    except ValueError:
+        raise exceptions.ConfigError(
+            "core.state_dir is outside the project, so lock files are not in git"
+        ) from None
+    lock_paths = [f"{stages_dir}/{name}.lock" for name in stage_names]
     lock_contents = git.read_files_from_head(lock_paths)
-    return _parse_lock_contents(stage_names, lock_contents)
+    return _parse_lock_contents(stage_names, lock_contents, stages_dir)
 
 
 def extract_output_hashes_from_lock(

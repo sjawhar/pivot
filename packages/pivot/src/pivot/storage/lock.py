@@ -42,15 +42,14 @@ _VALID_VARIANT_NAME = re.compile(r"[a-zA-Z0-9_.-]+")
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 
-STAGES_REL_PATH = ".pivot/stages"
+
+def stages_rel_path(state_dir: pathlib.Path, root: pathlib.Path) -> str:
+    """Return the git-relative directory holding lock files."""
+    return (state_dir / "stages").resolve().relative_to(root.resolve()).as_posix()
 
 
 def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
-    """Return the stages directory for lock files.
-
-    Lock files are stored in .pivot/stages/ (git-tracked) rather than
-    .pivot/cache/stages/ so they can be versioned for reproducibility.
-    """
+    """Return the state directory's git-tracked lock file directory."""
     return state_dir / "stages"
 
 
@@ -58,8 +57,9 @@ def stage_name_error(name: str) -> str | None:
     """Return why ``name`` cannot name a lock file, or None if it can.
 
     This is the single rule for stage, pipeline and variant names. A name is a relative path
-    of non-empty segments under ``.pivot/stages``: no leading or doubled ``/``, and no ``.``
-    or ``..`` segment, so the lock file can never land outside that directory.
+    of non-empty segments under the state directory's ``stages`` directory: no leading or
+    doubled ``/`, and no ``.`` or ``..`` segment, so the lock file can never land outside that
+    directory.
     """
     if not name or not _VALID_STAGE_NAME.fullmatch(name):
         return "use only letters, digits and the characters _ @ . / -"

@@ -61,6 +61,15 @@ def test_cache_dir_default_when_no_config(project_root: pathlib.Path) -> None:
     assert result == project_root / ".pivot" / "cache"
 
 
+def test_cache_dir_default_uses_the_configured_state_dir(project_root: pathlib.Path) -> None:
+    """The implicit cache follows core.state_dir."""
+    _write_config(project_root, "core:\n  state_dir: alternate-state\n")
+
+    result = config.get_cache_dir()
+
+    assert result == project_root / "alternate-state" / "cache"
+
+
 # --- PIVOT_CACHE_DIR env var tests ---
 
 
@@ -154,6 +163,13 @@ def test_state_dir_default_when_no_config(project_root: pathlib.Path) -> None:
 
     result = config.get_state_dir()
     assert result == project_root / ".pivot"
+
+
+def test_state_dir_for_reads_the_project_configuration(project_root: pathlib.Path) -> None:
+    """The project resolver is the source of truth for state location."""
+    _write_config(project_root, "core:\n  state_dir: custom-state\n")
+
+    assert project.state_dir_for(project_root) == project_root / "custom-state"
 
 
 # --- Error handling tests ---

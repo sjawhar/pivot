@@ -7,7 +7,7 @@ import pathlib
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
-from pivot import config, stage_def, types
+from pivot import config, project, stage_def, types
 from pivot.storage import cache
 from pivot.storage import state as state_mod
 
@@ -354,9 +354,10 @@ def relative_output_path(ref: types.ArtifactRef) -> pathlib.Path:
 def store_from_spec(spec: StoreSpec) -> Store:
     kind = spec["kind"]
     if kind == "cache":
+        project_root = pathlib.Path(spec["project_root"])
         return CacheStore(
             cache_dir=pathlib.Path(spec["cache_dir"]),
-            state_dir=pathlib.Path(spec["project_root"]) / ".pivot",
+            state_dir=project.state_dir_for(project_root),
         )
     if kind == "workspace":
         cache_dir_str = spec.get("cache_dir")

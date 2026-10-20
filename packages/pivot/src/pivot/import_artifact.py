@@ -117,7 +117,7 @@ async def read_remote_config(
     token: str | None,
     *,
     session: aiohttp.ClientSession | None = None,
-) -> str:
+) -> tuple[str, dict[str, object]]:
     raw = await _read_remote_file(repo_url, ".pivot/config.yaml", rev, token, session=session)
     if raw is None:
         raise exceptions.RemoteError("Remote repo is missing .pivot/config.yaml")
@@ -159,7 +159,22 @@ async def read_remote_config(
     url = str(remotes[default_remote])
     _ = remote_config.validate_remote_url(url)
     logger.info("Using source remote: %s", url)
-    return url
+    return url, config_data
+
+
+def _remote_stages_dir(config_data: dict[str, object]) -> str:
+    """Return the source repository's lock directory at the imported revision."""
+    core = config_data.get("core")
+    if not isinstance(core, dict):
+        return ".pivot/stages"
+    state_dir = cast("dict[str, object]", core).get("state_dir")
+    if state_dir is None:
+        return ".pivot/stages"
+    if not isinstance(state_dir, str) or pathlib.PurePosixPath(state_dir).is_absolute():
+        raise exceptions.RemoteError(
+            f"Source repo's core.state_dir must be a path inside the repo, got {state_dir!r}"
+        )
+    return f"{pathlib.PurePosixPath(state_dir).as_posix()}/stages"
 
 
 async def _list_github_lock_paths(
@@ -200,26 +215,27 @@ async def list_remote_lock_files(
     repo_url: str,
     rev: str,
     token: str | None,
+    stages_dir: str,
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> list[str]:
     if github.is_github_url(repo_url):
         owner, repo = github.parse_github_url(repo_url)
         entries = await _list_github_lock_paths(
-            owner, repo, ".pivot/stages", rev, _maybe_token(repo_url, token), session
+            owner, repo, stages_dir, rev, _maybe_token(repo_url, token), session
         )
     else:
         entries = await _run_blocking(
             git_archive.list_directory_from_remote_repo,
             repo_url,
-            ".pivot/stages",
+            stages_dir,
             rev,
         )
 
     if entries is None:
-        raise exceptions.RemoteError("Remote repo has no .pivot/stages directory")
+        raise exceptions.RemoteError(f"Remote repo has no {stages_dir} directory")
 
-    # Entries are relative to .pivot/stages, so nested paths are pipeline-prefixed names
+    # Entries are relative to the lock directory, so nested paths are pipeline-prefixed names.
     stage_names = [entry.removesuffix(".lock") for entry in entries if entry.endswith(".lock")]
 
     if not stage_names:
@@ -233,10 +249,11 @@ async def read_remote_lock_file(
     stage_name: str,
     rev: str,
     token: str | None,
+    stages_dir: str,
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> StorageLockData | None:
-    path = f".pivot/stages/{stage_name}.lock"
+    path = f"{stages_dir}/{stage_name}.lock"
     raw = await _read_remote_file(repo_url, path, rev, token, session=session)
     if raw is None:
         return None
@@ -328,13 +345,18 @@ async def _resolve_remote_path_with_session(
     if rev_lock is None:
         raise exceptions.RemoteError(f"Unable to resolve ref '{rev}'")
 
-    remote_url = await read_remote_config(repo_url, rev_lock, token, session=gh_session)
+    remote_url, config_data = await read_remote_config(
+        repo_url, rev_lock, token, session=gh_session
+    )
+    stages_dir = _remote_stages_dir(config_data)
 
     # Use resolved SHA for all subsequent reads to avoid TOCTOU race
-    stage_names = await list_remote_lock_files(repo_url, rev_lock, token, session=gh_session)
+    stage_names = await list_remote_lock_files(
+        repo_url, rev_lock, token, stages_dir, session=gh_session
+    )
     lock_datas = await asyncio.gather(
         *[
-            read_remote_lock_file(repo_url, stage, rev_lock, token, session=gh_session)
+            read_remote_lock_file(repo_url, stage, rev_lock, token, stages_dir, session=gh_session)
             for stage in stage_names
         ]
     )

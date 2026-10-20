@@ -304,8 +304,8 @@ After a stage returns, Pivot:
    `pathlib.Path` lies outside the project) before writing any of them
 2. Replaces each previous output with the new value, written by its writer to
    the path above, creating directories
-3. Hashes each file and copies it into `.pivot/cache/` (except metrics)
-4. Records the hashes in the stage's lock file under `.pivot/stages/`
+3. Hashes each file and copies it into `<state dir>/cache/` (except metrics)
+4. Records the hashes in the stage's lock file under `<state dir>/stages/`
 
 The previous output stays on disk while the stage runs, so a stage that reads
 its own output path sees the last run's file. Read a previous output through

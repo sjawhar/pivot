@@ -127,15 +127,15 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
 @click.option("--global", "use_global", is_flag=True, help="Set in global config")
 def config_set(key: str, value: str, use_global: bool) -> None:
     """Set a configuration value."""
+    scope = config.ConfigScope.GLOBAL if use_global else config.ConfigScope.LOCAL
     try:
-        validated = config.validate_config_value(key, value)
+        validated = config.validate_config_value(key, value, scope)
     except exceptions.ConfigValidationError as e:
         raise click.ClickException(str(e)) from e
     except pydantic.ValidationError as e:
         errors = "; ".join(err["msg"] for err in e.errors())
         raise click.ClickException(f"Invalid value for '{key}': {errors}") from e
 
-    scope = config.ConfigScope.GLOBAL if use_global else config.ConfigScope.LOCAL
     config.set_config_value(key, validated, scope)
     click.echo(f"Set {key} = {_format_value(validated)} in {scope} config")
 

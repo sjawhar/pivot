@@ -4,12 +4,12 @@ import pathlib
 
 import click
 
-from pivot import exceptions, ignore
+from pivot import exceptions, ignore, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
-# Entries are anchored to .pivot/ so a pipeline named e.g. "cache" or "locks" keeps its
-# committed lock files under .pivot/stages/<pipeline>/.
+# Entries are anchored to the state directory, so a pipeline named e.g. "cache" or "locks" keeps
+# its committed lock files under stages/<pipeline>/.
 _GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
 /cache/
@@ -22,9 +22,6 @@ _GITIGNORE_CONTENT = """\
 
 # Agent RPC socket (left behind by TUI and --serve sessions)
 /agent.sock
-
-# Config lock (held while editing config.yaml)
-/config.yaml.lock
 
 # Generated plots gallery (pivot plots show)
 /plots/
@@ -39,14 +36,15 @@ _GITIGNORE_CONTENT = """\
     "--force",
     "-f",
     is_flag=True,
-    help="Overwrite existing .pivot/.gitignore",
+    help="Overwrite the state directory's .gitignore",
 )
 @click.pass_context
 def init(ctx: click.Context, force: bool) -> None:
     """Initialize a new Pivot project."""
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
-    pivot_dir = pathlib.Path.cwd() / ".pivot"
+    cwd = pathlib.Path.cwd()
+    pivot_dir = cwd / ".pivot"
 
     if pivot_dir.is_symlink():
         raise exceptions.InitError(f"'{pivot_dir}' is a symlink; refusing to initialize")
@@ -60,14 +58,15 @@ def init(ctx: click.Context, force: bool) -> None:
             )
 
     pivot_dir.mkdir(exist_ok=True)
-    (pivot_dir / "stages").mkdir(exist_ok=True)
-    gitignore_path = pivot_dir / ".gitignore"
+    state_dir = project.state_dir_for(cwd)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    gitignore_path = state_dir / ".gitignore"
 
     # Warn if overwriting existing .gitignore with custom content
     if force and gitignore_path.exists():
         existing_content = gitignore_path.read_text()
         if existing_content != _GITIGNORE_CONTENT and not quiet:
-            click.echo("Warning: Overwriting existing .pivot/.gitignore", err=True)
+            click.echo(f"Warning: Overwriting existing {gitignore_path}", err=True)
 
     gitignore_path.write_text(_GITIGNORE_CONTENT)
 
@@ -84,8 +83,11 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo()
         click.echo("Created:")
         click.echo("  .pivot/")
-        click.echo("  .pivot/stages/")
-        click.echo("  .pivot/.gitignore")
+        try:
+            display_gitignore = gitignore_path.relative_to(cwd)
+        except ValueError:
+            display_gitignore = gitignore_path
+        click.echo(f"  {display_gitignore}")
         if created_pivotignore:
             click.echo("  .pivotignore")
         click.echo()

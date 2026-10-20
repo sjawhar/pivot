@@ -119,7 +119,9 @@ with Pipeline("all") as pipeline:
 
 **Give each pipeline a distinct name.** The name prefixes every stage and output directory.
 
-**Commit lock files.** Lock files live under `.pivot/stages/<pipeline>/`. Commit them so that `pivot pull` on another machine can restore outputs without re-running.
+**Commit lock files.** Lock files live under `<state dir>/stages/<pipeline>/`; `core.state_dir`
+defaults to `.pivot`. Commit them so that `pivot pull` on another machine can restore outputs
+without re-running.
 
 ## Related
 

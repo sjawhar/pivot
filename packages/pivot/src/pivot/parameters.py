@@ -583,23 +583,24 @@ def _secret_key() -> bytes:
     """Return the 32-byte key secret digests are made with.
 
     ``PIVOT_SECRET_KEY`` (64 hex digits) wins, so CI and teammates can share digests.
-    Otherwise the key is ``.pivot/secret.key`` under the project root, created on first use
-    with mode 0600 and added to ``.pivot/.gitignore``: it must never be committed. A clone
-    without the key makes a new one, so its stages with secrets re-run once. Neither file is
-    read or written through a symbolic link.
+    Otherwise the key is ``secret.key`` in the configured state directory, created on first use
+    with mode 0600 and added to that directory's ``.gitignore``: it must never be committed. A
+    clone without the key makes a new one, so its stages with secrets re-run once. Neither file
+    is read or written through a symbolic link.
 
     Raises:
         ParamsError: ``PIVOT_SECRET_KEY`` or the key file does not hold 32 hex-encoded bytes,
-            or the key file or ``.pivot/.gitignore`` is a symbolic link.
+            or the key file or state directory's ``.gitignore`` is a symbolic link.
     """
     if (from_env := os.environ.get(_SECRET_KEY_ENV)) is not None:
         return _parse_secret_key(from_env, _SECRET_KEY_ENV)
-    pivot_dir = project.get_project_root() / ".pivot"
-    key_file = pivot_dir / _SECRET_KEY_FILE
+    state_dir = project.get_state_dir()
+    key_file = state_dir / _SECRET_KEY_FILE
     try:
         text = _read_no_follow(key_file)
     except FileNotFoundError:
-        _create_secret_key(pivot_dir, key_file)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        _create_secret_key(state_dir, key_file)
         text = _read_no_follow(key_file)
     return _parse_secret_key(text, str(key_file))
 
@@ -636,19 +637,19 @@ def _parse_secret_key(text: str, source: str) -> bytes:
     return key
 
 
-def _create_secret_key(pivot_dir: pathlib.Path, key_file: pathlib.Path) -> None:
+def _create_secret_key(state_dir: pathlib.Path, key_file: pathlib.Path) -> None:
     """Write a random key to ``key_file`` with mode 0600, and gitignore it.
 
-    ``.pivot/.gitignore`` is opened first, so a symbolic link there is refused before any key
-    exists. The key is written to a private temporary file and hard-linked into place, so a
-    worker racing to create it reads either no file or a whole key, and one key wins. Only the
-    worker whose link made the key writes to ``.gitignore``, after the link, and it only
-    appends the entry when it is missing: the file is never rewritten, so a racing reader
-    never sees it truncated.
+    The state directory's ``.gitignore`` is opened first, so a symbolic link there is refused
+    before any key exists. The key is written to a private temporary file and hard-linked into
+    place, so a worker racing to create it reads either no file or a whole key, and one key wins.
+    Only the worker whose link made the key writes to ``.gitignore``, after the link, and it only
+    appends the entry when it is missing: the file is never rewritten, so a racing reader never
+    sees it truncated.
     """
-    ignore = _open_no_follow(pivot_dir / ".gitignore", os.O_RDWR | os.O_APPEND | os.O_CREAT)
+    ignore = _open_no_follow(state_dir / ".gitignore", os.O_RDWR | os.O_APPEND | os.O_CREAT)
     with os.fdopen(ignore, "a+") as gitignore:
-        descriptor, temporary = tempfile.mkstemp(dir=pivot_dir, prefix=".secret-key-")
+        descriptor, temporary = tempfile.mkstemp(dir=state_dir, prefix=".secret-key-")
         try:
             with os.fdopen(descriptor, "w") as handle:
                 handle.write(secrets.token_hex(32) + "\n")

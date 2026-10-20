@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import click
 from click.shell_completion import CompletionItem
 
+from pivot import project
 from pivot.config.models import CONFIG_KEY_DESCRIPTIONS, VALID_REMOTE_NAME
 
 logger = logging.getLogger(__name__)
@@ -172,7 +173,7 @@ def _get_stages_from_cache(root: pathlib.Path) -> list[str] | None:
     Returns stage names if cache exists and is valid, None otherwise.
     Cache is valid when version matches and config file mtime unchanged.
     """
-    cache_path = root / ".pivot" / "cache" / "stages.cache"
+    cache_path = project.state_dir_for(root) / "cache" / "stages.cache"
     try:
         lines = cache_path.read_text().splitlines()
     except OSError:
@@ -208,7 +209,7 @@ def _write_stages_cache(
     Cleans up temp file on failure before re-raising OSError.
     Caller is responsible for handling write failures.
     """
-    cache_dir = root / ".pivot" / "cache"
+    cache_dir = project.state_dir_for(root) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     cache_path = cache_dir / "stages.cache"

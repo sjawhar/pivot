@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from tests import helpers
 
 from pivot import compose, exceptions, fingerprint, loaders, registry, stage_def, types
+from pivot.config import io as config_io
 from pivot.registry import PipelineLike, RegistryStageInfo, StageRegistry
 
 
@@ -444,13 +445,17 @@ def test_stageparams_work(test_pipeline: PipelineLike, set_project_root: pathlib
     assert info["params"].learning_rate == 0.01
 
 
-def test_registry_stage_info_has_state_dir(tmp_path: pathlib.Path) -> None:
-    """Stages record their pipeline's state directory."""
+def test_registry_stage_info_uses_configured_state_dir(tmp_path: pathlib.Path) -> None:
+    """Stages record the project's configured state directory."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".pivot" / "config.yaml").write_text("core:\n  state_dir: alternate-state\n")
+    config_io.clear_config_cache()
+
     with compose.Pipeline("test", root=tmp_path) as pipeline:
         compose.stage(_stage3_no_deps)()
 
     info = pipeline.get_stage("test/_stage3_no_deps")
-    assert info["state_dir"] == tmp_path.resolve() / ".pivot"
+    assert info["state_dir"] == tmp_path.resolve() / "alternate-state"
 
 
 # =============================================================================

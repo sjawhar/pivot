@@ -23,12 +23,12 @@ def plots() -> None:
     "-o",
     "--output",
     type=click.Path(path_type=pathlib.Path),
-    default=".pivot/plots/index.html",
-    help="Output HTML path (default: .pivot/plots/index.html)",
+    default=None,
+    help="Output HTML path (default: <state dir>/plots/index.html)",
 )
 @click.option("--open", "open_browser", is_flag=True, help="Open browser after rendering")
 @cli_decorators.with_error_handling
-def plots_show(targets: tuple[str, ...], output: pathlib.Path, open_browser: bool) -> None:
+def plots_show(targets: tuple[str, ...], output: pathlib.Path | None, open_browser: bool) -> None:
     """Render plots as HTML image gallery.
 
     TARGETS can be file paths or stage names. If a stage name is provided,
@@ -39,13 +39,16 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path, open_browser: boo
     proj_root = project.get_project_root()
     _run_common.ensure_stages_registered()
 
-    # Validate output path stays within project
-    path_policy.require_valid_path(
-        str(output),
-        path_policy.PathType.CLI_OUTPUT,
-        proj_root,
-        context="plots show --output",
-    )
+    if output is None:
+        output_path = project.get_state_dir() / "plots" / "index.html"
+    else:
+        path_policy.require_valid_path(
+            str(output),
+            path_policy.PathType.CLI_OUTPUT,
+            proj_root,
+            context="plots show --output",
+        )
+        output_path = proj_root / output
 
     if targets:
         valid_targets = cli_targets.validate_targets(targets)
@@ -62,10 +65,12 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path, open_browser: boo
         click.echo("No plots found.")
         return
 
-    # --output is project-relative (absolute paths are rejected above), so the gallery lands
-    # in the project's .pivot/ even when run from a subdirectory.
-    output_path = plots_mod.render_plots_html(plot_list, proj_root / output)
-    click.echo(f"Rendered {len(plot_list)} plot(s) to {output_path.relative_to(proj_root)}")
+    output_path = plots_mod.render_plots_html(plot_list, output_path)
+    try:
+        display_path = output_path.relative_to(proj_root)
+    except ValueError:
+        display_path = output_path
+    click.echo(f"Rendered {len(plot_list)} plot(s) to {display_path}")
 
     if open_browser:
         import webbrowser

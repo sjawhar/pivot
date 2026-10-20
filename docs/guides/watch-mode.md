@@ -117,7 +117,8 @@ For headless environments (CI watchers, remote dev servers), serve mode runs the
 pivot repro --watch --serve
 ```
 
-This creates `.pivot/agent.sock` — a JSON-RPC 2.0 endpoint that the TUI or external tools can connect to for status queries and triggering runs.
+This creates `<state dir>/agent.sock` — a JSON-RPC 2.0 endpoint that the TUI or external tools
+can connect to for status queries and triggering runs. `core.state_dir` defaults to `.pivot`.
 
 ## Error Handling
 

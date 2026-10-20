@@ -13,7 +13,8 @@ Import a stage output produced by another Pivot project without copying its pipe
 The **source** repo must:
 
 1. Have a Pivot project with a stage that produces the artifact you want
-2. Have its lock files committed (`.pivot/stages/`)
+2. Have its lock files committed (`<state dir>/stages/`, where `core.state_dir` defaults to
+   `.pivot`)
 3. Have a [remote configured](./remote-storage.md) with cached outputs pushed to it
 
 ## Import an Artifact
@@ -151,7 +152,7 @@ If the file isn't in your local cache, run `pivot update` to re-download it from
 # Train and push outputs
 pivot repro
 pivot push
-git add .pivot/stages && git commit -m "Update model"
+git add <state-dir>/stages && git commit -m "Update model"
 git push
 ```
 

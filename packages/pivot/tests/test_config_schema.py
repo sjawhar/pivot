@@ -8,7 +8,7 @@ from pivot import config, exceptions
 
 def test_config_defaults_has_cache_section() -> None:
     defaults = config.PivotConfig.get_default()
-    assert defaults.cache.dir == ".pivot/cache"
+    assert defaults.cache.dir is None
     assert defaults.cache.checkout_mode == [
         config.CheckoutMode.HARDLINK,
         config.CheckoutMode.SYMLINK,
@@ -334,9 +334,9 @@ def test_validate_unknown_key_raises_error() -> None:
 # --- get_config_default tests ---
 
 
-def test_get_config_default_returns_default_for_cache_dir() -> None:
+def test_get_config_default_returns_none_for_cache_dir() -> None:
     result = config.get_config_default("cache.dir")
-    assert result == ".pivot/cache"
+    assert result is None
 
 
 def test_get_config_default_returns_default_for_core_max_workers() -> None:

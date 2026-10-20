@@ -42,9 +42,16 @@ def get_config_path(scope: models.ConfigScope) -> pathlib.Path:
             return get_local_config_path()
 
 
-def _config_lock_path(path: pathlib.Path) -> pathlib.Path:
-    """Lock file guarding a config file: ``config.yaml`` -> ``config.yaml.lock``."""
-    return path.with_name(f"{path.name}.lock")
+@contextlib.contextmanager
+def _config_lock(path: pathlib.Path) -> Generator[None]:
+    """Lock the persistent parent directory while atomically replacing a config file."""
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _load_yaml(path: pathlib.Path, *, as_dict: bool) -> Any:
@@ -111,21 +118,15 @@ def edit_config(
         # File is automatically saved on context exit
     """
     path = get_config_path(scope)
-    lock_path = _config_lock_path(path)
-
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            raw_data = _load_config_preserving_structure(path)
-            data: dict[str, Any] = raw_data if raw_data is not None else {}
+    with _config_lock(path):
+        raw_data = _load_config_preserving_structure(path)
+        data: dict[str, Any] = raw_data if raw_data is not None else {}
 
-            yield data
+        yield data
 
-            _save_config(path, data)
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        _save_config(path, data)
 
 
 def load_config_file(path: pathlib.Path) -> dict[str, Any]:
@@ -226,9 +227,10 @@ def get_merged_config() -> models.PivotConfig:
 
 
 def clear_config_cache() -> None:
-    """Clear the merged config cache. Call this when config files change."""
+    """Clear cached configuration and its project state directory."""
     global _merged_config_cache
     _merged_config_cache = None
+    project._state_dir_cache.clear()  # pyright: ignore[reportPrivateUsage] - shared resolver cache
 
 
 def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
@@ -245,9 +247,8 @@ def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
     if global_value is not _NOT_FOUND:
         return global_value, models.ConfigSource.GLOBAL
 
-    default_value = models.get_config_default(key)
-    if default_value is not None:
-        return default_value, models.ConfigSource.DEFAULT
+    if key in models.CONFIG_KEY_DESCRIPTIONS:
+        return models.get_config_default(key), models.ConfigSource.DEFAULT
 
     return None, models.ConfigSource.UNKNOWN
 
@@ -259,35 +260,31 @@ def set_config_value(
     keys = parse_dotted_key(key)
     with edit_config(scope) as data:
         set_nested(data, keys, value)
+    clear_config_cache()
 
 
 def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.LOCAL) -> bool:
     """Remove config value from specified scope. Returns True if removed."""
     keys = parse_dotted_key(key)
     path = get_config_path(scope)
-    lock_path = _config_lock_path(path)
 
     if not path.exists():
         return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            raw_data = _load_config_preserving_structure(path)
-            if raw_data is None:
-                return False
+    with _config_lock(path):
+        raw_data = _load_config_preserving_structure(path)
+        if raw_data is None:
+            return False
 
-            data: dict[str, Any] = raw_data
-            removed = unset_nested(data, keys)
+        data: dict[str, Any] = raw_data
+        removed = unset_nested(data, keys)
+        if removed:
+            _save_config(path, data)
+            clear_config_cache()
 
-            if removed:
-                _save_config(path, data)
-
-            return removed
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return removed
 
 
 def get_checkout_mode_order() -> list[models.CheckoutMode]:
@@ -306,15 +303,17 @@ def get_run_history_retention() -> int:
 def get_cache_dir() -> pathlib.Path:
     """Get cache directory, checking env var first.
 
-    Precedence: PIVOT_CACHE_DIR env var > config file > default (.pivot/cache).
+    Precedence: PIVOT_CACHE_DIR env var > config file > the current state directory's cache.
     Relative paths are resolved against the project root.
     """
     env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
     if env_cache:
         cache_dir = pathlib.Path(env_cache)
     else:
-        merged = get_merged_config()
-        cache_dir = pathlib.Path(merged.cache.dir)
+        configured = get_merged_config().cache.dir
+        if configured is None:
+            return project.get_state_dir() / "cache"
+        cache_dir = pathlib.Path(configured)
 
     if not cache_dir.is_absolute():
         cache_dir = project.get_project_root() / cache_dir
@@ -322,12 +321,8 @@ def get_cache_dir() -> pathlib.Path:
 
 
 def get_state_dir() -> pathlib.Path:
-    """Get state directory from merged config, resolved to absolute path."""
-    merged = get_merged_config()
-    state_dir = pathlib.Path(merged.core.state_dir)
-    if not state_dir.is_absolute():
-        state_dir = project.get_project_root() / state_dir
-    return state_dir
+    """Get the current project's configured state directory."""
+    return project.get_state_dir()
 
 
 def get_max_workers() -> int:

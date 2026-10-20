@@ -196,7 +196,7 @@ def test_get_merged_config_returns_defaults_when_no_files(
 
     result = io.get_merged_config()
 
-    assert result.cache.dir == ".pivot/cache"
+    assert result.cache.dir is None
     assert result.core.max_workers == -2
 
 

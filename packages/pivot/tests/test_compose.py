@@ -33,6 +33,7 @@ from pivot.compose import (
     plot,
     stage,
 )
+from pivot.config import io as config_io
 from pivot.decorators import no_fingerprint
 from pivot.executor import core as executor_core
 from pivot.executor import worker
@@ -641,6 +642,19 @@ def test_pipeline_build_bridge(tmp_path: pathlib.Path) -> None:
     assert stage_b["deps"]["data"].tag is types.ArtifactTag.DATA
     assert isinstance(stage_b["outs"][0].format, loaders.YAML)
     assert stage_b["outs"][0].tag is types.ArtifactTag.DATA
+
+
+def test_pipeline_uses_the_configured_project_state_dir(tmp_path: pathlib.Path) -> None:
+    """A stage's state directory follows core.state_dir instead of the marker location."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".pivot" / "config.yaml").write_text("core:\n  state_dir: alternate-state\n")
+    config_io.clear_config_cache()
+
+    with Pipeline("compose_build", root=tmp_path) as pipeline:
+        _helper_build_stage_a(params=stage_def.StageParams(), raw=pipeline.input("raw", t=dict))
+
+    info = pipeline.get_stage("compose_build/_helper_build_stage_a")
+    assert info["state_dir"] == tmp_path / "alternate-state"
 
 
 def test_pipeline_build_single_field_typeddict_preserves_key(tmp_path: pathlib.Path) -> None:

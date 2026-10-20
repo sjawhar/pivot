@@ -381,23 +381,24 @@ def _rollback_import_attempt(
 
 
 def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -> None:
-    """Refuse a pipeline whose stages would keep state outside the project's ``.pivot``.
+    """Refuse a pipeline whose stages keep state outside the project configuration.
 
     Inputs and outputs resolve against the project root, but ``root=`` moves a stage's lock
     files and half its StateDB, so a ``root=`` other than the project root splits one stage's
     state across two directories. Stages from another pipeline carry that pipeline's root.
     """
     advice = (
-        f"but a pipeline always uses the project's .pivot and data/ ({project_root}); "
-        + "remove root="
+        "but a pipeline always uses the project's .pivot and data/ (with state in its configured "
+        + f"directory; {project_root}); remove root="
     )
     if pipeline.root.resolve() != project_root:
         raise exceptions.PipelineConfigError(
             f"Pipeline '{pipeline.name}' sets root={pipeline.root}, {advice}"
         )
+    expected_state_dir = project.state_dir_for(project_root).resolve()
     for stage_name in pipeline.list_stages():
         state_dir = pipeline.get_stage(stage_name)["state_dir"]
-        if state_dir is not None and state_dir.resolve() != (project_root / ".pivot").resolve():
+        if state_dir is not None and state_dir.resolve() != expected_state_dir:
             raise exceptions.PipelineConfigError(
                 f"Stage '{stage_name}' comes from a pipeline that sets root={state_dir.parent}, "
                 + advice
@@ -602,9 +603,10 @@ def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> Pipe
         if pipeline is None:
             logger.warning(f"--all: failed to load pipeline from {path}, skipping")
             continue
-        # A pipeline name names .pivot/stages/<name>/ and data/<name>/, so two files
-        # declaring one name would silently share stages, locks and outputs. A file that
-        # exports a pipeline object another file already gave (a re-export) declares nothing.
+        # A pipeline name names its configured state directory's stages/<name>/ and
+        # data/<name>/, so two files declaring one name would silently share stages, locks and
+        # outputs. A file that exports a pipeline object another file already gave (a re-export)
+        # declares nothing.
         first_path, first_pipeline = first_by_name.setdefault(pipeline.name, (path, pipeline))
         if first_path != path:
             if first_pipeline is not pipeline:
@@ -683,6 +685,12 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
     Returns:
         List of paths to pipeline config files.
     """
+    state_dir = project.state_dir_for(project_root)
+    try:
+        state_parts = state_dir.relative_to(project_root).parts
+    except ValueError:
+        state_parts = ()
+
     # Collect all candidate paths grouped by directory
     by_dir = dict[pathlib.Path, list[pathlib.Path]]()
     for path in project_root.rglob(PIPELINE_PY_NAME):
@@ -694,6 +702,8 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
         except ValueError:
             continue
         if any(part in _SCAN_EXCLUDE_DIRS for part in rel_parts):
+            continue
+        if state_parts and rel_parts[: len(state_parts)] == state_parts:
             continue
         by_dir.setdefault(path.parent, list[pathlib.Path]()).append(path)
 

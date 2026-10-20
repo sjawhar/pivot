@@ -39,7 +39,7 @@ class ConfigSource(enum.StrEnum):
 class CacheConfig(pydantic.BaseModel):
     """Cache configuration options."""
 
-    dir: str = ".pivot/cache"
+    dir: str | None = None
     checkout_mode: list[CheckoutMode] = pydantic.Field(
         default=[CheckoutMode.HARDLINK, CheckoutMode.SYMLINK, CheckoutMode.COPY]
     )
@@ -160,7 +160,7 @@ class PivotConfig(pydantic.BaseModel):
 
 # Config keys with descriptions (used by CLI completion)
 CONFIG_KEY_DESCRIPTIONS: dict[str, str] = {
-    "cache.dir": "Local cache directory",
+    "cache.dir": "Cache directory path (default: <state dir>/cache)",
     "cache.checkout_mode": "Checkout strategy (hardlink,symlink,copy)",
     "core.max_workers": "Most parallel execution workers",
     "core.state_dir": "State directory path",
@@ -249,8 +249,10 @@ def _validate_int_field(
         raise exceptions.ConfigValidationError(f"'{key}' {error_msg}") from None
 
 
-def validate_config_value(key: str, value: Any) -> ConfigValue:
-    """Validate and coerce a config value based on key."""
+def validate_config_value(
+    key: str, value: Any, scope: ConfigScope = ConfigScope.LOCAL
+) -> ConfigValue:
+    """Validate and coerce a config value based on key and scope."""
     from pivot import exceptions
 
     parts = key.split(".")
@@ -270,6 +272,9 @@ def validate_config_value(key: str, value: Any) -> ConfigValue:
 
     if not is_valid_key(key):
         raise exceptions.ConfigValidationError(f"Unknown config key: '{key}'")
+
+    if key == "core.state_dir" and scope is ConfigScope.GLOBAL:
+        raise exceptions.ConfigValidationError("core.state_dir is per project and cannot be global")
 
     if key in _INT_VALIDATION_SPECS:
         model_cls, field, error_msg = _INT_VALIDATION_SPECS[key]

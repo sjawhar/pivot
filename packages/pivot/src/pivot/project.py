@@ -1,10 +1,12 @@
 import logging
 import os
 import pathlib
+import typing
 
 logger = logging.getLogger(__name__)
 
 _project_root_cache: pathlib.Path | None = None
+_state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 
 
 def find_project_root() -> pathlib.Path:
@@ -36,6 +38,52 @@ def get_project_root() -> pathlib.Path:
     if _project_root_cache is None:
         _project_root_cache = find_project_root()
     return _project_root_cache
+
+
+def state_dir_for(root: pathlib.Path) -> pathlib.Path:
+    """Return the state directory configured for ``root``.
+
+    ``core.state_dir`` comes from ``<root>/.pivot/config.yaml``. Relative values are rooted at
+    ``root``; absent configuration keeps state in ``<root>/.pivot``. The ``.pivot`` marker and
+    its configuration always remain at the project root.
+    """
+    if (cached := _state_dir_cache.get(root)) is not None:
+        return cached
+
+    import yaml
+
+    from pivot import exceptions
+
+    config_path = root / ".pivot" / "config.yaml"
+    try:
+        data: object = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        data = None
+    except yaml.YAMLError as e:
+        raise exceptions.ConfigError(f"Error reading {config_path}: {e}") from e
+
+    configured: object = None
+    if isinstance(data, dict):
+        config_data = typing.cast("dict[str, object]", data)
+        core = config_data.get("core")
+        if isinstance(core, dict):
+            configured = typing.cast("dict[str, object]", core).get("state_dir")
+
+    if configured is None:
+        state_dir = root / ".pivot"
+    elif isinstance(configured, str) and configured:
+        state_dir = pathlib.Path(configured)
+        state_dir = state_dir if state_dir.is_absolute() else root / state_dir
+    else:
+        raise exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
+
+    _state_dir_cache[root] = state_dir
+    return state_dir
+
+
+def get_state_dir() -> pathlib.Path:
+    """Return the state directory of the current project."""
+    return state_dir_for(get_project_root())
 
 
 def resolve_path(path: str | pathlib.Path) -> pathlib.Path:

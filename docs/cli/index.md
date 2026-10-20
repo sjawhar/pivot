@@ -45,7 +45,9 @@ All commands support:
 |----------|-------------|
 | `PIVOT_CACHE_DIR` | Override cache directory location |
 
-**`PIVOT_CACHE_DIR`** takes precedence over the `cache.dir` config setting. Relative paths are resolved against the project root. Empty or whitespace-only values are treated as unset, falling back to the config file (or `.pivot/cache` if no config is set).
+**`PIVOT_CACHE_DIR`** takes precedence over the `cache.dir` config setting. Relative paths are
+resolved against the project root. Empty or whitespace-only values are treated as unset, falling
+back to the config file or `<state dir>/cache`.
 
 ---
 
@@ -485,7 +487,7 @@ pivot plots show [TARGETS...] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--output` / `-o PATH` | Output HTML path (default: `.pivot/plots/index.html`, ignored by git). Image paths are relative to the HTML file. |
+| `--output` / `-o PATH` | Output HTML path (default: `<state dir>/plots/index.html`, ignored by git). Image paths are relative to the HTML file. |
 | `--open` | Open browser after rendering |
 
 ---
@@ -868,11 +870,11 @@ pivot config unset default_remote
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `cache.dir` | Cache directory | `.pivot/cache` |
+| `cache.dir` | Cache directory path | `<state dir>/cache` |
 | `cache.checkout_mode` | Checkout mode order | `hardlink,symlink,copy` |
 | `core.max_workers` | Most parallel workers (-1 = all CPUs); a run starts fewer when fewer of its stages can run at once | `-2` |
 | `core.run_history_retention` | Keep last N runs | `100` |
-| `core.state_dir` | State directory | `.pivot` |
+| `core.state_dir` | Where Pivot keeps lock files, the state database, the default cache, the RPC socket, secret keys and plot galleries; local to each project | `.pivot` |
 | `resources` | Scheduler resource capacities | `{}` |
 | `remote.jobs` | Parallel transfer jobs | `20` |
 | `remote.retries` | Transfer retry count | `10` |

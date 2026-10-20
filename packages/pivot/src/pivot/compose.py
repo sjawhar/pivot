@@ -542,7 +542,7 @@ class Pipeline:
 
     @property
     def state_dir(self) -> pathlib.Path:
-        return self._root / ".pivot"
+        return project.state_dir_for(self._root)
 
     @property
     def input_bindings(self) -> dict[str, str]:
@@ -656,16 +656,14 @@ class Pipeline:
 
         for foreign_pipeline, foreign_node in closure:
             qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
-            stage_info = _emit_stage_info(
-                foreign_node, qualified_name, foreign_pipeline._root / ".pivot"
-            )
+            stage_info = _emit_stage_info(foreign_node, qualified_name, foreign_pipeline.state_dir)
             new_registry.add_existing(stage_info)
 
         self._merge_foreign_input_bindings(closure)
 
         for node in self._stages:
             qualified_name = f"{self._name}/{node.name}"
-            stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
+            stage_info = _emit_stage_info(node, qualified_name, self.state_dir)
             new_registry.add_existing(stage_info)
 
         materialized_stages = set(new_registry.list_stages())
