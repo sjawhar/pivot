@@ -1,10 +1,12 @@
 # pyright: reportMissingImports=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
+import concurrent.futures
 import errno
 import os
 import pathlib
 import signal
+import threading
 import time
 from typing import TYPE_CHECKING, cast
 
@@ -16,7 +18,8 @@ from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
 
 if TYPE_CHECKING:
-    from multiprocessing.process import BaseProcess
+    from multiprocessing.managers import SyncManager  # noqa: F401
+    from multiprocessing.process import BaseProcess  # noqa: F401
 
 
 def _helper_identity(value: int) -> int:
@@ -58,6 +61,72 @@ def test_unknown_loky_reusable_executor_layout_names_version(
 
     with pytest.raises(RuntimeError, match=r"Unsupported loky \d"):
         _ = executor_core._reusable_worker_target(1, kill_workers=False)
+
+
+def test_short_parents_schedule_no_timer_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = list[object]()
+
+    class _Timer:
+        daemon: bool
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            started.append(self)
+            self.daemon = False
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            pass
+
+    monkeypatch.setattr(threading, "Timer", _Timer)
+    pool = WorkerPool(_idle_timeout_s=10)
+    for stage in range(100):
+        name = str(stage)
+        pool.keep_consumers_warm(name, 1)
+        pool.release_consumers(name)
+
+    assert started == []
+
+
+def test_keepalive_completion_and_cancellation_leave_no_pending_ping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Executor:
+        _processes: dict[int, object] = {1: object()}
+        _pending_work_items: dict[int, object] = {}
+
+    class _Manager:
+        def Barrier(self, _parties: int) -> object:  # noqa: N802
+            return object()
+
+    submitted = list[concurrent.futures.Future[None]]()
+
+    def submit_ping(*_args: object) -> concurrent.futures.Future[None]:
+        future = concurrent.futures.Future[None]()
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(executor_core, "submit_to_live_workers", submit_ping)
+    pool = WorkerPool(
+        _executor=cast("loky.ProcessPoolExecutor", cast("object", _Executor())),
+        _manager=cast("SyncManager", cast("object", _Manager())),
+        _idle_timeout_s=10,
+    )
+
+    pool.keep_consumers_warm("completed", 1)
+    pool._keepalives["completed"] = (0, 1)
+    pool.run_due_keepalives()
+    submitted[-1].set_result(None)
+    pool.release_consumers("completed")
+    assert pool._pings == {}
+
+    pool.keep_consumers_warm("cancelled", 1)
+    pool._keepalives["cancelled"] = (0, 1)
+    pool.run_due_keepalives()
+    pool._stop_keepalives()
+    assert submitted[-1].cancelled()
+    assert pool._pings == {}
 
 
 @pytest.mark.slow

@@ -88,11 +88,10 @@ class WorkerPool:
     _in_run: bool = False
     _max_workers: int = 0
     _idle_timeout_s: float | None = None
-    # Serializes pool sizing between the event loop's submissions and keep-alive timers.
-    _submit_lock: threading.Lock = field(default_factory=threading.Lock)
-    _keepalives: dict[str, threading.Timer] = field(default_factory=dict)
-    # Keep-alive pings loky has not reported done; they are not stage work when sizing the pool.
-    _pings: list[concurrent.futures.Future[None]] = field(default_factory=list)
+    # Deadlines are serviced by the Engine loop. Short parents therefore allocate no thread.
+    _keepalives: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # Ping futures are grouped by parent so completion and shutdown cancel queued pings.
+    _pings: dict[str, list[concurrent.futures.Future[None]]] = field(default_factory=dict)
     _user_code_files: dict[str, _FileStamp | None] = field(default_factory=dict)
     _code_changed: bool = False
 
@@ -215,73 +214,66 @@ class WorkerPool:
             raise RuntimeError("WorkerPool is not accepting new submissions")
         if self._executor is None:
             raise RuntimeError("WorkerPool not started")
-        with self._submit_lock:
-            self._pings = [ping for ping in self._pings if not ping.done()]
-            return executor_core.submit(
-                self._executor,
-                self._max_workers,
-                fn,
-                *args,
-                prestart_target=prestart_target,
-                keepalive_pings=len(self._pings),
-                **kwargs,
-            )
+        self._prune_pings()
+        return executor_core.submit(
+            self._executor,
+            self._max_workers,
+            fn,
+            *args,
+            prestart_target=prestart_target,
+            keepalive_pings=self._active_ping_count(),
+            **kwargs,
+        )
 
     def keep_consumers_warm(self, parent: str, worker_count: int) -> None:
-        """Stop workers pre-started for ``parent``'s consumers from idling out while it runs.
-
-        Every half idle timeout until ``parent`` resolves, up to ``worker_count`` idle workers
-        each run one ping, which restarts that worker's idle clock. A parent shorter than half
-        the timeout costs nothing, and once ``parent`` resolves its kept workers are ordinary
-        idle workers again and exit on the normal timeout.
-        """
+        """Schedule keep-alive work for an unusually long parent without starting a thread."""
         if worker_count <= 0 or self._idle_timeout_s is None:
             return
-        with self._submit_lock:
-            if parent in self._keepalives:
-                raise RuntimeError(f"workers already kept warm for {parent!r}")
-            self._schedule_keepalive(parent, worker_count)
+        if parent in self._keepalives:
+            raise RuntimeError(f"workers already kept warm for {parent!r}")
+        self._keepalives[parent] = (time.monotonic() + self._idle_timeout_s / 2, worker_count)
 
-    def release_consumers(self, parent: str) -> None:
-        """Stop keeping workers warm for ``parent``'s consumers."""
-        with self._submit_lock:
-            timer = self._keepalives.pop(parent, None)
-        if timer is not None:
-            timer.cancel()
-
-    def _schedule_keepalive(self, parent: str, worker_count: int) -> None:
-        """Arm the next ping round for ``parent``; the caller holds ``_submit_lock``."""
-        assert self._idle_timeout_s is not None
-        timer = threading.Timer(
-            self._idle_timeout_s / 2, self._ping_idle_workers, args=(parent, worker_count)
-        )
-        timer.daemon = True
-        self._keepalives[parent] = timer
-        timer.start()
-
-    def _ping_idle_workers(self, parent: str, worker_count: int) -> None:
-        with self._submit_lock:
-            if self._keepalives.get(parent) is not threading.current_thread():
-                return
-            if self._executor is None or self._manager is None:
-                return
-            self._pings = [ping for ping in self._pings if not ping.done()]
+    def run_due_keepalives(self) -> None:
+        """Ping pre-started idle workers whose parent has crossed the half-timeout deadline."""
+        if self._executor is None or self._manager is None or self._idle_timeout_s is None:
+            return
+        now = time.monotonic()
+        for parent, (deadline, worker_count) in list(self._keepalives.items()):
+            if deadline > now:
+                continue
             pings = min(worker_count, executor_core.idle_worker_count(self._executor))
             if pings > 0:
                 barrier = typing.cast("_KeepaliveBarrier", self._manager.Barrier(pings))
-                self._pings.extend(
+                self._pings.setdefault(parent, []).extend(
                     executor_core.submit_to_live_workers(self._executor, _keepalive_ping, barrier)
                     for _ in range(pings)
                 )
-            self._schedule_keepalive(parent, worker_count)
+            self._keepalives[parent] = (now + self._idle_timeout_s / 2, worker_count)
+        self._prune_pings()
+
+    def release_consumers(self, parent: str) -> None:
+        """Stop pinging a resolved parent's consumers and cancel queued ping work."""
+        self._keepalives.pop(parent, None)
+        for ping in self._pings.pop(parent, []):
+            _ = ping.cancel()
+
+    def _prune_pings(self) -> None:
+        for parent, pings in list(self._pings.items()):
+            active = [ping for ping in pings if not ping.done()]
+            if active:
+                self._pings[parent] = active
+            else:
+                del self._pings[parent]
+
+    def _active_ping_count(self) -> int:
+        return sum(len(pings) for pings in self._pings.values())
 
     def _stop_keepalives(self) -> None:
-        with self._submit_lock:
-            timers = list(self._keepalives.values())
-            self._keepalives.clear()
-            self._pings.clear()
-        for timer in timers:
-            timer.cancel()
+        self._keepalives.clear()
+        for pings in self._pings.values():
+            for ping in pings:
+                _ = ping.cancel()
+        self._pings.clear()
 
     def stop_accepting(self) -> None:
         """Stop accepting new submissions without shutting down workers."""

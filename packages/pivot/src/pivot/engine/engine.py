@@ -1210,6 +1210,7 @@ class Engine:
                     try:
                         # Main execution loop
                         while self._futures:
+                            self._worker_pool.run_due_keepalives()
                             # Snapshot futures keys before passing to thread to avoid
                             # "dictionary changed size during iteration" race condition.
                             # The main async loop can modify _futures while thread waits.
