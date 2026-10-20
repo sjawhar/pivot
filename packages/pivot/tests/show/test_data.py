@@ -709,50 +709,81 @@ def test_diff_data_hashes_change(
 
 
 # =============================================================================
-# Workspace Hash Tests
+# Workspace Selection Tests
 # =============================================================================
 
 
-def test_get_data_hashes_from_workspace(
-    tmp_path: Path,
-    set_project_root: Path,
+def _select(targets: list[str]) -> data.DataSelection:
+    selection = data.select_data_files(targets)
+    assert selection is not None
+    return selection
+
+
+def test_select_data_files_hashes_a_workspace_output(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Get hashes from workspace files."""
-    data_file = tmp_path / "data.csv"
-    data_file.write_text("id,name\n1,alice\n")
+    """A registered data output present in the workspace is hashed and its file recorded."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
+    output = mock_discovery.root / "data" / "process_data.csv"
+    output.parent.mkdir(parents=True)
+    output.write_text("id,name\n1,alice\n")
 
-    result = data.get_data_hashes_from_workspace(["data.csv"])
+    selection = _select(["process_data"])
 
-    assert "data.csv" in result
-    assert result["data.csv"] is not None
-    assert len(result["data.csv"]) == 16  # xxhash64 produces 16 hex chars
+    assert len(selection.workspace_hashes["data/process_data.csv"]) == 16  # xxhash64 hex
+    assert selection.workspace_paths == {"data/process_data.csv": output}
 
 
-def test_get_data_hashes_from_workspace_missing_file(
-    tmp_path: Path,
-    set_project_root: Path,
+def test_select_data_files_leaves_a_missing_workspace_output_absent(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Missing file returns None hash."""
-    result = data.get_data_hashes_from_workspace(["nonexistent.csv"])
+    """A registered output missing from the workspace has no workspace hash and no path."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
 
-    assert "nonexistent.csv" in result
-    assert result["nonexistent.csv"] is None
+    selection = _select(["data/process_data.csv"])
+
+    assert selection.head_hashes == {"data/process_data.csv": None}
+    assert selection.workspace_hashes == {}
+    assert selection.workspace_paths == {}
 
 
-def test_get_data_hashes_from_workspace_expands_directory_files(
-    tmp_path: Path,
-    set_project_root: Path,
+def test_select_data_files_expands_a_path_directory_output(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A directory contributes a hash for each data file, not one invalid hash for the directory."""
-    directory = tmp_path / "results"
-    directory.mkdir()
+    """A directory output contributes a hash for each data file, not one for the directory."""
+    _register_stage(
+        mock_discovery,
+        "results",
+        [_ref("results", None, ArtifactTag.DATA, loaders.PathOnly())],
+    )
+    _mock_head_lock(monkeypatch, None)
+    directory = mock_discovery.root / "data" / "results.dat"
+    directory.mkdir(parents=True)
     (directory / "one.csv").write_text("id\n1\n")
     (directory / "notes.yaml").write_text("n: 1\n")
 
-    result = data.get_data_hashes_from_workspace(["results"])
+    selection = _select(["."])
 
-    assert result["results/one.csv"] is not None
-    assert "results/notes.yaml" not in result
+    assert list(selection.workspace_hashes) == ["data/results.dat/one.csv"]
+
+
+def test_select_data_files_warns_about_a_target_that_names_no_output(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A path that is no stage output is named in a warning and not compared."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
+    (mock_discovery.root / "loose.csv").write_text("id\n1\n")
+
+    selection = _select(["loose.csv"])
+
+    assert selection.head_hashes == {}
+    assert selection.workspace_hashes == {}
+    assert "No CSV, JSON or JSONL stage output matches 'loose.csv'" in caplog.text
 
 
 # =============================================================================
@@ -1314,7 +1345,7 @@ def test_get_schema_unsupported(tmp_path: Path) -> None:
 
 
 # =============================================================================
-# get_data_hashes_from_head Tests (registered stages, mocked git HEAD)
+# select_data_files HEAD-side Tests (registered stages, mocked git HEAD)
 # =============================================================================
 
 
@@ -1371,7 +1402,7 @@ def _mock_head_lock(monkeypatch: pytest.MonkeyPatch, content: bytes | None) -> N
     monkeypatch.setattr(git, "read_files_from_head", _read_files_from_head)
 
 
-def test_get_data_hashes_from_head_only_includes_data_outputs(
+def test_select_data_files_only_includes_data_outputs_at_head(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1388,12 +1419,12 @@ def test_get_data_hashes_from_head_only_includes_data_outputs(
     )
     _mock_head_lock(monkeypatch, None)
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."]).head_hashes
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head(
+def test_select_data_files_reads_head_hash(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1411,12 +1442,12 @@ outs:
 """
     _mock_head_lock(monkeypatch, lock_content)
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."]).head_hashes
 
     assert result == {"data/process_data.csv": "deadbeef00000000"}
 
 
-def test_get_data_hashes_from_head_no_lock_file(
+def test_select_data_files_head_no_lock_file(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1424,12 +1455,12 @@ def test_get_data_hashes_from_head_no_lock_file(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, None)
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."]).head_hashes
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_invalid_yaml(
+def test_select_data_files_head_invalid_yaml(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1437,12 +1468,12 @@ def test_get_data_hashes_from_head_invalid_yaml(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"invalid: yaml: content: [")
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."]).head_hashes
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_missing_outs_key(
+def test_select_data_files_head_missing_outs_key(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1450,12 +1481,12 @@ def test_get_data_hashes_from_head_missing_outs_key(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"fingerprint: abc123\n")
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."]).head_hashes
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_outs_not_list(
+def test_select_data_files_head_outs_not_list(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1463,6 +1494,6 @@ def test_get_data_hashes_from_head_outs_not_list(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"outs: not_a_list\n")
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."]).head_hashes
 
     assert result == {"data/process_data.csv": None}

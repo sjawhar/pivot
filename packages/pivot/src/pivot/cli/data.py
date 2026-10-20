@@ -6,7 +6,7 @@ import pathlib
 
 import click
 
-from pivot import config, discovery, exceptions, project, registry, types
+from pivot import config, discovery, exceptions, project, registry
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -14,14 +14,6 @@ from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
 
 logger = logging.getLogger(__name__)
-
-
-def _is_target_path(path: str, targets: set[str]) -> bool:
-    """Whether a target names this file directly or as a file inside a target directory."""
-    return any(
-        target == "." or path == target or path.startswith(f"{target.rstrip('/')}/")
-        for target in targets
-    )
 
 
 @cli_decorators.pivot_command(allow_all=True)
@@ -74,50 +66,15 @@ def diff(
     if key_columns and positional:
         raise click.ClickException("Cannot use both --key and --positional")
 
-    # Get HEAD hashes from lock files
-    head_hashes = data_module.get_data_hashes_from_head()
-    if not head_hashes:
+    # One selection decides, for HEAD and the workspace, the data files the targets name
+    selection = data_module.select_data_files(targets)
+    if selection is None:
         click.echo("No data files found in registered stages.")
         return
-
-    # Filter to targets: stage identities resolve through the Store, anything else is a path
-    proj_root = project.get_project_root()
-    store = cli_helpers.require_workspace_store()
-    all_stages = cli_helpers.get_all_stages()
-    target_set = set[str]()
-
-    for target in targets:
-        resolved = cli_targets.resolve_cli_target(target, all_stages)
-        if resolved is None:
-            target_set.add(project.to_relative_path(project.normalize_path(target), proj_root))
-            continue
-        for ref in resolved["refs"]:
-            if ref.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
-                continue
-            target_set.add(project.to_relative_path(store.resolve_display_path(ref), proj_root))
-
-    filtered_head_hashes = {
-        path: file_hash
-        for path, file_hash in head_hashes.items()
-        if _is_target_path(path, target_set)
-    }
-
-    # Get workspace hashes and the matching member paths from one membership map.
-    directory_output_paths = {
-        project.to_relative_path(store.resolve_display_path(out), proj_root)
-        for stage_info in all_stages.values()
-        for out in stage_info["outs"]
-        if out.tag is types.ArtifactTag.DIRECTORY
-    }
-    workspace_member_paths = dict[str, pathlib.Path]()
-    workspace_hashes = data_module.get_data_hashes_from_workspace(
-        list(target_set),
-        member_paths=workspace_member_paths,
-        directory_output_paths=directory_output_paths,
-    )
+    workspace_member_paths = selection.workspace_paths
 
     # Quick hash comparison to find changed files
-    hash_diffs = data_module.diff_data_hashes(filtered_head_hashes, workspace_hashes)
+    hash_diffs = data_module.diff_data_hashes(selection.head_hashes, selection.workspace_hashes)
 
     if not hash_diffs:
         if output_format == OutputFormat.JSON:

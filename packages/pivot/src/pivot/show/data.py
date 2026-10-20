@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import csv
+import dataclasses
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ from pivot.types import (
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from pivot.registry import RegistryStageInfo
     from pivot.storage import store as store_mod
 
 # Status symbols for diff display (plain text)
@@ -539,120 +541,238 @@ def diff_data_files(
     )
 
 
-def get_data_hashes_from_head() -> dict[str, str | None]:
-    """Map each comparable workspace data file to its hash in the lock files at git HEAD.
+@dataclasses.dataclass(frozen=True)
+class _DiffOutput:
+    """A stage output `pivot diff` can compare, and whether it compares as a directory."""
 
-    A directory output contributes one entry per CSV, JSON or JSONL file from its manifest. This
-    lets a directory output and one of its files be diffed as data files, never as a directory.
+    path: str
+    head: types.HashInfo | None
+    is_directory: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class DataSelection:
+    """The data files a diff's targets select: hashes at git HEAD, and in the workspace.
+
+    ``workspace_paths`` holds the file to load for each workspace hash. A path absent from it
+    is absent on the workspace side and is never read.
     """
-    from pivot.cli import helpers as cli_helpers
 
-    store = cli_helpers.require_workspace_store()
-    proj_root = project.get_project_root()
+    head_hashes: dict[str, str | None]
+    workspace_hashes: dict[str, str]
+    workspace_paths: dict[str, pathlib.Path]
+
+
+def _parents(relpath: str) -> list[str]:
+    """Every directory above ``relpath``, nearest first, short of the root."""
+    return [str(parent) for parent in pathlib.PurePosixPath(relpath).parents[:-1]]
+
+
+def _member_selected(relpath: str, prefixes: frozenset[str] | None) -> bool:
+    """Whether a directory output's member is selected: every member, or one at or below a
+    selected prefix."""
+    return (
+        prefixes is None
+        or relpath in prefixes
+        or any(parent in prefixes for parent in _parents(relpath))
+    )
+
+
+def _diff_outputs(
+    stage_infos: Mapping[str, RegistryStageInfo],
+    store: store_mod.WorkspaceStore,
+    proj_root: pathlib.Path,
+) -> dict[str, _DiffOutput]:
+    """Map each comparable stage output's path to its HEAD hash and its kind.
+
+    An output compares as a directory when the registry tags it DIRECTORY, its HEAD lock
+    records a manifest, or it is a directory on disk. Any other output is comparable when its
+    loader or extension is CSV, JSON or JSONL.
+    """
     outs_by_stage = dict[str, list[types.ArtifactRef]]()
-    for stage_name in cli_helpers.list_stages():
+    for stage_name, stage_info in stage_infos.items():
         outs = [
             out
-            for out in cli_helpers.get_stage(stage_name)["outs"]
+            for out in stage_info["outs"]
             if out.tag not in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}
         ]
         if outs:
             outs_by_stage[stage_name] = outs
 
     lock_data_by_stage = common.read_lock_files_from_head(list(outs_by_stage))
-    result = dict[str, str | None]()
+    result = dict[str, _DiffOutput]()
     for stage_name, outs in outs_by_stage.items():
         lock_data = lock_data_by_stage[stage_name]
         entries = {} if lock_data is None else {entry["key"]: entry for entry in lock_data["outs"]}
         for out in outs:
             output_path = store.resolve_display_path(out)
-            rel_path = project.to_relative_path(output_path, proj_root)
             entry = entries.get(out.identity.key)
-            if entry is None:
-                if _is_data_output(out, store, proj_root) or output_path.is_dir():
-                    result[rel_path] = None
-                continue
-            output_hash = lock.entry_hash_info(entry)
-            if types.is_dir_hash(output_hash):
-                for manifest_entry in output_hash["manifest"]:
-                    path = pathlib.Path(rel_path) / manifest_entry["relpath"]
-                    if detect_format(path) is not DataFileFormat.UNKNOWN:
-                        result[path.as_posix()] = manifest_entry["hash"]
-            elif _is_data_output(out, store, proj_root) and not output_path.is_dir():
-                result[rel_path] = output_hash["hash"]
-            elif output_path.is_dir():
-                result[rel_path] = None
+            head = None if entry is None else lock.entry_hash_info(entry)
+            is_directory = (
+                out.tag is types.ArtifactTag.DIRECTORY
+                or (head is not None and types.is_dir_hash(head))
+                or output_path.is_dir()
+            )
+            if is_directory or _is_data_output(out, store, proj_root):
+                rel_path = project.to_relative_path(output_path, proj_root)
+                result[rel_path] = _DiffOutput(rel_path, head, is_directory)
     return result
 
 
-def _directory_output_path(path: str, directory_output_paths: set[str]) -> str | None:
-    """Return the longest directory-output path that contains ``path``."""
-    matches = [
-        directory_path
-        for directory_path in directory_output_paths
-        if path == directory_path or path.startswith(f"{directory_path.rstrip('/')}/")
-    ]
-    return max(matches, key=len, default=None)
+def _select_outputs(
+    targets: Sequence[str],
+    outputs: Mapping[str, _DiffOutput],
+    stage_infos: Mapping[str, RegistryStageInfo],
+    store: store_mod.WorkspaceStore,
+    proj_root: pathlib.Path,
+) -> dict[str, frozenset[str] | None]:
+    """Map each selected output to its selected member prefixes, or None for every member.
+
+    ``.`` selects every output, a stage its outputs, and a path the output at it, every output
+    below it, or, inside a directory output, the members at or below it. A file that is no
+    stage output is never compared: a target that selects no output is named in a warning.
+    """
+    from pivot.cli import targets as cli_targets
+
+    below = collections.defaultdict[str, list[str]](list)
+    for output_path in outputs:
+        for parent in _parents(output_path):
+            below[parent].append(output_path)
+
+    selected = dict[str, set[str] | None]()
+    unmatched = list[str]()
+    for target in targets:
+        resolved = cli_targets.resolve_cli_target(target, stage_infos)
+        if resolved is not None:
+            ref_paths = (
+                project.to_relative_path(store.resolve_display_path(ref), proj_root)
+                for ref in resolved["refs"]
+            )
+            hits = [ref_path for ref_path in ref_paths if ref_path in outputs]
+        else:
+            path = project.to_relative_path(project.normalize_path(target), proj_root)
+            if path == ".":
+                hits = list(outputs)
+            elif path in outputs:
+                hits = [path]
+            else:
+                hits = below.get(path, [])
+            if not hits:
+                container = next((parent for parent in _parents(path) if parent in outputs), None)
+                if container is not None and outputs[container].is_directory:
+                    prefixes = selected.setdefault(container, set[str]())
+                    if prefixes is not None:
+                        prefixes.add(path[len(container) + 1 :])
+                    continue
+        for hit in hits:
+            selected[hit] = None
+        if not hits:
+            unmatched.append(target)
+
+    if unmatched:
+        logger.warning(
+            "No CSV, JSON or JSONL stage output matches %s, so it is not compared",
+            ", ".join(repr(target) for target in unmatched),
+        )
+    return {
+        path: None if prefixes is None else frozenset(prefixes)
+        for path, prefixes in selected.items()
+    }
 
 
-def _selected_workspace_path(path: str, targets: set[str]) -> bool:
-    return any(path == target or path.startswith(f"{target.rstrip('/')}/") for target in targets)
+def _head_members(output: _DiffOutput, prefixes: frozenset[str] | None) -> dict[str, str | None]:
+    """The selected output's comparable files and their hashes at git HEAD."""
+    if not output.is_directory:
+        return {output.path: None if output.head is None else output.head["hash"]}
+    if output.head is None or not types.is_dir_hash(output.head):
+        return {}
+    return {
+        f"{output.path}/{entry['relpath']}": entry["hash"]
+        for entry in output.head["manifest"]
+        if _member_selected(entry["relpath"], prefixes)
+        and detect_format(pathlib.Path(entry["relpath"])) is not DataFileFormat.UNKNOWN
+    }
 
 
-def get_data_hashes_from_workspace(
-    paths: Sequence[str],
-    *,
-    member_paths: dict[str, pathlib.Path] | None = None,
-    directory_output_paths: set[str] | None = None,
-) -> dict[str, str | None]:
-    """Compute the member-hash map for comparable workspace data files."""
-    result = dict[str, str | None]()
+def _workspace_members(
+    output: _DiffOutput,
+    prefixes: frozenset[str] | None,
+    proj_root: pathlib.Path,
+    cache_dir: pathlib.Path,
+) -> dict[str, tuple[str, pathlib.Path]]:
+    """The selected output's comparable workspace files, each with its hash and path.
+
+    A directory output's members come from the record-time walker: a symlink it leaves out,
+    and everything below one, is not a member and is never read. The warning names only the
+    left-out symlinks inside the selected members, under the output's own path.
+    """
+    location = proj_root / output.path
+    if not output.is_directory:
+        if not location.exists():
+            return {}
+        file_hash, _ = cache.hash_file(location)
+        return {output.path: (file_hash, location)}
+    if not location.is_dir():
+        return {}
+
+    result = dict[str, tuple[str, pathlib.Path]]()
+    left_out = list[pathlib.Path]()
+    dirs = list[pathlib.Path]()
+    for entry in cache.scandir_artifact_members(location, cache_dir, left_out, dirs):
+        file_path = pathlib.Path(entry.path)
+        relpath = file_path.relative_to(location).as_posix()
+        if not _member_selected(relpath, prefixes):
+            continue
+        if detect_format(file_path) is DataFileFormat.UNKNOWN:
+            continue
+        file_hash, _ = cache.hash_file(file_path)
+        if not cache.is_artifact_member_content(file_path, file_hash, cache_dir):
+            left_out.append(file_path)
+            continue
+        result[f"{output.path}/{relpath}"] = (file_hash, file_path)
+
+    selected_parents = set[str]()
+    if prefixes is not None:
+        selected_parents = {parent for prefix in prefixes for parent in _parents(prefix)}
+    named = list[pathlib.Path]()
+    for link in left_out:
+        link_relpath = link.relative_to(location).as_posix()
+        if _member_selected(link_relpath, prefixes) or link_relpath in selected_parents:
+            named.append(link)
+    if named:
+        cache.log_left_out_symlinks(location, named)
+    return result
+
+
+def select_data_files(targets: Sequence[str]) -> DataSelection | None:
+    """Select the data files ``targets`` name, at git HEAD and in the workspace.
+
+    One selection serves both sides (see ``_select_outputs``), and one walk per selected
+    directory output builds its workspace members. Returns None when no registered stage has
+    an output `pivot diff` can compare.
+    """
+    from pivot.cli import helpers as cli_helpers
+
+    store = cli_helpers.require_workspace_store()
     proj_root = project.get_project_root()
-    directory_roots = set[str]() if directory_output_paths is None else directory_output_paths
-    directory_targets = dict[str, set[str]]()
-    file_targets = list[str]()
+    stage_infos = {name: cli_helpers.get_stage(name) for name in cli_helpers.list_stages()}
+    outputs = _diff_outputs(stage_infos, store, proj_root)
+    if not outputs:
+        return None
 
-    for rel_path in paths:
-        directory_path = _directory_output_path(rel_path, directory_roots)
-        abs_path = proj_root / (directory_path or rel_path)
-        if abs_path.is_dir():
-            directory_targets.setdefault(directory_path or rel_path, set[str]()).add(rel_path)
-        else:
-            file_targets.append(rel_path)
-
+    head_hashes = dict[str, str | None]()
+    workspace_hashes = dict[str, str]()
+    workspace_paths = dict[str, pathlib.Path]()
     cache_dir = config.get_cache_dir() / "files"
-    for directory_path, targets in directory_targets.items():
-        left_out = list[pathlib.Path]()
-        dirs = list[pathlib.Path]()
-        for entry in cache.scandir_artifact_members(
-            proj_root / directory_path, cache_dir, left_out, dirs
-        ):
-            file_path = pathlib.Path(entry.path)
-            workspace_path = project.to_relative_path(file_path, proj_root)
-            if not _selected_workspace_path(workspace_path, targets):
-                continue
-            if detect_format(file_path) is DataFileFormat.UNKNOWN:
-                continue
-            file_hash, _ = cache.hash_file(file_path)
-            if not cache.is_artifact_member_content(file_path, file_hash, cache_dir):
-                left_out.append(file_path)
-                continue
-            result[workspace_path] = file_hash
-            if member_paths is not None:
-                member_paths[workspace_path] = file_path
-        if left_out:
-            cache.log_left_out_symlinks(proj_root, left_out)
-
-    for rel_path in file_targets:
-        abs_path = proj_root / rel_path
-        if abs_path.exists():
-            file_hash, _ = cache.hash_file(abs_path)
-            result[rel_path] = file_hash
-            if member_paths is not None:
-                member_paths[rel_path] = abs_path
-        else:
-            result[rel_path] = None
-    return result
+    for path, prefixes in _select_outputs(targets, outputs, stage_infos, store, proj_root).items():
+        output = outputs[path]
+        head_hashes.update(_head_members(output, prefixes))
+        for member, (file_hash, file_path) in _workspace_members(
+            output, prefixes, proj_root, cache_dir
+        ).items():
+            workspace_hashes[member] = file_hash
+            workspace_paths[member] = file_path
+    return DataSelection(head_hashes, workspace_hashes, workspace_paths)
 
 
 def diff_data_hashes(

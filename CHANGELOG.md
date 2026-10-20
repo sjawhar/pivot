@@ -10,9 +10,12 @@
   their fingerprint. Stages with no outputs remain cached.
 - **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff`
   resolves them into workspace files.
-- **diff**: Build both frontends and direct directory-member targets from one workspace
-  artifact-member map. Checkout symlinks to the configured cache are members; other workspace
-  symlinks are left out, and manifest paths containing control characters are refused.
+- **diff**: One selection decides, for git HEAD and the workspace, which stage outputs and
+  directory members each target names. `pivot diff .` compares every output, and a file inside a
+  `directory` or `pathlib.Path` directory output is read only through that output's member map:
+  checkout symlinks to the configured cache are members, other symlinks are left out with a
+  warning naming the output, and manifest paths containing control characters are refused. A
+  target that names no CSV, JSON or JSONL stage output is named in a warning and not compared.
 
 
 ## v0.5.2 (2026-10-20)
@@ -45,6 +48,7 @@
   ([#497](https://github.com/sjawhar/pivot/pull/497),
   [`88596c4`](https://github.com/sjawhar/pivot/commit/88596c45af80c5f763363bcd597b843eef41c23c))
 
+
 ## v0.5.1 (2026-10-20)
 
 ### Bug Fixes
@@ -61,6 +65,7 @@
 - **remote**: Gs:// remotes through a RemoteStorage protocol
   ([#498](https://github.com/sjawhar/pivot/pull/498),
   [`f98e332`](https://github.com/sjawhar/pivot/commit/f98e332061e5dff39687e457a4ad4f99d6c1280c))
+
 
 ## v0.4.1 (2026-10-19)
 

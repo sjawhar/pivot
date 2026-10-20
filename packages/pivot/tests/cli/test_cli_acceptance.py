@@ -2485,7 +2485,7 @@ def test_diff_leaves_out_a_workspace_symlink_outside_the_project(tmp_path: pathl
     finally:
         secret.unlink()
 
-    assert "leaves out symlink data/d/split/train.csv" in output
+    assert "Directory artifact data/d/split leaves out symlink train.csv" in output
     assert "TOP_SECRET_VALUE" not in output
 
 
@@ -2632,7 +2632,7 @@ import pathlib
 
 
 def run_diff_app(results):
-    pathlib.Path("tui-results.json").write_text(json.dumps(results))
+    pathlib.Path("tui-results.json").write_text(json.dumps(results, default=str))
 """
 
 
@@ -2645,8 +2645,29 @@ def _write_tui_capture_module(root: pathlib.Path) -> pathlib.Path:
     return root / "tui-results.json"
 
 
+def _replace_nested_with_outside_directory(
+    root: pathlib.Path, tmp_path: pathlib.Path
+) -> pathlib.Path:
+    """Replace the recorded `data/d/make/nested` with a symlink to an outside secret directory."""
+    nested = root / "data" / "d" / "make" / "nested"
+    (nested / "train.csv").unlink()
+    nested.rmdir()
+    external = tmp_path.parent / f"{tmp_path.name}-external"
+    external.mkdir()
+    (external / "train.csv").write_text("TOP_SECRET_VALUE\n42\n")
+    nested.symlink_to(external, target_is_directory=True)
+    return external
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("d/make", id="directory-target"),
+        pytest.param("data/d/make/nested/train.csv", id="direct-member-target"),
+    ],
+)
 def test_diff_member_map_excludes_descendants_of_a_left_out_directory_symlink(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, target: str
 ) -> None:
     """`pivot diff` never reads a recorded file below a left-out directory symlink."""
     root = _project(
@@ -2660,29 +2681,31 @@ def test_diff_member_map_excludes_descendants_of_a_left_out_directory_symlink(
     _ok(_pivot(root, "repro"))
     _commit(root, "first run")
 
-    nested = root / "data" / "d" / "make" / "nested"
-    (nested / "train.csv").unlink()
-    nested.rmdir()
-    external = tmp_path.parent / f"{tmp_path.name}-external"
-    external.mkdir()
-    (external / "train.csv").write_text("TOP_SECRET_VALUE\n42\n")
-    nested.symlink_to(external, target_is_directory=True)
+    external = _replace_nested_with_outside_directory(root, tmp_path)
     try:
-        json_output = _ok(_pivot(root, "diff", "--json", "data/d/make/nested/train.csv"))
-        text_output = _ok(_pivot(root, "diff", "--no-tui", "data/d/make/nested/train.csv"))
-        tui_output = _ok(_pivot(root, "diff", "data/d/make/nested/train.csv"))
+        json_output = _ok(_pivot(root, "diff", "--json", target))
+        text_output = _ok(_pivot(root, "diff", "--no-tui", target))
+        tui_output = _ok(_pivot(root, "diff", target))
         tui_results = tui_capture.read_text()
     finally:
         (external / "train.csv").unlink()
         external.rmdir()
 
-    for output in (json_output, text_output, tui_output, tui_results):
-        assert "leaves out symlink data/d/make/nested" in output or output == tui_results
-        assert "TOP_SECRET_VALUE" not in output
+    for output in (json_output, text_output, tui_output):
+        assert "Directory artifact data/d/make leaves out symlink nested" in output, output
+        assert "TOP_SECRET_VALUE" not in output, output
     assert "data/d/make/nested/train.csv" in tui_results
+    assert "TOP_SECRET_VALUE" not in tui_results
 
 
-def test_diff_tui_excludes_an_outside_file_symlink(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("d/split", id="directory-target"),
+        pytest.param("data/d/split/train.csv", id="direct-member-target"),
+    ],
+)
+def test_diff_tui_excludes_an_outside_file_symlink(tmp_path: pathlib.Path, target: str) -> None:
     """The TUI receives no data from a left-out file symlink."""
     root = _project(
         tmp_path,
@@ -2701,12 +2724,12 @@ def test_diff_tui_excludes_an_outside_file_symlink(tmp_path: pathlib.Path) -> No
     member.unlink()
     member.symlink_to(secret)
     try:
-        output = _ok(_pivot(root, "diff", "data/d/split/train.csv"))
+        output = _ok(_pivot(root, "diff", target))
         tui_results = tui_capture.read_text()
     finally:
         secret.unlink()
 
-    assert "leaves out symlink data/d/split/train.csv" in output
+    assert "Directory artifact data/d/split leaves out symlink train.csv" in output
     assert "TOP_SECRET_VALUE" not in output
     assert "data/d/split/train.csv" in tui_results
     assert "TOP_SECRET_VALUE" not in tui_results
@@ -2738,12 +2761,20 @@ def test_diff_excludes_a_cache_shaped_symlink_with_wrong_contents(tmp_path: path
 
     output = _ok(_pivot(root, "diff", "--json", "d/split"))
 
-    assert "leaves out symlink data/d/split/train.csv" in output
+    assert "Directory artifact data/d/split leaves out symlink train.csv" in output
     assert "TOP_SECRET_VALUE" not in output
 
 
-def test_diff_supports_a_direct_cache_symlink_member(tmp_path: pathlib.Path) -> None:
-    """A direct directory-member target accepts a valid external cache symlink."""
+def _row_counts(root: pathlib.Path, target: str) -> dict[str, tuple[object, object]]:
+    result = _pivot(root, "diff", "--json", target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return {
+        entry["path"]: (entry["old_rows"], entry["new_rows"]) for entry in json.loads(result.stdout)
+    }
+
+
+def test_diff_compares_a_cache_object_symlink_member(tmp_path: pathlib.Path) -> None:
+    """A directory member that is a checkout link to its cache object diffs as that object."""
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     root = _project(
@@ -2753,15 +2784,170 @@ def test_diff_supports_a_direct_cache_symlink_member(tmp_path: pathlib.Path) -> 
             "data/raw/rows.csv": "part,v\ntrain,1\n",
         },
     )
-    _configure_external_symlink_cache(root, tmp_path / "cache")
+    cache_dir = tmp_path / "cache"
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_dir)))
     _ok(_pivot(root, "repro"))
     _commit(root, "first run")
     (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,2\n")
     _ok(_pivot(root, "repro"))
 
-    output = _ok(_pivot(root, "diff", "--json", "data/d/split/train.csv"))
+    member = root / "data" / "d" / "split" / "train.csv"
+    member_hash, _ = cache.hash_file(member)
+    cache_object = cache.get_cache_path(cache_dir / "files", member_hash)
+    assert cache_object.is_file()
+    member.unlink()
+    member.symlink_to(cache_object)
 
-    assert '"path": "data/d/split/train.csv"' in output
+    direct = _row_counts(root, "data/d/split/train.csv")
+    whole = _row_counts(root, "d/split")
+
+    assert direct == {"data/d/split/train.csv": (1, 2)}
+    assert whole["data/d/split/train.csv"] == (1, 2)
+
+
+def _output_root_symlinked_to_an_in_project_copy(root: pathlib.Path) -> None:
+    output = root / "data" / "d" / "split"
+    replacement = root / "data" / "d" / "replacement"
+    shutil.copytree(output, replacement)
+    shutil.rmtree(output)
+    output.symlink_to(replacement, target_is_directory=True)
+
+
+@pytest.mark.parametrize(
+    "layout", ["external-cache-symlink-checkout", "output-root-symlink", "data-symlinked-outside"]
+)
+def test_diff_gives_a_member_one_answer_whatever_the_target(
+    tmp_path: pathlib.Path, layout: str
+) -> None:
+    """A directory member diffs the same whether the target names it, its output, or a
+    directory above the output, including the project root, in each supported symlinked layout."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(project_dir, {"pipeline.py": _DIFF_PIPELINE})
+    rows = root / "data" / "raw" / "rows.csv"
+    if layout == "data-symlinked-outside":
+        external_data = tmp_path / "data"
+        external_data.mkdir()
+        (root / "data").symlink_to(external_data, target_is_directory=True)
+    if layout == "external-cache-symlink-checkout":
+        _configure_external_symlink_cache(root, tmp_path / "cache")
+    rows.parent.mkdir(parents=True, exist_ok=True)
+    rows.write_text("part,v\ntrain,1\n")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    rows.write_text("part,v\ntrain,1\ntrain,2\n")
+    _ok(_pivot(root, "repro"))
+    if layout == "output-root-symlink":
+        _output_root_symlinked_to_an_in_project_copy(root)
+    if layout != "data-symlinked-outside":
+        assert (root / "data" / "d" / "split").is_symlink()
+
+    answers = {
+        target: _row_counts(root, target).get("data/d/split/train.csv")
+        for target in (".", "data", "data/d", "data/d/split", "data/d/split/train.csv", "d/split")
+    }
+
+    assert answers == dict.fromkeys(answers, (1, 2))
+
+
+def test_diff_path_directory_member_never_reads_an_outside_symlink(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A direct member of a `pathlib.Path` directory output uses that output's member map."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    tui_capture = _write_tui_capture_module(root)
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("part,v\nTOP_SECRET_VALUE,42\n")
+    member = root / "data" / "d" / "bundle.dat" / "all.csv"
+    member.unlink()
+    member.symlink_to(secret)
+    target = "data/d/bundle.dat/all.csv"
+    try:
+        json_output = _ok(_pivot(root, "diff", "--json", target))
+        text_output = _ok(_pivot(root, "diff", "--no-tui", target))
+        tui_output = _ok(_pivot(root, "diff", target))
+        tui_results = tui_capture.read_text()
+    finally:
+        secret.unlink()
+
+    for output in (json_output, text_output, tui_output):
+        assert "Directory artifact data/d/bundle.dat leaves out symlink all.csv" in output, output
+        assert "TOP_SECRET_VALUE" not in output, output
+    assert target in tui_results
+    assert "TOP_SECRET_VALUE" not in tui_results
+
+
+def _json_diff(root: pathlib.Path, target: str) -> list[dict[str, object]]:
+    result = _pivot(root, "diff", "--json", target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout)
+
+
+def test_diff_of_the_project_root_equals_the_data_directory(tmp_path: pathlib.Path) -> None:
+    """`pivot diff .` and the absolute project root select the same outputs as `data`."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    targets = (".", str(root), "data")
+
+    unchanged = {target: _json_diff(root, target) for target in targets}
+
+    assert unchanged == {target: [] for target in targets}
+
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\ntest,2\n")
+    _ok(_pivot(root, "repro"))
+    changed = {target: _json_diff(root, target) for target in targets}
+
+    assert changed["."] == changed[str(root)] == changed["data"]
+    assert {entry["path"] for entry in changed["data"]} == {
+        "data/d/bundle.dat/all.csv",
+        "data/d/split/train.csv",
+    }
+
+
+def test_diff_warns_only_about_symlinks_inside_the_selected_targets(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A left-out sibling of a direct target is not named; the whole output names it."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("part,v\nTOP_SECRET_VALUE,42\n")
+    sibling = root / "data" / "d" / "split" / "test.csv"
+    sibling.unlink()
+    sibling.symlink_to(secret)
+    try:
+        direct = _ok(_pivot(root, "diff", "--json", "data/d/split/train.csv"))
+        whole = _ok(_pivot(root, "diff", "--json", "d/split"))
+    finally:
+        secret.unlink()
+
+    assert "leaves out" not in direct, direct
+    assert "Directory artifact data/d/split leaves out symlink test.csv" in whole, whole
+    assert "TOP_SECRET_VALUE" not in direct + whole
 
 
 _SHOUT_PIPELINE = """\

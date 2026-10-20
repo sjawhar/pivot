@@ -564,8 +564,11 @@ pivot diff TARGETS... [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Data files or stage outputs to compare (required). A directory output compares its
-  CSV, JSON, and JSONL files one by one.
+- `TARGETS` - Stage outputs to compare (required): a stage name, or a path at, inside or above a
+  stage output. `.` compares every output. A directory output compares its CSV, JSON, and JSONL
+  files one by one, and a path inside it compares the files at or below that path. A target that
+  names no CSV, JSON, or JSONL stage output is named in a warning and not compared.
+
 **Options:**
 
 | Option | Description |
