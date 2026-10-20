@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.5.1 (2026-10-20)
+
+### Bug Fixes
+
+- **fingerprint**: Keep the user's part of a namespace package user code
+  ([#499](https://github.com/sjawhar/pivot/pull/499),
+  [`58c7384`](https://github.com/sjawhar/pivot/commit/58c73847c645b3b0a152f022137eb231a4d9d2dd))
+
+
 ## v0.5.0 (2026-10-20)
 
 ### Features
