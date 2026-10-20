@@ -13,6 +13,7 @@ import py_compile
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.request
 import uuid
@@ -1859,10 +1860,12 @@ def _helper_cache_stale_bytecode(path: pathlib.Path, old: str, new: str) -> None
     os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
 
 
-def _helper_env_with_path(entry: pathlib.Path) -> dict[str, str]:
+def _helper_env_with_path(*entries: pathlib.Path) -> dict[str, str]:
     env = _env()
     env.pop("PYTHONDONTWRITEBYTECODE", None)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(entry), env.get("PYTHONPATH")]))
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [*(str(entry) for entry in entries), env.get("PYTHONPATH")])
+    )
     return env
 
 
@@ -1944,26 +1947,56 @@ with Pipeline("w") as pipeline:
     build(pipeline.input("in.txt"))
 """
 
+_LAZY_PIVOT_TUI_PIPELINE = _LAZY_IMPORT_PIPELINE.replace("lazy_helper", "pivot_tui.helpers")
 
+
+@pytest.mark.parametrize(
+    ("pipeline", "files", "helper", "pythonpath"),
+    [
+        pytest.param(
+            _LAZY_IMPORT_PIPELINE,
+            {"outside/lazy_helper.py": 'VALUE = "alpha"\n'},
+            "outside/lazy_helper.py",
+            ["outside"],
+            id="module-outside-the-root",
+        ),
+        pytest.param(
+            _LAZY_PIVOT_TUI_PIPELINE,
+            {
+                "project/pivot_tui/__init__.py": "",
+                "project/pivot_tui/helpers.py": 'VALUE = "alpha"\n',
+            },
+            "project/pivot_tui/helpers.py",
+            [],
+            id="project-package-named-pivot_tui",
+        ),
+    ],
+)
 def test_worker_runs_the_edited_code_of_a_module_a_stage_body_imports(
     tmp_path: pathlib.Path,
+    pipeline: str,
+    files: dict[str, str],
+    helper: str,
+    pythonpath: list[str],
 ) -> None:
-    """A module only a stage body imports is imported by the worker alone. The worker caches
-    bytecode for it checked by content, so an edit made in the second the previous version was
-    written and cached is run when the stage next runs."""
+    """A module only a stage body imports is imported by the worker alone: one outside the root
+    on ``PYTHONPATH``, or a project package named ``pivot_tui``, which the worker imports from the
+    project root on its ``sys.path``, not pivot-tui's. The worker treats it as user code and
+    caches bytecode for it checked by content, so an edit that keeps the file's size, made in the
+    second the previous version was written and cached, is run when the stage next runs."""
     root = tmp_path / "project"
     root.mkdir()
-    _project(root, {"pipeline.py": _LAZY_IMPORT_PIPELINE, "data/raw/in.txt": "x"})
-    helper = tmp_path / "outside" / "lazy_helper.py"
-    helper.parent.mkdir()
-    helper.write_text('VALUE = "alpha"\n')
-    env = _helper_env_with_path(helper.parent)
+    _project(root, {"pipeline.py": pipeline, "data/raw/in.txt": "x"})
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(text)
+    env = _helper_env_with_path(*(tmp_path / entry for entry in pythonpath))
     output = root / "data" / "w" / "build.txt"
     _ok(_pivot(root, "repro", env=env))
     assert output.read_text() == "x-alpha"
-    before = helper.stat()
-    helper.write_text('VALUE = "bravo"\n')
-    os.utime(helper, ns=(before.st_atime_ns, before.st_mtime_ns))
+    before = (tmp_path / helper).stat()
+    (tmp_path / helper).write_text('VALUE = "bravo"\n')
+    os.utime(tmp_path / helper, ns=(before.st_atime_ns, before.st_mtime_ns))
     (root / "data" / "raw" / "in.txt").write_text("y")
 
     out = _ok(_pivot(root, "repro", env=env))
@@ -2234,49 +2267,130 @@ def test_editing_a_project_package_named_pivot_tui_reruns_its_stage(
     assert output.read_text() == "HELLO u2", out
 
 
-_LAZY_PIVOT_TUI_PIPELINE = """\
-from pivot import Pipeline, stage
+_COMPANYVENDOR_PYPROJECT = """\
+[project]
+name = "companyvendor"
+version = "1.0"
 
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
 
-@stage
-def build(raw: str) -> str:
-    import pivot_tui.helpers
-
-    return raw.strip() + "-" + pivot_tui.helpers.VALUE
-
-
-with Pipeline("w") as pipeline:
-    build(pipeline.input("in.txt"))
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
 """
 
 
-def test_worker_runs_the_edited_code_of_a_project_package_named_pivot_tui(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A worker runs with the project root on ``sys.path``, so a stage body's ``import
-    pivot_tui.helpers`` imports the project's own package, not pivot-tui's. The worker treats
-    it as user code: it caches its bytecode checked by content, so an edit that keeps the
-    file's size, made in the second the previous version was written and cached, is run when
-    the stage next runs."""
-    root = _project(
-        tmp_path,
-        {
-            "pipeline.py": _LAZY_PIVOT_TUI_PIPELINE,
-            "data/raw/in.txt": "x",
-            "pivot_tui/__init__.py": "",
-            "pivot_tui/helpers.py": 'VALUE = "alpha"\n',
-        },
+@pytest.fixture(scope="module")
+def pip_checkout_venv(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
+    """A virtualenv where ``pip install -e git+file://...`` installed ``companyvendor``, which
+    provides ``company.vendor`` in the PEP 420 namespace package ``company``. pip checks it out in
+    ``<venv>/src``: under the interpreter's prefix, outside site-packages. The virtualenv sees
+    this environment's packages, pivot among them, and pip builds the package offline with this
+    environment's setuptools. ``<venv>/bin/pivot`` runs pivot as its console script does."""
+    base = tmp_path_factory.mktemp("pip-checkout")
+    repo = base / "companyvendor"
+    (repo / "src" / "company").mkdir(parents=True)
+    (repo / "src" / "company" / "vendor.py").write_text("X = 1\n")
+    (repo / "pyproject.toml").write_text(_COMPANYVENDOR_PYPROJECT)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    _commit(repo, "init")
+    venv = base / "venv"
+    python = str(venv / "bin" / "python")
+    _ok(subprocess.run([sys.executable, "-m", "venv", str(venv)], capture_output=True, text=True))
+    venv_site = (
+        venv / "lib" / f"python{sys.version_info[0]}.{sys.version_info[1]}" / "site-packages"
     )
-    env = {k: v for k, v in _env().items() if k != "PYTHONDONTWRITEBYTECODE"}
-    helper = root / "pivot_tui" / "helpers.py"
-    output = root / "data" / "w" / "build.txt"
-    _ok(_pivot(root, "repro", env=env))
-    assert output.read_text() == "x-alpha"
-    before = helper.stat()
-    helper.write_text('VALUE = "bravo"\n')
-    os.utime(helper, ns=(before.st_atime_ns, before.st_mtime_ns))
-    (root / "data" / "raw" / "in.txt").write_text("y")
+    (venv_site / "test_environment.pth").write_text(
+        f"import site; site.addsitedir({sysconfig.get_path('purelib')!r})\n"
+    )
+    install = [python, "-m", "pip", "install", "--isolated", "--disable-pip-version-check", "-q"]
+    install += ["--no-build-isolation", "--no-index", "--no-deps"]
+    install += ["-e", f"companyvendor @ git+file://{repo}"]
+    _ok(subprocess.run(install, env=_env(), capture_output=True, text=True, timeout=180))
+    checkout = venv / "src" / "companyvendor" / "src" / "company"
+    assert (checkout / "vendor.py").is_file(), "pip checks the package out under <venv>/src"
+    (venv / "bin" / "pivot").write_text(
+        "import sys\n\nfrom pivot.cli import main\n\nif __name__ == '__main__':\n    sys.exit(main())\n"
+    )
+    return venv
 
-    out = _ok(_pivot(root, "repro", env=env))
 
-    assert output.read_text() == "y-bravo", out
+_NAMESPACE_HELPER = 'def tag(text: str) -> str:\n    return text.strip().upper() + " {}"\n'
+
+_NAMESPACE_STAGE = """\
+import company.project
+
+from pivot import {names}
+
+
+@stage
+def shout(text: str) -> str:
+    return company.project.tag(text)
+"""
+
+_NAMESPACE_WIRING = """
+with Pipeline("ns") as pipeline:
+    {call}(pipeline.input("input.txt", t=str))
+"""
+
+
+@pytest.mark.parametrize(
+    ("files", "helper", "pythonpath"),
+    [
+        pytest.param(
+            {
+                "project/pipeline.py": _NAMESPACE_STAGE.format(names="Pipeline, stage")
+                + _NAMESPACE_WIRING.format(call="shout"),
+                "project/company/project.py": _NAMESPACE_HELPER.format("v1"),
+            },
+            "project/company/project.py",
+            [],
+            id="stage-at-the-root",
+        ),
+        pytest.param(
+            {
+                "project/pipeline.py": "from ext_stages import stages\n\nfrom pivot import Pipeline\n"
+                + _NAMESPACE_WIRING.format(call="stages.shout"),
+                "usercode/ext_stages/__init__.py": "",
+                "usercode/ext_stages/stages.py": _NAMESPACE_STAGE.format(names="stage"),
+                "usercode/company/project.py": _NAMESPACE_HELPER.format("v1"),
+            },
+            "usercode/company/project.py",
+            ["usercode"],
+            id="stage-outside-the-root",
+        ),
+    ],
+)
+def test_editing_the_user_s_part_of_a_namespace_shared_with_a_pip_checkout_reruns_its_stage(
+    tmp_path: pathlib.Path,
+    pip_checkout_venv: pathlib.Path,
+    files: dict[str, str],
+    helper: str,
+    pythonpath: list[str],
+) -> None:
+    """The user's own ``company/project.py`` and a package pip checked out under the
+    interpreter's prefix (``pip install -e git+...``) share the namespace package ``company``.
+    The user's part is user code, whether the stage that calls it is at the project root or
+    outside it: the stage runs, and an edit to the helper reruns it."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _project(root, {"data/raw/input.txt": "hello\n"})
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(text)
+    command = [str(pip_checkout_venv / "bin" / name) for name in ("python", "pivot")] + ["repro"]
+    env = _helper_env_with_path(*(tmp_path / entry for entry in pythonpath))
+    output = root / "data" / "ns" / "shout.txt"
+    first = _ok(
+        subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=180)
+    )
+    assert output.read_text() == "HELLO v1", first
+    (tmp_path / helper).write_text(_NAMESPACE_HELPER.format("v2"))
+
+    out = _ok(
+        subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=180)
+    )
+
+    assert output.read_text() == "HELLO v2", out

@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import locale
 import logging
 import math
 import os
@@ -825,6 +826,13 @@ def _helper_install_distribution(site_dir: pathlib.Path, name: str, files: dict[
             ["checkout/src/pivot_tui"],
             id="editable",
         ),
+        pytest.param(
+            ["site", "checkout/src"],
+            {"pivot-tui": {"pivot_tui.pth": "\ufeff{tmp}/checkout/src\n"}},
+            {"checkout/src/pivot_tui/__init__.py": ""},
+            ["checkout/src/pivot_tui"],
+            id="editable-pth-with-a-byte-order-mark",
+        ),
         pytest.param(["site"], {}, {}, [], id="not-installed"),
         pytest.param(
             ["user", "site"],
@@ -874,10 +882,66 @@ def test_pivot_tui_is_pivot_s_package_only_where_the_pivot_tui_distribution_inst
 
     with monkeypatch.context() as patch:
         patch.setattr(sys, "path", [str(tmp_path / entry) for entry in sys_path])
-        dirs = fingerprint._init_pivot_package_dirs()
+        dirs = fingerprint._pivot_tui_dirs()
 
-    pivot_dir = pathlib.Path(fingerprint.__file__).resolve().parent
-    assert dirs == (pivot_dir, *((tmp_path / rel).resolve() for rel in expected))
+    assert dirs == tuple((tmp_path / rel).resolve() for rel in expected)
+
+
+def _helper_remove_read_permission(path: pathlib.Path) -> None:
+    path.chmod(0)
+
+
+def _helper_replace_with_a_directory(path: pathlib.Path) -> None:
+    path.unlink()
+    path.mkdir()
+
+
+@pytest.mark.parametrize(
+    "make_unreadable",
+    [
+        pytest.param(_helper_remove_read_permission, id="mode-000"),
+        pytest.param(_helper_replace_with_a_directory, id="directory"),
+    ],
+)
+def test_pivot_tui_pth_file_python_cannot_read_adds_no_directory(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_unreadable: typing.Callable[[pathlib.Path], None],
+) -> None:
+    """A ``.pth`` file of pivot-tui's that cannot be read is skipped, as ``site`` skips it: it
+    adds no directory to ``sys.path``, so no directory of pivot_tui's comes from it, and reading
+    pivot's own packages does not fail."""
+    (tmp_path / "checkout" / "src" / "pivot_tui").mkdir(parents=True)
+    site_dir = tmp_path / "site"
+    _helper_install_distribution(
+        site_dir, "pivot-tui", {"pivot_tui.pth": f"{tmp_path}/checkout/src\n"}
+    )
+    make_unreadable(site_dir / "pivot_tui.pth")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "path", [str(site_dir)])
+        dirs = fingerprint._pivot_tui_dirs()
+
+    assert dirs == ()
+
+
+def test_pivot_tui_pth_file_that_is_not_utf_8_is_read_in_the_locale_s_encoding(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``.pth`` file of pivot-tui's that is not UTF-8 is decoded in the locale's encoding, as
+    ``site`` decodes it, so the checkout it adds to ``sys.path`` holds pivot's own package."""
+    checkout = tmp_path / "caf\xe9" / "src"
+    (checkout / "pivot_tui").mkdir(parents=True)
+    site_dir = tmp_path / "site"
+    _helper_install_distribution(site_dir, "pivot-tui", {"pivot_tui.pth": ""})
+    (site_dir / "pivot_tui.pth").write_bytes(f"{checkout}\n".encode("latin-1"))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(locale, "getencoding", lambda: "latin-1")
+        patch.setattr(sys, "path", [str(site_dir)])
+        dirs = fingerprint._pivot_tui_dirs()
+
+    assert dirs == ((checkout / "pivot_tui").resolve(),)
 
 
 def test_is_user_code_non_callable():
@@ -1711,16 +1775,16 @@ def test_is_user_code_path_component_matching_not_substring(
     sys.modules.pop("tricky_pkg", None)
 
 
-@pytest.mark.parametrize("prefixes", ["_PIVOT_PACKAGE_DIRS", "_STDLIB_PATHS"])
 def test_is_user_code_namespace_package_in_a_library_directory(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, prefixes: str
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A namespace package is decided by the rule that decides a regular module
-    (``is_library_path``): one whose directory lies in pivot's own packages or under the
-    interpreter's prefix is not user code, though no directory of it is site-packages."""
+    """A namespace package whose directory lies in one of pivot's own packages is not user code,
+    though no directory of it is site-packages."""
     library = tmp_path / "library"
     (library / "ns_in_library").mkdir(parents=True)
-    monkeypatch.setattr(fingerprint, prefixes, (*getattr(fingerprint, prefixes), library.resolve()))
+    monkeypatch.setattr(
+        fingerprint, "_PIVOT_PACKAGE_DIRS", (*fingerprint._PIVOT_PACKAGE_DIRS, library.resolve())
+    )
     monkeypatch.syspath_prepend(str(library))
     sys.modules.pop("ns_in_library", None)
     try:
@@ -1730,6 +1794,30 @@ def test_is_user_code_namespace_package_in_a_library_directory(
         assert fingerprint.is_user_code(module) is False
     finally:
         sys.modules.pop("ns_in_library", None)
+
+
+def test_is_user_code_namespace_package_split_with_a_directory_under_the_prefix(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A namespace package with one directory under the interpreter's prefix but outside
+    site-packages, as pip's checkout of a ``pip install -e git+...`` package in ``<venv>/src``,
+    and another in the user's code is user code, so the user's part of it is fingerprinted."""
+    venv = tmp_path / "venv"
+    vendor = venv / "src" / "vendor"
+    user = tmp_path / "user"
+    for import_root in (vendor, user):
+        (import_root / "split_ns").mkdir(parents=True)
+    monkeypatch.setattr(fingerprint, "_STDLIB_PATHS", (*fingerprint._STDLIB_PATHS, venv.resolve()))
+    monkeypatch.syspath_prepend(str(user))
+    monkeypatch.syspath_prepend(str(vendor))
+    sys.modules.pop("split_ns", None)
+    try:
+        module = importlib.import_module("split_ns")
+        assert len(module.__path__) == 2, "the namespace package spans both directories"
+
+        assert fingerprint.is_user_code(module) is True
+    finally:
+        sys.modules.pop("split_ns", None)
 
 
 # ==============================================================================
