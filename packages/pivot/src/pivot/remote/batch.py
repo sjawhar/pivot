@@ -62,8 +62,13 @@ async def bulk_exists[C](
     """Check which ``hashes`` exist on a remote whose cache objects live under ``prefix``.
 
     Below BULK_EXISTS_LIST_THRESHOLD hashes, asks ``exists_one`` for each in parallel; from the
-    threshold up, lists each 2-char key prefix with ``list_names`` instead. Any failure raises
-    one RemoteConnectionError whose message starts with ``label`` (the backend's name).
+    threshold up, lists each 2-char key prefix with ``list_names`` instead.
+
+    Raises:
+        RemoteError: A hash is not a valid cache hash (before any request).
+        Exception: Whatever ``open_client`` raises, unchanged (for GCS, unusable credentials).
+        RemoteConnectionError: An existence check or listing failed; the message starts with
+            ``label`` (the backend's name).
     """
     _t = metrics.start()
     if not hashes:
@@ -163,7 +168,11 @@ async def transfer_batch[C](
 
     A transfer that raises becomes ``TransferResult(success=False, error=str(exc))``, so one
     failed file never stops the rest. ``callback(completed, total, file_name)`` runs after each
-    success. Only opening the client can raise, before any transfer starts.
+    success.
+
+    Raises:
+        RemoteError: A hash is not a valid cache hash (before any transfer).
+        Exception: Whatever ``open_client`` raises, unchanged, before any transfer starts.
     """
     _t = metrics.start()
     if not items:
