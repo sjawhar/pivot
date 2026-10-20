@@ -6,7 +6,7 @@ import pathlib
 
 import click
 
-from pivot import config, discovery, exceptions, project, registry, types
+from pivot import config, discovery, exceptions, path_policy, project, registry, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -131,7 +131,13 @@ def diff(
                     old_path = data_module.restore_data_from_cache(rel_path, old_hash)
                     if old_path is not None:
                         temp_files.append(old_path)
-                new_path = abs_path if abs_path.exists() else None
+                new_path = (
+                    path_policy.require_resolved_path_within_root(
+                        abs_path, proj_root, display_path=rel_path
+                    )
+                    if abs_path.exists()
+                    else None
+                )
 
                 # When --positional is set, don't use key columns
                 effective_keys = None if positional else key_columns

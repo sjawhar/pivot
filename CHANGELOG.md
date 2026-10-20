@@ -10,6 +10,8 @@
   their fingerprint. Stages with no outputs remain cached.
 - **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff`
   resolves them into workspace files.
+- **diff**: Refuse workspace files whose symlink targets leave the project and manifests whose
+  paths contain control characters.
 
 
 ## v0.5.1 (2026-10-20)

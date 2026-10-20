@@ -13,7 +13,7 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import config, loaders, project, types
+from pivot import config, loaders, path_policy, project, types
 from pivot.show import common
 from pivot.storage import cache, lock
 from pivot.types import (
@@ -593,13 +593,24 @@ def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None
     for rel_path in paths:
         abs_path = proj_root / rel_path
         if abs_path.is_dir():
+            path_policy.require_resolved_path_within_root(
+                abs_path, proj_root, display_path=rel_path
+            )
             for file_path in sorted(path for path in abs_path.rglob("*") if path.is_file()):
-                if detect_format(file_path) is DataFileFormat.UNKNOWN:
+                resolved_file_path = path_policy.require_resolved_path_within_root(
+                    file_path,
+                    proj_root,
+                    display_path=project.to_relative_path(file_path, proj_root),
+                )
+                if detect_format(resolved_file_path) is DataFileFormat.UNKNOWN:
                     continue
-                file_hash, _ = cache.hash_file(file_path)
+                file_hash, _ = cache.hash_file(resolved_file_path)
                 result[project.to_relative_path(file_path, proj_root)] = file_hash
         elif abs_path.exists():
-            file_hash, _ = cache.hash_file(abs_path)
+            resolved_file_path = path_policy.require_resolved_path_within_root(
+                abs_path, proj_root, display_path=rel_path
+            )
+            file_hash, _ = cache.hash_file(resolved_file_path)
             result[rel_path] = file_hash
         else:
             result[rel_path] = None

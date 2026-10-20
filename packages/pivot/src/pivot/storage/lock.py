@@ -123,7 +123,13 @@ def _is_nonempty_str(value: object) -> bool:
 
 
 def _is_project_relative_posix_path(value: object) -> bool:
-    if not isinstance(value, str) or not value or "\\" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\0" in value
+        or "\\" in value
+        or not value.isprintable()
+    ):
         return False
     path = pathlib.PurePosixPath(value)
     return (

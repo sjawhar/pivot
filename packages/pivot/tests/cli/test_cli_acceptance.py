@@ -2463,6 +2463,62 @@ def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
     assert "TOP_SECRET_VALUE" not in output
 
 
+def test_diff_refuses_a_workspace_symlink_outside_the_project(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` refuses a directory member symlinked to a file outside the project."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("TOP_SECRET_VALUE\n1\n")
+    member = root / "data" / "d" / "split" / "train.csv"
+    member.unlink()
+    member.symlink_to(secret)
+    try:
+        result = _pivot(root, "diff", "--json", "d/split")
+    finally:
+        secret.unlink()
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "data/d/split/train.csv" in output
+    assert "TOP_SECRET_VALUE" not in output
+
+
+def test_diff_refuses_a_manifest_path_with_a_null_byte(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` names and refuses a committed manifest path containing a null byte."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    lock_path = root / ".pivot" / "stages" / "d" / "split.lock"
+    lock_data = yaml.safe_load(lock_path.read_text())
+    lock_data["outs"][0]["manifest"] = [
+        {"relpath": "nul\0.csv", "hash": "a" * 16, "size": 20, "isexec": False}
+    ]
+    lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
+    _commit(root, "malicious lock")
+
+    result = _pivot(root, "diff", "--json", "d/split")
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert ".pivot/stages/d/split.lock" in output
+    assert "not a project-relative POSIX path" in output
+
+
 _SHOUT_PIPELINE = """\
 from pivot import Pipeline, stage
 
