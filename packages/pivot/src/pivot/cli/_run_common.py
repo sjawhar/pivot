@@ -6,8 +6,12 @@ import contextlib
 import logging
 import sys
 import threading
-from collections.abc import Callable, Coroutine  # noqa: TC003 - used in function signatures
-from typing import TYPE_CHECKING, Any, TextIO, TypedDict, cast
+from collections.abc import (  # noqa: TC003 - used in function signatures
+    Callable,
+    Coroutine,
+    Mapping,
+)
+from typing import TYPE_CHECKING, Any, TextIO, TypedDict, cast, override
 
 import anyio
 import click
@@ -40,30 +44,103 @@ _POLLER_STOP_CHECK_S = 0.05
 POLLER_THREAD_NAME = "pivot-tui-event-poller"
 
 
-@contextlib.contextmanager
-def suppress_stderr_logging() -> Generator[None]:
-    """Suppress logging to stdout/stderr while TUI is active.
+def _record_key(record: logging.LogRecord) -> tuple[object, ...]:
+    """What makes two records the same to the user: logger, level, message and exception."""
+    try:
+        exception = logging.Formatter().formatException(record.exc_info) if record.exc_info else ""
+        return (record.name, record.levelno, record.getMessage(), exception, record.stack_info)
+    except Exception:
+        # As logging does, a bad record raises nothing where it is logged. It is kept apart from
+        # every other record, and the handler reports the error when it prints it.
+        return (id(record),)
 
-    Textual takes over the terminal, so stdout/stderr writes appear as garbage
-    in the upper-left corner. This temporarily removes StreamHandlers
-    that write to stdout or stderr and restores them on exit.
+
+class _HoldWhileTuiRuns(logging.Filter):
+    """Keeps a console handler off the terminal while the TUI owns it.
+
+    Until ``tui_started`` is set, records print at once and the warnings among them are
+    remembered. From then on the handler prints nothing: it holds the warnings and errors, and
+    ``release`` prints each one not already printed, in order, then lets records through again.
+    A record repeated exactly (logger, level, message, exception) is held once. Records from
+    ``pivot_tui`` describe the TUI itself, so they are dropped, not held.
+
+    A record logged with ``extra={"pivot_condition": (name, value)}`` reports a condition that a
+    later event can supersede; ``release`` prints it only if ``value`` is still the condition's
+    current value.
     """
-    root = logging.getLogger()
-    removed_handlers = list[logging.Handler]()
 
-    for handler in root.handlers[:]:
+    _lock: threading.RLock
+    _tui_started: threading.Event
+    _printed: set[tuple[object, ...]]
+    _held: dict[tuple[object, ...], logging.LogRecord]
+    _released: bool
+
+    def __init__(self, tui_started: threading.Event) -> None:
+        super().__init__()
+        self._lock = threading.RLock()
+        self._tui_started = tui_started
+        self._printed = set[tuple[object, ...]]()
+        self._held = dict[tuple[object, ...], logging.LogRecord]()
+        self._released = False
+
+    @override
+    def filter(self, record: logging.LogRecord) -> bool:
+        with self._lock:
+            printing = self._released or not self._tui_started.is_set()
+            if record.levelno < logging.WARNING:
+                return printing
+            key = _record_key(record)
+            if printing:
+                self._printed.add(key)
+                return True
+            if record.name.partition(".")[0] != "pivot_tui" and key not in self._printed:
+                self._held.setdefault(key, record)
+            return False
+
+    def release(self, handler: logging.Handler, conditions: Mapping[str, object]) -> None:
+        # Held under the lock, so a record another thread logs meanwhile prints after these.
+        with self._lock:
+            self._released = True
+            for record in self._held.values():
+                condition = getattr(record, "pivot_condition", None)
+                if condition is None or conditions.get(condition[0], condition[1]) == condition[1]:
+                    handler.handle(record)
+            self._held.clear()
+
+
+@contextlib.contextmanager
+def defer_console_logging(
+    tui_started: threading.Event | None = None,
+    conditions: Callable[[], Mapping[str, object]] = dict,
+) -> Generator[None]:
+    """Keep console log output off the terminal while the TUI owns it; print it afterwards.
+
+    Textual takes over the terminal, so stdout/stderr writes appear as garbage in the upper-left
+    corner. Each root handler that writes to stdout or stderr prints nothing once
+    ``tui_started`` is set (at once without it) until the block exits. It then prints the
+    warnings and errors it held and had not printed before the TUI started, leaving out those
+    whose condition ``conditions()`` no longer reports.
+    """
+    if tui_started is None:
+        tui_started = threading.Event()
+        tui_started.set()
+    holds = list[tuple[logging.Handler, _HoldWhileTuiRuns]]()
+    for handler in logging.getLogger().handlers:
         if isinstance(handler, logging.StreamHandler):
             # Cast to known type - stdlib handlers writing to stderr/stdout use TextIO
             # Use string literal because generic type isn't narrowed by isinstance
             stream_handler = cast("logging.StreamHandler[TextIO]", handler)
             if stream_handler.stream in (sys.stderr, sys.stdout):
-                root.removeHandler(stream_handler)
-                removed_handlers.append(stream_handler)
+                hold = _HoldWhileTuiRuns(tui_started)
+                stream_handler.addFilter(hold)
+                holds.append((stream_handler, hold))
     try:
         yield
     finally:
-        for handler in removed_handlers:
-            root.addHandler(handler)
+        current = conditions()
+        for handler, hold in holds:
+            hold.release(handler, current)
+            handler.removeFilter(hold)
 
 
 def compute_dag_levels(graph: nx.DiGraph[str]) -> dict[str, int]:
@@ -415,12 +492,6 @@ def run_tui_with_engine(
             with contextlib.suppress(Exception):
                 app.post_message(tui_run.TuiShutdown(error=error_text))
 
-    # Start engine in background thread
-    engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
-    engine_thread.start()
-    if not socket_ready.wait(timeout=10.0):
-        logger.warning("Engine socket not ready after 10s, poller will retry connect")
-
     async def wait_for_poller_stop(timeout: float) -> bool:
         """Wait up to ``timeout`` seconds for the stop signal; True once it is set."""
         with anyio.move_on_after(timeout):
@@ -468,21 +539,33 @@ def run_tui_with_engine(
         except Exception:
             logger.debug("Event poller stopped", exc_info=True)
 
+    engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
     poller_thread = threading.Thread(
         target=poller_thread_target, name=POLLER_THREAD_NAME, daemon=True
     )
-    poller_thread.start()
+    # Console handlers print as usual until the TUI starts and remember what they printed, so a
+    # warning the engine logs both before the TUI starts and while it runs reaches the terminal
+    # once. A "Pipeline invalid" record held while the TUI ran prints only if the TUI still
+    # shows that error when it exits.
+    tui_started = threading.Event()
+    with defer_console_logging(
+        tui_started, lambda: {engine.PIPELINE_ERROR_CONDITION: app.pipeline_error}
+    ):
+        engine_thread.start()
+        if not socket_ready.wait(timeout=10.0):
+            logger.warning("Engine socket not ready after 10s, poller will retry connect")
+        poller_thread.start()
 
-    # Run TUI in main thread (required for signal handlers)
-    try:
-        if suppress_keyboard_interrupt:
-            with contextlib.suppress(KeyboardInterrupt), suppress_stderr_logging():
+        # Run TUI in main thread (required for signal handlers)
+        tui_started.set()
+        try:
+            if suppress_keyboard_interrupt:
+                with contextlib.suppress(KeyboardInterrupt):
+                    app.run()
+            else:
                 app.run()
-        else:
-            with suppress_stderr_logging():
-                app.run()
-    finally:
-        poller_stop.set()
+        finally:
+            poller_stop.set()
 
     poller_thread.join()
     if result_future is not None:

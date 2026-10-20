@@ -754,7 +754,9 @@ with Pipeline("width") as pipeline:
 """
 
 # Imported by every Python process the command starts: each loky worker records when it started,
-# and the pivot process records when it starts the Textual TUI.
+# and the pivot process records when it starts the Textual TUI. With PIVOT_TEST_CHECKS_AFTER_TUI
+# set, the pivot process's engine checks the tracked files only once the TUI has mounted, the
+# order a busy machine sometimes gives.
 _WORKER_LOG_HOOK = """\
 import os
 import sys
@@ -778,6 +780,32 @@ elif len(sys.orig_argv) > 1 and os.path.basename(sys.orig_argv[1]) == "pivot":
         return _run_tui_with_engine(*args, **kwargs)
 
     _run_common.run_tui_with_engine = _logged_run_tui_with_engine
+
+    if os.environ.get("PIVOT_TEST_CHECKS_AFTER_TUI"):
+        import threading
+
+        import anyio
+        import pivot_tui.run
+        from pivot.engine import engine
+
+        _mounted = threading.Event()
+        _on_mount = pivot_tui.run.PivotApp.on_mount
+        _orchestrate_execution = engine.Engine._orchestrate_execution
+
+        async def _marked_on_mount(self):
+            _mounted.set()
+            await _on_mount(self)
+
+        async def _orchestrate_execution_after_tui(self, *args, **kwargs):
+            # The run checks the tracked files first, so it checks them after the TUI started.
+            with anyio.fail_after(60):
+                while not _mounted.is_set():
+                    await anyio.sleep(0.01)
+            _log("held")
+            return await _orchestrate_execution(self, *args, **kwargs)
+
+        pivot_tui.run.PivotApp.on_mount = _marked_on_mount
+        engine.Engine._orchestrate_execution = _orchestrate_execution_after_tui
 """
 
 
@@ -817,8 +845,11 @@ def _helper_pivot(root: pathlib.Path, env: dict[str, str], *args: str) -> str:
         timeout=180,
         check=False,
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    return proc.stdout + proc.stderr
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    # Python reports a failing sitecustomize and goes on, which would leave a test's hook unset.
+    assert "Error in sitecustomize" not in output, output
+    return output
 
 
 def _helper_configure_workers(root: pathlib.Path, max_workers: int) -> None:
@@ -918,24 +949,160 @@ def test_tui_starts_its_workers_before_the_tui_when_a_tracked_input_is_restored(
     assert started == 3, f"{' '.join(command)} started {started} workers"
 
 
-def test_tui_checkout_missing_warns_once_about_a_changed_tracked_file(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["repro", "--tui", "--checkout-missing"], id="repro-checkout-missing"),
+        pytest.param(["repro", "--tui"], id="repro"),
+        pytest.param(["run", "--tui", "--force", "lone"], id="run"),
+    ],
+)
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param({}, id="as-scheduled"),
+        pytest.param({"PIVOT_TEST_CHECKS_AFTER_TUI": "1"}, id="checks-after-tui"),
+    ],
+)
+def test_tui_warns_once_about_a_changed_tracked_file_whenever_the_engine_checks_it(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+    order: dict[str, str],
 ) -> None:
-    """The pre-warm only restores missing tracked files; checking the others stays the
-    engine's, so a tracked file edited since `pivot track` is reported once."""
+    """A tracked file edited since `pivot track` is reported once, outside the TUI's screen,
+    whether the engine checks it before the TUI starts or while the TUI runs. The pre-warm only
+    restores missing tracked files; checking the others stays the engine's."""
     # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
     root = tmp_path.resolve() / "p"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
-    env, _ = _helper_logging_env(tmp_path)
+    env, worker_log = _helper_logging_env(tmp_path)
     tracked = root / "data" / "raw" / "x.txt"
     tracked.parent.mkdir(parents=True)
     tracked.write_text("tracked")
     _helper_pivot(root, env, "track", "data/raw/x.txt")
     tracked.write_text("edited")
 
-    output = _helper_pivot(root, env, "repro", "--tui", "--checkout-missing")
+    output = _helper_pivot(root, {**env, **order}, *command)
 
+    held = [line for line in worker_log.read_text().splitlines() if line.startswith("held ")]
+    assert len(held) == len(order), f"the order hook held {len(held)} runs"
     assert output.count("has changed since tracking") == 1, output
+    warning = output.find("has changed since tracking")
+    enter, leave = output.find("\x1b[?1049h"), output.rfind("\x1b[?1049l")
+    assert -1 < enter < leave, f"the TUI never took over the terminal:\n{output}"
+    assert warning < enter or warning > leave, f"the warning landed on the TUI's screen:\n{output}"
+
+
+# Appended to _WORKER_LOG_HOOK. With PIVOT_TEST_CHECK_LOG set, the pivot process records each
+# tracked-file check there. With PIVOT_TEST_CHECKS_BEFORE_TUI set as well, the main thread starts
+# the TUI only once the engine's first check has returned: the order a busy machine gives when
+# the engine thread wins the race to the check.
+_CHECK_LOG_HOOK = """
+if (
+    len(sys.orig_argv) > 1
+    and os.path.basename(sys.orig_argv[1]) == "pivot"
+    and os.environ.get("PIVOT_TEST_CHECK_LOG")
+):
+    import threading
+
+    from pivot.cli import _run_common
+    from pivot.executor import core as _core
+
+    _checked = threading.Event()
+    _verify = _core.verify_tracked_files
+
+    def _recorded_verify(*args, **kwargs):
+        try:
+            return _verify(*args, **kwargs)
+        finally:
+            with open(os.environ["PIVOT_TEST_CHECK_LOG"], "a") as log:
+                log.write("check\\n")
+            _checked.set()
+
+    _core.verify_tracked_files = _recorded_verify
+
+    if os.environ.get("PIVOT_TEST_CHECKS_BEFORE_TUI"):
+        _start = threading.Thread.start
+
+        def _start_poller_after_first_check(self):
+            # The main thread starts the event poller just before it starts the TUI.
+            if self.name == _run_common.POLLER_THREAD_NAME and not _checked.wait(60):
+                raise RuntimeError("the engine never checked the tracked files")
+            return _start(self)
+
+        threading.Thread.start = _start_poller_after_first_check
+"""
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param({}, id="as-scheduled"),
+        pytest.param({"PIVOT_TEST_CHECKS_AFTER_TUI": "1"}, id="checks-after-tui"),
+        pytest.param({"PIVOT_TEST_CHECKS_BEFORE_TUI": "1"}, id="checks-before-tui"),
+    ],
+)
+def test_watch_tui_warns_once_about_a_changed_tracked_file_across_its_runs(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, order: dict[str, str]
+) -> None:
+    """`pivot repro --watch --tui` checks the tracked files on every run. A tracked file edited
+    since `pivot track`, and edited again while the session runs, is reported once, outside the
+    TUI's screen, whether the startup run checks it before the TUI starts or while it runs."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
+    env, _ = _helper_logging_env(tmp_path)
+    hook = tmp_path / "hook" / "sitecustomize.py"
+    hook.write_text(hook.read_text() + _CHECK_LOG_HOOK)
+    checks = tmp_path / "checks.log"
+    env["PIVOT_TEST_CHECK_LOG"] = str(checks)
+    tracked = root / "data" / "raw" / "x.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("tracked")
+    _helper_pivot(root, env, "track", "data/raw/x.txt")
+    tracked.write_text("edited")
+    lone = root / "data" / "width" / "lone.txt"
+    log = tmp_path / "pivot.log"
+    with log.open("wb") as output:
+        proc = subprocess.Popen(
+            [str(pathlib.Path(sys.executable).parent / "pivot"), "repro", "--watch", "--tui"],
+            cwd=root,
+            env={**env, **order},
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+
+    def wait_for(done: Callable[[], bool], what: str) -> None:
+        deadline = time.monotonic() + 60
+        while not done():
+            assert proc.poll() is None, f"pivot exited before {what}:\n{log.read_text()}"
+            assert time.monotonic() < deadline, f"no {what} after 60 s:\n{log.read_text()}"
+            time.sleep(0.1)
+
+    try:
+        wait_for(lambda: lone.exists() and lone.read_text().strip() == "edited", "startup run")
+        tracked.write_text("edited again")
+        wait_for(
+            lambda: checks.exists() and len(checks.read_text().splitlines()) >= 2,
+            "re-run's check of the tracked files",
+        )
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    output = log.read_text()
+    assert proc.returncode == 0, output
+    assert "Error in sitecustomize" not in output, output
+    assert output.count("has changed since tracking") == 1, output
+    warning = output.find("has changed since tracking")
+    enter, leave = output.find("\x1b[?1049h"), output.rfind("\x1b[?1049l")
+    assert -1 < enter < leave, f"the TUI never took over the terminal:\n{output}"
+    assert warning < enter or warning > leave, f"the warning landed on the TUI's screen:\n{output}"
 
 
 @pytest.mark.anyio

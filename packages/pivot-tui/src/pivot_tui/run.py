@@ -304,6 +304,11 @@ class PivotApp(textual.app.App[None]):
         """Return message to display after TUI exits (e.g., running stages warning)."""
         return self._exit_message
 
+    @property
+    def pipeline_error(self) -> str | None:
+        """Why the watched pipeline is invalid, as the TUI shows it; None once a reload fixed it."""
+        return self._pipeline_error
+
     def set_event_poller(self, poller: EventPoller) -> None:
         """Set the event poller for clean shutdown.
 

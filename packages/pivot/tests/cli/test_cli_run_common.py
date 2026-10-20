@@ -23,6 +23,7 @@ import pivot_tui.rpc_client_impl
 from conftest import isolated_pivot_dir
 from pivot import cli, compose
 from pivot.cli import _run_common
+from pivot.engine import engine as engine_mod
 
 # =============================================================================
 # Module-level stage functions (required for pickling)
@@ -40,6 +41,7 @@ class _FakeApp:
     ran: bool
     return_code: int | None
     run_return_code: int
+    pipeline_error: str | None
 
     def __init__(self, *, run_return_code: int = 0) -> None:
         self.posted = list[object]()
@@ -47,6 +49,7 @@ class _FakeApp:
         self.ran = False
         self.return_code = None
         self.run_return_code = run_return_code
+        self.pipeline_error = None
 
     def post_message(self, message: object) -> bool:
         self.posted.append(message)
@@ -936,6 +939,57 @@ def test_run_tui_with_engine_watch_quit_while_engine_runs_succeeds(
     assert app.ran is True
 
 
+def test_run_tui_with_engine_prints_a_warning_once_when_logged_before_and_during_the_tui(
+    mocker: MockerFixture, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A watch session checks the tracked files on every run. When the engine's first check
+    logs its warning before the main thread starts the TUI, and a later run logs the same
+    warning while the TUI runs, the user sees it once."""
+    import anyio
+
+    app = _FakeApp()
+    tui_running = threading.Event()
+    logged_during_tui = threading.Event()
+    logger = logging.getLogger("pivot.executor.core")
+    warning = "Tracked file 'x.txt' has changed since tracking."
+
+    async def _engine_fn(socket_ready: threading.Event) -> str:
+        logger.warning(warning)  # the startup run's check, before the TUI starts
+        socket_ready.set()
+        with anyio.fail_after(10):
+            while not tui_running.is_set():
+                await anyio.sleep(0.01)
+        logger.warning(warning)  # a later run's check, while the TUI runs
+        logged_during_tui.set()
+        return "ok"
+
+    def _run_until_logged() -> None:
+        app.ran = True
+        tui_running.set()
+        assert logged_during_tui.wait(10), "the engine never logged while the TUI ran"
+        app.return_code = 0
+
+    app.run = _run_until_logged
+    _FakeRpcPivotClient.instances = []
+    _FakeRpcPivotClient.failures_before_success = 0
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    result_future: concurrent.futures.Future[str] = concurrent.futures.Future()
+    try:
+        _run_common.run_tui_with_engine(
+            app, _engine_fn, tmp_path / "pivot.sock", result_future=result_future
+        )
+    finally:
+        root.removeHandler(handler)
+
+    printed = capsys.readouterr().err
+    assert printed.count(warning) == 1, printed
+    assert result_future.result(timeout=1) == "ok"
+
+
 def test_run_tui_with_engine_stops_poller_when_engine_finishes_before_connect(
     mocker: MockerFixture, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -982,3 +1036,184 @@ def test_run_tui_with_engine_stops_poller_when_engine_finishes_before_connect(
     assert new_threads == [], f"poller thread still alive after return: {new_threads}"
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
     assert result_future.result(timeout=1) == "ok"
+
+
+@pytest.mark.parametrize(
+    "checks_before_tui",
+    [
+        pytest.param(False, id="every-check-while-the-tui-runs"),
+        pytest.param(True, id="startup-check-before-the-tui-holds-output"),
+    ],
+)
+def test_run_tui_with_engine_watch_prints_a_repeated_warning_once(
+    mocker: MockerFixture,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    checks_before_tui: bool,
+) -> None:
+    """A watch session checks the tracked files on every run. Its warning reaches the terminal
+    once, whether the startup run's check comes before the TUI holds console output or after."""
+    import time
+
+    import anyio
+
+    import pivot_tui.run as tui_run
+
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    logger = logging.getLogger("pivot.executor.core")
+    app = _FakeApp()
+    tui_running = threading.Event()
+
+    async def _engine_fn(socket_ready: threading.Event) -> None:
+        if checks_before_tui:
+            logger.warning("tracked file changed")  # the startup run's check
+        socket_ready.set()
+        while not tui_running.is_set():
+            await anyio.sleep(0.01)
+        if not checks_before_tui:
+            logger.warning("tracked file changed")  # the startup run's check
+        logger.warning("tracked file changed")  # a later run's check
+
+    def _run_until_shutdown() -> None:
+        app.ran = True
+        tui_running.set()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(isinstance(m, tui_run.TuiShutdown) for m in app.posted):
+                break
+            time.sleep(0.01)
+        app.return_code = 0
+
+    app.run = _run_until_shutdown
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+    try:
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            oneshot=False,
+            suppress_keyboard_interrupt=True,
+        )
+    finally:
+        root.removeHandler(handler)
+
+    printed = capsys.readouterr().err
+    assert printed.count("tracked file changed") == 1, printed
+
+
+def test_defer_console_logging_prints_each_distinct_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stage that fails twice in a watch session with different errors gets both printed."""
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    logger = logging.getLogger("pivot.engine.engine")
+    try:
+        with _run_common.defer_console_logging():
+            for error in (ValueError("first failure"), KeyError("second failure")):
+                try:
+                    raise error
+                except (ValueError, KeyError):
+                    logger.exception("Stage %s failed with exception", "demo/train")
+        after = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
+
+    assert "first failure" in after.err, after.err
+    assert "second failure" in after.err, after.err
+
+
+def test_defer_console_logging_holds_a_record_whose_argument_repr_raises(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An argument whose repr raises makes the logging call raise nothing, as without the TUI;
+    the record prints once the TUI exits."""
+
+    class _NoRepr:
+        @override
+        def __str__(self) -> str:
+            return "value"
+
+        @override
+        def __repr__(self) -> str:
+            raise RuntimeError("no repr")
+
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    try:
+        with _run_common.defer_console_logging():
+            logging.getLogger("pivot.engine").warning("got %s", _NoRepr())
+        after = capsys.readouterr()
+    finally:
+        root.removeHandler(handler)
+
+    assert after.err == "got value\n", after.err
+
+
+@pytest.mark.parametrize(
+    ("error_at_exit", "printed"),
+    [
+        pytest.param(None, [], id="fixed-before-exit"),
+        pytest.param("boom", ["Pipeline invalid - waiting for fix"], id="still-invalid-at-exit"),
+        pytest.param("other", [], id="replaced-by-another-error"),
+    ],
+)
+def test_run_tui_with_engine_prints_a_pipeline_error_only_while_the_tui_shows_it(
+    mocker: MockerFixture,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    error_at_exit: str | None,
+    printed: list[str],
+) -> None:
+    """A watch session whose pipeline broke and was fixed while the TUI ran prints no stale
+    "Pipeline invalid" after exit; one the TUI still shows when it exits prints."""
+    import anyio
+
+    app = _FakeApp()
+    tui_running = threading.Event()
+    logged = threading.Event()
+    logger = logging.getLogger(engine_mod.__name__)
+
+    async def _engine_fn(socket_ready: threading.Event) -> None:
+        socket_ready.set()
+        with anyio.fail_after(10):
+            while not tui_running.is_set():
+                await anyio.sleep(0.01)
+        logger.error(
+            "Pipeline invalid - waiting for fix",
+            extra={"pivot_condition": (engine_mod.PIPELINE_ERROR_CONDITION, "boom")},
+        )
+        logged.set()
+
+    def _run_until_logged() -> None:
+        app.ran = True
+        tui_running.set()
+        assert logged.wait(10), "the engine never logged while the TUI ran"
+        app.pipeline_error = error_at_exit
+        app.return_code = 0
+
+    app.run = _run_until_logged
+    _FakeRpcPivotClient.instances = []
+    _FakeRpcPivotClient.failures_before_success = 0
+    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
+    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    try:
+        _run_common.run_tui_with_engine(
+            app,
+            _engine_fn,
+            tmp_path / "pivot.sock",
+            oneshot=False,
+            suppress_keyboard_interrupt=True,
+        )
+    finally:
+        root.removeHandler(handler)
+
+    assert capsys.readouterr().err.splitlines() == printed
