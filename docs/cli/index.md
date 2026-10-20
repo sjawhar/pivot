@@ -874,7 +874,7 @@ pivot config unset default_remote
 | `cache.checkout_mode` | Checkout mode order | `hardlink,symlink,copy` |
 | `core.max_workers` | Most parallel workers (-1 = all CPUs); a run starts fewer when fewer of its stages can run at once | `-2` |
 | `core.run_history_retention` | Keep last N runs | `100` |
-| `core.state_dir` | Where Pivot keeps lock files, the state database, the default cache, the RPC socket, secret keys and plot galleries; local to each project | `.pivot` |
+| `core.state_dir` | Where Pivot keeps lock files, the state database, the default cache, the RPC socket, secret keys and plot galleries. Set it in the project's `.pivot/config.yaml`; a global value is ignored with a warning, and `config set --global core.state_dir` is refused. Two projects must never point at the same directory | `.pivot` |
 | `resources` | Scheduler resource capacities | `{}` |
 | `remote.jobs` | Parallel transfer jobs | `20` |
 | `remote.retries` | Transfer retry count | `10` |

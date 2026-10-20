@@ -22,10 +22,13 @@ _merged_config_cache: models.PivotConfig | None = None
 
 DEFAULT_CHECKOUT_MODE_ORDER: list[models.CheckoutMode] = list(models.CheckoutMode)
 
+# Global config files whose ignored core.state_dir was already reported in this process.
+_warned_ignored_global_state_dir = set[pathlib.Path]()
+
 
 def get_global_config_path() -> pathlib.Path:
     """Get user-level config path (~/.config/pivot/config.yaml)."""
-    return project.global_config_path()
+    return pathlib.Path.home() / ".config" / "pivot" / "config.yaml"
 
 
 def get_local_config_path() -> pathlib.Path:
@@ -203,11 +206,49 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def ignored_global_state_dir_message() -> str:
+    """The one-line notice that a global core.state_dir has no effect."""
+    global_path = get_global_config_path()
+    try:
+        local_path = str(get_local_config_path())
+    except exceptions.ProjectNotInitializedError:
+        local_path = "the project's .pivot/config.yaml"
+    return f"core.state_dir in {global_path} is ignored; set it in {local_path}"
+
+
+def _load_global_config() -> dict[str, Any]:
+    """Load the global config, reporting once per process that its core.state_dir is ignored.
+
+    A state directory belongs to one project, so a shared global value would make projects
+    overwrite each other's lock files.
+    """
+    global_path = get_global_config_path()
+    data = load_config_file(global_path)
+    if (
+        get_nested(data, ["core", "state_dir"]) is not _NOT_FOUND
+        and global_path not in _warned_ignored_global_state_dir
+    ):
+        _warned_ignored_global_state_dir.add(global_path)
+        logger.warning(ignored_global_state_dir_message())
+    return data
+
+
+def _default_cache_dir() -> str:
+    """``<state dir>/cache``, relative to the project root when it lies inside it."""
+    root = project.get_project_root()
+    cache_dir = project.state_dir_for(root) / "cache"
+    try:
+        return cache_dir.relative_to(root).as_posix()
+    except ValueError:
+        return str(cache_dir)
+
+
 def get_merged_config() -> models.PivotConfig:
     """Load and merge configs: defaults < global < local.
 
-    Results are cached to avoid repeated disk I/O within a single command.
-    Call clear_config_cache() to reset (e.g., in tests).
+    A global ``core.state_dir`` is left out, so the merged config is the one in effect. An
+    unset ``cache.dir`` is ``<state dir>/cache``. Results are cached to avoid repeated disk I/O
+    within a single command. Call clear_config_cache() to reset (e.g., in tests).
     """
     global _merged_config_cache
     if _merged_config_cache is not None:
@@ -215,11 +256,15 @@ def get_merged_config() -> models.PivotConfig:
 
     defaults = models.PivotConfig.get_default().model_dump()
 
-    global_data = load_config_file(get_global_config_path())
+    global_data = copy.deepcopy(_load_global_config())
+    unset_nested(global_data, ["core", "state_dir"])
     merged = deep_merge(defaults, global_data)
 
     local_data = load_config_file(get_local_config_path())
     merged = deep_merge(merged, local_data)
+
+    if all(get_nested(data, ["cache", "dir"]) is _NOT_FOUND for data in (global_data, local_data)):
+        merged["cache"]["dir"] = _default_cache_dir()
 
     _merged_config_cache = models.PivotConfig.model_validate(merged)
     return _merged_config_cache
@@ -233,7 +278,10 @@ def clear_config_cache() -> None:
 
 
 def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
-    """Get value for dotted key, returns (value, source)."""
+    """Get value for dotted key, returns (value, source).
+
+    A global ``core.state_dir`` is reported with source ``global, ignored``.
+    """
     keys = parse_dotted_key(key)
 
     local_data = load_config_file(get_local_config_path())
@@ -241,11 +289,15 @@ def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
     if local_value is not _NOT_FOUND:
         return local_value, models.ConfigSource.LOCAL
 
-    global_data = load_config_file(get_global_config_path())
+    global_data = _load_global_config()
     global_value = get_nested(global_data, keys)
     if global_value is not _NOT_FOUND:
+        if key == "core.state_dir":
+            return global_value, models.ConfigSource.GLOBAL_IGNORED
         return global_value, models.ConfigSource.GLOBAL
 
+    if key == "cache.dir":
+        return _default_cache_dir(), models.ConfigSource.DEFAULT
     if key in models.CONFIG_KEY_DESCRIPTIONS:
         return models.get_config_default(key), models.ConfigSource.DEFAULT
 
@@ -316,7 +368,12 @@ def _changes_local_state_dir(key: str, scope: models.ConfigScope) -> bool:
 def set_config_value(
     key: str, value: Any, scope: models.ConfigScope = models.ConfigScope.LOCAL
 ) -> list[str]:
-    """Set a configuration value and return any state-transition notices."""
+    """Set a configuration value and return any state-transition notices.
+
+    A global ``core.state_dir`` is refused: it would have no effect.
+    """
+    if key == "core.state_dir" and scope is models.ConfigScope.GLOBAL:
+        raise exceptions.ConfigValidationError(ignored_global_state_dir_message())
     changes_state_dir = _changes_local_state_dir(key, scope)
     old_state_dir: pathlib.Path | None = None
     if changes_state_dir:
@@ -391,14 +448,7 @@ def get_cache_dir() -> pathlib.Path:
     Relative paths are resolved against the project root.
     """
     env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
-    if env_cache:
-        cache_dir = pathlib.Path(env_cache)
-    else:
-        configured = get_merged_config().cache.dir
-        if configured is None:
-            return project.get_state_dir() / "cache"
-        cache_dir = pathlib.Path(configured)
-
+    cache_dir = pathlib.Path(env_cache or get_merged_config().cache.dir)
     if not cache_dir.is_absolute():
         cache_dir = project.get_project_root() / cache_dir
     return cache_dir

@@ -32,6 +32,7 @@ class ConfigSource(enum.StrEnum):
 
     LOCAL = "local"
     GLOBAL = "global"
+    GLOBAL_IGNORED = "global, ignored"
     DEFAULT = "default"
     UNKNOWN = "unknown"
 
@@ -39,7 +40,7 @@ class ConfigSource(enum.StrEnum):
 class CacheConfig(pydantic.BaseModel):
     """Cache configuration options."""
 
-    dir: str | None = None
+    dir: str = ".pivot/cache"
     checkout_mode: list[CheckoutMode] = pydantic.Field(
         default=[CheckoutMode.HARDLINK, CheckoutMode.SYMLINK, CheckoutMode.COPY]
     )

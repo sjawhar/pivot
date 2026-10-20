@@ -89,17 +89,40 @@ def test_config_get_json_output(runner: click.testing.CliRunner, tmp_path: pathl
         assert "source" in data
 
 
-def test_config_get_reports_the_state_relative_cache_default(
+def test_config_get_reports_the_pivot_052_cache_default(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """An unset cache.dir is the documented state-dir-relative default."""
+    """In the default layout, an unset cache.dir prints 0.5.2's exact bytes."""
     with isolated_pivot_dir(runner, tmp_path):
-        result = runner.invoke(cli.cli, ["config", "get", "cache.dir", "--json"])
+        text = runner.invoke(cli.cli, ["config", "get", "cache.dir"])
+        as_json = runner.invoke(cli.cli, ["config", "get", "cache.dir", "--json"])
+        listed = runner.invoke(cli.cli, ["config", "list"])
+        listed_json = runner.invoke(cli.cli, ["config", "list", "--json"])
 
-    assert result.exit_code == 0
-    data = json.loads(result.output)
-    assert data["value"] is None
+    assert text.exit_code == 0, text.output
+    assert text.output == "cache.dir = .pivot/cache (default)\n"
+    assert as_json.exit_code == 0, as_json.output
+    assert as_json.output == '{"key": "cache.dir", "value": ".pivot/cache", "source": "default"}\n'
+    assert "cache.dir = .pivot/cache (default)\n" in listed.output
+    assert json.loads(listed_json.output)["cache"]["dir"] == ".pivot/cache"
+
+
+def test_config_get_reports_the_configured_state_cache_default(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """With core.state_dir set, the reported cache default is the real `<state_dir>/cache`."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path(".pivot/config.yaml").write_text("core:\n  state_dir: altstate\n")
+        text = runner.invoke(cli.cli, ["config", "get", "cache.dir"])
+        as_json = runner.invoke(cli.cli, ["config", "get", "cache.dir", "--json"])
+        listed_json = runner.invoke(cli.cli, ["config", "list", "--json"])
+
+    assert text.exit_code == 0, text.output
+    assert text.output == "cache.dir = altstate/cache (default)\n"
+    data = json.loads(as_json.output)
+    assert data["value"] == "altstate/cache"
     assert data["source"] == "default"
+    assert json.loads(listed_json.output)["cache"]["dir"] == "altstate/cache"
 
 
 def test_config_get_unknown_key_errors(
@@ -182,10 +205,10 @@ def test_config_set_global_flag(
         assert global_config.exists()
 
 
-def test_config_set_global_accepts_state_dir(
+def test_config_set_global_rejects_project_state_dir(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Like 0.5.2, core.state_dir can be set globally."""
+    """core.state_dir is local because it identifies one project's own state."""
     global_config = tmp_path / ".config" / "pivot" / "config.yaml"
 
     from pivot.config import io
@@ -195,8 +218,9 @@ def test_config_set_global_accepts_state_dir(
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "--global", "core.state_dir", "shared"])
 
-    assert result.exit_code == 0, result.output
-    assert "state_dir: shared" in global_config.read_text()
+    assert result.exit_code != 0
+    assert "is ignored; set it in" in result.output
+    assert not global_config.exists()
 
 
 def test_config_set_state_dir_updates_the_current_process(

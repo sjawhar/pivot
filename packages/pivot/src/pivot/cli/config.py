@@ -69,7 +69,9 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
                 _, source = config.get_config_value(f"remotes.{remote_name}")
                 click.echo(f"remotes.{remote_name} = {remote_url} ({source})")
         else:
-            _, source = config.get_config_value(key)
+            configured_value, source = config.get_config_value(key)
+            if source == config.ConfigSource.GLOBAL_IGNORED:
+                value = configured_value
             click.echo(f"{key} = {_format_value(value)} ({source})")
 
 

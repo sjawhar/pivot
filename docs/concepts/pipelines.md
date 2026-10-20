@@ -152,6 +152,11 @@ itself.
 `core.state_dir` selects the state directory and defaults to `.pivot`. The `.pivot/` marker stays
 at the project root and holds the project configuration.
 
+A state directory belongs to one project. Set `core.state_dir` in the project's own
+`.pivot/config.yaml`: a value in the global config is ignored, with a warning. Never point two
+projects at the same directory, including with an absolute path. They would share lock files
+and overwrite each other's records of what ran, so each would see the other's stages as stale.
+
 ```
 <project_root>/
   .pivot/

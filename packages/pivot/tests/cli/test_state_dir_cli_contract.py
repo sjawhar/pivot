@@ -248,45 +248,89 @@ def _run_with_home(
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False, env=env)
 
 
-def _project_with_global_state_dir(
-    tmp_path: pathlib.Path, global_state_dir: str
-) -> tuple[pathlib.Path, pathlib.Path]:
-    home = tmp_path / "home"
+def _write_global_state_dir(home: pathlib.Path, value: str) -> pathlib.Path:
     global_config = home / ".config" / "pivot" / "config.yaml"
-    global_config.parent.mkdir(parents=True)
-    global_config.write_text(f"core:\n  state_dir: {global_state_dir}\n")
-    root = tmp_path / "project"
+    global_config.parent.mkdir(parents=True, exist_ok=True)
+    global_config.write_text(f"core:\n  state_dir: {value}\n")
+    return global_config
+
+
+def _project(home: pathlib.Path, root: pathlib.Path, input_text: str) -> pathlib.Path:
     root.mkdir()
     _ok(_run_with_home(root, home, "git", "init", "-q"))
     _ok(_run_with_home(root, home, _PIVOT, "init"))
     (root / "data" / "raw").mkdir(parents=True)
-    (root / "data" / "raw" / "input.txt").write_text("input\n")
+    (root / "data" / "raw" / "input.txt").write_text(input_text)
     (root / "pipeline.py").write_text(_PIPELINE)
-    return root, home
+    return root
 
 
-def test_global_relative_state_dir_is_rooted_at_each_project(tmp_path: pathlib.Path) -> None:
-    """Like 0.5.2, a global relative core.state_dir holds that project's state under its root."""
-    root, home = _project_with_global_state_dir(tmp_path, "globalstate")
-
-    repro = _run_with_home(root, home, _PIVOT, "repro")
-    reported = _run_with_home(root, home, _PIVOT, "config", "get", "core.state_dir")
-
-    assert repro.returncode == 0, repro.stdout + repro.stderr
-    assert (root / "globalstate" / "stages" / "test" / "process.lock").is_file()
-    assert (root / "globalstate" / "state.lmdb").is_dir()
-    assert not (root / ".pivot" / "state.lmdb").exists()
-    assert reported.stdout.strip() == "core.state_dir = globalstate (global)", reported.stdout
+def _ignored_warning(global_config: pathlib.Path, root: pathlib.Path) -> str:
+    return (
+        f"core.state_dir in {global_config} is ignored; set it in {root / '.pivot' / 'config.yaml'}"
+    )
 
 
-def test_local_state_dir_overrides_the_global_one(tmp_path: pathlib.Path) -> None:
-    """A project's own core.state_dir wins over the global value."""
-    root, home = _project_with_global_state_dir(tmp_path, "globalstate")
-    _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "localstate"))
+def _stage_states(home: pathlib.Path, root: pathlib.Path) -> str:
+    status = _run_with_home(root, home, _PIVOT, "status")
+    assert status.returncode == 0, status.stdout + status.stderr
+    return status.stdout
 
-    repro = _run_with_home(root, home, _PIVOT, "repro")
 
-    assert repro.returncode == 0, repro.stdout + repro.stderr
-    assert (root / "localstate" / "stages" / "test" / "process.lock").is_file()
-    assert not (root / "globalstate" / "stages" / "test").exists()
-    assert not (root / "globalstate" / "state.lmdb").exists()
+def test_projects_sharing_a_global_state_dir_keep_correct_skip_decisions(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A global core.state_dir is ignored, so two projects never share lock files."""
+    home = tmp_path / "home"
+    global_config = _write_global_state_dir(home, str(tmp_path / "shared"))
+    a = _project(home, tmp_path / "a", "input-a\n")
+    b = _project(home, tmp_path / "b", "input-b\n")
+
+    for root in (a, b):
+        repro = _run_with_home(root, home, _PIVOT, "repro")
+        assert repro.returncode == 0, repro.stdout + repro.stderr
+        assert _ignored_warning(global_config, root) in repro.stderr, repro.stderr
+
+    assert "1 cached, 0 stale" in _stage_states(home, a)
+    assert "1 cached, 0 stale" in _stage_states(home, b)
+
+    (b / "data" / "raw" / "input.txt").write_text("input-b-changed\n")
+    _ok(_run_with_home(b, home, _PIVOT, "repro"))
+
+    assert "1 cached, 0 stale" in _stage_states(home, a)
+    assert "1 cached, 0 stale" in _stage_states(home, b)
+    for root in (a, b):
+        assert (root / ".pivot" / "stages" / "test" / "process.lock").is_file()
+    assert not (tmp_path / "shared" / "stages").exists()
+
+
+def test_config_get_and_list_show_a_global_state_dir_as_ignored(tmp_path: pathlib.Path) -> None:
+    """The reporting surfaces never present an ignored global value as in effect."""
+    home = tmp_path / "home"
+    global_config = _write_global_state_dir(home, "globalstate")
+    root = _project(home, tmp_path / "project", "input\n")
+
+    got = _run_with_home(root, home, _PIVOT, "config", "get", "core.state_dir")
+    listed = _run_with_home(root, home, _PIVOT, "config", "list")
+
+    assert got.returncode == 0, got.stdout + got.stderr
+    assert got.stdout.strip() == "core.state_dir = globalstate (global, ignored)", got.stdout
+    assert _ignored_warning(global_config, root) in got.stderr, got.stderr
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "core.state_dir = globalstate (global, ignored)" in listed.stdout, listed.stdout
+
+
+def test_config_set_global_state_dir_is_refused(tmp_path: pathlib.Path) -> None:
+    """A new global write is refused with the same one-line message, leaving no global file."""
+    home = tmp_path / "home"
+    root = _project(home, tmp_path / "project", "input\n")
+    global_config = home / ".config" / "pivot" / "config.yaml"
+
+    result = _run_with_home(
+        root, home, _PIVOT, "config", "set", "--global", "core.state_dir", "shared"
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert output.strip() == f"Error: {_ignored_warning(global_config, root)}", output
+    assert not global_config.exists()
