@@ -52,6 +52,12 @@ call it.
 (`<prefix>files/<hash[:2]>/<hash[2:]>`), hash validation, the streaming xxh64 digest, the
 hash-mismatch error, and the staged atomic download. A change to the hash or the layout goes there.
 
+`batch.py` owns the orchestration both backends run: `bulk_exists` (per-hash requests below 50
+hashes, a listing per 2-char prefix from 50 up), `cache_hashes` (which object names are cache
+objects), and `transfer_batch` (a failed transfer is a `TransferResult(success=False)`, never an
+exception). A backend passes its client context and per-object coroutines; checks on one object,
+such as GCS's upload verification, belong in those coroutines, not in `batch.py`.
+
 - **S3Remote** uses `aioboto3.Session()` — one session per instance, one client per method call;
   batch methods share that client across concurrent tasks.
 - **GCSRemote** opens one `aiohttp.ClientSession` per method call, shared by a batch's concurrent
@@ -62,7 +68,14 @@ hash-mismatch error, and the staged atomic download. A change to the hash or the
   10-30s, too short for large objects. Two requests keep gcloud-aio's fixed 10s total, because
   its public API exposes no timeout for them: a resumable upload's session-start POST, and the
   token request. It retries transient failures `remote.retries` times. Uploads above 8 MiB use a
-  resumable upload.
+  resumable upload, whose data PUT gcloud-aio first retries itself (up to 5 tries, each sent with
+  `Content-Range: bytes */*`); that loop can take a `308 Resume Incomplete` as success.
+- **A GCS upload counts only when the object resource the server returns has the key, the local
+  size and the local file's MD5** (`md5Hash`). Any other reply is retried as a fresh upload, then
+  fails, so `sync` never records a hash the remote lacks.
+- **No GCS error carries an HTTP client exception's str or repr, or chains one as its cause.**
+  aiohttp's repr includes the request headers, and so the bearer token. Report the status and
+  Google's message (`gcs._describe`, `gcs._remote_error`) and raise `from None`.
 
 ### Auth Conventions
 

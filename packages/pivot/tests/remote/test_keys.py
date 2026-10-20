@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from typing import TYPE_CHECKING
 
@@ -8,6 +9,7 @@ import xxhash
 
 from pivot import exceptions
 from pivot.remote import keys
+from pivot.storage import cache
 
 if TYPE_CHECKING:
     import pathlib
@@ -142,3 +144,98 @@ def test_check_digest_mismatch_names_location_and_recovery() -> None:
     assert message.startswith("Hash mismatch: expected abcdef1234567890, got 0000000000000000")
     assert "Delete gs://b/files/ab/cdef1234567890 from the remote, then run `pivot push`" in message
     assert "delete `.pivot/state.lmdb/`" in message
+
+
+# -----------------------------------------------------------------------------
+# Atomic Download Tests (every backend's download_file and download_batch)
+# -----------------------------------------------------------------------------
+
+
+def _writer(content: bytes):  # noqa: ANN202 - a download_verified stand-in
+    async def download_verified(dest: pathlib.Path) -> None:
+        dest.write_bytes(content)
+
+    return download_verified
+
+
+async def _failing(dest: pathlib.Path) -> None:
+    dest.write_bytes(b"partial")
+    raise exceptions.RemoteError("Hash mismatch: expected …")
+
+
+@pytest.mark.parametrize("overwrite", [True, False], ids=["download_file", "download_batch"])
+async def test_atomic_download_readonly_sets_0o444(tmp_path: pathlib.Path, overwrite: bool) -> None:
+    dest = tmp_path / "dest"
+
+    await keys.atomic_download(dest, _writer(b"content"), overwrite=overwrite, readonly=True)
+
+    assert dest.read_bytes() == b"content"
+    assert dest.stat().st_mode & 0o777 == 0o444
+
+
+async def test_atomic_download_default_permissions_are_writable(tmp_path: pathlib.Path) -> None:
+    dest = tmp_path / "dest"
+
+    await keys.atomic_download(dest, _writer(b"content"), overwrite=True, readonly=False)
+
+    assert dest.stat().st_mode & 0o200, oct(dest.stat().st_mode)
+
+
+@pytest.mark.parametrize("overwrite", [True, False], ids=["download_file", "download_batch"])
+async def test_atomic_download_failure_leaves_nothing(
+    tmp_path: pathlib.Path, overwrite: bool
+) -> None:
+    dest = tmp_path / "dest"
+
+    with pytest.raises(exceptions.RemoteError, match="Hash mismatch"):
+        await keys.atomic_download(dest, _failing, overwrite=overwrite, readonly=True)
+
+    assert [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK] == []
+
+
+async def test_atomic_download_overwrite_replaces_an_existing_file(tmp_path: pathlib.Path) -> None:
+    dest = tmp_path / "dest"
+    dest.write_bytes(b"old")
+
+    await keys.atomic_download(dest, _writer(b"new"), overwrite=True, readonly=False)
+
+    assert dest.read_bytes() == b"new"
+    assert os.listdir(tmp_path) == ["dest"]
+
+
+async def test_atomic_download_keeps_an_existing_cache_entry(tmp_path: pathlib.Path) -> None:
+    """A cache entry another process may be hardlinking is never replaced (#461)."""
+    dest = tmp_path / "entry"
+    dest.write_bytes(b"content")
+    inode = dest.stat().st_ino
+
+    await keys.atomic_download(dest, _writer(b"content"), overwrite=False, readonly=True)
+
+    assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
+    assert [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK] == ["entry"]
+
+
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
+@pytest.mark.parametrize("exists", [False, True])
+async def test_atomic_download_without_hard_links(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, link_errno: int, exists: bool
+) -> None:
+    """On a filesystem that refuses link() (vfat, many SMB and FUSE mounts), the verified file is
+    still promoted, and an existing entry is still kept."""
+    dest = tmp_path / "entry"
+    inode = None
+    if exists:
+        dest.write_bytes(b"content")
+        inode = dest.stat().st_ino
+
+    def _refuse_link(src: object, dst: object) -> None:
+        raise OSError(link_errno, os.strerror(link_errno))
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    await keys.atomic_download(dest, _writer(b"content"), overwrite=False, readonly=True)
+
+    assert dest.read_bytes() == b"content"
+    if inode is not None:
+        assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
+    assert [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK] == ["entry"]

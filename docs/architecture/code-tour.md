@@ -163,6 +163,7 @@ The TUI is a **pure RPC client** in a separate package (`pivot-tui`). It has zer
 - `packages/pivot/src/pivot/remote/storage.py` - S3 backend (`S3Remote`)
 - `packages/pivot/src/pivot/remote/gcs.py` - GCS backend (`GCSRemote`)
 - `packages/pivot/src/pivot/remote/keys.py` - Object key layout and download integrity checks both backends share
+- `packages/pivot/src/pivot/remote/batch.py` - Batch existence checks and transfers both backends run
 - `packages/pivot/src/pivot/remote/sync.py` - Push/pull logic
 - `packages/pivot/src/pivot/remote/config.py` - Remote configuration and URL validation
 

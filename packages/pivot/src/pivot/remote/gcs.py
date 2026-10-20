@@ -3,25 +3,29 @@
 Credentials are Application Default Credentials (``GOOGLE_APPLICATION_CREDENTIALS``, then
 ``gcloud auth application-default login``, then the GCE metadata server). ``STORAGE_EMULATOR_HOST``
 points the backend at an emulator such as fake-gcs-server, which needs no credentials.
+
+No error this module raises or logs contains an HTTP client exception's str or repr, nor chains
+one as its cause: aiohttp's repr carries the request headers, including the bearer token. Errors
+report the HTTP status and Google's own error message instead (``_describe``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import random
-from collections import defaultdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import aiohttp
 
-from pivot import config, exceptions, metrics
+from pivot import config, exceptions
+from pivot.remote import batch, keys
 from pivot.remote import config as remote_config
-from pivot.remote import keys
-from pivot.types import TransferResult
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
@@ -29,13 +33,12 @@ if TYPE_CHECKING:
 
     from gcloud.aio.storage import Storage, StreamResponse
 
+    from pivot.types import TransferResult
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONCURRENCY = 20
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # Read size for downloads; larger uploads go resumable
 STREAM_READ_TIMEOUT = 60  # Seconds to wait for each read from the network
-# Threshold for listing by prefix instead of one metadata request per hash in bulk_exists
-BULK_EXISTS_LIST_THRESHOLD = 50
 LIST_PAGE_SIZE = 1000  # Objects per listing page (the GCS maximum)
 
 # Statuses that may succeed on retry: request timeout, rate limit, and server-side failures
@@ -52,6 +55,10 @@ _AUTH_ERROR_MESSAGE = (
 )
 
 
+class _UploadNotStoredError(Exception):
+    """The server's reply to an upload does not show the whole object stored. Retryable."""
+
+
 def _google_message(exc: aiohttp.ClientResponseError) -> str:
     """Google's own error message from a gcloud-aio error ("<reason>: <JSON body>")."""
     _, _, body = exc.message.partition(": ")
@@ -63,10 +70,24 @@ def _google_message(exc: aiohttp.ClientResponseError) -> str:
     return str(message)
 
 
+def _describe(exc: BaseException) -> str:
+    """What failed, for a message: never an HTTP client exception's str or repr."""
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return f"HTTP {exc.status}: {_google_message(exc)}"
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return f"{type(exc).__name__} connecting to {exc.host}:{exc.port}"
+    if isinstance(exc, (aiohttp.ClientError, TimeoutError)):
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _remote_error(
     exc: aiohttp.ClientError | TimeoutError, action: str, location: str
 ) -> exceptions.RemoteConnectionError:
-    """An actionable error for a failed GCS request to ``action`` (read/list/write) ``location``."""
+    """An actionable error for a failed GCS request to ``action`` (read/list/write) ``location``.
+
+    Raise it ``from None``, so a traceback does not print the client exception either.
+    """
     if isinstance(exc, aiohttp.ClientResponseError):
         if exc.status == 401:
             return exceptions.RemoteConnectionError(_AUTH_ERROR_MESSAGE)
@@ -75,10 +96,10 @@ def _remote_error(
                 f"Permission denied to {action} {location}: {_google_message(exc)}"
             )
         return exceptions.RemoteConnectionError(
-            f"GCS {action} error for {location}: HTTP {exc.status}: {_google_message(exc)}"
+            f"GCS {action} error for {location}: {_describe(exc)}"
         )
     return exceptions.RemoteConnectionError(
-        f"Cannot reach Google Cloud Storage to {action} {location}: {exc!r}. "
+        f"Cannot reach Google Cloud Storage to {action} {location}: {_describe(exc)}. "
         + "Check network connectivity."
     )
 
@@ -89,6 +110,27 @@ def _emulated() -> bool:
 
     is_dev, _ = gcloud_storage_impl.init_api_root(None)
     return is_dev
+
+
+def _md5_base64(path: Path) -> str:
+    """The file's MD5 as Cloud Storage reports it in ``md5Hash`` (base64 of the digest)."""
+    with path.open("rb") as f:
+        digest = hashlib.file_digest(f, lambda: hashlib.md5(usedforsecurity=False)).digest()
+    return base64.b64encode(digest).decode()
+
+
+def _not_stored(stored: object, key: str, size: int, md5: str) -> str | None:
+    """Why the object resource an upload returned is not ``size`` bytes with ``md5`` at ``key``."""
+    if not isinstance(stored, dict):
+        return "the server returned no object"
+    resource = cast("dict[str, object]", stored)
+    if resource.get("name") != key:
+        return f"the server stored {resource.get('name')!r}"
+    if str(resource.get("size")) != str(size):
+        return f"the server stored {resource.get('size')} of {size} bytes"
+    if resource.get("md5Hash") != md5:
+        return "the stored object's MD5 does not match the local file"
+    return None
 
 
 async def _stream_download_to_fd(stream: StreamResponse, fd: int) -> str:
@@ -165,14 +207,15 @@ class GCSRemote:
         from gcloud.aio import storage as gcloud_storage
 
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
-            client = gcloud_storage.Storage(session=session)
-            if not _emulated():
-                try:
+            try:
+                # Reads GOOGLE_APPLICATION_CREDENTIALS, so a missing or bad key file fails here
+                client = gcloud_storage.Storage(session=session)
+                if not _emulated():
                     await client.token.get()
-                except Exception as e:  # any failure to get a token leaves no usable credentials
-                    raise exceptions.RemoteConnectionError(
-                        f"{_AUTH_ERROR_MESSAGE} Getting a token failed: {e!r}"
-                    ) from e
+            except Exception as e:  # any failure here leaves no usable credentials
+                raise exceptions.RemoteConnectionError(
+                    f"{_AUTH_ERROR_MESSAGE} Getting a token failed: {_describe(e)}"
+                ) from None
             yield client
 
     async def _with_retries[T](self, request: Callable[[], Awaitable[T]]) -> T:
@@ -184,7 +227,7 @@ class GCSRemote:
             except aiohttp.ClientResponseError as e:
                 if e.status not in _RETRYABLE_STATUSES or attempt >= self._retries:
                     raise
-            except (aiohttp.ClientConnectionError, TimeoutError):
+            except (aiohttp.ClientConnectionError, TimeoutError, _UploadNotStoredError):
                 if attempt >= self._retries:
                     raise
             delay = random.uniform(0, min(_RETRY_MAX_DELAY, _RETRY_BASE_DELAY * 2**attempt))
@@ -205,9 +248,9 @@ class GCSRemote:
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
                 return False
-            raise _remote_error(e, "read", self._location(key)) from e
+            raise _remote_error(e, "read", self._location(key)) from None
         except (aiohttp.ClientError, TimeoutError) as e:
-            raise _remote_error(e, "read", self._location(key)) from e
+            raise _remote_error(e, "read", self._location(key)) from None
         return True
 
     async def _iter_keys(self, client: Storage, prefix: str) -> AsyncGenerator[str]:
@@ -227,7 +270,7 @@ class GCSRemote:
                     )
                 )
             except (aiohttp.ClientError, TimeoutError) as e:
-                raise _remote_error(e, "list", self._location(prefix)) from e
+                raise _remote_error(e, "list", self._location(prefix)) from None
             for item in page.get("items", []):
                 yield str(item["name"])
             token = page.get("nextPageToken")
@@ -235,30 +278,43 @@ class GCSRemote:
                 return
             params["pageToken"] = str(token)
 
-    async def _upload(self, client: Storage, local_path: Path, hash_: str) -> None:
+    async def _upload(self, client: Storage, hash_: str, local_path: Path) -> None:
         """Upload one file: a simple upload up to 8 MiB, a resumable upload above it.
+
+        The upload counts only when the object the server returns has this key, the local
+        file's size and its MD5; any other reply is retried as a new upload, then fails. This
+        catches gcloud-aio's own retry of a failed resumable PUT, which accepts a
+        ``308 Resume Incomplete`` as the end of the upload.
 
         The resumable session-start POST carries gcloud-aio's fixed 10s total timeout; the data
         PUT carries ``self._timeout``.
         """
         key = keys.hash_to_key(self._prefix, hash_)
-        resumable = local_path.stat().st_size > STREAM_CHUNK_SIZE
+        size = local_path.stat().st_size
+        md5 = await asyncio.to_thread(_md5_base64, local_path)
 
         async def attempt() -> None:
             with local_path.open("rb") as f:
-                await client.upload(
+                stored: object = await client.upload(
                     self._bucket,
                     key,
                     f,
                     content_type=_OCTET_STREAM,
-                    force_resumable_upload=resumable,
+                    force_resumable_upload=size > STREAM_CHUNK_SIZE,
                     timeout=self._timeout,  # pyright: ignore[reportArgumentType] - gcloud-aio passes an aiohttp.ClientTimeout through
                 )
+            problem = _not_stored(stored, key, size, md5)
+            if problem is not None:
+                raise _UploadNotStoredError(problem)
 
         try:
             await self._with_retries(attempt)
+        except _UploadNotStoredError as e:
+            raise exceptions.RemoteConnectionError(
+                f"Upload to {self._location(key)} did not complete: {e}"
+            ) from None
         except (aiohttp.ClientError, TimeoutError) as e:
-            raise _remote_error(e, "write", self._location(key)) from e
+            raise _remote_error(e, "write", self._location(key)) from None
 
     async def _download_verified(
         self, client: Storage, key: str, dest: Path, expected_hash: str
@@ -276,14 +332,16 @@ class GCSRemote:
             if e.status == 404:
                 raise exceptions.RemoteError(
                     f"Remote cache file not found: {self._location(key)}"
-                ) from e
-            raise _remote_error(e, "read", self._location(key)) from e
+                ) from None
+            raise _remote_error(e, "read", self._location(key)) from None
         except (aiohttp.ClientError, TimeoutError) as e:
-            raise _remote_error(e, "read", self._location(key)) from e
+            raise _remote_error(e, "read", self._location(key)) from None
         fd = os.open(dest, os.O_WRONLY | os.O_TRUNC)
         try:
             async with stream:
                 actual_hash = await _stream_download_to_fd(stream, fd)
+        except aiohttp.ClientError as e:  # the body broke off mid-download
+            raise _remote_error(e, "read", self._location(key)) from None
         finally:
             with contextlib.suppress(OSError):
                 os.close(fd)
@@ -296,105 +354,40 @@ class GCSRemote:
             return await self._exists(client, cache_hash)
 
     async def bulk_exists(
-        self, hashes: list[str], concurrency: int = DEFAULT_CONCURRENCY
+        self, hashes: list[str], concurrency: int = batch.DEFAULT_CONCURRENCY
     ) -> dict[str, bool]:
         """Check which hashes exist on remote.
 
-        For small batches (< BULK_EXISTS_LIST_THRESHOLD), asks for each object's metadata in
-        parallel. For large batches, lists by 2-char prefix (one page holds 1000 objects).
+        Small batches ask for each object's metadata in parallel; large ones list by 2-char
+        prefix, one request per 1000 objects (``batch.bulk_exists``).
         """
-        _t = metrics.start()
-        if not hashes:
-            metrics.end("gcs.bulk_exists", _t)
-            return {}
-
-        for h in hashes:
-            keys.validate_hash(h)
-
-        try:
-            async with self._client() as client:
-                if len(hashes) >= BULK_EXISTS_LIST_THRESHOLD:
-                    return await self._bulk_exists_via_list(client, hashes, concurrency)
-                return await self._bulk_exists_via_head(client, hashes, concurrency)
-        finally:
-            metrics.end("gcs.bulk_exists", _t)
-
-    async def _bulk_exists_via_head(
-        self, client: Storage, hashes: list[str], concurrency: int
-    ) -> dict[str, bool]:
-        semaphore = asyncio.Semaphore(concurrency)
-
-        async def check_one(hash_: str) -> tuple[str, bool]:
-            async with semaphore:
-                return hash_, await self._exists(client, hash_)
-
-        results = await asyncio.gather(*[check_one(h) for h in hashes], return_exceptions=True)
-
-        output = dict[str, bool]()
-        for result in results:
-            if isinstance(result, BaseException):
-                raise exceptions.RemoteConnectionError(
-                    f"GCS bulk_exists failed: {result}"
-                ) from result
-            hash_, exists = result
-            output[hash_] = exists
-        return output
-
-    async def _bulk_exists_via_list(
-        self, client: Storage, hashes: list[str], concurrency: int
-    ) -> dict[str, bool]:
-        by_prefix = defaultdict[str, set[str]](set)
-        for h in hashes:
-            by_prefix[h[:2]].add(h)
-
-        semaphore = asyncio.Semaphore(concurrency)
-
-        async def list_prefix(prefix: str, wanted: set[str]) -> dict[str, bool]:
-            names = self._iter_keys(client, f"{self._prefix}files/{prefix}/")
-            async with semaphore, contextlib.aclosing(names):
-                found = set[str]()
-                async for key in names:
-                    hash_ = keys.key_to_hash(self._prefix, key)
-                    if hash_ in wanted:
-                        found.add(hash_)
-                        if found == wanted:
-                            break
-                return {h: h in found for h in wanted}
-
-        tasks = [list_prefix(prefix, wanted) for prefix, wanted in by_prefix.items()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        output = dict[str, bool]()
-        for result in results:
-            if isinstance(result, BaseException):
-                raise exceptions.RemoteConnectionError(
-                    f"GCS bulk_exists LIST failed: {result}"
-                ) from result
-            output.update(result)
-        return output
+        return await batch.bulk_exists(
+            hashes,
+            concurrency,
+            open_client=self._client,
+            exists_one=self._exists,
+            list_names=self._iter_keys,
+            prefix=self._prefix,
+            label="GCS",
+            metric="gcs.bulk_exists",
+        )
 
     async def iter_hashes(self) -> AsyncIterator[str]:
         """Iterate over all cache hashes on remote (memory-efficient streaming)."""
         async with self._client() as client:
-            async for key in self._iter_keys(client, f"{self._prefix}files/"):
-                hash_ = keys.key_to_hash(self._prefix, key)
-                if hash_ is not None:
-                    yield hash_
+            names = self._iter_keys(client, f"{self._prefix}files/")
+            async for hash_ in batch.cache_hashes(names, self._prefix):
+                yield hash_
 
     async def list_hashes(self) -> set[str]:
         """List all cache hashes on remote (collects into memory)."""
-        _t = metrics.start()
-        hashes = set[str]()
-        async for hash_ in self.iter_hashes():
-            hashes.add(hash_)
-        metrics.end("gcs.list_hashes", _t)
-        return hashes
+        return await batch.collect_hashes(self.iter_hashes(), "gcs.list_hashes")
 
     async def upload_file(self, local_path: Path, cache_hash: str) -> None:
         """Upload a single file to remote, streamed from disk."""
         keys.validate_hash(cache_hash)
         async with self._client() as client:
-            await self._upload(client, local_path, cache_hash)
+            await self._upload(client, cache_hash, local_path)
 
     async def download_file(
         self, cache_hash: str, local_path: Path, *, readonly: bool = False
@@ -413,7 +406,7 @@ class GCSRemote:
     async def upload_batch(
         self,
         items: list[tuple[Path, str]],
-        concurrency: int = DEFAULT_CONCURRENCY,
+        concurrency: int = batch.DEFAULT_CONCURRENCY,
         callback: Callable[[int, int, str], None] | None = None,
     ) -> list[TransferResult]:
         """Upload multiple files in parallel; a failed file is reported, never raised.
@@ -421,40 +414,19 @@ class GCSRemote:
         Missing or unusable credentials are the exception: they raise one RemoteConnectionError
         before any transfer starts, rather than a failed result per file.
         """
-        _t = metrics.start()
-        if not items:
-            metrics.end("gcs.upload_batch", _t)
-            return []
-
-        for _, h in items:
-            keys.validate_hash(h)
-
-        try:
-            semaphore = asyncio.Semaphore(concurrency)
-            completed = 0
-
-            async with self._client() as client:
-
-                async def upload_one(local_path: Path, hash_: str) -> TransferResult:
-                    nonlocal completed
-                    async with semaphore:
-                        try:
-                            await self._upload(client, local_path, hash_)
-                            completed += 1
-                            if callback:
-                                callback(completed, len(items), local_path.name)
-                            return TransferResult(hash=hash_, success=True)
-                        except Exception as e:
-                            return TransferResult(hash=hash_, success=False, error=str(e))
-
-                return await asyncio.gather(*[upload_one(p, h) for p, h in items])
-        finally:
-            metrics.end("gcs.upload_batch", _t)
+        return await batch.transfer_batch(
+            [(h, p) for p, h in items],
+            concurrency,
+            callback,
+            open_client=self._client,
+            transfer_one=self._upload,
+            metric="gcs.upload_batch",
+        )
 
     async def download_batch(
         self,
         items: list[tuple[str, Path]],
-        concurrency: int = DEFAULT_CONCURRENCY,
+        concurrency: int = batch.DEFAULT_CONCURRENCY,
         callback: Callable[[int, int, str], None] | None = None,
         *,
         readonly: bool = False,
@@ -469,38 +441,21 @@ class GCSRemote:
         Args:
             readonly: If True, set file permissions to 0o444 (for cache files).
         """
-        _t = metrics.start()
-        if not items:
-            metrics.end("gcs.download_batch", _t)
-            return []
 
-        for h, _ in items:
-            keys.validate_hash(h)
+        async def download_one(client: Storage, hash_: str, local_path: Path) -> None:
+            key = keys.hash_to_key(self._prefix, hash_)
+            await keys.atomic_download(
+                local_path,
+                lambda dest: self._download_verified(client, key, dest, hash_),
+                overwrite=False,
+                readonly=readonly,
+            )
 
-        try:
-            semaphore = asyncio.Semaphore(concurrency)
-            completed = 0
-
-            async with self._client() as client:
-
-                async def download_one(hash_: str, local_path: Path) -> TransferResult:
-                    nonlocal completed
-                    async with semaphore:
-                        key = keys.hash_to_key(self._prefix, hash_)
-                        try:
-                            await keys.atomic_download(
-                                local_path,
-                                lambda dest: self._download_verified(client, key, dest, hash_),
-                                overwrite=False,
-                                readonly=readonly,
-                            )
-                            completed += 1
-                            if callback:
-                                callback(completed, len(items), local_path.name)
-                            return TransferResult(hash=hash_, success=True)
-                        except Exception as e:
-                            return TransferResult(hash=hash_, success=False, error=str(e))
-
-                return await asyncio.gather(*[download_one(h, p) for h, p in items])
-        finally:
-            metrics.end("gcs.download_batch", _t)
+        return await batch.transfer_batch(
+            items,
+            concurrency,
+            callback,
+            open_client=self._client,
+            transfer_one=download_one,
+            metric="gcs.download_batch",
+        )

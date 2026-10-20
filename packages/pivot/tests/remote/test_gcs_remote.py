@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import json
 import os
 import pathlib
@@ -662,31 +661,6 @@ async def test_upload_batch(
         assert await _get(gcs_client, gcs_remote, cache_hash) == data
 
 
-async def test_upload_batch_with_callback(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path
-) -> None:
-    """upload_batch calls callback for each completed upload."""
-    files = list[tuple[pathlib.Path, str]]()
-    for i in range(3):
-        f = tmp_path / f"file{i}.txt"
-        f.write_text(f"content {i}")
-        files.append((f, f"a{i}b2c3d4e5f6789a"))
-    callback_values = list[int]()
-
-    def callback(completed: int, total: int, filename: str) -> None:
-        callback_values.append(completed)
-
-    await gcs_remote.upload_batch(files, concurrency=1, callback=callback)
-
-    assert sorted(callback_values) == [1, 2, 3]
-
-
-async def test_upload_batch_empty() -> None:
-    """upload_batch with empty list returns empty results."""
-    r = gcs.GCSRemote("gs://bucket/prefix")
-    assert await r.upload_batch([]) == []
-
-
 async def test_upload_batch_reports_each_failure_and_never_raises(
     gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, gcs_client: gcloud_storage.Storage
 ) -> None:
@@ -721,25 +695,6 @@ async def test_upload_batch_shares_one_http_session(
 
     assert all(r["success"] for r in results)
     assert session_init.call_count == 1
-
-
-async def test_upload_batch_calls_metrics_end_on_error(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
-    """upload_batch calls metrics.end even when uploads fail."""
-    from pivot import metrics
-
-    mocker.patch.object(
-        gcloud_storage.Storage, "upload", new=mocker.AsyncMock(side_effect=OSError("upload boom"))
-    )
-    spy_end = mocker.spy(metrics, "end")
-    f = tmp_path / "file.txt"
-    f.write_text("content")
-
-    results = await gcs_remote.upload_batch([(f, "a1b2c3d4e5f6789a")])
-
-    assert [r["success"] for r in results] == [False]
-    spy_end.assert_any_call("gcs.upload_batch", mocker.ANY)
 
 
 # -----------------------------------------------------------------------------
@@ -793,36 +748,6 @@ async def test_download_file_hash_mismatch(
     assert f"Delete {key} from the remote, then run `pivot push`" in message
     assert not dest.exists()
     assert os.listdir(tmp_path) == []
-
-
-async def test_download_file_readonly(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, gcs_client: gcloud_storage.Storage
-) -> None:
-    """download_file with readonly=True sets 0o444 permissions (for cache files)."""
-    cache_hash = _helper_hash(b"cached content")
-    await _put(gcs_client, gcs_remote, cache_hash, b"cached content")
-    dest_file = tmp_path / "cached.txt"
-
-    await gcs_remote.download_file(cache_hash, dest_file, readonly=True)
-
-    assert dest_file.read_bytes() == b"cached content"
-    mode = dest_file.stat().st_mode & 0o777
-    assert mode == 0o444, f"Expected 0o444, got {oct(mode)}"
-
-
-async def test_download_file_default_permissions(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, gcs_client: gcloud_storage.Storage
-) -> None:
-    """download_file without readonly flag creates file with default permissions."""
-    cache_hash = _helper_hash(b"writable content")
-    await _put(gcs_client, gcs_remote, cache_hash, b"writable content")
-    dest_file = tmp_path / "writable.txt"
-
-    await gcs_remote.download_file(cache_hash, dest_file, readonly=False)
-
-    assert dest_file.read_bytes() == b"writable content"
-    mode = dest_file.stat().st_mode & 0o777
-    assert mode & 0o200, f"Expected owner write permission, got {oct(mode)}"
 
 
 async def test_gcs_download_file_auth_error(
@@ -970,12 +895,6 @@ async def test_download_batch(
         assert path.read_bytes() == f"content {i}".encode()
 
 
-async def test_download_batch_empty() -> None:
-    """download_batch with empty list returns empty results."""
-    r = gcs.GCSRemote("gs://bucket/prefix")
-    assert await r.download_batch([]) == []
-
-
 async def test_download_batch_reports_each_failure_and_never_raises(
     gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, gcs_client: gcloud_storage.Storage
 ) -> None:
@@ -1005,94 +924,6 @@ async def test_download_batch_reports_each_failure_and_never_raises(
     assert not cache.get_cache_path(files_dir, missing_hash).exists()
 
 
-async def test_download_batch_with_callback(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, gcs_client: gcloud_storage.Storage
-) -> None:
-    """download_batch calls callback for each completed download."""
-    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"dest{i}.txt") for i in range(3)]
-    for i, (cache_hash, _) in enumerate(items):
-        await _put(gcs_client, gcs_remote, cache_hash, f"content {i}".encode())
-    callback_values = list[int]()
-
-    def callback(completed: int, total: int, filename: str) -> None:
-        callback_values.append(completed)
-
-    await gcs_remote.download_batch(items, concurrency=10, callback=callback)
-
-    assert sorted(callback_values) == [1, 2, 3]
-
-
-async def test_download_batch_readonly(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, gcs_client: gcloud_storage.Storage
-) -> None:
-    """download_batch with readonly=True sets 0o444 permissions on all files."""
-    items = [(_helper_hash(f"content {i}".encode()), tmp_path / f"cached{i}.txt") for i in range(3)]
-    for i, (cache_hash, _) in enumerate(items):
-        await _put(gcs_client, gcs_remote, cache_hash, f"content {i}".encode())
-
-    results = await gcs_remote.download_batch(items, concurrency=10, readonly=True)
-
-    assert all(r["success"] for r in results)
-    for _, path in items:
-        mode = path.stat().st_mode & 0o777
-        assert mode == 0o444, f"Expected 0o444 for {path}, got {oct(mode)}"
-
-
-async def test_download_batch_keeps_existing_destination(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, gcs_client: gcloud_storage.Storage
-) -> None:
-    """download_batch never replaces a destination that already exists (#461)."""
-    content = b"content"
-    cache_hash = _helper_hash(content)
-    await _put(gcs_client, gcs_remote, cache_hash, content)
-    dest = tmp_path / "entry"
-    dest.write_bytes(content)
-    inode = dest.stat().st_ino
-
-    results = await gcs_remote.download_batch([(cache_hash, dest)], readonly=True)
-
-    assert [r["success"] for r in results] == [True]
-    assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    left = [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK]
-    assert left == ["entry"], "no download temp file left"
-
-
-@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
-@pytest.mark.parametrize("exists", [False, True])
-async def test_download_batch_without_hard_links(
-    gcs_remote: gcs.GCSRemote,
-    tmp_path: pathlib.Path,
-    gcs_client: gcloud_storage.Storage,
-    monkeypatch: pytest.MonkeyPatch,
-    link_errno: int,
-    exists: bool,
-) -> None:
-    """On a filesystem that refuses link(), download still promotes the verified file, and
-    still keeps an existing entry."""
-    content = b"content"
-    cache_hash = _helper_hash(content)
-    await _put(gcs_client, gcs_remote, cache_hash, content)
-    dest = tmp_path / "entry"
-    inode = None
-    if exists:
-        dest.write_bytes(content)
-        inode = dest.stat().st_ino
-
-    def _refuse_link(src: object, dst: object) -> None:
-        raise OSError(link_errno, os.strerror(link_errno))
-
-    monkeypatch.setattr(os, "link", _refuse_link)
-
-    results = await gcs_remote.download_batch([(cache_hash, dest)], readonly=True)
-
-    assert [r["success"] for r in results] == [True], results
-    assert dest.read_bytes() == content
-    if inode is not None:
-        assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    left = [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK]
-    assert left == ["entry"], "no download temp file left"
-
-
 async def test_download_batch_shares_one_http_session(
     gcs_remote: gcs.GCSRemote,
     tmp_path: pathlib.Path,
@@ -1109,46 +940,3 @@ async def test_download_batch_shares_one_http_session(
 
     assert all(r["success"] for r in results)
     assert session_init.call_count == 1
-
-
-# -----------------------------------------------------------------------------
-# Metrics / Finally Tests
-# -----------------------------------------------------------------------------
-
-
-async def test_bulk_exists_calls_metrics_end_on_error(
-    gcs_remote: gcs.GCSRemote, mocker: MockerFixture
-) -> None:
-    """bulk_exists calls metrics.end even when an error occurs."""
-    from pivot import metrics
-
-    mocker.patch.object(
-        gcloud_storage.Storage,
-        "download_metadata",
-        new=mocker.AsyncMock(side_effect=_response_error(403, "Forbidden")),
-    )
-    spy_end = mocker.spy(metrics, "end")
-
-    with pytest.raises(exceptions.RemoteConnectionError):
-        await gcs_remote.bulk_exists(["a1b2c3d4e5f6789a"])
-
-    spy_end.assert_any_call("gcs.bulk_exists", mocker.ANY)
-
-
-async def test_download_batch_calls_metrics_end_on_error(
-    gcs_remote: gcs.GCSRemote, tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
-    """download_batch calls metrics.end even when downloads fail."""
-    from pivot import metrics
-
-    mocker.patch.object(
-        gcloud_storage.Storage,
-        "download_stream",
-        new=mocker.AsyncMock(side_effect=OSError("download boom")),
-    )
-    spy_end = mocker.spy(metrics, "end")
-
-    results = await gcs_remote.download_batch([("a1b2c3d4e5f6789a", tmp_path / "dest.txt")])
-
-    assert [r["success"] for r in results] == [False]
-    spy_end.assert_any_call("gcs.download_batch", mocker.ANY)
