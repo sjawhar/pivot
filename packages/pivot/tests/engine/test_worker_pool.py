@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import errno
 import os
+import pathlib
 import signal
 import time
 from typing import TYPE_CHECKING, cast
@@ -29,12 +30,60 @@ def _helper_pid() -> int:
     return os.getpid()
 
 
+def _helper_wait_for_release(ready_dir: str, release: str) -> int:
+    ready_path = pathlib.Path(ready_dir) / str(os.getpid())
+    ready_path.write_text("")
+    release_path = pathlib.Path(release)
+    deadline = time.monotonic() + 60
+    while not release_path.exists():
+        assert time.monotonic() < deadline, "test did not release waiting workers"
+        time.sleep(0.01)
+    return os.getpid()
+
+
+def _helper_process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.slow
+def test_idle_workers_exit_while_another_stage_runs(tmp_path: pathlib.Path) -> None:
+    idle_timeout_s = executor_core.one_shot_worker_idle_timeout()
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    release = tmp_path / "release"
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=4, idle_timeout_s=idle_timeout_s)
+        slow = pool.submit(_helper_sleep, idle_timeout_s + 5)
+        waiting = [
+            pool.submit(_helper_wait_for_release, str(ready_dir), str(release)) for _ in range(3)
+        ]
+        deadline = time.monotonic() + 60
+        while len(list(ready_dir.iterdir())) < len(waiting):
+            assert time.monotonic() < deadline, "workers did not start"
+            time.sleep(0.01)
+        release.write_text("")
+        idle_pids = {future.result(timeout=60) for future in waiting}
+
+        deadline = time.monotonic() + idle_timeout_s + 5
+        while any(_helper_process_is_alive(pid) for pid in idle_pids):
+            assert not slow.done(), "the slow stage ended before idle workers exited"
+            assert time.monotonic() < deadline, "idle workers stayed alive"
+            time.sleep(0.01)
+    finally:
+        pool.hard_cancel()
+
+
 def test_restart_workers_replaces_live_workers() -> None:
     """A code reload must replace workers rather than returning loky's live singleton."""
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     first = executor_core.create_executor(1).submit(_helper_pid).result(timeout=60)
 
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     second = executor_core.create_executor(1).submit(_helper_pid).result(timeout=60)
 
     assert second != first, "restart_workers should replace every live worker"
@@ -43,8 +92,8 @@ def test_restart_workers_replaces_live_workers() -> None:
 
 @pytest.mark.slow
 def test_warm_workers_survive_lokys_default_idle_timeout() -> None:
-    """Interactive runs stay warm even when a user pauses longer than loky's 10 s default."""
-    executor_core.restart_workers(1, 1)
+    """Long-lived workers stay warm after a pause longer than loky's default timeout."""
+    executor_core.restart_workers(1, idle_timeout_s=None)
     executor = executor_core.create_executor(1)
     first = executor.submit(_helper_pid).result(timeout=60)
 

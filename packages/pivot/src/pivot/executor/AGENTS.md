@@ -6,8 +6,12 @@ and a manager that cannot be reached when a run starts is replaced then.
 The loky initializer (`core._init_worker`, which runs `worker.unwind_when_stopped`) and the manager's initializer
 (`core._exit_when_parent_dies`) start the parent-death watcher, so a worker or manager exits
 when its Pivot process dies; a worker first unwinds its running stage so its `finally` blocks
-run, within `worker.TERMINATION_GRACE_S`. Keep `timeout=None` and
-`reuse=False if kill_workers else "auto"` in the shared executor policy.
+run, within `worker.TERMINATION_GRACE_S`.
+
+One-shot Engines give idle workers `core._WORKER_IDLE_TIMEOUT_S`; long-lived watch, serve and
+TUI Engines use no idle timeout so they stay warm between runs. `core.submit()` drives loky's
+private `_max_workers` to the submitted work count, so idle workers are not respawned until a
+stage needs one. Keep `reuse=False if kill_workers else "auto"` in the shared executor policy.
 While a discovery's import session lasts, the worker initializer (`core._init_worker`) also
 has each worker import user code through discovery's checked loader
 (`discovery.install_user_code_loader`); loky replaces a live pool whose initializer arguments

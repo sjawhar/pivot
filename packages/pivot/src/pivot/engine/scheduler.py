@@ -149,6 +149,38 @@ class Scheduler:
                 return False
         return True
 
+    def preview_direct_consumers(self, stage: str, *, limit: int) -> int:
+        """Return how many direct consumers could start if ``stage`` completed now.
+
+        The preview preserves stage-order admission and resource capacities. It has no scheduler
+        side effects, so the Engine can start worker processes while ``stage`` runs without
+        admitting its consumers before their inputs exist.
+        """
+        if limit <= 0:
+            return 0
+        resource_counts = collections.defaultdict(int, self._resource_counts)
+        for resource, request in self._stage_resources[stage].items():
+            resource_counts[resource] -= request
+        direct_consumers = set(self._downstream.get(stage, []))
+        count = 0
+        for candidate, state in self._stage_states.items():
+            if candidate not in direct_consumers or state != StageExecutionState.PENDING:
+                continue
+            if self._upstream_unfinished[candidate] != {stage}:
+                continue
+            request = self._stage_resources[candidate]
+            if any(
+                resource_counts[resource] + amount > self._resource_capacity[resource]
+                for resource, amount in request.items()
+            ):
+                continue
+            for resource, amount in request.items():
+                resource_counts[resource] += amount
+            count += 1
+            if count == limit:
+                break
+        return count
+
     def acquire_resources(self, stage: str) -> None:
         """Reserve a stage's resources immediately before it is admitted."""
         for resource, request in self._stage_resources[stage].items():

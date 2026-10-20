@@ -5,13 +5,17 @@ import contextlib
 import functools
 import logging
 import multiprocessing as mp
+import multiprocessing.resource_tracker
 import os
 import pathlib
 import threading
+import typing
 from multiprocessing import managers
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
 import loky
+import loky.backend.resource_tracker
+import loky.reusable_executor
 
 from pivot import config, discovery, exceptions, parameters, project, registry, types
 from pivot.executor import worker
@@ -28,7 +32,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_WORKER_IDLE_TIMEOUT_S: Final[float | None] = None
+# A 100-stage pandas/NumPy chain on pivot-dirout had a 78.898 ms maximum coordinator
+# handoff gap. Ten seconds is 126 times that gap, while freeing workers during the
+# multi-minute farm waits that motivated idle-worker reclamation.
+_WORKER_IDLE_TIMEOUT_S: Final[float] = 10.0
+
+
+def one_shot_worker_idle_timeout() -> float:
+    """Return the idle timeout for a process that exits after its current run."""
+    return _WORKER_IDLE_TIMEOUT_S
+
+
+def start_resource_trackers() -> None:
+    """Start resource trackers before Textual replaces ``sys.stderr`` with an invalid fd."""
+    multiprocessing.resource_tracker.ensure_running()
+    loky.backend.resource_tracker.ensure_running()
 
 
 def _noop() -> None:
@@ -64,21 +82,21 @@ def configured_worker_count(override: int | None = None) -> int:
     return max(1, max_workers)
 
 
-def compute_max_workers(width: int, override: int | None = None) -> int:
-    """Worker pool size: the configured worker count, clamped to the run's width, the most
-    stages that can run at once (``engine.graph.get_width``)."""
-    return max(1, min(configured_worker_count(override), width))
+def _reusable_worker_target(max_workers: int, *, kill_workers: bool) -> int:
+    """Keep reuse from invoking loky's blocking ``_resize`` between runs."""
+    executor = loky.reusable_executor._executor  # pyright: ignore[reportPrivateUsage] - loky has no public reusable-executor accessor
+    if kill_workers or executor is None:
+        return max_workers
+    return executor._max_workers
 
 
-def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
-    """Submit no-op tasks to ensure workers are warm and channels established."""
-    futures = [pool.submit(_noop) for _ in range(count)]
-    for f in futures:
-        f.result()
-
-
-def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.ProcessPoolExecutor:
-    """Return Pivot's reusable executor with one worker-lifetime policy.
+def _get_executor(
+    max_workers: int,
+    *,
+    idle_timeout_s: float | None,
+    kill_workers: bool = False,
+) -> loky.ProcessPoolExecutor:
+    """Return Pivot's reusable executor without resizing warm workers between runs.
 
     Every worker starts with ``_init_worker``. While a discovery's import session lasts, it
     also imports user code as that session does (``discovery.install_user_code_loader``), so a
@@ -89,13 +107,33 @@ def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.Proce
     _ensure_cleanup_registered()
     root = discovery.import_session_root()
     return loky.get_reusable_executor(
-        max_workers=max_workers,
-        timeout=_WORKER_IDLE_TIMEOUT_S,
+        max_workers=_reusable_worker_target(max_workers, kill_workers=kill_workers),
+        timeout=idle_timeout_s,
         kill_workers=kill_workers,
         reuse=False if kill_workers else "auto",
         initializer=_init_worker,
         initargs=(os.getpid(), None if root is None else str(root)),
     )
+
+
+def submit[T](
+    pool: loky.ProcessPoolExecutor,
+    max_workers: int,
+    fn: typing.Callable[..., T],
+    /,
+    *args: object,
+    prestart_target: int = 0,
+    **kwargs: object,
+) -> concurrent.futures.Future[T]:
+    """Submit work, growing only when every live worker already has work.
+
+    ``prestart_target`` covers direct consumers that the scheduler predicts will become
+    resource-admissible when this stage completes.
+    """
+    with pool._submit_resize_lock:
+        target_workers = max(len(pool._pending_work_items) + 1, prestart_target)
+        pool._max_workers = min(max_workers, target_workers)
+        return pool.submit(fn, *args, **kwargs)
 
 
 def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
@@ -114,35 +152,17 @@ def create_manager() -> managers.SyncManager:
     return manager
 
 
-def prepare_workers(width: int, *, parallel: bool = True, max_workers: int | None = None) -> int:
-    """Pre-warm loky worker pool for a run of the given width. Returns actual worker count.
-
-    Call before starting Textual TUI to avoid FD inheritance issues. Pass the width the engine
-    will compute for the run, so the engine reuses these workers instead of resizing the pool.
-    Safe to call in non-TUI mode (no downside, slightly faster first execution).
-    """
-    if not parallel or width <= 0:
-        return 1
-    workers = compute_max_workers(width, max_workers)
-    _warm_workers(_get_executor(workers), workers)
-    return workers
-
-
-def restart_workers(width: int, max_workers: int | None = None) -> int:
-    """Kill and warm fresh workers after code reload or stale-source detection."""
-
-    # A reusable executor with matching kwargs would otherwise keep live workers.
-    if width <= 0:
-        return 1
-    workers = compute_max_workers(width, max_workers)
-    _warm_workers(_get_executor(workers, kill_workers=True), workers)
-    return workers
+def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
+    """Replace stale workers and leave one fresh worker ready for the next dispatch."""
+    pool = _get_executor(max_workers, idle_timeout_s=idle_timeout_s, kill_workers=True)
+    submit(pool, max_workers, _noop).result()
+    return 1
 
 
 def _cleanup_worker_pool() -> None:
     """Kill loky worker pool on process exit to prevent orphaned workers."""
     with contextlib.suppress(Exception):
-        _get_executor(1, kill_workers=True)
+        _get_executor(1, idle_timeout_s=None, kill_workers=True)
 
 
 @functools.cache  # Ensures single atexit registration across threads
@@ -342,9 +362,11 @@ def _ensure_deterministic_environment() -> None:
     os.environ.setdefault("PYTHONHASHSEED", "0")
 
 
-def create_executor(max_workers: int) -> concurrent.futures.Executor:
-    """Get Pivot's reusable executor, keeping its workers warm between runs."""
-    return _get_executor(max_workers)
+def create_executor(
+    max_workers: int, *, idle_timeout_s: float | None = None
+) -> concurrent.futures.Executor:
+    """Get Pivot's reusable executor without growing it before work is submitted."""
+    return _get_executor(max_workers, idle_timeout_s=idle_timeout_s)
 
 
 def prepare_worker_info(

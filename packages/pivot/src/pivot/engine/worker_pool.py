@@ -70,41 +70,52 @@ class WorkerPool:
     _accepting: bool = True
     _in_run: bool = False
     _max_workers: int = 0
+    _idle_timeout_s: float | None = None
     _user_code_files: dict[str, _FileStamp | None] = field(default_factory=dict)
     _code_changed: bool = False
 
-    def start(self, *, max_workers: int) -> None:
+    def start(self, *, max_workers: int, idle_timeout_s: float | None = None) -> None:
         """Start a run without shrinking workers warmed by earlier runs."""
         if self._in_run:
             return
         self._max_workers = max(self._max_workers, max_workers)
-        executor = typing.cast(
-            "loky.ProcessPoolExecutor", executor_core.create_executor(self._max_workers)
-        )
-        fresh_workers = executor is not self._executor
-        if self._executor is executor and self._has_stale_user_code():
-            executor_core.restart_workers(self._max_workers, self._max_workers)
+        executor = self._executor
+        fresh_workers = False
+        if executor is None or self._idle_timeout_s != idle_timeout_s:
             executor = typing.cast(
                 "loky.ProcessPoolExecutor",
-                executor_core.create_executor(self._max_workers),
+                executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s),
+            )
+            fresh_workers = executor is not self._executor
+        if executor is self._executor and self._has_stale_user_code():
+            executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
+            executor = typing.cast(
+                "loky.ProcessPoolExecutor",
+                executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s),
             )
             fresh_workers = True
         if fresh_workers:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
         self._executor = executor
+        self._idle_timeout_s = idle_timeout_s
         self._output_queue = typing.cast("mp.Queue[OutputMessage]", self._new_output_queue())
         self._shutdown_event = threading.Event()
         self._accepting = True
         self._in_run = True
 
     def restart(self, *, max_workers: int) -> int:
-        """Replace every worker with a fresh one, as many as the next ``start`` asks for.
-
-        Returns the worker count, which never shrinks below the pool's earlier size.
-        """
+        """Replace every worker before a reload starts its next run."""
         self._max_workers = max(self._max_workers, max_workers)
-        return executor_core.restart_workers(self._max_workers, self._max_workers)
+        workers = executor_core.restart_workers(
+            self._max_workers, idle_timeout_s=self._idle_timeout_s
+        )
+        self._executor = typing.cast(
+            "loky.ProcessPoolExecutor",
+            executor_core.create_executor(self._max_workers, idle_timeout_s=self._idle_timeout_s),
+        )
+        self._restamp_user_code_files()
+        return workers
 
     def _new_output_queue(self) -> object:
         """Return a fresh queue from the engine-lifetime manager, replacing it if unreachable."""
@@ -174,6 +185,7 @@ class WorkerPool:
         fn: typing.Callable[..., _T],
         /,
         *args: object,
+        prestart_target: int = 0,
         **kwargs: object,
     ) -> concurrent.futures.Future[_T]:
         """Submit work to the underlying executor."""
@@ -181,7 +193,14 @@ class WorkerPool:
             raise RuntimeError("WorkerPool is not accepting new submissions")
         if self._executor is None:
             raise RuntimeError("WorkerPool not started")
-        return self._executor.submit(fn, *args, **kwargs)
+        return executor_core.submit(
+            self._executor,
+            self._max_workers,
+            fn,
+            *args,
+            prestart_target=prestart_target,
+            **kwargs,
+        )
 
     def stop_accepting(self) -> None:
         """Stop accepting new submissions without shutting down workers."""

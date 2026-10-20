@@ -149,6 +149,41 @@ def test_fan_out_sets_ready_after_upstream_completion() -> None:
     assert newly_blocked == [], "no stages should be blocked on success"
 
 
+def test_preview_direct_consumers_respects_resource_capacity() -> None:
+    scheduler = _helper_init_scheduler(
+        execution_order=["source", "grade_a", "grade_b", "grade_c", "grade_d"],
+        edges=[
+            ("source", "grade_a"),
+            ("source", "grade_b"),
+            ("source", "grade_c"),
+            ("source", "grade_d"),
+        ],
+        stage_resources={
+            "source": {"cpu": 1},
+            "grade_a": {"cpu": 1, "local_grade": 1},
+            "grade_b": {"cpu": 1, "local_grade": 1},
+            "grade_c": {"cpu": 1, "local_grade": 1},
+            "grade_d": {"cpu": 1, "local_grade": 1},
+        },
+        resource_capacity={"cpu": 8, "local_grade": 2},
+    )
+    scheduler.acquire_resources("source")
+    scheduler.set_state("source", StageExecutionState.RUNNING)
+
+    assert scheduler.preview_direct_consumers("source", limit=8) == 2
+
+
+def test_preview_direct_consumers_keeps_chain_at_one_worker() -> None:
+    scheduler = _helper_init_scheduler(
+        execution_order=["source", "next"],
+        edges=[("source", "next")],
+    )
+    scheduler.acquire_resources("source")
+    scheduler.set_state("source", StageExecutionState.RUNNING)
+
+    assert scheduler.preview_direct_consumers("source", limit=8) == 1
+
+
 def test_fan_in_waits_for_all_upstream() -> None:
     scheduler = _helper_init_scheduler(
         execution_order=["A", "B", "C"],

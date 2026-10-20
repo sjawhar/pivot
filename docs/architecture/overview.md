@@ -205,8 +205,9 @@ Files are stored by their content hash:
 
 **Problem:** Importing numpy/pandas takes seconds per worker.
 
-**Solution:** `loky.get_reusable_executor()` keeps workers alive for the Engine's lifetime.
-Each run gets a fresh output queue, while workers retain imports from earlier runs. Pivot replaces
+**Solution:** `loky.get_reusable_executor()` starts workers on demand and keeps imports available
+for their lifetime. One-shot Engines release idle workers after the idle timeout; long-lived
+Engines keep workers warm between runs. Each run gets a fresh output queue, and Pivot replaces
 workers before a later run when a user-code module they imported changed.
 
 ### Trie for Path Validation

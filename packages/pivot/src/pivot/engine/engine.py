@@ -237,7 +237,7 @@ class Engine:
     _futures: dict[concurrent.futures.Future[StageResult], str]
     _worker_pool: worker_pool_mod.WorkerPool | None
     _effective_max_workers: int
-
+    _worker_idle_timeout_s: float | None
     # Run state machine (Task 10/11)
     _run_state: _RunState
     _run_task_group: TaskGroup | None
@@ -302,7 +302,7 @@ class Engine:
         self._futures = dict[concurrent.futures.Future[StageResult], str]()
         self._worker_pool = None
         self._effective_max_workers = 1
-
+        self._worker_idle_timeout_s = None
         # Run state machine (Task 10/11)
         self._run_state = _RunState.IDLE
         self._run_task_group = None
@@ -460,6 +460,9 @@ class Engine:
 
         # Create fresh dispatch completion event (Events can only be set once)
         self._dispatch_complete = anyio.Event()
+        self._worker_idle_timeout_s = (
+            executor_core.one_shot_worker_idle_timeout() if exit_on_completion else None
+        )
 
         async with anyio.create_task_group() as tg:
             self._run_task_group = tg
@@ -1598,7 +1601,10 @@ class Engine:
         if self._worker_pool is None:
             self._worker_pool = worker_pool_mod.WorkerPool()
         if not self._worker_pool.in_run:
-            self._worker_pool.start(max_workers=self._effective_max_workers)
+            self._worker_pool.start(
+                max_workers=self._effective_max_workers,
+                idle_timeout_s=self._worker_idle_timeout_s,
+            )
         return self._worker_pool
 
     async def _start_ready_stages(
@@ -1705,12 +1711,20 @@ class Engine:
                     store_spec=store_spec,
                 )
 
+                active_after_parent = len(self._futures)
+                prestart_limit = self._effective_max_workers - active_after_parent
+                direct_consumers = self._scheduler.preview_direct_consumers(
+                    stage_name,
+                    limit=prestart_limit,
+                )
+                prestart_target = active_after_parent + direct_consumers
                 future = pool.submit(
                     worker.execute_stage,
                     stage_name,
                     worker_info,
                     cache_dir,
                     pool.output_queue(),
+                    prestart_target=prestart_target,
                 )
                 self._futures[future] = stage_name
 

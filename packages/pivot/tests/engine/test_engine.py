@@ -1445,7 +1445,7 @@ def _helper_bipartite_chain(names: list[str]) -> nx.DiGraph[str]:
 @pytest.mark.parametrize(
     ("parallel", "max_workers", "expected_restart_calls"),
     [
-        pytest.param(True, 4, [(1, 1)], id="parallel-restarts-workers"),
+        pytest.param(True, 4, [(1, None)], id="parallel-restarts-worker"),
         pytest.param(False, None, [], id="non-parallel-skips-restart"),
     ],
 )
@@ -1453,15 +1453,14 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
     monkeypatch: pytest.MonkeyPatch,
     parallel: bool,
     max_workers: int | None,
-    expected_restart_calls: list[tuple[int, int | None]],
+    expected_restart_calls: list[tuple[int, float | None]],
 ) -> None:
-    """A reload restarts workers only in parallel mode, one for each stage of the reloaded
-    pipeline that can run at once, and no fewer than the pool held: a chain of three needs one."""
-    restart_calls = list[tuple[int, int | None]]()
+    """A parallel reload starts one fresh worker before its reloaded pipeline runs."""
+    restart_calls = list[tuple[int, float | None]]()
 
-    def mock_restart_workers(width: int, max_workers: int | None = None) -> int:
-        restart_calls.append((width, max_workers))
-        return width
+    def mock_restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
+        restart_calls.append((max_workers, idle_timeout_s))
+        return 1
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 
@@ -1565,7 +1564,8 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
 ) -> None:
     """_handle_code_or_config_changed continues if restart_workers raises."""
 
-    def mock_restart_workers(width: int, max_workers: int | None = None) -> int:
+    def mock_restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
+        del max_workers, idle_timeout_s
         raise RuntimeError("loky pool broken")
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)

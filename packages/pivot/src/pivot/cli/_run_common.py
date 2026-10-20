@@ -12,11 +12,9 @@ from typing import TYPE_CHECKING, Any, TextIO, TypedDict, cast
 import anyio
 import click
 
-from pivot import discovery, project
+from pivot import discovery
 from pivot.cli import decorators as cli_decorators
-from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine, sinks
-from pivot.engine import graph as engine_graph
 from pivot.executor import core as executor_core
 from pivot.types import OnError
 
@@ -185,40 +183,6 @@ def resolve_on_error(fail_fast: bool, keep_going: bool) -> OnError:
     if fail_fast and keep_going:
         raise click.ClickException("--fail-fast and --keep-going are mutually exclusive")
     return OnError.KEEP_GOING if keep_going else OnError.FAIL
-
-
-def tui_prewarm_width(
-    stages: list[str] | None,
-    *,
-    single_stage: bool,
-    all_pipelines: bool,
-    on_error: OnError,
-    checkout_missing: bool,
-) -> int:
-    """Return the width the engine will compute for this run, for the TUI's worker pre-warm.
-
-    Like the engine, it first restores missing tracked files when asked to, then sizes the
-    pool over the stages the engine runs (``engine_graph.get_runnable_stages``), so the pool
-    warmed before Textual starts is the pool the engine then uses. Checking the tracked files
-    that exist stays the engine's.
-    """
-    if checkout_missing:
-        executor_core.restore_missing_tracked_files(project.get_project_root())
-    runnable, _ = engine_graph.get_runnable_stages(
-        cli_helpers.get_all_stages(),
-        cli_helpers.require_workspace_store(),
-        all_pipelines=all_pipelines,
-        on_error=on_error,
-    )
-    if not runnable:
-        # The engine stops at the missing dependency before it starts a worker.
-        return 1
-    stage_dag = engine_graph.get_stage_dag(engine_graph.build_graph(runnable))
-    targets = [stage for stage in stages if stage in stage_dag] if stages else None
-    if stages and not targets:
-        return 1
-    order = engine_graph.get_execution_order(stage_dag, targets, single_stage=single_stage)
-    return engine_graph.get_width(stage_dag, order, limit=executor_core.configured_worker_count())
 
 
 class DryRunJsonStageOutput(TypedDict):
@@ -390,6 +354,7 @@ def run_tui_with_engine(
     from pivot_tui.event_poller import EventPoller
     from pivot_tui.rpc_client_impl import RpcPivotClient
 
+    executor_core.start_resource_trackers()
     socket_ready = threading.Event()
     # Set when the engine finishes or the TUI exits; the poller thread stops on it.
     poller_stop = threading.Event()
