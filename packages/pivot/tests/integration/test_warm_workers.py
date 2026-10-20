@@ -10,8 +10,10 @@ from __future__ import annotations
 import contextlib
 import functools
 import importlib
+import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -1103,6 +1105,79 @@ def test_watch_tui_warns_once_about_a_changed_tracked_file_across_its_runs(
     enter, leave = output.find("\x1b[?1049h"), output.rfind("\x1b[?1049l")
     assert -1 < enter < leave, f"the TUI never took over the terminal:\n{output}"
     assert warning < enter or warning > leave, f"the warning landed on the TUI's screen:\n{output}"
+
+
+def test_watch_tui_prints_the_pipeline_error_it_shows_at_exit_after_a_second_break(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watch session whose pipeline breaks one way, then another, and is still broken when
+    the user quits prints the error the TUI shows, in full, once: `Pipeline invalid: <error>`
+    and `Pipeline invalid - waiting for fix`, as plain `pivot repro --watch` prints them."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+    env["TERM"] = "xterm-256color"
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "x.txt").write_text("tracked")
+    pipeline_file = root / "pipeline.py"
+    lone = root / "data" / "width" / "lone.txt"
+    tui_log = tmp_path / "tui.jsonl"
+    log = tmp_path / "pivot.log"
+    with log.open("wb") as output:
+        proc = subprocess.Popen(
+            [
+                str(pathlib.Path(sys.executable).parent / "pivot"),
+                "repro",
+                "--watch",
+                "--tui",
+                "--tui-log",
+                str(tui_log),
+            ],
+            cwd=root,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+
+    def wait_for(done: Callable[[], bool], what: str) -> None:
+        deadline = time.monotonic() + 60
+        while not done():
+            assert proc.poll() is None, f"pivot exited before {what}:\n{log.read_text()}"
+            assert time.monotonic() < deadline, f"no {what} after 60 s:\n{log.read_text()}"
+            time.sleep(0.1)
+
+    def reload_errors() -> list[str]:
+        if not tui_log.exists():
+            return []
+        messages = [json.loads(line) for line in tui_log.read_text().splitlines() if line]
+        return [m["error"] for m in messages if m.get("type") == "reload" and m.get("error")]
+
+    try:
+        wait_for(lambda: lone.exists(), "startup run")
+        pipeline_file.write_text(_TRACKED_WIDTH_PIPELINE + "def first_break(:\n")
+        wait_for(lambda: len(reload_errors()) >= 1, "TUI showing the first break")
+        pipeline_file.write_text(_TRACKED_WIDTH_PIPELINE + "\n\n\n\ndef second_break(:\n")
+        wait_for(
+            lambda: len(set(reload_errors())) >= 2,  # noqa: PLR2004 - two distinct breaks
+            "TUI showing the second break",
+        )
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    output = log.read_text()
+    assert proc.returncode == 0, output
+    shown = reload_errors()[-1]
+    # What follows the TUI's exit from the alternate screen, without its terminal resets.
+    after_tui = re.sub(r"\x1b\[[0-9;?<]*[A-Za-z]", "", output[output.rfind("\x1b[?1049l") :])
+    printed = [line for line in after_tui.splitlines() if "Pipeline invalid" in line]
+    assert printed == [f"Pipeline invalid: {shown}", "Pipeline invalid - waiting for fix"], output
 
 
 @pytest.mark.anyio

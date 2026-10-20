@@ -37,9 +37,15 @@ The TUI requires at least **80 columns by 24 rows**. If your terminal is smaller
 
 ### Warnings While the TUI Runs
 
-The TUI owns the terminal while it runs, so Pivot holds the warnings and errors it logs itself while the TUI is up, such as a tracked file that changed since `pivot track`, and prints each one once the TUI exits. A warning logged before the TUI starts prints at once, as without `--tui`. A warning Pivot logs again later, on each run of a watch session for example, prints only once in all. A `Pipeline invalid` error from a watch session prints only if the pipeline is still invalid when the TUI exits.
+Pivot installs its console filter before it starts the engine thread. A warning it logs before
+the TUI starts prints at once, as without `--tui`. While the TUI owns the terminal, Pivot holds
+its own warnings and errors, such as a tracked file that changed since `pivot track`, and prints
+each distinct one once the TUI exits. A repeated warning from later watch runs is not printed
+again. A `Pipeline invalid` error prints only if the engine still reports that error at exit.
 
-A stage's own output, including anything it logs, stays in that stage's **Logs** tab and is not printed after the TUI exits. If the process is killed (SIGTERM, SIGHUP or SIGKILL) while the TUI runs, held warnings are lost.
+A stage's own output, including anything it logs, stays in that stage's **Logs** tab and is not
+printed after the TUI exits. If the process is killed (SIGTERM, SIGHUP or SIGKILL) while the TUI
+runs, held warnings are lost.
 
 ## Layout
 

@@ -406,9 +406,15 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             serve=serve,
             socket_path=socket_path,
         )
+        engine_ref = dict[str, engine.Engine]()
+
+        def conditions() -> dict[str, object]:
+            current = engine_ref.get("engine")
+            return {engine.PIPELINE_ERROR_CONDITION: current.pipeline_error if current else None}
 
         async def watch_engine_fn(socket_ready: threading.Event) -> None:
             async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
+                engine_ref["engine"] = eng
                 _run_common.configure_result_collector(eng)
                 _run_common.configure_output_sink(
                     eng,
@@ -445,6 +451,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             app,
             watch_engine_fn,
             socket_path,
+            conditions=conditions,
             oneshot=False,
             suppress_keyboard_interrupt=True,
         )
@@ -618,6 +625,11 @@ def _run_oneshot_mode(
             cancel_event=cancel_event,
             socket_path=socket_path,
         )
+        engine_ref = dict[str, engine.Engine]()
+
+        def conditions() -> dict[str, object]:
+            current = engine_ref.get("engine")
+            return {engine.PIPELINE_ERROR_CONDITION: current.pipeline_error if current else None}
 
         result_future: concurrent.futures.Future[dict[str, executor_core.ExecutionSummary]] = (
             concurrent.futures.Future()
@@ -627,6 +639,7 @@ def _run_oneshot_mode(
             socket_ready: threading.Event,
         ) -> dict[str, executor_core.ExecutionSummary]:
             async with engine.Engine(pipeline=pipeline, all_pipelines=use_all_pipelines) as eng:
+                engine_ref["engine"] = eng
                 result_sink = _run_common.configure_result_collector(eng)
                 _run_common.configure_output_sink(
                     eng,
@@ -665,6 +678,7 @@ def _run_oneshot_mode(
             oneshot_engine_fn,
             socket_path,
             result_future=result_future,
+            conditions=conditions,
         )
 
         # Return results (re-raises if engine raised an exception)
