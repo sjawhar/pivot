@@ -368,6 +368,30 @@ def test_glob_all_pipelines_ignores_the_configured_state_dir(tmp_path: pathlib.P
     assert discovery.glob_all_pipelines(tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    ("configured_state_dir", "symlink"),
+    [
+        pytest.param("nested/../actual-state", False, id="parent-segment"),
+        pytest.param("state-link", True, id="in-project-symlink"),
+    ],
+)
+def test_glob_all_pipelines_ignores_normalized_configured_state_dir(
+    tmp_path: pathlib.Path, configured_state_dir: str, symlink: bool
+) -> None:
+    """--all excludes the resolved state tree rather than its lexical spelling."""
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    actual_state_dir = tmp_path / "actual-state"
+    if symlink:
+        (tmp_path / "state-link").symlink_to(actual_state_dir, target_is_directory=True)
+    (tmp_path / ".pivot" / "config.yaml").write_text(
+        f"core:\n  state_dir: {configured_state_dir}\n"
+    )
+    config_io.clear_config_cache()
+    _helper_write_pipeline(actual_state_dir, "state", "write")
+
+    assert discovery.glob_all_pipelines(tmp_path) == []
+
+
 def test_discover_all_pipelines_returns_none_when_empty(tmp_path: pathlib.Path) -> None:
     """--all returns None when no pipeline files exist."""
     assert discovery.discover_pipeline(project_root=tmp_path, all_pipelines=True) is None

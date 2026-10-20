@@ -685,11 +685,8 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
     Returns:
         List of paths to pipeline config files.
     """
-    state_dir = project.state_dir_for(project_root)
-    try:
-        state_parts = state_dir.relative_to(project_root).parts
-    except ValueError:
-        state_parts = ()
+    resolved_project_root = project_root.resolve()
+    resolved_state_dir = project.state_dir_for(project_root).resolve()
 
     # Collect all candidate paths grouped by directory
     by_dir = dict[pathlib.Path, list[pathlib.Path]]()
@@ -703,7 +700,9 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
             continue
         if any(part in _SCAN_EXCLUDE_DIRS for part in rel_parts):
             continue
-        if state_parts and rel_parts[: len(state_parts)] == state_parts:
+        if resolved_state_dir != resolved_project_root and path.resolve().is_relative_to(
+            resolved_state_dir
+        ):
             continue
         by_dir.setdefault(path.parent, list[pathlib.Path]()).append(path)
 

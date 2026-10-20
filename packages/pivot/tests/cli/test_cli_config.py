@@ -212,7 +212,43 @@ def test_config_set_state_dir_updates_the_current_process(
 
         assert result.exit_code == 0, result.output
         assert project.get_state_dir() == root / "alternate-state"
-        assert sorted(path.name for path in (root / ".pivot").iterdir()) == ["config.yaml"]
+        assert sorted(path.name for path in (root / ".pivot").iterdir()) == [
+            "config.yaml",
+            "config.yaml.lock",
+        ]
+
+
+@pytest.mark.parametrize(
+    "target_kind",
+    [
+        pytest.param("file", id="existing-file"),
+        pytest.param("dangling-symlink", id="dangling-symlink"),
+        pytest.param("file-parent", id="file-parent"),
+    ],
+)
+def test_config_set_refuses_unusable_state_dir_without_writing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, target_kind: str
+) -> None:
+    """State-dir validation happens before the config writer changes the marker file."""
+    with isolated_pivot_dir(runner, tmp_path):
+        root = pathlib.Path.cwd()
+        config_path = root / ".pivot" / "config.yaml"
+        config_path.write_text("core:\n  max_workers: 2\n")
+        before = config_path.read_text()
+        if target_kind == "file":
+            (root / "state").write_text("not a directory")
+            value = "state"
+        elif target_kind == "dangling-symlink":
+            (root / "state").symlink_to(root / "missing")
+            value = "state"
+        else:
+            (root / "parent").write_text("not a directory")
+            value = "parent/state"
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.state_dir", value])
+
+        assert result.exit_code != 0
+        assert config_path.read_text() == before
 
 
 def test_config_set_checkout_mode_comma_separated(

@@ -42,16 +42,9 @@ def get_config_path(scope: models.ConfigScope) -> pathlib.Path:
             return get_local_config_path()
 
 
-@contextlib.contextmanager
-def _config_lock(path: pathlib.Path) -> Generator[None]:
-    """Lock the persistent parent directory while atomically replacing a config file."""
-    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+def _config_lock_path(path: pathlib.Path) -> pathlib.Path:
+    """Lock file guarding a config file: ``config.yaml`` -> ``config.yaml.lock``."""
+    return path.with_name(f"{path.name}.lock")
 
 
 def _load_yaml(path: pathlib.Path, *, as_dict: bool) -> Any:
@@ -118,15 +111,21 @@ def edit_config(
         # File is automatically saved on context exit
     """
     path = get_config_path(scope)
+    lock_path = _config_lock_path(path)
+
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with _config_lock(path):
-        raw_data = _load_config_preserving_structure(path)
-        data: dict[str, Any] = raw_data if raw_data is not None else {}
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            raw_data = _load_config_preserving_structure(path)
+            data: dict[str, Any] = raw_data if raw_data is not None else {}
 
-        yield data
+            yield data
 
-        _save_config(path, data)
+            _save_config(path, data)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def load_config_file(path: pathlib.Path) -> dict[str, Any]:
@@ -253,6 +252,28 @@ def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
     return None, models.ConfigSource.UNKNOWN
 
 
+def _validate_state_dir_target(value: str) -> None:
+    """Reject state-directory paths that cannot become a directory before persistence."""
+    root = project.get_project_root()
+    target = pathlib.Path(value)
+    if not target.is_absolute():
+        target = root / target
+    if target.is_symlink() and not target.exists():
+        raise exceptions.ConfigValidationError(
+            f"core.state_dir points to a dangling symlink: {target}"
+        )
+    if target.exists() and not target.is_dir():
+        raise exceptions.ConfigValidationError(f"core.state_dir must be a directory: {target}")
+
+    existing_parent = target.parent
+    while not existing_parent.exists():
+        existing_parent = existing_parent.parent
+    if not existing_parent.is_dir():
+        raise exceptions.ConfigValidationError(
+            f"core.state_dir parent must be a directory: {existing_parent}"
+        )
+
+
 def _has_runtime_state(state_dir: pathlib.Path) -> bool:
     """Whether a previous state directory contains more than the project marker files."""
     try:
@@ -285,6 +306,8 @@ def set_config_value(
     key: str, value: Any, scope: models.ConfigScope = models.ConfigScope.LOCAL
 ) -> list[str]:
     """Set a configuration value and return any state-transition notices."""
+    if key == "core.state_dir" and scope is models.ConfigScope.LOCAL:
+        _validate_state_dir_target(cast("str", value))
     old_state_dir = project.get_state_dir() if scope is models.ConfigScope.LOCAL else None
     keys = parse_dotted_key(key)
     with edit_config(scope) as data:
@@ -303,20 +326,25 @@ def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.
     if not path.exists():
         return False
 
+    lock_path = _config_lock_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with _config_lock(path):
-        raw_data = _load_config_preserving_structure(path)
-        if raw_data is None:
-            return False
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            raw_data = _load_config_preserving_structure(path)
+            if raw_data is None:
+                return False
 
-        data: dict[str, Any] = raw_data
-        removed = unset_nested(data, keys)
-        if removed:
-            _save_config(path, data)
-            clear_config_cache()
+            data: dict[str, Any] = raw_data
+            removed = unset_nested(data, keys)
+            if removed:
+                _save_config(path, data)
+                clear_config_cache()
 
-        return removed
+            return removed
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def get_checkout_mode_order() -> list[models.CheckoutMode]:

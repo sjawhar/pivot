@@ -465,6 +465,7 @@ def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> 
     created = sorted(
         str(p.relative_to(root)) for p in (root / ".pivot").iterdir() if p.name != ".gitignore"
     )
+    assert ".pivot/config.yaml.lock" in created, created
     assert ".pivot/locks" in created, created
 
     status = subprocess.run(

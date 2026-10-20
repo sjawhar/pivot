@@ -14,7 +14,7 @@ from pivot.cli import helpers as cli_helpers
     "--force",
     "-f",
     is_flag=True,
-    help="Overwrite the state directory's .gitignore",
+    help="Overwrite .pivot/.gitignore only when using the default state directory",
 )
 @click.pass_context
 def init(ctx: click.Context, force: bool) -> None:
@@ -76,7 +76,8 @@ def init(ctx: click.Context, force: bool) -> None:
             display_stages = stages_dir
             display_gitignore = gitignore_path
         click.echo(f"  {display_stages}/")
-        click.echo(f"  {display_gitignore}")
+        if not state_dir_is_configured or not gitignore_existed:
+            click.echo(f"  {display_gitignore}")
         if created_pivotignore:
             click.echo("  .pivotignore")
         click.echo()

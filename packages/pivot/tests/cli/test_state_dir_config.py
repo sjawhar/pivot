@@ -95,7 +95,7 @@ def test_configuring_state_dir_after_init_moves_generated_gitignore(
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
     assert configured.returncode == 0, configured.stdout + configured.stderr
     assert repro.returncode == 0, repro.stdout + repro.stderr
-    assert _pivot_entries(root) == ["config.yaml", "stages"]
+    assert _pivot_entries(root) == ["config.yaml", "config.yaml.lock", "stages"]
     assert (root / "altstate" / ".gitignore").is_file()
     assert "no longer used" in configured.stdout + configured.stderr
 
@@ -277,6 +277,8 @@ def test_init_force_preserves_existing_configured_state_ignore(
     assert result.exit_code == 0, result.output
     assert state_ignore.read_text() == "existing content\n"
     assert f"Leaving {state_ignore}; Pivot does not own it." in result.output
+    created = result.output.split("Created:\n", 1)[1].split("\n\nNext steps:", 1)[0]
+    assert f"  {state_ignore.relative_to(root)}" not in created
 
 
 def test_init_force_overwrites_default_state_ignore(

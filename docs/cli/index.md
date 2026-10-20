@@ -900,7 +900,7 @@ pivot init [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--force` / `-f` | Overwrite the configured state directory's `.gitignore` (the state directory defaults to `.pivot`) |
+| `--force` / `-f` | Overwrite `.pivot/.gitignore` only for the default state directory. A configured state directory keeps any existing entry and creates a missing one atomically. |
 
 ---
 
