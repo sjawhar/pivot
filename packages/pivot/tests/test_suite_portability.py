@@ -223,13 +223,16 @@ class _LaunchScan:
                 )
                 argvs = [argv + part for argv in argvs for part in parts]
             return [(False, argv) for argv in argvs]
-        if (
-            isinstance(expr, ast.ListComp)
-            and len(expr.generators) == 1
-            and isinstance(expr.generators[0].iter, (ast.List, ast.Tuple))
-            and expr.generators[0].iter.elts
-        ):
-            return [(False, [expr.elt])]
+        if isinstance(expr, ast.ListComp) and len(expr.generators) == 1:
+            generator = expr.generators[0]
+            if isinstance(generator.iter, (ast.List, ast.Tuple)) and generator.iter.elts:
+                if (
+                    isinstance(expr.elt, ast.Name)
+                    and isinstance(generator.target, ast.Name)
+                    and expr.elt.id == generator.target.id
+                ):
+                    return [(False, [element]) for element in generator.iter.elts]
+                return [(False, [expr.elt])]
         if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
             return [
                 (False, left + right)
@@ -382,8 +385,9 @@ class _LaunchScan:
                 if binding.value is not None:
                     values.append(binding.value)
             elif isinstance(binding, ast.AugAssign):
-                # Appending command arguments does not replace argv[0].
-                continue
+                # Appending a list or tuple preserves argv[0]; text can be a shell command.
+                if not isinstance(binding.value, (ast.List, ast.Tuple)):
+                    values.append(None)
             else:
                 values.append(None)
         return values
@@ -469,6 +473,26 @@ def _helper_in_function(*lines: str) -> str:
         pytest.param('subprocess.run(["pivot"] if fast else [sys.executable])', id="conditional"),
         pytest.param('subprocess.getoutput("uv run pivot repro")', id="getoutput"),
         pytest.param('subprocess.getstatusoutput("uv run pivot repro")', id="getstatusoutput"),
+        pytest.param(
+            'cmd = ""\ncmd += "uv run pivot repro"\nsubprocess.run(cmd, shell=True)',
+            id="shell-string-augmented",
+        ),
+        pytest.param(
+            'cmd = "cd /tmp && "\ncmd += "uv run pivot repro"\nsubprocess.run(cmd, shell=True)',
+            id="shell-string-augmented-after-prefix",
+        ),
+        pytest.param(
+            'script = "set -e; "\nscript += "uv run pivot repro"\nsubprocess.run(["sh", "-c", script])',
+            id="shell-script-augmented",
+        ),
+        pytest.param(
+            'cmd = ""\ncmd += "uv --version"\nsubprocess.getoutput(cmd)',
+            id="getoutput-augmented",
+        ),
+        pytest.param(
+            'x = str(venv / "bin" / "pivot")\nsubprocess.run([x for x in ("uv", "run")])',
+            id="comprehension-shadows-path",
+        ),
     ],
 )
 def test_scan_finds_a_launch_that_searches_path(source: str) -> None:
@@ -486,7 +510,6 @@ def test_scan_finds_a_launch_that_searches_path(source: str) -> None:
         pytest.param('subprocess.run(["git", "init", "-q"])', id="git"),
         pytest.param('subprocess.run(["docker", "run", "--rm", "image"])', id="docker"),
         pytest.param('subprocess.run(["/bin/sh", "-c", "printf ok"])', id="sh-script"),
-        pytest.param('subprocess.run(["docker", "run", "--rm", "image"])', id="docker"),
         pytest.param(
             'command = [str(venv / "bin" / name) for name in ("python", "pivot")]\n'
             + "subprocess.run(command)",

@@ -194,7 +194,12 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
 
 
 def main() -> None:
-    """Main CLI entry point."""
+    """Public CLI entry point for embedders."""
+    cli()
+
+
+def _console_main() -> None:  # pyright: ignore[reportUnusedFunction] - console-script entry point in pyproject.toml
+    """Run the console script, keeping stop signals ignored through process shutdown."""
     token = _standalone_invocation.set(True)
     try:
         cli()

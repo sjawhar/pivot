@@ -684,6 +684,44 @@ with pipeline:
     assert "SIGTERM stopped it" in result.stdout, result.stdout
 
 
+@pytest.mark.parametrize("signame", ["TERM", "INT"])
+def test_public_main_restores_stop_signals_for_children(
+    tmp_path: pathlib.Path, signame: str
+) -> None:
+    """The public `pivot.cli.main()` function is also an embedding API, not only the console
+    script's entry point. It restores its caller's stop handlers after serve returns."""
+    project = tmp_path / "project"
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text("""\
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def noop() -> None:
+    pass
+
+
+with pipeline:
+    noop()
+""")
+    probe = pathlib.Path(__file__).with_name("inproc_main_serve.py")
+    result = subprocess.run(
+        [sys.executable, str(probe), str(project), signame],
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "after: SIGINT=default_int_handler SIGTERM=0" in result.stdout, result.stdout
+    assert "SIGTERM stopped it" in result.stdout, result.stdout
+
+
 def test_group_sigterm_during_a_stage_is_not_logged_as_a_failure(tmp_path: pathlib.Path) -> None:
     """`systemctl stop` sends SIGTERM to the whole cgroup. A running worker receives that
     signal directly, but a deliberate service stop must not emit a stage-failure traceback."""
