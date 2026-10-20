@@ -5,6 +5,7 @@ Tests E2E flow: socket creation, status queries, event broadcast.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -29,6 +30,9 @@ from tests import helpers
 from tests.conftest import send_rpc
 
 if TYPE_CHECKING:
+    import types
+    from collections.abc import Callable
+
     from pivot.registry import PipelineLike as Pipeline
 
 _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
@@ -498,12 +502,66 @@ with pipeline:
             proc.wait()
 
 
-def test_serve_mode_stopped_by_sigterm_exits_cleanly_and_leaves_nothing_behind(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+def _helper_deliver(proc: subprocess.Popen[bytes], to_group: bool, signum: int) -> None:
+    """Send ``signum`` to the process, or to its whole process group as a service manager does."""
+    if to_group:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signum)
+    else:
+        proc.send_signal(signum)
+
+
+@pytest.mark.parametrize(
+    ("stops", "inherited_sigint"),
+    [
+        pytest.param([(False, signal.SIGTERM, 0.0)], signal.default_int_handler, id="sigterm"),
+        pytest.param([(False, signal.SIGINT, 0.0)], signal.default_int_handler, id="sigint"),
+        pytest.param(
+            [(False, signal.SIGINT, 0.0), (False, signal.SIGINT, 0.05)],
+            signal.default_int_handler,
+            id="sigint-twice",
+        ),
+        *(
+            pytest.param(
+                [(False, signal.SIGTERM, 0.0), (False, signal.SIGTERM, delay)],
+                signal.default_int_handler,
+                id=f"sigterm-twice-{int(delay * 1000)}ms-apart",
+            )
+            for delay in (0.0, 0.01, 0.05, 0.1, 0.2, 0.3)
+        ),
+        pytest.param(
+            [(False, signal.SIGTERM, 0.0), (False, signal.SIGTERM, 0.3)],
+            signal.SIG_IGN,
+            id="sigterm-twice-300ms-apart-sigint-ignored",
+        ),
+        pytest.param(
+            [(False, signal.SIGTERM, 0.0), (True, signal.SIGTERM, 0.1)],
+            signal.default_int_handler,
+            id="sigterm-then-group-as-timeout-does",
+        ),
+        pytest.param(
+            [(True, signal.SIGTERM, 0.0)],
+            signal.default_int_handler,
+            id="group-sigterm-as-systemctl-stop-does",
+        ),
+        pytest.param(
+            [(False, signal.SIGTERM, 0.0), (False, signal.SIGINT, 0.1)],
+            signal.default_int_handler,
+            id="sigterm-then-sigint",
+        ),
+        pytest.param([(False, signal.SIGTERM, 0.0)], signal.SIG_IGN, id="sigterm-sigint-ignored"),
+    ],
+)
+def test_serve_mode_stopped_by_signals_exits_cleanly_and_leaves_nothing_behind(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stops: list[tuple[bool, int, float]],
+    inherited_sigint: Callable[[int, types.FrameType | None], object] | signal.Handlers,
 ) -> None:
-    """SIGTERM, as a service manager stops a server, shuts serve mode down as Ctrl-C does: it
-    exits 0, leaves no task failing during shutdown, and removes its socket and
-    multiprocessing's manager directory."""
+    """A service manager stops a server with SIGTERM, often more than once (GNU timeout signals
+    the process and then its group) and often to the whole process group (systemd). Serve mode
+    shuts down as Ctrl-C does whatever arrives: exit 0, no task failing during shutdown, and
+    neither its socket nor multiprocessing's manager directory left behind."""
     project = tmp_path / "project"
     (project / ".pivot").mkdir(parents=True)
     (project / ".git").mkdir()
@@ -530,14 +588,21 @@ with pipeline:
     stderr_path = tmp_path / "serve.stderr"
     env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
     try:
-        with stderr_path.open("wb") as stderr_file:
-            proc = subprocess.Popen(
-                [_PIVOT_BIN, "repro", "--watch", "--serve"],
-                cwd=project,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_file,
-            )
+        # The child inherits this process's SIGINT disposition: ignored stays ignored, handled
+        # resets to the default.
+        previous_sigint = signal.signal(signal.SIGINT, inherited_sigint)
+        try:
+            with stderr_path.open("wb") as stderr_file:
+                proc = subprocess.Popen(
+                    [_PIVOT_BIN, "repro", "--watch", "--serve"],
+                    cwd=project,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
         monkeypatch.chdir(project)
         try:
             response: dict[str, object] | None = None
@@ -548,19 +613,32 @@ with pipeline:
                 except (ConnectionRefusedError, FileNotFoundError):
                     time.sleep(0.1)
             assert response is not None, f"serve mode did not answer (exit {proc.poll()})"
-            proc.send_signal(signal.SIGTERM)
-            exit_code = proc.wait(timeout=15)
+            while not list(private_tmp.glob("pymp-*")) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert list(private_tmp.glob("pymp-*")), "the worker pool's manager never started"
+            for to_group, signum, delay in stops:
+                time.sleep(delay)
+                _helper_deliver(proc, to_group, signum)
+            exit_code = proc.wait(timeout=20)
         finally:
             if proc.poll() is None:
-                proc.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
 
         stderr = stderr_path.read_text(errors="replace")
-        assert exit_code == 0, f"serve mode exited {exit_code} on SIGTERM:\n{stderr}"
+        assert exit_code == 0, f"serve mode exited {exit_code} on {stops}:\n{stderr}"
         assert "unhandled exception during asyncio.run() shutdown" not in stderr, (
-            f"a task failed while serve mode shut down on SIGTERM:\n{stderr}"
+            f"a task failed while serve mode shut down on {stops}:\n{stderr}"
+        )
+        assert "KeyboardInterrupt" not in stderr, (
+            f"a stop signal escaped as an exception:\n{stderr}"
         )
         assert not socket_path.exists(), "serve mode left .pivot/agent.sock behind"
+        # The manager removes its directory as it exits, just after pivot does.
+        deadline = time.monotonic() + 5
+        while list(private_tmp.iterdir()) and time.monotonic() < deadline:
+            time.sleep(0.1)
         left = sorted(str(p.relative_to(private_tmp)) for p in private_tmp.rglob("*"))
         assert not left, f"serve mode left {left} in TMPDIR"
     finally:

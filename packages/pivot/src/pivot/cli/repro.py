@@ -42,8 +42,6 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    import types
-
     import networkx as nx
 
     from pivot.cli import console as tui_console
@@ -518,7 +516,7 @@ def _run_serve_mode(
     pipeline = cli_decorators.get_pipeline_from_context()
     use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
-    async def serve_main() -> None:
+    async def _serve() -> None:
         # Build watch paths
         all_stages = cli_helpers.get_all_stages()
         engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
@@ -566,22 +564,36 @@ def _run_serve_mode(
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)
 
-    # A service manager stops a server with SIGTERM; stop as Ctrl-C does, through whatever SIGINT
-    # handler is live: while the loop runs, asyncio's runner cancels the main task, so the engine
-    # unwinds, removes the socket and shuts down the worker pool's manager, and the exit code is 0.
-    def _stop_as_ctrl_c(_signum: int, frame: types.FrameType | None) -> None:
-        handler = signal.getsignal(signal.SIGINT)
-        if callable(handler):
-            handler(signal.SIGINT, frame)
-        else:
-            raise KeyboardInterrupt
+    # A service manager stops a server with SIGTERM, often more than once (GNU timeout signals
+    # the process and then its group). The event loop receives SIGTERM, and Ctrl-C unless it was
+    # inherited as ignored; the first cancels the serve task group, so the engine unwinds,
+    # removes the socket and shuts down the worker pool, and later ones are no-ops.
+    stop_signals = [signal.SIGTERM]
+    if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+        stop_signals.append(signal.SIGINT)
 
-    previous = signal.signal(signal.SIGTERM, _stop_as_ctrl_c)
-    try:
-        with contextlib.suppress(KeyboardInterrupt):
-            anyio.run(serve_main)
-    finally:
-        signal.signal(signal.SIGTERM, previous)
+    async def serve_main() -> None:
+        try:
+            with anyio.open_signal_receiver(*stop_signals) as received:
+                async with anyio.create_task_group() as tg:
+
+                    async def _cancel_on_stop() -> None:
+                        async for _ in received:
+                            tg.cancel_scope.cancel()
+                            return
+
+                    tg.start_soon(_cancel_on_stop)
+                    await _serve()
+                    tg.cancel_scope.cancel()
+        finally:
+            # The stop is under way; a stop signal during the rest of the shutdown changes
+            # nothing. The receiver restored the default dispositions as it closed.
+            for signum in stop_signals:
+                signal.signal(signum, signal.SIG_IGN)
+
+    # Ctrl-C before the loop receives it stops startup.
+    with contextlib.suppress(KeyboardInterrupt):
+        anyio.run(serve_main)
 
 
 def _run_oneshot_mode(
