@@ -1,0 +1,128 @@
+name: Benchmark
+
+# Pull requests run every project except the 1,000-stage ones, so each job stays well under an
+# hour. The weekly schedule and manual runs add the 1,000-stage projects.
+on:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Ref measured as the base (for an A/A run, the same as head)
+        default: main
+      head:
+        description: Ref measured as the head
+        default: main
+
+env:
+  UV_VERSION: 0.9.18
+  # The smallest count at which the planted-sleep check (Task 1.1) fails and the A/A passes.
+  BENCH_REPS: 6
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          version: "${{ env.UV_VERSION }}"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.0.0
+        with:
+          python-version-file: pyproject.toml
+
+      - name: Install dependencies
+        run: uv sync --all-extras --all-groups --locked
+
+      - name: Test the harness
+        run: uv run pytest benchmarks -p no:randomly
+
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 60 || 240 }}
+    name: bench (${{ matrix.project }})
+    strategy:
+      fail-fast: false
+      matrix:
+        project: >-
+          ${{ fromJSON(github.event_name == 'pull_request'
+          && '["multi","chain-10","chain-100","fan-10","fan-100","diamond-10","diamond-100"]'
+          || '["multi","chain-10","chain-100","chain-1000","fan-10","fan-100","fan-1000","diamond-10","diamond-100","diamond-1000"]') }}
+
+    steps:
+      - name: Check out the head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.head || 'main' }}
+          path: head
+          fetch-depth: 0
+
+      - name: Choose the base
+        id: base
+        working-directory: head
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          INPUT_BASE: ${{ inputs.base }}
+        run: |-
+          if [ -n "$PR_BASE" ]; then
+            echo "ref=$PR_BASE" >> "$GITHUB_OUTPUT"
+          elif [ -n "$INPUT_BASE" ]; then
+            echo "ref=$INPUT_BASE" >> "$GITHUB_OUTPUT"
+          else
+            # The weekly run compares main with main as it was a week earlier.
+            echo "ref=$(git rev-list -1 --before='7 days ago' origin/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the base
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.base.outputs.ref }}
+          path: base
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          version: "${{ env.UV_VERSION }}"
+          enable-cache: true
+          cache-dependency-glob: "*/uv.lock"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.0.0
+        with:
+          python-version-file: head/pyproject.toml
+
+      - name: Build the base and the head in two venvs
+        run: |-
+          (cd base && uv sync --locked --no-dev --package pivot --compile-bytecode)
+          (cd head && uv sync --locked --no-dev --package pivot --compile-bytecode)
+
+      - name: Run base and head interleaved
+        run: >-
+          python head/benchmarks/run.py --project ${{ matrix.project }}
+          --variant "base=$GITHUB_WORKSPACE/base/.venv/bin/pivot"
+          --variant "head=$GITHUB_WORKSPACE/head/.venv/bin/pivot"
+          --reps "$BENCH_REPS" --work "$RUNNER_TEMP/bench" --out-dir results
+
+      - name: Upload both result files
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-${{ matrix.project }}
+          path: results/
+
+      - name: Compare head with base
+        run: >-
+          python head/benchmarks/compare.py results/base.jsonl results/head.jsonl
+          --threshold-file head/benchmarks/threshold.json
+
+      - name: Thresholds this run would set (an A/A run's when base and head build the same pivot)
+        if: always()
+        run: python head/benchmarks/compare.py results/base.jsonl results/head.jsonl --derive-threshold

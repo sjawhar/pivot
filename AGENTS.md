@@ -208,3 +208,5 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright              
 ```
 
 **Run all quality checks before returning to user or pushing.**
+
+Measure a performance change on one pipeline and on one task with its upstream stages, the scopes people run, with wall time and CPU, against main in the same job. `.github/workflows/benchmark.yaml` does this on every pull request (`benchmarks/run.py`, `benchmarks/compare.py`); it runs pivot with a user's environment, so never pin `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` or `MKL_NUM_THREADS` for a measurement.
