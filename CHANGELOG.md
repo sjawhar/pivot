@@ -2,6 +2,46 @@
 
 <!-- version list -->
 
+## v0.5.2 (2026-10-20)
+
+### Bug Fixes
+
+- **cli**: Ignore third-party warning conditions ([#497](https://github.com/sjawhar/pivot/pull/497),
+  [`88596c4`](https://github.com/sjawhar/pivot/commit/88596c45af80c5f763363bcd597b843eef41c23c))
+
+- **cli**: Make TUI warning replay atomic and preserve current errors
+  ([#497](https://github.com/sjawhar/pivot/pull/497),
+  [`88596c4`](https://github.com/sjawhar/pivot/commit/88596c45af80c5f763363bcd597b843eef41c23c))
+
+- **cli**: Print each TUI-time warning once, across watch runs and thread orders
+  ([#497](https://github.com/sjawhar/pivot/pull/497),
+  [`88596c4`](https://github.com/sjawhar/pivot/commit/88596c45af80c5f763363bcd597b843eef41c23c))
+
+- **cli**: Print each warning a TUI run logs once, after the TUI exits
+  ([#497](https://github.com/sjawhar/pivot/pull/497),
+  [`88596c4`](https://github.com/sjawhar/pivot/commit/88596c45af80c5f763363bcd597b843eef41c23c))
+
+### Refactoring
+
+- **cli**: Simplify TUI warning deferral ([#497](https://github.com/sjawhar/pivot/pull/497),
+  [`88596c4`](https://github.com/sjawhar/pivot/commit/88596c45af80c5f763363bcd597b843eef41c23c))
+
+### Testing
+
+- **cli**: Restore O3 engine-state regression lock
+  ([#497](https://github.com/sjawhar/pivot/pull/497),
+  [`88596c4`](https://github.com/sjawhar/pivot/commit/88596c45af80c5f763363bcd597b843eef41c23c))
+
+
+## v0.5.1 (2026-10-20)
+
+### Bug Fixes
+
+- **fingerprint**: Keep the user's part of a namespace package user code
+  ([#499](https://github.com/sjawhar/pivot/pull/499),
+  [`58c7384`](https://github.com/sjawhar/pivot/commit/58c73847c645b3b0a152f022137eb231a4d9d2dd))
+
+
 ## v0.5.0 (2026-10-20)
 
 ### Features

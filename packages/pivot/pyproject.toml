@@ -1,6 +1,6 @@
 [project]
 name = "pivot"
-version = "0.5.0"
+version = "0.5.2"
 description = "High-performance Python pipeline tool with automatic code change detection"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
@@ -78,6 +78,7 @@ dev = [
   "pytest-xdist>=3.8.0",
   "pytest>=7.0",
   "ruff>=0.8.0",
+  "setuptools>=64",
   "types-aioboto3[all]>=13.0.0",
   "types-psutil>=7.0",
 ]
