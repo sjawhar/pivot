@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+import pathlib
 
 import pytest
 
 import compare
 
-if TYPE_CHECKING:
-    import pathlib
+_BENCHMARKS = pathlib.Path(__file__).parent
 
 _SCENARIO = "chain-10/pipeline/cold"
 _WARM = "chain-10/pipeline/warm"
@@ -179,7 +178,7 @@ def test_derived_threshold_is_three_times_each_scenarios_aa_spread_rounded_up(
     assert json.loads(capsys.readouterr().out) == {
         _SCENARIO: {"wall_pct": 8, "cpu_pct": 2},
         _WARM: {"wall_pct": 4, "cpu_pct": 10},
-        edit: {"wall_pct": 1, "cpu_pct": 1},
+        edit: {"wall_pct": 2, "cpu_pct": 2},
     }
 
 
@@ -216,3 +215,74 @@ def test_derived_threshold_uses_the_largest_spread_from_independent_aa_pairs(
         == 0
     )
     assert json.loads(capsys.readouterr().out) == {_SCENARIO: {"wall_pct": 6, "cpu_pct": 9}}
+
+
+def test_threshold_missing_one_metric_cannot_be_compared(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _helper_rows([1.0] * 6, [2.0] * 6)
+    head = _helper_rows([1.0] * 6, [2.0] * 6)
+
+    assert _helper_compare(tmp_path, base, head, limits={_SCENARIO: {"wall_pct": 10}}) == 2
+    assert f"no threshold for {_SCENARIO} cpu_pct" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        pytest.param("head.jsonl", id="result-file"),
+        pytest.param("threshold.json", id="threshold-file"),
+    ],
+)
+def test_missing_file_cannot_be_compared(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], missing: str
+) -> None:
+    rows = "".join(json.dumps(row) + "\n" for row in _helper_rows([1.0] * 6, [2.0] * 6))
+    (tmp_path / "base.jsonl").write_text(rows)
+    (tmp_path / "head.jsonl").write_text(rows)
+    (tmp_path / "threshold.json").write_text(
+        json.dumps({_SCENARIO: {"wall_pct": 10, "cpu_pct": 10}})
+    )
+    (tmp_path / missing).unlink()
+    argv = [str(tmp_path / "base.jsonl"), str(tmp_path / "head.jsonl")]
+
+    assert compare.main([*argv, "--threshold-file", str(tmp_path / "threshold.json")]) == 2
+    assert f"{tmp_path / missing}: no such file" in capsys.readouterr().err
+
+
+def test_calibration_file_records_each_sample_and_rebuilds_the_same_thresholds(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pairs = [([1.004] * 6, [1.99] * 6), ([1.018] * 6, [2.06] * 6)]
+    argv = ["--write-calibration", str(tmp_path / "calibration.json")]
+    for index, (wall, cpu) in enumerate(pairs):
+        base = tmp_path / f"{index}-base.jsonl"
+        head = tmp_path / f"{index}-head.jsonl"
+        base.write_text(
+            "".join(json.dumps(row) + "\n" for row in _helper_rows([1.0] * 6, [2.0] * 6))
+        )
+        head.write_text("".join(json.dumps(row) + "\n" for row in _helper_rows(wall, cpu)))
+        argv += ["--sample", str(index + 1), "100", "1", str(200 + index), str(base), str(head)]
+
+    assert compare.main(argv) == 0
+    samples = json.loads((tmp_path / "calibration.json").read_text())["samples"]
+    assert [(s["sample"], s["run"], s["attempt"], s["job"]) for s in samples] == [
+        (1, 100, 1, 200),
+        (2, 100, 1, 201),
+    ]
+    assert (
+        compare.main(["--derive-threshold", "--calibration", str(tmp_path / "calibration.json")])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {_SCENARIO: {"wall_pct": 6, "cpu_pct": 9}}
+
+
+def test_committed_calibration_rebuilds_the_committed_thresholds(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calibration = _BENCHMARKS / "calibration.json"
+
+    assert compare.main(["--derive-threshold", "--calibration", str(calibration)]) == 0
+    assert json.loads(capsys.readouterr().out) == json.loads(
+        (_BENCHMARKS / "threshold.json").read_text()
+    ), "threshold.json must be exactly what calibration.json derives"

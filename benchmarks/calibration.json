@@ -1,0 +1,956 @@
+{
+  "samples": [
+    {
+      "attempt": 1,
+      "changes": {
+        "multi/pipeline/cold": {
+          "cpu_pct": -0.3730260703775871,
+          "wall_pct": -0.5248091603053532
+        },
+        "multi/pipeline/edit": {
+          "cpu_pct": -0.23834137376522502,
+          "wall_pct": 1.446314949167672
+        },
+        "multi/pipeline/touch": {
+          "cpu_pct": -0.37600841809890867,
+          "wall_pct": -0.017854353114486576
+        },
+        "multi/pipeline/warm": {
+          "cpu_pct": -0.03883327580255967,
+          "wall_pct": -0.05293494882954364
+        },
+        "multi/task/cold": {
+          "cpu_pct": 0.4797163416414732,
+          "wall_pct": 1.1400957117387522
+        },
+        "multi/task/edit": {
+          "cpu_pct": 0.22202881045846404,
+          "wall_pct": 0.31022782355793427
+        },
+        "multi/task/touch": {
+          "cpu_pct": 0.14178686458480363,
+          "wall_pct": 0.738758790519265
+        },
+        "multi/task/warm": {
+          "cpu_pct": -0.08500357909806786,
+          "wall_pct": -0.19153537225827016
+        }
+      },
+      "job": 118626773105,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "diamond-100/pipeline/cold": {
+          "cpu_pct": 0.6380002781026805,
+          "wall_pct": 0.7688889487362502
+        },
+        "diamond-100/pipeline/edit": {
+          "cpu_pct": -0.6114619135161006,
+          "wall_pct": -0.3678655309997425
+        },
+        "diamond-100/pipeline/touch": {
+          "cpu_pct": 0.10803658168904189,
+          "wall_pct": -0.11663692190946318
+        },
+        "diamond-100/pipeline/warm": {
+          "cpu_pct": -0.05211862198362902,
+          "wall_pct": 0.25325271455253434
+        }
+      },
+      "job": 118626773149,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "diamond-10/pipeline/cold": {
+          "cpu_pct": -1.4990104846519947,
+          "wall_pct": -1.4939434724091567
+        },
+        "diamond-10/pipeline/edit": {
+          "cpu_pct": -0.25853901369774673,
+          "wall_pct": -1.3501786625829548
+        },
+        "diamond-10/pipeline/touch": {
+          "cpu_pct": 2.4686952069142163,
+          "wall_pct": 3.1409125283589514
+        },
+        "diamond-10/pipeline/warm": {
+          "cpu_pct": 1.3537631132198822,
+          "wall_pct": 1.6935052587794728
+        }
+      },
+      "job": 118626773211,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "fan-1000/pipeline/cold": {
+          "cpu_pct": -0.818095865360472,
+          "wall_pct": -0.12153055244792565
+        },
+        "fan-1000/pipeline/edit": {
+          "cpu_pct": 0.44599239458201523,
+          "wall_pct": 0.2872950784733261
+        },
+        "fan-1000/pipeline/touch": {
+          "cpu_pct": 0.507606434534095,
+          "wall_pct": 0.3555066706603969
+        },
+        "fan-1000/pipeline/warm": {
+          "cpu_pct": 0.49622345905548154,
+          "wall_pct": 0.5893505575371925
+        }
+      },
+      "job": 118626773233,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "chain-1000/pipeline/cold": {
+          "cpu_pct": 0.0345183680866194,
+          "wall_pct": -0.19443813600714285
+        },
+        "chain-1000/pipeline/edit": {
+          "cpu_pct": 0.06110275932301564,
+          "wall_pct": 0.0900915308630302
+        },
+        "chain-1000/pipeline/touch": {
+          "cpu_pct": 0.19625043861847385,
+          "wall_pct": -0.20755295612363633
+        },
+        "chain-1000/pipeline/warm": {
+          "cpu_pct": -0.1310400025109474,
+          "wall_pct": 0.010881392818285119
+        }
+      },
+      "job": 118626773418,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "chain-10/pipeline/cold": {
+          "cpu_pct": -0.23909924792418,
+          "wall_pct": -0.5009262409738839
+        },
+        "chain-10/pipeline/edit": {
+          "cpu_pct": 0.21545639608316386,
+          "wall_pct": 0.13519603424966017
+        },
+        "chain-10/pipeline/touch": {
+          "cpu_pct": -0.03311735061195059,
+          "wall_pct": -0.11853691578233476
+        },
+        "chain-10/pipeline/warm": {
+          "cpu_pct": -0.3088142277784051,
+          "wall_pct": -0.4283393235192827
+        }
+      },
+      "job": 118626773625,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "fan-10/pipeline/cold": {
+          "cpu_pct": -0.19446664837327235,
+          "wall_pct": -0.22435659719647372
+        },
+        "fan-10/pipeline/edit": {
+          "cpu_pct": -0.13531300357963455,
+          "wall_pct": -0.021347616829686788
+        },
+        "fan-10/pipeline/touch": {
+          "cpu_pct": -0.08723888915815664,
+          "wall_pct": 0.016937031879251736
+        },
+        "fan-10/pipeline/warm": {
+          "cpu_pct": 0.06299562736235377,
+          "wall_pct": 0.3230701453815515
+        }
+      },
+      "job": 118626773763,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "fan-100/pipeline/cold": {
+          "cpu_pct": -0.08419597277368965,
+          "wall_pct": 0.07114544160993444
+        },
+        "fan-100/pipeline/edit": {
+          "cpu_pct": 0.35941760857204574,
+          "wall_pct": -0.3127177552303852
+        },
+        "fan-100/pipeline/touch": {
+          "cpu_pct": -0.09456451072716877,
+          "wall_pct": -0.22713194301053619
+        },
+        "fan-100/pipeline/warm": {
+          "cpu_pct": 0.16325401217488822,
+          "wall_pct": 0.0721624686436889
+        }
+      },
+      "job": 118626773777,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "diamond-1000/pipeline/cold": {
+          "cpu_pct": -0.05797834772251228,
+          "wall_pct": -0.056820697492508655
+        },
+        "diamond-1000/pipeline/edit": {
+          "cpu_pct": 0.04128153614493514,
+          "wall_pct": 0.05121102951982588
+        },
+        "diamond-1000/pipeline/touch": {
+          "cpu_pct": 0.05899735020519014,
+          "wall_pct": -0.022008363177999
+        },
+        "diamond-1000/pipeline/warm": {
+          "cpu_pct": -0.2346707040121142,
+          "wall_pct": -0.23613614745537675
+        }
+      },
+      "job": 118626774039,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "chain-100/pipeline/cold": {
+          "cpu_pct": -0.06522112248985557,
+          "wall_pct": -0.09686280179269008
+        },
+        "chain-100/pipeline/edit": {
+          "cpu_pct": -0.1867612923881346,
+          "wall_pct": -0.09604805895603821
+        },
+        "chain-100/pipeline/touch": {
+          "cpu_pct": -0.06278131883333646,
+          "wall_pct": 0.0335192534591922
+        },
+        "chain-100/pipeline/warm": {
+          "cpu_pct": 0.3208164013565937,
+          "wall_pct": 0.4512214096779061
+        }
+      },
+      "job": 118626774095,
+      "run": 39422515292,
+      "sample": 1
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "fan-1000/pipeline/cold": {
+          "cpu_pct": -0.5951167419057323,
+          "wall_pct": -0.2046603799371291
+        },
+        "fan-1000/pipeline/edit": {
+          "cpu_pct": -0.1701937646860683,
+          "wall_pct": -0.2633865900126892
+        },
+        "fan-1000/pipeline/touch": {
+          "cpu_pct": -0.13247688533871302,
+          "wall_pct": 0.03275615311735526
+        },
+        "fan-1000/pipeline/warm": {
+          "cpu_pct": -0.12939588297138524,
+          "wall_pct": 0.0013133614830563908
+        }
+      },
+      "job": 118666011569,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "diamond-10/pipeline/cold": {
+          "cpu_pct": -0.42743367902366486,
+          "wall_pct": -0.2926617769266819
+        },
+        "diamond-10/pipeline/edit": {
+          "cpu_pct": 0.3950387064322553,
+          "wall_pct": 0.18792096155993826
+        },
+        "diamond-10/pipeline/touch": {
+          "cpu_pct": -0.3032591645849017,
+          "wall_pct": -0.4155124653739674
+        },
+        "diamond-10/pipeline/warm": {
+          "cpu_pct": 0.3375803114450646,
+          "wall_pct": 0.338240198180167
+        }
+      },
+      "job": 118666011691,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "fan-10/pipeline/cold": {
+          "cpu_pct": -0.5075196054536739,
+          "wall_pct": -0.07363092498848706
+        },
+        "fan-10/pipeline/edit": {
+          "cpu_pct": -0.37239680311667195,
+          "wall_pct": -0.19758759333715104
+        },
+        "fan-10/pipeline/touch": {
+          "cpu_pct": 0.6117829101954261,
+          "wall_pct": 0.865382402356793
+        },
+        "fan-10/pipeline/warm": {
+          "cpu_pct": 0.018147996914838524,
+          "wall_pct": 0.06937874487543998
+        }
+      },
+      "job": 118666011695,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "multi/pipeline/cold": {
+          "cpu_pct": -0.09310023792281746,
+          "wall_pct": -0.1700921332388347
+        },
+        "multi/pipeline/edit": {
+          "cpu_pct": -0.031078545045972888,
+          "wall_pct": -0.05177273686025266
+        },
+        "multi/pipeline/touch": {
+          "cpu_pct": 0.12317437972902104,
+          "wall_pct": 0.1065451806675734
+        },
+        "multi/pipeline/warm": {
+          "cpu_pct": -0.017760727479387714,
+          "wall_pct": -0.10663946587539007
+        },
+        "multi/task/cold": {
+          "cpu_pct": 0.13960118146685505,
+          "wall_pct": 0.1851030599849571
+        },
+        "multi/task/edit": {
+          "cpu_pct": 0.07067669172931887,
+          "wall_pct": 0.04982064567557574
+        },
+        "multi/task/touch": {
+          "cpu_pct": -0.019305305989107693,
+          "wall_pct": 0.15649452269168856
+        },
+        "multi/task/warm": {
+          "cpu_pct": -0.07827642761294136,
+          "wall_pct": -0.024691358024699604
+        }
+      },
+      "job": 118666011936,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "diamond-1000/pipeline/cold": {
+          "cpu_pct": 0.1506224370439172,
+          "wall_pct": 4.9367663582681836
+        },
+        "diamond-1000/pipeline/edit": {
+          "cpu_pct": -0.7849562652819416,
+          "wall_pct": -0.6786690001328444
+        },
+        "diamond-1000/pipeline/touch": {
+          "cpu_pct": -0.26306167550549203,
+          "wall_pct": 0.8074169886961642
+        },
+        "diamond-1000/pipeline/warm": {
+          "cpu_pct": 0.2735942008586138,
+          "wall_pct": 0.09655405152048341
+        }
+      },
+      "job": 118666012141,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "chain-100/pipeline/cold": {
+          "cpu_pct": 0.08192244675041016,
+          "wall_pct": -0.08996272972625859
+        },
+        "chain-100/pipeline/edit": {
+          "cpu_pct": 0.09458069226428086,
+          "wall_pct": 0.40172230113637364
+        },
+        "chain-100/pipeline/touch": {
+          "cpu_pct": 0.24315696529241207,
+          "wall_pct": 0.25368529310937665
+        },
+        "chain-100/pipeline/warm": {
+          "cpu_pct": 0.49951219512194817,
+          "wall_pct": 0.513452454302732
+        }
+      },
+      "job": 118666012279,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "diamond-100/pipeline/cold": {
+          "cpu_pct": -0.16318711531298,
+          "wall_pct": -0.07963897000265241
+        },
+        "diamond-100/pipeline/edit": {
+          "cpu_pct": -0.041058191664080285,
+          "wall_pct": -0.09027414833466607
+        },
+        "diamond-100/pipeline/touch": {
+          "cpu_pct": 0.05934980954912191,
+          "wall_pct": 0.010486891385769963
+        },
+        "diamond-100/pipeline/warm": {
+          "cpu_pct": -0.19069201857174184,
+          "wall_pct": -0.21030494216614784
+        }
+      },
+      "job": 118666012359,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "fan-100/pipeline/cold": {
+          "cpu_pct": -0.6588389327648426,
+          "wall_pct": -0.48281661106138984
+        },
+        "fan-100/pipeline/edit": {
+          "cpu_pct": -0.23382479841889794,
+          "wall_pct": -0.29068351223630035
+        },
+        "fan-100/pipeline/touch": {
+          "cpu_pct": -0.009169096477228052,
+          "wall_pct": -0.47322381733879415
+        },
+        "fan-100/pipeline/warm": {
+          "cpu_pct": -0.503454830340861,
+          "wall_pct": -0.580637148357447
+        }
+      },
+      "job": 118666012363,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "chain-10/pipeline/cold": {
+          "cpu_pct": -0.1344508468657206,
+          "wall_pct": -0.33230366002058803
+        },
+        "chain-10/pipeline/edit": {
+          "cpu_pct": 0.4760370807831379,
+          "wall_pct": 0.68418105232403
+        },
+        "chain-10/pipeline/touch": {
+          "cpu_pct": -0.3021305412304059,
+          "wall_pct": -0.8165741215995553
+        },
+        "chain-10/pipeline/warm": {
+          "cpu_pct": -0.4783405605972718,
+          "wall_pct": -0.9479256432352627
+        }
+      },
+      "job": 118666012372,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 2,
+      "changes": {
+        "chain-1000/pipeline/cold": {
+          "cpu_pct": -0.15807755506713705,
+          "wall_pct": -1.0043781292044378
+        },
+        "chain-1000/pipeline/edit": {
+          "cpu_pct": -0.5070908199658751,
+          "wall_pct": -0.2547014676244974
+        },
+        "chain-1000/pipeline/touch": {
+          "cpu_pct": -0.06612877806996631,
+          "wall_pct": -5.9792198574569175
+        },
+        "chain-1000/pipeline/warm": {
+          "cpu_pct": -0.29024605795618513,
+          "wall_pct": -0.2830048160468627
+        }
+      },
+      "job": 118666012457,
+      "run": 39422515292,
+      "sample": 2
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "diamond-1000/pipeline/cold": {
+          "cpu_pct": -0.04031601553717,
+          "wall_pct": -0.11573218007231935
+        },
+        "diamond-1000/pipeline/edit": {
+          "cpu_pct": 0.05386646836178499,
+          "wall_pct": -0.020353826519377297
+        },
+        "diamond-1000/pipeline/touch": {
+          "cpu_pct": -0.12465834379846111,
+          "wall_pct": 0.2878678111011362
+        },
+        "diamond-1000/pipeline/warm": {
+          "cpu_pct": 0.4811090406733979,
+          "wall_pct": 0.42197704376407436
+        }
+      },
+      "job": 118715582942,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "chain-100/pipeline/cold": {
+          "cpu_pct": 0.07267118513355371,
+          "wall_pct": -0.8088164829899254
+        },
+        "chain-100/pipeline/edit": {
+          "cpu_pct": -0.36155419222905344,
+          "wall_pct": -0.5972173608680311
+        },
+        "chain-100/pipeline/touch": {
+          "cpu_pct": -0.2284148012791395,
+          "wall_pct": -0.9150685872233784
+        },
+        "chain-100/pipeline/warm": {
+          "cpu_pct": -0.27470307829038293,
+          "wall_pct": -0.23779927579311247
+        }
+      },
+      "job": 118715583096,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "fan-100/pipeline/cold": {
+          "cpu_pct": 0.28795433502934037,
+          "wall_pct": 0.06031280413417411
+        },
+        "fan-100/pipeline/edit": {
+          "cpu_pct": -0.011204586410711172,
+          "wall_pct": 0.03947238577677931
+        },
+        "fan-100/pipeline/touch": {
+          "cpu_pct": 0.1043987285726155,
+          "wall_pct": 0.32169490974670656
+        },
+        "fan-100/pipeline/warm": {
+          "cpu_pct": 0.5453359425962087,
+          "wall_pct": 0.5664556962025326
+        }
+      },
+      "job": 118715583101,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "diamond-100/pipeline/cold": {
+          "cpu_pct": 0.335823809647779,
+          "wall_pct": 0.33355858122584214
+        },
+        "diamond-100/pipeline/edit": {
+          "cpu_pct": -0.38439175657342517,
+          "wall_pct": -0.20889332616542935
+        },
+        "diamond-100/pipeline/touch": {
+          "cpu_pct": -0.11364523600906942,
+          "wall_pct": 0.061490710510532044
+        },
+        "diamond-100/pipeline/warm": {
+          "cpu_pct": -0.07370403734338898,
+          "wall_pct": -0.05348487380911997
+        }
+      },
+      "job": 118715583157,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "fan-10/pipeline/cold": {
+          "cpu_pct": -0.7152317880794808,
+          "wall_pct": -1.1986942794455988
+        },
+        "fan-10/pipeline/edit": {
+          "cpu_pct": 0.057333853810867856,
+          "wall_pct": 0.17715815216344524
+        },
+        "fan-10/pipeline/touch": {
+          "cpu_pct": 0.33783783783782206,
+          "wall_pct": 0.25343545843656107
+        },
+        "fan-10/pipeline/warm": {
+          "cpu_pct": -0.4073992512662531,
+          "wall_pct": -0.5127212924446244
+        }
+      },
+      "job": 118715583163,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "fan-1000/pipeline/cold": {
+          "cpu_pct": 0.48369098137396804,
+          "wall_pct": 0.3629831726288288
+        },
+        "fan-1000/pipeline/edit": {
+          "cpu_pct": 0.44275005722132943,
+          "wall_pct": 0.30301841218354203
+        },
+        "fan-1000/pipeline/touch": {
+          "cpu_pct": 0.6411300644620592,
+          "wall_pct": 0.7165617005998903
+        },
+        "fan-1000/pipeline/warm": {
+          "cpu_pct": 0.46135368542796806,
+          "wall_pct": 0.4583190946187741
+        }
+      },
+      "job": 118715583213,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "multi/pipeline/cold": {
+          "cpu_pct": -0.06264332457071853,
+          "wall_pct": -0.36177216926136196
+        },
+        "multi/pipeline/edit": {
+          "cpu_pct": 0.7056309585309758,
+          "wall_pct": 0.4561324473476615
+        },
+        "multi/pipeline/touch": {
+          "cpu_pct": 0.2899186841618938,
+          "wall_pct": 0.1529739944209436
+        },
+        "multi/pipeline/warm": {
+          "cpu_pct": 0.06308484912207779,
+          "wall_pct": 0.1412558097147692
+        },
+        "multi/task/cold": {
+          "cpu_pct": -0.2991964438365519,
+          "wall_pct": -0.4221831311915592
+        },
+        "multi/task/edit": {
+          "cpu_pct": 0.11402008507653194,
+          "wall_pct": 0.12881395035857138
+        },
+        "multi/task/touch": {
+          "cpu_pct": -0.3287741421272037,
+          "wall_pct": -0.4621328354622154
+        },
+        "multi/task/warm": {
+          "cpu_pct": -0.04358722894191522,
+          "wall_pct": -0.07632859459976471
+        }
+      },
+      "job": 118715583214,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "chain-1000/pipeline/cold": {
+          "cpu_pct": -0.5938352703385639,
+          "wall_pct": 0.705108678122812
+        },
+        "chain-1000/pipeline/edit": {
+          "cpu_pct": 0.5918880189404144,
+          "wall_pct": 0.5644834781525413
+        },
+        "chain-1000/pipeline/touch": {
+          "cpu_pct": -1.1089443090193007,
+          "wall_pct": -2.375593386806354
+        },
+        "chain-1000/pipeline/warm": {
+          "cpu_pct": 0.0011749638698582635,
+          "wall_pct": -0.16447997551926116
+        }
+      },
+      "job": 118715583272,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "diamond-10/pipeline/cold": {
+          "cpu_pct": -0.16329888682514138,
+          "wall_pct": 0.08523073176672896
+        },
+        "diamond-10/pipeline/edit": {
+          "cpu_pct": 0.20050062889946327,
+          "wall_pct": -0.6325073985957209
+        },
+        "diamond-10/pipeline/touch": {
+          "cpu_pct": 0.06470192710249116,
+          "wall_pct": 0.0692252875903506
+        },
+        "diamond-10/pipeline/warm": {
+          "cpu_pct": 0.18790980329440687,
+          "wall_pct": 0.09964018820924571
+        }
+      },
+      "job": 118715583444,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 3,
+      "changes": {
+        "chain-10/pipeline/cold": {
+          "cpu_pct": 0.3635291805855772,
+          "wall_pct": 0.546249750467307
+        },
+        "chain-10/pipeline/edit": {
+          "cpu_pct": -0.4780742832380478,
+          "wall_pct": -0.5530591081921917
+        },
+        "chain-10/pipeline/touch": {
+          "cpu_pct": 0.33820790886185886,
+          "wall_pct": 0.43957983935033457
+        },
+        "chain-10/pipeline/warm": {
+          "cpu_pct": -0.14911066141229032,
+          "wall_pct": -0.37908557163330336
+        }
+      },
+      "job": 118715583564,
+      "run": 39422515292,
+      "sample": 3
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "chain-10/pipeline/cold": {
+          "cpu_pct": 0.7415254237288131,
+          "wall_pct": 0.37264416503577863
+        },
+        "chain-10/pipeline/edit": {
+          "cpu_pct": -1.0027245936277878,
+          "wall_pct": -1.3187836160529507
+        },
+        "chain-10/pipeline/touch": {
+          "cpu_pct": -1.0873736727644856,
+          "wall_pct": -1.6631076497927462
+        },
+        "chain-10/pipeline/warm": {
+          "cpu_pct": 0.8888473053892275,
+          "wall_pct": 1.2223171452980186
+        }
+      },
+      "job": 118755767752,
+      "run": 39459736250,
+      "sample": 4
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "diamond-10/pipeline/cold": {
+          "cpu_pct": 0.005149662053427176,
+          "wall_pct": 0.10419797615468245
+        },
+        "diamond-10/pipeline/edit": {
+          "cpu_pct": 0.12031719989063175,
+          "wall_pct": -0.3511437841389632
+        },
+        "diamond-10/pipeline/touch": {
+          "cpu_pct": 0.28020460222841226,
+          "wall_pct": 0.30748554207054524
+        },
+        "diamond-10/pipeline/warm": {
+          "cpu_pct": 0.4131561892417454,
+          "wall_pct": 0.0893889998948383
+        }
+      },
+      "job": 118755767787,
+      "run": 39459736250,
+      "sample": 4
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "chain-100/pipeline/cold": {
+          "cpu_pct": -0.039944078290389054,
+          "wall_pct": -4.8719723183391
+        },
+        "chain-100/pipeline/edit": {
+          "cpu_pct": -0.300782033286531,
+          "wall_pct": -1.3915098499144474
+        },
+        "chain-100/pipeline/touch": {
+          "cpu_pct": -0.17134905758017213,
+          "wall_pct": -2.3760517098183658
+        },
+        "chain-100/pipeline/warm": {
+          "cpu_pct": 0.3159663865546169,
+          "wall_pct": 0.3558115892917639
+        }
+      },
+      "job": 118755767832,
+      "run": 39459736250,
+      "sample": 4
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "fan-100/pipeline/cold": {
+          "cpu_pct": 0.2683986408017406,
+          "wall_pct": 0.2321540279418942
+        },
+        "fan-100/pipeline/edit": {
+          "cpu_pct": -0.13548209836188543,
+          "wall_pct": -0.05184813513966832
+        },
+        "fan-100/pipeline/touch": {
+          "cpu_pct": 0.03651822165622323,
+          "wall_pct": 0.058793748264761365
+        },
+        "fan-100/pipeline/warm": {
+          "cpu_pct": 0.0837718264876068,
+          "wall_pct": 0.09215418348216807
+        }
+      },
+      "job": 118755767877,
+      "run": 39459736250,
+      "sample": 4
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "multi/pipeline/cold": {
+          "cpu_pct": 0.19679947820024143,
+          "wall_pct": 0.2180081666551155
+        },
+        "multi/pipeline/edit": {
+          "cpu_pct": 0.024526120318123148,
+          "wall_pct": 0.05221347853652503
+        },
+        "multi/pipeline/touch": {
+          "cpu_pct": 0.33328370345767155,
+          "wall_pct": 0.07127710757496676
+        },
+        "multi/pipeline/warm": {
+          "cpu_pct": -0.06268937415105902,
+          "wall_pct": -0.16256491307295062
+        },
+        "multi/task/cold": {
+          "cpu_pct": -0.0878317086866999,
+          "wall_pct": -0.02629453637096711
+        },
+        "multi/task/edit": {
+          "cpu_pct": 0.10035863453224061,
+          "wall_pct": 0.01749441150744615
+        },
+        "multi/task/touch": {
+          "cpu_pct": 0.13229051578763895,
+          "wall_pct": 0.15789073200426487
+        },
+        "multi/task/warm": {
+          "cpu_pct": -0.3132284382284361,
+          "wall_pct": -0.6451612903225837
+        }
+      },
+      "job": 118755767917,
+      "run": 39459736250,
+      "sample": 4
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "diamond-100/pipeline/cold": {
+          "cpu_pct": -0.08755837224816876,
+          "wall_pct": -0.19650987392923783
+        },
+        "diamond-100/pipeline/edit": {
+          "cpu_pct": 0.17835592152339624,
+          "wall_pct": 0.49390596030516765
+        },
+        "diamond-100/pipeline/touch": {
+          "cpu_pct": -0.8481425012705539,
+          "wall_pct": -0.6363225915683686
+        },
+        "diamond-100/pipeline/warm": {
+          "cpu_pct": 0.8652591784031242,
+          "wall_pct": 1.1687552756314536
+        }
+      },
+      "job": 118755768027,
+      "run": 39459736250,
+      "sample": 4
+    },
+    {
+      "attempt": 1,
+      "changes": {
+        "fan-10/pipeline/cold": {
+          "cpu_pct": 1.0233608582115856,
+          "wall_pct": 1.2819402338674684
+        },
+        "fan-10/pipeline/edit": {
+          "cpu_pct": -0.3626920454380646,
+          "wall_pct": -0.5575117370892256
+        },
+        "fan-10/pipeline/touch": {
+          "cpu_pct": 0.338069216757743,
+          "wall_pct": 0.9509041570702034
+        },
+        "fan-10/pipeline/warm": {
+          "cpu_pct": -0.4711529913770186,
+          "wall_pct": -0.737040872266553
+        }
+      },
+      "job": 118755768138,
+      "run": 39459736250,
+      "sample": 4
+    }
+  ]
+}
