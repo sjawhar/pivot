@@ -26,6 +26,23 @@ _KILLED_WORKER_JOIN_S = 5.0
 _FileStamp = tuple[int, int, int, int, int]
 
 
+class _KeepaliveBarrier(typing.Protocol):
+    """The manager-backed barrier one round of keep-alive pings waits on."""
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
+# A ping round normally clears as soon as each idle worker has taken one ping; the timeout only
+# bounds a round whose estimate of idle workers was off by a worker that exited meanwhile.
+_KEEPALIVE_PING_TIMEOUT_S = 0.25
+
+
+def _keepalive_ping(barrier: _KeepaliveBarrier) -> None:
+    """Restart one idle worker's idle clock; the barrier spreads a round over distinct workers."""
+    with contextlib.suppress(threading.BrokenBarrierError):
+        _ = barrier.wait(_KEEPALIVE_PING_TIMEOUT_S)
+
+
 def _file_stamp(path: str) -> _FileStamp | None:
     """Return the stat signature and content digest of a user-code file, or None if unreadable.
 
@@ -71,6 +88,11 @@ class WorkerPool:
     _in_run: bool = False
     _max_workers: int = 0
     _idle_timeout_s: float | None = None
+    # Serializes pool sizing between the event loop's submissions and keep-alive timers.
+    _submit_lock: threading.Lock = field(default_factory=threading.Lock)
+    _keepalives: dict[str, threading.Timer] = field(default_factory=dict)
+    # Keep-alive pings loky has not reported done; they are not stage work when sizing the pool.
+    _pings: list[concurrent.futures.Future[None]] = field(default_factory=list)
     _user_code_files: dict[str, _FileStamp | None] = field(default_factory=dict)
     _code_changed: bool = False
 
@@ -193,14 +215,73 @@ class WorkerPool:
             raise RuntimeError("WorkerPool is not accepting new submissions")
         if self._executor is None:
             raise RuntimeError("WorkerPool not started")
-        return executor_core.submit(
-            self._executor,
-            self._max_workers,
-            fn,
-            *args,
-            prestart_target=prestart_target,
-            **kwargs,
+        with self._submit_lock:
+            self._pings = [ping for ping in self._pings if not ping.done()]
+            return executor_core.submit(
+                self._executor,
+                self._max_workers,
+                fn,
+                *args,
+                prestart_target=prestart_target,
+                keepalive_pings=len(self._pings),
+                **kwargs,
+            )
+
+    def keep_consumers_warm(self, parent: str, worker_count: int) -> None:
+        """Stop workers pre-started for ``parent``'s consumers from idling out while it runs.
+
+        Every half idle timeout until ``parent`` resolves, up to ``worker_count`` idle workers
+        each run one ping, which restarts that worker's idle clock. A parent shorter than half
+        the timeout costs nothing, and once ``parent`` resolves its kept workers are ordinary
+        idle workers again and exit on the normal timeout.
+        """
+        if worker_count <= 0 or self._idle_timeout_s is None:
+            return
+        with self._submit_lock:
+            if parent in self._keepalives:
+                raise RuntimeError(f"workers already kept warm for {parent!r}")
+            self._schedule_keepalive(parent, worker_count)
+
+    def release_consumers(self, parent: str) -> None:
+        """Stop keeping workers warm for ``parent``'s consumers."""
+        with self._submit_lock:
+            timer = self._keepalives.pop(parent, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_keepalive(self, parent: str, worker_count: int) -> None:
+        """Arm the next ping round for ``parent``; the caller holds ``_submit_lock``."""
+        assert self._idle_timeout_s is not None
+        timer = threading.Timer(
+            self._idle_timeout_s / 2, self._ping_idle_workers, args=(parent, worker_count)
         )
+        timer.daemon = True
+        self._keepalives[parent] = timer
+        timer.start()
+
+    def _ping_idle_workers(self, parent: str, worker_count: int) -> None:
+        with self._submit_lock:
+            if self._keepalives.get(parent) is not threading.current_thread():
+                return
+            if self._executor is None or self._manager is None:
+                return
+            self._pings = [ping for ping in self._pings if not ping.done()]
+            pings = min(worker_count, executor_core.idle_worker_count(self._executor))
+            if pings > 0:
+                barrier = typing.cast("_KeepaliveBarrier", self._manager.Barrier(pings))
+                self._pings.extend(
+                    executor_core.submit_to_live_workers(self._executor, _keepalive_ping, barrier)
+                    for _ in range(pings)
+                )
+            self._schedule_keepalive(parent, worker_count)
+
+    def _stop_keepalives(self) -> None:
+        with self._submit_lock:
+            timers = list(self._keepalives.values())
+            self._keepalives.clear()
+            self._pings.clear()
+        for timer in timers:
+            timer.cancel()
 
     def stop_accepting(self) -> None:
         """Stop accepting new submissions without shutting down workers."""
@@ -209,6 +290,7 @@ class WorkerPool:
     def end_run(self) -> None:
         """Release this run's queue while keeping workers warm for the next run."""
         self._accepting = False
+        self._stop_keepalives()
         self._output_queue = None
         self._shutdown_event = None
         self._in_run = False
@@ -217,6 +299,7 @@ class WorkerPool:
         """Shut down workers and the manager when the owning Engine exits."""
         self._accepting = False
         self._in_run = False
+        self._stop_keepalives()
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
@@ -240,6 +323,7 @@ class WorkerPool:
         """
         self._accepting = False
         self._in_run = False
+        self._stop_keepalives()
         try:
             if self._executor is not None:
                 executor = self._executor

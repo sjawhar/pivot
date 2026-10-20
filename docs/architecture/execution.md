@@ -116,11 +116,13 @@ when a run starts (it died, or its socket was removed) is replaced then.
 `get_width()` still gives the Engine an upper bound from the run's stage graph, capped by
 `core.max_workers`. It limits admission; it does not pre-create that many workers.
 
-The worker pool starts a process only when an admitted stage needs capacity. While a parent runs,
-it can also pre-start its direct consumer wave using the scheduler's resource-admission preview;
-those workers are idle and still subject to the normal timeout. Consequently, live workers stay
-bounded by actual scheduler capacity. A `local_grade: 2` limit therefore starts at most two
-workers for an otherwise-wide grade wave. Cached and skipped stages do not start workers.
+The worker pool starts a process only when an admitted stage needs capacity. For a parent that
+runs past half the one-shot idle timeout, it pings idle workers pre-started for that parent’s
+scheduler-admissible direct consumer wave. The ping restarts the worker’s idle clock without
+blocking it on the parent; when the parent resolves, pings stop and those workers become
+ordinary idle workers. Consequently, live workers stay bounded by actual scheduler capacity. A
+`local_grade: 2` limit therefore starts at most two workers for an otherwise-wide grade wave.
+Cached and skipped stages do not start workers.
 
 For a one-shot Engine, an idle worker exits after 10 seconds. The timeout is 126 times the
 78.898 ms maximum coordinator handoff gap measured on a 100-stage pandas/NumPy chain, while

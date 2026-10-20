@@ -82,15 +82,23 @@ def configured_worker_count(override: int | None = None) -> int:
     return max(1, max_workers)
 
 
+def _unsupported_loky_layout(detail: str) -> RuntimeError:
+    version = getattr(loky, "__version__", "unknown")
+    return RuntimeError(f"Unsupported loky {version}: {detail}")
+
+
 def _reusable_worker_target(max_workers: int, *, kill_workers: bool) -> int:
     """Keep reuse from invoking loky's blocking ``_resize`` between runs."""
-    executor = cast(
-        "loky.ProcessPoolExecutor | None",
-        getattr(loky.reusable_executor, "_executor", None),  # noqa: B009 - loky 3.4 singleton
-    )
-    if executor is None:
+    if hasattr(loky.reusable_executor, "_executor"):
+        executor = cast(
+            "loky.ProcessPoolExecutor | None",
+            getattr(loky.reusable_executor, "_executor"),  # noqa: B009 - loky 3.5 singleton
+        )
+    else:
         storage = getattr(loky.reusable_executor, "_executor_storage", None)  # noqa: B009 - loky 3.7 singleton
-        executor = cast("loky.ProcessPoolExecutor | None", getattr(storage, "executor", None))
+        if storage is None or not hasattr(storage, "executor"):
+            raise _unsupported_loky_layout("no reusable-executor singleton")
+        executor = cast("loky.ProcessPoolExecutor | None", storage.executor)
     if kill_workers or executor is None:
         return max_workers
     return executor._max_workers
@@ -129,20 +137,42 @@ def submit[T](
     /,
     *args: object,
     prestart_target: int = 0,
+    keepalive_pings: int = 0,
     **kwargs: object,
 ) -> concurrent.futures.Future[T]:
     """Submit work, growing only when every live worker already has work.
 
     ``prestart_target`` covers direct consumers that the scheduler predicts will become
-    resource-admissible when this stage completes.
+    resource-admissible when this stage completes. ``keepalive_pings`` counts submitted
+    keep-alive pings that have not finished: they last milliseconds, so they are not work.
     """
-    target_workers = max(len(pool._pending_work_items) + 1, prestart_target)
+    pending = len(pool._pending_work_items) - keepalive_pings
+    target_workers = max(pending + 1, prestart_target)
     pool._max_workers = min(max_workers, target_workers)
     resize_lock = getattr(pool, "_submit_resize_lock", None)  # noqa: B009 - absent in loky 3.7
     if resize_lock is None:
+        if not hasattr(loky.reusable_executor, "_executor_storage"):
+            raise _unsupported_loky_layout("no reusable-executor submission lock")
         return pool.submit(fn, *args, **kwargs)
     with resize_lock:
         return pool.submit(fn, *args, **kwargs)
+
+
+def submit_to_live_workers[T](
+    pool: loky.ProcessPoolExecutor, fn: typing.Callable[..., T], /, *args: object
+) -> concurrent.futures.Future[T]:
+    """Submit work that only a worker already alive may take; it never starts a worker."""
+    pool._max_workers = len(pool._processes)
+    resize_lock = getattr(pool, "_submit_resize_lock", None)  # noqa: B009 - absent in loky 3.7
+    if resize_lock is None:
+        return pool.submit(fn, *args)
+    with resize_lock:
+        return pool.submit(fn, *args)
+
+
+def idle_worker_count(pool: loky.ProcessPoolExecutor) -> int:
+    """Return how many live workers have no submitted work."""
+    return max(0, len(pool._processes) - len(pool._pending_work_items))
 
 
 def _init_worker(parent_pid: int, user_code_root: str | None) -> None:

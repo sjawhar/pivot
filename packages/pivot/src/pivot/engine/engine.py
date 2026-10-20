@@ -1727,6 +1727,7 @@ class Engine:
                     prestart_target=prestart_target,
                 )
                 self._futures[future] = stage_name
+                pool.keep_consumers_warm(stage_name, direct_consumers)
 
                 stage_start_times[stage_name] = time.perf_counter()
 
@@ -2159,6 +2160,10 @@ class Engine:
     ) -> float:
         """Handle a stage completing execution. Returns duration in milliseconds."""
         duration_ms = (time.perf_counter() - start_time) * 1000
+        # Stop keeping this stage's consumer workers warm; from here they are ordinary idle
+        # workers that the consumers reuse or the idle timeout reclaims.
+        if self._worker_pool is not None:
+            self._worker_pool.release_consumers(stage_name)
         # Record completed output state before replaying deferred file events.
         self._record_watch_output_stats(stage_name)
         await self._set_stage_state(stage_name, StageExecutionState.COMPLETED)

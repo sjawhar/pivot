@@ -8,6 +8,7 @@ import signal
 import time
 from typing import TYPE_CHECKING, cast
 
+import loky.reusable_executor
 import pytest
 
 from pivot.engine import worker_pool
@@ -47,6 +48,16 @@ def _helper_process_is_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def test_unknown_loky_reusable_executor_layout_names_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(loky.reusable_executor, "_executor", raising=False)
+    monkeypatch.delattr(loky.reusable_executor, "_executor_storage", raising=False)
+
+    with pytest.raises(RuntimeError, match=r"Unsupported loky \d"):
+        _ = executor_core._reusable_worker_target(1, kill_workers=False)
 
 
 @pytest.mark.slow

@@ -11,9 +11,15 @@ run, within `worker.TERMINATION_GRACE_S`.
 One-shot Engines give idle workers `core._WORKER_IDLE_TIMEOUT_S`; long-lived watch, serve and
 TUI Engines use no idle timeout so they stay warm between runs. `core.submit()` drives loky's
 private `_max_workers` to the submitted work count, so idle workers are not respawned until a
-stage needs one. Keep `reuse=False if kill_workers else "auto"` in the shared executor policy.
-While a discovery's import session lasts, the worker initializer (`core._init_worker`) also
-has each worker import user code through discovery's checked loader
+stage needs one. Parents running past half the one-shot idle timeout periodically ping idle
+workers pre-started for their direct consumers. The pings stop when the parent resolves, so the
+workers then follow the normal idle timeout. Keep `reuse=False if kill_workers else "auto"` in
+the shared executor policy.
+
+Pivot supports `loky>=3.5.6,<3.8`: 3.5.6 uses the legacy singleton and resize lock; 3.7 uses
+executor storage without that lock. Reject an unknown layout with an error that names the
+installed Loky version. While a discovery's import session lasts, the worker initializer
+(`core._init_worker`) also has each worker import user code through discovery's checked loader
 (`discovery.install_user_code_loader`); loky replaces a live pool whose initializer arguments
 differ.
 

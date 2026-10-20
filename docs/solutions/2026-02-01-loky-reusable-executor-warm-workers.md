@@ -42,9 +42,11 @@ def create_executor(
 The key behaviors:
 
 1. **First dispatch** - `core.submit()` sets loky's private `_max_workers` to the number of
-   submitted, unfinished stages, capped by the Engine's limit. It also accepts a
-   resource-admission preview of the dispatched stage's direct consumers, so a wide next wave
-   can finish worker startup while its parent runs.
+   submitted, unfinished stages, capped by the Engine's limit. If a parent is still running
+   halfway through the one-shot idle timeout, the Engine sends a barrier-coordinated ping to
+   each idle worker pre-started for its direct consumer wave. The ping restarts that worker’s
+   idle clock without delaying a short parent. When the parent resolves, pings stop and the
+   worker follows the normal timeout.
 2. **Later dispatches** - An existing idle worker takes the stage. A new worker starts only when
    every live worker already has work.
 3. **Idle cleanup** - One-shot Engines give idle workers a 10-second timeout. The timeout is
@@ -53,10 +55,13 @@ The key behaviors:
 4. **Long-lived Engines** - Watch, serve and persistent TUI Engines use no idle timeout, so a
    later run reuses their warm workers.
 
-This relies on loky's private executor state. Pivot supports both the 3.4–3.6 singleton and
-lock layout and 3.7's executor storage and submission layout. An upgrade must recheck the
-reusable-executor lookup plus `_max_workers` and `_pending_work_items` submission accounting;
-an upstream change can reintroduce refill churn.
+Pivot constrains Loky to `>=3.5.6,<3.8`: 3.5.0–3.5.5 print `resource_tracker` tracebacks on
+Python 3.13, and the code reads private executor state that a later release may move. It
+handles the legacy `_executor` singleton with `_submit_resize_lock` and 3.7's
+`_executor_storage`; an unknown layout raises an error naming the installed Loky version. The
+fresh-wheel test installs 3.5.6, 3.6.0 and 3.7.0 and checks the worker count and idle exit for
+each. An upgrade must recheck reusable-executor lookup plus `_max_workers` and
+`_pending_work_items` submission accounting; an upstream change can reintroduce refill churn.
 
 ### Starting Process Trackers for the TUI
 

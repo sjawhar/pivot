@@ -778,6 +778,77 @@ with Pipeline("resources") as pipeline:
             grade(shared)
 """
 
+# The parent sleeps longer than the one-shot idle timeout; the fan of four becomes ready only
+# when it finishes.
+_LONG_PARENT_FAN_PIPELINE = """\
+import time
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def source() -> str:
+    time.sleep({parent_s!r})
+    return "source"
+
+
+@stage
+def fan(value: str) -> str:
+    return value
+
+
+with Pipeline("fan") as pipeline:
+    shared = source()
+    for index in range(4):
+        with pipeline.variant(str(index)):
+            fan(shared)
+"""
+
+
+# The parent fails while an independent stage outlives the idle timeout and then counts the
+# live workers; workers reserved for the failed parent's fan must be gone by then.
+_FAILED_PARENT_FAN_PIPELINE = """\
+import os
+import pathlib
+import time
+
+import psutil
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def source() -> str:
+    time.sleep({parent_s!r})
+    raise RuntimeError("parent fails")
+
+
+@stage
+def fan(value: str) -> str:
+    return value
+
+
+@stage
+def bystander() -> str:
+    time.sleep({wait_s!r})
+    live = [
+        child
+        for child in psutil.Process(os.getppid()).children()
+        if "loky.backend.popen_loky_posix" in " ".join(child.cmdline())
+    ]
+    pathlib.Path({live_path!r}).write_text(str(len(live)))
+    return "bystander"
+
+
+with Pipeline("fan") as pipeline:
+    shared = source()
+    for index in range(4):
+        with pipeline.variant(str(index)):
+            fan(shared)
+    bystander()
+"""
+
+
 # Imported by every Python process the command starts: each loky worker records when it started,
 # and the pivot process records when it starts the Textual TUI.
 _WORKER_LOG_HOOK = """\
@@ -878,6 +949,66 @@ def test_resource_capacity_bounds_workers_started(
     _helper_pivot(root, env, "repro")
 
     assert _helper_started_workers(worker_log) == 2
+
+
+@pytest.mark.slow
+def test_fan_after_parent_longer_than_idle_timeout_starts_each_worker_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker started for a fan while its parent runs must not exit idle before the fan is
+    ready and then be started again: the run starts no more workers than the fan has stages."""
+    root = tmp_path.resolve() / "project"
+    parent_s = executor_core.one_shot_worker_idle_timeout() + 5
+    _helper_project(root, monkeypatch, _LONG_PARENT_FAN_PIPELINE.format(parent_s=parent_s))
+    _helper_configure_workers(root, 8)
+    env, worker_log = _helper_logging_env(tmp_path)
+
+    _helper_pivot(root, env, "repro")
+
+    started = _helper_started_workers(worker_log)
+    assert started <= 4, (
+        f"a four-stage fan after a {parent_s:g} s parent started {started} workers: workers "
+        "started while the parent ran exited idle and were started again for the fan"
+    )
+
+
+@pytest.mark.slow
+def test_workers_reserved_for_a_failed_parent_exit_within_the_idle_timeout(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers pre-started for a fan whose parent fails become ordinary idle workers and exit."""
+    root = tmp_path.resolve() / "project"
+    live_path = tmp_path / "live-workers"
+    parent_s = executor_core.one_shot_worker_idle_timeout() / 2 + 1
+    wait_s = parent_s + executor_core.one_shot_worker_idle_timeout() + 5
+    _helper_project(
+        root,
+        monkeypatch,
+        _FAILED_PARENT_FAN_PIPELINE.format(
+            parent_s=parent_s,
+            wait_s=wait_s,
+            live_path=str(live_path),
+        ),
+    )
+    _helper_configure_workers(root, 8)
+    env, _ = _helper_logging_env(tmp_path)
+
+    proc = subprocess.run(
+        [str(pathlib.Path(sys.executable).parent / "pivot"), "repro", "--keep-going"],
+        cwd=root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert live_path.read_text() == "1", (
+        f"{live_path.read_text()} workers were alive {wait_s:g} s after the parent failed; "
+        "only the one running the bystander should be"
+    )
 
 
 @pytest.mark.parametrize(
