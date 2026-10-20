@@ -1252,18 +1252,19 @@ def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> No
         name = node.func.id
         is_getattr = name in getattr_aliases or func_globals.get(name) is builtins.getattr
         if not is_getattr:
-            if (
-                len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value in ("import_module", "__import__")
-                and name not in local_functions
-            ):
-                raise _dynamic_import_error(func)
             if name in ("globals", "locals"):
                 qualname = getattr(func, "__qualname__", "?")
                 raise exceptions.StageDefinitionError(
                     f"'{qualname}' uses {name}() which bypasses fingerprint tracking."
                 )
+            if _static_value(node.func, func_globals) is not _UNREAD or name in local_functions:
+                continue
+            if (
+                len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in ("import_module", "__import__")
+            ):
+                raise _dynamic_import_error(func)
             continue
         if len(node.args) < 2:
             continue

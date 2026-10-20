@@ -146,8 +146,9 @@ Pivot rejects patterns that bypass static analysis:
   default argument, `functools.partial`, or a literal `getattr` lookup through the real
   loader — dynamic imports
 
-A user API can use either name. An unresolved receiver of either attribute is refused.
-Computed dictionary/attribute lookups and alternate loading APIs remain outside this check.
+A resolved user helper or API can receive either string without becoming a loader. An unresolved
+receiver or call callee for either spelling is refused. Computed dictionary/attribute lookups and
+alternate loading APIs remain outside this check.
 Use direct attribute access and static imports instead.
 
 ## @pivot.no_fingerprint()

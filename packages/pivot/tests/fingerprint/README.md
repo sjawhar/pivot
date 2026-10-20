@@ -184,6 +184,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `eval()` / `exec()`                      | ❌        | **NO TEST** - can't analyze dynamically |
 | Visible `importlib.import_module` / `__import__` spelling | ✅ (error) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_is_refused` |
 | A user method named `import_module` | ✅ | `test_fingerprint_gaps.py::test_user_method_named_import_module_runs` |
+| A resolved helper receiving `"import_module"` | ✅ | `test_fingerprint_gaps.py::test_resolved_helper_accepts_import_module_argument_name` |
 | Unresolved receiver of `import_module` / `__import__` | ✅ (error) | The receiver could be a dynamic loader |
 | Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss` |
 | Callback/function passed as argument     | ❌        | **NO TEST** - not tracked |

@@ -144,6 +144,32 @@ _DYNAMIC_IMPORT_SHAPES = {
         },
         _EDIT_LIB_VALUE,
     ),
+    "chained-alias-getattr-import-module": (
+        {
+            **_LIB_VALUE,
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    first = getattr\n"
+                "    lookup = first\n"
+                '    load = lookup(importlib, "import_module")\n'
+                '    return {"v": load("helpers.lib").VALUE + len(text.splitlines())}\n',
+            ),
+        },
+        _EDIT_LIB_VALUE,
+    ),
+    "parameter-getattr-import-module": (
+        {
+            **_LIB_VALUE,
+            "pipeline.py": _pipeline(
+                "\n\ndef _load(lookup):\n"
+                '    return lookup(importlib, "import_module")("helpers.lib").VALUE\n',
+                "@stage\ndef count(text: str) -> dict:\n"
+                '    return {"v": _load(getattr) + len(text.splitlines())}\n',
+            ),
+        },
+        _EDIT_LIB_VALUE,
+    ),
 }
 
 
@@ -210,6 +236,28 @@ def test_user_method_named_import_module_runs(tmp_path: pathlib.Path) -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == len(_LINES.strip())
+
+
+def test_resolved_helper_accepts_import_module_argument_name(tmp_path: pathlib.Path) -> None:
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/names.py": (
+                "def lookup(value: str, name: str) -> str:\n    return f'{value}:{name}'\n"
+            ),
+            "pipeline.py": _pipeline(
+                "\nfrom helpers.names import lookup\n",
+                "@stage\ndef count(text: str) -> dict:\n"
+                '    return {"v": lookup("safe", "import_module")}\n',
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(project) == "safe:import_module"
 
 
 def test_decorated_method_wrapper_edit_reruns_stage(tmp_path: pathlib.Path) -> None:

@@ -114,9 +114,9 @@ def process():
 An import whose module is named at run time cannot be resolved statically:
 visible references to `importlib.import_module` or `__import__`, including aliases, default
 arguments, `functools.partial`, and literal `getattr` lookups through a resolved loader, are
-refused with `StageDefinitionError`. A user API may use either name. An attribute receiver that
-cannot be resolved statically is refused for these spellings.
-
+refused with `StageDefinitionError`. A resolved user helper or API may receive either string
+without becoming a loader. An attribute receiver or call callee that cannot be resolved
+statically is refused for these spellings.
 Computed attribute names and alternate loading APIs (`vars(module)[name]`,
 `operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs) remain outside this
 check.
