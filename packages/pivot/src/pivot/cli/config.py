@@ -136,7 +136,9 @@ def config_set(key: str, value: str, use_global: bool) -> None:
         errors = "; ".join(err["msg"] for err in e.errors())
         raise click.ClickException(f"Invalid value for '{key}': {errors}") from e
 
-    config.set_config_value(key, validated, scope)
+    notices = config.set_config_value(key, validated, scope)
+    for notice in notices:
+        click.echo(notice)
     click.echo(f"Set {key} = {_format_value(validated)} in {scope} config")
 
 

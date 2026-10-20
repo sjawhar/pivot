@@ -253,14 +253,46 @@ def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
     return None, models.ConfigSource.UNKNOWN
 
 
+def _has_runtime_state(state_dir: pathlib.Path) -> bool:
+    """Whether a previous state directory contains more than the project marker files."""
+    try:
+        return any(path.name not in {"config.yaml", ".gitignore"} for path in state_dir.iterdir())
+    except FileNotFoundError:
+        return False
+
+
+def _transition_local_state_dir(old_state_dir: pathlib.Path) -> list[str]:
+    """Initialize the new directory without moving or discarding prior project state."""
+    root = project.get_project_root()
+    new_state_dir = project.ensure_state_dir(root)
+    if old_state_dir == new_state_dir:
+        return []
+
+    messages = list[str]()
+    marker_ignore = root / ".pivot" / ".gitignore"
+    if old_state_dir == root / ".pivot" and marker_ignore.exists():
+        if marker_ignore.read_text() == project.STATE_GITIGNORE_CONTENT:
+            marker_ignore.unlink()
+        else:
+            messages.append(f"Leaving {marker_ignore}; it has custom content.")
+
+    if _has_runtime_state(old_state_dir):
+        messages.append(f"Existing state at {old_state_dir} is no longer used.")
+    return messages
+
+
 def set_config_value(
     key: str, value: Any, scope: models.ConfigScope = models.ConfigScope.LOCAL
-) -> None:
-    """Set config value in specified scope with file locking."""
+) -> list[str]:
+    """Set a configuration value and return any state-transition notices."""
+    old_state_dir = project.get_state_dir() if scope is models.ConfigScope.LOCAL else None
     keys = parse_dotted_key(key)
     with edit_config(scope) as data:
         set_nested(data, keys, value)
     clear_config_cache()
+    if old_state_dir is None:
+        return []
+    return _transition_local_state_dir(old_state_dir)
 
 
 def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.LOCAL) -> bool:

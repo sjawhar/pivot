@@ -6,6 +6,7 @@ import pathlib
 import signal
 import socket
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,88 @@ def _pivot_entries(root: pathlib.Path) -> list[str]:
 
 def _lock_text() -> str:
     return yaml.safe_dump({"code_manifest": {}, "params": {}, "deps": [], "outs": []})
+
+
+_PIVOT = str(pathlib.Path(sys.executable).with_name("pivot"))
+
+
+def _run_pivot(root: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [_PIVOT, *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _write_acceptance_pipeline(root: pathlib.Path) -> None:
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "input.txt").write_text("data")
+    (root / "pipeline.py").write_text("""\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def upper(value: str) -> str:
+    return value.upper()
+
+
+with Pipeline("state") as pipeline:
+    upper(pipeline.input("input.txt", t=str))
+""")
+
+
+def test_configuring_state_dir_after_init_moves_generated_gitignore(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The documented init/config/repro sequence relocates future state without moving old state."""
+    root = tmp_path / "project"
+    root.mkdir()
+
+    initialized = _run_pivot(root, "init")
+    configured = _run_pivot(root, "config", "set", "core.state_dir", "altstate")
+    _write_acceptance_pipeline(root)
+    repro = _run_pivot(root, "repro")
+
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    assert repro.returncode == 0, repro.stdout + repro.stderr
+    assert _pivot_entries(root) == ["config.yaml", "stages"]
+    assert (root / "altstate" / ".gitignore").is_file()
+    assert "no longer used" in configured.stdout + configured.stderr
+
+
+def test_configuring_state_dir_preserves_custom_marker_gitignore(tmp_path: pathlib.Path) -> None:
+    """A hand-maintained marker ignore file is retained and explicitly named."""
+    root = tmp_path / "project"
+    root.mkdir()
+
+    initialized = _run_pivot(root, "init")
+    marker_ignore = root / ".pivot" / ".gitignore"
+    marker_ignore.write_text("custom rule\n")
+    configured = _run_pivot(root, "config", "set", "core.state_dir", "altstate")
+
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    assert marker_ignore.read_text() == "custom rule\n"
+    assert (root / "altstate" / ".gitignore").is_file()
+    assert str(marker_ignore) in configured.stdout + configured.stderr
+
+
+def test_repro_after_hand_editing_state_dir_creates_its_gitignore(tmp_path: pathlib.Path) -> None:
+    """A hand-edited state setting creates the configured directory's ignore file on repro."""
+    root = tmp_path / "project"
+    root.mkdir()
+
+    initialized = _run_pivot(root, "init")
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
+    _write_acceptance_pipeline(root)
+    repro = _run_pivot(root, "repro")
+
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+    assert repro.returncode == 0, repro.stdout + repro.stderr
+    assert (root / "altstate" / ".gitignore").is_file()
 
 
 def test_repro_keeps_all_state_in_the_configured_state_dir(
@@ -252,7 +335,7 @@ with pipeline:
 """)
     socket_path = tmp_path / "altstate" / "agent.sock"
     proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+        [_PIVOT, "repro", "--watch", "--serve"],
         cwd=tmp_path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -278,9 +361,10 @@ with pipeline:
         assert "error" not in response, response
         assert "result" in response
     finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()

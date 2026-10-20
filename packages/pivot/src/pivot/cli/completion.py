@@ -209,7 +209,7 @@ def _write_stages_cache(
     Cleans up temp file on failure before re-raising OSError.
     Caller is responsible for handling write failures.
     """
-    cache_dir = project.state_dir_for(root) / "cache"
+    cache_dir = project.ensure_state_dir(root) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     cache_path = cache_dir / "stages.cache"

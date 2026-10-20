@@ -25,7 +25,7 @@ differ.
 | `outs` | Output artifact references |
 | `incremental_inputs` | Parameter-to-own-output identities for prior incremental values |
 | `project_root` | Absolute path to project root |
-| `state_dir` | Absolute path to `.pivot/` directory |
+| `state_dir` | Absolute path to the configured state directory |
 ## Path Derivation
 
 Workers derive all paths from `project_root` and `state_dir` in `WorkerStageInfo`:

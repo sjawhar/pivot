@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, cast
 
 import aiohttp
 
-from pivot import config, exceptions
+from pivot import config, exceptions, project
 from pivot.remote import batch, keys
 from pivot.remote import config as remote_config
 
@@ -352,7 +352,12 @@ class GCSRemote:
         finally:
             with contextlib.suppress(OSError):
                 os.close(fd)
-        keys.check_digest(expected_hash, actual_hash, self._location(key))
+        keys.check_digest(
+            expected_hash,
+            actual_hash,
+            self._location(key),
+            state_dir=project.get_state_dir(),
+        )
 
     async def exists(self, cache_hash: str) -> bool:
         """Check if hash exists on remote via an object metadata request."""

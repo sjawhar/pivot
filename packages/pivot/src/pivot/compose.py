@@ -542,7 +542,7 @@ class Pipeline:
 
     @property
     def state_dir(self) -> pathlib.Path:
-        return project.state_dir_for(self._root)
+        return project.ensure_state_dir(self._root)
 
     @property
     def input_bindings(self) -> dict[str, str]:

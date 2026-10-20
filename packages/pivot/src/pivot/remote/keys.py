@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import pathlib
 import re
 import tempfile
 from typing import TYPE_CHECKING
@@ -79,13 +80,16 @@ async def stream_to_fd(read_chunk: Callable[[], Awaitable[bytes]], fd: int) -> s
     return hasher.hexdigest()
 
 
-def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
-    """Raise RemoteError if the downloaded object at ``location`` is not ``expected_hash``.
-
-    The digest detects accidental corruption during storage or transfer. It does not
-    authenticate remote content.
-    """
+def check_digest(
+    expected_hash: str,
+    actual_hash: str,
+    location: str,
+    *,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    """Raise RemoteError if the downloaded object at ``location`` is not ``expected_hash``."""
     if actual_hash != expected_hash:
+        state_db_path = (state_dir or pathlib.Path(".pivot")) / "state.lmdb"
         raise exceptions.RemoteError(
             f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
             + f"for {location}. Delete {location} from the remote, then run "
@@ -93,7 +97,7 @@ def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
             + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
             + "against this remote for this object. Pivot records hashes those commands "
             + "upload, download, or find, then skips recorded hashes. If every machine "
-            + "with a good copy has recorded it, delete `.pivot/state.lmdb/` before "
+            + f"with a good copy has recorded it, delete `{state_db_path}/` before "
             + "pushing; this also clears run history and local caches."
         )
 

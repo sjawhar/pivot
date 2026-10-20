@@ -8,6 +8,26 @@ logger = logging.getLogger(__name__)
 _project_root_cache: pathlib.Path | None = None
 _state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 
+STATE_GITIGNORE_CONTENT = """\
+# Cache directory (stage outputs, file hashes)
+/cache/
+
+# State database (file hashes, generation counters)
+/state.lmdb/
+
+# Artifact and restore locks (flock files for concurrent execution)
+/locks/
+
+# Agent RPC socket (left behind by TUI and --serve sessions)
+/agent.sock
+
+# Generated plots gallery (pivot plots show)
+/plots/
+
+# Key for secret params' digests in lock files; never commit it
+/secret.key
+"""
+
 
 def find_project_root() -> pathlib.Path:
     """Walk up from cwd to find the top-most .pivot directory.
@@ -84,6 +104,18 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
 def get_state_dir() -> pathlib.Path:
     """Return the state directory of the current project."""
     return state_dir_for(get_project_root())
+
+
+def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
+    """Create an initialized project's state directory and default ignore file when absent."""
+    state_dir = state_dir_for(root)
+    if not (root / ".pivot").is_dir():
+        return state_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    gitignore_path = state_dir / ".gitignore"
+    if not gitignore_path.exists():
+        gitignore_path.write_text(STATE_GITIGNORE_CONTENT)
+    return state_dir
 
 
 def resolve_path(path: str | pathlib.Path) -> pathlib.Path:

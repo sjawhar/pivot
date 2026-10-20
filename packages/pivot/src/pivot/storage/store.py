@@ -357,7 +357,7 @@ def store_from_spec(spec: StoreSpec) -> Store:
         project_root = pathlib.Path(spec["project_root"])
         return CacheStore(
             cache_dir=pathlib.Path(spec["cache_dir"]),
-            state_dir=project.state_dir_for(project_root),
+            state_dir=project.ensure_state_dir(project_root),
         )
     if kind == "workspace":
         cache_dir_str = spec.get("cache_dir")

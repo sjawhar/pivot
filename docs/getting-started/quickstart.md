@@ -24,12 +24,12 @@ pivot init
 `pivot init` creates:
 
 - `.pivot/`: the project marker and its `config.yaml`
-- `.pivot/.gitignore`: by default, keeps the state directory's cache, state database, artifact
-  locks and agent socket out of git
+- `<state dir>/.gitignore`: keeps the cache, state database, artifact locks and agent socket out
+  of git; `<state dir>` is `core.state_dir` and defaults to `.pivot`
 - `.pivotignore`: patterns for files watch mode ignores
 
-`core.state_dir` selects where Pivot writes state and defaults to `.pivot`. Commit the lock files
-under `<state dir>/stages/`; they record what ran and what it produced.
+`core.state_dir` selects where Pivot writes state. Commit the lock files under
+`<state dir>/stages/`; they record what ran and what it produced.
 
 ## 2. Add Input Data
 

@@ -594,12 +594,11 @@ def _secret_key() -> bytes:
     """
     if (from_env := os.environ.get(_SECRET_KEY_ENV)) is not None:
         return _parse_secret_key(from_env, _SECRET_KEY_ENV)
-    state_dir = project.get_state_dir()
+    state_dir = project.ensure_state_dir(project.get_project_root())
     key_file = state_dir / _SECRET_KEY_FILE
     try:
         text = _read_no_follow(key_file)
     except FileNotFoundError:
-        state_dir.mkdir(parents=True, exist_ok=True)
         _create_secret_key(state_dir, key_file)
         text = _read_no_follow(key_file)
     return _parse_secret_key(text, str(key_file))

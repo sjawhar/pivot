@@ -25,6 +25,14 @@ def _write_config(project_root: pathlib.Path, content: str) -> None:
     config_io.clear_config_cache()
 
 
+def test_ensure_state_dir_does_not_create_a_project_marker(tmp_path: pathlib.Path) -> None:
+    """A pipeline constructed outside a project must not turn its parent into a project."""
+    result = project.ensure_state_dir(tmp_path)
+
+    assert result == tmp_path / ".pivot"
+    assert not result.exists()
+
+
 # --- cache.dir tests ---
 
 

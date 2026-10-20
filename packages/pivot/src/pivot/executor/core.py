@@ -212,7 +212,7 @@ def run(
     Args:
         stages: Target stages to run (and their dependencies). If None, runs all.
         single_stage: If True, run only the specified stages without dependencies.
-        cache_dir: Directory for lock files. Defaults to .pivot/cache.
+        cache_dir: Cache directory, defaulting to `<state dir>/cache`.
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Most workers, and the ``cpu`` resource capacity (default: ``core.max_workers``).
         resource_capacity: Per-run resource capacity overrides.

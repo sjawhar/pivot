@@ -28,6 +28,19 @@ def test_init_creates_gitignore(runner: click.testing.CliRunner, tmp_path: pathl
         assert pathlib.Path(".pivot/.gitignore").exists()
 
 
+def test_default_init_keeps_legacy_stages_directory(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The default state directory keeps init's established layout and output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0, result.output
+        assert pathlib.Path(".pivot/stages").is_dir()
+        assert "  .pivot/stages/" in result.output
+
+
 @pytest.mark.parametrize(
     "expected_content",
     [

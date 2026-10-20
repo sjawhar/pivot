@@ -8,27 +8,7 @@ from pivot import exceptions, ignore, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
-# Entries are anchored to the state directory, so a pipeline named e.g. "cache" or "locks" keeps
-# its committed lock files under stages/<pipeline>/.
-_GITIGNORE_CONTENT = """\
-# Cache directory (stage outputs, file hashes)
-/cache/
-
-# State database (file hashes, generation counters)
-/state.lmdb/
-
-# Artifact and restore locks (flock files for concurrent execution)
-/locks/
-
-# Agent RPC socket (left behind by TUI and --serve sessions)
-/agent.sock
-
-# Generated plots gallery (pivot plots show)
-/plots/
-
-# Key for secret params' digests in lock files; never commit it
-/secret.key
-"""
+_GITIGNORE_CONTENT = project.STATE_GITIGNORE_CONTENT
 
 
 @cli_decorators.pivot_command(auto_discover=False)
@@ -58,17 +38,18 @@ def init(ctx: click.Context, force: bool) -> None:
             )
 
     pivot_dir.mkdir(exist_ok=True)
-    state_dir = project.state_dir_for(cwd)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = project.ensure_state_dir(cwd)
     gitignore_path = state_dir / ".gitignore"
 
     # Warn if overwriting existing .gitignore with custom content
     if force and gitignore_path.exists():
         existing_content = gitignore_path.read_text()
-        if existing_content != _GITIGNORE_CONTENT and not quiet:
+        if existing_content != project.STATE_GITIGNORE_CONTENT and not quiet:
             click.echo(f"Warning: Overwriting existing {gitignore_path}", err=True)
 
-    gitignore_path.write_text(_GITIGNORE_CONTENT)
+    gitignore_path.write_text(project.STATE_GITIGNORE_CONTENT)
+    stages_dir = state_dir / "stages"
+    stages_dir.mkdir(exist_ok=True)
 
     # Create .pivotignore with default patterns if it doesn't exist
     pivotignore_path = pathlib.Path.cwd() / ".pivotignore"
@@ -84,9 +65,12 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo("Created:")
         click.echo("  .pivot/")
         try:
+            display_stages = stages_dir.relative_to(cwd)
             display_gitignore = gitignore_path.relative_to(cwd)
         except ValueError:
+            display_stages = stages_dir
             display_gitignore = gitignore_path
+        click.echo(f"  {display_stages}/")
         click.echo(f"  {display_gitignore}")
         if created_pivotignore:
             click.echo("  .pivotignore")

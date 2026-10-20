@@ -40,7 +40,7 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path | None, open_brows
     _run_common.ensure_stages_registered()
 
     if output is None:
-        output_path = project.get_state_dir() / "plots" / "index.html"
+        output_path = project.ensure_state_dir(proj_root) / "plots" / "index.html"
     else:
         path_policy.require_valid_path(
             str(output),
