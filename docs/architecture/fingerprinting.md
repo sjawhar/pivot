@@ -25,7 +25,7 @@ Pivot's fingerprinting system:
 |---------|----------|-----|
 | Same-module helpers | Yes | `getclosurevars()` discovers reference |
 | Module imports | Yes | AST scanning for attribute access |
-| Imports in a function body | Yes | Pivot never executes a body import while defining a pipeline. An already-loaded user module is walked like a module-level import; an unloaded user module contributes a static closure of its own and statically imported user source files. Library modules add nothing. |
+| Imports in a function body | Yes | Pivot never executes a body import while defining a pipeline. An already-loaded user module is walked like a module-level import. An unloaded `from module import name` is accepted only when `name` is statically a function, class, immutable literal, or submodule; other bindings are refused with a StageParams fix. A plain unloaded module import contributes its static user-source closure. Library modules add nothing. |
 | Class definitions | Yes | Full class AST hashed |
 | Callable members of user classes | Yes | User-defined methods, classmethods, staticmethods, property accessors, cached properties, `functools.partial`/`partialmethod` members, nested user classes, and dataclass default factories are walked like stage helpers. Callable instances and other user-defined descriptors are refused because their state is not reliably fingerprintable. Generated and library members are skipped. |
 | StageParams subclasses | Yes | Type hint analysis + full class AST + Pydantic field defaults + `default_factory` functions |
@@ -112,10 +112,10 @@ def process():
 ```
 
 An import whose module is named at run time cannot be resolved statically:
-any visible reference to `importlib.import_module` or `__import__`, including an alias,
-default argument, `functools.partial`, or literal `getattr`, is refused with
-`StageDefinitionError`. A static import inside the function body (`from helpers import
-process_data`) is tracked without executing it during pipeline definition.
+visible references to `importlib.import_module` or `__import__`, including aliases, default
+arguments, `functools.partial`, and literal `getattr` lookups through a resolved loader, are
+refused with `StageDefinitionError`. A user API may use either name. An attribute receiver that
+cannot be resolved statically is refused for these spellings.
 
 Computed attribute names and alternate loading APIs (`vars(module)[name]`,
 `operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs) remain outside this

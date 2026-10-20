@@ -141,8 +141,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Change Type                          | Detected? | Test Reference                                                       |
 | ------------------------------------ | --------- | -------------------------------------------------------------------- |
 | `from X import func` inside function | ✅        | `test_change_detection.py::test_loaded_body_import_is_tracked_as_a_helper` |
-| `import X as alias` inside function  | ✅        | `test_change_detection.py::test_in_body_import_change_causes_miss`   |
+| `import X as alias` inside function  | ✅        | `test_change_detection.py::test_in_body_import_change_causes_miss` |
 | Conditional import inside function   | ✅        | `test_fingerprint_gaps.py::test_guarded_in_body_import_is_not_imported_at_definition` |
+| Unloaded `from X import NAME` binding a runtime value | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_runtime_body_import_value_is_refused` |
 
 ---
 
@@ -182,8 +183,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `func_dict[key]()` dispatch              | ✅        | `test_change_detection.py::test_dynamic_dispatch_change_detected`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
 | `eval()` / `exec()`                      | ❌        | **NO TEST** - can't analyze dynamically |
 | Visible `importlib.import_module` / `__import__` spelling | ✅ (error) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_is_refused` |
-| `importlib.import_module(...)` (direct call) | ✅ (error) | `test_fingerprint.py::test_dynamic_import_is_refused[attribute-import-module]` |
-| Dynamic attribute and alternate loading APIs | ❌ | `vars(module)[name]`, `operator.attrgetter`, `exec_module`, and `runpy` are documented limits |
+| A user method named `import_module` | ✅ | `test_fingerprint_gaps.py::test_user_method_named_import_module_runs` |
+| Unresolved receiver of `import_module` / `__import__` | ✅ (error) | The receiver could be a dynamic loader |
 | Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss` |
 | Callback/function passed as argument     | ❌        | **NO TEST** - not tracked |
 | Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source) |

@@ -1176,9 +1176,56 @@ def _dynamic_import_error(func: Callable[..., Any]) -> exceptions.StageDefinitio
     )
 
 
+def _static_value(node: ast.expr, globals_dict: dict[str, Any]) -> Any:
+    """Resolve a name or safe module/class attribute without executing user code."""
+    if isinstance(node, ast.Name):
+        return globals_dict.get(node.id, _UNREAD)
+    if not isinstance(node, ast.Attribute):
+        return _UNREAD
+    owner = _static_value(node.value, globals_dict)
+    if not isinstance(owner, (types.ModuleType, type)):
+        return _UNREAD
+    raw = vars(owner).get(node.attr, _UNREAD)
+    if isinstance(raw, (classmethod, staticmethod)):
+        return cast("Any", raw.__func__)
+    return raw
+
+
+def _getattr_aliases(tree: ast.Module, globals_dict: dict[str, Any]) -> set[str]:
+    """Return names assigned directly from the builtin ``getattr`` in reached source."""
+    aliases = set[str]()
+    if globals_dict.get("getattr", builtins.getattr) is builtins.getattr:
+        aliases.add("getattr")
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            value: ast.expr | None
+            targets: list[ast.expr]
+            if isinstance(node, ast.Assign):
+                value, targets = node.value, node.targets
+            elif isinstance(node, ast.AnnAssign):
+                value, targets = node.value, [node.target]
+            else:
+                continue
+            if not isinstance(value, ast.Name) or value.id not in aliases:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in aliases:
+                    aliases.add(target.id)
+                    changed = True
+    return aliases
+
+
 def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
     """Refuse statically visible aliases of ``import_module`` and ``__import__``."""
     func_globals: dict[str, Any] = getattr(func, "__globals__", {})
+    getattr_aliases = _getattr_aliases(tree, func_globals)
+    local_functions = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.ImportFrom)
@@ -1186,30 +1233,58 @@ def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> No
             and any(alias.name in ("import_module", "__import__") for alias in node.names)
         ):
             raise _dynamic_import_error(func)
-        if isinstance(node, ast.Attribute) and node.attr in ("import_module", "__import__"):
-            raise _dynamic_import_error(func)
         if (
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
             and (node.id == "__import__" or _is_dynamic_import(func_globals.get(node.id)))
         ):
             raise _dynamic_import_error(func)
+        if isinstance(node, ast.Attribute) and node.attr in ("import_module", "__import__"):
+            receiver = _static_value(node.value, func_globals)
+            if receiver in (importlib, builtins) or _is_dynamic_import(
+                _static_value(node, func_globals)
+            ):
+                raise _dynamic_import_error(func)
+            if receiver is _UNREAD:
+                raise _dynamic_import_error(func)
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             continue
-        if node.func.id == "getattr" and len(node.args) >= 2:
-            attribute = node.args[1]
-            if not isinstance(attribute, ast.Constant):
+        name = node.func.id
+        is_getattr = name in getattr_aliases or func_globals.get(name) is builtins.getattr
+        if not is_getattr:
+            if (
+                len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in ("import_module", "__import__")
+                and name not in local_functions
+            ):
+                raise _dynamic_import_error(func)
+            if name in ("globals", "locals"):
                 qualname = getattr(func, "__qualname__", "?")
                 raise exceptions.StageDefinitionError(
-                    f"'{qualname}' uses getattr() with non-literal attribute. Use direct attribute access."
+                    f"'{qualname}' uses {name}() which bypasses fingerprint tracking."
                 )
-            if attribute.value in ("import_module", "__import__"):
-                raise _dynamic_import_error(func)
-        elif node.func.id in ("globals", "locals"):
+            continue
+        if len(node.args) < 2:
+            continue
+        attribute = node.args[1]
+        if not isinstance(attribute, ast.Constant):
             qualname = getattr(func, "__qualname__", "?")
             raise exceptions.StageDefinitionError(
-                f"'{qualname}' uses {node.func.id}() which bypasses fingerprint tracking."
+                f"'{qualname}' uses getattr() with non-literal attribute. Use direct attribute access."
             )
+        if attribute.value in ("import_module", "__import__"):
+            receiver = _static_value(node.args[0], func_globals)
+            resolved = _static_value(
+                ast.Attribute(value=node.args[0], attr=attribute.value, ctx=ast.Load()),
+                func_globals,
+            )
+            if (
+                receiver is _UNREAD
+                or receiver in (importlib, builtins)
+                or _is_dynamic_import(resolved)
+            ):
+                raise _dynamic_import_error(func)
 
 
 def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
@@ -1614,6 +1689,64 @@ def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
     return all(is_library_path(pathlib.Path(location).resolve()) for location in locations)
 
 
+def _is_static_immutable_literal(node: ast.expr) -> bool:
+    """Whether `node` evaluates to one of Pivot's immutable tracked value shapes."""
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return _immutable_value_text(value) is not None
+
+
+def _unloaded_from_import_is_safe(module_name: str, attribute: str) -> bool | None:
+    """Return whether an unloaded ``from module import attribute`` binding is statically safe.
+
+    ``None`` means the module is not user source and needs no fingerprint rule. A user module
+    may supply only a class, function, or tracked immutable literal without executing it.
+    """
+    target_spec = _module_spec_without_import(f"{module_name}.{attribute}")
+    if target_spec is not None and not _is_library_spec(target_spec):
+        return True
+    spec = _module_spec_without_import(module_name)
+    if spec is None or _is_library_spec(spec):
+        return None
+    if spec.origin is None:
+        return False
+    try:
+        tree = ast.parse(pathlib.Path(spec.origin).read_text())
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return False
+    safe: bool | None = None
+    for node in tree.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == attribute
+        ):
+            safe = True
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == attribute for target in node.targets
+        ):
+            safe = _is_static_immutable_literal(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == attribute
+        ):
+            safe = node.value is not None and _is_static_immutable_literal(node.value)
+    return safe is True
+
+
+def _unloaded_from_import_error(
+    func: Callable[..., Any], module_name: str, attribute: str
+) -> exceptions.StageDefinitionError:
+    qualname = getattr(func, "__qualname__", "?")
+    return exceptions.StageDefinitionError(
+        f"'{qualname}' imports '{attribute}' from unloaded user module '{module_name}', "
+        + "whose value cannot be fingerprinted without executing the import. "
+        + "Fix: move this value into the stage's StageParams or use a static module-level import."
+    )
+
+
 def _process_body_imports(
     func: Callable[..., Any], tree: ast.Module, manifest: dict[str, str], visited: set[int]
 ) -> None:
@@ -1628,7 +1761,13 @@ def _process_body_imports(
         if module is None:
             _record_unloaded_body_import(func, body_import.module, manifest)
             if body_import.attribute is not None:
-                _record_unloaded_body_import(func, body_import.target, manifest)
+                safety = _unloaded_from_import_is_safe(body_import.module, body_import.attribute)
+                if safety is False:
+                    raise _unloaded_from_import_error(
+                        func, body_import.module, body_import.attribute
+                    )
+                if safety is True:
+                    _record_unloaded_body_import(func, body_import.target, manifest)
             continue
         imported = f"bi:{body_import.module}"
         _record_read(func, imported)

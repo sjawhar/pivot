@@ -131,6 +131,19 @@ _DYNAMIC_IMPORT_SHAPES = {
         },
         _EDIT_LIB_VALUE,
     ),
+    "local-alias-getattr-import-module": (
+        {
+            **_LIB_VALUE,
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    lookup = getattr\n"
+                '    load = lookup(importlib, "import_module")\n'
+                '    return {"v": load("helpers.lib").VALUE + len(text.splitlines())}\n',
+            ),
+        },
+        _EDIT_LIB_VALUE,
+    ),
 }
 
 
@@ -144,6 +157,59 @@ def test_dynamic_import_spelling_is_refused(tmp_path: pathlib.Path, shape: str) 
     assert result.returncode != 0, result.stdout + result.stderr
     assert "fingerprinting failed" in result.stdout + result.stderr
     assert "dynamic imports" in result.stdout + result.stderr
+
+
+def test_unloaded_runtime_body_import_value_is_refused(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BODY_IMPORT_BONUS", "1")
+    project = _project(
+        tmp_path,
+        {
+            "runtime_values.py": (
+                "import os\n\nCONFIG = {'bonus': int(os.environ['BODY_IMPORT_BONUS'])}\n"
+            ),
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    from runtime_values import CONFIG\n"
+                '    return {"v": len(text.splitlines()) + CONFIG["bonus"]}\n',
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    message = result.stdout + result.stderr
+    assert "runtime_values" in message
+    assert "CONFIG" in message
+    assert "StageParams" in message
+
+
+def test_user_method_named_import_module_runs(tmp_path: pathlib.Path) -> None:
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/formatter.py": (
+                "class Formatter:\n"
+                "    @staticmethod\n"
+                "    def import_module(text: str) -> int:\n"
+                "        return len(text.strip())\n"
+            ),
+            "pipeline.py": _pipeline(
+                "\nfrom helpers.formatter import Formatter\n",
+                "@stage\ndef count(text: str) -> dict:\n"
+                '    return {"v": Formatter.import_module(text)}\n',
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(project) == len(_LINES.strip())
 
 
 def test_decorated_method_wrapper_edit_reruns_stage(tmp_path: pathlib.Path) -> None:

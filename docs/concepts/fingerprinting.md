@@ -41,8 +41,10 @@ For each stage function, Pivot:
 4. **Follows imports in the function body** — `import helpers` or
    `from helpers import scale` inside a stage or helper is walked as if it
    were a module-level import when discovery already loaded the user module.
-   Otherwise Pivot tracks its static user-source import closure without
-   executing the import. A library module adds nothing
+   Otherwise a plain module import tracks its static user-source closure.
+   An unloaded `from module import name` is accepted only for a statically
+   proven function, class, immutable literal, or submodule; other bindings
+   are refused rather than executing the import
 5. **Inspects type hints** — user-defined classes in annotations
    (including Pydantic models) are fingerprinted
 6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
@@ -136,15 +138,15 @@ needed that downgrade still runs, but its result is never filed in the run
 cache or restored from it: the captured value may differ next time while the
 fingerprint stays the same.
 
-### Dynamic Name Access
-
 Pivot rejects patterns that bypass static analysis:
 
 - `globals()` / `locals()` — runtime namespace access
 - `getattr(obj, variable)` — dynamic attribute lookup
 - a visible reference to `importlib.import_module` or `__import__`, including an alias,
-  default argument, `functools.partial`, or literal `getattr` — dynamic imports
+  default argument, `functools.partial`, or a literal `getattr` lookup through the real
+  loader — dynamic imports
 
+A user API can use either name. An unresolved receiver of either attribute is refused.
 Computed dictionary/attribute lookups and alternate loading APIs remain outside this check.
 Use direct attribute access and static imports instead.
 

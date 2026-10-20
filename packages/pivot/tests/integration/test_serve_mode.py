@@ -375,31 +375,33 @@ with pipeline:
     )
 
     try:
-        # Wait for socket to be created (poll up to 10s)
+        # A filesystem socket can exist before the server calls listen(). Wait for an actual
+        # JSON-RPC response rather than treating creation as readiness.
+        response: dict[str, object] | None = None
         for _ in range(100):
             if socket_path.exists():
-                break
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                        sock.settimeout(5.0)
+                        sock.connect(str(socket_path))
+                        request = '{"jsonrpc":"2.0","method":"status","id":1}\n'
+                        sock.sendall(request.encode())
+                        response = json.loads(sock.recv(1024).decode().strip())
+                        break
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass
             time.sleep(0.1)
-        else:
-            stdout, stderr = proc.communicate(timeout=1)
-            pytest.fail(
-                "Socket not created within 10s.\n"
-                + f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
-            )
-
-        # Connect and send status query
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5.0)
-            sock.connect(str(socket_path))
-            request = '{"jsonrpc":"2.0","method":"status","id":1}\n'
-            sock.sendall(request.encode())
-            response_data = sock.recv(1024)
-            response = json.loads(response_data.decode().strip())
+        assert response is not None, "Agent socket did not become RPC-ready within 10s"
+        status_response = response
 
         # Should get valid status response, NOT "Method not found" error
-        assert "error" not in response, f"Expected status result, got error: {response}"
-        assert "result" in response
-        assert response["result"]["state"] in ("idle", "active")
+        assert "error" not in status_response, (
+            f"Expected status result, got error: {status_response}"
+        )
+        assert "result" in status_response
+        status_result = status_response["result"]
+        assert isinstance(status_result, dict)
+        assert status_result["state"] in ("idle", "active")
 
         # Also test stages query
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -407,12 +409,16 @@ with pipeline:
             sock.connect(str(socket_path))
             request = '{"jsonrpc":"2.0","method":"stages","id":2}\n'
             sock.sendall(request.encode())
-            response_data = sock.recv(1024)
-            response = json.loads(response_data.decode().strip())
+            stages_response = json.loads(sock.recv(1024).decode().strip())
 
-        assert "error" not in response, f"Expected stages result, got error: {response}"
-        assert "result" in response
-        assert "stages" in response["result"]
+        assert isinstance(stages_response, dict)
+        assert "error" not in stages_response, (
+            f"Expected stages result, got error: {stages_response}"
+        )
+        assert "result" in stages_response
+        stages_result = stages_response["result"]
+        assert isinstance(stages_result, dict)
+        assert "stages" in stages_result
 
     finally:
         # Clean up subprocess
