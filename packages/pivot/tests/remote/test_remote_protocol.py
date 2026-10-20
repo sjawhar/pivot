@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 
 from pivot.remote import gcs, protocol, storage
@@ -31,3 +34,14 @@ def test_both_backends_satisfy_protocol() -> None:
             if not hasattr(cls, m)
         ]
         assert missing == []
+
+
+def test_importing_pivot_remote_does_not_load_the_gcs_backend() -> None:
+    """Every command that imports pivot.remote would otherwise pay for loading aiohttp."""
+    probe = "import sys, pivot.remote; print(sorted({'aiohttp', 'pivot.remote.gcs'} & set(sys.modules)))"
+
+    loaded = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    assert loaded == "[]"

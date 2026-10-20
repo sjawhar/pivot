@@ -14,13 +14,13 @@ import collections
 import datetime
 import gc
 import hashlib
-import inspect
 import json
 import logging
 import os
 import traceback
+import tracemalloc
 import types
-from typing import IO, TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING
 
 import aiohttp
 import pytest
@@ -68,7 +68,7 @@ class _Google:
     url: str
     authorizations: list[str]
     content_ranges: list[str]
-    session_names: dict[str, str]
+    upload_types: list[str]
     counts: collections.Counter[str]
     routes: dict[str, Handler]
 
@@ -76,7 +76,7 @@ class _Google:
         self.url = ""
         self.authorizations = []
         self.content_ranges = []
-        self.session_names = {}
+        self.upload_types = []
         self.counts = collections.Counter()
         self.routes = {
             "token": self._token,
@@ -85,8 +85,6 @@ class _Google:
             "media": self._not_found,
             "list": self._empty_listing,
             "simple": self._store_simple,
-            "initiate": self._initiate,
-            "session": self._store_session,
         }
         self._runner: web.AppRunner | None = None
 
@@ -97,7 +95,6 @@ class _Google:
         app.router.add_get("/storage/v1/b/{bucket}/o", self._route("list"))
         app.router.add_get("/storage/v1/b/{bucket}/o/{name:.+}", self._object)
         app.router.add_post("/upload/storage/v1/b/{bucket}/o", self._upload)
-        app.router.add_put("/session/{session}", self._route("session"))
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "127.0.0.1", 0)
@@ -129,8 +126,9 @@ class _Google:
         return await self._route(name)(request)
 
     async def _upload(self, request: web.Request) -> web.StreamResponse:
-        name = "initiate" if request.query.get("uploadType") == "resumable" else "simple"
-        return await self._route(name)(request)
+        """Every upload POST, with its ``uploadType`` recorded (``media`` for a simple upload)."""
+        self.upload_types.append(request.query.get("uploadType", ""))
+        return await self._route("simple")(request)
 
     async def _token(self, request: web.Request) -> web.StreamResponse:
         return web.json_response({"access_token": _SENTINEL, "expires_in": 3600})
@@ -146,19 +144,6 @@ class _Google:
 
     async def _store_simple(self, request: web.Request) -> web.StreamResponse:
         return web.json_response(_resource(request.query["name"], await request.read()))
-
-    async def _initiate(self, request: web.Request) -> web.StreamResponse:
-        session = str(self.counts["initiate"])
-        self.session_names[session] = json.loads(await request.read())["name"]
-        return web.Response(headers={"Location": f"{self.url}/session/{session}"})
-
-    async def _store_session(self, request: web.Request) -> web.StreamResponse:
-        name = self.session_names[request.match_info["session"]]
-        return web.json_response(_resource(name, await request.read()))
-
-
-async def _no_sleep(_: float) -> None:
-    return None
 
 
 @pytest.fixture
@@ -192,7 +177,6 @@ async def google(
         return False, stub.url
 
     monkeypatch.setattr(gcloud_storage_impl, "init_api_root", api_root)
-    monkeypatch.setattr(gcloud_storage_impl, "sleep", _no_sleep)  # gcloud-aio's own retries
     monkeypatch.setattr(gcs, "_RETRY_BASE_DELAY", 0)
     monkeypatch.setattr(gcloud_token.BaseToken.acquire_access_token.retry, "enabled", False)
     mocker.patch.object(config, "get_remote_retries", return_value=0)
@@ -369,19 +353,11 @@ _Operation = "Callable[[gcs.GCSRemote, pathlib.Path], Awaitable[object]]"
         ),
         pytest.param(
             False,
-            "initiate",
+            "simple",
             _forbidden,
             _upload_large,
             "Permission denied to write",
-            id="resumable-start-403",
-        ),
-        pytest.param(
-            False,
-            "session",
-            _forbidden,
-            _upload_large,
-            "Permission denied to write",
-            id="resumable-data-403",
+            id="upload-large-403",
         ),
         pytest.param(
             False, "media", _forbidden, _download_file, "Permission denied to read", id="media-403"
@@ -533,35 +509,164 @@ async def test_missing_key_file_is_a_credentials_error_naming_the_file(
 
 
 # -----------------------------------------------------------------------------
-# An upload counts only when the stored object matches the local file
+# Every upload is one streamed simple upload, retried whole
 # -----------------------------------------------------------------------------
 
 
-async def test_resumable_upload_answered_308_is_not_recorded_as_pushed(
-    google: _Google, tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
-    """gcloud-aio returns the JSON of any reply below 400, so a data PUT answered
-    ``308 Resume Incomplete`` returns no object; pivot must not count that as uploaded."""
-    mocker.patch.object(config, "get_remote_retries", return_value=1)
-
-    async def resume_incomplete(request: web.Request) -> web.StreamResponse:
-        await request.read()
-        return web.Response(status=308)
-
-    google.routes["session"] = resume_incomplete
-    content = os.urandom(gcs.STREAM_CHUNK_SIZE + 1)
+def _cache_holding(tmp_path: pathlib.Path, content: bytes) -> tuple[pathlib.Path, str]:
+    """A cache directory holding ``content`` as its only object, and that object's hash."""
     content_hash = xxhash.xxh64(content).hexdigest()
     cache_dir = tmp_path / "cache"
     cached = cache.get_cache_path(cache_dir / "files", content_hash)
     cached.parent.mkdir(parents=True)
     cached.write_bytes(content)
+    return cache_dir, content_hash
+
+
+async def test_large_file_goes_up_in_one_streamed_simple_upload(
+    google: _Google, tmp_path: pathlib.Path
+) -> None:
+    """A file three times the 8 MiB download read size goes up in one POST, never through a
+    resumable session, and is streamed from disk: the process never holds it in memory."""
+    size = 3 * gcs.STREAM_CHUNK_SIZE
+    local = tmp_path / "large"
+    with local.open("wb") as f:
+        for _ in range(size // (1024 * 1024)):
+            f.write(os.urandom(1024 * 1024))
+
+    async def store_streamed(request: web.Request) -> web.StreamResponse:
+        received = hashlib.md5()
+        length = 0
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            received.update(chunk)
+            length += len(chunk)
+        resource = {
+            "name": request.query["name"],
+            "size": str(length),
+            "md5Hash": base64.b64encode(received.digest()).decode(),
+        }
+        return web.json_response(resource)
+
+    google.routes["simple"] = store_streamed
+    remote = gcs.GCSRemote(f"gs://{_BUCKET}/p")
+
+    tracemalloc.start()
+    try:
+        await remote.upload_file(local, _HASH)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert google.upload_types == ["media"]
+    assert peak < gcs.STREAM_CHUNK_SIZE, f"{peak} bytes held while uploading {size}"
+
+
+async def _unavailable(request: web.Request) -> web.StreamResponse:
+    return _error(503, "Backend Error")
+
+
+async def _rate_limited(request: web.Request) -> web.StreamResponse:
+    return _error(429, "rateLimitExceeded")
+
+
+async def _stalled(request: web.Request) -> web.StreamResponse:
+    await asyncio.sleep(1)  # longer than the 0.2 s read timeout the test sets
+    return web.Response()
+
+
+@pytest.mark.parametrize(
+    "failure", [_unavailable, _rate_limited, _stalled], ids=["503", "429", "read-timeout"]
+)
+async def test_transient_upload_failure_is_retried_as_a_fresh_upload_from_byte_0(
+    google: _Google,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    failure: Handler,
+) -> None:
+    """The retry is a new POST that reopens the file and sends it whole; the stored object's
+    MD5 then matches the local file, so the upload counts."""
+    mocker.patch.object(config, "get_remote_retries", return_value=1)
+    monkeypatch.setattr(gcs, "STREAM_READ_TIMEOUT", 0.2)
+    received = list[bytes]()
+
+    async def fail_once(request: web.Request) -> web.StreamResponse:
+        body = await request.read()
+        received.append(body)
+        if len(received) == 1:
+            return await failure(request)
+        return web.json_response(_resource(request.query["name"], body))
+
+    google.routes["simple"] = fail_once
+    content = os.urandom(gcs.STREAM_CHUNK_SIZE + 1)
+    local = tmp_path / "local"
+    local.write_bytes(content)
+
+    await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_file(local, _HASH)
+
+    assert received == [content, content], "each attempt sends the whole file"
+    assert google.upload_types == ["media", "media"]
+    assert google.content_ranges == []
+
+
+@pytest.mark.parametrize(
+    ("status", "attempts", "reported"),
+    [
+        pytest.param(400, 1, "GCS write error for {key}: HTTP 400: refused", id="400-at-once"),
+        pytest.param(403, 1, "Permission denied to write {key}: refused", id="403-at-once"),
+        pytest.param(
+            503, 3, "GCS write error for {key}: HTTP 503: refused", id="503-after-retries"
+        ),
+    ],
+)
+async def test_failed_upload_reports_its_own_status(
+    google: _Google,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    status: int,
+    attempts: int,
+    reported: str,
+) -> None:
+    """A 4xx other than 408 and 429 fails without a retry; a transient status is retried
+    ``remote.retries`` times. Either way the user sees the status the server sent."""
+    mocker.patch.object(config, "get_remote_retries", return_value=2)
+
+    async def refuse(request: web.Request) -> web.StreamResponse:
+        await request.read()
+        return _error(status, "refused")
+
+    google.routes["simple"] = refuse
+
+    with pytest.raises(exceptions.RemoteConnectionError) as exc_info:
+        await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_file(
+            _file(tmp_path, gcs.STREAM_CHUNK_SIZE + 1), _HASH
+        )
+
+    assert google.counts["simple"] == attempts
+    key = f"gs://{_BUCKET}/p/files/ab/cdef1234567890"
+    assert str(exc_info.value) == reported.format(key=key)
+
+
+async def test_upload_answered_without_the_stored_object_is_not_recorded_as_pushed(
+    google: _Google, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """gcloud-aio returns the JSON of any reply below 400, so an empty 200 returns no object;
+    pivot retries it as a fresh upload, then reports it failed rather than pushed."""
+    mocker.patch.object(config, "get_remote_retries", return_value=1)
+
+    async def empty_reply(request: web.Request) -> web.StreamResponse:
+        await request.read()
+        return web.Response()
+
+    google.routes["simple"] = empty_reply
+    cache_dir, content_hash = _cache_holding(tmp_path, os.urandom(gcs.STREAM_CHUNK_SIZE + 1))
     remote = gcs.GCSRemote(f"gs://{_BUCKET}/p")
 
     with state.StateDB(tmp_path / "state") as state_db:
         summary = await sync._push_async(cache_dir, tmp_path / "state", remote, state_db, "origin")
         recorded = state_db.remote_hash_exists("origin", content_hash)
 
-    assert google.counts["initiate"] == 2, "pivot retries with a fresh upload session"
+    assert google.counts["simple"] == 2, "pivot retries with a fresh upload"
     assert (summary["transferred"], summary["failed"]) == (0, 1)
     assert summary["errors"] == [
         f"Upload to gs://{_BUCKET}/p/files/{content_hash[:2]}/{content_hash[2:]} did not "
@@ -573,34 +678,30 @@ async def test_resumable_upload_answered_308_is_not_recorded_as_pushed(
 async def test_resumable_upload_retries_a_transient_503_the_way_cloud_storage_answers(
     google: _Google, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
-    """One transient 503 on a resumable upload's data PUT is retried, as on a simple upload.
+    """One transient 503 on a file large enough for gcloud-aio's resumable upload is retried, as
+    on a small file.
 
-    gcloud-aio retries the failed PUT on the same session with ``Content-Range: bytes */*`` and
-    the whole body again. Cloud Storage answers that request with
+    gcloud-aio's resumable upload would retry the failed PUT on the same session with
+    ``Content-Range: bytes */*`` and the whole body again, which Cloud Storage answers with
     ``400 Client sent query request with a non-empty body.`` (a status query must have an empty
-    body), so gcloud-aio's own retries end in a 400. ``remote.retries`` still covers the 503: pivot
-    must start a fresh upload session rather than fail the push on gcloud-aio's 400.
+    body). Pivot sends every file as one simple upload instead, so ``remote.retries`` covers the
+    503 with a second POST of the whole file.
     """
     mocker.patch.object(config, "get_remote_retries", return_value=1)
-    injected = list[str]()
+    received = list[bytes]()
 
     async def one_503_then_as_cloud_storage(request: web.Request) -> web.StreamResponse:
         body = await request.read()
-        session = request.match_info["session"]
-        if not injected:
-            injected.append(session)
+        received.append(body)
+        if len(received) == 1:
             return _error(503, "Backend Error")
         if request.headers.get("Content-Range") == "bytes */*" and body:
             return web.Response(status=400, text="Client sent query request with a non-empty body.")
-        return web.json_response(_resource(google.session_names[session], body))
+        return web.json_response(_resource(request.query["name"], body))
 
-    google.routes["session"] = one_503_then_as_cloud_storage
+    google.routes["simple"] = one_503_then_as_cloud_storage
     content = os.urandom(gcs.STREAM_CHUNK_SIZE + 1)
-    content_hash = xxhash.xxh64(content).hexdigest()
-    cache_dir = tmp_path / "cache"
-    cached = cache.get_cache_path(cache_dir / "files", content_hash)
-    cached.parent.mkdir(parents=True)
-    cached.write_bytes(content)
+    cache_dir, content_hash = _cache_holding(tmp_path, content)
     remote = gcs.GCSRemote(f"gs://{_BUCKET}/p")
 
     with state.StateDB(tmp_path / "state") as state_db:
@@ -608,143 +709,10 @@ async def test_resumable_upload_retries_a_transient_503_the_way_cloud_storage_an
         recorded = state_db.remote_hash_exists("origin", content_hash)
 
     assert "bytes */*" not in google.content_ranges, "the 503 reaches pivot, not a status query"
-    assert google.counts["initiate"] == 2, "pivot retries with a fresh upload session"
+    assert google.upload_types == ["media", "media"], "two whole POSTs, no resumable session"
+    assert _md5(received[-1]) == _md5(content)
     assert (summary["transferred"], summary["failed"]) == (1, 0), summary["errors"]
     assert recorded
-
-
-async def test_resumable_upload_503_is_reported_after_one_attempt_per_session(
-    google: _Google, tmp_path: pathlib.Path
-) -> None:
-    """A failed data PUT is sent once per upload session, and the user sees its own status."""
-
-    async def unavailable(request: web.Request) -> web.StreamResponse:
-        await request.read()
-        return _error(503, "Backend Error")
-
-    google.routes["session"] = unavailable
-
-    with pytest.raises(exceptions.RemoteConnectionError) as exc_info:
-        await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_file(
-            _file(tmp_path, gcs.STREAM_CHUNK_SIZE + 1), _HASH
-        )
-
-    assert google.counts["session"] == 1
-    assert google.content_ranges == []
-    assert str(exc_info.value).endswith("HTTP 503: Backend Error")
-
-
-# sha256 of the source of each gcloud-aio-storage 9.6.5 method on the path from the public
-# ``Storage.upload`` to ``Storage._do_upload``, which gcs._storage_class overrides. A release that
-# changes any of them can route a resumable upload's data PUT around the override.
-_REVIEWED_UPLOAD_PATH = {
-    "upload": "f981a78f29d0e4adc75bbf0620c54c5a6b159cfadfde93502d03f95cca65cd24",
-    "_decide_upload_type": "4ca2ef67354c2a88275639aab6b7366328687fd93812313980a93659ba6fa970",
-    "_upload_resumable": "5f3cef390d89cfe20e93d31b6b80b1a7172150a105563f6c3a20a4c07800e826",
-    "_do_upload": "9797a96c6671574791a45e3a245325c408a4cd843523204ba95152d8bd48fbc3",
-}
-
-
-def _changed_upload_path(storage_class: type[gcloud_storage_impl.Storage]) -> list[str]:
-    """The methods on the upload path whose source differs from the reviewed 9.6.5 source."""
-    return [
-        name
-        for name, digest in _REVIEWED_UPLOAD_PATH.items()
-        if hashlib.sha256(inspect.getsource(getattr(storage_class, name)).encode()).hexdigest()
-        != digest
-    ]
-
-
-def test_overridden_gcloud_upload_path_is_the_version_reviewed() -> None:
-    """gcs._storage_class overrides gcloud-aio's private ``Storage._do_upload``, relying on its
-    parameters, on ``retries=1`` meaning one PUT whose error is raised, and on ``upload`` reaching
-    it through ``_decide_upload_type`` and ``_upload_resumable``. An upgrade that changes any of
-    those fails here, so it cannot silently bring back the same-session retry: re-read the new
-    methods, re-check the override, then update the digests."""
-    parameters = inspect.signature(gcloud_storage_impl.Storage._do_upload).parameters
-
-    assert list(parameters) == [
-        "self",
-        "session_uri",
-        "stream",
-        "headers",
-        "retries",
-        "session",
-        "timeout",
-    ]
-    assert parameters["retries"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["retries"].default == 5
-    assert _changed_upload_path(gcloud_storage_impl.Storage) == []
-
-
-class _ReleaseWhoseResumableUploadSkipsDoUpload(gcloud_storage_impl.Storage):
-    """A simulated gcloud-aio-storage release: ``_upload_resumable`` sends the data PUT itself,
-    with the same-session retry 9.6.5 has in ``_do_upload``, so pivot's override never runs."""
-
-    @override
-    async def _upload_resumable(
-        self,
-        url: str,
-        object_name: str,
-        stream: IO[Any],
-        params: dict[str, str],
-        headers: dict[str, str],
-        *,
-        metadata: dict[str, Any] | None = None,
-        session: Any = None,  # noqa: ANN401 - gcloud-aio's own parameter type
-        timeout: int = 30,
-    ) -> dict[str, Any]:
-        session_uri = await self._initiate_upload(
-            url, object_name, params, headers, metadata=metadata, session=session
-        )
-        body = stream.read()
-        tries = 0
-        while True:
-            try:
-                response = await self.session.put(
-                    session_uri, headers=headers, data=body, timeout=timeout
-                )
-                break
-            except aiohttp.ClientResponseError:
-                tries += 1
-                if tries == 5:
-                    raise
-                headers["Content-Range"] = "bytes */*"
-        stored: dict[str, Any] = await response.json(content_type=None)
-        return stored
-
-
-async def test_upload_path_guard_catches_a_release_whose_resumable_upload_skips_do_upload(
-    google: _Google, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The guard flags a release in which ``_do_upload``'s override is bypassed, and under such a
-    release a transient 503 does end in Cloud Storage's 400 again (the guard's positive control).
-    """
-    assert _changed_upload_path(_ReleaseWhoseResumableUploadSkipsDoUpload) == ["_upload_resumable"]
-
-    async def one_503_then_as_cloud_storage(request: web.Request) -> web.StreamResponse:
-        body = await request.read()
-        if google.counts["session"] == 1:
-            return _error(503, "Backend Error")
-        if request.headers.get("Content-Range") == "bytes */*" and body:
-            return web.Response(status=400, text="Client sent query request with a non-empty body.")
-        return web.json_response(
-            _resource(google.session_names[request.match_info["session"]], body)
-        )
-
-    google.routes["session"] = one_503_then_as_cloud_storage
-    monkeypatch.setattr(gcloud_storage_impl, "Storage", _ReleaseWhoseResumableUploadSkipsDoUpload)
-    gcs._storage_class.cache_clear()
-    try:
-        with pytest.raises(exceptions.RemoteConnectionError) as exc_info:
-            await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_file(
-                _file(tmp_path, gcs.STREAM_CHUNK_SIZE + 1), _HASH
-            )
-    finally:
-        gcs._storage_class.cache_clear()  # the next caller builds on the real Storage again
-
-    assert "bytes */*" in google.content_ranges
-    assert "HTTP 400" in str(exc_info.value)
 
 
 def _short(name: str, body: bytes) -> dict[str, str]:
@@ -763,7 +731,6 @@ def _wrong_name(name: str, body: bytes) -> dict[str, str]:
     return {**_resource(name, body), "name": "p/files/00/0000000000000000"}
 
 
-@pytest.mark.parametrize("resumable", [False, True], ids=["simple", "resumable"])
 @pytest.mark.parametrize(
     ("stored", "reason"),
     [
@@ -780,33 +747,18 @@ def _wrong_name(name: str, body: bytes) -> dict[str, str]:
 async def test_upload_whose_stored_object_differs_is_a_failed_transfer(
     google: _Google,
     tmp_path: pathlib.Path,
-    resumable: bool,
     stored: Callable[[str, bytes], dict[str, str]],
     reason: str,
 ) -> None:
-    size = gcs.STREAM_CHUNK_SIZE + 1 if resumable else 100
-    route = "session" if resumable else "simple"
-
     async def misreport(request: web.Request) -> web.StreamResponse:
-        body = await request.read()
-        name = (
-            google.session_names[request.match_info["session"]]
-            if resumable
-            else request.query["name"]
-        )
-        resource = stored(name, body)
-        if resource["size"] == str(len(body) - 1):
-            resource["size"] = str(size - 1)
-        return web.json_response(resource)
+        return web.json_response(stored(request.query["name"], await request.read()))
 
-    google.routes[route] = misreport
-    local = _file(tmp_path, size)
+    google.routes["simple"] = misreport
 
-    results = await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_batch([(local, _HASH)])
+    results = await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_batch([(_file(tmp_path, 100), _HASH)])
 
     assert [r["success"] for r in results] == [False]
     error = results[0]["error"] if "error" in results[0] else ""
-    reason = reason.replace("99 of 100", f"{size - 1} of {size}")
     assert error == f"Upload to gs://{_BUCKET}/p/files/ab/cdef1234567890 did not complete: {reason}"
 
 

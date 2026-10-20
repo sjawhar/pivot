@@ -810,7 +810,7 @@ from pivot.compose import Pipeline, stage
 
 @stage
 def generate() -> str:
-    return random.Random(0).randbytes(5 * 1024 * 1024).hex()  # 10 MiB: a resumable upload
+    return random.Random(0).randbytes(5 * 1024 * 1024).hex()  # 10 MiB, above one download read
 
 
 @stage

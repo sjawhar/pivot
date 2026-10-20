@@ -14,13 +14,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import functools
 import hashlib
 import json
 import logging
 import os
 import random
-from typing import IO, TYPE_CHECKING, Any, cast, override
+from typing import TYPE_CHECKING, cast
 
 import aiohttp
 
@@ -38,7 +37,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # Read size for downloads; larger uploads go resumable
+STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # Read size for downloads
 STREAM_READ_TIMEOUT = 60  # Seconds to wait for each read from the network
 LIST_PAGE_SIZE = 1000  # Objects per listing page (the GCS maximum)
 
@@ -113,39 +112,6 @@ def _emulated() -> bool:
     return is_dev
 
 
-@functools.cache
-def _storage_class() -> type[Storage]:
-    """gcloud-aio-storage's ``Storage``, sending each resumable upload's data in one attempt.
-
-    gcloud-aio retries a failed data PUT on the same upload session, resending the whole body
-    with ``Content-Range: bytes */*``. Cloud Storage answers that request with
-    ``400 Client sent query request with a non-empty body.``, so a transient 503 would end as a
-    400 that looks permanent. With one attempt, the 503 itself reaches ``_with_retries``, which
-    starts a fresh upload session. This overrides a private method of the version pinned in the
-    ``gcs`` extra; ``test_gcs_stub.py`` fails if its signature or retry loop changes.
-    """
-    from gcloud.aio.storage import storage as gcloud_storage_impl
-
-    class _OneAttemptStorage(gcloud_storage_impl.Storage):
-        @override
-        async def _do_upload(
-            self,
-            session_uri: str,
-            stream: IO[Any],
-            headers: dict[str, str],
-            *,
-            retries: int = 5,
-            session: Any = None,  # noqa: ANN401 - gcloud-aio's own parameter type
-            timeout: int = 30,
-        ) -> dict[str, Any]:
-            del retries  # pivot retries a failed upload with a fresh session instead
-            return await super()._do_upload(
-                session_uri, stream, headers, retries=1, session=session, timeout=timeout
-            )
-
-    return _OneAttemptStorage
-
-
 def _md5_base64(path: Path) -> str:
     """The file's MD5 as Cloud Storage reports it in ``md5Hash`` (base64 of the digest)."""
     with path.open("rb") as f:
@@ -208,9 +174,8 @@ class GCSRemote:
         self._prefix = prefix.rstrip("/") + "/" if prefix else ""
         self._retries = config.get_remote_retries()
         # No whole-request deadline: a large object takes as long as it takes, while a stalled
-        # connection or read still fails. Passed to every storage request pivot makes; gcloud-aio
-        # sends two requests with its own fixed 10s total instead (a resumable upload's
-        # session-start POST, and the token request), and upload() exposes no way to change them.
+        # connection or read still fails. Passed to every storage request pivot makes; only the
+        # token request keeps gcloud-aio's own fixed 10s total, which its API cannot change.
         self._timeout = aiohttp.ClientTimeout(
             total=None,
             sock_connect=config.get_remote_connect_timeout(),
@@ -238,10 +203,12 @@ class GCSRemote:
     @contextlib.asynccontextmanager
     async def _client(self) -> AsyncIterator[Storage]:
         """A gcloud-aio-storage client on one aiohttp session, with credentials in hand."""
+        from gcloud.aio import storage as gcloud_storage
+
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
             try:
                 # Reads GOOGLE_APPLICATION_CREDENTIALS, so a missing or bad key file fails here
-                client = _storage_class()(session=session)
+                client = gcloud_storage.Storage(session=session)
                 # Refresh the token in the request that needs it, never in gcloud-aio's
                 # background task: nothing awaits that task, so asyncio would log a failed
                 # refresh's exception, whose repr carries the bearer token. At or above
@@ -316,19 +283,18 @@ class GCSRemote:
             params["pageToken"] = str(token)
 
     async def _upload(self, client: Storage, hash_: str, local_path: Path) -> None:
-        """Upload one file: a simple upload up to 8 MiB, a resumable upload above it.
+        """Upload one file in one simple upload (``uploadType=media``), at any size.
 
-        Any transient failure, in a resumable upload's session-start POST or its data PUT, is
-        retried by ``_with_retries`` as a new upload with a new session (``_storage_class``);
-        a 4xx other than 408 and 429 fails at once.
+        The upload streams the file from disk in a single POST carrying ``self._timeout``. A
+        transient failure is retried by ``_with_retries`` as a new upload that reopens the file
+        from byte 0; a 4xx other than 408 and 429 fails at once. gcloud-aio's resumable upload
+        is never used: with every failure restarting from byte 0 it resumes nothing, and its own
+        retry resends the body on the same session, which Cloud Storage refuses with a 400.
 
         The upload counts only when the object the server returns has this key, the local
         file's size and its MD5; any other reply is retried as a new upload, then fails.
         gcloud-aio returns the JSON of any reply below 400, so a reply without the stored
         object (an empty body, a short object) would otherwise count as uploaded.
-
-        The resumable session-start POST carries gcloud-aio's fixed 10s total timeout; the data
-        PUT carries ``self._timeout``.
         """
         key = keys.hash_to_key(self._prefix, hash_)
         size = local_path.stat().st_size
@@ -341,7 +307,7 @@ class GCSRemote:
                     key,
                     f,
                     content_type=_OCTET_STREAM,
-                    force_resumable_upload=size > STREAM_CHUNK_SIZE,
+                    force_resumable_upload=False,
                     timeout=self._timeout,  # pyright: ignore[reportArgumentType] - gcloud-aio passes an aiohttp.ClientTimeout through
                 )
             problem = _not_stored(stored, key, size, md5)

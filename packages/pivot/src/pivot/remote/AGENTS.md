@@ -65,19 +65,18 @@ such as GCS's upload verification, belong in those coroutines, not in `batch.py`
   `RemoteConnectionError` before any transfer (S3 batches instead report each item failed). It
   passes its own `aiohttp.ClientTimeout` (no total deadline, `remote.connect_timeout` to connect)
   to every storage request it makes, because gcloud-aio's defaults are whole-request deadlines of
-  10-30s, too short for large objects. Two requests keep gcloud-aio's fixed 10s total, because
-  its public API exposes no timeout for them: a resumable upload's session-start POST, and the
-  token request. It retries transient failures `remote.retries` times. Uploads above 8 MiB use a
-  resumable upload. `gcs._storage_class` makes its data PUT a single attempt, so a transient
-  failure is retried with a fresh upload session: gcloud-aio's own retry resends the body with
-  `Content-Range: bytes */*` on the same session, which Cloud Storage refuses with a 400. That
-  overrides gcloud-aio's private `Storage._do_upload`; the `gcs` extra pins gcloud-aio-storage to
-  9.6, and `test_gcs_stub.py` fails if `_do_upload` or any method on the path to it from
-  `Storage.upload` changes.
+  10-30s, too short for large objects. Only the token request keeps gcloud-aio's fixed 10s total,
+  because its public API exposes no timeout for it. It retries transient failures
+  `remote.retries` times.
+- **Every GCS upload is one simple upload (`uploadType=media`), at any size**, streamed from disk
+  in one POST. Never pass `force_resumable_upload=True`: each retry reopens the file from byte 0,
+  so a resumable session would resume nothing, and gcloud-aio's own retry of a failed resumable
+  PUT resends the body on the same session with `Content-Range: bytes */*`, which Cloud Storage
+  refuses with a 400.
 - **A GCS upload counts only when the object resource the server returns has the key, the local
   size and the local file's MD5** (`md5Hash`). Any other reply (gcloud-aio returns the JSON of any
-  reply below 400, a `308` included) is retried as a fresh upload, then fails, so `sync` never
-  records a hash the remote lacks.
+  reply below 400, an empty one included) is retried as a fresh upload, then fails, so `sync`
+  never records a hash the remote lacks.
 - **No GCS error or log line carries an HTTP client exception's str or repr, or chains one as its
   cause.** aiohttp's repr includes the request headers, and so the bearer token. Report the status
   and Google's message (`gcs._describe`, `gcs._remote_error`) and raise `from None`. The same rule

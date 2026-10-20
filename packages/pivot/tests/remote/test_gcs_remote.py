@@ -587,41 +587,17 @@ async def test_upload_file(
     assert await _get(gcs_client, gcs_remote, cache_hash) == b"test content"
 
 
-async def test_upload_file_large_uses_resumable(
+@pytest.mark.parametrize("size", [100, gcs.STREAM_CHUNK_SIZE + 1], ids=["small", "above-8-MiB"])
+async def test_upload_file_uses_one_simple_upload_at_any_size(
     gcs_remote: gcs.GCSRemote,
     tmp_path: pathlib.Path,
     gcs_client: gcloud_storage.Storage,
     mocker: MockerFixture,
+    size: int,
 ) -> None:
-    """A file above 8 MiB goes up through a resumable upload session."""
-    test_file = tmp_path / "large_file.bin"
-    large_payload = b"x" * (gcs.STREAM_CHUNK_SIZE + 1)
-    test_file.write_bytes(large_payload)
-    cache_hash = "abc123def4567890"
-    resumable = mocker.spy(gcloud_storage.Storage, "_upload_resumable")
-    simple = mocker.spy(gcloud_storage.Storage, "_upload_simple")
-    data_put = mocker.spy(gcloud_storage.Storage, "_do_upload")
-
-    await gcs_remote.upload_file(test_file, cache_hash)
-
-    assert resumable.call_count == 1
-    assert simple.call_count == 0
-    # The data PUT gets the configured timeouts; gcloud-aio sends the session-start POST before it
-    # with its own fixed 10s total timeout, which upload() does not let a caller change.
-    assert data_put.call_args is not None
-    assert data_put.call_args.kwargs["timeout"] is gcs_remote._timeout
-    assert await _get(gcs_client, gcs_remote, cache_hash) == large_payload
-
-
-async def test_upload_file_small_uses_simple_upload(
-    gcs_remote: gcs.GCSRemote,
-    tmp_path: pathlib.Path,
-    gcs_client: gcloud_storage.Storage,
-    mocker: MockerFixture,
-) -> None:
-    """A file of at most 8 MiB goes up in one simple upload request."""
+    """Every file, however large, goes up in one simple upload carrying the configured timeouts."""
     test_file = tmp_path / "file.bin"
-    payload = b"y" * gcs.STREAM_CHUNK_SIZE
+    payload = os.urandom(size)
     test_file.write_bytes(payload)
     cache_hash = "abc123def4567890"
     resumable = mocker.spy(gcloud_storage.Storage, "_upload_resumable")
@@ -631,6 +607,8 @@ async def test_upload_file_small_uses_simple_upload(
 
     assert simple.call_count == 1
     assert resumable.call_count == 0
+    assert simple.call_args is not None
+    assert simple.call_args.kwargs["timeout"] is gcs_remote._timeout
     assert await _get(gcs_client, gcs_remote, cache_hash) == payload
 
 

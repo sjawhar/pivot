@@ -42,8 +42,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dvc = ["dvc>=3.0"]
-# remote/gcs.py overrides a private method of 9.6; test_gcs_stub.py guards it before any upgrade
-gcs = ["gcloud-aio-storage>=9.6.5,<9.7"]
+gcs = ["gcloud-aio-storage>=9.6.5"]
 matplotlib = ["matplotlib>=3.5"]
 s3 = ["aioboto3>=13.0.0"]
 tui = ["pivot-tui"]

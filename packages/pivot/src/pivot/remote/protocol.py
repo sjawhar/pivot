@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 from pivot.remote import config as remote_config
-from pivot.remote import gcs, storage
+from pivot.remote import storage
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -60,4 +60,7 @@ def open_remote(url: str) -> RemoteStorage:
         case remote_config.RemoteScheme.S3:
             return storage.S3Remote(url)
         case remote_config.RemoteScheme.GS:
+            # Imported here so commands that never open a gs:// remote do not load aiohttp
+            from pivot.remote import gcs
+
             return gcs.GCSRemote(url)
