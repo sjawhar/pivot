@@ -307,8 +307,10 @@ def test_helper_function_captured():
 
     assert "self:main" in fp
     assert _definition_key("func", helper) in fp
-    assert f"module:{helper.__module__}" in fp
-    assert len(fp) == 3
+    modules = {key for key in fp if key.startswith("module:")}
+    assert f"module:{helper.__module__}" in modules
+    assert all(f"{helper.__module__}.".startswith(f"{key[7:]}.") for key in modules), modules
+    assert len(fp) == 2 + len(modules)
 
 
 def test_constant_captured():

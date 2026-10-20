@@ -77,8 +77,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 29 decides a namespace package by its site-packages, dist-packages and pivot-package
 # directories, not by the interpreter's prefix, so a manifest that left out the user's part of a
 # namespace shared with a checkout under the prefix is not reused.
-# Version 30 follows every callable user class member, dataclass defaults, and body imports
-# without executing unloaded user modules while fingerprinting.
+# Version 30 follows every callable user class member, dataclass defaults, and body imports of
+# user modules discovery loaded, and records the user modules each manifest covers.
 _CACHE_SCHEMA_VERSION = 30
 _REPR_SIZE_LIMIT = 10_000
 
@@ -772,9 +772,6 @@ def _read_step(owner: Any, step: str) -> Any:
             case "bi":
                 module = _body_import_module(arg)
                 return _UNREAD if module is None else module
-            case "bs":
-                token = _body_import_source_token(arg)
-                return _UNREAD if token is None else token
             case "u":
                 return inspect.unwrap(owner)
             case "pf":
@@ -1607,368 +1604,17 @@ def _module_spec_without_import(name: str) -> importlib.machinery.ModuleSpec | N
     return spec
 
 
-def _is_r5_literal(node: ast.expr) -> bool:
-    if isinstance(node, ast.Constant):
-        return node.value is None or isinstance(node.value, (bool, int, float, str, bytes))
-    if isinstance(node, ast.Tuple):
-        return all(_is_r5_literal(element) for element in node.elts)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        return isinstance(node.operand, ast.Constant) and isinstance(
-            node.operand.value, (int, float)
-        )
-    return False
-
-
-def _static_import_module_name(
-    node: ast.ImportFrom, module_name: str, spec: importlib.machinery.ModuleSpec
-) -> str | None:
-    package = (
-        module_name
-        if spec.submodule_search_locations is not None
-        else module_name.rpartition(".")[0]
-    )
-    try:
-        return importlib.util.resolve_name("." * node.level + (node.module or ""), package)
-    except (ImportError, ValueError):
-        return None
-
-
-def _is_r5_external_module(module_name: str, _spec: importlib.machinery.ModuleSpec | None) -> bool:
-    if module_name == "pivot" or module_name.startswith("pivot."):
-        return True
-    if module_name == "__future__":
-        return True
-    return module_name.partition(".")[0] in sys.stdlib_module_names
-
-
-def _is_r5_inert(node: ast.expr) -> bool:
-    if isinstance(node, ast.Constant):
-        return True
-    if isinstance(node, ast.Name):
-        return True
-    if isinstance(node, ast.Attribute):
-        return _is_r5_inert(node.value)
-    if isinstance(node, ast.Subscript):
-        return _is_r5_inert(node.value) and _is_r5_inert(node.slice)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
-        return _is_r5_inert(node.operand)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        return _is_r5_inert(node.left) and _is_r5_inert(node.right)
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return all(_is_r5_inert(element) for element in node.elts)
-    if isinstance(node, ast.Dict):
-        return all(
-            key is not None and _is_r5_inert(key) and _is_r5_inert(value)
-            for key, value in zip(node.keys, node.values, strict=True)
-        )
-    return False
-
-
-def _r5_arguments_are_static(arguments: ast.arguments, future_annotations: bool) -> bool:
-    if not all(
-        _is_r5_inert(default)
-        for default in (*arguments.defaults, *arguments.kw_defaults)
-        if default
-    ):
-        return False
-    if future_annotations:
-        return True
-    annotations = [
-        *(
-            argument.annotation
-            for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
-        ),
-        arguments.vararg.annotation if arguments.vararg else None,
-        arguments.kwarg.annotation if arguments.kwarg else None,
-    ]
-    return all(annotation is None or _is_r5_inert(annotation) for annotation in annotations)
-
-
-def _r5_class_body_is_static(body: list[ast.stmt], future_annotations: bool) -> bool:
-    names = set[str]()
-    for index, node in enumerate(body):
-        if (
-            index == 0
-            and isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ) or isinstance(node, ast.Pass):
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if (
-                node.decorator_list
-                or node.name in names
-                or not _r5_arguments_are_static(node.args, future_annotations)
-                or (
-                    not future_annotations
-                    and node.returns is not None
-                    and not _is_r5_inert(node.returns)
-                )
-            ):
-                return False
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.ClassDef):
-            if (
-                node.decorator_list
-                or node.name in names
-                or not all(_is_r5_inert(base) for base in node.bases)
-                or not all(_is_r5_inert(keyword.value) for keyword in node.keywords)
-                or not _r5_class_body_is_static(node.body, future_annotations)
-            ):
-                return False
-            names.add(node.name)
-            continue
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            value = node.value
-            annotation = node.annotation if isinstance(node, ast.AnnAssign) else None
-            if (
-                len(targets) != 1
-                or not isinstance(targets[0], ast.Name)
-                or targets[0].id in names
-                or value is None
-                or not _is_r5_inert(value)
-                or (
-                    not future_annotations
-                    and annotation is not None
-                    and not _is_r5_inert(annotation)
-                )
-            ):
-                return False
-            names.add(targets[0].id)
-            continue
-        return False
-    return True
-
-
-def _is_r5_type_checking_guard(node: ast.If) -> bool:
-    test = node.test
-    return (
-        isinstance(test, ast.Name)
-        and test.id == "TYPE_CHECKING"
-        or (
-            isinstance(test, ast.Attribute)
-            and isinstance(test.value, ast.Name)
-            and test.value.id == "typing"
-            and test.attr == "TYPE_CHECKING"
-        )
-    )
-
-
-def _unloaded_module_is_static(module_name: str, visiting: set[str] | None = None) -> bool:
-    """Prove an unloaded user module has only R5a's static module-level forms."""
-    visiting = visiting or set[str]()
-    if module_name in visiting:
-        return True
-    spec = _module_spec_without_import(module_name)
-    if _is_r5_external_module(module_name, spec):
-        return True
-    if spec is None or spec.origin is None:
-        return False
-    path = pathlib.Path(spec.origin)
-    if not path.is_file() or _is_library_spec(spec):
-        return False
-    try:
-        tree = ast.parse(path.read_text())
-    except (OSError, UnicodeDecodeError, SyntaxError):
-        return False
-    future_annotations = any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "__future__"
-        and any(alias.name == "annotations" for alias in node.names)
-        for node in tree.body
-    )
-    names = set[str]()
-    nested = {*visiting, module_name}
-    for index, node in enumerate(tree.body):
-        if (
-            index == 0
-            and isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            continue
-        if isinstance(node, ast.If) and _is_r5_type_checking_guard(node):
-            if node.orelse:
-                return False
-            for guarded in node.body:
-                if isinstance(guarded, ast.Import):
-                    if not all(
-                        _unloaded_module_is_static(alias.name, nested) for alias in guarded.names
-                    ):
-                        return False
-                elif isinstance(guarded, ast.ImportFrom):
-                    if (
-                        any(alias.name == "*" for alias in guarded.names)
-                        or (
-                            (imported := _static_import_module_name(guarded, module_name, spec))
-                            is None
-                        )
-                        or not _unloaded_module_is_static(imported, nested)
-                    ):
-                        return False
-                else:
-                    return False
-            continue
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                bound = alias.asname or alias.name.partition(".")[0]
-                if bound in names or not _unloaded_module_is_static(alias.name, nested):
-                    return False
-                names.add(bound)
-            continue
-        if isinstance(node, ast.ImportFrom):
-            if any(alias.name == "*" for alias in node.names):
-                return False
-            imported = _static_import_module_name(node, module_name, spec)
-            if imported is None or not _unloaded_module_is_static(imported, nested):
-                return False
-            for alias in node.names:
-                bound = alias.asname or alias.name
-                target = f"{imported}.{alias.name}"
-                target_spec = _module_spec_without_import(target)
-                if bound in names or (
-                    target_spec is not None and not _unloaded_module_is_static(target, nested)
-                ):
-                    return False
-                names.add(bound)
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if (
-                node.decorator_list
-                or node.name in names
-                or not _r5_arguments_are_static(node.args, future_annotations)
-                or (
-                    not future_annotations
-                    and node.returns is not None
-                    and not _is_r5_inert(node.returns)
-                )
-            ):
-                return False
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.ClassDef):
-            if (
-                node.decorator_list
-                or node.name in names
-                or not all(_is_r5_inert(base) for base in node.bases)
-                or not all(_is_r5_inert(keyword.value) for keyword in node.keywords)
-                or not _r5_class_body_is_static(node.body, future_annotations)
-            ):
-                return False
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.Assign):
-            if (
-                len(node.targets) != 1
-                or not isinstance(node.targets[0], ast.Name)
-                or node.targets[0].id in names
-                or not _is_r5_literal(node.value)
-            ):
-                return False
-            names.add(node.targets[0].id)
-            continue
-        if isinstance(node, ast.AnnAssign):
-            if (
-                not isinstance(node.target, ast.Name)
-                or node.target.id in names
-                or node.value is None
-                or not _is_r5_literal(node.value)
-                or (not future_annotations and not _is_r5_inert(node.annotation))
-            ):
-                return False
-            names.add(node.target.id)
-            continue
-        return False
-    return True
-
-
-def _record_static_source(path: pathlib.Path, digest: str) -> None:
-    """Add an in-project static import dependency to the active source map."""
-    if _active_source_map is None:
-        return
-    from pivot import project
-
-    try:
-        relative = str(path.resolve().relative_to(project.get_project_root()))
-    except (OSError, ValueError, exceptions.ProjectNotInitializedError):
-        return
-    _active_source_map.setdefault(relative, digest)
-
-
-def _body_import_source_closure(name: str) -> dict[str, str]:
-    """Return static user modules and source digests for an unloaded body import."""
-    if not _unloaded_module_is_static(name):
-        return {}
-    memo = _pass_memo.get()
-    key = ("body-import-closure", name)
-    if memo is not None and key in memo:
-        return cast("dict[str, str]", memo[key])
-
-    found = dict[str, str]()
-    visited = set[str]()
-
-    def visit(module_name: str) -> None:
-        if module_name in visited:
-            return
-        visited.add(module_name)
-        spec = _module_spec_without_import(module_name)
-        if spec is None or _is_library_spec(spec) or spec.origin is None:
-            return
-        path = pathlib.Path(spec.origin)
-        if not path.is_file():
-            return
-        try:
-            digest = _source_digest(str(path))
-            source = path.read_text()
-            tree = ast.parse(source)
-        except (OSError, UnicodeDecodeError, SyntaxError):
-            return
-        found[module_name] = digest
-        _record_static_source(path, digest)
-        package = (
-            module_name
-            if spec.submodule_search_locations is not None
-            else module_name.rpartition(".")[0]
-        )
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    visit(alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                try:
-                    base = importlib.util.resolve_name(
-                        "." * node.level + (node.module or ""), package
-                    )
-                except (ImportError, ValueError):
-                    continue
-                visit(base)
-                for alias in node.names:
-                    if alias.name != "*":
-                        visit(f"{base}.{alias.name}")
-
-    visit(name)
-    if memo is not None:
-        memo[key] = found
-    return found
-
-
-def _body_import_source_token(name: str) -> str | None:
-    """Digest the static user-source closure of an unloaded body import without importing it."""
-    found = _body_import_source_closure(name)
-    return (
-        xxhash.xxh64(json.dumps(sorted(found.items()), separators=(",", ":")).encode()).hexdigest()
-        if found
-        else None
-    )
-
-
 def _mark_module_covered(module_name: str, manifest: dict[str, str]) -> None:
-    """Record that this stage fingerprint covers a user-code module by name."""
-    module = sys.modules.get(module_name)
-    if isinstance(module, types.ModuleType) and is_user_code(module):
-        manifest.setdefault(f"module:{module_name}", "")
+    """Record that this manifest covers user module `module_name` and its user packages.
+
+    The worker compares the user modules a stage imports with these entries.
+    """
+    parts = module_name.split(".")
+    for index in range(1, len(parts) + 1):
+        name = ".".join(parts[:index])
+        module = sys.modules.get(name)
+        if isinstance(module, types.ModuleType) and is_user_code(module):
+            manifest.setdefault(f"module:{name}", "")
 
 
 def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
@@ -1981,21 +1627,32 @@ def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
     return all(is_library_path(pathlib.Path(location).resolve()) for location in locations)
 
 
-def _unloaded_from_import_error(
-    func: Callable[..., Any], module_name: str, attribute: str
+def _unloaded_body_import_error(
+    func: Callable[..., Any], module_name: str
 ) -> exceptions.StageDefinitionError:
     qualname = getattr(func, "__qualname__", "?")
     return exceptions.StageDefinitionError(
-        f"'{qualname}' imports '{attribute}' from unloaded user module '{module_name}', "
-        + "whose value cannot be fingerprinted without executing the import. "
-        + "Fix: move this value into the stage's StageParams or use a static module-level import."
+        f"'{qualname}' imports user module '{module_name}' in its body, but pipeline discovery "
+        + "did not load it, so Pivot cannot fingerprint it without running it. "
+        + "Fix: import it at module level (or in pipeline.py) so discovery loads it, "
+        + "or move the value into the stage's StageParams."
     )
+
+
+def _is_user_module_name(name: str) -> bool:
+    """Whether `name` locates a user module, found without importing it or its packages."""
+    spec = _module_spec_without_import(name)
+    return spec is not None and not _is_library_spec(spec)
 
 
 def _process_body_imports(
     func: Callable[..., Any], tree: ast.Module, manifest: dict[str, str], visited: set[int]
 ) -> None:
-    """Track body imports without executing a module pipeline discovery did not load."""
+    """Walk body imports of user modules discovery loaded; refuse unloaded user modules.
+
+    Pivot never imports a module to fingerprint it: importing a module discovery did not load
+    can run any code, so reading its source cannot decide its fingerprint.
+    """
     imports = _body_imports(func, tree)
     if not imports:
         return
@@ -2004,18 +1661,10 @@ def _process_body_imports(
     for body_import in imports:
         module = _body_import_module(body_import.module)
         if module is None:
-            if body_import.attribute is not None and not _unloaded_module_is_static(
-                body_import.module
-            ):
-                raise _unloaded_from_import_error(func, body_import.module, body_import.attribute)
-            _record_unloaded_body_import(func, body_import.module, manifest)
-            if body_import.attribute is not None:
-                target_spec = _module_spec_without_import(body_import.target)
-                if target_spec is not None and not _is_r5_external_module(
-                    body_import.target, target_spec
-                ):
-                    _record_unloaded_body_import(func, body_import.target, manifest)
+            if _is_user_module_name(body_import.module):
+                raise _unloaded_body_import_error(func, body_import.module)
             continue
+        _mark_module_covered(body_import.module, manifest)
         imported = f"bi:{body_import.module}"
         _record_read(func, imported)
         attribute = body_import.attribute
@@ -2038,7 +1687,8 @@ def _process_body_imports(
             continue
         target = _body_import_module(body_import.target)
         if target is None:
-            _record_unloaded_body_import(func, body_import.target, manifest)
+            if _is_user_module_name(body_import.target):
+                raise _unloaded_body_import_error(func, body_import.target)
             continue
         step = f"bi:{body_import.target}"
         if step != imported:
@@ -2054,26 +1704,6 @@ def _process_body_imports(
                 stage_name,
                 chain=body_import.bound,
             )
-
-
-def _record_unloaded_body_import(
-    func: Callable[..., Any], name: str, manifest: dict[str, str]
-) -> None:
-    """Record a static source closure when a body import remains intentionally unloaded."""
-    closure = _body_import_source_closure(name)
-    token = _body_import_source_token(name)
-    if token is None:
-        spec = _module_spec_without_import(name)
-        if not _is_r5_external_module(name, spec):
-            raise _unloaded_from_import_error(func, name, name.rpartition(".")[2])
-        return
-    manifest.setdefault(f"module:{name}", "")
-    for module_name in closure:
-        parts = module_name.split(".")
-        for index in range(1, len(parts) + 1):
-            manifest.setdefault(f"module:{'.'.join(parts[:index])}", "")
-    _record_read(func, f"bs:{name}")
-    manifest[f"body-import:{name}"] = token
 
 
 def _names_submodule(module: types.ModuleType, attribute: str) -> bool:
@@ -3222,10 +2852,6 @@ def _process_module_dependency(
         try:
             value = getattr(module, attribute)
         except AttributeError:
-            submodule = f"{module.__name__}.{attribute}"
-            spec = _module_spec_without_import(submodule)
-            if spec is not None and not _is_r5_external_module(submodule, spec):
-                _record_unloaded_body_import(func, submodule, manifest)
             continue
         binding_ref = f"{module.__name__}.{attribute}"
         with _walking(step):

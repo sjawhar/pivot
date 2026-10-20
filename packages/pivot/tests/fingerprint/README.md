@@ -91,8 +91,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Data class default from a module value | ✅ | `test_fingerprint_gaps.py::test_class_member_edit_reruns_stage[dataclass-field-default]` |
 | In-body `from X import` of a mutable loaded module value | ✅ (error) | `test_change_detection.py::test_in_body_from_import_of_non_scalar_is_refused` |
 | Relative in-body import (`from .sibling import value`) | ✅ | `test_change_detection.py::test_relative_in_body_import_change_causes_miss` |
-| Unloaded body import never executed during fingerprinting | ✅ | `test_fingerprint_gaps.py::test_guarded_in_body_import_is_not_imported_at_definition` |
-| Static user dependency of an unloaded body import | ✅ | `test_change_detection.py::test_unloaded_body_import_tracks_static_user_import_closure` |
+| Unloaded body import refused without running it | ✅ (error) | `test_fingerprint_gaps.py::test_guarded_unloaded_body_import_is_refused_without_running_it`, `test_change_detection.py::test_unloaded_body_import_is_refused_without_running_it` |
+| Static body import of a loaded submodule (`import pkg.sub`, `from pkg import sub`) | ✅ | `test_fingerprint_gaps.py::test_static_body_import_of_loaded_submodule_is_reused` |
 | Class base/field annotation dependencies             | ✅        | `test_fingerprint.py::test_process_class_body_dependencies_tracks_bases_and_annotations`                                           |
 | StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                           |
 | StageParams regular method change                    | ✅        | `test_change_detection.py::test_stageparams_method_change_causes_miss`                                                             |
@@ -141,9 +141,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Change Type                          | Detected? | Test Reference                                                       |
 | ------------------------------------ | --------- | -------------------------------------------------------------------- |
 | Loaded `from X import func` inside function | ✅ | `test_change_detection.py::test_loaded_body_import_is_tracked_as_a_helper` |
-| Unloaded static module import | ✅ | `test_change_detection.py::test_unloaded_body_import_tracks_static_user_import_closure` |
-| Runtime module-level code in an unloaded import | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_body_import_with_runtime_module_state_is_refused` |
-| Dynamic runtime module load | ✅ (error) | `test_fingerprint_gaps.py::test_runtime_dynamic_import_backstop_refuses_and_skips_cache` |
+| Unloaded user module (`import m`, `from m import f`, `import pkg.sub`, `pkg.sub` read through `import pkg`) | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_user_body_import_is_refused_at_definition`, `test_fingerprint_gaps.py::test_body_import_of_unloaded_submodule_through_loaded_package_is_refused`, `test_fingerprint_gaps.py::test_preloaded_package_attribute_of_unloaded_package_is_refused` |
+| Library module imported in the body | ✅ | `test_fingerprint_gaps.py::test_body_import_of_a_library_module_is_not_refused` |
+| User module loaded only at run time (partial, `vars`, `exec`, manual loader) | ✅ (not reused) | `test_fingerprint_gaps.py::test_runtime_dynamic_import_makes_result_not_reusable` |
+| Import from a thread an earlier stage left running | ✅ (not reused) | `test_fingerprint_gaps.py::test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage` |
 
 ---
 
@@ -181,7 +182,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `getattr(obj, name)` (non-literal)       | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_dynamic_getattr` |
 | `globals()` / `locals()`                 | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_globals` |
 | `func_dict[key]()` dispatch              | ✅        | `test_change_detection.py::test_dynamic_dispatch_change_detected`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
-| `eval()` / `exec()`                      | ❌        | **NO TEST** - can't analyze dynamically |
+| `eval()` / `exec()` of code reading other names | ❌        | **NO TEST** - can't analyze dynamically |
+| Lambda created by `eval()` (no source) | ✅        | `test_fingerprint_gaps.py::test_eval_lambda_is_hashed_by_its_code_object` |
 | Visible `importlib.import_module` / `__import__` spelling | ✅ (error) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_is_refused` |
 | A user method named `import_module` | ✅ | `test_fingerprint_gaps.py::test_user_method_named_import_module_runs` |
 | A resolved helper receiving `"import_module"` | ✅ | `test_fingerprint_gaps.py::test_resolved_helper_accepts_import_module_argument_name` |
@@ -214,7 +216,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                               | Detected? | Test Reference                                                                  |
 | ----------------------------------------- | --------- | ------------------------------------------------------------------------------- |
-| Lambda function                           | ⚠️        | `test_fingerprint.py::test_lambda_function_fingerprinted` (hashed but unstable) |
+| Lambda function                           | ✅        | `test_fingerprint.py::test_lambda_function_fingerprinted`; without source, its `__code__` is hashed |
 | Function without source (builtin)         | ⚠️        | `test_fingerprint.py::test_hash_builtin_function` (fallback hash)               |
 | Function without `__code__`               | ⚠️        | `test_fingerprint.py::test_hash_function_no_code_object` (id-based hash)        |
 | Circular references                       | ✅        | `test_fingerprint.py::test_circular_reference_handled`                          |

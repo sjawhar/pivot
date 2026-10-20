@@ -23,17 +23,17 @@ def test_it():
 
 Only dunders (`__name__`, `__init__`) are filtered from fingerprinting. Single underscore functions like `_helper()` ARE tracked.
 
-### Lambda Fingerprinting Is Non-Deterministic
+### Lambdas Without Source Are Hashed by Code Object
 
-Lambdas without accessible source code fall back to `id(func)`, which changes every interpreter session. This causes unnecessary re-runs.
+A lambda in a source file is hashed by its AST. One without accessible source (`eval`, `exec`, a REPL) is hashed by `marshal` of its `__code__` with the source path removed: stable across interpreter sessions, and sensitive to bytecode and constants. Only a callable with neither source nor `__code__` is hashed by `id()`, which differs between sessions and reruns its stage every time.
 
-**Always use named functions in stage definitions:**
+**Prefer named functions in stage definitions**, whose AST hash ignores formatting and comments:
 
 ```python
-# Bad - non-deterministic fingerprint
-filter_func = lambda x: x > 0.5
+# Hashed by code object: any compiler-visible change reruns
+filter_func = eval("lambda x: x > 0.5")
 
-# Good - stable AST-based fingerprint
+# AST-based fingerprint
 def filter_positive(x: float) -> bool:
     return x > 0.5
 ```

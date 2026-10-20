@@ -38,13 +38,14 @@ For each stage function, Pivot:
    methods, descriptors such as properties, partial members, and nested user
    classes. A module value or helper read only inside a method
    (`ScopeWalk().step(...)` reading a module-level regex) is tracked
-4. **Follows imports in the function body** — a user module already loaded
-   during discovery is walked like a module-level dependency. An unloaded
-   module is accepted only when its module-level code is inert: permitted
-   imports, undecorated definitions with inert definition-time expressions,
-   and one-time primitive or tuple assignments. Otherwise Pivot refuses the
-   import without executing it and suggests a module-level import or
-   `StageParams`
+4. **Follows imports in the function body** — a user module discovery already
+   loaded is walked like a module-level dependency, together with its packages
+   and a submodule a `from` import names (`import pkg.sub`, `from pkg import
+   sub`). A body import of a user module discovery did not load is refused
+   when the pipeline is defined, without running it: Pivot would have to
+   execute the module to fingerprint it. The error names the module; import
+   it at module level (or in `pipeline.py`) so discovery loads it, or move the
+   value into the stage's `StageParams`
 5. **Inspects type hints** — user-defined classes in annotations
    (including Pydantic models) are fingerprinted
 6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
@@ -53,17 +54,34 @@ For each stage function, Pivot:
 The manifest is stored in the per-stage lock file. On the next run, the
 worker recomputes the manifest and compares it key-by-key against the
 locked version. Any difference triggers re-execution.
-During execution, Pivot records user modules reached through Python's
-`__import__` and `importlib.import_module` entry points, including an
-already-resident module requested by a warm worker. It also compares the
-`sys.modules` keys before and after the stage to catch a newly registered
-user module. An uncovered module fails before a lock or run-cache entry is
-written.
 
-This does not observe a read of an already-resident module without an import,
-`importlib.reload`, private import machinery, a loader that does not register
-its module in `sys.modules`, or a child-process import. Use a static import,
-a declared dependency, or `StageParams` for those paths.
+While a stage runs, its worker records the user modules it imports through
+Python's `__import__` and `importlib.import_module` entry points, including a
+module a warm worker already holds, and compares the `sys.modules` keys before
+and after the stage to catch a newly registered user module. A stage that
+imported a user module its fingerprint does not cover still succeeds, with one
+warning naming the module, but its result is never reused: Pivot files no
+run-cache entry and writes a lock the next run cannot match, and `pivot status`
+and `pivot explain` show the stage as stale with that reason.
+
+That check does not see every way a stage can reach code. In these cases Pivot
+reuses a result whose fingerprint missed the code, as it would without the
+check:
+
+- a read of a module already in `sys.modules` without an import, or
+  `importlib.reload`: import the module at module level instead;
+- private import machinery, or a loader that replaces a module already in
+  `sys.modules` or never registers one: import it statically, or move the value
+  into `StageParams`;
+- an import in a child process: declare the code the child runs as an input,
+  or list it in `@no_fingerprint(code_deps=[...])`;
+- an import from a thread that outlives its stage: the import is charged to
+  whichever stage is running when it happens, or to none; join the thread
+  before the stage returns;
+- `pivot repro --no-commit` followed by `pivot commit`: `pivot commit` records
+  the outputs on disk against the static fingerprint, as it records any
+  output; run `pivot repro` without `--no-commit` for a stage that imports
+  dynamically.
 
 
 ### Transitive Tracking
@@ -97,16 +115,21 @@ raises `StageDefinitionError`; use [StageParams](parameters.md) instead.
 
 ### Lambdas
 
-Lambdas created dynamically (via `eval`, `exec`, or an interactive session)
-have no source to hash, so their fingerprint changes every run. Use named,
-module-level functions for stages and the helpers they call:
+A lambda in a source file is hashed by its AST like any function. One created
+dynamically (via `eval`, `exec`, or an interactive session) has no source, so
+Pivot hashes its code object (`__code__`: bytecode and constants, without the
+source path). Its fingerprint is the same from run to run, and editing the
+expression re-runs the stage. Only a callable with neither source nor a code
+object falls back to `id()`, which changes every run; Pivot warns when it does.
+Prefer named, module-level functions, whose AST hash ignores comments and
+formatting:
 
 ```python
-# Bad - no stable source
+# Works, hashed by its code object
 normalize = eval("lambda df: df / df.max()")
 
 
-# Good - stable fingerprint
+# Better - AST fingerprint
 def normalize(df):
     return df / df.max()
 ```

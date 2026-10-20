@@ -650,14 +650,25 @@ def _execute_stage(
                     if isinstance(module, type(sys)) and fingerprint.is_user_code(module):
                         imported_modules.add(module_name)
                 uncovered = imported_modules - _covered_user_modules(current_fingerprint)
+                lock_manifest = current_fingerprint
                 if uncovered:
                     modules = ", ".join(sorted(uncovered))
-                    return _make_result(
-                        StageStatus.FAILED,
-                        f"Stage imported dynamically: {modules}. Use static imports or StageParams.",
-                        ring_buffer,
-                        input_hash=input_hash,
+                    commit_note = (
+                        " `pivot commit` will record these outputs as current." if no_commit else ""
                     )
+                    logger.warning(
+                        "Stage '%s' imported user modules its fingerprint does not cover: %s. "
+                        + "Its result will not be reused; the next run reruns it.%s Fix: import "
+                        + "them at module level (or in pipeline.py), or move the values into "
+                        + "StageParams.",
+                        stage_name,
+                        modules,
+                        commit_note,
+                    )
+                    lock_manifest = {
+                        **current_fingerprint,
+                        f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}{modules}": "",
+                    }
                 if no_commit:
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=_store_cache_dir(store)
@@ -684,7 +695,7 @@ def _execute_stage(
 
                 # Build lock data
                 new_lock_data = LockData(
-                    code_manifest=current_fingerprint,
+                    code_manifest=lock_manifest,
                     params=current_params,
                     dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
                     output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
@@ -701,6 +712,7 @@ def _execute_stage(
                         output_hashes,
                         production_lock,
                         state_db,
+                        reusable=not uncovered,
                         file_hash_entries=file_hash_entries,
                     )
                     return StageResult(
@@ -1778,6 +1790,7 @@ def _commit_lock_and_build_deferred(
     production_lock: lock.StageLock,
     state_db: state.StateDB,
     *,
+    reusable: bool = True,
     file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
@@ -1792,6 +1805,7 @@ def _commit_lock_and_build_deferred(
         input_hash,
         output_hashes,
         state_db,
+        reusable=reusable,
         file_hash_entries=file_hash_entries,
         increment_outputs=increment_outputs,
     )
@@ -1803,10 +1817,15 @@ def _build_deferred_writes(
     output_hashes: dict[str, HashInfo],
     state_db: state.StateDB,
     *,
+    reusable: bool = True,
     file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
-    """Build deferred writes for coordinator to apply."""
+    """Build deferred writes for coordinator to apply.
+
+    A result that is not ``reusable`` (its run imported user modules its fingerprint does not
+    cover) files no run-cache entry; its lock carries a key no fingerprint has, so no tier skips it.
+    """
     result: DeferredWrites = {}
 
     if increment_outputs:
@@ -1833,8 +1852,9 @@ def _build_deferred_writes(
         for path, oh in output_hashes.items()
         if path in cached_paths
     ]
-    # An unsafe fingerprint may match a run whose captured values differed; never file it.
-    if output_entries and not stage_info["unsafe_fingerprint"]:
+    # An unsafe fingerprint may match a run whose captured values differed; a non-reusable
+    # result imported code its fingerprint does not cover. Never file either.
+    if output_entries and reusable and not stage_info["unsafe_fingerprint"]:
         result["run_cache_input_hash"] = input_hash
         result["run_cache_entry"] = run_history.RunCacheEntry(
             run_id=stage_info["run_id"],

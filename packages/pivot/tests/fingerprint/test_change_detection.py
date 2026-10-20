@@ -387,18 +387,13 @@ def test_loaded_body_import_is_tracked_as_a_helper(module_dir: pathlib.Path) -> 
     )
 
 
-def test_unloaded_body_import_tracks_static_user_import_closure(
-    module_dir: pathlib.Path,
-) -> None:
-    """An unloaded body import follows static user imports without executing either module."""
+def test_unloaded_body_import_is_refused_without_running_it(module_dir: pathlib.Path) -> None:
+    """A body import of a user module discovery did not load is refused, and fingerprinting
+    neither imports it nor its package."""
     package = module_dir / "test_change_static_import"
     package.mkdir()
     (package / "__init__.py").write_text("")
-    dependency = package / "dependency.py"
-    dependency.write_text("LIMIT = 2\n")
-    (package / "helper.py").write_text(
-        "from .dependency import LIMIT\n\n\ndef value():\n    return LIMIT\n"
-    )
+    (package / "helper.py").write_text("def value():\n    return 1\n")
     (package / "stages.py").write_text(
         """\
 def stage():
@@ -409,16 +404,12 @@ def stage():
 """
     )
 
-    first_module = _import_fresh("test_change_static_import.stages")
-    first = fingerprint.get_stage_fingerprint(first_module.stage)
+    module = _import_fresh("test_change_static_import.stages")
+    with pytest.raises(
+        exceptions.StageDefinitionError, match="imports user module 'test_change_static_import"
+    ):
+        fingerprint.get_stage_fingerprint(module.stage)
     assert "test_change_static_import.helper" not in sys.modules
-    assert "test_change_static_import.dependency" not in sys.modules
-
-    dependency.write_text("LIMIT = 200\n")
-    second_module = _import_fresh("test_change_static_import.stages")
-    second = fingerprint.get_stage_fingerprint(second_module.stage)
-
-    assert first != second, "a static dependency of an unloaded body import must be tracked"
 
 
 # =============================================================================
@@ -866,12 +857,13 @@ def test_method_helper_change_causes_miss(module_dir: pathlib.Path) -> None:
 
 
 def test_in_body_import_change_causes_miss(module_dir: pathlib.Path) -> None:
-    """A module imported inside the stage body is a dependency."""
+    """A module discovery loaded and the stage imports in its body is a dependency."""
     helper_py = module_dir / "test_change_inbody_lib.py"
     helper_py.write_text("def value():\n    return 2\n")
     (module_dir / "test_change_inbody.py").write_text(
         "def stage():\n    import test_change_inbody_lib as lib\n    return lib.value()\n"
     )
+    _import_fresh("test_change_inbody_lib")
     fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_inbody").stage)
     helper_py.write_text("def value():\n    return 101\n")
     _import_fresh("test_change_inbody_lib")
@@ -925,6 +917,7 @@ def test_relative_in_body_import_change_causes_miss(module_dir: pathlib.Path) ->
     (package / "stages.py").write_text(
         "def stage():\n    from .sibling import value\n    return value()\n"
     )
+    _import_fresh("test_change_relpkg.sibling")
     fp1 = fingerprint.get_stage_fingerprint(_import_fresh("test_change_relpkg.stages").stage)
     sibling_py.write_text("def value():\n    return 101\n")
     _import_fresh("test_change_relpkg.sibling")

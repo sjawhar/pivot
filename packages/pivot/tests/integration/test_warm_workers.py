@@ -655,7 +655,8 @@ with Pipeline("warm") as pipeline:
 async def test_forced_run_restarts_workers_after_in_function_helper_changes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A helper first imported inside a stage is reported by the worker and invalidates it."""
+    """A helper first imported inside a stage at run time is reported by the worker and
+    invalidates it. (A static body import of a module discovery did not load is refused.)"""
     module_name = f"warm_in_function_{uuid.uuid4().hex}"
     root = tmp_path.resolve() / "project"
     root.mkdir()
@@ -670,8 +671,9 @@ from pivot.compose import Pipeline, stage
 
 @stage
 def value() -> str:
-    import {module_name}
-    return {module_name}.value()
+    scope = {{}}
+    exec("import {module_name} as helper", scope)
+    return scope["helper"].value()
 
 
 with Pipeline("warm") as pipeline:

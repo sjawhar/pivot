@@ -25,7 +25,7 @@ Pivot's fingerprinting system:
 |---------|----------|-----|
 | Same-module helpers | Yes | `getclosurevars()` discovers reference |
 | Module imports | Yes | AST scanning for attribute access |
-| Imports in a function body | Yes | Pivot never executes a body import while defining a pipeline. An already-loaded user module is walked; an unloaded module needs the conservative static proof (permitted imports, inert undecorated definitions, inert literals). The worker records `__import__`/`import_module` calls and snapshots newly registered `sys.modules` keys. It cannot see reads of resident modules without an import, `reload`, private or unregistered loaders, or child-process imports; use a static import, declared dependency, or `StageParams` there. |
+| Imports in a function body | Yes, or error | Pivot never executes a body import while defining a pipeline. A user module discovery loaded is walked like a module-level import, and the manifest covers it, its packages and a submodule a `from` import names (`module:<name>` keys). A body import of a user module discovery did not load is refused with `StageDefinitionError` naming the module: import it at module level (or in `pipeline.py`), or move the value into `StageParams`. See [Imports a Stage Makes While It Runs](#imports-a-stage-makes-while-it-runs) for the worker's check |
 | Class definitions | Yes | Full class AST hashed |
 | Callable members of user classes | Yes | User-defined methods, classmethods, staticmethods, property accessors, cached properties, `functools.partial`/`partialmethod` members, nested user classes, and dataclass default factories are walked like stage helpers. Callable instances and other user-defined descriptors are refused because their state is not reliably fingerprintable. Generated and library members are skipped. |
 | StageParams subclasses | Yes | Type hint analysis + full class AST + Pydantic field defaults + `default_factory` functions |
@@ -118,10 +118,32 @@ refused with `StageDefinitionError`. A resolved user helper or API may receive e
 without becoming a loader. An attribute receiver or call callee that cannot be resolved
 statically is refused for these spellings.
 Computed attribute names and alternate loading APIs (`vars(module)[name]`,
-`operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs) remain outside this
-check.
+`operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs) are not refused at
+definition. A user module one of them loads while the stage runs is caught by the worker's
+check below; an attribute read on a module already loaded is not.
 
 **Workaround:** Import the module statically.
+
+### Imports a Stage Makes While It Runs
+
+The worker wraps `builtins.__import__` and `importlib.import_module`, recording each user module
+(and its user packages) a stage requests, including one already in `sys.modules`, and compares the
+`sys.modules` keys before and after the stage. A recorded module the stage's manifest does not
+cover (`module:<name>` keys) makes the result not reusable: the stage succeeds and logs one
+warning naming the modules; its lock carries an `uncovered-import:<modules>` key no fingerprint
+matches, so the next `repro` reruns it and `status`/`explain` report "Previous run imported modules
+its fingerprint does not cover"; and no run-cache entry is filed. Under `--no-commit` the warning
+adds that `pivot commit` will record the outputs as current.
+
+The check does not see these paths, which behave as they would without it:
+
+| Path | Remedy |
+|------|--------|
+| Reading a module already in `sys.modules` without an import; `importlib.reload` | Import the module at module level |
+| Private import machinery; a loader that replaces a key already in `sys.modules` or never registers one | Import statically, or move the value into `StageParams` |
+| An import in a child process | Declare the code the child runs as an input, or use `@no_fingerprint(code_deps=[...])` |
+| An import from a thread that outlives its stage | Join the thread before the stage returns; its import is charged to whichever stage is running, or to none |
+| `pivot repro --no-commit`, then `pivot commit` | `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
 
 ### Module-Level Instances
 
@@ -141,13 +163,12 @@ the class's methods.
 ### Lambda Functions
 
 ```python
-# Lambda fingerprints are non-deterministic!
-process = lambda x: x + 1  # Falls back to id(func), changes every session
+process = eval("lambda x: x + 1")  # No source: hashed by its code object
 ```
 
-Lambdas without accessible source code fall back to `id(func)`, which changes between interpreter sessions. This causes unnecessary re-runs.
+A lambda without accessible source is hashed by its code object: `marshal` of `__code__` with the source path removed, so bytecode and constants (`x + 1` against `x + 100`) count. The hash is the same in every interpreter session. Only a callable with neither source nor `__code__` is hashed by its `id()`, which differs between sessions; Pivot logs a warning for a user callable hashed that way.
 
-**Workaround:** Always use named functions for stages.
+**Workaround:** Prefer named functions, whose AST hash ignores formatting and comments.
 
 ### Dynamic Patterns
 

@@ -21,6 +21,20 @@ from pivot.types import (
     ParamChange,
 )
 
+# A lock's code manifest carries this prefix, followed by module names, when its run imported
+# user modules its fingerprint did not cover. No fingerprint has such a key, so the lock never
+# matches and the stage reruns.
+UNCOVERED_IMPORT_KEY_PREFIX = "uncovered-import:"
+
+
+def uncovered_import_reason(manifest: dict[str, str]) -> str | None:
+    """The rerun reason for a lock written by a run that imported uncovered user modules."""
+    for key in manifest:
+        if key.startswith(UNCOVERED_IMPORT_KEY_PREFIX):
+            modules = key.removeprefix(UNCOVERED_IMPORT_KEY_PREFIX)
+            return f"Previous run imported modules its fingerprint does not cover: {modules}"
+    return None
+
 
 def check_stage(
     lock_data: LockData | None,
@@ -53,9 +67,8 @@ def check_stage(
     # Fast path: cheap dict equality, no detailed diffs or path conversion.
     if not explain:
         if lock_data["code_manifest"] != fingerprint:
-            return ChangeDecision(
-                changed=True, reason="Code changed", run_cache_allowed=run_cache_allowed
-            )
+            reason = uncovered_import_reason(lock_data["code_manifest"]) or "Code changed"
+            return ChangeDecision(changed=True, reason=reason, run_cache_allowed=run_cache_allowed)
         if not params_equal(lock_data["params"], params):
             return ChangeDecision(
                 changed=True, reason="Params changed", run_cache_allowed=run_cache_allowed
@@ -83,7 +96,9 @@ def check_stage(
     out_changed = sorted(out_paths) != locked_out_paths
 
     changed = force or bool(code_changes or param_changes or dep_changes or out_changed)
-    reason = _first_reason(code_changes, param_changes, dep_changes, out_changed, force)
+    reason = uncovered_import_reason(lock_data["code_manifest"]) or _first_reason(
+        code_changes, param_changes, dep_changes, out_changed, force
+    )
 
     return ChangeDecision(
         changed=changed,
