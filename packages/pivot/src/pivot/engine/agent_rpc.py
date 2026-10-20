@@ -452,6 +452,7 @@ class AgentRpcSource:
     _handler: AgentRpcHandler | None
     _resource_capacity: dict[str, int]
     _ready: threading.Event | None
+    _socket_identity: tuple[int, int] | None
 
     def __init__(
         self,
@@ -466,6 +467,7 @@ class AgentRpcSource:
         self._handler = handler
         self._resource_capacity = dict(resource_capacity or {})
         self._ready = ready
+        self._socket_identity = None
 
     async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
         """Listen for agent connections and process requests."""
@@ -476,6 +478,8 @@ class AgentRpcSource:
 
         try:
             listener = await self._listen()
+            socket_stat = self._socket_path.lstat()
+            self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
             self._socket_path.chmod(0o600)  # Owner-only access
             if self._ready is not None:
                 self._ready.set()
@@ -484,9 +488,11 @@ class AgentRpcSource:
                     conn = await listener.accept()
                     tg.start_soon(self._handle_connection, conn, send)
         finally:
-            # Clean up socket file on exit (suppress errors to avoid masking original exception)
-            with contextlib.suppress(OSError):
-                if self._socket_path.exists():
+            # A newer serve can take this pathname while this source still accepts clients.
+            # Unlink only the socket this source bound; lstat avoids following a replacement link.
+            with contextlib.suppress(FileNotFoundError):
+                socket_stat = self._socket_path.lstat()
+                if self._socket_identity == (socket_stat.st_dev, socket_stat.st_ino):
                     self._socket_path.unlink()
 
     async def _listen(self) -> SocketListener:  # pyright: ignore[reportReturnType] - CancelScope.__exit__ is typed -> bool but never swallows an exception it did not raise

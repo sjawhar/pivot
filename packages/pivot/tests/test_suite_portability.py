@@ -201,8 +201,12 @@ class _LaunchScan:
             shell_keyword is not None
             and not (isinstance(shell_keyword, ast.Constant) and not shell_keyword.value)
         )
+        executable = next((kw.value for kw in call.keywords if kw.arg == "executable"), None)
         problems = list[_Problem]()
         for is_string, elements in argvs:
+            if executable is not None:
+                # Popen's executable= overrides args[0]; an untraceable override fails closed.
+                problems += self._argv([executable] if shell else [executable, *elements[1:]])
             if shell or (kind == "command" and is_string):
                 problems += self._script(elements, 0)
             else:
@@ -268,7 +272,7 @@ class _LaunchScan:
                 )
             ]
         if isinstance(element, ast.BinOp) and isinstance(element.op, ast.Div):
-            return [("path", None, element)]
+            return [("path", _string(element.right), element)]
         if isinstance(element, ast.JoinedStr) and any(
             "/" in (_string(part) or "") for part in element.values
         ):
@@ -289,6 +293,11 @@ class _LaunchScan:
                 problems.append((node, "looks its program up on PATH with shutil.which"))
             elif kind == "unknown":
                 problems.append((node, "starts a program the scan cannot trace to a path"))
+            elif kind == "path":
+                if text == "env":
+                    problems += self._argv(self._after_env(elements))
+                elif text in _SHELLS:
+                    problems += self._shell(elements)
             elif text is not None:
                 name = text.rsplit("/", 1)[-1]
                 if "/" not in text and text not in _SYSTEM_PROGRAMS:
@@ -488,6 +497,14 @@ def _helper_in_function(*lines: str) -> str:
         pytest.param(
             'cmd = ""\ncmd += "uv --version"\nsubprocess.getoutput(cmd)',
             id="getoutput-augmented",
+        ),
+        pytest.param(
+            'subprocess.run([sys.executable, "--version"], executable="uv")',
+            id="executable-override",
+        ),
+        pytest.param(
+            'subprocess.run([str(pathlib.Path("/bin") / "sh"), "-c", "uv run pivot"])',
+            id="path-built-shell",
         ),
         pytest.param(
             'x = str(venv / "bin" / "pivot")\nsubprocess.run([x for x in ("uv", "run")])',

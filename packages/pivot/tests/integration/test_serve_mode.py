@@ -780,6 +780,90 @@ with pipeline:
         shutil.rmtree(private_tmp)
 
 
+@pytest.mark.parametrize("long_path", [False, True], ids=["short-path", "long-path"])
+def test_stopping_first_live_serve_keeps_replacement_socket(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, long_path: bool
+) -> None:
+    """A newer serve takes the project's socket path as current startup behavior permits. When
+    the older serve stops, it must leave the newer socket in place."""
+    project = tmp_path / (("deep-project-" * 10) if long_path else "project")
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text("""\
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def noop() -> None:
+    pass
+
+
+with pipeline:
+    noop()
+""")
+    socket_path = project / ".pivot" / "agent.sock"
+    if long_path:
+        assert len(os.fsencode(socket_path)) > 108
+    tmpdirs = [pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp")) for _ in range(2)]
+    procs = list[subprocess.Popen[bytes]]()
+    first_inode: int | None = None
+    try:
+        for index, private_tmp in enumerate(tmpdirs):
+            stderr = (tmp_path / f"serve-{index}.stderr").open("wb")
+            procs.append(
+                subprocess.Popen(
+                    [_PIVOT_BIN, "repro", "--watch", "--serve"],
+                    cwd=project,
+                    env={
+                        **os.environ,
+                        "TMPDIR": str(private_tmp),
+                        "PIVOT_CACHE_DIR": str(tmp_path / f"cache-{index}"),
+                    },
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr,
+                )
+            )
+            stderr.close()
+            monkeypatch.chdir(project)
+            deadline = time.monotonic() + 30
+            response: dict[str, object] | None = None
+            while response is None and procs[-1].poll() is None and time.monotonic() < deadline:
+                if index and socket_path.exists() and socket_path.lstat().st_ino == first_inode:
+                    time.sleep(0.1)
+                    continue
+                try:
+                    response = send_rpc(pathlib.Path(".pivot", "agent.sock"), "status")
+                except (ConnectionRefusedError, FileNotFoundError):
+                    time.sleep(0.1)
+            assert response is not None, f"serve {index} did not answer (exit {procs[-1].poll()})"
+            if index == 0:
+                first_inode = socket_path.lstat().st_ino
+
+        replacement_inode = socket_path.lstat().st_ino
+        procs[0].send_signal(signal.SIGTERM)
+        assert procs[0].wait(timeout=15) == 0
+        assert procs[1].poll() is None, "the replacement serve exited when the first stopped"
+        assert socket_path.exists(), "the first serve removed the replacement socket"
+        assert socket_path.lstat().st_ino == replacement_inode
+        assert send_rpc(pathlib.Path(".pivot", "agent.sock"), "status")["result"]
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=10)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        for private_tmp in tmpdirs:
+            shutil.rmtree(private_tmp)
+
+
 # =============================================================================
 # AgentRpcSource Handler Tests (Component-level)
 # =============================================================================
