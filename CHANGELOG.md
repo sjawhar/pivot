@@ -10,9 +10,9 @@
   their fingerprint. Stages with no outputs remain cached.
 - **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff`
   resolves them into workspace files.
-- **diff**: Build both frontends from one workspace artifact-member map. Checkout symlinks to
-  the configured cache are members; other workspace symlinks are left out, and manifest paths
-  containing control characters are refused.
+- **diff**: Build both frontends and direct directory-member targets from one workspace
+  artifact-member map. Checkout symlinks to the configured cache are members; other workspace
+  symlinks are left out, and manifest paths containing control characters are refused.
 
 
 ## v0.5.2 (2026-10-20)

@@ -2668,9 +2668,9 @@ def test_diff_member_map_excludes_descendants_of_a_left_out_directory_symlink(
     (external / "train.csv").write_text("TOP_SECRET_VALUE\n42\n")
     nested.symlink_to(external, target_is_directory=True)
     try:
-        json_output = _ok(_pivot(root, "diff", "--json", "d/make"))
-        text_output = _ok(_pivot(root, "diff", "--no-tui", "d/make"))
-        tui_output = _ok(_pivot(root, "diff", "d/make"))
+        json_output = _ok(_pivot(root, "diff", "--json", "data/d/make/nested/train.csv"))
+        text_output = _ok(_pivot(root, "diff", "--no-tui", "data/d/make/nested/train.csv"))
+        tui_output = _ok(_pivot(root, "diff", "data/d/make/nested/train.csv"))
         tui_results = tui_capture.read_text()
     finally:
         (external / "train.csv").unlink()
@@ -2701,7 +2701,7 @@ def test_diff_tui_excludes_an_outside_file_symlink(tmp_path: pathlib.Path) -> No
     member.unlink()
     member.symlink_to(secret)
     try:
-        output = _ok(_pivot(root, "diff", "d/split"))
+        output = _ok(_pivot(root, "diff", "data/d/split/train.csv"))
         tui_results = tui_capture.read_text()
     finally:
         secret.unlink()
@@ -2740,6 +2740,28 @@ def test_diff_excludes_a_cache_shaped_symlink_with_wrong_contents(tmp_path: path
 
     assert "leaves out symlink data/d/split/train.csv" in output
     assert "TOP_SECRET_VALUE" not in output
+
+
+def test_diff_supports_a_direct_cache_symlink_member(tmp_path: pathlib.Path) -> None:
+    """A direct directory-member target accepts a valid external cache symlink."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _configure_external_symlink_cache(root, tmp_path / "cache")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,2\n")
+    _ok(_pivot(root, "repro"))
+
+    output = _ok(_pivot(root, "diff", "--json", "data/d/split/train.csv"))
+
+    assert '"path": "data/d/split/train.csv"' in output
 
 
 _SHOUT_PIPELINE = """\

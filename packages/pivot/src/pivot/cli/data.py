@@ -103,9 +103,17 @@ def diff(
     }
 
     # Get workspace hashes and the matching member paths from one membership map.
+    directory_output_paths = {
+        project.to_relative_path(store.resolve_display_path(out), proj_root)
+        for stage_info in all_stages.values()
+        for out in stage_info["outs"]
+        if out.tag is types.ArtifactTag.DIRECTORY
+    }
     workspace_member_paths = dict[str, pathlib.Path]()
     workspace_hashes = data_module.get_data_hashes_from_workspace(
-        list(target_set), member_paths=workspace_member_paths
+        list(target_set),
+        member_paths=workspace_member_paths,
+        directory_output_paths=directory_output_paths,
     )
 
     # Quick hash comparison to find changed files
