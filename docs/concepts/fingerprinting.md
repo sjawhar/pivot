@@ -38,13 +38,13 @@ For each stage function, Pivot:
    methods, descriptors such as properties, partial members, and nested user
    classes. A module value or helper read only inside a method
    (`ScopeWalk().step(...)` reading a module-level regex) is tracked
-4. **Follows imports in the function body** — `import helpers` or
-   `from helpers import scale` inside a stage or helper is walked as if it
-   were a module-level import when discovery already loaded the user module.
-   An unloaded user module is accepted only if its module-level statements
-   are plain imports of permitted static modules, undecorated defs/classes,
-   and one-time primitive or tuple literals; otherwise Pivot refuses it
-   without executing it
+4. **Follows imports in the function body** — a user module already loaded
+   during discovery is walked like a module-level dependency. An unloaded
+   module is accepted only when its module-level code is inert: permitted
+   imports, undecorated definitions with inert definition-time expressions,
+   and one-time primitive or tuple assignments. Otherwise Pivot refuses the
+   import without executing it and suggests a module-level import or
+   `StageParams`
 5. **Inspects type hints** — user-defined classes in annotations
    (including Pydantic models) are fingerprinted
 6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
@@ -53,9 +53,17 @@ For each stage function, Pivot:
 The manifest is stored in the per-stage lock file. On the next run, the
 worker recomputes the manifest and compares it key-by-key against the
 locked version. Any difference triggers re-execution.
-During execution, a worker records every user module import for that stage, including a module
-already resident in a warm worker. A user module absent from the stage's fingerprint fails the
-stage before its lock or run-cache entry can be written.
+During execution, Pivot records user modules reached through Python's
+`__import__` and `importlib.import_module` entry points, including an
+already-resident module requested by a warm worker. It also compares the
+`sys.modules` keys before and after the stage to catch a newly registered
+user module. An uncovered module fails before a lock or run-cache entry is
+written.
+
+This does not observe a read of an already-resident module without an import,
+`importlib.reload`, private import machinery, a loader that does not register
+its module in `sys.modules`, or a child-process import. Use a static import,
+a declared dependency, or `StageParams` for those paths.
 
 
 ### Transitive Tracking
