@@ -858,6 +858,26 @@ def _helper_configure_workers(root: pathlib.Path, max_workers: int) -> None:
     (root / ".pivot" / "config.yaml").write_text(f"core:\n  max_workers: {max_workers}\n")
 
 
+def _helper_assert_warning_outside_tui(output: str) -> None:
+    """Require one tracked-file warning, printed outside the TUI's alternate screen."""
+    assert output.count("has changed since tracking") == 1, output
+    warning = output.find("has changed since tracking")
+    enter, leave = output.find("\x1b[?1049h"), output.rfind("\x1b[?1049l")
+    assert -1 < enter < leave, f"the TUI never took over the terminal:\n{output}"
+    assert warning < enter or warning > leave, f"the warning landed on the TUI's screen:\n{output}"
+
+
+def _helper_wait_for_running_pivot(
+    proc: subprocess.Popen[bytes], log: pathlib.Path, done: Callable[[], bool], what: str
+) -> None:
+    """Wait up to 60 seconds for ``done`` while the pivot process keeps running."""
+    deadline = time.monotonic() + 60
+    while not done():
+        assert proc.poll() is None, f"pivot exited before {what}:\n{log.read_text()}"
+        assert time.monotonic() < deadline, f"no {what} after 60 s:\n{log.read_text()}"
+        time.sleep(0.1)
+
+
 def test_repro_runs_a_chain_of_stages_on_one_worker(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -989,11 +1009,7 @@ def test_tui_warns_once_about_a_changed_tracked_file_whenever_the_engine_checks_
 
     held = [line for line in worker_log.read_text().splitlines() if line.startswith("held ")]
     assert len(held) == len(order), f"the order hook held {len(held)} runs"
-    assert output.count("has changed since tracking") == 1, output
-    warning = output.find("has changed since tracking")
-    enter, leave = output.find("\x1b[?1049h"), output.rfind("\x1b[?1049l")
-    assert -1 < enter < leave, f"the TUI never took over the terminal:\n{output}"
-    assert warning < enter or warning > leave, f"the warning landed on the TUI's screen:\n{output}"
+    _helper_assert_warning_outside_tui(output)
 
 
 # Appended to _WORKER_LOG_HOOK. With PIVOT_TEST_CHECK_LOG set, the pivot process records each
@@ -1076,17 +1092,17 @@ def test_watch_tui_warns_once_about_a_changed_tracked_file_across_its_runs(
             stderr=subprocess.STDOUT,
         )
 
-    def wait_for(done: Callable[[], bool], what: str) -> None:
-        deadline = time.monotonic() + 60
-        while not done():
-            assert proc.poll() is None, f"pivot exited before {what}:\n{log.read_text()}"
-            assert time.monotonic() < deadline, f"no {what} after 60 s:\n{log.read_text()}"
-            time.sleep(0.1)
-
     try:
-        wait_for(lambda: lone.exists() and lone.read_text().strip() == "edited", "startup run")
+        _helper_wait_for_running_pivot(
+            proc,
+            log,
+            lambda: lone.exists() and lone.read_text().strip() == "edited",
+            "startup run",
+        )
         tracked.write_text("edited again")
-        wait_for(
+        _helper_wait_for_running_pivot(
+            proc,
+            log,
             lambda: checks.exists() and len(checks.read_text().splitlines()) >= 2,
             "re-run's check of the tracked files",
         )
@@ -1100,11 +1116,7 @@ def test_watch_tui_warns_once_about_a_changed_tracked_file_across_its_runs(
     output = log.read_text()
     assert proc.returncode == 0, output
     assert "Error in sitecustomize" not in output, output
-    assert output.count("has changed since tracking") == 1, output
-    warning = output.find("has changed since tracking")
-    enter, leave = output.find("\x1b[?1049h"), output.rfind("\x1b[?1049l")
-    assert -1 < enter < leave, f"the TUI never took over the terminal:\n{output}"
-    assert warning < enter or warning > leave, f"the warning landed on the TUI's screen:\n{output}"
+    _helper_assert_warning_outside_tui(output)
 
 
 def test_watch_tui_prints_the_pipeline_error_it_shows_at_exit_after_a_second_break(
@@ -1142,13 +1154,6 @@ def test_watch_tui_prints_the_pipeline_error_it_shows_at_exit_after_a_second_bre
             stderr=subprocess.STDOUT,
         )
 
-    def wait_for(done: Callable[[], bool], what: str) -> None:
-        deadline = time.monotonic() + 60
-        while not done():
-            assert proc.poll() is None, f"pivot exited before {what}:\n{log.read_text()}"
-            assert time.monotonic() < deadline, f"no {what} after 60 s:\n{log.read_text()}"
-            time.sleep(0.1)
-
     def reload_errors() -> list[str]:
         if not tui_log.exists():
             return []
@@ -1156,11 +1161,15 @@ def test_watch_tui_prints_the_pipeline_error_it_shows_at_exit_after_a_second_bre
         return [m["error"] for m in messages if m.get("type") == "reload" and m.get("error")]
 
     try:
-        wait_for(lambda: lone.exists(), "startup run")
+        _helper_wait_for_running_pivot(proc, log, lone.exists, "startup run")
         pipeline_file.write_text(_TRACKED_WIDTH_PIPELINE + "def first_break(:\n")
-        wait_for(lambda: len(reload_errors()) >= 1, "TUI showing the first break")
+        _helper_wait_for_running_pivot(
+            proc, log, lambda: len(reload_errors()) >= 1, "TUI showing the first break"
+        )
         pipeline_file.write_text(_TRACKED_WIDTH_PIPELINE + "\n\n\n\ndef second_break(:\n")
-        wait_for(
+        _helper_wait_for_running_pivot(
+            proc,
+            log,
             lambda: len(set(reload_errors())) >= 2,  # noqa: PLR2004 - two distinct breaks
             "TUI showing the second break",
         )

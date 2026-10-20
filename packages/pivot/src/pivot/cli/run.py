@@ -126,17 +126,11 @@ def _run_with_tui(
     result_future: concurrent.futures.Future[dict[str, executor_core.ExecutionSummary]] = (
         concurrent.futures.Future()
     )
-    engine_ref = dict[str, engine.Engine]()
-
-    def conditions() -> dict[str, object]:
-        current = engine_ref.get("engine")
-        return {engine.PIPELINE_ERROR_CONDITION: current.pipeline_error if current else None}
 
     async def run_engine_fn(
         socket_ready: threading.Event,
     ) -> dict[str, executor_core.ExecutionSummary]:
         async with engine.Engine(pipeline=pipeline) as eng:
-            engine_ref["engine"] = eng
             result_sink = _run_common.configure_result_collector(eng)
             _run_common.configure_output_sink(
                 eng,
@@ -175,7 +169,6 @@ def _run_with_tui(
         run_engine_fn,
         socket_path,
         result_future=result_future,
-        conditions=conditions,
     )
 
     # Return results (re-raises if engine raised an exception)

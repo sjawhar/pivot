@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import sys
 import threading
@@ -95,7 +96,7 @@ class _HoldWhileTuiRuns(logging.Filter):
             self._held.setdefault(key, record)
         return False
 
-    def remember_printed(self, record: logging.LogRecord) -> None:
+    def _remember_printed(self, record: logging.LogRecord) -> None:
         """Remember a warning only after the original handler completed its terminal write."""
         if (
             not self._released
@@ -113,16 +114,13 @@ class _HoldWhileTuiRuns(logging.Filter):
         with self._lock:
             handled = original_handle(record)
             if handled:
-                self.remember_printed(record)
+                self._remember_printed(record)
             return handled
 
-    def acquire_write_lock(self) -> None:
-        """Acquire the lock that covers this handler's filter decision and terminal write."""
-        self._lock.acquire()
-
-    def release_write_lock(self) -> None:
-        """Release a prior ``acquire_write_lock`` call."""
-        self._lock.release()
+    @property
+    def write_lock(self) -> threading.RLock:
+        """The lock that covers this handler's filter decision and terminal write."""
+        return self._lock
 
     def release(
         self,
@@ -146,26 +144,12 @@ class _ConsoleDeferral:
     _conditions: Callable[[], Mapping[str, object]]
     _handlers: list[tuple[logging.Handler, _HoldWhileTuiRuns, Callable[[logging.LogRecord], bool]]]
 
-    def __init__(
-        self,
-        tui_started: threading.Event,
-        conditions: Callable[[], Mapping[str, object]],
-    ) -> None:
-        self._tui_started = tui_started
+    def __init__(self, conditions: Callable[[], Mapping[str, object]]) -> None:
+        self._tui_started = threading.Event()
         self._conditions = conditions
         self._handlers = list[
             tuple[logging.Handler, _HoldWhileTuiRuns, Callable[[logging.LogRecord], bool]]
         ]()
-
-    @staticmethod
-    def _wrapped_handle(
-        hold: _HoldWhileTuiRuns,
-        original_handle: Callable[[logging.LogRecord], bool],
-    ) -> Callable[[logging.LogRecord], bool]:
-        def handle(record: logging.LogRecord, /) -> bool:
-            return hold.handle_with(original_handle, record)
-
-        return handle
 
     def attach(self) -> None:
         """Wrap each console handler so its filter decision and terminal write share one lock."""
@@ -179,19 +163,17 @@ class _ConsoleDeferral:
             original_handle = stream_handler.handle
 
             stream_handler.addFilter(hold)
-            stream_handler.handle = self._wrapped_handle(hold, original_handle)  # pyright: ignore[reportAttributeAccessIssue] - atomic wrapper
+            stream_handler.handle = functools.partial(
+                hold.handle_with, original_handle
+            )  # atomic wrapper
             self._handlers.append((stream_handler, hold, original_handle))
 
     def start_holding(self) -> None:
         """Wait for every passing write, then let Textual take the terminal."""
-        holds = [hold for _, hold, _ in self._handlers]
-        for hold in holds:
-            hold.acquire_write_lock()
-        try:
+        with contextlib.ExitStack() as locks:
+            for _, hold, _ in self._handlers:
+                locks.enter_context(hold.write_lock)
             self._tui_started.set()
-        finally:
-            for hold in reversed(holds):
-                hold.release_write_lock()
 
     def release(self) -> None:
         """Flush held records, then restore the console handlers exactly as they were."""
@@ -204,20 +186,18 @@ class _ConsoleDeferral:
 
 @contextlib.contextmanager
 def defer_console_logging(
-    tui_started: threading.Event | None = None,
-    conditions: Callable[[], Mapping[str, object]] | None = None,
+    conditions: Callable[[], Mapping[str, object]] = dict,
+    *,
+    hold_now: bool = True,
 ) -> Generator[_ConsoleDeferral]:
     """Keep console records off Textual's terminal, then print held diagnostics after exit.
 
-    Without ``tui_started``, holding begins immediately. ``run_tui_with_engine`` supplies an
-    unset event so a record printed before the TUI starts is remembered, not printed again later.
+    With ``hold_now=False``, records print until ``start_holding()``. ``run_tui_with_engine``
+    uses that so a record printed before the TUI starts is remembered, not printed again later.
     """
-    immediate = tui_started is None
-    if tui_started is None:
-        tui_started = threading.Event()
-    deferral = _ConsoleDeferral(tui_started, conditions or dict)
+    deferral = _ConsoleDeferral(conditions)
     deferral.attach()
-    if immediate:
+    if hold_now:
         deferral.start_holding()
     try:
         yield deferral
@@ -524,7 +504,7 @@ def run_tui_with_engine(
     socket_path: pathlib.Path,
     *,
     result_future: concurrent.futures.Future[Any] | None = None,
-    conditions: Callable[[], Mapping[str, object]] | None = None,
+    conditions: Callable[[], Mapping[str, object]] = dict,
     oneshot: bool = True,
     suppress_keyboard_interrupt: bool = False,
 ) -> None:
@@ -532,7 +512,6 @@ def run_tui_with_engine(
 
     Three-thread model:
     - Main thread: Textual TUI (required for signal handlers)
-    - Engine thread: runs engine_fn with its own anyio event loop
     - Poller thread: connects client, polls events, feeds TUI
 
     Args:
@@ -552,7 +531,6 @@ def run_tui_with_engine(
     from pivot_tui.rpc_client_impl import RpcPivotClient
 
     socket_ready = threading.Event()
-    # Set when the engine finishes or the TUI exits; the poller thread stops on it.
     poller_stop = threading.Event()
     # The exception that ended the engine; raised once the TUI has exited.
     engine_errors = list[BaseException]()
@@ -629,19 +607,9 @@ def run_tui_with_engine(
     )
     # Console handlers print as usual until the TUI starts and remember what they printed, so a
     # warning the engine logs both before the TUI starts and while it runs reaches the terminal
-    # once. A "Pipeline invalid" record held while the TUI ran prints only if the engine still
-    # reports that error when it exits.
-    tui_started = threading.Event()
-    if conditions is None:
-
-        def default_conditions() -> Mapping[str, object]:
-            return {engine.PIPELINE_ERROR_CONDITION: app.pipeline_error}
-
-        condition_supplier = default_conditions
-    else:
-        condition_supplier = conditions
-
-    with defer_console_logging(tui_started, condition_supplier) as console_logging:
+    # once. A "Pipeline invalid" record held while the TUI ran prints only if ``conditions``
+    # still reports that error when it exits.
+    with defer_console_logging(conditions, hold_now=False) as console_logging:
         engine_thread.start()
         if not socket_ready.wait(timeout=10.0):
             logger.warning("Engine socket not ready after 10s, poller will retry connect")

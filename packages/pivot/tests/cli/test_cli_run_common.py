@@ -40,7 +40,6 @@ class _FakeApp:
     ran: bool
     return_code: int | None
     run_return_code: int
-    pipeline_error: str | None
 
     def __init__(self, *, run_return_code: int = 0) -> None:
         self.posted = list[object]()
@@ -48,7 +47,6 @@ class _FakeApp:
         self.ran = False
         self.return_code = None
         self.run_return_code = run_return_code
-        self.pipeline_error = None
 
     def post_message(self, message: object) -> bool:
         self.posted.append(message)
@@ -283,8 +281,7 @@ def test_defer_console_logging_never_reuses_a_bad_record_key(
     monkeypatch.setattr(root, "handlers", [handler])
     monkeypatch.setattr(logging, "raiseExceptions", True)
     logger = logging.getLogger("pivot.engine")
-    tui_started = threading.Event()
-    with _run_common.defer_console_logging(tui_started) as console_logging:
+    with _run_common.defer_console_logging(hold_now=False) as console_logging:
         for _ in range(20):
             logger.warning("needs %d", "text")
         console_logging.start_holding()
@@ -1285,7 +1282,7 @@ def test_run_tui_with_engine_prints_a_pipeline_error_only_while_the_tui_shows_it
     printed: list[str],
 ) -> None:
     """A watch session whose pipeline broke and was fixed while the TUI ran prints no stale
-    "Pipeline invalid" after exit; one the TUI still shows when it exits prints."""
+    "Pipeline invalid" after exit; one the engine still reports when the TUI exits prints."""
     import anyio
 
     app = _FakeApp()
@@ -1308,7 +1305,6 @@ def test_run_tui_with_engine_prints_a_pipeline_error_only_while_the_tui_shows_it
         app.ran = True
         tui_running.set()
         assert logged.wait(10), "the engine never logged while the TUI ran"
-        app.pipeline_error = error_at_exit
         app.return_code = 0
 
     app.run = _run_until_logged
@@ -1324,6 +1320,7 @@ def test_run_tui_with_engine_prints_a_pipeline_error_only_while_the_tui_shows_it
             app,
             _engine_fn,
             tmp_path / "pivot.sock",
+            conditions=lambda: {engine_mod.PIPELINE_ERROR_CONDITION: error_at_exit},
             oneshot=False,
             suppress_keyboard_interrupt=True,
         )
@@ -1345,10 +1342,11 @@ def test_run_tui_with_engine_prints_the_pipeline_error_the_tui_shows_after_a_sec
     tui_running = threading.Event()
     logged = threading.Event()
     logger = logging.getLogger(engine_mod.__name__)
+    error = "invalid syntax (pipeline.py, line 33)"
 
-    def _log_break(error: str) -> None:
-        condition = {"pivot_condition": (engine_mod.PIPELINE_ERROR_CONDITION, error)}
-        logger.warning(f"Pipeline invalid: {error}", extra=condition)
+    def _log_break(message: str) -> None:
+        condition = {"pivot_condition": (engine_mod.PIPELINE_ERROR_CONDITION, message)}
+        logger.warning(f"Pipeline invalid: {message}", extra=condition)
         logger.error("Pipeline invalid - waiting for fix", extra=condition)
 
     async def _engine_fn(socket_ready: threading.Event) -> None:
@@ -1357,14 +1355,13 @@ def test_run_tui_with_engine_prints_the_pipeline_error_the_tui_shows_after_a_sec
             while not tui_running.is_set():
                 await anyio.sleep(0.01)
         _log_break("invalid syntax (pipeline.py, line 29)")
-        _log_break("invalid syntax (pipeline.py, line 33)")
+        _log_break(error)
         logged.set()
 
     def _run_until_logged() -> None:
         app.ran = True
         tui_running.set()
         assert logged.wait(10), "the engine never logged while the TUI ran"
-        app.pipeline_error = "invalid syntax (pipeline.py, line 33)"
         app.return_code = 0
 
     app.run = _run_until_logged
@@ -1380,6 +1377,7 @@ def test_run_tui_with_engine_prints_the_pipeline_error_the_tui_shows_after_a_sec
             app,
             _engine_fn,
             tmp_path / "pivot.sock",
+            conditions=lambda: {engine_mod.PIPELINE_ERROR_CONDITION: error},
             oneshot=False,
             suppress_keyboard_interrupt=True,
         )
@@ -1387,7 +1385,7 @@ def test_run_tui_with_engine_prints_the_pipeline_error_the_tui_shows_after_a_sec
         root.removeHandler(handler)
 
     assert capsys.readouterr().err.splitlines() == [
-        "Pipeline invalid: invalid syntax (pipeline.py, line 33)",
+        f"Pipeline invalid: {error}",
         "Pipeline invalid - waiting for fix",
     ]
 
@@ -1485,77 +1483,3 @@ def test_run_tui_with_engine_prints_a_warning_the_engine_was_writing_as_the_tui_
 
     assert capsys.readouterr().err.count(warning) == 1
     assert result_future.result(timeout=1) == "ok"
-
-
-@pytest.mark.parametrize(
-    ("engine_error", "tui_error", "printed"),
-    [
-        pytest.param(
-            "boom",
-            None,
-            ["Pipeline invalid - waiting for fix"],
-            id="engine-still-invalid-tui-lagged-behind",
-        ),
-        pytest.param(
-            None,
-            "boom",
-            [],
-            id="engine-repaired-tui-still-shows-old-error",
-        ),
-    ],
-)
-def test_run_tui_with_engine_uses_engine_conditions_not_tui_poll_state(
-    mocker: MockerFixture,
-    tmp_path: pathlib.Path,
-    capsys: pytest.CaptureFixture[str],
-    engine_error: str | None,
-    tui_error: str | None,
-    printed: list[str],
-) -> None:
-    """Release uses the engine-state supplier, not the poll-lagged TUI's pipeline error."""
-    import anyio
-
-    app = _FakeApp()
-    tui_running = threading.Event()
-    logged = threading.Event()
-    logger = logging.getLogger(engine_mod.__name__)
-
-    async def _engine_fn(socket_ready: threading.Event) -> None:
-        socket_ready.set()
-        with anyio.fail_after(10):
-            while not tui_running.is_set():
-                await anyio.sleep(0.01)
-        logger.error(
-            "Pipeline invalid - waiting for fix",
-            extra={"pivot_condition": (engine_mod.PIPELINE_ERROR_CONDITION, "boom")},
-        )
-        logged.set()
-
-    def _run_until_logged() -> None:
-        app.ran = True
-        tui_running.set()
-        assert logged.wait(10), "the engine never logged while the TUI ran"
-        app.pipeline_error = tui_error
-        app.return_code = 0
-
-    app.run = _run_until_logged
-    _FakeRpcPivotClient.instances = []
-    _FakeRpcPivotClient.failures_before_success = 0
-    mocker.patch.object(pivot_tui.rpc_client_impl, "RpcPivotClient", _FakeRpcPivotClient)
-    mocker.patch.object(pivot_tui.event_poller, "EventPoller", _FakeEventPoller)
-    root = logging.getLogger()
-    handler = logging.StreamHandler(sys.stderr)
-    root.addHandler(handler)
-    try:
-        _run_common.run_tui_with_engine(
-            app,
-            _engine_fn,
-            tmp_path / "pivot.sock",
-            conditions=lambda: {engine_mod.PIPELINE_ERROR_CONDITION: engine_error},
-            oneshot=False,
-            suppress_keyboard_interrupt=True,
-        )
-    finally:
-        root.removeHandler(handler)
-
-    assert capsys.readouterr().err.splitlines() == printed
