@@ -29,20 +29,14 @@ _REMOTE_URL_PATTERN = re.compile(
     rf"^({'|'.join(re.escape(scheme) for scheme in RemoteScheme)})://([^/]+)(/.*)?$"
 )
 
-# The bucket names each backend accepts. Both refuse ``?``, ``#``, ``%``, whitespace and newlines,
-# so a bucket cannot bend the request path. S3 takes what botocore accepts
-# (``botocore.handlers.VALID_BUCKET``), which includes legacy us-east-1 names with uppercase
-# letters and underscores; GCS takes Cloud Storage's naming rules, because gcloud-aio-storage puts
-# the bucket into the request path unquoted. Matched with ``fullmatch``.
-_BUCKET_PATTERNS = {
-    RemoteScheme.S3: re.compile(r"[A-Za-z0-9._-]{1,255}"),
-    RemoteScheme.GS: re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?"),
-}
-_BUCKET_RULES = {
-    RemoteScheme.S3: "letters, digits, '.', '-' and '_', at most 255 characters",
-    RemoteScheme.GS: "lowercase letters, digits, '.', '-' and '_', "
-    + "starting and ending with a letter or digit",
-}
+# Cloud Storage's bucket naming rules, checked for gs:// only: gcloud-aio-storage puts the bucket
+# into the request path unquoted, so ``?``, ``#``, ``%``, whitespace or a newline would bend it.
+# s3:// buckets are not checked here; botocore validates and quotes them itself, and S3 also takes
+# names these rules exclude (legacy uppercase names, access point and Outposts ARNs).
+_GCS_BUCKET_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
+_GCS_BUCKET_RULE = (
+    "lowercase letters, digits, '.', '-' and '_', starting and ending with a letter or digit"
+)
 
 
 def _get_config_path() -> Path:
@@ -85,7 +79,11 @@ def _save_raw_config(data: RawPivotConfig) -> None:
 
 
 def validate_remote_url(url: str) -> tuple[RemoteScheme, str, str]:
-    """Validate and parse an s3:// or gs:// remote URL. Returns (scheme, bucket, prefix)."""
+    """Validate and parse an s3:// or gs:// remote URL. Returns (scheme, bucket, prefix).
+
+    A gs:// bucket must follow Cloud Storage's naming rules. An s3:// URL is accepted on the
+    grammar alone, leaving the bucket to botocore.
+    """
     match = _REMOTE_URL_PATTERN.match(url)
     if not match:
         raise exceptions.InvalidRemoteURLError(
@@ -93,10 +91,10 @@ def validate_remote_url(url: str) -> tuple[RemoteScheme, str, str]:
         )
     scheme = RemoteScheme(match.group(1))
     bucket = match.group(2)
-    if not _BUCKET_PATTERNS[scheme].fullmatch(bucket):
+    if scheme is RemoteScheme.GS and not _GCS_BUCKET_PATTERN.fullmatch(bucket):
         raise exceptions.InvalidRemoteURLError(
             f"Invalid remote URL: {url!r}. Bucket name {bucket!r} may contain only "
-            + f"{_BUCKET_RULES[scheme]}. Expected format: {REMOTE_URL_FORMATS}"
+            + f"{_GCS_BUCKET_RULE}. Expected format: {REMOTE_URL_FORMATS}"
         )
     prefix = (match.group(3) or "").lstrip("/")
     return scheme, bucket, prefix
