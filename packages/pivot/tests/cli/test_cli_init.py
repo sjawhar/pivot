@@ -28,6 +28,29 @@ def test_init_creates_gitignore(runner: click.testing.CliRunner, tmp_path: pathl
         assert pathlib.Path(".pivot/.gitignore").exists()
 
 
+def test_default_state_gitignore_matches_main_template() -> None:
+    """Default initialization retains main's exact ignore contract."""
+    assert (
+        project.STATE_GITIGNORE_CONTENT
+        == """\
+# Cache directory (stage outputs, file hashes)
+/cache/
+# State database (file hashes, generation counters)
+/state.lmdb/
+# Artifact and restore locks (flock files for concurrent execution)
+/locks/
+# Agent RPC socket (left behind by TUI and --serve sessions)
+/agent.sock
+# Config lock (held while editing config.yaml)
+/config.yaml.lock
+# Generated plots gallery (pivot plots show)
+/plots/
+# Key for secret params' digests in lock files; never commit it
+/secret.key
+"""
+    )
+
+
 def test_default_init_keeps_legacy_stages_directory(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
@@ -449,13 +472,11 @@ def test_init_force_no_warning_for_identical_gitignore(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """pivot init --force doesn't warn when .gitignore is identical."""
-    from pivot.cli import init as init_module
-
     with runner.isolated_filesystem(temp_dir=tmp_path):
         project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         # Write the exact same content that init would write
-        pathlib.Path(".pivot/.gitignore").write_text(init_module._GITIGNORE_CONTENT)
+        pathlib.Path(".pivot/.gitignore").write_text(project.STATE_GITIGNORE_CONTENT)
 
         result = runner.invoke(cli.cli, ["init", "--force"])
 

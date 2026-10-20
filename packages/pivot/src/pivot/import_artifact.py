@@ -168,6 +168,8 @@ def _remote_state_dir(config_data: dict[str, object]) -> str:
     if not isinstance(core, dict):
         return ".pivot"
     state_dir = cast("dict[str, object]", core).get("state_dir")
+    if state_dir is None:
+        return ".pivot"
     if (
         not isinstance(state_dir, str)
         or not state_dir

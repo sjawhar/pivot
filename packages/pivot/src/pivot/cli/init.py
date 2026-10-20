@@ -1,29 +1,12 @@
 from __future__ import annotations
 
 import pathlib
-import stat
 
 import click
 
 from pivot import exceptions, ignore, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-
-_GITIGNORE_CONTENT = project.STATE_GITIGNORE_CONTENT
-
-
-def _owns_state_gitignore(state_dir: pathlib.Path, root: pathlib.Path) -> bool:
-    """Whether it is safe for ``init --force`` to replace this state ignore file."""
-    try:
-        relative_state_dir = state_dir.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False
-    if not relative_state_dir.parts:
-        return False
-    try:
-        return stat.S_ISREG((state_dir / ".gitignore").lstat().st_mode)
-    except FileNotFoundError:
-        return True
 
 
 @cli_decorators.pivot_command(auto_discover=False)
@@ -53,15 +36,21 @@ def init(ctx: click.Context, force: bool) -> None:
             )
 
     pivot_dir.mkdir(exist_ok=True)
+    state_dir_is_configured = project.state_dir_is_configured(cwd)
+    gitignore_path = project.state_dir_for(cwd) / ".gitignore"
+    try:
+        gitignore_path.lstat()
+        gitignore_existed = True
+    except FileNotFoundError:
+        gitignore_existed = False
     state_dir = project.ensure_state_dir(cwd)
-    gitignore_path = state_dir / ".gitignore"
 
-    if force and _owns_state_gitignore(state_dir, cwd):
+    if force and not state_dir_is_configured:
         existing_content = gitignore_path.read_text()
         if existing_content != project.STATE_GITIGNORE_CONTENT and not quiet:
             click.echo(f"Warning: Overwriting existing {gitignore_path}", err=True)
         gitignore_path.write_text(project.STATE_GITIGNORE_CONTENT)
-    elif force and not quiet:
+    elif force and gitignore_existed and not quiet:
         click.echo(f"Leaving {gitignore_path}; Pivot does not own it.")
 
     stages_dir = state_dir / "stages"

@@ -238,6 +238,63 @@ def test_init_force_preserves_symlinked_internal_state_gitignore(
     assert target.read_text() == "external content\n"
 
 
+@pytest.mark.parametrize(
+    ("configured_state_dir", "symlink_to_git"),
+    [
+        pytest.param("state", False, id="configured-directory"),
+        pytest.param(".git", False, id="git-directory"),
+        pytest.param("state-link", True, id="symlink-to-git"),
+    ],
+)
+def test_init_force_preserves_existing_configured_state_ignore(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_state_dir: str,
+    symlink_to_git: bool,
+) -> None:
+    """Configured state never grants force-overwrite ownership of its ignore file."""
+    root = tmp_path / "project"
+    root.mkdir()
+    git_dir = root / ".git"
+    git_dir.mkdir()
+    if symlink_to_git:
+        (root / "state-link").symlink_to(git_dir, target_is_directory=True)
+        state_dir = root / "state-link"
+    else:
+        state_dir = root / configured_state_dir
+        state_dir.mkdir(exist_ok=True)
+    state_ignore = state_dir / ".gitignore"
+    state_ignore.write_text("existing content\n")
+    (root / ".pivot").mkdir()
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {configured_state_dir}\n")
+    monkeypatch.chdir(root)
+    project._project_root_cache = None
+    config_io.clear_config_cache()
+
+    result = runner.invoke(cli.cli, ["init", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert state_ignore.read_text() == "existing content\n"
+    assert f"Leaving {state_ignore}; Pivot does not own it." in result.output
+
+
+def test_init_force_overwrites_default_state_ignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The unset state directory preserves main's force-overwrite behavior."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        initial = runner.invoke(cli.cli, ["init"])
+        assert initial.exit_code == 0, initial.output
+        ignore_path = pathlib.Path(".pivot/.gitignore")
+        ignore_path.write_text("custom content\n")
+
+        result = runner.invoke(cli.cli, ["init", "--force"])
+
+        assert result.exit_code == 0, result.output
+        assert ignore_path.read_text() == project.STATE_GITIGNORE_CONTENT
+
+
 def test_init_writes_gitignore_to_the_configured_state_dir(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
@@ -562,3 +619,48 @@ with pipeline:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+
+def test_import_uses_default_state_dir_when_source_core_omits_state_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A source with other core settings keeps its default `.pivot/stages` lock location."""
+    source = tmp_path / "source"
+    source.mkdir()
+    init_git_repo(source)
+    subprocess.run(
+        ["git", "config", "uploadArchive.allowUnreachable", "true"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=source, check=False, capture_output=True)
+    (source / ".pivot").mkdir()
+    lock_file = source / ".pivot" / "stages" / "test" / "writes_state.lock"
+    lock_file.parent.mkdir(parents=True)
+    lock_file.write_text(
+        yaml.safe_dump(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": None, "tag": "data", "hash": "0123456789abcdef"}],
+            }
+        )
+    )
+    (source / ".pivot" / "config.yaml").write_text(
+        "core:\n  max_workers: 1\nremotes:\n  origin: s3://source-cache\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "default source state"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+
+    resolved = asyncio.run(
+        import_artifact.resolve_remote_path(str(source), "test/writes_state", "main", None)
+    )
+
+    assert resolved["stage"] == "test/writes_state"

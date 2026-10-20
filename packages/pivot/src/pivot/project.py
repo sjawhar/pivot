@@ -11,19 +11,16 @@ _state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 STATE_GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
 /cache/
-
 # State database (file hashes, generation counters)
 /state.lmdb/
-
 # Artifact and restore locks (flock files for concurrent execution)
 /locks/
-
 # Agent RPC socket (left behind by TUI and --serve sessions)
 /agent.sock
-
+# Config lock (held while editing config.yaml)
+/config.yaml.lock
 # Generated plots gallery (pivot plots show)
 /plots/
-
 # Key for secret params' digests in lock files; never commit it
 /secret.key
 """
@@ -101,6 +98,20 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
+def state_dir_is_configured(root: pathlib.Path) -> bool:
+    """Return whether the local configuration explicitly contains core.state_dir."""
+    import yaml
+
+    try:
+        data: object = yaml.safe_load((root / ".pivot" / "config.yaml").read_text())
+    except FileNotFoundError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    core = typing.cast("dict[str, object]", data).get("core")
+    return isinstance(core, dict) and "state_dir" in core
+
+
 def get_state_dir() -> pathlib.Path:
     """Return the state directory of the current project."""
     return state_dir_for(get_project_root())
@@ -114,9 +125,15 @@ def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
     state_dir.mkdir(parents=True, exist_ok=True)
     gitignore_path = state_dir / ".gitignore"
     try:
-        gitignore_path.lstat()
-    except FileNotFoundError:
-        gitignore_path.write_text(STATE_GITIGNORE_CONTENT)
+        descriptor = os.open(
+            gitignore_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+        )
+    except FileExistsError:
+        return state_dir
+    with os.fdopen(descriptor, "w") as gitignore:
+        gitignore.write(STATE_GITIGNORE_CONTENT)
     return state_dir
 
 
