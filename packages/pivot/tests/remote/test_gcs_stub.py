@@ -20,7 +20,7 @@ import logging
 import os
 import traceback
 import types
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, Any, override
 
 import aiohttp
 import pytest
@@ -634,20 +634,34 @@ async def test_resumable_upload_503_is_reported_after_one_attempt_per_session(
     assert str(exc_info.value).endswith("HTTP 503: Backend Error")
 
 
-# sha256 of gcloud-aio-storage 9.6.5's ``Storage._do_upload`` source, which gcs._storage_class
-# overrides.
-_DO_UPLOAD_SHA256 = "9797a96c6671574791a45e3a245325c408a4cd843523204ba95152d8bd48fbc3"
+# sha256 of the source of each gcloud-aio-storage 9.6.5 method on the path from the public
+# ``Storage.upload`` to ``Storage._do_upload``, which gcs._storage_class overrides. A release that
+# changes any of them can route a resumable upload's data PUT around the override.
+_REVIEWED_UPLOAD_PATH = {
+    "upload": "f981a78f29d0e4adc75bbf0620c54c5a6b159cfadfde93502d03f95cca65cd24",
+    "_decide_upload_type": "4ca2ef67354c2a88275639aab6b7366328687fd93812313980a93659ba6fa970",
+    "_upload_resumable": "5f3cef390d89cfe20e93d31b6b80b1a7172150a105563f6c3a20a4c07800e826",
+    "_do_upload": "9797a96c6671574791a45e3a245325c408a4cd843523204ba95152d8bd48fbc3",
+}
 
 
-def test_overridden_gcloud_upload_method_is_the_version_reviewed() -> None:
+def _changed_upload_path(storage_class: type[gcloud_storage_impl.Storage]) -> list[str]:
+    """The methods on the upload path whose source differs from the reviewed 9.6.5 source."""
+    return [
+        name
+        for name, digest in _REVIEWED_UPLOAD_PATH.items()
+        if hashlib.sha256(inspect.getsource(getattr(storage_class, name)).encode()).hexdigest()
+        != digest
+    ]
+
+
+def test_overridden_gcloud_upload_path_is_the_version_reviewed() -> None:
     """gcs._storage_class overrides gcloud-aio's private ``Storage._do_upload``, relying on its
-    parameters and on ``retries=1`` meaning one PUT whose error is raised. An upgrade that
-    changes the method fails here, so it cannot silently bring back the same-session retry:
-    re-read the new method, re-check the override, then update the digest."""
-    from gcloud.aio.storage import storage as gcloud_storage_impl
-
-    method = gcloud_storage_impl.Storage._do_upload
-    parameters = inspect.signature(method).parameters
+    parameters, on ``retries=1`` meaning one PUT whose error is raised, and on ``upload`` reaching
+    it through ``_decide_upload_type`` and ``_upload_resumable``. An upgrade that changes any of
+    those fails here, so it cannot silently bring back the same-session retry: re-read the new
+    methods, re-check the override, then update the digests."""
+    parameters = inspect.signature(gcloud_storage_impl.Storage._do_upload).parameters
 
     assert list(parameters) == [
         "self",
@@ -660,8 +674,77 @@ def test_overridden_gcloud_upload_method_is_the_version_reviewed() -> None:
     ]
     assert parameters["retries"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["retries"].default == 5
-    source = inspect.getsource(method)
-    assert hashlib.sha256(source.encode()).hexdigest() == _DO_UPLOAD_SHA256, source
+    assert _changed_upload_path(gcloud_storage_impl.Storage) == []
+
+
+class _ReleaseWhoseResumableUploadSkipsDoUpload(gcloud_storage_impl.Storage):
+    """A simulated gcloud-aio-storage release: ``_upload_resumable`` sends the data PUT itself,
+    with the same-session retry 9.6.5 has in ``_do_upload``, so pivot's override never runs."""
+
+    @override
+    async def _upload_resumable(
+        self,
+        url: str,
+        object_name: str,
+        stream: IO[Any],
+        params: dict[str, str],
+        headers: dict[str, str],
+        *,
+        metadata: dict[str, Any] | None = None,
+        session: Any = None,  # noqa: ANN401 - gcloud-aio's own parameter type
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        session_uri = await self._initiate_upload(
+            url, object_name, params, headers, metadata=metadata, session=session
+        )
+        body = stream.read()
+        tries = 0
+        while True:
+            try:
+                response = await self.session.put(
+                    session_uri, headers=headers, data=body, timeout=timeout
+                )
+                break
+            except aiohttp.ClientResponseError:
+                tries += 1
+                if tries == 5:
+                    raise
+                headers["Content-Range"] = "bytes */*"
+        stored: dict[str, Any] = await response.json(content_type=None)
+        return stored
+
+
+async def test_upload_path_guard_catches_a_release_whose_resumable_upload_skips_do_upload(
+    google: _Google, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard flags a release in which ``_do_upload``'s override is bypassed, and under such a
+    release a transient 503 does end in Cloud Storage's 400 again (the guard's positive control).
+    """
+    assert _changed_upload_path(_ReleaseWhoseResumableUploadSkipsDoUpload) == ["_upload_resumable"]
+
+    async def one_503_then_as_cloud_storage(request: web.Request) -> web.StreamResponse:
+        body = await request.read()
+        if google.counts["session"] == 1:
+            return _error(503, "Backend Error")
+        if request.headers.get("Content-Range") == "bytes */*" and body:
+            return web.Response(status=400, text="Client sent query request with a non-empty body.")
+        return web.json_response(
+            _resource(google.session_names[request.match_info["session"]], body)
+        )
+
+    google.routes["session"] = one_503_then_as_cloud_storage
+    monkeypatch.setattr(gcloud_storage_impl, "Storage", _ReleaseWhoseResumableUploadSkipsDoUpload)
+    gcs._storage_class.cache_clear()
+    try:
+        with pytest.raises(exceptions.RemoteConnectionError) as exc_info:
+            await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_file(
+                _file(tmp_path, gcs.STREAM_CHUNK_SIZE + 1), _HASH
+            )
+    finally:
+        gcs._storage_class.cache_clear()  # the next caller builds on the real Storage again
+
+    assert "bytes */*" in google.content_ranges
+    assert "HTTP 400" in str(exc_info.value)
 
 
 def _short(name: str, body: bytes) -> dict[str, str]:

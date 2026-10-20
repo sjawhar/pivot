@@ -72,7 +72,8 @@ such as GCS's upload verification, belong in those coroutines, not in `batch.py`
   failure is retried with a fresh upload session: gcloud-aio's own retry resends the body with
   `Content-Range: bytes */*` on the same session, which Cloud Storage refuses with a 400. That
   overrides gcloud-aio's private `Storage._do_upload`; the `gcs` extra pins gcloud-aio-storage to
-  9.6, and `test_gcs_stub.py` fails if the method changes.
+  9.6, and `test_gcs_stub.py` fails if `_do_upload` or any method on the path to it from
+  `Storage.upload` changes.
 - **A GCS upload counts only when the object resource the server returns has the key, the local
   size and the local file's MD5** (`md5Hash`). Any other reply (gcloud-aio returns the JSON of any
   reply below 400, a `308` included) is retried as a fresh upload, then fails, so `sync` never
