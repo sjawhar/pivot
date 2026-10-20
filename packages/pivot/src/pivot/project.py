@@ -113,7 +113,9 @@ def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
         return state_dir
     state_dir.mkdir(parents=True, exist_ok=True)
     gitignore_path = state_dir / ".gitignore"
-    if not gitignore_path.exists():
+    try:
+        gitignore_path.lstat()
+    except FileNotFoundError:
         gitignore_path.write_text(STATE_GITIGNORE_CONTENT)
     return state_dir
 

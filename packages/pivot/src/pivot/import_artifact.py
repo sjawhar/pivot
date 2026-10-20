@@ -168,9 +168,11 @@ def _remote_state_dir(config_data: dict[str, object]) -> str:
     if not isinstance(core, dict):
         return ".pivot"
     state_dir = cast("dict[str, object]", core).get("state_dir")
-    if state_dir is None:
-        return ".pivot"
-    if not isinstance(state_dir, str) or pathlib.PurePosixPath(state_dir).is_absolute():
+    if (
+        not isinstance(state_dir, str)
+        or not state_dir
+        or pathlib.PurePosixPath(state_dir).is_absolute()
+    ):
         raise exceptions.RemoteError(
             f"Source repo's core.state_dir must be a path inside the repo, got {state_dir!r}"
         )
@@ -362,12 +364,16 @@ async def _resolve_remote_path_with_session(
         repo_url, rev_lock, token, session=gh_session
     )
     source_state_dir = _remote_state_dir(config_data)
-    stages_dir = f"{source_state_dir}/stages"
-    if not github.is_github_url(repo_url) and await _run_blocking(
-        git_archive.path_is_symlink_from_remote_repo,
-        repo_url,
-        source_state_dir,
-        rev_lock,
+    stages_dir = "stages" if source_state_dir == "." else f"{source_state_dir}/stages"
+    if (
+        source_state_dir != "."
+        and not github.is_github_url(repo_url)
+        and await _run_blocking(
+            git_archive.path_is_symlink_from_remote_repo,
+            repo_url,
+            source_state_dir,
+            rev_lock,
+        )
     ):
         raise exceptions.RemoteError(
             f"Source repo's core.state_dir is a symlink and cannot be imported: {source_state_dir}"

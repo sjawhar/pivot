@@ -195,6 +195,49 @@ def test_init_force_preserves_external_state_dir_gitignore(
     assert external_ignore.read_text() == "external content\n"
 
 
+def test_init_force_preserves_project_root_gitignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root state directory is not Pivot-owned for force-overwrite purposes."""
+    root = tmp_path / "project"
+    root.mkdir()
+    root_ignore = root / ".gitignore"
+    root_ignore.write_text("repository content\n")
+    (root / ".pivot").mkdir()
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: .\n")
+    monkeypatch.chdir(root)
+    project._project_root_cache = None
+    config_io.clear_config_cache()
+
+    result = runner.invoke(cli.cli, ["init", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert root_ignore.read_text() == "repository content\n"
+
+
+def test_init_force_preserves_symlinked_internal_state_gitignore(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlinked ignore file is not Pivot-owned even inside the project."""
+    root = tmp_path / "project"
+    root.mkdir()
+    target = tmp_path / "outside-ignore"
+    target.write_text("external content\n")
+    state_dir = root / "state"
+    state_dir.mkdir()
+    (state_dir / ".gitignore").symlink_to(target)
+    (root / ".pivot").mkdir()
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: state\n")
+    monkeypatch.chdir(root)
+    project._project_root_cache = None
+    config_io.clear_config_cache()
+
+    result = runner.invoke(cli.cli, ["init", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert target.read_text() == "external content\n"
+
+
 def test_init_writes_gitignore_to_the_configured_state_dir(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
@@ -392,6 +435,8 @@ def test_import_reads_locks_from_the_source_configured_state_dir(tmp_path: pathl
     ("configured_state_dir", "symlink", "error"),
     [
         pytest.param("nested/../actual-state", False, None, id="parent-segment"),
+        pytest.param(".", False, None, id="repository-root"),
+        pytest.param("state/..", False, None, id="root-after-parent"),
         pytest.param("state-link", True, "symlink", id="state-symlink"),
     ],
 )
@@ -413,7 +458,9 @@ def test_import_normalizes_or_refuses_source_state_dir(
     )
     subprocess.run(["git", "checkout", "-b", "main"], cwd=source, check=False, capture_output=True)
     (source / ".pivot").mkdir()
-    actual_state_dir = source / "actual-state"
+    actual_state_dir = (
+        source if configured_state_dir in {".", "state/.."} else source / "actual-state"
+    )
     lock_file = actual_state_dir / "stages" / "test" / "writes_state.lock"
     lock_file.parent.mkdir(parents=True)
     lock_file.write_text(
@@ -452,6 +499,12 @@ def test_import_normalizes_or_refuses_source_state_dir(
             import_artifact.resolve_remote_path(str(source), "test/writes_state", "main", None)
         )
         assert resolved["stage"] == "test/writes_state"
+
+
+def test_import_refuses_empty_source_state_dir() -> None:
+    """A source core.state_dir follows the local empty-value validation rule."""
+    with pytest.raises(exceptions.RemoteError, match="must be a path"):
+        import_artifact._remote_state_dir({"core": {"state_dir": ""}})
 
 
 def test_serve_mode_uses_the_configured_state_directory_socket(tmp_path: pathlib.Path) -> None:
