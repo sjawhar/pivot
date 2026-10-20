@@ -1633,18 +1633,127 @@ def _static_import_module_name(
         return None
 
 
-def _is_r5_external_module(module_name: str, spec: importlib.machinery.ModuleSpec | None) -> bool:
+def _is_r5_external_module(module_name: str, _spec: importlib.machinery.ModuleSpec | None) -> bool:
     if module_name == "pivot" or module_name.startswith("pivot."):
         return True
     if module_name == "__future__":
         return True
-    if spec is None or spec.origin is None:
+    return module_name.partition(".")[0] in sys.stdlib_module_names
+
+
+def _is_r5_inert(node: ast.expr) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.Attribute):
+        return _is_r5_inert(node.value)
+    if isinstance(node, ast.Subscript):
+        return _is_r5_inert(node.value) and _is_r5_inert(node.slice)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
+        return _is_r5_inert(node.operand)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _is_r5_inert(node.left) and _is_r5_inert(node.right)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_r5_inert(element) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            key is not None and _is_r5_inert(key) and _is_r5_inert(value)
+            for key, value in zip(node.keys, node.values, strict=True)
+        )
+    return False
+
+
+def _r5_arguments_are_static(arguments: ast.arguments, future_annotations: bool) -> bool:
+    if not all(
+        _is_r5_inert(default)
+        for default in (*arguments.defaults, *arguments.kw_defaults)
+        if default
+    ):
         return False
-    try:
-        origin = pathlib.Path(spec.origin).resolve()
-    except OSError:
+    if future_annotations:
+        return True
+    annotations = [
+        *(
+            argument.annotation
+            for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+        ),
+        arguments.vararg.annotation if arguments.vararg else None,
+        arguments.kwarg.annotation if arguments.kwarg else None,
+    ]
+    return all(annotation is None or _is_r5_inert(annotation) for annotation in annotations)
+
+
+def _r5_class_body_is_static(body: list[ast.stmt], future_annotations: bool) -> bool:
+    names = set[str]()
+    for index, node in enumerate(body):
+        if (
+            index == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ) or isinstance(node, ast.Pass):
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (
+                node.decorator_list
+                or node.name in names
+                or not _r5_arguments_are_static(node.args, future_annotations)
+                or (
+                    not future_annotations
+                    and node.returns is not None
+                    and not _is_r5_inert(node.returns)
+                )
+            ):
+                return False
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.ClassDef):
+            if (
+                node.decorator_list
+                or node.name in names
+                or not all(_is_r5_inert(base) for base in node.bases)
+                or not all(_is_r5_inert(keyword.value) for keyword in node.keywords)
+                or not _r5_class_body_is_static(node.body, future_annotations)
+            ):
+                return False
+            names.add(node.name)
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            annotation = node.annotation if isinstance(node, ast.AnnAssign) else None
+            if (
+                len(targets) != 1
+                or not isinstance(targets[0], ast.Name)
+                or targets[0].id in names
+                or value is None
+                or not _is_r5_inert(value)
+                or (
+                    not future_annotations
+                    and annotation is not None
+                    and not _is_r5_inert(annotation)
+                )
+            ):
+                return False
+            names.add(targets[0].id)
+            continue
         return False
-    return any(origin.is_relative_to(path) for path in _STDLIB_PATHS)
+    return True
+
+
+def _is_r5_type_checking_guard(node: ast.If) -> bool:
+    test = node.test
+    return (
+        isinstance(test, ast.Name)
+        and test.id == "TYPE_CHECKING"
+        or (
+            isinstance(test, ast.Attribute)
+            and isinstance(test.value, ast.Name)
+            and test.value.id == "typing"
+            and test.attr == "TYPE_CHECKING"
+        )
+    )
 
 
 def _unloaded_module_is_static(module_name: str, visiting: set[str] | None = None) -> bool:
@@ -1664,6 +1773,12 @@ def _unloaded_module_is_static(module_name: str, visiting: set[str] | None = Non
         tree = ast.parse(path.read_text())
     except (OSError, UnicodeDecodeError, SyntaxError):
         return False
+    future_annotations = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in tree.body
+    )
     names = set[str]()
     nested = {*visiting, module_name}
     for index, node in enumerate(tree.body):
@@ -1673,6 +1788,28 @@ def _unloaded_module_is_static(module_name: str, visiting: set[str] | None = Non
             and isinstance(node.value, ast.Constant)
             and isinstance(node.value.value, str)
         ):
+            continue
+        if isinstance(node, ast.If) and _is_r5_type_checking_guard(node):
+            if node.orelse:
+                return False
+            for guarded in node.body:
+                if isinstance(guarded, ast.Import):
+                    if not all(
+                        _unloaded_module_is_static(alias.name, nested) for alias in guarded.names
+                    ):
+                        return False
+                elif isinstance(guarded, ast.ImportFrom):
+                    if (
+                        any(alias.name == "*" for alias in guarded.names)
+                        or (
+                            (imported := _static_import_module_name(guarded, module_name, spec))
+                            is None
+                        )
+                        or not _unloaded_module_is_static(imported, nested)
+                    ):
+                        return False
+                else:
+                    return False
             continue
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -1697,8 +1834,28 @@ def _unloaded_module_is_static(module_name: str, visiting: set[str] | None = Non
                     return False
                 names.add(bound)
             continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.decorator_list or node.name in names:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (
+                node.decorator_list
+                or node.name in names
+                or not _r5_arguments_are_static(node.args, future_annotations)
+                or (
+                    not future_annotations
+                    and node.returns is not None
+                    and not _is_r5_inert(node.returns)
+                )
+            ):
+                return False
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.ClassDef):
+            if (
+                node.decorator_list
+                or node.name in names
+                or not all(_is_r5_inert(base) for base in node.bases)
+                or not all(_is_r5_inert(keyword.value) for keyword in node.keywords)
+                or not _r5_class_body_is_static(node.body, future_annotations)
+            ):
                 return False
             names.add(node.name)
             continue
@@ -1718,6 +1875,7 @@ def _unloaded_module_is_static(module_name: str, visiting: set[str] | None = Non
                 or node.target.id in names
                 or node.value is None
                 or not _is_r5_literal(node.value)
+                or (not future_annotations and not _is_r5_inert(node.annotation))
             ):
                 return False
             names.add(node.target.id)
@@ -3064,6 +3222,10 @@ def _process_module_dependency(
         try:
             value = getattr(module, attribute)
         except AttributeError:
+            submodule = f"{module.__name__}.{attribute}"
+            spec = _module_spec_without_import(submodule)
+            if spec is not None and not _is_r5_external_module(submodule, spec):
+                _record_unloaded_body_import(func, submodule, manifest)
             continue
         binding_ref = f"{module.__name__}.{attribute}"
         with _walking(step):

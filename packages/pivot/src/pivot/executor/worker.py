@@ -626,6 +626,7 @@ def _execute_stage(
                                 deferred_writes=deferred,
                             )
 
+                before_modules = set(sys.modules)
                 with _track_stage_imports() as imported_modules:
                     output_paths = _run_stage_function_with_store(
                         stage_info["func"],
@@ -644,6 +645,10 @@ def _execute_stage(
                         project_state_dir,
                         project_root,
                     )
+                for module_name in set(sys.modules) - before_modules:
+                    module = sys.modules.get(module_name)
+                    if isinstance(module, type(sys)) and fingerprint.is_user_code(module):
+                        imported_modules.add(module_name)
                 uncovered = imported_modules - _covered_user_modules(current_fingerprint)
                 if uncovered:
                     modules = ", ".join(sorted(uncovered))

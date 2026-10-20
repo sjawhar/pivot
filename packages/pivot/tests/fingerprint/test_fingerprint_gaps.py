@@ -578,3 +578,133 @@ def test_guarded_in_body_import_with_runtime_module_code_is_refused(tmp_path: pa
     message = result.stdout + result.stderr
     assert "helpers.gpu" in message
     assert "StageParams" in message
+
+
+def test_body_import_package_attribute_submodule_change_reruns_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "from . import lib\n",
+            "helpers/lib.py": "VALUE = 1\n",
+            "pipeline.py": _pipeline(
+                "\nimport helpers.lib\n",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    import helpers\n"
+                '    return {"v": helpers.lib.VALUE + len(text.splitlines())}\n',
+            ),
+        },
+    )
+    assert _run(project, "repro").returncode == 0
+    assert _count(project) == 4
+    _edit(project, "helpers/lib.py", "VALUE = 1", "VALUE = 100")
+
+    result = _run(project, "repro")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(project) == 103
+
+
+@pytest.mark.parametrize(
+    "module_source",
+    [
+        pytest.param(
+            "import pathlib\n\n"
+            'def value(bonus=int(pathlib.Path("runtime.txt").read_text())):\n'
+            "    return bonus\n",
+            id="default-expression",
+        ),
+        pytest.param(
+            "import pathlib\n\n"
+            "class Config:\n"
+            '    bonus = int(pathlib.Path("runtime.txt").read_text())\n',
+            id="class-body-expression",
+        ),
+    ],
+)
+def test_unloaded_definition_time_expression_is_refused(
+    tmp_path: pathlib.Path, module_source: str
+) -> None:
+    project = _project(
+        tmp_path,
+        {
+            "runtime_helper.py": module_source,
+            "runtime.txt": "1\n",
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    from runtime_helper import value\n"
+                '    return {"v": len(text.splitlines())}\n',
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "StageParams" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "module_source",
+    [
+        pytest.param("VALUE: int = 1\n", id="annotated-literal"),
+        pytest.param("VALUE = 1\n\nasync def helper():\n    return 1\n", id="async-def"),
+        pytest.param(
+            "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import os\nVALUE = 1\n",
+            id="type-checking-import",
+        ),
+        pytest.param("import os\nVALUE = 1\n", id="stdlib-import"),
+    ],
+)
+def test_unloaded_static_module_forms_are_accepted(
+    tmp_path: pathlib.Path, module_source: str
+) -> None:
+    project = _project(
+        tmp_path,
+        {
+            "static_helper.py": module_source,
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    from static_helper import VALUE\n"
+                '    return {"v": len(text.splitlines()) + VALUE}\n',
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_manual_loader_runtime_import_backstop_refuses_and_skips_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    project = _project(
+        tmp_path,
+        {
+            "helpers/lib.py": "VALUE = 1\n",
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    import importlib.util\n"
+                "    import pathlib\n"
+                "    import sys\n"
+                "    path = pathlib.Path(__file__).parent / 'helpers' / 'lib.py'\n"
+                "    spec = importlib.util.spec_from_file_location('manual_loaded', path)\n"
+                "    assert spec is not None and spec.loader is not None\n"
+                "    module = importlib.util.module_from_spec(spec)\n"
+                "    sys.modules[spec.name] = module\n"
+                "    spec.loader.exec_module(module)\n"
+                '    return {"v": module.VALUE + len(text.splitlines())}\n',
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "imported dynamically" in result.stdout + result.stderr
+    assert _run_cache_entries(project) == []
