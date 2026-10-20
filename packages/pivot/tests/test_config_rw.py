@@ -408,9 +408,10 @@ def test_unset_config_value_removes_key(
     local_file = tmp_path / ".pivot" / "config.yaml"
     local_file.write_text("cache:\n  dir: /custom\n")
 
-    removed = io.unset_config_value("cache.dir", scope=models.ConfigScope.LOCAL)
+    removed, notices = io.unset_config_value("cache.dir", scope=models.ConfigScope.LOCAL)
 
     assert removed is True
+    assert notices == []
     content = local_file.read_text()
     assert "/custom" not in content
 
@@ -424,9 +425,10 @@ def test_unset_config_value_returns_false_for_missing(
     (tmp_path / ".pivot").mkdir()
     monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
-    removed = io.unset_config_value("cache.dir", scope=models.ConfigScope.LOCAL)
+    removed, notices = io.unset_config_value("cache.dir", scope=models.ConfigScope.LOCAL)
 
     assert removed is False
+    assert notices == []
 
 
 def test_unset_config_value_cleans_empty_sections(

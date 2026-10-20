@@ -249,10 +249,8 @@ def _validate_int_field(
         raise exceptions.ConfigValidationError(f"'{key}' {error_msg}") from None
 
 
-def validate_config_value(
-    key: str, value: Any, scope: ConfigScope = ConfigScope.LOCAL
-) -> ConfigValue:
-    """Validate and coerce a config value based on key and scope."""
+def validate_config_value(key: str, value: Any) -> ConfigValue:
+    """Validate and coerce a config value based on key."""
     from pivot import exceptions
 
     parts = key.split(".")
@@ -272,9 +270,6 @@ def validate_config_value(
 
     if not is_valid_key(key):
         raise exceptions.ConfigValidationError(f"Unknown config key: '{key}'")
-
-    if key == "core.state_dir" and scope is ConfigScope.GLOBAL:
-        raise exceptions.ConfigValidationError("core.state_dir is per project and cannot be global")
 
     if key in _INT_VALIDATION_SPECS:
         model_cls, field, error_msg = _INT_VALIDATION_SPECS[key]

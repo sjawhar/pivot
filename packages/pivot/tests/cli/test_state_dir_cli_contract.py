@@ -151,3 +151,142 @@ def test_default_init_force_warns_like_pivot_052(tmp_path: pathlib.Path) -> None
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stderr == "Warning: Overwriting existing .pivot/.gitignore\n", result.stderr
+
+
+def _init_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, bytes]:
+    root = tmp_path / "project"
+    root.mkdir()
+    _ok(_run(root, "git", "init", "-q"))
+    _ok(_run(root, _PIVOT, "init"))
+    _ok(_run(root, _PIVOT, "config", "set", "core.max_workers", "2"))
+    config_path = root / ".pivot" / "config.yaml"
+    return root, config_path, config_path.read_bytes()
+
+
+@pytest.mark.parametrize("target_kind", ["regular-file", "dangling-symlink"])
+def test_config_set_normalizes_parent_segments_before_the_preflight(
+    tmp_path: pathlib.Path, target_kind: str
+) -> None:
+    """`missing/../state` names `state`, so an unusable `state` is refused before writing."""
+    root, config_path, before = _init_project(tmp_path)
+    if target_kind == "regular-file":
+        (root / "state").write_text("not a directory\n")
+    else:
+        (root / "state").symlink_to(root / "missing-target")
+
+    result = _run(root, _PIVOT, "config", "set", "core.state_dir", "missing/../state")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert config_path.read_bytes() == before
+    assert output.strip().startswith("Error: core.state_dir"), output
+
+
+def test_config_set_repairs_a_hand_edited_invalid_state_dir(tmp_path: pathlib.Path) -> None:
+    """Like 0.5.2, `config set` overwrites an unusable value written by hand."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _ok(_run(root, "git", "init", "-q"))
+    _ok(_run(root, _PIVOT, "init"))
+    config_path = root / ".pivot" / "config.yaml"
+    config_path.write_text("core:\n  state_dir: ''\n")
+
+    result = _run(root, _PIVOT, "config", "set", "core.state_dir", "altstate")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "state_dir: altstate" in config_path.read_text()
+    assert "nothing was moved" in output, output
+    assert (root / "altstate" / ".gitignore").is_file()
+
+
+def test_config_unset_state_dir_reports_the_transition_like_set(tmp_path: pathlib.Path) -> None:
+    """Unsetting core.state_dir transitions back to `.pivot` with the same notice as set."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _ok(_run(root, "git", "init", "-q"))
+    _ok(_run(root, _PIVOT, "init"))
+    _ok(_run(root, _PIVOT, "config", "set", "core.state_dir", "altstate"))
+    (root / "altstate" / "state.lmdb").mkdir()
+
+    result = _run(root, _PIVOT, "config", "unset", "core.state_dir")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert f"Existing state at {root / 'altstate'} is no longer used." in output, output
+    assert "Removed core.state_dir from local config" in output, output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_config_set_refuses_a_state_dir_under_a_read_only_parent(tmp_path: pathlib.Path) -> None:
+    """A target whose nearest existing ancestor is not writable is refused before writing."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory write permission")
+    root, config_path, before = _init_project(tmp_path)
+    read_only = root / "read-only"
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    try:
+        result = _run(root, _PIVOT, "config", "set", "core.state_dir", "read-only/state")
+    finally:
+        read_only.chmod(0o755)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert config_path.read_bytes() == before
+    assert output.strip().startswith("Error: core.state_dir"), output
+
+
+def _run_with_home(
+    cwd: pathlib.Path, home: pathlib.Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    import os
+
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False, env=env)
+
+
+def _project_with_global_state_dir(
+    tmp_path: pathlib.Path, global_state_dir: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    home = tmp_path / "home"
+    global_config = home / ".config" / "pivot" / "config.yaml"
+    global_config.parent.mkdir(parents=True)
+    global_config.write_text(f"core:\n  state_dir: {global_state_dir}\n")
+    root = tmp_path / "project"
+    root.mkdir()
+    _ok(_run_with_home(root, home, "git", "init", "-q"))
+    _ok(_run_with_home(root, home, _PIVOT, "init"))
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "input.txt").write_text("input\n")
+    (root / "pipeline.py").write_text(_PIPELINE)
+    return root, home
+
+
+def test_global_relative_state_dir_is_rooted_at_each_project(tmp_path: pathlib.Path) -> None:
+    """Like 0.5.2, a global relative core.state_dir holds that project's state under its root."""
+    root, home = _project_with_global_state_dir(tmp_path, "globalstate")
+
+    repro = _run_with_home(root, home, _PIVOT, "repro")
+    reported = _run_with_home(root, home, _PIVOT, "config", "get", "core.state_dir")
+
+    assert repro.returncode == 0, repro.stdout + repro.stderr
+    assert (root / "globalstate" / "stages" / "test" / "process.lock").is_file()
+    assert (root / "globalstate" / "state.lmdb").is_dir()
+    assert not (root / ".pivot" / "state.lmdb").exists()
+    assert reported.stdout.strip() == "core.state_dir = globalstate (global)", reported.stdout
+
+
+def test_local_state_dir_overrides_the_global_one(tmp_path: pathlib.Path) -> None:
+    """A project's own core.state_dir wins over the global value."""
+    root, home = _project_with_global_state_dir(tmp_path, "globalstate")
+    _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "localstate"))
+
+    repro = _run_with_home(root, home, _PIVOT, "repro")
+
+    assert repro.returncode == 0, repro.stdout + repro.stderr
+    assert (root / "localstate" / "stages" / "test" / "process.lock").is_file()
+    assert not (root / "globalstate" / "stages" / "test").exists()
+    assert not (root / "globalstate" / "state.lmdb").exists()

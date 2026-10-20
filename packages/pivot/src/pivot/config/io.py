@@ -25,7 +25,7 @@ DEFAULT_CHECKOUT_MODE_ORDER: list[models.CheckoutMode] = list(models.CheckoutMod
 
 def get_global_config_path() -> pathlib.Path:
     """Get user-level config path (~/.config/pivot/config.yaml)."""
-    return pathlib.Path.home() / ".config" / "pivot" / "config.yaml"
+    return project.global_config_path()
 
 
 def get_local_config_path() -> pathlib.Path:
@@ -253,15 +253,15 @@ def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
 
 
 def _validate_state_dir_target(value: str) -> None:
-    """Reject state-directory paths that cannot become a directory before persistence.
+    """Reject state-directory paths that cannot become a writable directory, before persistence.
 
-    The nearest existing entry, found with ``lexists`` so a dangling link counts as existing,
-    decides: a dangling link or a non-directory refuses the path.
+    The path is normalized against the project root first, so ``missing/../state`` is checked
+    as ``state``. The nearest existing entry, found with ``lexists`` so a dangling link counts as
+    existing, decides: a dangling link, a non-directory, or a directory this process cannot
+    write refuses the path.
     """
     root = project.get_project_root()
-    target = pathlib.Path(value)
-    if not target.is_absolute():
-        target = root / target
+    target = pathlib.Path(os.path.normpath(root / value))
 
     for candidate in (target, *target.parents):
         if not os.path.lexists(candidate):
@@ -271,6 +271,8 @@ def _validate_state_dir_target(value: str) -> None:
             raise exceptions.ConfigValidationError(f"{role} is a dangling symlink: {candidate}")
         if not candidate.is_dir():
             raise exceptions.ConfigValidationError(f"{role} must be a directory: {candidate}")
+        if not os.access(candidate, os.W_OK):
+            raise exceptions.ConfigValidationError(f"{role} is not writable: {candidate}")
         return
 
 
@@ -283,13 +285,23 @@ def _has_runtime_state(state_dir: pathlib.Path) -> bool:
         return False
 
 
-def _transition_local_state_dir(old_state_dir: pathlib.Path) -> list[str]:
+def _current_state_dir() -> pathlib.Path | None:
+    """The project's state directory, or None when the configured value cannot be used."""
+    try:
+        return project.get_state_dir()
+    except exceptions.ConfigError:
+        return None
+
+
+def _transition_local_state_dir(old_state_dir: pathlib.Path | None) -> list[str]:
     """Initialize the new directory without moving or discarding prior project state.
 
     ``.pivot/.gitignore`` is never touched: ``.pivot`` still holds the config and its lock.
     """
     root = project.get_project_root()
     new_state_dir = project.ensure_state_dir(root)
+    if old_state_dir is None:
+        return ["The previous core.state_dir was invalid; nothing was moved."]
     if old_state_dir == new_state_dir:
         return []
     if _has_runtime_state(old_state_dir):
@@ -297,30 +309,45 @@ def _transition_local_state_dir(old_state_dir: pathlib.Path) -> list[str]:
     return []
 
 
+def _changes_local_state_dir(key: str, scope: models.ConfigScope) -> bool:
+    return key == "core.state_dir" and scope is models.ConfigScope.LOCAL
+
+
 def set_config_value(
     key: str, value: Any, scope: models.ConfigScope = models.ConfigScope.LOCAL
 ) -> list[str]:
     """Set a configuration value and return any state-transition notices."""
-    if key == "core.state_dir" and scope is models.ConfigScope.LOCAL:
+    changes_state_dir = _changes_local_state_dir(key, scope)
+    old_state_dir: pathlib.Path | None = None
+    if changes_state_dir:
         _validate_state_dir_target(cast("str", value))
-    old_state_dir = project.get_state_dir() if scope is models.ConfigScope.LOCAL else None
+        old_state_dir = _current_state_dir()
     keys = parse_dotted_key(key)
     with edit_config(scope) as data:
         set_nested(data, keys, value)
     clear_config_cache()
-    if old_state_dir is None:
+    if not changes_state_dir:
         return []
     return _transition_local_state_dir(old_state_dir)
 
 
-def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.LOCAL) -> bool:
-    """Remove config value from specified scope. Returns True if removed."""
+def unset_config_value(
+    key: str, scope: models.ConfigScope = models.ConfigScope.LOCAL
+) -> tuple[bool, list[str]]:
+    """Remove config value from specified scope.
+
+    Returns whether it was removed, and any state-transition notices.
+    """
     keys = parse_dotted_key(key)
     path = get_config_path(scope)
 
     if not path.exists():
-        return False
+        return False, []
 
+    changes_state_dir = _changes_local_state_dir(key, scope)
+    old_state_dir: pathlib.Path | None = None
+    if changes_state_dir:
+        old_state_dir = _current_state_dir()
     lock_path = _config_lock_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -329,17 +356,19 @@ def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.
         try:
             raw_data = _load_config_preserving_structure(path)
             if raw_data is None:
-                return False
+                return False, []
 
             data: dict[str, Any] = raw_data
             removed = unset_nested(data, keys)
             if removed:
                 _save_config(path, data)
                 clear_config_cache()
-
-            return removed
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    if not removed or not changes_state_dir:
+        return removed, []
+    return removed, _transition_local_state_dir(old_state_dir)
 
 
 def get_checkout_mode_order() -> list[models.CheckoutMode]:

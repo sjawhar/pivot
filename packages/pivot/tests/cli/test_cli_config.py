@@ -182,10 +182,10 @@ def test_config_set_global_flag(
         assert global_config.exists()
 
 
-def test_config_set_global_rejects_project_state_dir(
+def test_config_set_global_accepts_state_dir(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """core.state_dir is local because it identifies one project's own state."""
+    """Like 0.5.2, core.state_dir can be set globally."""
     global_config = tmp_path / ".config" / "pivot" / "config.yaml"
 
     from pivot.config import io
@@ -195,9 +195,8 @@ def test_config_set_global_rejects_project_state_dir(
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "--global", "core.state_dir", "shared"])
 
-    assert result.exit_code != 0
-    assert "per project" in result.output
-    assert not global_config.exists()
+    assert result.exit_code == 0, result.output
+    assert "state_dir: shared" in global_config.read_text()
 
 
 def test_config_set_state_dir_updates_the_current_process(

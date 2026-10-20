@@ -63,59 +63,67 @@ def get_project_root() -> pathlib.Path:
     return _project_root_cache
 
 
-def state_dir_for(root: pathlib.Path) -> pathlib.Path:
-    """Return the state directory configured for ``root``.
+def global_config_path() -> pathlib.Path:
+    """Return the user-level config path (``~/.config/pivot/config.yaml``)."""
+    return pathlib.Path.home() / ".config" / "pivot" / "config.yaml"
 
-    ``core.state_dir`` comes from ``<root>/.pivot/config.yaml``. Relative values are rooted at
-    ``root``; absent configuration keeps state in ``<root>/.pivot``. The ``.pivot`` marker and
-    its configuration always remain at the project root.
-    """
-    if (cached := _state_dir_cache.get(root)) is not None:
-        return cached
 
+def _configured_state_dir(config_path: pathlib.Path) -> tuple[bool, object]:
+    """Read ``core.state_dir`` from one config file: (present, value)."""
     import yaml
 
     from pivot import exceptions
 
-    config_path = root / ".pivot" / "config.yaml"
     try:
         data: object = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        data = None
+        return False, None
     except yaml.YAMLError as e:
         raise exceptions.ConfigError(f"Error reading {config_path}: {e}") from e
+    if not isinstance(data, dict):
+        return False, None
+    core = typing.cast("dict[str, object]", data).get("core")
+    if not isinstance(core, dict):
+        return False, None
+    core_data = typing.cast("dict[str, object]", core)
+    return "state_dir" in core_data, core_data.get("state_dir")
 
-    configured: object = None
-    if isinstance(data, dict):
-        config_data = typing.cast("dict[str, object]", data)
-        core = config_data.get("core")
-        if isinstance(core, dict):
-            configured = typing.cast("dict[str, object]", core).get("state_dir")
 
-    if configured is None:
-        state_dir = root / ".pivot"
-    elif isinstance(configured, str) and configured:
+def state_dir_for(root: pathlib.Path) -> pathlib.Path:
+    """Return the state directory configured for ``root``.
+
+    ``core.state_dir`` comes from ``<root>/.pivot/config.yaml``, else from the global config,
+    the same precedence ``config get`` reports. Relative values are rooted at ``root``, so a
+    relative global value gives each project its own directory; absent configuration keeps
+    state in ``<root>/.pivot``. The ``.pivot`` marker and its configuration always remain at
+    the project root.
+    """
+    if (cached := _state_dir_cache.get(root)) is not None:
+        return cached
+
+    from pivot import exceptions
+
+    state_dir = root / ".pivot"
+    for config_path in (root / ".pivot" / "config.yaml", global_config_path()):
+        present, configured = _configured_state_dir(config_path)
+        if not present:
+            continue
+        if not isinstance(configured, str) or not configured:
+            raise exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
         state_dir = pathlib.Path(configured)
         state_dir = state_dir if state_dir.is_absolute() else root / state_dir
-    else:
-        raise exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
+        break
 
     _state_dir_cache[root] = state_dir
     return state_dir
 
 
 def state_dir_is_configured(root: pathlib.Path) -> bool:
-    """Return whether the local configuration explicitly contains core.state_dir."""
-    import yaml
-
-    try:
-        data: object = yaml.safe_load((root / ".pivot" / "config.yaml").read_text())
-    except FileNotFoundError:
-        return False
-    if not isinstance(data, dict):
-        return False
-    core = typing.cast("dict[str, object]", data).get("core")
-    return isinstance(core, dict) and "state_dir" in core
+    """Return whether the local or global configuration sets core.state_dir."""
+    return any(
+        _configured_state_dir(config_path)[0]
+        for config_path in (root / ".pivot" / "config.yaml", global_config_path())
+    )
 
 
 def get_state_dir() -> pathlib.Path:
