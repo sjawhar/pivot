@@ -570,8 +570,10 @@ async def _rate_limited(request: web.Request) -> web.StreamResponse:
 
 
 async def _stalled(request: web.Request) -> web.StreamResponse:
-    await asyncio.sleep(1)  # longer than the 0.2 s read timeout the test sets
-    return web.Response()
+    """Answer correctly, but only after the 0.2 s read timeout the test sets: the object counts
+    as stored, so only the read timeout can make pivot send a second POST."""
+    await asyncio.sleep(1)
+    return web.json_response(_resource(request.query["name"], await request.read()))
 
 
 @pytest.mark.parametrize(

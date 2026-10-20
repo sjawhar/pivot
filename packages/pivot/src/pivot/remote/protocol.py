@@ -60,7 +60,7 @@ def open_remote(url: str) -> RemoteStorage:
         case remote_config.RemoteScheme.S3:
             return storage.S3Remote(url)
         case remote_config.RemoteScheme.GS:
-            # Imported here so commands that never open a gs:// remote do not load aiohttp
+            # Imported here so importing this module loads neither the GCS backend nor aiohttp
             from pivot.remote import gcs
 
             return gcs.GCSRemote(url)
