@@ -11,16 +11,22 @@ _state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 STATE_GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
 /cache/
+
 # State database (file hashes, generation counters)
 /state.lmdb/
+
 # Artifact and restore locks (flock files for concurrent execution)
 /locks/
+
 # Agent RPC socket (left behind by TUI and --serve sessions)
 /agent.sock
+
 # Config lock (held while editing config.yaml)
 /config.yaml.lock
+
 # Generated plots gallery (pivot plots show)
 /plots/
+
 # Key for secret params' digests in lock files; never commit it
 /secret.key
 """

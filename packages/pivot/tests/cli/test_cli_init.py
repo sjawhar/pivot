@@ -28,27 +28,63 @@ def test_init_creates_gitignore(runner: click.testing.CliRunner, tmp_path: pathl
         assert pathlib.Path(".pivot/.gitignore").exists()
 
 
-def test_default_state_gitignore_matches_main_template() -> None:
-    """Default initialization retains main's exact ignore contract."""
-    assert (
-        project.STATE_GITIGNORE_CONTENT
-        == """\
+_PIVOT_052_GITIGNORE = b"""\
 # Cache directory (stage outputs, file hashes)
 /cache/
+
 # State database (file hashes, generation counters)
 /state.lmdb/
+
 # Artifact and restore locks (flock files for concurrent execution)
 /locks/
+
 # Agent RPC socket (left behind by TUI and --serve sessions)
 /agent.sock
+
 # Config lock (held while editing config.yaml)
 /config.yaml.lock
+
 # Generated plots gallery (pivot plots show)
 /plots/
+
 # Key for secret params' digests in lock files; never commit it
 /secret.key
 """
-    )
+
+
+def test_default_init_writes_the_pivot_052_ignore_bytes(tmp_path: pathlib.Path) -> None:
+    """Default init must preserve the released byte-for-byte ignore contract."""
+    runner = click.testing.CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0, result.output
+        assert pathlib.Path(".pivot/.gitignore").read_bytes() == _PIVOT_052_GITIGNORE
+
+
+def test_default_config_set_keeps_the_released_config_lock_file(tmp_path: pathlib.Path) -> None:
+    """Default config writes preserve the files created by Pivot 0.5.2."""
+    runner = click.testing.CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        initialized = runner.invoke(cli.cli, ["init"])
+        before = {
+            path.relative_to(".").as_posix()
+            for path in pathlib.Path(".").rglob("*")
+            if path.is_file()
+        }
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.max_workers", "1"])
+
+        after = {
+            path.relative_to(".").as_posix()
+            for path in pathlib.Path(".").rglob("*")
+            if path.is_file()
+        }
+        assert result.exit_code == 0, initialized.output + result.output
+        assert after - before == {".pivot/config.yaml", ".pivot/config.yaml.lock"}
 
 
 def test_default_init_keeps_legacy_stages_directory(
