@@ -127,6 +127,22 @@ def test_config_set_creates_value(runner: click.testing.CliRunner, tmp_path: pat
         assert "/custom" in config_file.read_text()
 
 
+def test_config_set_rejects_an_empty_state_dir_without_writing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An empty core.state_dir is invalid before config persistence."""
+    with isolated_pivot_dir(runner, tmp_path):
+        config_file = pathlib.Path(".pivot/config.yaml")
+        config_file.write_text("core:\n  max_workers: 2\n")
+        before = config_file.read_text()
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.state_dir", ""])
+
+        assert result.exit_code != 0
+        assert "must be a path" in result.output
+        assert config_file.read_text() == before
+
+
 def test_config_set_validates_value(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

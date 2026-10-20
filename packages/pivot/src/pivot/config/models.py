@@ -281,7 +281,12 @@ def validate_config_value(
         return _validate_int_field(key, value, model_cls, field, error_msg)
 
     match key:
-        case "cache.dir" | "core.state_dir" | "default_remote":
+        case "core.state_dir":
+            state_dir = str(value) if not isinstance(value, str) else value
+            if not state_dir:
+                raise exceptions.ConfigValidationError("'core.state_dir' must be a path")
+            return state_dir
+        case "cache.dir" | "default_remote":
             return str(value) if not isinstance(value, str) else value
 
         case "cache.checkout_mode":

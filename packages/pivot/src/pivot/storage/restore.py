@@ -98,9 +98,13 @@ def get_lock_data_from_revision(
     stage_name: str, rev: str, state_dir: pathlib.Path
 ) -> StorageLockData | None:
     """Read and parse lock file for a stage from a git revision."""
-    stages_dir = lock.get_stages_dir(state_dir)
-    rel_path = str(stages_dir.relative_to(project.get_project_root()) / f"{stage_name}.lock")
-    content = git.read_file_from_revision(rel_path, rev)
+    try:
+        stages_dir = lock.stages_rel_path(state_dir, project.get_project_root())
+    except ValueError:
+        raise exceptions.ConfigError(
+            "core.state_dir is outside the project, so lock files are not in git"
+        ) from None
+    content = git.read_file_from_revision(f"{stages_dir}/{stage_name}.lock", rev)
     if content is None:
         return None
     return _parse_lock_data_from_bytes(content)

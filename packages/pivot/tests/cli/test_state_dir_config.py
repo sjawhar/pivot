@@ -19,6 +19,7 @@ from pivot import cli, compose, exceptions, import_artifact, parameters, project
 from pivot.cli import completion
 from pivot.config import io as config_io
 from pivot.show import common as show_common
+from pivot.storage import restore
 
 if TYPE_CHECKING:
     import click.testing
@@ -269,6 +270,42 @@ def test_show_refuses_a_state_dir_outside_the_project(
         show_common.read_lock_files_from_head(["test/writes_state"])
 
 
+@pytest.mark.parametrize(
+    ("configured_state_dir", "symlink"),
+    [
+        pytest.param("nested/../actual-state", False, id="parent-segment"),
+        pytest.param("state-link", True, id="in-project-symlink"),
+    ],
+)
+def test_revision_lock_read_normalizes_configured_state_dir(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_state_dir: str,
+    symlink: bool,
+) -> None:
+    """Revision reads use the Git path of the resolved in-project state directory."""
+    root, commit = git_repo
+    (root / ".pivot").mkdir()
+    actual_state_dir = root / "actual-state"
+    lock_file = actual_state_dir / "stages" / "test" / "writes_state.lock"
+    lock_file.parent.mkdir(parents=True)
+    lock_file.write_text(_lock_text())
+    if symlink:
+        (root / "state-link").symlink_to(actual_state_dir, target_is_directory=True)
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {configured_state_dir}\n")
+    commit("configured revision lock")
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    config_io.clear_config_cache()
+
+    lock_data = restore.get_lock_data_from_revision(
+        "test/writes_state",
+        "HEAD",
+        project.get_state_dir(),
+    )
+
+    assert lock_data is not None
+
+
 def test_import_reads_locks_from_the_source_configured_state_dir(tmp_path: pathlib.Path) -> None:
     """Import resolves source locks from that revision's configured state directory."""
     source = tmp_path / "source"
@@ -311,6 +348,72 @@ def test_import_reads_locks_from_the_source_configured_state_dir(tmp_path: pathl
 
     assert resolved["stage"] == "test/writes_state"
     assert resolved["remote_url"] == "s3://source-cache"
+
+
+@pytest.mark.parametrize(
+    ("configured_state_dir", "symlink", "error"),
+    [
+        pytest.param("nested/../actual-state", False, None, id="parent-segment"),
+        pytest.param("state-link", True, "symlink", id="state-symlink"),
+    ],
+)
+def test_import_normalizes_or_refuses_source_state_dir(
+    tmp_path: pathlib.Path,
+    configured_state_dir: str,
+    symlink: bool,
+    error: str | None,
+) -> None:
+    """A local git import normalizes source paths and names unsupported symlink layouts."""
+    source = tmp_path / "source"
+    source.mkdir()
+    init_git_repo(source)
+    subprocess.run(
+        ["git", "config", "uploadArchive.allowUnreachable", "true"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=source, check=False, capture_output=True)
+    (source / ".pivot").mkdir()
+    actual_state_dir = source / "actual-state"
+    lock_file = actual_state_dir / "stages" / "test" / "writes_state.lock"
+    lock_file.parent.mkdir(parents=True)
+    lock_file.write_text(
+        yaml.safe_dump(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": None, "tag": "data", "hash": "0123456789abcdef"}],
+            }
+        )
+    )
+    if symlink:
+        (source / "state-link").symlink_to(actual_state_dir, target_is_directory=True)
+    (source / ".pivot" / "config.yaml").write_text(
+        "core:\n"
+        + f"  state_dir: {configured_state_dir}\n"
+        + "remotes:\n"
+        + "  origin: s3://source-cache\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "configured source state"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+
+    if error is not None:
+        with pytest.raises(exceptions.RemoteError, match=error):
+            asyncio.run(
+                import_artifact.resolve_remote_path(str(source), "test/writes_state", "main", None)
+            )
+    else:
+        resolved = asyncio.run(
+            import_artifact.resolve_remote_path(str(source), "test/writes_state", "main", None)
+        )
+        assert resolved["stage"] == "test/writes_state"
 
 
 def test_serve_mode_uses_the_configured_state_directory_socket(tmp_path: pathlib.Path) -> None:
