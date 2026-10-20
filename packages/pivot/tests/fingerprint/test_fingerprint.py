@@ -307,7 +307,8 @@ def test_helper_function_captured():
 
     assert "self:main" in fp
     assert _definition_key("func", helper) in fp
-    assert len(fp) == 2
+    assert f"module:{helper.__module__}" in fp
+    assert len(fp) == 3
 
 
 def test_constant_captured():

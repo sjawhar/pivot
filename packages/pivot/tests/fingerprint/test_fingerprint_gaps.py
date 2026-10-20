@@ -10,6 +10,9 @@ import sys
 import pytest
 import yaml
 
+from pivot import run_history
+from pivot.storage import state
+
 _PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _LINES = "Local Set Default Proof Using\nSet Default Proof Using\nLemma a\n"
 _HEADER = """\
@@ -67,6 +70,12 @@ def _edit(project: pathlib.Path, rel: str, old: str, new: str) -> None:
     text = path.read_text()
     assert old in text
     path.write_text(text.replace(old, new, 1))
+
+
+def _run_cache_entries(project: pathlib.Path) -> list[run_history.RunCacheEntry]:
+    with state.StateDB(project / ".pivot", readonly=True) as db:
+        entries = list(db.iter_prefix(b"runcache:t/count:"))
+    return [run_history.deserialize_run_cache_entry(value) for _key, value in entries]
 
 
 def _count(project: pathlib.Path) -> object:
@@ -173,6 +182,54 @@ _DYNAMIC_IMPORT_SHAPES = {
 }
 
 
+@pytest.mark.parametrize(
+    "loader_body",
+    [
+        pytest.param(
+            "lookup = functools.partial(getattr, importlib)\n"
+            '    load = lookup("import_module")\n'
+            '    return {"v": load("helpers.lib").VALUE + len(text.splitlines())}',
+            id="partial-getattr",
+        ),
+        pytest.param(
+            'load = importlib.__dict__["import_module"]\n'
+            '    return {"v": load("helpers.lib").VALUE + len(text.splitlines())}',
+            id="module-dict",
+        ),
+        pytest.param(
+            'load = vars(importlib)["import_module"]\n'
+            '    return {"v": load("helpers.lib").VALUE + len(text.splitlines())}',
+            id="vars-dict",
+        ),
+        pytest.param(
+            "scope = {}\n"
+            '    exec("import helpers.lib as loaded", scope)\n'
+            '    return {"v": scope["loaded"].VALUE + len(text.splitlines())}',
+            id="exec-import",
+        ),
+    ],
+)
+def test_runtime_dynamic_import_backstop_refuses_and_skips_cache(
+    tmp_path: pathlib.Path, loader_body: str
+) -> None:
+    project = _project(
+        tmp_path,
+        {
+            **_LIB_VALUE,
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n    " + loader_body + "\n",
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "imported dynamically" in result.stdout + result.stderr
+    assert _run_cache_entries(project) == []
+
+
 @pytest.mark.parametrize("shape", sorted(_DYNAMIC_IMPORT_SHAPES))
 def test_dynamic_import_spelling_is_refused(tmp_path: pathlib.Path, shape: str) -> None:
     files, _edit_spec = _DYNAMIC_IMPORT_SHAPES[shape]
@@ -183,6 +240,53 @@ def test_dynamic_import_spelling_is_refused(tmp_path: pathlib.Path, shape: str) 
     assert result.returncode != 0, result.stdout + result.stderr
     assert "fingerprinting failed" in result.stdout + result.stderr
     assert "dynamic imports" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("module_source", "imported_name"),
+    [
+        pytest.param(
+            "import os\n\nBONUS = int(os.environ['BODY_IMPORT_BONUS'])\n\n"
+            "def value():\n    return BONUS\n",
+            "value",
+            id="function-reads-runtime-global",
+        ),
+        pytest.param(
+            "import os\n\nCONFIG = 1\nif os.environ['BODY_IMPORT_BONUS']:\n"
+            "    CONFIG = {'bonus': int(os.environ['BODY_IMPORT_BONUS'])}\n",
+            "CONFIG",
+            id="conditional-rebinding",
+        ),
+    ],
+)
+def test_unloaded_body_import_with_runtime_module_state_is_refused(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    module_source: str,
+    imported_name: str,
+) -> None:
+    monkeypatch.setenv("BODY_IMPORT_BONUS", "1")
+    expression = f"{imported_name}()" if imported_name == "value" else f'{imported_name}["bonus"]'
+    project = _project(
+        tmp_path,
+        {
+            "runtime_helper.py": module_source,
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                f"    from runtime_helper import {imported_name}\n"
+                f'    return {{"v": len(text.splitlines()) + {expression}}}\n',
+            ),
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    message = result.stdout + result.stderr
+    assert "runtime_helper" in message
+    assert imported_name in message
+    assert "StageParams" in message
 
 
 def test_unloaded_runtime_body_import_value_is_refused(
@@ -453,7 +557,7 @@ def test_dataclass_callable_member_is_refused(tmp_path: pathlib.Path) -> None:
     assert "Settings.scale" in result.stdout + result.stderr
 
 
-def test_guarded_in_body_import_is_not_imported_at_definition(tmp_path: pathlib.Path) -> None:
+def test_guarded_in_body_import_with_runtime_module_code_is_refused(tmp_path: pathlib.Path) -> None:
     project = _project(
         tmp_path,
         {
@@ -467,14 +571,10 @@ def test_guarded_in_body_import_is_not_imported_at_definition(tmp_path: pathlib.
             ),
         },
     )
-    first = _run(project, "repro")
-    assert first.returncode == 0, first.stdout + first.stderr
-    assert _count(project) == 3
-    _edit(
-        project, "pipeline.py", "n = len(text.splitlines())\n", "n = len(text.splitlines()) + 10\n"
-    )
 
-    second = _run(project, "repro")
+    result = _run(project, "repro")
 
-    assert second.returncode == 0, second.stdout + second.stderr
-    assert _count(project) == 13
+    assert result.returncode != 0, result.stdout + result.stderr
+    message = result.stdout + result.stderr
+    assert "helpers.gpu" in message
+    assert "StageParams" in message

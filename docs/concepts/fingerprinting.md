@@ -41,10 +41,10 @@ For each stage function, Pivot:
 4. **Follows imports in the function body** — `import helpers` or
    `from helpers import scale` inside a stage or helper is walked as if it
    were a module-level import when discovery already loaded the user module.
-   Otherwise a plain module import tracks its static user-source closure.
-   An unloaded `from module import name` is accepted only for a statically
-   proven function, class, immutable literal, or submodule; other bindings
-   are refused rather than executing the import
+   An unloaded user module is accepted only if its module-level statements
+   are plain imports of permitted static modules, undecorated defs/classes,
+   and one-time primitive or tuple literals; otherwise Pivot refuses it
+   without executing it
 5. **Inspects type hints** — user-defined classes in annotations
    (including Pydantic models) are fingerprinted
 6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
@@ -53,6 +53,10 @@ For each stage function, Pivot:
 The manifest is stored in the per-stage lock file. On the next run, the
 worker recomputes the manifest and compares it key-by-key against the
 locked version. Any difference triggers re-execution.
+During execution, a worker records every user module import for that stage, including a module
+already resident in a warm worker. A user module absent from the stage's fingerprint fails the
+stage before its lock or run-cache entry can be written.
+
 
 ### Transitive Tracking
 

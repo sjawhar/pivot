@@ -140,10 +140,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                          | Detected? | Test Reference                                                       |
 | ------------------------------------ | --------- | -------------------------------------------------------------------- |
-| `from X import func` inside function | ✅        | `test_change_detection.py::test_loaded_body_import_is_tracked_as_a_helper` |
-| `import X as alias` inside function  | ✅        | `test_change_detection.py::test_in_body_import_change_causes_miss` |
-| Conditional import inside function   | ✅        | `test_fingerprint_gaps.py::test_guarded_in_body_import_is_not_imported_at_definition` |
-| Unloaded `from X import NAME` binding a runtime value | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_runtime_body_import_value_is_refused` |
+| Loaded `from X import func` inside function | ✅ | `test_change_detection.py::test_loaded_body_import_is_tracked_as_a_helper` |
+| Unloaded static module import | ✅ | `test_change_detection.py::test_unloaded_body_import_tracks_static_user_import_closure` |
+| Runtime module-level code in an unloaded import | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_body_import_with_runtime_module_state_is_refused` |
+| Dynamic runtime module load | ✅ (error) | `test_fingerprint_gaps.py::test_runtime_dynamic_import_backstop_refuses_and_skips_cache` |
 
 ---
 

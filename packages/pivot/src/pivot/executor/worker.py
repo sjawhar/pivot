@@ -6,11 +6,14 @@ Must be module-level and picklable.
 
 from __future__ import annotations
 
+import builtins
 import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
 import dataclasses
+import importlib
+import importlib.util
 import logging
 import os
 import pathlib
@@ -74,6 +77,83 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+_stage_imports: set[str] | None = None
+_stage_imports_lock = threading.Lock()
+_original_import = builtins.__import__
+_original_import_module = importlib.import_module
+
+
+def _record_stage_import(name: str, package: str | None = None) -> None:
+    with _stage_imports_lock:
+        tracked = _stage_imports
+        if tracked is None:
+            return
+    try:
+        absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
+    except (ImportError, ValueError):
+        return
+    candidates = set[str]()
+    parts = absolute.split(".")
+    for index in range(1, len(parts) + 1):
+        candidates.add(".".join(parts[:index]))
+    for module_name in candidates:
+        module = sys.modules.get(module_name)
+        if isinstance(module, type(sys)) and fingerprint.is_user_code(module):
+            with _stage_imports_lock:
+                if _stage_imports is not None:
+                    _stage_imports.add(module_name)
+
+
+def _tracked_import(
+    name: str,
+    globals_dict: dict[str, object] | None = None,
+    locals_dict: dict[str, object] | None = None,
+    fromlist: tuple[str, ...] | None = None,
+    level: int = 0,
+) -> object:
+    result = _original_import(name, globals_dict, locals_dict, fromlist, level)
+    package = globals_dict.get("__package__") if globals_dict is not None else None
+    if not isinstance(package, str):
+        package = None
+    relative = "." * level + name if level else name
+    _record_stage_import(relative, package)
+    if level:
+        try:
+            base = importlib.util.resolve_name(relative, package)
+        except (ImportError, ValueError):
+            return result
+    else:
+        base = name
+    for imported in fromlist or ():
+        if imported != "*":
+            _record_stage_import(f"{base}.{imported}")
+    return result
+
+
+def _tracked_import_module(name: str, package: str | None = None) -> object:
+    result = _original_import_module(name, package)
+    _record_stage_import(name, package)
+    return result
+
+
+builtins.__import__ = _tracked_import
+importlib.import_module = _tracked_import_module
+
+
+@contextlib.contextmanager
+def _track_stage_imports() -> Generator[set[str]]:
+    global _stage_imports
+    with _stage_imports_lock:
+        assert _stage_imports is None, "Worker cannot execute two stages concurrently"
+        _stage_imports = set[str]()
+    try:
+        yield _stage_imports
+    finally:
+        with _stage_imports_lock:
+            _stage_imports = None
+
 
 # How long a stopped worker's running stage may take to unwind before the worker exits.
 TERMINATION_GRACE_S = 10.0
@@ -546,23 +626,33 @@ def _execute_stage(
                                 deferred_writes=deferred,
                             )
 
-                output_paths = _run_stage_function_with_store(
-                    stage_info["func"],
-                    stage_name,
-                    output_queue,
-                    ring_buffer,
-                    params_instance,
-                    stage_info["deps"],
-                    stage_outs,
-                    store,
-                    stage_info["params_arg_name"],
-                    stage_info["collection_params"],
-                    stage_info["incremental_inputs"],
-                    lock_data,
-                    state_dir,
-                    project_state_dir,
-                    project_root,
-                )
+                with _track_stage_imports() as imported_modules:
+                    output_paths = _run_stage_function_with_store(
+                        stage_info["func"],
+                        stage_name,
+                        output_queue,
+                        ring_buffer,
+                        params_instance,
+                        stage_info["deps"],
+                        stage_outs,
+                        store,
+                        stage_info["params_arg_name"],
+                        stage_info["collection_params"],
+                        stage_info["incremental_inputs"],
+                        lock_data,
+                        state_dir,
+                        project_state_dir,
+                        project_root,
+                    )
+                uncovered = imported_modules - _covered_user_modules(current_fingerprint)
+                if uncovered:
+                    modules = ", ".join(sorted(uncovered))
+                    return _make_result(
+                        StageStatus.FAILED,
+                        f"Stage imported dynamically: {modules}. Use static imports or StageParams.",
+                        ring_buffer,
+                        input_hash=input_hash,
+                    )
                 if no_commit:
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=_store_cache_dir(store)
@@ -665,6 +755,10 @@ def user_code_files() -> list[str]:
         except OSError:
             files.add(str(pathlib.Path(module_file).absolute()))
     return sorted(files)
+
+
+def _covered_user_modules(manifest: dict[str, str]) -> set[str]:
+    return {key.removeprefix("module:") for key in manifest if key.startswith("module:")}
 
 
 def _begin_stage() -> None:

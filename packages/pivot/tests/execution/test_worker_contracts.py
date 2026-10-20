@@ -11,6 +11,7 @@ import array
 import contextlib
 import dataclasses
 import fcntl
+import importlib
 import io
 import logging
 import os
@@ -443,6 +444,23 @@ def test_unsafe_stage_never_restores_an_existing_run_cache_entry(
         StageStatus.RAN,
         "Input dependencies changed",
     )
+
+
+def test_stage_import_tracking_records_cached_module_per_stage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "warm_worker_dynamic_module"
+    (tmp_path / f"{module_name}.py").write_text("VALUE = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    with worker._track_stage_imports() as first:
+        importlib.import_module(module_name)
+    with worker._track_stage_imports() as second:
+        importlib.import_module(module_name)
+
+    assert module_name in first
+    assert module_name in second
 
 
 @pytest.mark.parametrize(
