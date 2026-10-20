@@ -6,8 +6,8 @@
 
 ### Bug Fixes
 
-- **compose**: Every stage re-runs once after upgrading because output tags are part of its
-  fingerprint.
+- **compose**: After upgrading, stages with outputs rerun once because output tags are part of
+  their fingerprint. Stages with no outputs remain cached.
 
 
 ## v0.5.1 (2026-10-20)
