@@ -21,7 +21,7 @@ import yaml
 
 import conftest
 from pivot import cli, project, types
-from pivot.remote import storage as remote_storage
+from pivot.remote import keys
 from pivot.storage import lock, track
 
 if TYPE_CHECKING:
@@ -50,7 +50,7 @@ class _Bucket:
         """Store content under its own hash (or under ``as_hash``) and return that hash."""
         file_hash = as_hash or xxhash.xxh64(content).hexdigest()
         self._client().put_object(  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
-            Bucket=self._name, Key=remote_storage._hash_to_key("cache/", file_hash), Body=content
+            Bucket=self._name, Key=keys.hash_to_key("cache/", file_hash), Body=content
         )
         return file_hash
 
@@ -328,7 +328,10 @@ def test_import_under_the_old_name_of_a_directory_file_names_the_new_one(
             id="unknown-default",
         ),
         pytest.param(
-            "remotes:\n  a: https://example.com/c\n", "Invalid S3 URL", id="non-s3-remote"
+            "remotes:\n  a: https://example.com/c\n",
+            "Invalid remote URL: https://example.com/c. "
+            + "Expected format: s3://bucket/prefix or gs://bucket/prefix",
+            id="unsupported-scheme",
         ),
     ],
 )

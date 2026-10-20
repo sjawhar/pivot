@@ -4,7 +4,6 @@ from typing import Annotated, Any, Self, cast
 
 import pydantic
 
-_S3_URL_PATTERN = re.compile(r"^s3://[^/]+(/.*)?$")
 _REMOTES_PREFIX = "remotes."
 
 # Valid remote name pattern (alphanumeric, hyphens, underscores) - public for completion module
@@ -97,10 +96,15 @@ class DiffConfig(pydantic.BaseModel):
     max_rows: Annotated[int, pydantic.Field(gt=0)] = 10000
 
 
-def _validate_s3_url(url: str) -> str:
-    """Validate that a string is a valid S3 URL."""
-    if not _S3_URL_PATTERN.match(url):
-        raise ValueError(f"must be a valid S3 URL (s3://bucket/prefix), got: {url}")
+def _validate_remote_url(url: str) -> str:
+    """Validate that a string is an s3:// or gs:// remote URL; the error says why it is not."""
+    from pivot import exceptions
+    from pivot.remote import config as remote_config
+
+    try:
+        remote_config.validate_remote_url(url)
+    except exceptions.InvalidRemoteURLError as e:
+        raise ValueError(str(e)) from None
     return url
 
 
@@ -129,9 +133,9 @@ class PivotConfig(pydantic.BaseModel):
                     f"Invalid remote name '{name}': must be alphanumeric, hyphens, or underscores"
                 )
             try:
-                _validate_s3_url(url)
+                _validate_remote_url(url)
             except ValueError as e:
-                raise ValueError(f"Remote '{name}' {e}") from None
+                raise ValueError(f"Remote '{name}': {e}") from None
         return v
 
     @pydantic.field_validator("resources")
@@ -260,9 +264,9 @@ def validate_config_value(key: str, value: Any) -> ConfigValue:
         if not isinstance(value, str):
             raise exceptions.ConfigValidationError(f"'{key}' must be a string")
         try:
-            return _validate_s3_url(value)
+            return _validate_remote_url(value)
         except ValueError as e:
-            raise exceptions.ConfigValidationError(f"'{key}' {e}") from None
+            raise exceptions.ConfigValidationError(f"'{key}': {e}") from None
 
     if not is_valid_key(key):
         raise exceptions.ConfigValidationError(f"Unknown config key: '{key}'")

@@ -3,14 +3,20 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import linecache
 import logging
 import multiprocessing as mp
 import os
 import pathlib
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import TYPE_CHECKING
@@ -634,3 +640,99 @@ async def moto_s3_bucket(
     bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
     await aioboto3_s3_client.create_bucket(Bucket=bucket_name)
     yield bucket_name
+
+
+# =============================================================================
+# GCS (fake-gcs-server)
+# =============================================================================
+
+_FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.56.1"
+_FAKE_GCS_LABEL = "owner=pivot-tests"
+_FAKE_GCS_START_TIMEOUT = 60
+
+
+def _free_local_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+        return port
+
+
+def _fake_gcs_ready(endpoint: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{endpoint}/storage/v1/b", timeout=1) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, ConnectionError):
+        return False
+
+
+@pytest.fixture(scope="session")
+def fake_gcs_server() -> Generator[str]:
+    """Serve fake-gcs-server from Docker for this test process and yield its endpoint URL.
+
+    One container per xdist worker, removed when the worker's session ends. Without Docker the
+    GCS tests are skipped locally and fail in CI (``CI`` set), so CI never loses them silently.
+    """
+    if shutil.which("docker") is None:
+        message = "fake-gcs-server needs Docker, which is not installed"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+
+    port = _free_local_port()
+    endpoint = f"http://127.0.0.1:{port}"
+    run = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--detach",
+            "--label",
+            _FAKE_GCS_LABEL,
+            "--publish",
+            f"127.0.0.1:{port}:{port}",
+            _FAKE_GCS_IMAGE,
+            "-scheme",
+            "http",
+            "-port",
+            str(port),
+            "-backend",
+            "memory",
+            "-external-url",
+            endpoint,
+            "-log-level",
+            "error",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if run.returncode != 0:
+        pytest.fail(f"docker run {_FAKE_GCS_IMAGE} failed: {run.stderr.strip()}")
+    container = run.stdout.strip()
+    try:
+        deadline = time.monotonic() + _FAKE_GCS_START_TIMEOUT
+        while not _fake_gcs_ready(endpoint):
+            if time.monotonic() > deadline:
+                logs = subprocess.run(
+                    ["docker", "logs", container], capture_output=True, text=True
+                ).stderr
+                pytest.fail(f"fake-gcs-server did not answer at {endpoint}: {logs}")
+            time.sleep(0.1)
+        yield endpoint
+    finally:
+        subprocess.run(["docker", "rm", "--force", container], capture_output=True)
+
+
+@pytest.fixture
+def gcs_bucket(fake_gcs_server: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Create a uniquely named fake-gcs-server bucket and point gcloud-aio-storage at it."""
+    monkeypatch.setenv("STORAGE_EMULATOR_HOST", fake_gcs_server)
+    name = f"pivot-test-{uuid.uuid4().hex[:12]}"
+    request = urllib.request.Request(
+        f"{fake_gcs_server}/storage/v1/b?project=pivot-test",
+        data=json.dumps({"name": name}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as resp:
+        assert resp.status == 200, resp.read()
+    return name

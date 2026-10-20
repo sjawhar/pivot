@@ -326,7 +326,7 @@ class InvalidRemoteURLError(RemoteError):
 
     @override
     def get_suggestion(self) -> str:
-        return "Use format: s3://bucket/path, gs://bucket/path, or /local/path"
+        return "Use format: s3://bucket/prefix or gs://bucket/prefix"
 
 
 class RemoteTransferError(RemoteError):

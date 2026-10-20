@@ -147,6 +147,26 @@ def test_doctor_remote_json_includes_remote_checks(
     assert any("remote" in name for name in check_names)
 
 
+def test_doctor_remote_accepts_s3_and_gs_remotes(
+    runner: click.testing.CliRunner, set_project_root: pathlib.Path
+) -> None:
+    """pivot doctor --remote reports both an s3:// and a gs:// remote as valid."""
+    (set_project_root / ".pivot" / "config.yaml").write_text(
+        "remotes:\n  aws: s3://bucket/cache\n  gcp: gs://bucket/cache\n"
+    )
+
+    result = runner.invoke(cli, ["doctor", "--remote", "--json"])
+
+    assert result.exit_code == 0, result.output
+    events = [json.loads(line) for line in result.output.strip().split("\n") if line]
+    remote_checks = {
+        e["name"]: e for e in events if e["type"] == "check" and e["name"].startswith("remote:")
+    }
+    assert remote_checks["remote:aws"]["status"] == "ok"
+    assert remote_checks["remote:gcp"]["status"] == "ok"
+    assert remote_checks["remote:gcp"]["value"] == "gs://bucket/cache"
+
+
 # =============================================================================
 # Check Function Unit Tests
 # =============================================================================

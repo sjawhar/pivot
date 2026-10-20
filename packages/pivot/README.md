@@ -10,7 +10,7 @@ Pivot works out what needs to re-run.
 - **No paths in pipeline code**: Pivot chooses where every output is stored
 - **Per-stage lock files** for fast parallel writes
 - **Warm worker pools** with preloaded imports
-- **Content-addressable caching** with S3 remote storage
+- **Content-addressable caching** with S3 or Google Cloud Storage remotes
 
 **Python:** 3.13+ | **Platform:** Unix (Linux/macOS)
 

@@ -190,6 +190,6 @@ Common causes:
 
 ## Related
 
-- [Remote Storage](remote-storage.md) — configuring S3 remotes for `push`/`pull`
+- [Remote Storage](remote-storage.md) — configuring S3 and GCS remotes for `push`/`pull`
 - [Caching & Skip Detection](../concepts/caching.md) — how Pivot decides what to re-run
 - [Fingerprinting](../concepts/fingerprinting.md) — how code changes are detected

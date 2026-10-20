@@ -8,6 +8,7 @@ import xxhash
 
 from pivot import exceptions, project
 from pivot.remote import config as remote_config
+from pivot.remote import keys
 from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
 from pivot.storage import cache as cache_mod
@@ -629,6 +630,7 @@ def test_create_remote_from_name(lock_project: Path, mocker: MockerFixture) -> N
     remote, name = transfer.create_remote_from_name("origin")
 
     assert name == "origin"
+    assert isinstance(remote, remote_mod.S3Remote)
     assert remote.bucket == "bucket"
 
 
@@ -641,6 +643,7 @@ def test_create_remote_from_name_default(lock_project: Path, mocker: MockerFixtu
     remote, name = transfer.create_remote_from_name(None)
 
     assert name == "origin"
+    assert isinstance(remote, remote_mod.S3Remote)
     assert remote.bucket == "bucket"
 
 
@@ -705,7 +708,7 @@ async def test_push_async_integration(
 
     response = await aioboto3_s3_client.get_object(
         Bucket=s3_remote.bucket,
-        Key=remote_mod._hash_to_key(s3_remote.prefix, hash1),
+        Key=keys.hash_to_key(s3_remote.prefix, hash1),
     )
     content = await response["Body"].read()
     assert content == b"content1"
@@ -722,7 +725,7 @@ async def test_pull_async_integration(
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
-        Key=remote_mod._hash_to_key(s3_remote.prefix, hash1),
+        Key=keys.hash_to_key(s3_remote.prefix, hash1),
         Body=b"content1",
     )
 
@@ -747,7 +750,7 @@ async def test_pull_then_checkout_preserves_executable_bit_integration(
 ) -> None:
     """A directory output's executable file keeps its executable bit after `pivot pull`.
 
-    `_atomic_download` writes a freshly-pulled cache object by content hash alone, with no
+    A pull writes each downloaded cache object by content hash alone, with no
     executable bit (always 0o444): it has no manifest to read one from. Checking it out as
     HARDLINK or SYMLINK must still produce a correctly-executable workspace file, by falling
     back to COPY rather than serving the pulled object's own (wrong) permissions.
@@ -757,7 +760,7 @@ async def test_pull_then_checkout_preserves_executable_bit_integration(
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
-        Key=remote_mod._hash_to_key(s3_remote.prefix, file_hash),
+        Key=keys.hash_to_key(s3_remote.prefix, file_hash),
         Body=content,
     )
 
@@ -839,7 +842,7 @@ async def test_compare_status_integration(
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
-        Key=remote_mod._hash_to_key(s3_remote.prefix, hash_common),
+        Key=keys.hash_to_key(s3_remote.prefix, hash_common),
         Body=b"remote2",
     )
 
@@ -871,12 +874,12 @@ async def test_pull_async_with_deps_integration(
 
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
-        Key=remote_mod._hash_to_key(s3_remote.prefix, out_hash),
+        Key=keys.hash_to_key(s3_remote.prefix, out_hash),
         Body=b"main_file",
     )
     await aioboto3_s3_client.put_object(
         Bucket=s3_remote.bucket,
-        Key=remote_mod._hash_to_key(s3_remote.prefix, dep_hash),
+        Key=keys.hash_to_key(s3_remote.prefix, dep_hash),
         Body=b"dependency_file",
     )
 

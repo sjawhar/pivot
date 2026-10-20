@@ -16,7 +16,7 @@ How Pivot compares to other pipeline and workflow tools.
 | **Caching** | | | | |
 | Content-addressable | xxhash64 | MD5 | No | Yes |
 | Per-stage locks | Parallel-safe writes | Single dvc.lock | N/A | N/A |
-| Remote storage | S3 | S3, GCS, Azure, SSH | Cloud-native | Cloud-native |
+| Remote storage | S3, GCS | S3, GCS, Azure, SSH | Cloud-native | Cloud-native |
 | **Configuration** | | | | |
 | Pure Python | `@stage` functions + `Pipeline` | YAML + scripts | Decorators | Decorators |
 | Type-safe parameters | Pydantic models | No | Pydantic | Yes |

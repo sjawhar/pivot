@@ -557,7 +557,7 @@ class RemoteStatus(TypedDict):
 class RawPivotConfig(TypedDict, total=False):
     """Raw config file structure (.pivot/config.yaml)."""
 
-    remotes: dict[str, str]  # {remote_name: s3_url}
+    remotes: dict[str, str]  # {remote_name: s3:// or gs:// url}
     default_remote: str
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import logging
 import re
 from typing import TYPE_CHECKING, Any, cast
@@ -14,7 +15,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_S3_URL_PATTERN = re.compile(r"^s3://([^/]+)(/.*)?$")
+
+class RemoteScheme(enum.StrEnum):
+    """URL scheme of a remote cache backend."""
+
+    S3 = "s3"
+    GS = "gs"
+
+
+REMOTE_URL_FORMATS = "s3://bucket/prefix or gs://bucket/prefix"
+
+_REMOTE_URL_PATTERN = re.compile(
+    rf"^({'|'.join(re.escape(scheme) for scheme in RemoteScheme)})://([^/]+)(/.*)?$"
+)
+
+# Cloud Storage's bucket naming rules, checked for gs:// only: gcloud-aio-storage puts the bucket
+# into the request path unquoted, so ``?``, ``#``, ``%``, whitespace or a newline would bend it.
+# s3:// buckets are not checked here; botocore validates and quotes them itself, and S3 also takes
+# names these rules exclude (legacy uppercase names, access point and Outposts ARNs).
+_GCS_BUCKET_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
+_GCS_BUCKET_RULE = (
+    "lowercase letters, digits, '.', '-' and '_', starting and ending with a letter or digit"
+)
 
 
 def _get_config_path() -> Path:
@@ -56,21 +78,31 @@ def _save_raw_config(data: RawPivotConfig) -> None:
         yaml.dump(dict(data), f, default_flow_style=False, sort_keys=False)
 
 
-def validate_s3_url(url: str) -> tuple[str, str]:
-    """Validate and parse s3://bucket/prefix URL. Returns (bucket, prefix)."""
-    match = _S3_URL_PATTERN.match(url)
+def validate_remote_url(url: str) -> tuple[RemoteScheme, str, str]:
+    """Validate and parse an s3:// or gs:// remote URL. Returns (scheme, bucket, prefix).
+
+    A gs:// bucket must follow Cloud Storage's naming rules. An s3:// URL is accepted on the
+    grammar alone, leaving the bucket to botocore.
+    """
+    match = _REMOTE_URL_PATTERN.match(url)
     if not match:
         raise exceptions.InvalidRemoteURLError(
-            f"Invalid S3 URL: {url}. Expected format: s3://bucket/prefix"
+            f"Invalid remote URL: {url}. Expected format: {REMOTE_URL_FORMATS}"
         )
-    bucket = match.group(1)
-    prefix = (match.group(2) or "").lstrip("/")
-    return bucket, prefix
+    scheme = RemoteScheme(match.group(1))
+    bucket = match.group(2)
+    if scheme is RemoteScheme.GS and not _GCS_BUCKET_PATTERN.fullmatch(bucket):
+        raise exceptions.InvalidRemoteURLError(
+            f"Invalid remote URL: {url!r}. Bucket name {bucket!r} may contain only "
+            + f"{_GCS_BUCKET_RULE}. Expected format: {REMOTE_URL_FORMATS}"
+        )
+    prefix = (match.group(3) or "").lstrip("/")
+    return scheme, bucket, prefix
 
 
 def add_remote(name: str, url: str) -> None:
     """Add or update a remote in config."""
-    validate_s3_url(url)
+    validate_remote_url(url)
 
     data = _load_raw_config()
     if "remotes" not in data:

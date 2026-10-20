@@ -15,7 +15,7 @@ packages/pivot/src/pivot/
 ├── dag/           # DAG rendering for `pivot dag` (ASCII, DOT, Mermaid)
 ├── engine/        # Execution coordinator, watch mode, RPC server
 ├── executor/      # Worker process execution (see executor/AGENTS.md)
-├── remote/        # S3/remote storage
+├── remote/        # S3 and GCS remote cache storage (see remote/AGENTS.md)
 ├── storage/       # StateDB, lock files, cache management (see storage/AGENTS.md)
 ├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot/incremental/directory tags, format inference
 ├── discovery.py   # Finds and loads pipeline.py

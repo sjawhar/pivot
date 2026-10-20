@@ -13,12 +13,13 @@ uv add pivot
 
 ## Installing with Optional Dependencies
 
-### S3 Remote Storage
+### Remote Storage
 
-For pushing/pulling cached outputs to S3:
+For pushing/pulling cached outputs to S3 or Google Cloud Storage:
 
 ```bash
-uv add "pivot[s3]"
+uv add "pivot[s3]"   # s3:// remotes
+uv add "pivot[gcs]"  # gs:// remotes
 ```
 
 ### Matplotlib Plots
@@ -32,7 +33,7 @@ uv add "pivot[matplotlib]"
 ### All Optional Dependencies
 
 ```bash
-uv add "pivot[s3,matplotlib]"
+uv add "pivot[s3,gcs,matplotlib]"
 ```
 
 ## Development Installation

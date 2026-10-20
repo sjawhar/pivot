@@ -1,11 +1,19 @@
-"""Shared fixtures for S3 remote storage tests using moto."""
+"""Shared fixtures for remote storage tests: S3 against moto, GCS against fake-gcs-server."""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import aiohttp
 import pytest
+from gcloud.aio import storage as gcloud_storage
 
 from pivot.cli import helpers as cli_helpers
+from pivot.remote import gcs
 from pivot.remote import storage as remote_mod
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 
 @pytest.fixture(autouse=True)
@@ -37,3 +45,16 @@ def s3_remote(moto_s3_bucket: str) -> remote_mod.S3Remote:
         S3Remote: Configured S3Remote instance with test-prefix.
     """
     return remote_mod.S3Remote(f"s3://{moto_s3_bucket}/test-prefix/")
+
+
+@pytest.fixture
+def gcs_remote(gcs_bucket: str) -> gcs.GCSRemote:
+    """A GCSRemote on a fresh fake-gcs-server bucket under ``test-prefix/``."""
+    return gcs.GCSRemote(f"gs://{gcs_bucket}/test-prefix/")
+
+
+@pytest.fixture
+async def gcs_client(gcs_bucket: str) -> AsyncGenerator[gcloud_storage.Storage]:
+    """A gcloud-aio-storage client on fake-gcs-server, for arranging and inspecting objects."""
+    async with aiohttp.ClientSession() as session:
+        yield gcloud_storage.Storage(session=session)

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 
 import boto3
@@ -799,6 +800,101 @@ def _commit(cwd: pathlib.Path, message: str) -> None:
         cwd=cwd,
         check=True,
     )
+
+
+_GCS_PIPELINE = """\
+import random
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def generate() -> str:
+    return random.Random(0).randbytes(5 * 1024 * 1024).hex()  # 10 MiB, above one download read
+
+
+@stage
+def measure(text: str) -> dict[str, int]:
+    return {"chars": len(text)}
+
+
+with Pipeline("g") as pipeline:
+    measure(generate())
+"""
+
+
+def test_gcs_remote_push_pull_import_round_trip(
+    tmp_path: pathlib.Path, fake_gcs_server: str, gcs_bucket: str
+) -> None:
+    """A gs:// remote serves push, pull, status --remote and import like an s3:// one."""
+    env = _env(STORAGE_EMULATOR_HOST=fake_gcs_server)
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(src, {"pipeline.py": _GCS_PIPELINE, ".gitignore": "/data/g/\n__pycache__/\n"})
+    # `pivot import` defaults to --rev main; a bare `git init` names its branch after init.defaultBranch
+    subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=src, check=True)
+    # `git archive --remote` by commit SHA (pivot import) requires this for local repos
+    subprocess.run(["git", "config", "uploadArchive.allowUnreachable", "true"], cwd=src, check=True)
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"gs://{gcs_bucket}/cache"))
+    _ok(_pivot(src, "repro", env=env))
+    outputs = [src / "data" / "g" / "generate.txt", src / "data" / "g" / "measure.yaml"]
+    originals = [path.read_bytes() for path in outputs]
+
+    assert "2 transferred, 0 skipped, 0 failed" in _ok(_pivot(src, "push", env=env))
+    shutil.rmtree(src / ".pivot" / "cache")
+    shutil.rmtree(src / "data" / "g")
+    _ok(_pivot(src, "pull", env=env))
+
+    assert [path.read_bytes() for path in outputs] == originals
+    status = json.loads(_ok(_pivot(src, "--quiet", "status", "--remote-only", "--json", env=env)))
+    assert status["remote"]["url"] == f"gs://{gcs_bucket}/cache"
+    assert (status["remote"]["push_count"], status["remote"]["pull_count"]) == (0, 0)
+
+    _commit(src, "v1")
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _project(consumer, {})
+    _ok(_pivot(consumer, "import", str(src), "g/generate", "--out", "generate.txt", env=env))
+
+    assert (consumer / "generate.txt").read_bytes() == originals[0]
+
+
+def test_status_remote_rechecks_after_the_remote_url_changes(
+    tmp_path: pathlib.Path, fake_gcs_server: str, gcs_bucket: str
+) -> None:
+    """`status --remote` must query the bucket the remote points at now, not the previous one.
+
+    `push`, `pull` and `status.get_remote_status` all call `sync.check_remote_url`, which clears
+    the cached "known on remote" index when a remote's URL changes. So after a remote is
+    repointed at an empty bucket, `status --remote` reports both outputs to push, rather than
+    the old bucket's "0 to push" answered from the stale index.
+    """
+    env = _env(STORAGE_EMULATOR_HOST=fake_gcs_server)
+    empty_bucket = f"pivot-test-{uuid.uuid4().hex[:12]}"
+    request = urllib.request.Request(
+        f"{fake_gcs_server}/storage/v1/b?project=pivot-test",
+        data=json.dumps({"name": empty_bucket}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as resp:
+        assert resp.status == 200, resp.read()
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _project(src, {"pipeline.py": _GCS_PIPELINE, ".gitignore": "/data/g/\n__pycache__/\n"})
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"gs://{gcs_bucket}/cache"))
+    _ok(_pivot(src, "repro", env=env))
+    assert "2 transferred" in _ok(_pivot(src, "push", env=env))
+
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"gs://{empty_bucket}/cache"))
+    # stdout only: clearing a stale index logs a warning to stderr, which is not JSON
+    proc = _pivot(src, "--quiet", "status", "--remote-only", "--json", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    status = json.loads(proc.stdout)
+
+    assert status["remote"]["url"] == f"gs://{empty_bucket}/cache"
+    assert status["remote"]["push_count"] == 2
 
 
 def _dirout_clone_after_teammate_rerun(
@@ -1624,7 +1720,8 @@ def test_doctor_reports_invalid_remote_with_one_actionable_line(tmp_path: pathli
     assert result.returncode == 1, output
     assert output.strip() == (
         "Error: Invalid config remotes.broken: 'not-a-remote'; "
-        + "Remote 'broken' must be a valid S3 URL (s3://bucket/prefix), got: not-a-remote"
+        + "Remote 'broken': Invalid remote URL: not-a-remote. "
+        + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
     )
 
 
@@ -1641,7 +1738,8 @@ def test_doctor_identifies_invalid_remote_after_valid_remote(tmp_path: pathlib.P
     assert result.returncode == 1, output
     assert output.strip() == (
         "Error: Invalid config remotes.broken: 'not-a-remote'; "
-        + "Remote 'broken' must be a valid S3 URL (s3://bucket/prefix), got: not-a-remote"
+        + "Remote 'broken': Invalid remote URL: not-a-remote. "
+        + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
     )
 
 

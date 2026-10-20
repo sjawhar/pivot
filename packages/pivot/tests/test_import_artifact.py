@@ -10,6 +10,7 @@ import xxhash
 import yaml
 
 from pivot import exceptions, import_artifact
+from pivot.remote import keys
 from pivot.remote import storage as remote_mod
 from pivot.storage import track
 
@@ -241,11 +242,11 @@ async def test_import_artifact_creates_pvt(
     )
     read_file.side_effect = _read_file
 
-    key = remote_mod._hash_to_key("test-prefix/", file_hash)
+    key = keys.hash_to_key("test-prefix/", file_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key, Body=content)
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         return_value=remote_mod.S3Remote(remote_url),
     )
@@ -315,7 +316,7 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
     read_file.side_effect = _read_file
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         side_effect=AssertionError("S3Remote should not be instantiated"),
     )
@@ -388,11 +389,11 @@ async def test_import_artifact_force_overwrites(
     )
     read_file.side_effect = _read_file
 
-    key = remote_mod._hash_to_key("test-prefix/", file_hash)
+    key = keys.hash_to_key("test-prefix/", file_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key, Body=content)
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         return_value=remote_mod.S3Remote(remote_url),
     )

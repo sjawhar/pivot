@@ -15,8 +15,7 @@ import yaml
 
 from pivot import exceptions, project, types
 from pivot.remote import config as remote_config
-from pivot.remote import git_archive, github
-from pivot.remote import storage as remote_storage
+from pivot.remote import git_archive, github, protocol
 from pivot.storage import cache, track
 from pivot.storage import lock as storage_lock
 
@@ -56,7 +55,7 @@ async def _download_verified(remote_url: str, file_hash: str, data_path: pathlib
     os.close(fd)
     tmp_path = pathlib.Path(tmp_name)
     try:
-        await remote_storage.S3Remote(remote_url).download_file(file_hash, tmp_path)
+        await protocol.open_remote(remote_url).download_file(file_hash, tmp_path)
         actual_hash, _ = cache.hash_file(tmp_path)
         if actual_hash != file_hash:
             raise exceptions.RemoteError(f"Hash mismatch: expected {file_hash}, got {actual_hash}")
@@ -158,7 +157,7 @@ async def read_remote_config(
         raise exceptions.RemoteError(f"Default remote '{default_remote}' not found in config")
 
     url = str(remotes[default_remote])
-    _ = remote_config.validate_s3_url(url)
+    _ = remote_config.validate_remote_url(url)
     logger.info("Using source remote: %s", url)
     return url
 

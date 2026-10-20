@@ -258,8 +258,7 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
     for name, url in remotes.items():
         sanitized_url = _sanitize_url(url)
         try:
-            # Validate S3 URL format
-            remote_config.validate_s3_url(url)
+            remote_config.validate_remote_url(url)
             results.append(
                 _check_event(f"remote:{name}", CheckStatus.OK, sanitized_url, {"valid": True})
             )

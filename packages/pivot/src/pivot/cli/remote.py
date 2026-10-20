@@ -103,7 +103,7 @@ def push(
 
     cache_dir = config.get_cache_dir()
     state_dir = config.get_state_dir()
-    s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
+    remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
@@ -139,7 +139,7 @@ def push(
         result = transfer.push(
             cache_dir,
             state_dir,
-            s3_remote,
+            remote_storage,
             state_db,
             resolved_name,
             targets_list,
@@ -192,7 +192,7 @@ def fetch(
 
     cache_dir = config.get_cache_dir()
     state_dir = config.get_state_dir()
-    s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
+    remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
@@ -208,7 +208,7 @@ def fetch(
                 targets_list, state_dir, include_deps=True, all_stages=all_stages
             )
         else:
-            needed = asyncio.run(s3_remote.list_hashes())
+            needed = asyncio.run(remote_storage.list_hashes())
 
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
@@ -223,7 +223,7 @@ def fetch(
         result = transfer.pull(
             cache_dir,
             state_dir,
-            s3_remote,
+            remote_storage,
             state_db,
             resolved_name,
             targets_list,
@@ -292,7 +292,7 @@ def pull(
 
     cache_dir = config.get_cache_dir()
     state_dir = config.get_state_dir()
-    s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
+    remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
@@ -316,7 +316,7 @@ def pull(
                 targets_list, state_dir, include_deps=True, all_stages=all_stages
             )
         else:
-            needed = asyncio.run(s3_remote.list_hashes())
+            needed = asyncio.run(remote_storage.list_hashes())
 
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
@@ -332,7 +332,7 @@ def pull(
         fetch_result = transfer.pull(
             cache_dir,
             state_dir,
-            s3_remote,
+            remote_storage,
             state_db,
             resolved_name,
             targets_list,

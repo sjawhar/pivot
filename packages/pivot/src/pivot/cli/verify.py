@@ -13,13 +13,14 @@ from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
-from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
 from pivot.storage import lock
 from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from pivot.remote import protocol
 
 
 VerifyStatus = Literal["passed", "failed"]
@@ -170,7 +171,7 @@ def _get_stage_missing_hashes(
     return hash_to_paths
 
 
-def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
+def _create_remote_if_needed(allow_missing: bool) -> protocol.RemoteStorage | None:
     """Create remote connection if allow_missing mode requires it."""
     if not allow_missing:
         return None
@@ -220,7 +221,7 @@ def _verify_stages(
 ) -> tuple[bool, list[StageVerifyInfo]]:
     """Verify all stages and return pass/fail status with details.
 
-    Batches all S3 existence checks into a single call for performance.
+    Batches all remote existence checks into a single call for performance.
     """
     remote = _create_remote_if_needed(allow_missing)
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
@@ -239,7 +240,7 @@ def _verify_stages(
         stage_hash_to_paths[stage_info["name"]] = hash_to_paths
         all_missing_hashes.update(hash_to_paths.keys())
 
-    # Phase 2: Single batched S3 existence check for all hashes
+    # Phase 2: Single batched remote existence check for all hashes
     remote_exists = dict[str, bool]()
     if all_missing_hashes and remote is not None:
         try:
