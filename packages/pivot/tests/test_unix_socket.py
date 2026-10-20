@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import shutil
@@ -107,6 +108,34 @@ async def test_connect_to_missing_socket_past_the_address_limit_raises(
     with pytest.raises(FileNotFoundError):
         await unix_socket.connect_unix(path)
     assert not _helper_entries(private_tmp), "a failed connect left entries in TMPDIR"
+
+
+def _helper_fds_naming(directory: pathlib.Path) -> list[str]:
+    """Return this process's open descriptors that name ``directory``."""
+    names = list[str]()
+    for fd in pathlib.Path("/proc/self/fd").iterdir():
+        with contextlib.suppress(FileNotFoundError):
+            if fd.readlink() == directory:
+                names.append(fd.name)
+    return names
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc/self/fd")
+@pytest.mark.anyio
+async def test_long_path_calls_leave_no_descriptor_open(tmp_path: pathlib.Path) -> None:
+    """Binding, connecting and a failed connect at a long path each close the descriptor they
+    open on the socket's directory."""
+    path = _helper_deep_socket_path(tmp_path)
+    assert not _helper_fds_naming(path.parent), "the test starts with no descriptor open"
+
+    with pytest.raises(FileNotFoundError):
+        await unix_socket.connect_unix(path)
+    assert not _helper_fds_naming(path.parent), "a failed connect left a descriptor open"
+
+    async with await unix_socket.create_unix_listener(path) as listener:
+        assert not _helper_fds_naming(path.parent), "binding left a descriptor open"
+        async with await unix_socket.connect_unix(path), await listener.accept():
+            assert not _helper_fds_naming(path.parent), "connecting left a descriptor open"
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux's address is 108 bytes")

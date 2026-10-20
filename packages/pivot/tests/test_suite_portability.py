@@ -51,6 +51,8 @@ _LAUNCHERS: dict[tuple[str, str], tuple[str, int, str]] = {
     ("anyio", "open_process"): ("command", 0, "command"),
     ("anyio", "run_process"): ("command", 0, "command"),
     ("asyncio", "create_subprocess_shell"): ("shell", 0, "cmd"),
+    ("subprocess", "getoutput"): ("shell", 0, "cmd"),
+    ("subprocess", "getstatusoutput"): ("shell", 0, "cmd"),
     ("os", "popen"): ("shell", 0, "cmd"),
     ("os", "system"): ("shell", 0, "command"),
     ("pexpect", "spawn"): ("shell", 0, "command"),
@@ -455,6 +457,8 @@ def _helper_in_function(*lines: str) -> str:
         pytest.param('pexpect.spawn("uv run pivot")', id="pexpect"),
         pytest.param('os.execv("uv", ["uv", "run"])', id="os-execv-relative"),
         pytest.param('subprocess.run(["pivot"] if fast else [sys.executable])', id="conditional"),
+        pytest.param('subprocess.getoutput("uv run pivot repro")', id="getoutput"),
+        pytest.param('subprocess.getstatusoutput("uv run pivot repro")', id="getstatusoutput"),
     ],
 )
 def test_scan_finds_a_launch_that_searches_path(source: str) -> None:
