@@ -208,3 +208,5 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright              
 ```
 
 **Run all quality checks before returning to user or pushing.**
+
+**A regression found on main gets a line in `.github/known-regressions`, by PR.** Main then goes red and nothing publishes until the fix's PR deletes the line.
