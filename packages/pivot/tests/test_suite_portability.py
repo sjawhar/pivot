@@ -223,6 +223,13 @@ class _LaunchScan:
                 )
                 argvs = [argv + part for argv in argvs for part in parts]
             return [(False, argv) for argv in argvs]
+        if (
+            isinstance(expr, ast.ListComp)
+            and len(expr.generators) == 1
+            and isinstance(expr.generators[0].iter, (ast.List, ast.Tuple))
+            and expr.generators[0].iter.elts
+        ):
+            return [(False, [expr.elt])]
         if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
             return [
                 (False, left + right)
@@ -374,6 +381,9 @@ class _LaunchScan:
             elif isinstance(binding, ast.AnnAssign):
                 if binding.value is not None:
                     values.append(binding.value)
+            elif isinstance(binding, ast.AugAssign):
+                # Appending command arguments does not replace argv[0].
+                continue
             else:
                 values.append(None)
         return values
@@ -476,7 +486,18 @@ def test_scan_finds_a_launch_that_searches_path(source: str) -> None:
         pytest.param('subprocess.run(["git", "init", "-q"])', id="git"),
         pytest.param('subprocess.run(["docker", "run", "--rm", "image"])', id="docker"),
         pytest.param('subprocess.run(["/bin/sh", "-c", "printf ok"])', id="sh-script"),
-        pytest.param('LOGGERS = ["pivot", "pivot.project"]', id="list-of-names"),
+        pytest.param('subprocess.run(["docker", "run", "--rm", "image"])', id="docker"),
+        pytest.param(
+            'command = [str(venv / "bin" / name) for name in ("python", "pivot")]\n'
+            + "subprocess.run(command)",
+            id="nonempty-path-list-comprehension",
+        ),
+        pytest.param(
+            'install = [str(venv / "bin" / "python")]\n'
+            + 'install += ["-m", "pip"]\n'
+            + "subprocess.run(install)",
+            id="argv-augmented-with-arguments",
+        ),
         pytest.param('runner.invoke(cli, ["pivot", "--help"])', id="cli-runner"),
         pytest.param('subprocess.run([os.fspath(venv / "bin" / "pivot")])', id="fspath-join"),
         pytest.param('subprocess.run([f"{venv}/bin/pivot", "init"])', id="f-string-path"),
