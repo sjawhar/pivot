@@ -23,7 +23,7 @@ from pivot.types import DataDiffResult, OnError, StageExplanation
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from anyio.abc import SocketStream
+    from anyio.abc import SocketListener, SocketStream
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import InputEvent
@@ -474,9 +474,8 @@ class AgentRpcSource:
             if self._socket_path.exists():
                 self._socket_path.unlink()
 
-        listener = await unix_socket.create_unix_listener(self._socket_path)
-
         try:
+            listener = await self._listen()
             self._socket_path.chmod(0o600)  # Owner-only access
             if self._ready is not None:
                 self._ready.set()
@@ -489,6 +488,16 @@ class AgentRpcSource:
             with contextlib.suppress(OSError):
                 if self._socket_path.exists():
                     self._socket_path.unlink()
+
+    async def _listen(self) -> SocketListener:  # pyright: ignore[reportReturnType] - CancelScope.__exit__ is typed -> bool but never swallows an exception it did not raise
+        """Bind the listener; a cancellation waits until the bind has finished.
+
+        anyio binds in a worker thread that it abandons on cancellation, so a cancel landing
+        mid-bind would return before the socket exists while the thread goes on to create it,
+        and the caller's cleanup would run too early to remove it.
+        """
+        with anyio.CancelScope(shield=True):
+            return await unix_socket.create_unix_listener(self._socket_path)
 
     async def _handle_connection(
         self,

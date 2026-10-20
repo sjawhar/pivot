@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import socket
+import threading
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
 import anyio
+import anyio.to_thread
 import pytest
 
 from pivot.compose import Pipeline
@@ -408,6 +412,77 @@ async def test_agent_rpc_source_socket_permissions(tmp_path: Path) -> None:
         assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"
 
         tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_cancelled_while_binding_leaves_no_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serve mode's stop cancels the engine's task group, which can land while the listener
+    binds; anyio binds in a worker thread it abandons on cancellation. The socket is still
+    removed."""
+    path = tmp_path / "agent.sock"
+    bound = threading.Event()
+    release = threading.Event()
+    original = socket.socket.bind
+
+    def _bind_then_wait(self: socket.socket, address: str) -> None:
+        original(self, address)
+        bound.set()
+        release.wait(10)
+
+    monkeypatch.setattr(socket.socket, "bind", _bind_then_wait)
+    send, _receive = anyio.create_memory_object_stream[InputEvent](10)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(AgentRpcSource(socket_path=path).run, send)
+        await anyio.to_thread.run_sync(bound.wait, 10)
+        tg.cancel_scope.cancel()
+        release.set()
+    await anyio.sleep(0.5)
+
+    assert not path.exists(), "a source cancelled while binding left its socket behind"
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_cancelled_before_binding_a_long_path_binds_nowhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source cancelled before its bind runs creates no socket anywhere, even when its
+    address names a directory descriptor that the cancellation closed and something reused."""
+    project = tmp_path.joinpath(*["nested-directory"] * 8)
+    project.mkdir(parents=True)
+    path = project / "agent.sock"
+    assert len(os.fsencode(path)) > 108, "the path must go through a directory descriptor"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+    original = socket.socket.bind
+
+    def _wait_then_bind(self: socket.socket, address: str) -> None:
+        entered.set()
+        release.wait(10)
+        original(self, address)
+
+    monkeypatch.setattr(socket.socket, "bind", _wait_then_bind)
+    send, _receive = anyio.create_memory_object_stream[InputEvent](10)
+    releaser = threading.Timer(0.5, release.set)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(AgentRpcSource(socket_path=path).run, send)
+        await anyio.to_thread.run_sync(entered.wait, 10)
+        releaser.start()
+        tg.cancel_scope.cancel()
+    # The process goes on opening files as it shuts down; the lowest free descriptor is reused.
+    reused = os.open(elsewhere, os.O_PATH | os.O_DIRECTORY)
+    try:
+        await anyio.to_thread.run_sync(release.wait, 10)
+        await anyio.sleep(0.5)
+    finally:
+        os.close(reused)
+
+    created = sorted(p.name for p in elsewhere.iterdir())
+    assert not created, f"a cancelled bind created {created} in an unrelated directory"
+    assert not path.exists(), "a source cancelled before binding left its socket behind"
 
 
 def test_agent_rpc_source_conforms_to_protocol() -> None:
