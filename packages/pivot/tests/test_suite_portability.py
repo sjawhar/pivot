@@ -148,6 +148,7 @@ class _LaunchScan:
     its base normalizes away, as ``Path(".") / "uv"`` and an empty base both give ``"uv"``; so a
     bare literal after an untraced or relative base fails, and a literal with a directory (venv /
     "bin" / "python") passes. The literal basename tells the scan whether the program is a shell.
+    With ``shell=True``, ``executable=`` names that shell, and the command is its ``-c`` script.
     Anything else is untraceable and fails. It follows names to their assignments, a function's
     parameters to its callers, comprehensions over literals to each item, and ``sh -c`` scripts,
     or the ``-c`` script of a program it cannot trace, to their commands.
@@ -216,13 +217,16 @@ class _LaunchScan:
             executable = None
         problems = list[_Problem]()
         for is_string, elements in argvs:
-            if shell or (kind == "command" and is_string):
-                problems += self._script(elements, 0)
-            if executable is not None:
+            script = shell or (kind == "command" and is_string)
+            if executable is None:
+                problems += self._script(elements, 0) if script else self._argv(elements)
+            elif script:
+                # With shell=True, Popen runs [executable, "-c", *args]: executable= is the shell.
+                flag = ast.copy_location(ast.Constant(value="-c"), executable)
+                problems += self._argv([executable, flag, *elements])
+            else:
                 # Popen's executable= is the program that runs; args[0] is only its argv[0].
-                problems += self._argv([executable] if shell else [executable, *elements[1:]])
-            elif not (shell or (kind == "command" and is_string)):
-                problems += self._argv(elements)
+                problems += self._argv([executable, *elements[1:]])
         return problems
 
     def _argvs(self, expr: ast.expr) -> list[tuple[bool, _Elements]]:
@@ -662,6 +666,14 @@ def _helper_in_function(*lines: str) -> str:
             id="path-join-dot-components",
         ),
         pytest.param(
+            'subprocess.run("uv run pivot", shell=True, executable="/bin/sh")',
+            id="shell-true-executable-sh-runs-uv",
+        ),
+        pytest.param(
+            'bindir = "/bin"\nsubprocess.run([f"{bindir}/sh", "-c", "uv run pivot"])',
+            id="f-string-shell-path",
+        ),
+        pytest.param(
             'x = str(venv / "bin" / "pivot")\nsubprocess.run([x for x in ("uv", "run")])',
             id="comprehension-shadows-path",
         ),
@@ -685,6 +697,18 @@ def test_scan_finds_a_launch_that_searches_path(source: str) -> None:
         pytest.param(
             'subprocess.run([sys.executable, "--version"], executable=None)',
             id="executable-none",
+        ),
+        pytest.param(
+            'subprocess.run("printf ok", shell=True, executable="/bin/sh")',
+            id="shell-true-executable-sh",
+        ),
+        pytest.param(
+            'subprocess.run("printf ok", shell=True, executable="/bin/bash")',
+            id="shell-true-executable-bash",
+        ),
+        pytest.param(
+            'subprocess.run(["display-name", "-V"], executable=sys.executable)',
+            id="executable-overrides-argv0",
         ),
         pytest.param(
             'subprocess.run([str(pathlib.Path("/usr/bin") / "true")])', id="path-join-all-literal"

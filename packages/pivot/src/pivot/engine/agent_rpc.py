@@ -452,7 +452,6 @@ class AgentRpcSource:
     _handler: AgentRpcHandler | None
     _resource_capacity: dict[str, int]
     _ready: threading.Event | None
-    _socket_identity: tuple[int, int] | None
 
     def __init__(
         self,
@@ -467,7 +466,6 @@ class AgentRpcSource:
         self._handler = handler
         self._resource_capacity = dict(resource_capacity or {})
         self._ready = ready
-        self._socket_identity = None
 
     async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
         """Listen for agent connections and process requests."""
@@ -476,24 +474,26 @@ class AgentRpcSource:
             if self._socket_path.exists():
                 self._socket_path.unlink()
 
-        try:
-            listener = await self._listen()
-            socket_stat = self._socket_path.lstat()
-            self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
-            self._socket_path.chmod(0o600)  # Owner-only access
-            if self._ready is not None:
-                self._ready.set()
-            async with listener, anyio.create_task_group() as tg:
-                while True:
-                    conn = await listener.accept()
-                    tg.start_soon(self._handle_connection, conn, send)
-        finally:
-            # A newer serve can take this pathname while this source still accepts clients.
-            # Unlink only the socket this source bound; lstat avoids following a replacement link.
-            with contextlib.suppress(FileNotFoundError):
-                socket_stat = self._socket_path.lstat()
-                if self._socket_identity == (socket_stat.st_dev, socket_stat.st_ino):
-                    self._socket_path.unlink()
+        listener = await self._listen()
+        async with listener:
+            bound = self._socket_path.lstat()
+            try:
+                self._socket_path.chmod(0o600)  # Owner-only access
+                if self._ready is not None:
+                    self._ready.set()
+                async with anyio.create_task_group() as tg:
+                    while True:
+                        conn = await listener.accept()
+                        tg.start_soon(self._handle_connection, conn, send)
+            finally:
+                # A newer serve can take this pathname while this source still accepts clients.
+                # Unlink only the socket this source bound; lstat avoids following a replacement
+                # link. The check runs while the listener is open: the bound socket keeps its
+                # inode, so a replacement cannot be given the same inode number.
+                with contextlib.suppress(FileNotFoundError):
+                    current = self._socket_path.lstat()
+                    if (current.st_dev, current.st_ino) == (bound.st_dev, bound.st_ino):
+                        self._socket_path.unlink()
 
     async def _listen(self) -> SocketListener:  # pyright: ignore[reportReturnType] - CancelScope.__exit__ is typed -> bool but never swallows an exception it did not raise
         """Bind the listener; a cancellation waits until the bind has finished.

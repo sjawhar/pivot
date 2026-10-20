@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import socket
@@ -483,6 +484,57 @@ async def test_agent_rpc_source_cancelled_before_binding_a_long_path_binds_nowhe
     created = sorted(p.name for p in elsewhere.iterdir())
     assert not created, f"a cancelled bind created {created} in an unrelated directory"
     assert not path.exists(), "a source cancelled before binding left its socket behind"
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_checks_its_socket_while_still_listening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stopping source removes the socket only if it is the one it bound, and checks while it
+    still listens. Its socket then keeps its inode, so a newer serve that replaces the path at
+    that moment is given another inode number and keeps its socket."""
+    path = tmp_path / "agent.sock"
+    armed = threading.Event()
+    seen = dict[str, object]()
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    originals = {name: getattr(os, name) for name in ("stat", "lstat", "unlink")}
+
+    def _replace_on_first_touch(
+        name: str, target: object, *args: object, **kwargs: object
+    ) -> object:
+        if (
+            armed.is_set()
+            and not seen
+            and isinstance(target, (str, os.PathLike))
+            and os.fspath(target) == str(path)
+        ):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                seen["listening"] = client.connect_ex(str(path)) == 0
+            originals["unlink"](path)
+            replacement.bind(str(path))
+            replacement.listen()
+            seen["inode"] = originals["lstat"](path).st_ino
+        return originals[name](target, *args, **kwargs)
+
+    for name in originals:
+        monkeypatch.setattr(os, name, functools.partial(_replace_on_first_touch, name))
+    send, _receive = anyio.create_memory_object_stream[InputEvent](10)
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(AgentRpcSource(socket_path=path).run, send)
+            await helpers.wait_for_socket(path)
+            armed.set()
+            tg.cancel_scope.cancel()
+
+        assert seen, "the stopping source never touched its socket path"
+        assert seen["listening"], (
+            "the source checked its socket after closing its listener, when a replacement can "
+            + "be given the freed inode number"
+        )
+        assert path.exists(), "the stopping source removed the replacement's socket"
+        assert path.lstat().st_ino == seen["inode"]
+    finally:
+        replacement.close()
 
 
 def test_agent_rpc_source_conforms_to_protocol() -> None:

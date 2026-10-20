@@ -993,8 +993,7 @@ def test_tui_warns_once_about_a_changed_tracked_file_whenever_the_engine_checks_
     """A tracked file edited since `pivot track` is reported once, outside the TUI's screen,
     whether the engine checks it before the TUI starts or while the TUI runs. The pre-warm only
     restores missing tracked files; checking the others stays the engine's."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env, worker_log = _helper_logging_env(tmp_path)
     tracked = root / "data" / "raw" / "x.txt"
@@ -1065,8 +1064,7 @@ def test_watch_tui_warns_once_about_a_changed_tracked_file_across_its_runs(
     """`pivot repro --watch --tui` checks the tracked files on every run. A tracked file edited
     since `pivot track`, and edited again while the session runs, is reported once, outside the
     TUI's screen, whether the startup run checks it before the TUI starts or while it runs."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env, _ = _helper_logging_env(tmp_path)
     hook = tmp_path / "hook" / "sitecustomize.py"
