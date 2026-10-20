@@ -3,18 +3,16 @@ from __future__ import annotations
 
 import inspect
 import pathlib
-from typing import TYPE_CHECKING
 
-from pivot import git, loaders, project, types
+import pytest
+
+from pivot import exceptions, git, loaders, project, types
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import RegistryStageInfo
 from pivot.show import common as show_common
 from pivot.show import data as data_module
 from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
-
-if TYPE_CHECKING:
-    import pytest
 
 
 def _make_artifact_ref(
@@ -169,6 +167,38 @@ outs:
     result = data_module.get_data_hashes_from_head()
 
     assert result == {"data/train/first.csv": "abcd123400000000"}
+
+
+def test_get_data_hashes_from_head_refuses_a_manifest_path_outside_its_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed lock whose directory manifest leaves the directory is refused, naming the lock
+    and the path, before any file is read through it."""
+    _use_store(tmp_path, monkeypatch)
+    _register(
+        monkeypatch,
+        _make_artifact_ref("train", None, types.ArtifactTag.DIRECTORY, loaders.CSV()),
+    )
+    lock_content = b"""
+code_manifest: {}
+params: {}
+deps: []
+outs:
+  - key: null
+    hash: deadbeef00000000
+    manifest:
+      - relpath: ../../secret.csv
+        hash: abcd123400000000
+        size: 4
+        isexec: false
+"""
+    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
+
+    with pytest.raises(exceptions.SecurityValidationError) as excinfo:
+        data_module.get_data_hashes_from_head()
+
+    assert ".pivot/stages/train.lock" in str(excinfo.value)
+    assert "outs[0].manifest[0].relpath: '../../secret.csv'" in str(excinfo.value)
 
 
 def test_get_data_hashes_from_head_keeps_an_unlocked_path_directory_target(

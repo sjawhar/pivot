@@ -482,6 +482,21 @@ _MANIFEST_ENTRY: dict[str, object] = {
             id="null-manifest-relpath",
         ),
         pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "../escaped.csv"}]}]},
+            id="traversal-manifest-relpath",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "/abs.csv"}]}]},
+            id="absolute-manifest-relpath",
+        ),
+        pytest.param(
+            "deps[0].manifest[0].relpath",
+            {"deps": [{**_DEP, "manifest": [{**_MANIFEST_ENTRY, "relpath": "a/../b.csv"}]}]},
+            id="inner-traversal-dep-manifest-relpath",
+        ),
+        pytest.param(
             "outs[0].manifest[0].hash",
             {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "hash": "abc"}]}]},
             id="short-manifest-hash",
@@ -514,7 +529,7 @@ _MANIFEST_ENTRY: dict[str, object] = {
         pytest.param("schema_version", {"schema_version": "2"}, id="string-schema-version"),
     ],
 )
-def test_lock_read_treats_wrongly_typed_fields_as_missing_and_names_them(
+def test_lock_read_treats_invalid_fields_as_missing_and_names_them(
     field: str,
     document: dict[str, object],
     tmp_path: Path,
@@ -530,6 +545,30 @@ def test_lock_read_treats_wrongly_typed_fields_as_missing_and_names_them(
         assert stage_lock.read() is None
 
     assert any(field in record.getMessage() for record in caplog.records), caplog.text
+
+
+def test_lock_read_warns_naming_the_lock_and_its_unsafe_manifest_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lock recording a manifest path that leaves its directory is treated as missing, and
+    the warning names the lock and the path."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    entry = {**_MANIFEST_ENTRY, "relpath": "../../secret.csv"}
+    document = {
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [{**_OUT, "manifest": [entry]}],
+    }
+    stage_lock.path.write_text(yaml.safe_dump(document))
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
+        assert stage_lock.read() is None
+
+    (record,) = caplog.records
+    assert str(stage_lock.path) in record.getMessage()
+    assert "outs[0].manifest[0].relpath: '../../secret.csv'" in record.getMessage()
 
 
 def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:

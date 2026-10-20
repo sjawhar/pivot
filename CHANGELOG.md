@@ -8,6 +8,8 @@
 
 - **compose**: After upgrading, stages with outputs rerun once because output tags are part of
   their fingerprint. Stages with no outputs remain cached.
+- **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff`
+  resolves them into workspace files.
 
 
 ## v0.5.1 (2026-10-20)
