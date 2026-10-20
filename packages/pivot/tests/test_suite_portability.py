@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ast
+import copy
 import pathlib
 import re
 import shlex
 import subprocess
 import sys
-from typing import TYPE_CHECKING, final
+from typing import TYPE_CHECKING, final, override
 
 import pytest
 
@@ -65,7 +66,8 @@ _LAUNCHERS: dict[tuple[str, str], tuple[str, int, str]] = {
 type _Function = ast.FunctionDef | ast.AsyncFunctionDef
 type _Elements = list[ast.expr | None]
 type _Problem = tuple[ast.expr | None, str]
-# (kind, text, node): kind is "text" (a string), "path", "which" (shutil.which) or "unknown".
+# (kind, text, node): kind is "text" (the program's exact string), "path" (a path whose basename
+# is text; None for sys.executable), "which" (shutil.which) or "unknown" (untraceable).
 type _Program = tuple[str, str | None, ast.expr | None]
 
 
@@ -138,9 +140,17 @@ def _command_words(script: str) -> list[str]:
 class _LaunchScan:
     """Find the launches in one module whose program is looked up on PATH or cannot be traced.
 
-    A launch passes only when the scan can show it names its program by a path: a string with a
-    ``/``, ``sys.executable``, a ``pathlib`` join, or git or sh. It follows names to their
-    assignments, a function's parameters to its callers, and ``sh -c`` scripts to their commands.
+    The property is no PATH search. ``execvp`` and its relatives search PATH only for a program
+    string without a ``/``; one that contains a ``/`` is opened as given. A launch therefore
+    passes only when the scan proves its program's string: an exact string (a bare name only for
+    git, sh or docker), ``sys.executable``, or a path join whose joined components all resolve
+    to literal strings and whose result is sure to contain a ``/``. A join keeps its ``/`` unless
+    its base normalizes away, as ``Path(".") / "uv"`` and an empty base both give ``"uv"``; so a
+    bare literal after an untraced or relative base fails, and a literal with a directory (venv /
+    "bin" / "python") passes. The literal basename tells the scan whether the program is a shell.
+    Anything else is untraceable and fails. It follows names to their assignments, a function's
+    parameters to its callers, comprehensions over literals to each item, and ``sh -c`` scripts,
+    or the ``-c`` script of a program it cannot trace, to their commands.
     """
 
     def __init__(self, source: str, filename: str) -> None:
@@ -202,14 +212,16 @@ class _LaunchScan:
             and not (isinstance(shell_keyword, ast.Constant) and not shell_keyword.value)
         )
         executable = next((kw.value for kw in call.keywords if kw.arg == "executable"), None)
+        if isinstance(executable, ast.Constant) and executable.value is None:
+            executable = None
         problems = list[_Problem]()
         for is_string, elements in argvs:
-            if executable is not None:
-                # Popen's executable= overrides args[0]; an untraceable override fails closed.
-                problems += self._argv([executable] if shell else [executable, *elements[1:]])
             if shell or (kind == "command" and is_string):
                 problems += self._script(elements, 0)
-            else:
+            if executable is not None:
+                # Popen's executable= is the program that runs; args[0] is only its argv[0].
+                problems += self._argv([executable] if shell else [executable, *elements[1:]])
+            elif not (shell or (kind == "command" and is_string)):
                 problems += self._argv(elements)
         return problems
 
@@ -228,15 +240,18 @@ class _LaunchScan:
                 argvs = [argv + part for argv in argvs for part in parts]
             return [(False, argv) for argv in argvs]
         if isinstance(expr, ast.ListComp) and len(expr.generators) == 1:
+            # One generator over a literal sequence, no filter: the argv is exactly the element
+            # read once per item, in order.
             generator = expr.generators[0]
-            if isinstance(generator.iter, (ast.List, ast.Tuple)) and generator.iter.elts:
-                if (
-                    isinstance(expr.elt, ast.Name)
-                    and isinstance(generator.target, ast.Name)
-                    and expr.elt.id == generator.target.id
-                ):
-                    return [(False, [element]) for element in generator.iter.elts]
-                return [(False, [expr.elt])]
+            if (
+                isinstance(generator.iter, (ast.List, ast.Tuple))
+                and generator.iter.elts
+                and isinstance(generator.target, ast.Name)
+                and not generator.ifs
+                and not generator.is_async
+            ):
+                name = generator.target.id
+                return [(False, [self._bind(expr, name, item) for item in generator.iter.elts])]
         if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
             return [
                 (False, left + right)
@@ -252,6 +267,97 @@ class _LaunchScan:
                 for argv in (self._argvs(value) if value is not None else _untraced_argv())
             ]
         return _untraced_argv()
+
+    def _bind(self, comprehension: ast.ListComp, name: str, item: ast.expr) -> ast.expr:
+        """Return a copy of the comprehension's element with ``name`` read as ``item``, in the
+        comprehension's scope."""
+
+        class _Substitute(ast.NodeTransformer):
+            @override
+            def visit_Name(self, node: ast.Name) -> ast.expr:
+                if node.id == name and isinstance(node.ctx, ast.Load):
+                    return copy.deepcopy(item)
+                return node
+
+        bound = _Substitute().visit(copy.deepcopy(comprehension.elt))
+        self._parents[bound] = comprehension
+        for node in ast.walk(bound):
+            for child in ast.iter_child_nodes(node):
+                self._parents[child] = node
+        return bound
+
+    def _literals(self, expr: ast.expr | None) -> list[str] | None:
+        """Return every string ``expr`` may hold, or None unless each is built from literals."""
+        if expr is None:
+            return None
+        if (text := _string(expr)) is not None:
+            return [text]
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            left, right = self._literals(expr.left), self._literals(expr.right)
+            return None if left is None or right is None else [a + b for a in left for b in right]
+        if isinstance(expr, ast.IfExp):
+            body, orelse = self._literals(expr.body), self._literals(expr.orelse)
+            return None if body is None or orelse is None else body + orelse
+        if isinstance(expr, ast.Name) and expr.id not in self._imported:
+            strings = list[str]()
+            for value in self._values(expr):
+                found = self._literals(value)
+                if found is None:
+                    return None
+                strings += found
+            return strings
+        return None
+
+    def _path_shapes(self, expr: ast.expr | None) -> list[tuple[str, str]] | None:
+        """Return each path ``expr`` may hold as ``(anchor, tail)``: ``"exact"`` when the path is
+        the literal ``tail``; ``"absolute"`` or ``"unknown"`` when an absolute (``sys.executable``
+        and its parents) or an untraced path precedes the literal ``tail``. None when a joined
+        component cannot be resolved to literal strings."""
+        if expr is None:
+            return [("unknown", "")]
+        if (strings := self._literals(expr)) is not None:
+            return [("exact", text) for text in strings]
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Div):
+            bases, leaves = self._path_shapes(expr.left), self._literals(expr.right)
+            if bases is None or leaves is None:
+                return None
+            return [
+                ("exact", leaf)
+                if leaf.startswith("/")
+                else (anchor, str(pathlib.PurePosixPath(tail or ".") / leaf))
+                for anchor, tail in bases
+                for leaf in leaves
+            ]
+        if isinstance(expr, (ast.Name, ast.Attribute)) and self._target(expr) == (
+            "sys",
+            "executable",
+        ):
+            return [("absolute", "")]
+        if isinstance(expr, ast.Attribute) and expr.attr == "parent":
+            bases = self._path_shapes(expr.value)
+            if bases is None:
+                return None
+            parents = list[tuple[str, str]]()
+            for anchor, tail in bases:
+                parent = str(pathlib.PurePosixPath(tail or ".").parent)
+                parents.append((anchor, parent if anchor == "exact" or parent != "." else ""))
+            return parents
+        if isinstance(expr, ast.Name) and expr.id not in self._imported:
+            shapes = list[tuple[str, str]]()
+            for value in self._values(expr):
+                found = self._path_shapes(value)
+                if found is None:
+                    return None
+                shapes += found
+            return shapes
+        if (
+            isinstance(expr, ast.Call)
+            and self._target(expr.func) in _PATH_CONVERSIONS
+            and len(expr.args) == 1
+            and not expr.keywords
+        ):
+            return self._path_shapes(expr.args[0])
+        return [("unknown", "")]
 
     def _programs(self, element: ast.expr | None) -> list[_Program]:
         """Return what ``element`` may name as a program."""
@@ -272,11 +378,28 @@ class _LaunchScan:
                 )
             ]
         if isinstance(element, ast.BinOp) and isinstance(element.op, ast.Div):
-            return [("path", _string(element.right), element)]
-        if isinstance(element, ast.JoinedStr) and any(
-            "/" in (_string(part) or "") for part in element.values
-        ):
-            return [("path", None, element)]
+            # A join names its program only through components that resolve to literals; its
+            # result skips PATH when exact, after an absolute path, or when the literal tail has a
+            # directory. A join with an unresolvable component, or a bare name after an untraced
+            # path, is untraceable.
+            shapes = self._path_shapes(element)
+            if shapes is None:
+                return [("unknown", None, element)]
+            programs = list[_Program]()
+            for anchor, tail in shapes:
+                if anchor == "exact":
+                    programs.append(("text", tail, element))
+                elif anchor == "absolute" or "/" in tail:
+                    programs.append(("path", tail.rsplit("/", 1)[-1] or None, element))
+                else:
+                    programs.append(("unknown", None, element))
+            return programs
+        if isinstance(element, ast.JoinedStr):
+            last = element.values[-1] if element.values else None
+            tail = _string(last) if isinstance(last, ast.Constant) else None
+            if tail is not None and "/" in tail:
+                return [("path", tail.rsplit("/", 1)[-1], element)]
+            return [("unknown", None, element)]
         if isinstance(element, ast.Call):
             target = self._target(element.func)
             if target == ("shutil", "which"):
@@ -293,6 +416,10 @@ class _LaunchScan:
                 problems.append((node, "looks its program up on PATH with shutil.which"))
             elif kind == "unknown":
                 problems.append((node, "starts a program the scan cannot trace to a path"))
+                # An untraceable program may be a shell: read a literal -c script as shell code.
+                flag = _string(_element(elements, 1))
+                if flag is not None and flag.startswith("-") and "c" in flag:
+                    problems += self._script(elements, 2)
             elif kind == "path":
                 if text == "env":
                     problems += self._argv(self._after_env(elements))
@@ -330,8 +457,8 @@ class _LaunchScan:
         """Return the problems with the commands of the script at ``elements[index]``, whose
         ``$0`` is the argv that follows it."""
         problems = list[_Problem]()
-        for _, text, node in self._programs(_element(elements, index)):
-            if text is None:
+        for kind, text, node in self._programs(_element(elements, index)):
+            if kind != "text" or text is None:
                 problems.append((node, "runs a shell script the scan cannot read"))
                 continue
             try:
@@ -507,6 +634,34 @@ def _helper_in_function(*lines: str) -> str:
             id="path-built-shell",
         ),
         pytest.param(
+            'shell = "sh"\nsubprocess.run([str(pathlib.Path("/bin") / shell), "-c", "uv run pivot"])',
+            id="path-join-variable-leaf",
+        ),
+        pytest.param(
+            'subprocess.run([str(pathlib.Path("/bin") / ("s" + "h")), "-c", "uv run pivot"])',
+            id="path-join-composed-leaf",
+        ),
+        pytest.param(
+            'def _run(x, y):\n    return subprocess.run([str(pathlib.Path(x) / y), "--version"])',
+            id="path-join-parameter-leaf",
+        ),
+        pytest.param(
+            'subprocess.run([str(pathlib.Path(".") / "uv"), "run"])',
+            id="path-join-dot-base",
+        ),
+        pytest.param(
+            'def _run(base):\n    return subprocess.run([str(pathlib.Path(base) / "uv")])\n_run("")',
+            id="path-join-base-resolves-empty",
+        ),
+        pytest.param(
+            'def _run(base):\n    return subprocess.run([str(pathlib.Path(base) / "uv")])',
+            id="path-join-untraced-base-bare-leaf",
+        ),
+        pytest.param(
+            'subprocess.run([str(pathlib.Path(".") / "." / "uv")])',
+            id="path-join-dot-components",
+        ),
+        pytest.param(
             'x = str(venv / "bin" / "pivot")\nsubprocess.run([x for x in ("uv", "run")])',
             id="comprehension-shadows-path",
         ),
@@ -527,6 +682,31 @@ def test_scan_finds_a_launch_that_searches_path(source: str) -> None:
         pytest.param('subprocess.run(["git", "init", "-q"])', id="git"),
         pytest.param('subprocess.run(["docker", "run", "--rm", "image"])', id="docker"),
         pytest.param('subprocess.run(["/bin/sh", "-c", "printf ok"])', id="sh-script"),
+        pytest.param(
+            'subprocess.run([sys.executable, "--version"], executable=None)',
+            id="executable-none",
+        ),
+        pytest.param(
+            'subprocess.run([str(pathlib.Path("/usr/bin") / "true")])', id="path-join-all-literal"
+        ),
+        pytest.param(
+            'subprocess.run([sys.executable, "-c", "import stages; print(stages.VALUE)"])',
+            id="python-c-literal",
+        ),
+        pytest.param(
+            '_CHILD = "import sys\\nprint(sys.argv)"\n'
+            + "subprocess.Popen([sys.executable, '-c', _CHILD, str(path), method])",
+            id="python-c-constant-with-arguments",
+        ),
+        pytest.param(
+            'script = "import json\\nprint(1)"\nsubprocess.run([sys.executable, "-c", script])',
+            id="python-c-local-script",
+        ),
+        pytest.param(
+            'script = "import os\\nprint(os.getpid())"\n'
+            + 'subprocess.run([sys.executable, "-c", script, str(tmp_path)])',
+            id="python-c-local-script-with-argument",
+        ),
         pytest.param(
             'command = [str(venv / "bin" / name) for name in ("python", "pivot")]\n'
             + "subprocess.run(command)",
@@ -604,6 +784,46 @@ def test_tests_start_programs_without_searching_path() -> None:
         )
     ]
     assert not found, f"these launches find their program on PATH: {found}"
+
+
+def _helper_python_c_launches(source: str) -> list[int]:
+    """Return the line of each launch whose argv is ``[sys.executable, "-c", ...]``."""
+    lines = list[int]()
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        argv = node.args[0]
+        if not isinstance(argv, ast.List) or len(argv.elts) < 2:  # noqa: PLR2004 - program, -c
+            continue
+        program, flag = argv.elts[0], argv.elts[1]
+        if (
+            isinstance(program, ast.Attribute)
+            and isinstance(program.value, ast.Name)
+            and (program.value.id, program.attr) == ("sys", "executable")
+            and _string(flag) == "-c"
+        ):
+            lines.append(node.lineno)
+    return lines
+
+
+def test_python_c_launches_in_the_suite_are_not_read_as_shell() -> None:
+    """``sys.executable -c <script>`` runs Python, not a shell: the scan reads its script as no
+    command line. Every such launch in the suite stays unflagged."""
+    launches = {
+        path: lines
+        for path in sorted(_PACKAGES.glob("*/tests/**/*.py"))
+        if path.name != pathlib.Path(__file__).name
+        and (lines := _helper_python_c_launches(path.read_text("utf-8")))
+    }
+    count = sum(len(lines) for lines in launches.values())
+    assert count >= 14, f"found {count} sys.executable -c launches; the census counted 14"  # noqa: PLR2004
+    flagged = [
+        f"{path.relative_to(_PACKAGES)}:{problem}"
+        for path, lines in launches.items()
+        for problem in _helper_path_launches(path.read_text("utf-8"), str(path))
+        if int(problem.split(":")[0]) in lines
+    ]
+    assert not flagged, f"python -c launches read as shell or untraced: {flagged}"
 
 
 def test_ctrl_c_tests_pass_when_pytest_starts_with_sigint_ignored(tmp_path: pathlib.Path) -> None:
