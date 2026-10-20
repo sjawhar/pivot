@@ -864,10 +864,10 @@ def test_status_remote_rechecks_after_the_remote_url_changes(
 ) -> None:
     """`status --remote` must query the bucket the remote points at now, not the previous one.
 
-    `push` and `pull` call `sync._check_remote_url`, which clears the cached "known on remote"
-    index when a remote's URL changes. `status.get_remote_status` does not, so after repointing
-    a remote it reports counts for the old bucket: here, "0 to push" while the new bucket is
-    empty and `push` immediately afterwards uploads both objects.
+    `push`, `pull` and `status.get_remote_status` all call `sync.check_remote_url`, which clears
+    the cached "known on remote" index when a remote's URL changes. So after a remote is
+    repointed at an empty bucket, `status --remote` reports both outputs to push, rather than
+    the old bucket's "0 to push" answered from the stale index.
     """
     env = _env(STORAGE_EMULATOR_HOST=fake_gcs_server)
     empty_bucket = f"pivot-test-{uuid.uuid4().hex[:12]}"
