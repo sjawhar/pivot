@@ -1034,7 +1034,7 @@ class StateDB:
                         txn.put(key, value)
 
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_db_full_message(self._lmdb_path)) from e
+            raise self._database_full_error() from e
 
     def close(self) -> None:
         """Release this StateDB's lease on the shared environment."""

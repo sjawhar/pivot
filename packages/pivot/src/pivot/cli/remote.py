@@ -133,7 +133,7 @@ def push(
     # Remote hash tracking is project-level (not per-stage), so use the
     # project-level StateDB regardless of --all mode.
     with (
-        state.StateDB(config.get_state_dir()) as state_db,
+        state.StateDB(state_dir) as state_db,
         cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
     ):
         result = transfer.push(
@@ -217,7 +217,7 @@ def fetch(
         return
 
     with (
-        state.StateDB(config.get_state_dir()) as state_db,
+        state.StateDB(state_dir) as state_db,
         cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
     ):
         result = transfer.pull(
@@ -326,7 +326,7 @@ def pull(
 
     # Step 1: Fetch from remote to cache
     with (
-        state.StateDB(config.get_state_dir()) as state_db,
+        state.StateDB(state_dir) as state_db,
         cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
     ):
         fetch_result = transfer.pull(
