@@ -53,9 +53,10 @@ The key behaviors:
 4. **Long-lived Engines** - Watch, serve and persistent TUI Engines use no idle timeout, so a
    later run reuses their warm workers.
 
-This relies on loky 3.5.6's `_max_workers`, `_pending_work_items` and `_submit_resize_lock`.
-Those internals must be rechecked when the loky pin changes: an upstream change to their
-submission or worker-exit accounting can reintroduce refill churn.
+This relies on loky's private executor state. Pivot supports both the 3.4–3.6 singleton and
+lock layout and 3.7's executor storage and submission layout. An upgrade must recheck the
+reusable-executor lookup plus `_max_workers` and `_pending_work_items` submission accounting;
+an upstream change can reintroduce refill churn.
 
 ### Starting Process Trackers for the TUI
 

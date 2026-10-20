@@ -84,7 +84,13 @@ def configured_worker_count(override: int | None = None) -> int:
 
 def _reusable_worker_target(max_workers: int, *, kill_workers: bool) -> int:
     """Keep reuse from invoking loky's blocking ``_resize`` between runs."""
-    executor = loky.reusable_executor._executor  # pyright: ignore[reportPrivateUsage] - loky has no public reusable-executor accessor
+    executor = cast(
+        "loky.ProcessPoolExecutor | None",
+        getattr(loky.reusable_executor, "_executor", None),  # noqa: B009 - loky 3.4 singleton
+    )
+    if executor is None:
+        storage = getattr(loky.reusable_executor, "_executor_storage", None)  # noqa: B009 - loky 3.7 singleton
+        executor = cast("loky.ProcessPoolExecutor | None", getattr(storage, "executor", None))
     if kill_workers or executor is None:
         return max_workers
     return executor._max_workers
@@ -130,9 +136,12 @@ def submit[T](
     ``prestart_target`` covers direct consumers that the scheduler predicts will become
     resource-admissible when this stage completes.
     """
-    with pool._submit_resize_lock:
-        target_workers = max(len(pool._pending_work_items) + 1, prestart_target)
-        pool._max_workers = min(max_workers, target_workers)
+    target_workers = max(len(pool._pending_work_items) + 1, prestart_target)
+    pool._max_workers = min(max_workers, target_workers)
+    resize_lock = getattr(pool, "_submit_resize_lock", None)  # noqa: B009 - absent in loky 3.7
+    if resize_lock is None:
+        return pool.submit(fn, *args, **kwargs)
+    with resize_lock:
         return pool.submit(fn, *args, **kwargs)
 
 
