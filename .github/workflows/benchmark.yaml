@@ -17,7 +17,7 @@ on:
 
 env:
   UV_VERSION: 0.9.18
-  # The smallest count at which the planted-sleep check (Task 1.1) fails and the A/A passes.
+  # 48 keeps multi below the per-PR limit; thresholds use 3x the largest absolute median A/A change across two 48-repetition runs.
   BENCH_REPS: 48
 
 jobs:
@@ -47,12 +47,15 @@ jobs:
 
   bench:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 60 || 240 }}
     name: bench (${{ matrix.project }})
     strategy:
       fail-fast: false
       matrix:
-        project: ["multi", "chain-10", "chain-100", "chain-1000", "fan-10", "fan-100", "fan-1000", "diamond-10", "diamond-100", "diamond-1000"]
+        project: >-
+          ${{ fromJSON(github.event_name == 'pull_request'
+          && '["multi","chain-10","chain-100","fan-10","fan-100","diamond-10","diamond-100"]'
+          || '["multi","chain-10","chain-100","chain-1000","fan-10","fan-100","fan-1000","diamond-10","diamond-100","diamond-1000"]') }}
 
     steps:
       - name: Check out the head

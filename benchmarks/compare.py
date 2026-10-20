@@ -1,7 +1,7 @@
 """Compare two benchmark result files from run.py, scenario by scenario.
 
 Usage: compare.py BASE.jsonl HEAD.jsonl --threshold-file benchmarks/threshold.json
-       compare.py A.jsonl B.jsonl --derive-threshold
+       compare.py A1_BASE.jsonl A1_HEAD.jsonl [A2_BASE.jsonl A2_HEAD.jsonl ...] --derive-threshold
 
 The threshold file gives each scenario its own limits, {"<scenario>": {"wall_pct": N,
 "cpu_pct": N}}, because scenarios differ in noise: a warm no-op and a cold build do not vary
@@ -12,9 +12,9 @@ or median CPU exceeds the base's by more than that scenario's `wall_pct` or `cpu
 when the files cannot be compared: a command failed, a scenario is on one side only or has no
 threshold, or the two ran on machines with different core counts.
 
-With --derive-threshold, the two files are an A/A run (the same build on both sides); it prints
-a threshold file: for each scenario and metric, three times the change between the two medians,
-rounded up to a whole percent and at least 1.
+With --derive-threshold, each file pair is an A/A run (the same build on both sides). It prints
+a threshold file: for each scenario and metric, three times the largest absolute change between
+any pair's medians, rounded up to a whole percent and at least 1.
 """
 
 from __future__ import annotations
@@ -74,34 +74,61 @@ def _change_pct(base: float, head: float) -> float:
     return (head - base) / base * 100
 
 
+def _derive_threshold(
+    medians_by_pair: list[dict[str, dict[str, tuple[float, float]]]],
+) -> dict[str, dict[str, int]]:
+    scenarios = set(medians_by_pair[0])
+    if any(set(medians) != scenarios for medians in medians_by_pair[1:]):
+        raise _CannotCompareError("A/A pairs have different scenarios")
+    return {
+        scenario: {
+            key: max(
+                1,
+                math.ceil(
+                    round(
+                        3
+                        * max(
+                            abs(_change_pct(*medians[scenario][metric]))
+                            for medians in medians_by_pair
+                        ),
+                        6,
+                    )
+                ),
+            )
+            for metric, key in _METRICS
+        }
+        for scenario in sorted(scenarios)
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("base", type=pathlib.Path)
-    parser.add_argument("head", type=pathlib.Path)
+    parser.add_argument("result_files", nargs="+", type=pathlib.Path)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--threshold-file", type=pathlib.Path)
     mode.add_argument("--derive-threshold", action="store_true")
     args = parser.parse_args(argv)
+    result_files: list[pathlib.Path] = args.result_files
+    if len(result_files) < 2 or len(result_files) % 2:
+        parser.error("result files must be BASE HEAD pairs")
+    if args.threshold_file and len(result_files) != 2:
+        parser.error("--threshold-file accepts exactly one BASE HEAD pair")
 
     try:
-        medians = _medians(args.base, args.head)
+        medians_by_pair = [
+            _medians(result_files[index], result_files[index + 1])
+            for index in range(0, len(result_files), 2)
+        ]
+        if args.derive_threshold:
+            print(json.dumps(_derive_threshold(medians_by_pair), indent=2, sort_keys=True))
+            return 0
     except _CannotCompareError as error:
         print(f"cannot compare: {error}", file=sys.stderr)
         return 2
 
-    if args.derive_threshold:
-        threshold = {
-            scenario: {
-                key: max(1, math.ceil(round(3 * abs(_change_pct(*by_metric[metric])), 6)))
-                for metric, key in _METRICS
-            }
-            for scenario, by_metric in medians.items()
-        }
-        print(json.dumps(threshold, indent=2, sort_keys=True))
-        return 0
-
+    medians = medians_by_pair[0]
     limits: dict[str, dict[str, float]] = json.loads(pathlib.Path(args.threshold_file).read_text())
     if missing := sorted(set(medians) - set(limits)):
         print(f"cannot compare: no threshold for {', '.join(missing)}", file=sys.stderr)

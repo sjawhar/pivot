@@ -181,3 +181,38 @@ def test_derived_threshold_is_three_times_each_scenarios_aa_spread_rounded_up(
         _WARM: {"wall_pct": 4, "cpu_pct": 10},
         edit: {"wall_pct": 1, "cpu_pct": 1},
     }
+
+
+def test_derived_threshold_uses_the_largest_spread_from_independent_aa_pairs(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first_base = tmp_path / "first-base.jsonl"
+    first_head = tmp_path / "first-head.jsonl"
+    second_base = tmp_path / "second-base.jsonl"
+    second_head = tmp_path / "second-head.jsonl"
+    first_base.write_text(
+        "".join(json.dumps(row) + "\n" for row in _helper_rows([1.0] * 6, [2.0] * 6))
+    )
+    first_head.write_text(
+        "".join(json.dumps(row) + "\n" for row in _helper_rows([1.004] * 6, [1.99] * 6))
+    )
+    second_base.write_text(
+        "".join(json.dumps(row) + "\n" for row in _helper_rows([1.0] * 6, [2.0] * 6))
+    )
+    second_head.write_text(
+        "".join(json.dumps(row) + "\n" for row in _helper_rows([1.018] * 6, [2.06] * 6))
+    )
+
+    assert (
+        compare.main(
+            [
+                str(first_base),
+                str(first_head),
+                str(second_base),
+                str(second_head),
+                "--derive-threshold",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {_SCENARIO: {"wall_pct": 6, "cpu_pct": 9}}
