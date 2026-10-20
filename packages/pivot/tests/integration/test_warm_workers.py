@@ -1189,6 +1189,113 @@ def test_watch_tui_prints_the_pipeline_error_it_shows_at_exit_after_a_second_bre
     assert printed == [f"Pipeline invalid: {shown}", "Pipeline invalid - waiting for fix"], output
 
 
+# Appended to _WORKER_LOG_HOOK. With PIVOT_TEST_LAG_RELOADS set to "failed" (or "good"), the TUI
+# receives each reload result that rejected (or accepted) the edited pipeline, and so records it
+# in --tui-log, but shows it only after the test has ended: the TUI's view of the pipeline lags
+# the engine's, as it does for a poll interval or longer on a loaded machine.
+_RELOAD_LAG_HOOK = """
+if (
+    len(sys.orig_argv) > 1
+    and os.path.basename(sys.orig_argv[1]) == "pivot"
+    and os.environ.get("PIVOT_TEST_LAG_RELOADS")
+):
+    import pivot_tui.run
+
+    _handle_reload = pivot_tui.run.PivotApp._handle_reload
+    _lag_failed = os.environ["PIVOT_TEST_LAG_RELOADS"] == "failed"
+
+    def _lagging_handle_reload(self, msg):
+        if (msg["error"] is not None) == _lag_failed:
+            self.set_timer(600, lambda: _handle_reload(self, msg))
+            return
+        _handle_reload(self, msg)
+
+    pivot_tui.run.PivotApp._handle_reload = _lagging_handle_reload
+"""
+
+
+@pytest.mark.parametrize(
+    ("lagged", "repair"),
+    [
+        pytest.param("failed", False, id="engine-invalid-tui-not-showing-it-yet"),
+        pytest.param("good", True, id="engine-repaired-tui-still-showing-the-error"),
+    ],
+)
+def test_watch_tui_prints_a_pipeline_error_by_the_engines_state_not_the_tuis(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, lagged: str, repair: bool
+) -> None:
+    """After a watch session the terminal reports the pipeline error the engine still has when
+    the user quits, even when the TUI has not yet shown the latest reload: a pipeline still
+    broken prints its error, and one already repaired prints nothing stale."""
+    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
+    root = tmp_path.resolve() / "p"
+    _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
+    env, _ = _helper_logging_env(tmp_path)
+    hook = tmp_path / "hook" / "sitecustomize.py"
+    hook.write_text(hook.read_text() + _RELOAD_LAG_HOOK)
+    env["PIVOT_TEST_LAG_RELOADS"] = lagged
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "x.txt").write_text("tracked")
+    pipeline_file = root / "pipeline.py"
+    lone = root / "data" / "width" / "lone.txt"
+    tui_log = tmp_path / "tui.jsonl"
+    log = tmp_path / "pivot.log"
+    with log.open("wb") as output:
+        proc = subprocess.Popen(
+            [
+                str(pathlib.Path(sys.executable).parent / "pivot"),
+                "repro",
+                "--watch",
+                "--tui",
+                "--tui-log",
+                str(tui_log),
+            ],
+            cwd=root,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+
+    def reload_results() -> list[str | None]:
+        if not tui_log.exists():
+            return []
+        messages = [json.loads(line) for line in tui_log.read_text().splitlines() if line]
+        return [m.get("error") for m in messages if m.get("type") == "reload"]
+
+    try:
+        _helper_wait_for_running_pivot(proc, log, lone.exists, "startup run")
+        pipeline_file.write_text(_TRACKED_WIDTH_PIPELINE + "def first_break(:\n")
+        _helper_wait_for_running_pivot(
+            proc, log, lambda: any(reload_results()), "the engine rejecting the break"
+        )
+        if repair:
+            pipeline_file.write_text(_TRACKED_WIDTH_PIPELINE)
+            _helper_wait_for_running_pivot(
+                proc, log, lambda: reload_results()[-1] is None, "the engine accepting the repair"
+            )
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    output = log.read_text()
+    assert proc.returncode == 0, output
+    assert "Error in sitecustomize" not in output, output
+    # What follows the TUI's exit from the alternate screen, without its terminal resets.
+    after_tui = re.sub(r"\x1b\[[0-9;?<]*[A-Za-z]", "", output[output.rfind("\x1b[?1049l") :])
+    printed = [line for line in after_tui.splitlines() if "Pipeline invalid" in line]
+    if repair:
+        assert printed == [], output
+    else:
+        error = next(result for result in reload_results() if result)
+        assert printed == [f"Pipeline invalid: {error}", "Pipeline invalid - waiting for fix"], (
+            output
+        )
+
+
 @pytest.mark.anyio
 async def test_watch_reload_checks_dependencies_once(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch

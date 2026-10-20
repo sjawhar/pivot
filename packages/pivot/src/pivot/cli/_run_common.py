@@ -508,11 +508,14 @@ def run_tui_with_engine(
     oneshot: bool = True,
     suppress_keyboard_interrupt: bool = False,
 ) -> None:
-    """Run TUI with engine in background thread.
+    """Run the TUI, engine and event poller on their required three threads.
 
-    Three-thread model:
-    - Main thread: Textual TUI (required for signal handlers)
-    - Poller thread: connects client, polls events, feeds TUI
+    - Main thread: Textual TUI (required for signal handlers).
+    - Engine thread: its own AnyIO loop runs ``engine_fn`` and the RPC server.
+    - Poller thread: its own AnyIO loop polls engine events and posts TUI updates.
+
+    ``poller_stop`` is set when the engine finishes or the TUI exits. It stops a connected
+    poller and ends retries when a one-shot engine has already removed its socket.
 
     Args:
         app: PivotApp instance (connects its own client on mount)
