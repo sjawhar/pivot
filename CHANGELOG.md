@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-10-20)
+
+### Features
+
+- **remote**: Gs:// remotes through a RemoteStorage protocol
+  ([#498](https://github.com/sjawhar/pivot/pull/498),
+  [`f98e332`](https://github.com/sjawhar/pivot/commit/f98e332061e5dff39687e457a4ad4f99d6c1280c))
+
+
 ## v0.4.1 (2026-10-19)
 
 ### Bug Fixes
