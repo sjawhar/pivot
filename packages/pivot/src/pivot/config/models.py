@@ -97,16 +97,14 @@ class DiffConfig(pydantic.BaseModel):
 
 
 def _validate_remote_url(url: str) -> str:
-    """Validate that a string is an s3:// or gs:// remote URL."""
+    """Validate that a string is an s3:// or gs:// remote URL; the error says why it is not."""
     from pivot import exceptions
     from pivot.remote import config as remote_config
 
     try:
         remote_config.validate_remote_url(url)
-    except exceptions.InvalidRemoteURLError:
-        raise ValueError(
-            f"must be a valid remote URL ({remote_config.REMOTE_URL_FORMATS}), got: {url}"
-        ) from None
+    except exceptions.InvalidRemoteURLError as e:
+        raise ValueError(str(e)) from None
     return url
 
 
@@ -137,7 +135,7 @@ class PivotConfig(pydantic.BaseModel):
             try:
                 _validate_remote_url(url)
             except ValueError as e:
-                raise ValueError(f"Remote '{name}' {e}") from None
+                raise ValueError(f"Remote '{name}': {e}") from None
         return v
 
     @pydantic.field_validator("resources")
@@ -268,7 +266,7 @@ def validate_config_value(key: str, value: Any) -> ConfigValue:
         try:
             return _validate_remote_url(value)
         except ValueError as e:
-            raise exceptions.ConfigValidationError(f"'{key}' {e}") from None
+            raise exceptions.ConfigValidationError(f"'{key}': {e}") from None
 
     if not is_valid_key(key):
         raise exceptions.ConfigValidationError(f"Unknown config key: '{key}'")

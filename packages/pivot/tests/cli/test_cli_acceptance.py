@@ -1720,8 +1720,8 @@ def test_doctor_reports_invalid_remote_with_one_actionable_line(tmp_path: pathli
     assert result.returncode == 1, output
     assert output.strip() == (
         "Error: Invalid config remotes.broken: 'not-a-remote'; "
-        + "Remote 'broken' must be a valid remote URL (s3://bucket/prefix or gs://bucket/prefix), "
-        + "got: not-a-remote"
+        + "Remote 'broken': Invalid remote URL: not-a-remote. "
+        + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
     )
 
 
@@ -1738,8 +1738,8 @@ def test_doctor_identifies_invalid_remote_after_valid_remote(tmp_path: pathlib.P
     assert result.returncode == 1, output
     assert output.strip() == (
         "Error: Invalid config remotes.broken: 'not-a-remote'; "
-        + "Remote 'broken' must be a valid remote URL (s3://bucket/prefix or gs://bucket/prefix), "
-        + "got: not-a-remote"
+        + "Remote 'broken': Invalid remote URL: not-a-remote. "
+        + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
     )
 
 

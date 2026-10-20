@@ -779,9 +779,9 @@ def test_status_remote_with_unusable_remote_url_fails(
 
     assert result.exit_code != 0
     assert (
-        "Remote 'origin' must be a valid remote URL (s3://bucket/prefix or gs://bucket/prefix)"
-        in result.output
-    )
+        "Remote 'origin': Invalid remote URL: https://x/c. "
+        + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
+    ) in result.output
 
 
 def test_status_remote_without_remotes_still_shows_local_sections(

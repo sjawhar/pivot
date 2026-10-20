@@ -256,8 +256,8 @@ def test_validate_remotes_rejects_unknown_scheme_naming_both_schemes() -> None:
     with pytest.raises(exceptions.ConfigValidationError) as exc_info:
         config.validate_config_value("remotes.origin", "gcs://my-bucket/prefix")
     assert str(exc_info.value) == (
-        "'remotes.origin' must be a valid remote URL "
-        + "(s3://bucket/prefix or gs://bucket/prefix), got: gcs://my-bucket/prefix"
+        "'remotes.origin': Invalid remote URL: gcs://my-bucket/prefix. "
+        + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
     )
 
 
@@ -266,9 +266,28 @@ def test_config_load_rejects_unknown_scheme_naming_both_schemes() -> None:
     with pytest.raises(pydantic.ValidationError) as exc_info:
         config.PivotConfig(remotes={"origin": "s3://ok/p", "gcs": "gcs://my-bucket/prefix"})
     assert (
-        "Remote 'gcs' must be a valid remote URL (s3://bucket/prefix or gs://bucket/prefix), "
-        + "got: gcs://my-bucket/prefix"
+        "Remote 'gcs': Invalid remote URL: gcs://my-bucket/prefix. "
+        + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
     ) in str(exc_info.value)
+
+
+_BAD_GS_BUCKET = (
+    "Invalid remote URL: 'gs://Bad_Bucket/x'. Bucket name 'Bad_Bucket' may contain only "
+    + "lowercase letters, digits, '.', '-' and '_', starting and ending with a letter or digit. "
+    + "Expected format: s3://bucket/prefix or gs://bucket/prefix"
+)
+
+
+def test_config_set_explains_why_a_gs_bucket_name_is_refused() -> None:
+    with pytest.raises(exceptions.ConfigValidationError) as exc_info:
+        config.validate_config_value("remotes.origin", "gs://Bad_Bucket/x")
+    assert str(exc_info.value) == f"'remotes.origin': {_BAD_GS_BUCKET}"
+
+
+def test_config_load_explains_why_a_gs_bucket_name_is_refused() -> None:
+    with pytest.raises(pydantic.ValidationError) as exc_info:
+        config.PivotConfig(remotes={"origin": "gs://Bad_Bucket/x"})
+    assert f"Remote 'origin': {_BAD_GS_BUCKET}" in str(exc_info.value)
 
 
 def test_config_load_accepts_gs_remote() -> None:
