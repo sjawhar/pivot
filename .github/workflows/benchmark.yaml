@@ -47,15 +47,12 @@ jobs:
 
   bench:
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 60 || 240 }}
+    timeout-minutes: 240
     name: bench (${{ matrix.project }})
     strategy:
       fail-fast: false
       matrix:
-        project: >-
-          ${{ fromJSON(github.event_name == 'pull_request'
-          && '["multi","chain-10","chain-100","fan-10","fan-100","diamond-10","diamond-100"]'
-          || '["multi","chain-10","chain-100","chain-1000","fan-10","fan-100","fan-1000","diamond-10","diamond-100","diamond-1000"]') }}
+        project: ["multi", "chain-10", "chain-100", "chain-1000", "fan-10", "fan-100", "fan-1000", "diamond-10", "diamond-100", "diamond-1000"]
 
     steps:
       - name: Check out the head
