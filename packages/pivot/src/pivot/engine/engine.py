@@ -1615,6 +1615,7 @@ class Engine:
         results: dict[str, executor_core.ExecutionSummary],
     ) -> None:
         """Start all eligible stages up to max_workers."""
+        time.sleep(0.05)
         if self._scheduler.stop_starting_new:
             return
 
