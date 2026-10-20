@@ -13,7 +13,7 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import config, loaders, path_policy, project, types
+from pivot import config, loaders, project, types
 from pivot.show import common
 from pivot.storage import cache, lock
 from pivot.types import (
@@ -585,7 +585,9 @@ def get_data_hashes_from_head() -> dict[str, str | None]:
     return result
 
 
-def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None]:
+def get_data_hashes_from_workspace(
+    paths: Sequence[str], *, excluded_paths: set[str] | None = None
+) -> dict[str, str | None]:
     """Compute hashes for workspace data files, expanding each directory into its data files."""
     result = dict[str, str | None]()
     proj_root = project.get_project_root()
@@ -593,24 +595,24 @@ def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None
     for rel_path in paths:
         abs_path = proj_root / rel_path
         if abs_path.is_dir():
-            path_policy.require_resolved_path_within_root(
-                abs_path, proj_root, display_path=rel_path
-            )
-            for file_path in sorted(path for path in abs_path.rglob("*") if path.is_file()):
-                resolved_file_path = path_policy.require_resolved_path_within_root(
-                    file_path,
-                    proj_root,
-                    display_path=project.to_relative_path(file_path, proj_root),
-                )
-                if detect_format(resolved_file_path) is DataFileFormat.UNKNOWN:
+            left_out = list[pathlib.Path]()
+            dirs = list[pathlib.Path]()
+            for entry in cache.scandir_artifact_members(
+                abs_path, config.get_cache_dir() / "files", left_out, dirs
+            ):
+                file_path = pathlib.Path(entry.path)
+                if detect_format(file_path) is DataFileFormat.UNKNOWN:
                     continue
-                file_hash, _ = cache.hash_file(resolved_file_path)
+                file_hash, _ = cache.hash_file(file_path)
                 result[project.to_relative_path(file_path, proj_root)] = file_hash
+            if left_out:
+                cache.log_left_out_symlinks(proj_root, left_out)
+                if excluded_paths is not None:
+                    excluded_paths.update(
+                        project.to_relative_path(file_path, proj_root) for file_path in left_out
+                    )
         elif abs_path.exists():
-            resolved_file_path = path_policy.require_resolved_path_within_root(
-                abs_path, proj_root, display_path=rel_path
-            )
-            file_hash, _ = cache.hash_file(resolved_file_path)
+            file_hash, _ = cache.hash_file(abs_path)
             result[rel_path] = file_hash
         else:
             result[rel_path] = None

@@ -204,22 +204,6 @@ def require_valid_path(
     return result["normalized_path"]
 
 
-def require_resolved_path_within_root(
-    path: pathlib.Path,
-    root: pathlib.Path,
-    *,
-    display_path: str | None = None,
-) -> pathlib.Path:
-    """Resolve ``path`` and return it only when its target stays under ``root``."""
-    resolved_root = root.resolve()
-    resolved_path = path.resolve()
-    if not resolved_path.is_relative_to(resolved_root):
-        raise exceptions.SecurityValidationError(
-            f"Workspace file resolves outside project root: {display_path or path}"
-        )
-    return resolved_path
-
-
 def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
     """Check if path is within root directory."""
     try:

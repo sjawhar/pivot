@@ -2463,8 +2463,8 @@ def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
     assert "TOP_SECRET_VALUE" not in output
 
 
-def test_diff_refuses_a_workspace_symlink_outside_the_project(tmp_path: pathlib.Path) -> None:
-    """`pivot diff` refuses a directory member symlinked to a file outside the project."""
+def test_diff_leaves_out_a_workspace_symlink_outside_the_project(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` warns and ignores a non-cache directory member symlink."""
     root = _project(
         tmp_path,
         {
@@ -2481,13 +2481,11 @@ def test_diff_refuses_a_workspace_symlink_outside_the_project(tmp_path: pathlib.
     member.unlink()
     member.symlink_to(secret)
     try:
-        result = _pivot(root, "diff", "--json", "d/split")
+        output = _ok(_pivot(root, "diff", "--json", "d/split"))
     finally:
         secret.unlink()
 
-    output = result.stdout + result.stderr
-    assert result.returncode != 0, output
-    assert "data/d/split/train.csv" in output
+    assert "leaves out symlink data/d/split/train.csv" in output
     assert "TOP_SECRET_VALUE" not in output
 
 
@@ -2517,6 +2515,98 @@ def test_diff_refuses_a_manifest_path_with_a_null_byte(tmp_path: pathlib.Path) -
     assert result.returncode != 0, output
     assert ".pivot/stages/d/split.lock" in output
     assert "not a project-relative POSIX path" in output
+
+
+_EXTERNAL_CACHE_DIFF_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def double(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 2
+
+
+with Pipeline("p") as pipeline:
+    double(pipeline.input("numbers.csv"))
+"""
+
+
+def _configure_external_symlink_cache(root: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_dir)))
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+
+
+def test_diff_supports_external_cache_symlink_checkout_for_a_single_file_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` reads a single-file output checked out from an external cache."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _EXTERNAL_CACHE_DIFF_PIPELINE,
+            "data/raw/numbers.csv": "a\n1\n",
+        },
+    )
+    _configure_external_symlink_cache(root, tmp_path / "cache")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "numbers.csv").write_text("a\n1\n2\n")
+    _ok(_pivot(root, "repro"))
+
+    json_output = _ok(_pivot(root, "diff", "--json", "data/p/double.jsonl"))
+    text_output = _ok(_pivot(root, "diff", "--no-tui", "data/p/double.jsonl"))
+
+    assert '"path": "data/p/double.jsonl"' in json_output
+    assert "Rows: 1 -> 2 (+1)" in text_output
+
+
+def test_diff_supports_external_cache_symlink_checkout_for_a_directory_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` reads a directory output checked out from an external cache."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _configure_external_symlink_cache(root, tmp_path / "cache")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,2\n")
+    _ok(_pivot(root, "repro"))
+
+    json_output = _ok(_pivot(root, "diff", "--json", "d/split"))
+    text_output = _ok(_pivot(root, "diff", "--no-tui", "d/split"))
+
+    assert '"path": "data/d/split/train.csv"' in json_output
+    assert "Rows: 1 -> 2 (+1)" in text_output
+
+
+def test_diff_supports_data_symlinked_outside_the_project(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` reads an output below a project data symlink."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(project_dir, {"pipeline.py": _DIFF_PIPELINE})
+    external_data = tmp_path / "data"
+    (external_data / "raw").mkdir(parents=True)
+    (external_data / "raw" / "rows.csv").write_text("part,v\ntrain,1\n")
+    (root / "data").symlink_to(external_data, target_is_directory=True)
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (external_data / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,2\n")
+    _ok(_pivot(root, "repro"))
+
+    output = _ok(_pivot(root, "diff", "--json", "d/split"))
+
+    assert '"path": "data/d/split/train.csv"' in output
 
 
 _SHOUT_PIPELINE = """\

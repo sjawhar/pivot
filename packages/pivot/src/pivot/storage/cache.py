@@ -186,7 +186,14 @@ def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str
     return key
 
 
-def _scandir_recursive(
+def is_artifact_file_member(path: pathlib.Path, cache_dir: pathlib.Path | None) -> bool:
+    """Whether ``path`` is a regular artifact member or a checkout symlink to its cache object."""
+    return path.is_file() and (
+        not path.is_symlink() or _cache_object_key(path, cache_dir) is not None
+    )
+
+
+def scandir_artifact_members(
     path: pathlib.Path,
     cache_dir: pathlib.Path | None,
     left_out: list[pathlib.Path],
@@ -211,7 +218,7 @@ def _scandir_recursive(
     with os.scandir(path) as entries:
         for entry in entries:
             if entry.is_symlink():
-                if _cache_object_key(pathlib.Path(entry.path), cache_dir) is not None:
+                if is_artifact_file_member(pathlib.Path(entry.path), cache_dir):
                     yield entry
                 else:
                     left_out.append(pathlib.Path(entry.path))
@@ -219,7 +226,9 @@ def _scandir_recursive(
                 yield entry
             elif entry.is_dir():
                 dirs.append(pathlib.Path(entry.path))
-                yield from _scandir_recursive(pathlib.Path(entry.path), cache_dir, left_out, dirs)
+                yield from scandir_artifact_members(
+                    pathlib.Path(entry.path), cache_dir, left_out, dirs
+                )
 
 
 def _parent_dirs(relpaths: Iterable[str]) -> set[str]:
@@ -252,7 +261,7 @@ def _empty_dir_path(root: pathlib.Path, relpath: str) -> pathlib.Path:
     return target
 
 
-def _warn_left_out_symlinks(path: pathlib.Path, left_out: list[pathlib.Path]) -> None:
+def log_left_out_symlinks(path: pathlib.Path, left_out: list[pathlib.Path]) -> None:
     """Log one warning naming every symlink a directory artifact does not store."""
     absolute = path.absolute()
     cwd = pathlib.Path.cwd()
@@ -306,7 +315,9 @@ def hash_directory(
     dirs = list[pathlib.Path]()
     resolved_base = path.resolve()
 
-    for entry in sorted(_scandir_recursive(path, cache_dir, left_out, dirs), key=lambda e: e.path):
+    for entry in sorted(
+        scandir_artifact_members(path, cache_dir, left_out, dirs), key=lambda e: e.path
+    ):
         file_path = pathlib.Path(entry.path)
         # Verify a regular file is still within the directory (paranoid check). A cache-object
         # link resolves into the cache by design.
@@ -330,7 +341,7 @@ def hash_directory(
             continue  # File deleted between scan and hash
 
     if left_out and warn_left_out_symlinks:
-        _warn_left_out_symlinks(path, left_out)
+        log_left_out_symlinks(path, left_out)
 
     # A deepest empty directory holds no stored file and no other directory.
     found_dirs = {str(directory.relative_to(path)) for directory in dirs}
@@ -1238,7 +1249,7 @@ def _publish_tree(
     manifest = output_hash["manifest"]
 
     def _user_symlinks(directory: str, names: list[str]) -> list[str]:
-        # Not stored (see _scandir_recursive); copytree would copy each target.
+        # Not stored (see scandir_artifact_members); copytree would copy each target.
         return [
             name
             for name in names

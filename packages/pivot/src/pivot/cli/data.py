@@ -6,7 +6,7 @@ import pathlib
 
 import click
 
-from pivot import config, discovery, exceptions, path_policy, project, registry, types
+from pivot import config, discovery, exceptions, project, registry, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -103,7 +103,10 @@ def diff(
     }
 
     # Get workspace hashes
-    workspace_hashes = data_module.get_data_hashes_from_workspace(list(target_set))
+    excluded_workspace_paths = set[str]()
+    workspace_hashes = data_module.get_data_hashes_from_workspace(
+        list(target_set), excluded_paths=excluded_workspace_paths
+    )
 
     # Quick hash comparison to find changed files
     hash_diffs = data_module.diff_data_hashes(filtered_head_hashes, workspace_hashes)
@@ -132,11 +135,9 @@ def diff(
                     if old_path is not None:
                         temp_files.append(old_path)
                 new_path = (
-                    path_policy.require_resolved_path_within_root(
-                        abs_path, proj_root, display_path=rel_path
-                    )
-                    if abs_path.exists()
-                    else None
+                    None
+                    if rel_path in excluded_workspace_paths
+                    else (abs_path if abs_path.exists() else None)
                 )
 
                 # When --positional is set, don't use key columns
