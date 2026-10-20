@@ -14,12 +14,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
 import json
 import logging
 import os
 import random
-from typing import TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING, Any, cast, override
 
 import aiohttp
 
@@ -110,6 +111,39 @@ def _emulated() -> bool:
 
     is_dev, _ = gcloud_storage_impl.init_api_root(None)
     return is_dev
+
+
+@functools.cache
+def _storage_class() -> type[Storage]:
+    """gcloud-aio-storage's ``Storage``, sending each resumable upload's data in one attempt.
+
+    gcloud-aio retries a failed data PUT on the same upload session, resending the whole body
+    with ``Content-Range: bytes */*``. Cloud Storage answers that request with
+    ``400 Client sent query request with a non-empty body.``, so a transient 503 would end as a
+    400 that looks permanent. With one attempt, the 503 itself reaches ``_with_retries``, which
+    starts a fresh upload session. This overrides a private method of the version pinned in the
+    ``gcs`` extra; ``test_gcs_stub.py`` fails if its signature or retry loop changes.
+    """
+    from gcloud.aio.storage import storage as gcloud_storage_impl
+
+    class _OneAttemptStorage(gcloud_storage_impl.Storage):
+        @override
+        async def _do_upload(
+            self,
+            session_uri: str,
+            stream: IO[Any],
+            headers: dict[str, str],
+            *,
+            retries: int = 5,
+            session: Any = None,  # noqa: ANN401 - gcloud-aio's own parameter type
+            timeout: int = 30,
+        ) -> dict[str, Any]:
+            del retries  # pivot retries a failed upload with a fresh session instead
+            return await super()._do_upload(
+                session_uri, stream, headers, retries=1, session=session, timeout=timeout
+            )
+
+    return _OneAttemptStorage
 
 
 def _md5_base64(path: Path) -> str:
@@ -204,12 +238,15 @@ class GCSRemote:
     @contextlib.asynccontextmanager
     async def _client(self) -> AsyncIterator[Storage]:
         """A gcloud-aio-storage client on one aiohttp session, with credentials in hand."""
-        from gcloud.aio import storage as gcloud_storage
-
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
             try:
                 # Reads GOOGLE_APPLICATION_CREDENTIALS, so a missing or bad key file fails here
-                client = gcloud_storage.Storage(session=session)
+                client = _storage_class()(session=session)
+                # Refresh the token in the request that needs it, never in gcloud-aio's
+                # background task: nothing awaits that task, so asyncio would log a failed
+                # refresh's exception, whose repr carries the bearer token. At or above
+                # force_refresh_after (0.95), the background refresh is unreachable.
+                client.token.background_refresh_after = 1.0
                 if not _emulated():
                     await client.token.get()
             except Exception as e:  # any failure here leaves no usable credentials
@@ -281,10 +318,14 @@ class GCSRemote:
     async def _upload(self, client: Storage, hash_: str, local_path: Path) -> None:
         """Upload one file: a simple upload up to 8 MiB, a resumable upload above it.
 
+        Any transient failure, in a resumable upload's session-start POST or its data PUT, is
+        retried by ``_with_retries`` as a new upload with a new session (``_storage_class``);
+        a 4xx other than 408 and 429 fails at once.
+
         The upload counts only when the object the server returns has this key, the local
-        file's size and its MD5; any other reply is retried as a new upload, then fails. This
-        catches gcloud-aio's own retry of a failed resumable PUT, which accepts a
-        ``308 Resume Incomplete`` as the end of the upload.
+        file's size and its MD5; any other reply is retried as a new upload, then fails.
+        gcloud-aio returns the JSON of any reply below 400, so a reply without the stored
+        object (an empty body, a short object) would otherwise count as uploaded.
 
         The resumable session-start POST carries gcloud-aio's fixed 10s total timeout; the data
         PUT carries ``self._timeout``.

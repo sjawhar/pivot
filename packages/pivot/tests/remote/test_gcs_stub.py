@@ -8,13 +8,18 @@ server reports storing matches the local file.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import collections
+import datetime
+import gc
 import hashlib
+import inspect
 import json
 import logging
 import os
 import traceback
+import types
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -453,6 +458,67 @@ async def test_refused_impersonation_names_the_status_and_googles_reason(
     )
 
 
+class _ShiftedDatetime:
+    """Stands in for ``datetime.datetime`` in gcloud-aio-auth, running ``offset`` seconds ahead."""
+
+    offset: float
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def __call__(self, *args: int) -> datetime.datetime:
+        return datetime.datetime(*args)  # pyright: ignore[reportArgumentType] - forwards datetime's own arguments
+
+    def now(self, tz: datetime.tzinfo | None = None) -> datetime.datetime:
+        return datetime.datetime.now(tz) + datetime.timedelta(seconds=self.offset)
+
+
+async def test_failed_token_refresh_partway_through_a_call_never_logs_the_token(
+    google: _Google,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """A token refresh that falls due partway through a long call is awaited by the request that
+    needs it, so its failure is reported like any other. gcloud-aio's unawaited background
+    refresh would instead end in asyncio's 'Task exception was never retrieved' log line, whose
+    repr of the failure carries the source token."""
+    caplog.set_level(logging.DEBUG)
+    _impersonating(google, tmp_path, monkeypatch)
+    clock = _ShiftedDatetime()
+    monkeypatch.setattr(
+        gcloud_token,
+        "datetime",
+        types.SimpleNamespace(datetime=clock, UTC=datetime.UTC, timedelta=datetime.timedelta),
+    )
+
+    async def grant_once(request: web.Request) -> web.StreamResponse:
+        if google.counts["impersonate"] > 1:
+            return _error(403, "Permission 'iam.serviceAccounts.getAccessToken' denied")
+        return web.json_response({"accessToken": "ya29.pivot-test-impersonated"})
+
+    async def slow_metadata(request: web.Request) -> web.StreamResponse:
+        clock.offset += 400  # the stand-in's 3600 s token: refresh due at 1800 s, forced at 3420 s
+        return _error(404, "No such object")
+
+    google.routes["impersonate"] = grant_once
+    google.routes["metadata"] = slow_metadata
+
+    with pytest.raises(exceptions.RemoteConnectionError) as exc_info:
+        await gcs.GCSRemote(f"gs://{_BUCKET}/p").bulk_exists(
+            [f"{i:016x}" for i in range(12)], concurrency=1
+        )
+    gc.collect()
+    await asyncio.sleep(0)
+
+    assert google.counts["impersonate"] >= 2, "a refresh must have been attempted"
+    assert "Permission 'iam.serviceAccounts.getAccessToken' denied" in str(exc_info.value)
+    captured = capfd.readouterr()
+    texts = [str(exc_info.value), captured.out, captured.err, caplog.text]
+    assert [text for text in texts if _SENTINEL in text or "RequestInfo" in text] == []
+
+
 async def test_missing_key_file_is_a_credentials_error_naming_the_file(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -471,22 +537,18 @@ async def test_missing_key_file_is_a_credentials_error_naming_the_file(
 # -----------------------------------------------------------------------------
 
 
-async def test_resumable_upload_answered_308_after_a_503_is_not_recorded_as_pushed(
+async def test_resumable_upload_answered_308_is_not_recorded_as_pushed(
     google: _Google, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
-    """gcloud-aio retries a failed data PUT with ``Content-Range: bytes */*`` and takes the
-    ``308 Resume Incomplete`` answer as the end of the upload; pivot must not."""
+    """gcloud-aio returns the JSON of any reply below 400, so a data PUT answered
+    ``308 Resume Incomplete`` returns no object; pivot must not count that as uploaded."""
     mocker.patch.object(config, "get_remote_retries", return_value=1)
-    puts = collections.Counter[str]()
 
-    async def fail_then_resume_incomplete(request: web.Request) -> web.StreamResponse:
+    async def resume_incomplete(request: web.Request) -> web.StreamResponse:
         await request.read()
-        puts[request.match_info["session"]] += 1
-        if puts[request.match_info["session"]] == 1:
-            return _error(503, "Backend Error")
         return web.Response(status=308)
 
-    google.routes["session"] = fail_then_resume_incomplete
+    google.routes["session"] = resume_incomplete
     content = os.urandom(gcs.STREAM_CHUNK_SIZE + 1)
     content_hash = xxhash.xxh64(content).hexdigest()
     cache_dir = tmp_path / "cache"
@@ -499,7 +561,6 @@ async def test_resumable_upload_answered_308_after_a_503_is_not_recorded_as_push
         summary = await sync._push_async(cache_dir, tmp_path / "state", remote, state_db, "origin")
         recorded = state_db.remote_hash_exists("origin", content_hash)
 
-    assert "bytes */*" in google.content_ranges, "gcloud-aio's own retry must have run"
     assert google.counts["initiate"] == 2, "pivot retries with a fresh upload session"
     assert (summary["transferred"], summary["failed"]) == (0, 1)
     assert summary["errors"] == [
@@ -546,10 +607,61 @@ async def test_resumable_upload_retries_a_transient_503_the_way_cloud_storage_an
         summary = await sync._push_async(cache_dir, tmp_path / "state", remote, state_db, "origin")
         recorded = state_db.remote_hash_exists("origin", content_hash)
 
-    assert "bytes */*" in google.content_ranges, "gcloud-aio's own retry must have run"
+    assert "bytes */*" not in google.content_ranges, "the 503 reaches pivot, not a status query"
     assert google.counts["initiate"] == 2, "pivot retries with a fresh upload session"
     assert (summary["transferred"], summary["failed"]) == (1, 0), summary["errors"]
     assert recorded
+
+
+async def test_resumable_upload_503_is_reported_after_one_attempt_per_session(
+    google: _Google, tmp_path: pathlib.Path
+) -> None:
+    """A failed data PUT is sent once per upload session, and the user sees its own status."""
+
+    async def unavailable(request: web.Request) -> web.StreamResponse:
+        await request.read()
+        return _error(503, "Backend Error")
+
+    google.routes["session"] = unavailable
+
+    with pytest.raises(exceptions.RemoteConnectionError) as exc_info:
+        await gcs.GCSRemote(f"gs://{_BUCKET}/p").upload_file(
+            _file(tmp_path, gcs.STREAM_CHUNK_SIZE + 1), _HASH
+        )
+
+    assert google.counts["session"] == 1
+    assert google.content_ranges == []
+    assert str(exc_info.value).endswith("HTTP 503: Backend Error")
+
+
+# sha256 of gcloud-aio-storage 9.6.5's ``Storage._do_upload`` source, which gcs._storage_class
+# overrides.
+_DO_UPLOAD_SHA256 = "9797a96c6671574791a45e3a245325c408a4cd843523204ba95152d8bd48fbc3"
+
+
+def test_overridden_gcloud_upload_method_is_the_version_reviewed() -> None:
+    """gcs._storage_class overrides gcloud-aio's private ``Storage._do_upload``, relying on its
+    parameters and on ``retries=1`` meaning one PUT whose error is raised. An upgrade that
+    changes the method fails here, so it cannot silently bring back the same-session retry:
+    re-read the new method, re-check the override, then update the digest."""
+    from gcloud.aio.storage import storage as gcloud_storage_impl
+
+    method = gcloud_storage_impl.Storage._do_upload
+    parameters = inspect.signature(method).parameters
+
+    assert list(parameters) == [
+        "self",
+        "session_uri",
+        "stream",
+        "headers",
+        "retries",
+        "session",
+        "timeout",
+    ]
+    assert parameters["retries"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["retries"].default == 5
+    source = inspect.getsource(method)
+    assert hashlib.sha256(source.encode()).hexdigest() == _DO_UPLOAD_SHA256, source
 
 
 def _short(name: str, body: bytes) -> dict[str, str]:
