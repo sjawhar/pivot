@@ -509,6 +509,49 @@ async def test_resumable_upload_answered_308_after_a_503_is_not_recorded_as_push
     assert not recorded, "a hash that is not on the remote must not be recorded as pushed"
 
 
+async def test_resumable_upload_retries_a_transient_503_the_way_cloud_storage_answers(
+    google: _Google, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """One transient 503 on a resumable upload's data PUT is retried, as on a simple upload.
+
+    gcloud-aio retries the failed PUT on the same session with ``Content-Range: bytes */*`` and
+    the whole body again. Cloud Storage answers that request with
+    ``400 Client sent query request with a non-empty body.`` (a status query must have an empty
+    body), so gcloud-aio's own retries end in a 400. ``remote.retries`` still covers the 503: pivot
+    must start a fresh upload session rather than fail the push on gcloud-aio's 400.
+    """
+    mocker.patch.object(config, "get_remote_retries", return_value=1)
+    injected = list[str]()
+
+    async def one_503_then_as_cloud_storage(request: web.Request) -> web.StreamResponse:
+        body = await request.read()
+        session = request.match_info["session"]
+        if not injected:
+            injected.append(session)
+            return _error(503, "Backend Error")
+        if request.headers.get("Content-Range") == "bytes */*" and body:
+            return web.Response(status=400, text="Client sent query request with a non-empty body.")
+        return web.json_response(_resource(google.session_names[session], body))
+
+    google.routes["session"] = one_503_then_as_cloud_storage
+    content = os.urandom(gcs.STREAM_CHUNK_SIZE + 1)
+    content_hash = xxhash.xxh64(content).hexdigest()
+    cache_dir = tmp_path / "cache"
+    cached = cache.get_cache_path(cache_dir / "files", content_hash)
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(content)
+    remote = gcs.GCSRemote(f"gs://{_BUCKET}/p")
+
+    with state.StateDB(tmp_path / "state") as state_db:
+        summary = await sync._push_async(cache_dir, tmp_path / "state", remote, state_db, "origin")
+        recorded = state_db.remote_hash_exists("origin", content_hash)
+
+    assert "bytes */*" in google.content_ranges, "gcloud-aio's own retry must have run"
+    assert google.counts["initiate"] == 2, "pivot retries with a fresh upload session"
+    assert (summary["transferred"], summary["failed"]) == (1, 0), summary["errors"]
+    assert recorded
+
+
 def _short(name: str, body: bytes) -> dict[str, str]:
     return {**_resource(name, body), "size": str(len(body) - 1)}
 
