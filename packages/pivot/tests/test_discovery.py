@@ -295,53 +295,6 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     assert str(second) == sys.path[0]
 
 
-def test_rediscovery_reimports_a_module_first_imported_by_the_fingerprint(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A module the pipeline never imports, first loaded when fingerprinting walked a stage
-    body's import, is imported again by the next discovery, so an edit to it is seen."""
-    (tmp_path / "stages.py").write_text(
-        """
-from pivot.compose import stage
-
-
-@stage
-def clean(value: str) -> str:
-    import body_only
-
-    return body_only.VALUE
-"""
-    )
-    (tmp_path / "pipeline.py").write_text(
-        """
-import pathlib
-
-from pivot.compose import Pipeline
-from stages import clean
-
-
-with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
-    clean(pipeline.input("value.txt", t=str))
-"""
-    )
-    body_only = tmp_path / "body_only.py"
-    body_only.write_text('VALUE = "first"\n')
-
-    pipeline = discovery.discover_pipeline(project_root=tmp_path)
-    assert pipeline is not None
-    assert "body_only" not in sys.modules, "discovery alone must not import the body's module"
-    before = pipeline.ensure_fingerprint("test/clean")
-    assert before["const:body_only.VALUE"] == "'first'", before
-
-    # A different size, so bytecode cached within the same second is not reused.
-    body_only.write_text('VALUE = "second, edited"\n')
-    pipeline = discovery.discover_pipeline(project_root=tmp_path)
-    assert pipeline is not None
-    after = pipeline.ensure_fingerprint("test/clean")
-
-    assert after["const:body_only.VALUE"] == "'second, edited'", after
-
-
 def _write_sibling_stage_project(
     root: pathlib.Path, value: str, *, broken: bool = False
 ) -> pathlib.Path:

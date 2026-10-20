@@ -368,8 +368,8 @@ def test_underscore_helper_change_detected(module_dir: pathlib.Path) -> None:
     )
 
 
-def test_lazy_import_change_detected(module_dir: pathlib.Path) -> None:
-    """A function imported inside the stage body is tracked as a helper."""
+def test_loaded_body_import_is_tracked_as_a_helper(module_dir: pathlib.Path) -> None:
+    """A body import already loaded during discovery is followed to its helper function."""
     helpers_py = module_dir / "test_limit_helpers_lazy.py"
     helpers_py.write_text("def helper(x):\n    return x * 2\n")
 
@@ -378,12 +378,47 @@ def test_lazy_import_change_detected(module_dir: pathlib.Path) -> None:
         "def stage():\n    from test_limit_helpers_lazy import helper\n    return helper(10)\n"
     )
 
+    _import_fresh("test_limit_helpers_lazy")
     mod = _import_fresh("test_limit_stage_lazy")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
     assert "func:test_limit_helpers_lazy.helper" in fp, (
-        "Should capture lazy imports inside function body"
+        "Should capture a body import that discovery already loaded"
     )
+
+
+def test_unloaded_body_import_tracks_static_user_import_closure(
+    module_dir: pathlib.Path,
+) -> None:
+    """An unloaded body import follows static user imports without executing either module."""
+    package = module_dir / "test_change_static_import"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    dependency = package / "dependency.py"
+    dependency.write_text("LIMIT = 2\n")
+    (package / "helper.py").write_text(
+        "from .dependency import LIMIT\n\n\ndef value():\n    return LIMIT\n"
+    )
+    (package / "stages.py").write_text(
+        """\
+def stage():
+    if False:
+        from . import helper
+        return helper.value()
+    return 1
+"""
+    )
+
+    first_module = _import_fresh("test_change_static_import.stages")
+    first = fingerprint.get_stage_fingerprint(first_module.stage)
+    assert "test_change_static_import.helper" not in sys.modules
+    assert "test_change_static_import.dependency" not in sys.modules
+
+    dependency.write_text("LIMIT = 200\n")
+    second_module = _import_fresh("test_change_static_import.stages")
+    second = fingerprint.get_stage_fingerprint(second_module.stage)
+
+    assert first != second, "a static dependency of an unloaded body import must be tracked"
 
 
 # =============================================================================
@@ -874,6 +909,7 @@ def test_in_body_from_import_of_non_scalar_is_refused(module_dir: pathlib.Path) 
         + "    from test_change_inbody_list_lib import SUFFIXES\n"
         + "    return SUFFIXES[0]\n"
     )
+    _import_fresh("test_change_inbody_list_lib")
     module = _import_fresh("test_change_inbody_list")
     with pytest.raises(exceptions.StageDefinitionError, match="SUFFIXES"):
         fingerprint.get_stage_fingerprint(module.stage)

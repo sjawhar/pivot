@@ -34,13 +34,15 @@ For each stage function, Pivot:
    and nonlocals the function references
 3. **Recurses transitively** — every user-code callable found in step 2
    gets the same treatment, and *its* dependencies are merged into the
-   manifest. A user class the stage reaches has each method its source
-   defines walked the same way, so a module value or helper read only
-   inside a method (`ScopeWalk().step(...)` reading a module-level regex)
-   is tracked
+   manifest. A user class the stage reaches has its callable members walked:
+   methods, descriptors such as properties, partial members, and nested user
+   classes. A module value or helper read only inside a method
+   (`ScopeWalk().step(...)` reading a module-level regex) is tracked
 4. **Follows imports in the function body** — `import helpers` or
    `from helpers import scale` inside a stage or helper is walked as if it
-   were a module-level import; a library module adds nothing
+   were a module-level import when discovery already loaded the user module.
+   Otherwise Pivot tracks its static user-source import closure without
+   executing the import. A library module adds nothing
 5. **Inspects type hints** — user-defined classes in annotations
    (including Pydantic models) are fingerprinted
 6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
@@ -140,11 +142,11 @@ Pivot rejects patterns that bypass static analysis:
 
 - `globals()` / `locals()` — runtime namespace access
 - `getattr(obj, variable)` — dynamic attribute lookup
-- `importlib.import_module()` under any name (`from importlib import
-  import_module as load`) and `__import__()` — dynamic imports
+- a visible reference to `importlib.import_module` or `__import__`, including an alias,
+  default argument, `functools.partial`, or literal `getattr` — dynamic imports
 
-All of these silently introduce dependencies that fingerprinting can't
-track. Use direct attribute access and static imports instead.
+Computed dictionary/attribute lookups and alternate loading APIs remain outside this check.
+Use direct attribute access and static imports instead.
 
 ## @pivot.no_fingerprint()
 

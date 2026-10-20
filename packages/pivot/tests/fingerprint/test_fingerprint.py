@@ -2613,6 +2613,7 @@ def test_recorded_reads_replay_method_and_body_import_reads(
     names = ("replay_stage", "replay_lib", "replay_body")
     try:
         settings = importlib.import_module("replay_settings")
+        importlib.import_module("replay_body")
         module = importlib.import_module("replay_stage")
         manifest = fingerprint.get_stage_fingerprint_cached("r/stage", module.stage)
         assert manifest["const:replay_lib.LIMIT"] == "1", manifest
@@ -2621,12 +2622,14 @@ def test_recorded_reads_replay_method_and_body_import_reads(
         reads = json.loads(raw)["r"]
         for name in names:
             del sys.modules[name]
+        importlib.import_module("replay_body")
         module = importlib.import_module("replay_stage")
         assert fingerprint._recorded_reads_hold(module.stage, reads), "re-import alone must hit"
 
         vars(settings)["SOURCE"][changed] += 100
         for name in names:
             del sys.modules[name]
+        importlib.import_module("replay_body")
         module = importlib.import_module("replay_stage")
 
         assert fingerprint._recorded_reads_hold(module.stage, reads) is False

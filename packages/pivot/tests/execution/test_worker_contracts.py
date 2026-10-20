@@ -81,6 +81,7 @@ def _stage_info(
     bindings: dict[str, str] | None = None,
     no_commit: bool = True,
     force: bool = False,
+    unsafe_fingerprint: bool = False,
 ) -> worker.WorkerStageInfo:
     return worker.WorkerStageInfo(
         func=func,
@@ -114,7 +115,7 @@ def _stage_info(
         project_state_dir=project / ".pivot",
         collection_params={},
         incremental_inputs={},
-        unsafe_fingerprint=False,
+        unsafe_fingerprint=unsafe_fingerprint,
     )
 
 
@@ -422,6 +423,26 @@ def test_run_cache_restores_an_earlier_input_version(
         "unchanged (run cache)",
     )
     assert _output_path(project).read_text() == "V2"
+
+
+def test_unsafe_stage_never_restores_an_existing_run_cache_entry(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """An unsafe fingerprint must run even when a safe run filed this input's cache entry."""
+    raw = project / "raw.txt"
+    committed = _stage_info(_upper, project, worker_env, no_commit=False)
+    for content in ("v1", "v2"):
+        raw.write_text(content)
+        assert _run_and_apply(committed, worker_env, output_queue)["status"] == StageStatus.RAN
+
+    raw.write_text("v1")
+    unsafe = _stage_info(_upper, project, worker_env, no_commit=False, unsafe_fingerprint=True)
+    result = _run_and_apply(unsafe, worker_env, output_queue)
+
+    assert (result["status"], result["reason"]) == (
+        StageStatus.RAN,
+        "Input dependencies changed",
+    )
 
 
 @pytest.mark.parametrize(

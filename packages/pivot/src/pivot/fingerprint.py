@@ -1,5 +1,6 @@
 import ast
 import atexit
+import builtins
 import contextlib
 import contextvars
 import dataclasses
@@ -76,7 +77,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 29 decides a namespace package by its site-packages, dist-packages and pivot-package
 # directories, not by the interpreter's prefix, so a manifest that left out the user's part of a
 # namespace shared with a checkout under the prefix is not reused.
-_CACHE_SCHEMA_VERSION = 29
+# Version 30 follows every callable user class member, dataclass defaults, and body imports
+# without executing unloaded user modules while fingerprinting.
+_CACHE_SCHEMA_VERSION = 30
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -647,6 +650,7 @@ class _ValueKind(enum.Enum):
     """How the walk treats a value read through a global, a cell, a default or `module.NAME`."""
 
     PARTIAL = "partial"
+    DYNAMIC_IMPORT = "dynamic_import"
     REFUSED = "refused"
     USER = "user"
     EXTERNAL = "external"
@@ -673,10 +677,17 @@ def _immutable_value_text(value: Any) -> str | None:
     return None
 
 
+def _is_dynamic_import(value: Any) -> bool:
+    """Whether `value` imports a module by a runtime-selected name."""
+    return value is importlib.import_module or value is builtins.__import__
+
+
 def _value_kind(value: Any) -> _ValueKind:
     """Classify a value a walked function reads; the walk and a cache hit share this."""
-    # functools.partial fails is_user_code() (module is functools/stdlib).
-    if isinstance(value, functools.partial):
+    if _is_dynamic_import(value):
+        return _ValueKind.DYNAMIC_IMPORT
+    # functools.partial and partialmethod fail is_user_code() (module is functools/stdlib).
+    if isinstance(value, (functools.partial, functools.partialmethod)):
         return _ValueKind.PARTIAL
     if _is_callable_instance(value) or _is_user_class_instance(value) or _carries_instance(value):
         return _ValueKind.REFUSED
@@ -728,11 +739,11 @@ def _default_token(value: Any) -> str:
 # A walk step names one move from a visited object to a value it reads: `g:NAME` a global
 # (also recorded when absent), `c:NAME` a closure cell, `d:PARAM` a default, `a:ATTR` a module
 # attribute, `ca:ATTR` a class attribute (`Config.SCALE`), `n:NAME` and `np:DOTTED` names in a
-# class's module, `m:NAME` the function behind a user class's method, `bi:MODULE` a module a
-# function body imports, `u` the function behind a
-# C-level wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and
-# `s:INDEX` container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a
-# model's field annotations. `hints` and `schema` read the visited object itself.
+# class's module, `m:NAME` a callable user class member, `fd:NAME` a dataclass field default,
+# `bi:MODULE` a loaded module a function body imports, `u` the function behind a C-level
+# wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and `s:INDEX`
+# container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a model's field
+# annotations. `hints` and `schema` read the visited object itself.
 _UNREAD = object()
 
 
@@ -756,9 +767,14 @@ def _read_step(owner: Any, step: str) -> Any:
                 return _resolve_dotted_path(tuple(arg.split(".")), namespace)
             case "m":
                 return dict(_user_methods(owner)).get(arg, _UNREAD)
+            case "fd":
+                return _dataclass_field_value(owner, arg)
             case "bi":
                 module = _body_import_module(arg)
                 return _UNREAD if module is None else module
+            case "bs":
+                token = _body_import_source_token(arg)
+                return _UNREAD if token is None else token
             case "u":
                 return inspect.unwrap(owner)
             case "pf":
@@ -804,6 +820,8 @@ def _read_token(owner: Any, step: str) -> str:
             return "absent"
         field_classes = "|".join(_value_token(cls) for cls in _model_field_classes(owner))
         return f"{_schema_hash(owner)}|{field_classes}"
+    if step.startswith("fd:"):
+        return _dataclass_field_token(owner, step.partition(":")[2])
     value = _read_step(owner, step)
     if value is _UNREAD:
         return "absent"
@@ -1140,56 +1158,58 @@ def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
 
 
 def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
-    """Parse `func`'s source, or None when it has no source to parse."""
+    """Parse `func`'s own source, without following a functools.wraps chain."""
+    code = getattr(func, "__code__", None)
+    target: object = (
+        code if hasattr(func, "__wrapped__") and isinstance(code, types.CodeType) else func
+    )
     try:
-        return ast.parse(textwrap.dedent(inspect.getsource(func)))
+        return ast.parse(textwrap.dedent(inspect.getsource(target)))
     except (OSError, TypeError, SyntaxError):
         return None
 
 
-def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
-    """Refuse a call in `func`'s source (`tree`) that reaches a name chosen at run time.
-
-    A dynamic import is refused under every spelling: `importlib.import_module` called as an
-    attribute, through any name bound to it (`from importlib import import_module as load`, at
-    module level or in the body), and the builtin `__import__`.
-    """
+def _dynamic_import_error(func: Callable[..., Any]) -> exceptions.StageDefinitionError:
     qualname = getattr(func, "__qualname__", "?")
+    return exceptions.StageDefinitionError(
+        f"'{qualname}' uses dynamic imports. Use static imports instead."
+    )
+
+
+def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
+    """Refuse statically visible aliases of ``import_module`` and ``__import__``."""
     func_globals: dict[str, Any] = getattr(func, "__globals__", {})
-    import_module_names = {
-        alias.asname or alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module == "importlib" and node.level == 0
-        for alias in node.names
-        if alias.name == "import_module"
-    }
-    dynamic_import = f"'{qualname}' uses dynamic imports. Use static imports instead."
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Name):
-            name = node.func.id
-            if name == "getattr" and len(node.args) >= 2:
-                if not isinstance(node.args[1], ast.Constant):
-                    message = (
-                        f"'{qualname}' uses getattr() "
-                        + "with non-literal attribute. Use direct attribute access."
-                    )
-                    raise exceptions.StageDefinitionError(message)
-            elif name in ("globals", "locals"):
-                message = f"'{qualname}' uses {name}() which bypasses fingerprint tracking."
-                raise exceptions.StageDefinitionError(message)
-            elif (
-                name == "__import__"
-                or name in import_module_names
-                or func_globals.get(name) is importlib.import_module
-            ):
-                raise exceptions.StageDefinitionError(dynamic_import)
-        elif isinstance(node.func, ast.Attribute) and node.func.attr in (
-            "import_module",
-            "__import__",
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module in ("importlib", "builtins")
+            and any(alias.name in ("import_module", "__import__") for alias in node.names)
         ):
-            raise exceptions.StageDefinitionError(dynamic_import)
+            raise _dynamic_import_error(func)
+        if isinstance(node, ast.Attribute) and node.attr in ("import_module", "__import__"):
+            raise _dynamic_import_error(func)
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and (node.id == "__import__" or _is_dynamic_import(func_globals.get(node.id)))
+        ):
+            raise _dynamic_import_error(func)
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id == "getattr" and len(node.args) >= 2:
+            attribute = node.args[1]
+            if not isinstance(attribute, ast.Constant):
+                qualname = getattr(func, "__qualname__", "?")
+                raise exceptions.StageDefinitionError(
+                    f"'{qualname}' uses getattr() with non-literal attribute. Use direct attribute access."
+                )
+            if attribute.value in ("import_module", "__import__"):
+                raise _dynamic_import_error(func)
+        elif node.func.id in ("globals", "locals"):
+            qualname = getattr(func, "__qualname__", "?")
+            raise exceptions.StageDefinitionError(
+                f"'{qualname}' uses {node.func.id}() which bypasses fingerprint tracking."
+            )
 
 
 def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
@@ -1260,86 +1280,192 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
 
     _process_default_values(func, manifest, visited)
     _process_type_hint_dependencies(func, manifest, visited)
-    # A `functools.wraps` wrapper's source is the function it wraps, which its closure holds.
-    if tree is not None and not hasattr(func, "__wrapped__"):
+    if tree is not None:
         _process_body_imports(func, tree, manifest, visited)
 
     return manifest
 
 
 def _process_user_methods(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
-    """Walk each method user code wrote for `cls`, its own and inherited, as a stage helper.
-
-    The class AST hash records a method's code, not the module values it reads or the helpers
-    it calls: `ScopeWalk.step` reading a module-level regex, `Runner.go` calling `bump`. Each
-    method's globals, closure cells, defaults and body imports get the stage-helper walk, and a
-    non-scalar value it reads is refused. A cache hit re-reads each method (`m:LABEL`).
-    """
-    for label, method in _user_methods(cls):
+    """Walk each callable user class member as a stage helper or refuse opaque state."""
+    class_ref = _definition_ref(cls)
+    stage_name = _current_stage_name.get() or cls.__qualname__
+    for label, member in _user_methods(cls):
         step = f"m:{label}"
         _record_read(cls, step)
         with _walking(step):
-            key = f"func:{_definition_ref(method)}"
-            if key not in manifest:
-                _add_callable_to_manifest(key, method, manifest, visited)
+            binding_ref = f"{class_ref}.{label}"
+            _process_captured_value(
+                binding_ref,
+                binding_ref,
+                member,
+                cls,
+                manifest,
+                visited,
+                stage_name,
+                chain=None,
+            )
+            if isinstance(member, type) and hasattr(member, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", member), manifest, visited
+                )
+    _process_dataclass_defaults(cls, manifest, visited)
 
 
-def _user_methods(cls: type) -> list[tuple[str, Callable[..., Any]]]:
-    """Each function user code wrote for an attribute of `cls`, labelled by its name.
+def _dataclass_field_value(cls: type, name: str) -> Any:
+    """Return one dataclass field's default or factory, or `_UNREAD` when absent."""
+    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
+    field = fields.get(name)
+    if field is None:
+        return _UNREAD
+    if field.default is not dataclasses.MISSING:
+        return field.default
+    if field.default_factory is not dataclasses.MISSING:
+        return field.default_factory
+    return _UNREAD
 
-    An attribute is looked up as Python does, on the nearest class of the MRO that defines it,
-    and that class must be user code. A method, classmethod or staticmethod gives its function,
-    a `functools.cached_property` its function, and a property its getter, labelled `NAME`, and
-    its setter and deleter, labelled `NAME.fset` and `NAME.fdel`. A C-level wrapper such as
-    `functools.cache` gives the function it wraps. Only functions written in their module's
-    source file are kept (`_written_in_module_source`): a dataclass's generated `__init__` is
-    compiled from a string, and the wrapper `reprlib` puts around its `__repr__` is library
-    code. Within one `fingerprint_pass()` each class's methods are listed once.
-    """
 
-    def collect() -> list[tuple[str, Callable[..., Any]]]:
-        found = list[tuple[str, Callable[..., Any]]]()
+def _dataclass_field_token(cls: type, name: str) -> str:
+    """Return a stable token for a dataclass field's live default or factory."""
+    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
+    field = fields.get(name)
+    if field is None:
+        return "absent"
+    if field.default_factory is not dataclasses.MISSING:
+        return _value_token(field.default_factory)
+    if field.default is dataclasses.MISSING:
+        return "absent"
+    serialized = _serialize_value_for_hash(field.default)
+    return f"field:{xxhash.xxh64(serialized.encode()).hexdigest()}"
+
+
+def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
+    """Track each own dataclass field's live default or factory."""
+    if not dataclasses.is_dataclass(cls):
+        return
+    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
+    annotations = cast("Mapping[str, Any]", vars(cls).get("__annotations__", {}))
+    class_ref = _definition_ref(cls)
+    stage_name = _current_stage_name.get() or cls.__qualname__
+    for name in annotations:
+        field = fields.get(name)
+        if field is None:
+            continue
+        step = f"fd:{name}"
+        _record_read(cls, step)
+        binding_ref = f"{class_ref}.{name}"
+        if field.default is not dataclasses.MISSING:
+            serialized = _serialize_value_for_hash(field.default)
+            manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
+            continue
+        if field.default_factory is dataclasses.MISSING:
+            continue
+        with _walking(step):
+            _process_captured_value(
+                binding_ref,
+                binding_ref,
+                field.default_factory,
+                cls,
+                manifest,
+                visited,
+                stage_name,
+                chain=None,
+            )
+
+
+def _class_member_parts(name: str, raw: Any) -> list[tuple[str, Any]]:
+    """Return the concrete callable values one class-dict member can execute."""
+    if isinstance(raw, property):
+        return [(name, raw.fget), (f"{name}.fset", raw.fset), (f"{name}.fdel", raw.fdel)]
+    if isinstance(raw, functools.cached_property):
+        return [(name, cast("functools.cached_property[Any]", raw).func)]
+    if isinstance(raw, (classmethod, staticmethod)):
+        return [(name, cast("Any", raw.__func__))]
+    if isinstance(raw, functools.partialmethod):
+        return [
+            (
+                name,
+                functools.partial(
+                    cast("Callable[..., Any]", raw.func), *raw.args, **(raw.keywords or {})
+                ),
+            )
+        ]
+    if isinstance(raw, functools.singledispatchmethod):
+        dispatcher = cast("Any", raw.dispatcher)
+        members = [(name, raw.func)]
+        for registered_type, function in cast("Mapping[type, Any]", dispatcher.registry).items():
+            if registered_type is object:
+                continue
+            label = f"{name}.register:{registered_type.__module__}.{registered_type.__qualname__}"
+            members.append((label, function))
+        return members
+    return [(name, raw)]
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_user_source_file(filename: str) -> bool:
+    """Whether a code object's filename is a real source file outside library directories."""
+    try:
+        path = pathlib.Path(filename).resolve()
+    except OSError:
+        return False
+    return path.is_file() and not is_library_path(path)
+
+
+def _written_in_user_source(function: types.FunctionType) -> bool:
+    """Whether a function's own code object was compiled from a user source file."""
+    return _is_user_source_file(function.__code__.co_filename)
+
+
+def _user_member_value(value: Any) -> Any:
+    """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it."""
+    if isinstance(value, functools.partial):
+        return cast("Any", value)
+    if inspect.isfunction(value):
+        if _written_in_user_source(value):
+            return value
+        unwrapped = inspect.unwrap(value)
+        if unwrapped is not value and inspect.isfunction(unwrapped):
+            return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
+        return _UNREAD
+    if isinstance(value, type):
+        return value if is_user_code(value) else _UNREAD
+    if _is_dynamic_import(value) or _is_callable_instance(value) or _carries_instance(value):
+        return value
+    if callable(value):
+        unwrapped = inspect.unwrap(value)
+        if unwrapped is not value and inspect.isfunction(unwrapped):
+            return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
+    if hasattr(value, "__get__") and _is_user_class_instance(value):
+        return value
+    return _UNREAD
+
+
+def _user_methods(cls: type) -> list[tuple[str, Any]]:
+    """Trackable or refused callable members user classes expose, labelled for cache replay."""
+
+    def collect() -> list[tuple[str, Any]]:
+        found = list[tuple[str, Any]]()
         mro = cls.__mro__
         user = [is_user_code(klass) for klass in mro]
-        # A class later in the MRO than the last user class cannot own a user attribute.
         end = max((index + 1 for index, is_user in enumerate(user) if is_user), default=0)
         seen = set[str]()
         for klass, is_user in zip(mro[:end], user[:end], strict=True):
+            if not is_user:
+                continue
             for name, raw in vars(klass).items():
                 if name in seen:
                     continue
                 seen.add(name)
-                if not is_user:
-                    continue
-                if isinstance(raw, property):
-                    members = [
-                        (name, raw.fget),
-                        (f"{name}.fset", raw.fset),
-                        (f"{name}.fdel", raw.fdel),
-                    ]
-                elif isinstance(raw, functools.cached_property):
-                    members = [(name, cast("functools.cached_property[Any]", raw).func)]
-                else:
-                    members = [(name, getattr(raw, "__func__", raw))]
-                for label, member in members:
-                    if not callable(member):
+                for label, member in _class_member_parts(name, raw):
+                    if member is None:
                         continue
-                    function = inspect.unwrap(member)
-                    if inspect.isfunction(function) and _written_in_module_source(function):
-                        found.append((label, function))
+                    value = _user_member_value(member)
+                    if value is not _UNREAD:
+                        found.append((label, value))
         return found
 
-    return _memoized("methods", cls, collect)
-
-
-def _written_in_module_source(function: types.FunctionType) -> bool:
-    """Whether `function` was compiled from its own module's source file, not from a string or
-    another module's file, and that module is user code. The module's answer is cached
-    (`is_user_code`); a function object's would resolve its file's path again."""
-    module = sys.modules.get(function.__module__)
-    if module is None or function.__code__.co_filename != getattr(module, "__file__", None):
-        return False
-    return is_user_code(module)
+    return _memoized("members", cls, collect)
 
 
 class _BodyImport(typing.NamedTuple):
@@ -1352,10 +1478,9 @@ class _BodyImport(typing.NamedTuple):
 
 
 def _body_imports(func: Callable[..., Any], tree: ast.Module) -> list[_BodyImport]:
-    """The import statements in `func`'s source (`tree`), relative ones resolved against its
-    module's package. A relative import with no package to resolve against fails when the body
-    runs, so it is left out."""
-    package = getattr(sys.modules.get(getattr(func, "__module__", None) or ""), "__package__", None)
+    """Return imports in `func`'s own body, resolving relative names without executing them."""
+    globals_dict = getattr(func, "__globals__", {})
+    package = globals_dict.get("__package__")
     found = list[_BodyImport]()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1379,35 +1504,104 @@ def _body_imports(func: Callable[..., Any], tree: ast.Module) -> list[_BodyImpor
 
 
 def _body_import_module(name: str) -> types.ModuleType | None:
-    """Import user module `name` as a function body's import of it would, or return None.
+    """Return an already-loaded user module without executing an import."""
+    module = sys.modules.get(name)
+    return module if isinstance(module, types.ModuleType) and is_user_code(module) else None
 
-    None is a library, builtin or frozen module, which is found without importing it, or a
-    module that cannot be imported, whose import fails when the body runs. An import that
-    loads new user modules is reported to discovery's import session
-    (`discovery.track_user_imports`), so a reload imports them again.
-    """
-    top = name.partition(".")[0]
-    loaded = sys.modules.get(top)
-    if loaded is not None:
-        if not is_user_code(loaded):
+
+def _module_spec_without_import(name: str) -> importlib.machinery.ModuleSpec | None:
+    """Resolve `name` through filesystem finders without running package initializers."""
+    path: Sequence[str] | None = None
+    spec: importlib.machinery.ModuleSpec | None = None
+    parts = name.split(".")
+    for index, part in enumerate(parts):
+        current = ".".join(parts[: index + 1])
+        loaded = sys.modules.get(current)
+        if isinstance(loaded, types.ModuleType):
+            spec = getattr(loaded, "__spec__", None)
+            if not isinstance(spec, importlib.machinery.ModuleSpec):
+                return None
+        else:
+            spec = importlib.machinery.PathFinder.find_spec(part, path)
+            if spec is None:
+                return None
+        path = spec.submodule_search_locations
+        if index + 1 < len(parts) and path is None:
             return None
-    else:
-        try:
-            spec = importlib.util.find_spec(top)
-        except (ImportError, ValueError):
-            return None
-        if spec is None or _is_library_spec(spec):
-            return None
-    already_loaded = name in sys.modules
+    return spec
+
+
+def _record_static_source(path: pathlib.Path, digest: str) -> None:
+    """Add an in-project static import dependency to the active source map."""
+    if _active_source_map is None:
+        return
+    from pivot import project
+
     try:
-        module = importlib.import_module(name)
-    except ImportError:
-        return None
-    if not already_loaded:
-        from pivot import discovery
+        relative = str(path.resolve().relative_to(project.get_project_root()))
+    except (OSError, ValueError, exceptions.ProjectNotInitializedError):
+        return
+    _active_source_map.setdefault(relative, digest)
 
-        discovery.track_user_imports()
-    return module if is_user_code(module) else None
+
+def _body_import_source_token(name: str) -> str | None:
+    """Digest the static user-source closure of an unloaded body import without importing it."""
+    memo = _pass_memo.get()
+    key = ("body-import", name)
+    if memo is not None and key in memo:
+        return cast("str | None", memo[key])
+
+    found = dict[str, str]()
+    visited = set[str]()
+
+    def visit(module_name: str) -> None:
+        if module_name in visited:
+            return
+        visited.add(module_name)
+        spec = _module_spec_without_import(module_name)
+        if spec is None or _is_library_spec(spec) or spec.origin is None:
+            return
+        path = pathlib.Path(spec.origin)
+        if not path.is_file():
+            return
+        try:
+            digest = _source_digest(str(path))
+            source = path.read_text()
+            tree = ast.parse(source)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            return
+        found[module_name] = digest
+        _record_static_source(path, digest)
+        package = (
+            module_name
+            if spec.submodule_search_locations is not None
+            else module_name.rpartition(".")[0]
+        )
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    visit(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                try:
+                    base = importlib.util.resolve_name(
+                        "." * node.level + (node.module or ""), package
+                    )
+                except (ImportError, ValueError):
+                    continue
+                visit(base)
+                for alias in node.names:
+                    if alias.name != "*":
+                        visit(f"{base}.{alias.name}")
+
+    visit(name)
+    result = (
+        xxhash.xxh64(json.dumps(sorted(found.items()), separators=(",", ":")).encode()).hexdigest()
+        if found
+        else None
+    )
+    if memo is not None:
+        memo[key] = result
+    return result
 
 
 def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
@@ -1423,14 +1617,7 @@ def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
 def _process_body_imports(
     func: Callable[..., Any], tree: ast.Module, manifest: dict[str, str], visited: set[int]
 ) -> None:
-    """Walk what each import statement in `func`'s body binds, as a global it read would be.
-
-    `import pkg.sub` binds `pkg`, `import pkg.sub as s` binds `pkg.sub`, and `from pkg import
-    name` binds `pkg.name`: an attribute of `pkg`, or its submodule. A user module has the
-    attributes `func` reads on the bound name followed; a user function or class is walked; a
-    scalar is recorded by value; a non-scalar is refused (`_process_captured_value`). A library
-    module adds nothing. A cache hit imports each module again (`bi:MODULE`).
-    """
+    """Track body imports without executing a module pipeline discovery did not load."""
     imports = _body_imports(func, tree)
     if not imports:
         return
@@ -1439,6 +1626,9 @@ def _process_body_imports(
     for body_import in imports:
         module = _body_import_module(body_import.module)
         if module is None:
+            _record_unloaded_body_import(func, body_import.module, manifest)
+            if body_import.attribute is not None:
+                _record_unloaded_body_import(func, body_import.target, manifest)
             continue
         imported = f"bi:{body_import.module}"
         _record_read(func, imported)
@@ -1462,6 +1652,7 @@ def _process_body_imports(
             continue
         target = _body_import_module(body_import.target)
         if target is None:
+            _record_unloaded_body_import(func, body_import.target, manifest)
             continue
         step = f"bi:{body_import.target}"
         if step != imported:
@@ -1477,6 +1668,17 @@ def _process_body_imports(
                 stage_name,
                 chain=body_import.bound,
             )
+
+
+def _record_unloaded_body_import(
+    func: Callable[..., Any], name: str, manifest: dict[str, str]
+) -> None:
+    """Record a static source closure when a body import remains intentionally unloaded."""
+    token = _body_import_source_token(name)
+    if token is None:
+        return
+    _record_read(func, f"bs:{name}")
+    manifest[f"body-import:{name}"] = token
 
 
 def _names_submodule(module: types.ModuleType, attribute: str) -> bool:
@@ -1902,10 +2104,10 @@ def _process_captured_value(
     `parameter` names the parameter when the value is a default argument.
     """
     match _value_kind(value):
+        case _ValueKind.DYNAMIC_IMPORT:
+            raise _dynamic_import_error(func)
         case _ValueKind.PARTIAL:
-            _process_partial_dependency(
-                binding_ref, cast("functools.partial[Any]", value), manifest, visited
-            )
+            _process_partial_dependency(binding_ref, value, manifest, visited)
         case _ValueKind.USER:
             _process_callable_dependency(binding_ref, value, manifest, visited)
             if isinstance(value, type) and chain is not None:
@@ -2151,7 +2353,7 @@ def _process_callable_dependency(
 
 def _process_partial_dependency(
     binding_ref: str,
-    partial_obj: functools.partial[Any],
+    partial_obj: Any,
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
@@ -2168,6 +2370,11 @@ def _process_partial_dependency(
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
+    if _is_dynamic_import(underlying):
+        stage_name = _current_stage_name.get() or "<unknown>"
+        raise exceptions.StageDefinitionError(
+            f"Stage '{stage_name}': '{binding_ref}' uses dynamic imports. Use static imports instead."
+        )
     if _value_kind(underlying) is _ValueKind.REFUSED:
         with _walking("pf"):
             _check_non_scalar_capture(
@@ -2184,7 +2391,7 @@ def _process_partial_dependency(
 
 def _process_partial_arguments(
     binding_ref: str,
-    partial_obj: functools.partial[Any],
+    partial_obj: Any,
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
@@ -2232,6 +2439,11 @@ def _process_bound_values(
     `default_rng(SEED).normal`), is refused, as it is when a stage reads one: what it reads
     from its instance is not walked, and its repr does not record that state.
     """
+    if _is_dynamic_import(value):
+        stage_name = _current_stage_name.get() or "<unknown>"
+        raise exceptions.StageDefinitionError(
+            f"Stage '{stage_name}': '{binding_ref}' uses dynamic imports. Use static imports instead."
+        )
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
         _process_bound_member(
@@ -2527,14 +2739,14 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         return ["function", _function_identity(value, active)]
     if _is_library_callable(value):
         return ["external", _library_name(value)]
-    if isinstance(value, functools.partial):
-        partial_obj = cast("functools.partial[Any]", value)
-        inner = (*active, id(partial_obj))
+    if isinstance(value, (functools.partial, functools.partialmethod)):
+        partial_value = cast("Any", value)
+        inner = (*active, id(partial_value))
         return [
             "partial",
-            _canonicalize_value_for_hash(partial_obj.func, inner),
-            _canonicalize_value_for_hash(partial_obj.args, inner),
-            _canonicalize_value_for_hash(partial_obj.keywords, inner),
+            _canonicalize_value_for_hash(partial_value.func, inner),
+            _canonicalize_value_for_hash(partial_value.args, inner),
+            _canonicalize_value_for_hash(partial_value.keywords, inner),
         ]
     if isinstance(value, dict):
         mapping = cast("dict[Any, Any]", value)
@@ -2663,17 +2875,20 @@ def _definition_ref(obj: Any) -> str:
 
 def _binding_ref(func: Callable[..., Any], name: str) -> str:
     """Return a module-qualified reference for a value reached through `func`."""
-    module = getattr(func, "__module__", None) or "<unknown>"
+    globals_dict = getattr(func, "__globals__", {})
+    module = globals_dict.get("__name__") or getattr(func, "__module__", None) or "<unknown>"
     return f"{module}.{name}"
 
 
 def _callable_ref(func: Callable[..., Any], binding_ref: str) -> str:
     """Use callable's definition, or the binding path where one definition makes many.
 
-    A lambda is keyed by its binding, and so is a function defined inside another one that
-    holds closure cells or defaults: two closures from one factory (`h2 = make(2)`,
-    `h5 = make(5)`) share a definition, and their values must not share keys.
+    A functools.wraps wrapper gets a separate owner from the function it wraps: update_wrapper
+    copies the wrapped function's module and qualname, so without the marker the child's hash
+    overwrites the wrapper's bytecode hash in the manifest.
     """
+    if inspect.isfunction(func) and hasattr(func, "__wrapped__"):
+        return f"{binding_ref}.<wrapper>"
     qualname = getattr(func, "__qualname__", "") or ""
     if "<lambda>" in qualname:
         return binding_ref

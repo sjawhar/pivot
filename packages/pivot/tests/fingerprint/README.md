@@ -12,6 +12,7 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
 - **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
 - **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (dynamic name access, unsafe fingerprinting and the run cache)
+- **`test_fingerprint_gaps.py`** - CLI regressions for callable class members, dynamic-import spellings, and body imports
 - **`test_no_fingerprint.py`** - Worker skip/re-run behavior for `@no_fingerprint()` stages (file-level hashing)
 - **`test_fingerprint_properties.py`** - Hypothesis properties over generated stage bodies: fresh-process determinism, formatting insensitivity, one-token sensitivity, and `params.yaml` overrides vs. the run-cache key
 
@@ -83,10 +84,15 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global read only inside a method of a user class (`Scaler().apply` reads `SCALE`) | ✅ | `test_change_detection.py::test_method_global_change_causes_miss` |
 | Compiled regex read only inside a method, class imported from another module (`ScopeWalk().step`) | ✅ | `test_change_detection.py::test_method_regex_change_causes_miss` |
 | Helper called only from a classmethod (`Runner.go` calls `bump`) | ✅ | `test_change_detection.py::test_method_helper_change_causes_miss` |
+| Callable class member (`partial`, `partialmethod`, nested class) | ✅ | `test_fingerprint_gaps.py::test_class_member_edit_reruns_stage` |
+| Callable instance class member | ✅ (error) | `test_fingerprint_gaps.py::test_dataclass_callable_member_is_refused` |
+| Decorator wrapper body on a class method | ✅ | `test_fingerprint_gaps.py::test_decorated_method_wrapper_edit_reruns_stage` |
 | Data class method reading a global (method walked, not refused) | ✅ | `test_change_detection.py::test_dataclass_method_reading_global_is_walked` |
-| In-body `from X import` of a mutable module value | ✅ (error) | `test_change_detection.py::test_in_body_from_import_of_non_scalar_is_refused` |
+| Data class default from a module value | ✅ | `test_fingerprint_gaps.py::test_class_member_edit_reruns_stage[dataclass-field-default]` |
+| In-body `from X import` of a mutable loaded module value | ✅ (error) | `test_change_detection.py::test_in_body_from_import_of_non_scalar_is_refused` |
 | Relative in-body import (`from .sibling import value`) | ✅ | `test_change_detection.py::test_relative_in_body_import_change_causes_miss` |
-| Module first imported by the fingerprint's body-import walk is re-imported by the next discovery | ✅ | `test_discovery.py::test_rediscovery_reimports_a_module_first_imported_by_the_fingerprint` |
+| Unloaded body import never executed during fingerprinting | ✅ | `test_fingerprint_gaps.py::test_guarded_in_body_import_is_not_imported_at_definition` |
+| Static user dependency of an unloaded body import | ✅ | `test_change_detection.py::test_unloaded_body_import_tracks_static_user_import_closure` |
 | Class base/field annotation dependencies             | ✅        | `test_fingerprint.py::test_process_class_body_dependencies_tracks_bases_and_annotations`                                           |
 | StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                           |
 | StageParams regular method change                    | ✅        | `test_change_detection.py::test_stageparams_method_change_causes_miss`                                                             |
@@ -134,9 +140,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                          | Detected? | Test Reference                                                       |
 | ------------------------------------ | --------- | -------------------------------------------------------------------- |
-| `from X import func` inside function | ✅        | `test_change_detection.py::test_lazy_import_change_detected`         |
+| `from X import func` inside function | ✅        | `test_change_detection.py::test_loaded_body_import_is_tracked_as_a_helper` |
 | `import X as alias` inside function  | ✅        | `test_change_detection.py::test_in_body_import_change_causes_miss`   |
-| Conditional import inside function   | ✅        | Same walk: every import statement in the body is resolved            |
+| Conditional import inside function   | ✅        | `test_fingerprint_gaps.py::test_guarded_in_body_import_is_not_imported_at_definition` |
 
 ---
 
@@ -171,16 +177,16 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Change Type                              | Detected? | Test Reference                                                                                                                                |
 | ---------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `getattr(module, "func")`                | ❌        | **NO TEST** - can't resolve statically                                                                                                        |
-| `getattr(obj, name)` (non-literal)       | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_dynamic_getattr`                                                        |
-| `globals()` / `locals()`                 | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_globals`                                                                  |
+| `getattr(obj, name)` (non-literal)       | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_dynamic_getattr` |
+| `globals()` / `locals()`                 | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_globals` |
 | `func_dict[key]()` dispatch              | ✅        | `test_change_detection.py::test_dynamic_dispatch_change_detected`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
-| `eval()` / `exec()`                      | ❌        | **NO TEST** - can't analyze dynamically                                                                                                       |
-| `importlib.import_module(string)`        | ✅ (error) | `test_fingerprint.py::test_dynamic_import_is_refused[attribute-import-module]`                                                         |
-| `import_module` under an alias, `__import__(...)` | ✅ (error) | `test_fingerprint.py::test_dynamic_import_is_refused[aliased-import-module]`, `test_fingerprint.py::test_dynamic_import_is_refused[dunder-import]` |
-| `importlib.import_module(...)` (call)    | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_import_module`                                                           |
-| Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss`         |
-| Callback/function passed as argument     | ❌        | **NO TEST** - not tracked                                                                                                                     |
-| Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source)                                                            |
+| `eval()` / `exec()`                      | ❌        | **NO TEST** - can't analyze dynamically |
+| Visible `importlib.import_module` / `__import__` spelling | ✅ (error) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_is_refused` |
+| `importlib.import_module(...)` (direct call) | ✅ (error) | `test_fingerprint.py::test_dynamic_import_is_refused[attribute-import-module]` |
+| Dynamic attribute and alternate loading APIs | ❌ | `vars(module)[name]`, `operator.attrgetter`, `exec_module`, and `runpy` are documented limits |
+| Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss` |
+| Callback/function passed as argument     | ❌        | **NO TEST** - not tracked |
+| Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source) |
 
 ---
 

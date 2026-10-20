@@ -25,9 +25,9 @@ Pivot's fingerprinting system:
 |---------|----------|-----|
 | Same-module helpers | Yes | `getclosurevars()` discovers reference |
 | Module imports | Yes | AST scanning for attribute access |
-| Imports in a function body | Yes | `import helpers` and `from helpers import scale` in a stage or helper body are resolved (relative ones against the function's package) and walked as a module-level import would be; a library module adds nothing |
+| Imports in a function body | Yes | Pivot never executes a body import while defining a pipeline. An already-loaded user module is walked like a module-level import; an unloaded user module contributes a static closure of its own and statically imported user source files. Library modules add nothing. |
 | Class definitions | Yes | Full class AST hashed |
-| Methods of user classes | Yes | Each function a user class's source defines (method, classmethod, staticmethod, property accessor, `functools.cached_property`), its own and inherited from user bases, is walked like a stage helper: the module values it reads are tracked or refused and the helpers it calls are walked. Generated methods (a dataclass's `__init__`) and library methods are not |
+| Callable members of user classes | Yes | User-defined methods, classmethods, staticmethods, property accessors, cached properties, `functools.partial`/`partialmethod` members, nested user classes, and dataclass default factories are walked like stage helpers. Callable instances and other user-defined descriptors are refused because their state is not reliably fingerprintable. Generated and library members are skipped. |
 | StageParams subclasses | Yes | Type hint analysis + full class AST + Pydantic field defaults + `default_factory` functions |
 | Custom loaders | Yes | Loader method ASTs hashed. A user loader's own `load()`, `save()` and `empty()`, and functions and classes in its config fields, are walked like stage helpers: module values they read are tracked or refused. Methods inherited from `pivot.loaders` are hashed only |
 | Module-level immutable values | Yes (value) | Scalars, exact tuples and frozensets of scalars, and compiled regexes are recorded by value |
@@ -38,9 +38,9 @@ Pivot's fingerprinting system:
 | Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
 | Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
 | Class attributes a stage reads | Yes (value) | `Cls.NAME` read directly on a user class that the function names (a global, cell or default holding the class), or reaches through a user module (`settings.Config.SCALE`). When `NAME` is written in a user class body, it follows the module-level rule: scalars, exact tuples and frozensets of scalars, and compiled regexes are recorded; mutable or nested values are refused; a plain function is walked; and a member of a user Enum is recorded by name and value. A pydantic or StageParams class read this way is covered by its schema hash, field defaults included. Attributes a library base or the language defines (an inherited stdlib dict, `NamedTuple._fields`, an Enum's `_member_names_`), and descriptors (property, classmethod, staticmethod), are left to the class AST hash |
-| Other class-level and module reads | No | Not tracked: `cls.SCALE` inside a classmethod, a nested class (`Outer.Inner.X`), an attribute read through an instance (`Config().SCALE`), a `ClassVar` on a `StageParams` class, a module read through a local alias (`s = settings; s.SCALE`), a literal `getattr(settings, "SCALE")`, and a module held in a class attribute (`Holder.lib.SCALE`). Put such configuration in the stage's `StageParams` |
+| Other class-level and module reads | No | Not tracked: `cls.SCALE` inside a classmethod, `Outer.Inner.X`, an attribute read through an instance (`Config().SCALE`), a `ClassVar` on a `StageParams` class, a module read through a local alias (`s = settings; s.SCALE`), a literal `getattr(settings, "SCALE")`, and a module held in a class attribute (`Holder.lib.SCALE`). Put such configuration in the stage's `StageParams` |
 
-**Note:** The class AST and the method walk cover a class's code and the module values its methods read, but *runtime values* of class-level variables are tracked only in the `Cls.NAME` and `module.Cls.NAME` shapes above, and for Pydantic model field defaults. A value read as `module.NAME` follows the rule it follows as a global: a library function is an `ext:` entry, a `functools.partial` is walked, a logger is ignored.
+**Note:** The class AST and callable-member walk cover a class's code and the module values callable members read. Non-callable class attributes are only tracked in the direct `Cls.NAME` and `module.Cls.NAME` shapes above, plus dataclass and Pydantic field defaults. A value read as `module.NAME` follows the rule it follows as a global: a library function is an `ext:` entry, a `functools.partial` is walked, and a logger is ignored.
 
 For Pydantic models, both static defaults and `default_factory` functions are tracked:
 
@@ -112,9 +112,14 @@ def process():
 ```
 
 An import whose module is named at run time cannot be resolved statically:
-`importlib.import_module` under any name and `__import__` are refused with
-`StageDefinitionError`. A static import inside the function body
-(`from helpers import process_data`) is tracked.
+any visible reference to `importlib.import_module` or `__import__`, including an alias,
+default argument, `functools.partial`, or literal `getattr`, is refused with
+`StageDefinitionError`. A static import inside the function body (`from helpers import
+process_data`) is tracked without executing it during pipeline definition.
+
+Computed attribute names and alternate loading APIs (`vars(module)[name]`,
+`operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs) remain outside this
+check.
 
 **Workaround:** Import the module statically.
 
