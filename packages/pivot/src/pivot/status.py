@@ -409,6 +409,7 @@ def get_remote_status(
         return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
     with state_mod.StateDB(config.get_state_dir()) as state_db:
+        transfer.check_remote_url(state_db, resolved_name, remote_storage)
         status = asyncio.run(
             transfer.compare_status(local_hashes, remote_storage, state_db, resolved_name)
         )

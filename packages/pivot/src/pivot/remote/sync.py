@@ -315,7 +315,7 @@ def get_target_hashes(
     return hashes
 
 
-def _check_remote_url(
+def check_remote_url(
     state_db: state_mod.StateDB,
     remote_name: str,
     remote: protocol.RemoteStorage,
@@ -384,7 +384,7 @@ async def _push_async(
     _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    _check_remote_url(state_db, remote_name, remote)
+    check_remote_url(state_db, remote_name, remote)
 
     if targets:
         local_hashes = get_target_hashes(
@@ -474,7 +474,7 @@ async def _pull_async(
     _t = metrics.start()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    _check_remote_url(state_db, remote_name, remote)
+    check_remote_url(state_db, remote_name, remote)
 
     if targets:
         needed_hashes = get_target_hashes(

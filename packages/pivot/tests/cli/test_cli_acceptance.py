@@ -831,6 +831,8 @@ def test_gcs_remote_push_pull_import_round_trip(
     src = tmp_path / "src"
     src.mkdir()
     _project(src, {"pipeline.py": _GCS_PIPELINE, ".gitignore": "/data/g/\n__pycache__/\n"})
+    # `pivot import` defaults to --rev main; a bare `git init` names its branch after init.defaultBranch
+    subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=src, check=True)
     # `git archive --remote` by commit SHA (pivot import) requires this for local repos
     subprocess.run(["git", "config", "uploadArchive.allowUnreachable", "true"], cwd=src, check=True)
     _ok(_pivot(src, "config", "set", "remotes.origin", f"gs://{gcs_bucket}/cache"))
