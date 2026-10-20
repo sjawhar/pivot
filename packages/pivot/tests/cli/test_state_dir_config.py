@@ -157,6 +157,44 @@ def test_repro_keeps_all_state_in_the_configured_state_dir(
     assert (state_dir / ".gitignore").is_file()
 
 
+@pytest.mark.parametrize(
+    ("state_dir_name", "symlink"),
+    [
+        pytest.param("outside-state", False, id="absolute-state-dir"),
+        pytest.param("state-link", True, id="in-project-state-symlink"),
+    ],
+)
+def test_init_force_preserves_external_state_dir_gitignore(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state_dir_name: str,
+    symlink: bool,
+) -> None:
+    """Force init never overwrites an ignore file outside the project."""
+    root = tmp_path / "project"
+    root.mkdir()
+    external_state_dir = tmp_path / "outside-state"
+    external_state_dir.mkdir()
+    external_ignore = external_state_dir / ".gitignore"
+    external_ignore.write_text("external content\n")
+    (root / ".pivot").mkdir()
+    if symlink:
+        (root / state_dir_name).symlink_to(external_state_dir, target_is_directory=True)
+        configured_state_dir = state_dir_name
+    else:
+        configured_state_dir = str(external_state_dir)
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {configured_state_dir}\n")
+    monkeypatch.chdir(root)
+    project._project_root_cache = None
+    config_io.clear_config_cache()
+
+    result = runner.invoke(cli.cli, ["init", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert external_ignore.read_text() == "external content\n"
+
+
 def test_init_writes_gitignore_to_the_configured_state_dir(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

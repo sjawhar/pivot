@@ -40,14 +40,15 @@ def init(ctx: click.Context, force: bool) -> None:
     pivot_dir.mkdir(exist_ok=True)
     state_dir = project.ensure_state_dir(cwd)
     gitignore_path = state_dir / ".gitignore"
+    state_dir_is_internal = state_dir.resolve().is_relative_to(cwd.resolve())
 
-    # Warn if overwriting existing .gitignore with custom content
-    if force and gitignore_path.exists():
+    # --force only replaces an ignore file Pivot owns inside this project.
+    if force and state_dir_is_internal and gitignore_path.exists():
         existing_content = gitignore_path.read_text()
         if existing_content != project.STATE_GITIGNORE_CONTENT and not quiet:
             click.echo(f"Warning: Overwriting existing {gitignore_path}", err=True)
+        gitignore_path.write_text(project.STATE_GITIGNORE_CONTENT)
 
-    gitignore_path.write_text(project.STATE_GITIGNORE_CONTENT)
     stages_dir = state_dir / "stages"
     stages_dir.mkdir(exist_ok=True)
 
