@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 
 _PACKAGES = pathlib.Path(__file__).resolve().parents[2]
 
-# Programs every Unix system has; a test may start them by name.
-_SYSTEM_PROGRAMS = frozenset({"git", "sh"})
+# Programs supplied by the suite's documented environment; a test may start them by name.
+_SYSTEM_PROGRAMS = frozenset({"docker", "git", "sh"})
 # On the line that names the program, this comment marks a launch that searches PATH on purpose.
 _ON_PURPOSE = "# searches PATH:"
 _SHELLS = frozenset({"bash", "dash", "sh", "zsh"})
@@ -474,6 +474,7 @@ def test_scan_finds_a_launch_that_searches_path(source: str) -> None:
             id="venv-pivot",
         ),
         pytest.param('subprocess.run(["git", "init", "-q"])', id="git"),
+        pytest.param('subprocess.run(["docker", "run", "--rm", "image"])', id="docker"),
         pytest.param('subprocess.run(["/bin/sh", "-c", "printf ok"])', id="sh-script"),
         pytest.param('LOGGERS = ["pivot", "pivot.project"]', id="list-of-names"),
         pytest.param('runner.invoke(cli, ["pivot", "--help"])', id="cli-runner"),

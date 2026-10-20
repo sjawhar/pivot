@@ -23,7 +23,7 @@ import anyio
 import click
 
 from pivot import config, project, registry
-from pivot.cli import _run_common, completion
+from pivot.cli import _run_common, completion, is_standalone_invocation
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -571,6 +571,7 @@ def _run_serve_mode(
     stop_signals = [signal.SIGTERM]
     if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
         stop_signals.append(signal.SIGINT)
+    previous_handlers = {signum: signal.getsignal(signum) for signum in stop_signals}
 
     async def serve_main() -> None:
         try:
@@ -587,13 +588,18 @@ def _run_serve_mode(
                     tg.cancel_scope.cancel()
         finally:
             # The stop is under way; a stop signal during the rest of the shutdown changes
-            # nothing. The receiver restored the default dispositions as it closed.
+            # nothing. Restore the caller's dispositions after anyio.run has fully returned.
             for signum in stop_signals:
                 signal.signal(signum, signal.SIG_IGN)
 
-    # Ctrl-C before the loop receives it stops startup.
-    with contextlib.suppress(KeyboardInterrupt):
-        anyio.run(serve_main)
+    try:
+        # Ctrl-C before the loop receives it stops startup.
+        with contextlib.suppress(KeyboardInterrupt):
+            anyio.run(serve_main)
+    finally:
+        if not is_standalone_invocation():
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
 
 def _run_oneshot_mode(

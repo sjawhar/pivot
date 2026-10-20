@@ -1263,6 +1263,11 @@ class Engine:
                                     )
 
                                 except Exception as e:
+                                    # A service manager can SIGTERM the worker cgroup at the
+                                    # same time it stops pivot. Let cancellation win over a late
+                                    # TerminatedWorkerError so a deliberate stop is not logged
+                                    # as a stage failure.
+                                    await anyio.lowlevel.checkpoint_if_cancelled()
                                     _logger.exception("Stage %s failed with exception", stage_name)
                                     self._worker_pool.mark_workers_unverified()
                                     failed_result = StageResult(

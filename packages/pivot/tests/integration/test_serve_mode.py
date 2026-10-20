@@ -645,6 +645,103 @@ with pipeline:
         shutil.rmtree(private_tmp)
 
 
+@pytest.mark.parametrize("signame", ["TERM", "INT"])
+def test_inprocess_serve_restores_stop_signals_for_children(
+    tmp_path: pathlib.Path, signame: str
+) -> None:
+    """An application that invokes pivot's CLI in-process can still stop a child it starts
+    afterward. The standalone pivot command exits immediately, but CLI embedders do not."""
+    project = tmp_path / "project"
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text("""\
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def noop() -> None:
+    pass
+
+
+with pipeline:
+    noop()
+""")
+    probe = pathlib.Path(__file__).with_name("inproc_serve.py")
+    result = subprocess.run(
+        [sys.executable, str(probe), str(project), signame],
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "serve returned" in result.stdout, result.stdout
+    assert "after:  SIGINT=default_int_handler SIGTERM=0" in result.stdout, result.stdout
+    assert "SIGTERM stopped it" in result.stdout, result.stdout
+
+
+def test_group_sigterm_during_a_stage_is_not_logged_as_a_failure(tmp_path: pathlib.Path) -> None:
+    """`systemctl stop` sends SIGTERM to the whole cgroup. A running worker receives that
+    signal directly, but a deliberate service stop must not emit a stage-failure traceback."""
+    project = tmp_path / "project"
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    marker = project / "started"
+    (project / "pipeline.py").write_text(f"""\
+import pathlib
+import time
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def slow() -> None:
+    pathlib.Path({str(marker)!r}).write_text("started")
+    time.sleep(30)
+
+
+with pipeline:
+    slow()
+""")
+    private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
+    stderr_path = tmp_path / "serve.stderr"
+    env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    try:
+        with stderr_path.open("wb") as stderr_file:
+            proc = subprocess.Popen(
+                [_PIVOT_BIN, "repro", "--watch", "--serve", "--force"],
+                cwd=project,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+        try:
+            deadline = time.monotonic() + 30
+            while not marker.exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.exists(), f"the stage did not start (exit {proc.poll()})"
+            os.killpg(proc.pid, signal.SIGTERM)
+            assert proc.wait(timeout=20) == 0
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        stderr = stderr_path.read_text(errors="replace")
+        assert "TerminatedWorkerError" not in stderr, stderr
+        assert "Stage test/slow failed with exception" not in stderr, stderr
+    finally:
+        shutil.rmtree(private_tmp)
+
+
 # =============================================================================
 # AgentRpcSource Handler Tests (Component-level)
 # =============================================================================

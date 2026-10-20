@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import importlib
 import logging
 import sys
@@ -77,6 +78,14 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "Update imported artifacts from source repos.",
     ),
 }
+
+
+_standalone_invocation = contextvars.ContextVar("standalone_invocation", default=False)
+
+
+def is_standalone_invocation() -> bool:
+    """Return whether the console-script entry point invoked the current command."""
+    return _standalone_invocation.get()
 
 
 class CliContext(TypedDict):
@@ -186,7 +195,11 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
 
 def main() -> None:
     """Main CLI entry point."""
-    cli()
+    token = _standalone_invocation.set(True)
+    try:
+        cli()
+    finally:
+        _standalone_invocation.reset(token)
 
 
 if __name__ == "__main__":
