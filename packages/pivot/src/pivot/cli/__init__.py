@@ -185,7 +185,7 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     if not ctx.resilient_parsing:
         from pivot import project
 
-        project.enable_ignored_global_state_dir_warning()
+        project.enable_state_dir_warnings()
 
 
 def main() -> None:

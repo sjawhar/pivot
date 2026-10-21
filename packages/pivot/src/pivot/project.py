@@ -8,10 +8,12 @@ logger = logging.getLogger(__name__)
 _project_root_cache: pathlib.Path | None = None
 _state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 
-# The CLI turns this on; loky workers and shell completion never do, so they stay silent.
-_ignored_global_state_dir_warning_enabled = False
+# The CLI turns these warnings on; loky workers and shell completion never do, so they stay silent.
+_state_dir_warnings_enabled = False
 # Global config files whose ignored core.state_dir was already reported in this process.
 _reported_ignored_global_state_dirs = set[pathlib.Path]()
+# Project config files already reported as unreadable in this process.
+_reported_unreadable_configs = set[pathlib.Path]()
 
 STATE_GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
@@ -90,11 +92,18 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     if (cached := _state_dir_cache.get(root)) is not None:
         return cached
 
-    from pivot import exceptions
     from pivot.config import io as config_io
 
     config_path = root / ".pivot" / "config.yaml"
     present, configured = config_io.read_config_file_value(config_path, "core.state_dir")
+    return _resolve_configured_state_dir(root, config_path, present, configured)
+
+
+def _resolve_configured_state_dir(
+    root: pathlib.Path, config_path: pathlib.Path, present: bool, configured: object
+) -> pathlib.Path:
+    from pivot import exceptions
+
     warn_if_global_state_dir_ignored(root, shadowed=present)
 
     if configured is None:
@@ -106,6 +115,33 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
 
     _state_dir_cache[root] = state_dir
     return state_dir
+
+
+def state_dir_if_readable(root: pathlib.Path) -> pathlib.Path | None:
+    """Return ``state_dir_for(root)``, or None when ``<root>/.pivot/config.yaml`` cannot be read.
+
+    Loading and listing a pipeline never needs its state, so they go on without it, as 0.5.2
+    did, after one warning per process once the CLI enabled warnings. Every command that uses
+    the state directory still fails reading the file, with the same message.
+    """
+    if (cached := _state_dir_cache.get(root)) is not None:
+        return cached
+
+    from pivot import exceptions
+    from pivot.config import io as config_io
+
+    config_path = root / ".pivot" / "config.yaml"
+    try:
+        present, configured = config_io.read_config_file_value(config_path, "core.state_dir")
+    except exceptions.ConfigError as e:
+        if _state_dir_warnings_enabled and config_path not in _reported_unreadable_configs:
+            _reported_unreadable_configs.add(config_path)
+            logger.warning(
+                f"{e}. The state directory is unknown; "
+                + "commands that use it will fail until the file is fixed."
+            )
+        return None
+    return _resolve_configured_state_dir(root, config_path, present, configured)
 
 
 def is_valid_state_dir_value(value: object) -> bool:
@@ -126,10 +162,10 @@ def get_state_dir() -> pathlib.Path:
     return state_dir_for(get_project_root())
 
 
-def enable_ignored_global_state_dir_warning() -> None:
-    """Report an ignored global ``core.state_dir`` from now on in this process."""
-    global _ignored_global_state_dir_warning_enabled
-    _ignored_global_state_dir_warning_enabled = True
+def enable_state_dir_warnings() -> None:
+    """Report an ignored global ``core.state_dir`` and an unreadable project config from now on."""
+    global _state_dir_warnings_enabled
+    _state_dir_warnings_enabled = True
 
 
 def ignored_global_state_dir_message(
@@ -147,11 +183,11 @@ def ignored_global_state_dir_message(
 def warn_if_global_state_dir_ignored(root: pathlib.Path, *, shadowed: bool) -> None:
     """Log, once per process, that the global config's ``core.state_dir`` is ignored.
 
-    Silent until ``enable_ignored_global_state_dir_warning`` runs. ``shadowed`` says the project
+    Silent until ``enable_state_dir_warnings`` runs. ``shadowed`` says the project
     sets its own value. The global file is read only to decide whether to warn: when it cannot
     be read, this says nothing, and reporting that stays with the normal config load.
     """
-    if not _ignored_global_state_dir_warning_enabled:
+    if not _state_dir_warnings_enabled:
         return
     from pivot import exceptions
     from pivot.config import io as config_io

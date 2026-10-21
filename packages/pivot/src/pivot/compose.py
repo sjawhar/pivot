@@ -401,7 +401,7 @@ def _require_same_stage(
 def _emit_stage_info(
     node: _StageNode,
     qualified_name: str,
-    state_dir: pathlib.Path,
+    state_dir: pathlib.Path | None,
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     deps = dict[str, types.ArtifactRef]()
@@ -544,6 +544,17 @@ class Pipeline:
     def state_dir(self) -> pathlib.Path:
         return project.ensure_state_dir(self._root)
 
+    def _stage_state_dir(self) -> pathlib.Path | None:
+        """The state directory recorded on this pipeline's stages.
+
+        None while the project config cannot be read: building and listing stages never needs
+        it, and every reader of a stage's state falls back to the project's state directory,
+        which then fails with the config's own error.
+        """
+        if project.state_dir_if_readable(self._root) is None:
+            return None
+        return self.state_dir
+
     @property
     def input_bindings(self) -> dict[str, str]:
         return {name: node.path for name, node in self._inputs.items()}
@@ -656,14 +667,16 @@ class Pipeline:
 
         for foreign_pipeline, foreign_node in closure:
             qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
-            stage_info = _emit_stage_info(foreign_node, qualified_name, foreign_pipeline.state_dir)
+            stage_info = _emit_stage_info(
+                foreign_node, qualified_name, foreign_pipeline._stage_state_dir()
+            )
             new_registry.add_existing(stage_info)
 
         self._merge_foreign_input_bindings(closure)
 
         for node in self._stages:
             qualified_name = f"{self._name}/{node.name}"
-            stage_info = _emit_stage_info(node, qualified_name, self.state_dir)
+            stage_info = _emit_stage_info(node, qualified_name, self._stage_state_dir())
             new_registry.add_existing(stage_info)
 
         materialized_stages = set(new_registry.list_stages())

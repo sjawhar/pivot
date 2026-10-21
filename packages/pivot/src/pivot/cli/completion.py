@@ -173,7 +173,10 @@ def _get_stages_from_cache(root: pathlib.Path) -> list[str] | None:
     Returns stage names if cache exists and is valid, None otherwise.
     Cache is valid when version matches and config file mtime unchanged.
     """
-    cache_path = project.state_dir_for(root) / "cache" / "stages.cache"
+    state_dir = project.state_dir_if_readable(root)
+    if state_dir is None:
+        return None
+    cache_path = state_dir / "cache" / "stages.cache"
     try:
         lines = cache_path.read_text().splitlines()
     except OSError:
@@ -207,8 +210,11 @@ def _write_stages_cache(
 
     Uses temp file + rename for atomic write on POSIX.
     Cleans up temp file on failure before re-raising OSError.
-    Caller is responsible for handling write failures.
+    Caller is responsible for handling write failures. Nothing is written while the project
+    config cannot be read, since the state directory is then unknown.
     """
+    if project.state_dir_if_readable(root) is None:
+        return
     cache_dir = project.ensure_state_dir(root) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 

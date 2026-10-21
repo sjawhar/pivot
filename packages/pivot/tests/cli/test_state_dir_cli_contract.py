@@ -381,3 +381,64 @@ def test_cache_dir_completion_help_matches_pivot_052() -> None:
     from pivot.config import models
 
     assert models.CONFIG_KEY_DESCRIPTIONS["cache.dir"] == "Local cache directory"
+
+
+_UNKNOWN_STATE_DIR = (
+    ". The state directory is unknown; commands that use it will fail until the file is fixed."
+)
+
+
+def _project_with_invalid_local_config(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:
+    home = tmp_path / "home"
+    root = _project(home, tmp_path / "project", "input\n")
+    config_path = root / ".pivot" / "config.yaml"
+    config_path.write_text("core: [unclosed\n")
+    return root, f"Invalid YAML in {config_path}:"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("list",), ("list", "--all"), ("dag",)],
+    ids=lambda args: "-".join(args),
+)
+def test_list_and_dag_warn_on_an_invalid_local_config(
+    tmp_path: pathlib.Path, args: tuple[str, ...]
+) -> None:
+    """Like 0.5.2, listing never needs the config; the unknown state directory is warned once."""
+    root, invalid_yaml = _project_with_invalid_local_config(tmp_path)
+
+    result = _run_with_home(root, tmp_path / "home", _PIVOT, *args)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "test/process" in result.stdout, result.stdout
+    assert result.stderr.count(invalid_yaml) == 1, result.stderr
+    assert result.stderr.count(_UNKNOWN_STATE_DIR) == 1, result.stderr
+    assert "Invalid YAML" not in result.stdout, result.stdout
+
+
+def test_list_json_stays_parseable_with_an_invalid_local_config(tmp_path: pathlib.Path) -> None:
+    """The warning goes to stderr only, so `list --json` output still parses."""
+    import json
+
+    root, invalid_yaml = _project_with_invalid_local_config(tmp_path)
+
+    result = _run_with_home(root, tmp_path / "home", _PIVOT, "list", "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [stage["name"] for stage in json.loads(result.stdout)["stages"]] == ["test/process"]
+    assert result.stderr.count(invalid_yaml) == 1, result.stderr
+
+
+@pytest.mark.parametrize("command", ["status", "repro"])
+def test_state_commands_fail_on_an_invalid_local_config_as_on_052(
+    tmp_path: pathlib.Path, command: str
+) -> None:
+    """Every command that uses state still exits 1 with 0.5.2's one `Error:` line."""
+    root, invalid_yaml = _project_with_invalid_local_config(tmp_path)
+
+    result = _run_with_home(root, tmp_path / "home", _PIVOT, command)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    errors = [line for line in result.stderr.splitlines() if line.startswith("Error")]
+    assert errors and errors[0].startswith(f"Error: {invalid_yaml}"), result.stderr
+    assert not (root / ".pivot" / "state.lmdb").exists()

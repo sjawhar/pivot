@@ -179,15 +179,17 @@ my_db = lmdb.open("my_state.lmdb")
 
 ### ruamel.yaml vs PyYAML
 
-- **ruamel.yaml** - For editable config (preserves comments)
-- **PyYAML** - For read-only (faster)
+- **ruamel.yaml** - For every read and write of a config file, through `config/io.py` (preserves comments, and reads YAML 1.2 as `config set` writes it)
+- **PyYAML** - For every other YAML file: lock files, `.pvt` files, params, data (faster)
+
+Never read a config file with PyYAML, even for one key: PyYAML reads YAML 1.1, so an unquoted `on` written by `config set` comes back as `True` and `1:20` as `80`. `docs/solutions/2026-02-01-yaml-library-choice-ruamel-vs-pyyaml.md` lists the exceptions kept from 0.5.2.
 
 ```python
-# Editing config - preserve comments
-import ruamel.yaml
-yaml = ruamel.yaml.YAML()
+# Config files - one reader and one writer
+from pivot.config import io as config_io
+present, value = config_io.read_config_file_value(path, "core.state_dir")
 
-# Read-only
+# Every other YAML file
 import yaml
 data = yaml.safe_load(f)
 ```

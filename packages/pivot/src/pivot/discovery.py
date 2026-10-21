@@ -386,6 +386,8 @@ def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -
     Inputs and outputs resolve against the project root, but ``root=`` moves a stage's lock
     files and half its StateDB, so a ``root=`` other than the project root splits one stage's
     state across two directories. Stages from another pipeline carry that pipeline's root.
+    While the project config cannot be read, the state directory is unknown and only the root
+    is checked.
     """
     advice = (
         "but a pipeline always uses the project's .pivot and data/ (with state in its configured "
@@ -395,7 +397,10 @@ def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -
         raise exceptions.PipelineConfigError(
             f"Pipeline '{pipeline.name}' sets root={pipeline.root}, {advice}"
         )
-    expected_state_dir = project.state_dir_for(project_root).resolve()
+    project_state_dir = project.state_dir_if_readable(project_root)
+    if project_state_dir is None:
+        return
+    expected_state_dir = project_state_dir.resolve()
     for stage_name in pipeline.list_stages():
         state_dir = pipeline.get_stage(stage_name)["state_dir"]
         if state_dir is not None and state_dir.resolve() != expected_state_dir:
@@ -686,9 +691,12 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
         List of paths to pipeline config files.
     """
     resolved_project_root = project_root.resolve()
-    resolved_state_dir = project.state_dir_for(project_root).resolve()
-    # A state directory at or above the root would exclude the whole project.
-    exclude_state_dir = not resolved_project_root.is_relative_to(resolved_state_dir)
+    state_dir = project.state_dir_if_readable(project_root)
+    # A state directory at or above the root would exclude the whole project; an unknown one
+    # (unreadable config) excludes nothing.
+    excluded_state_dir: pathlib.Path | None = None
+    if state_dir is not None and not resolved_project_root.is_relative_to(state_dir.resolve()):
+        excluded_state_dir = state_dir.resolve()
 
     # Collect all candidate paths grouped by directory
     by_dir = dict[pathlib.Path, list[pathlib.Path]]()
@@ -702,7 +710,7 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
             continue
         if any(part in _SCAN_EXCLUDE_DIRS for part in rel_parts):
             continue
-        if exclude_state_dir and path.resolve().is_relative_to(resolved_state_dir):
+        if excluded_state_dir is not None and path.resolve().is_relative_to(excluded_state_dir):
             continue
         by_dir.setdefault(path.parent, list[pathlib.Path]()).append(path)
 
