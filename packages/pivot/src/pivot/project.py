@@ -8,6 +8,11 @@ logger = logging.getLogger(__name__)
 _project_root_cache: pathlib.Path | None = None
 _state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 
+# The CLI turns this on; loky workers and shell completion never do, so they stay silent.
+_ignored_global_state_dir_warning_enabled = False
+# Global config files whose ignored core.state_dir was already reported in this process.
+_reported_ignored_global_state_dirs = set[pathlib.Path]()
+
 STATE_GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
 /cache/
@@ -63,41 +68,59 @@ def get_project_root() -> pathlib.Path:
     return _project_root_cache
 
 
+def _read_core_state_dir(config_path: pathlib.Path) -> tuple[bool, object]:
+    """Read ``core.state_dir`` from one config file: (present, value)."""
+    import yaml
+
+    from pivot import exceptions
+
+    try:
+        data: object = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False, None
+    except yaml.YAMLError as e:
+        raise exceptions.ConfigError(f"Error reading {config_path}: {e}") from e
+    if not isinstance(data, dict):
+        return False, None
+    core = typing.cast("dict[str, object]", data).get("core")
+    if not isinstance(core, dict):
+        return False, None
+    core_data = typing.cast("dict[str, object]", core)
+    return "state_dir" in core_data, core_data.get("state_dir")
+
+
+def resolve_state_dir_value(root: pathlib.Path, value: str) -> pathlib.Path:
+    """Return the directory a ``core.state_dir`` value names, as the kernel will open it.
+
+    Existing components are resolved, symbolic links included, so ``link/../state`` names the
+    link target's sibling; ``..`` after a missing component applies to the path so far. Every
+    reader and writer uses this result, never a lexical spelling of the value.
+    """
+    return pathlib.Path(os.path.realpath(root / value))
+
+
 def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     """Return the state directory configured for ``root``.
 
     ``core.state_dir`` comes from ``<root>/.pivot/config.yaml`` only: a state directory belongs
-    to one project, so a global value is ignored. Relative values are rooted at ``root``; absent
+    to one project, so a global value is ignored, and reported once per process when the CLI
+    enabled that. A configured value is resolved with ``resolve_state_dir_value``; absent
     configuration keeps state in ``<root>/.pivot``. The ``.pivot`` marker and its configuration
     always remain at the project root.
     """
     if (cached := _state_dir_cache.get(root)) is not None:
         return cached
 
-    import yaml
-
     from pivot import exceptions
 
     config_path = root / ".pivot" / "config.yaml"
-    try:
-        data: object = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        data = None
-    except yaml.YAMLError as e:
-        raise exceptions.ConfigError(f"Error reading {config_path}: {e}") from e
-
-    configured: object = None
-    if isinstance(data, dict):
-        config_data = typing.cast("dict[str, object]", data)
-        core = config_data.get("core")
-        if isinstance(core, dict):
-            configured = typing.cast("dict[str, object]", core).get("state_dir")
+    present, configured = _read_core_state_dir(config_path)
+    warn_if_global_state_dir_ignored(root, shadowed=present)
 
     if configured is None:
         state_dir = root / ".pivot"
-    elif isinstance(configured, str) and configured:
-        state_dir = pathlib.Path(configured)
-        state_dir = state_dir if state_dir.is_absolute() else root / state_dir
+    elif is_valid_state_dir_value(configured):
+        state_dir = resolve_state_dir_value(root, typing.cast("str", configured))
     else:
         raise exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
 
@@ -105,23 +128,62 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
+def is_valid_state_dir_value(value: object) -> bool:
+    """Whether a configured ``core.state_dir`` value names a path, as ``state_dir_for`` requires."""
+    return isinstance(value, str) and bool(value)
+
+
 def state_dir_is_configured(root: pathlib.Path) -> bool:
     """Return whether the local configuration explicitly contains core.state_dir."""
-    import yaml
-
-    try:
-        data: object = yaml.safe_load((root / ".pivot" / "config.yaml").read_text())
-    except FileNotFoundError:
-        return False
-    if not isinstance(data, dict):
-        return False
-    core = typing.cast("dict[str, object]", data).get("core")
-    return isinstance(core, dict) and "state_dir" in core
+    return _read_core_state_dir(root / ".pivot" / "config.yaml")[0]
 
 
 def get_state_dir() -> pathlib.Path:
     """Return the state directory of the current project."""
     return state_dir_for(get_project_root())
+
+
+def enable_ignored_global_state_dir_warning() -> None:
+    """Report an ignored global ``core.state_dir`` from now on in this process."""
+    global _ignored_global_state_dir_warning_enabled
+    _ignored_global_state_dir_warning_enabled = True
+
+
+def ignored_global_state_dir_message(
+    global_path: pathlib.Path, root: pathlib.Path | None, *, shadowed: bool
+) -> str:
+    """The one-line notice that a global ``core.state_dir`` has no effect."""
+    local_path = (
+        "the project's .pivot/config.yaml" if root is None else root / ".pivot" / "config.yaml"
+    )
+    if shadowed:
+        return f"core.state_dir in {global_path} is shadowed by {local_path} and ignored"
+    return f"core.state_dir in {global_path} is ignored; set it in {local_path}"
+
+
+def warn_if_global_state_dir_ignored(root: pathlib.Path | None, *, shadowed: bool) -> None:
+    """Log, once per process, that the global config's ``core.state_dir`` is ignored.
+
+    Silent until ``enable_ignored_global_state_dir_warning`` runs. ``shadowed`` says the project
+    sets its own value.
+    """
+    if not _ignored_global_state_dir_warning_enabled:
+        return
+    from pivot.config import io as config_io
+
+    global_path = config_io.get_global_config_path()
+    if global_path in _reported_ignored_global_state_dirs:
+        return
+    if not _read_core_state_dir(global_path)[0]:
+        return
+    _reported_ignored_global_state_dirs.add(global_path)
+    logger.warning(ignored_global_state_dir_message(global_path, root, shadowed=shadowed))
+
+
+def report_ignored_global_state_dir() -> None:
+    """Report the ignored global value for the current project, as ``state_dir_for`` does."""
+    root = get_project_root()
+    warn_if_global_state_dir_ignored(root, shadowed=state_dir_is_configured(root))
 
 
 def create_gitignore_if_absent(path: pathlib.Path) -> bool:

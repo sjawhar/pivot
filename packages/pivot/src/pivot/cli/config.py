@@ -4,7 +4,7 @@ from typing import Any, cast
 import click
 import pydantic
 
-from pivot import config, exceptions
+from pivot import config, exceptions, project
 from pivot.cli import completion
 
 
@@ -72,7 +72,10 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
             configured_value, source = config.get_config_value(key)
             if source == config.ConfigSource.GLOBAL_IGNORED:
                 value = configured_value
-            click.echo(f"{key} = {_format_value(value)} ({source})")
+            row = f"{key} = {_format_value(value)} ({source})"
+            if key == "core.state_dir" and not project.is_valid_state_dir_value(value):
+                row += " invalid: core.state_dir must be a path"
+            click.echo(row)
 
 
 def _get_nested_value(data: dict[str, Any], key: str) -> Any:
@@ -109,6 +112,9 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         data = config.load_config_file(config.get_global_config_path())
         value = _get_nested_value(data, key)
         source = config.ConfigScope.GLOBAL
+        if key == "core.state_dir" and value is not None:
+            project.report_ignored_global_state_dir()
+            source = config.ConfigSource.GLOBAL_IGNORED
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
         value = _get_nested_value(data, key)

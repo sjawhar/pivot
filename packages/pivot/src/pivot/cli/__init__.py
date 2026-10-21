@@ -182,6 +182,10 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         raise click.UsageError("--verbose and --quiet are mutually exclusive")
     ctx.obj = CliContext(verbose=verbose, quiet=quiet)
     _setup_logging(verbose, quiet)
+    if not ctx.resilient_parsing:
+        from pivot import project
+
+        project.enable_ignored_global_state_dir_warning()
 
 
 def main() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 import signal
 import socket
@@ -260,9 +261,11 @@ def test_init_force_preserves_existing_configured_state_ignore(
 
     assert result.exit_code == 0, result.output
     assert state_ignore.read_text() == "existing content\n"
-    assert f"Leaving {state_ignore}; Pivot does not own it." in result.output
+    # The notice names the file actually kept: the resolver follows ``state-link``.
+    kept = pathlib.Path(os.path.realpath(state_ignore))
+    assert f"Leaving {kept}; Pivot does not own it." in result.output
     created = result.output.split("Created:\n", 1)[1].split("\n\nNext steps:", 1)[0]
-    assert f"  {state_ignore.relative_to(root)}" not in created
+    assert f"  {kept.relative_to(root)}" not in created
 
 
 def test_init_force_overwrites_default_state_ignore(

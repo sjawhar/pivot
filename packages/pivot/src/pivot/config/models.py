@@ -161,7 +161,7 @@ class PivotConfig(pydantic.BaseModel):
 
 # Config keys with descriptions (used by CLI completion)
 CONFIG_KEY_DESCRIPTIONS: dict[str, str] = {
-    "cache.dir": "Cache directory path (default: <state dir>/cache)",
+    "cache.dir": "Local cache directory",
     "cache.checkout_mode": "Checkout strategy (hardlink,symlink,copy)",
     "core.max_workers": "Most parallel execution workers",
     "core.state_dir": "State directory path",

@@ -22,9 +22,6 @@ _merged_config_cache: models.PivotConfig | None = None
 
 DEFAULT_CHECKOUT_MODE_ORDER: list[models.CheckoutMode] = list(models.CheckoutMode)
 
-# Global config files whose ignored core.state_dir was already reported in this process.
-_warned_ignored_global_state_dir = set[pathlib.Path]()
-
 
 def get_global_config_path() -> pathlib.Path:
     """Get user-level config path (~/.config/pivot/config.yaml)."""
@@ -206,37 +203,17 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return result
 
 
-def ignored_global_state_dir_message() -> str:
-    """The one-line notice that a global core.state_dir has no effect."""
-    global_path = get_global_config_path()
-    try:
-        local_path = str(get_local_config_path())
-    except exceptions.ProjectNotInitializedError:
-        local_path = "the project's .pivot/config.yaml"
-    return f"core.state_dir in {global_path} is ignored; set it in {local_path}"
-
-
-def _load_global_config() -> dict[str, Any]:
-    """Load the global config, reporting once per process that its core.state_dir is ignored.
-
-    A state directory belongs to one project, so a shared global value would make projects
-    overwrite each other's lock files.
-    """
-    global_path = get_global_config_path()
-    data = load_config_file(global_path)
-    if (
-        get_nested(data, ["core", "state_dir"]) is not _NOT_FOUND
-        and global_path not in _warned_ignored_global_state_dir
-    ):
-        _warned_ignored_global_state_dir.add(global_path)
-        logger.warning(ignored_global_state_dir_message())
-    return data
-
-
 def _default_cache_dir() -> str:
-    """``<state dir>/cache``, relative to the project root when it lies inside it."""
+    """``<state dir>/cache``, relative to the project root when it lies inside it.
+
+    A hand-edited ``core.state_dir`` that is not a path reports ``.pivot/cache``, as 0.5.2
+    does; commands that use the state directory still refuse that value.
+    """
     root = project.get_project_root()
-    cache_dir = project.state_dir_for(root) / "cache"
+    try:
+        cache_dir = project.state_dir_for(root) / "cache"
+    except exceptions.ConfigError:
+        return ".pivot/cache"
     try:
         return cache_dir.relative_to(root).as_posix()
     except ValueError:
@@ -256,7 +233,7 @@ def get_merged_config() -> models.PivotConfig:
 
     defaults = models.PivotConfig.get_default().model_dump()
 
-    global_data = copy.deepcopy(_load_global_config())
+    global_data = copy.deepcopy(load_config_file(get_global_config_path()))
     unset_nested(global_data, ["core", "state_dir"])
     merged = deep_merge(defaults, global_data)
 
@@ -280,16 +257,19 @@ def clear_config_cache() -> None:
 def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
     """Get value for dotted key, returns (value, source).
 
-    A global ``core.state_dir`` is reported with source ``global, ignored``.
+    A global ``core.state_dir`` is reported with source ``global, ignored``, and the ignored-value
+    warning is issued.
     """
     keys = parse_dotted_key(key)
+    if key == "core.state_dir":
+        project.report_ignored_global_state_dir()
 
     local_data = load_config_file(get_local_config_path())
     local_value = get_nested(local_data, keys)
     if local_value is not _NOT_FOUND:
         return local_value, models.ConfigSource.LOCAL
 
-    global_data = _load_global_config()
+    global_data = load_config_file(get_global_config_path())
     global_value = get_nested(global_data, keys)
     if global_value is not _NOT_FOUND:
         if key == "core.state_dir":
@@ -304,37 +284,69 @@ def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
     return None, models.ConfigSource.UNKNOWN
 
 
-def _validate_state_dir_target(value: str) -> None:
-    """Reject state-directory paths that cannot become a writable directory, before persistence.
+def _refuse_dangling_component(root: pathlib.Path, value: str) -> None:
+    """Refuse a value whose path reaches a dangling symbolic link.
 
-    The path is normalized against the project root first, so ``missing/../state`` is checked
-    as ``state``. The nearest existing entry, found with ``lexists`` so a dangling link counts as
-    existing, decides: a dangling link, a non-directory, or a directory this process cannot
-    write refuses the path.
+    Components are walked as the kernel walks them: ``..`` applies to the directory reached so
+    far, through any link already followed, so ``link/../state`` checks the link target's
+    sibling. A dangling link anywhere on that walk can never become a directory.
+    """
+    written = pathlib.Path(value)
+    if written.is_absolute():
+        current = pathlib.Path(written.anchor)
+        parts = written.parts[1:]
+    else:
+        current = root
+        parts = written.parts
+    for index, part in enumerate(parts):
+        if part == ".":
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        try:
+            is_link = current.is_symlink()
+        except OSError:
+            # An unsearchable parent: the access check below refuses it.
+            is_link = False
+        if not is_link:
+            # A real or missing directory: a later ``..`` steps back past it, as realpath does.
+            continue
+        if not current.exists():
+            role = "core.state_dir" if index == len(parts) - 1 else "core.state_dir parent"
+            raise exceptions.ConfigValidationError(f"{role} is a dangling symlink: {current}")
+        current = pathlib.Path(os.path.realpath(current))
+
+
+def _validate_state_dir_target(value: str) -> None:
+    """Reject state-directory paths that cannot become a usable directory, before persistence.
+
+    A dangling link on the path is refused. Then the path the resolver will use
+    (``project.resolve_state_dir_value``) is checked: its nearest existing entry must be a
+    directory this process can create entries in and search (``W_OK | X_OK``).
     """
     root = project.get_project_root()
-    target = pathlib.Path(os.path.normpath(root / value))
+    _refuse_dangling_component(root, value)
 
+    target = project.resolve_state_dir_value(root, value)
     for candidate in (target, *target.parents):
         if not os.path.lexists(candidate):
             continue
         role = "core.state_dir" if candidate == target else "core.state_dir parent"
-        if candidate.is_symlink() and not candidate.exists():
-            raise exceptions.ConfigValidationError(f"{role} is a dangling symlink: {candidate}")
         if not candidate.is_dir():
             raise exceptions.ConfigValidationError(f"{role} must be a directory: {candidate}")
-        if not os.access(candidate, os.W_OK):
-            raise exceptions.ConfigValidationError(f"{role} is not writable: {candidate}")
+        if not os.access(candidate, os.W_OK | os.X_OK):
+            raise exceptions.ConfigValidationError(
+                f"{role} is not a writable, searchable directory: {candidate}"
+            )
         return
 
 
 def _has_runtime_state(state_dir: pathlib.Path) -> bool:
     """Whether a previous state directory holds more than the project's marker files."""
     marker_files = {"config.yaml", "config.yaml.lock", ".gitignore"}
-    try:
-        return any(path.name not in marker_files for path in state_dir.iterdir())
-    except FileNotFoundError:
-        return False
+    return any(path.name not in marker_files for path in state_dir.iterdir())
 
 
 def _current_state_dir() -> pathlib.Path | None:
@@ -348,17 +360,37 @@ def _current_state_dir() -> pathlib.Path | None:
 def _transition_local_state_dir(old_state_dir: pathlib.Path | None) -> list[str]:
     """Initialize the new directory without moving or discarding prior project state.
 
-    ``.pivot/.gitignore`` is never touched: ``.pivot`` still holds the config and its lock.
+    ``.pivot/.gitignore`` is never touched: ``.pivot`` still holds the config and its lock. An
+    old value that names no readable directory is reported as invalid, as 0.5.2 never read it.
     """
     root = project.get_project_root()
     new_state_dir = project.ensure_state_dir(root)
+    invalid = ["The previous core.state_dir was invalid; nothing was moved."]
     if old_state_dir is None:
-        return ["The previous core.state_dir was invalid; nothing was moved."]
+        return invalid
     if old_state_dir == new_state_dir:
         return []
-    if _has_runtime_state(old_state_dir):
+    try:
+        has_runtime_state = _has_runtime_state(old_state_dir)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return invalid
+    if has_runtime_state:
         return [f"Existing state at {old_state_dir} is no longer used."]
     return []
+
+
+def _global_state_dir_refusal() -> str:
+    """The refusal of a global ``core.state_dir`` write, worded as the ignored-value warning."""
+    try:
+        root: pathlib.Path | None = project.get_project_root()
+    except exceptions.ProjectNotInitializedError:
+        root = None
+    shadowed = root is not None and project.state_dir_is_configured(root)
+    return project.ignored_global_state_dir_message(
+        get_global_config_path(), root, shadowed=shadowed
+    )
 
 
 def _changes_local_state_dir(key: str, scope: models.ConfigScope) -> bool:
@@ -373,7 +405,7 @@ def set_config_value(
     A global ``core.state_dir`` is refused: it would have no effect.
     """
     if key == "core.state_dir" and scope is models.ConfigScope.GLOBAL:
-        raise exceptions.ConfigValidationError(ignored_global_state_dir_message())
+        raise exceptions.ConfigValidationError(_global_state_dir_refusal())
     changes_state_dir = _changes_local_state_dir(key, scope)
     old_state_dir: pathlib.Path | None = None
     if changes_state_dir:

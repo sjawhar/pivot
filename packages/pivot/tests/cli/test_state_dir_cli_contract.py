@@ -334,3 +334,50 @@ def test_config_set_global_state_dir_is_refused(tmp_path: pathlib.Path) -> None:
     assert result.returncode == 1, output
     assert output.strip() == f"Error: {_ignored_warning(global_config, root)}", output
     assert not global_config.exists()
+
+
+def test_config_list_marks_a_hand_edited_empty_state_dir(tmp_path: pathlib.Path) -> None:
+    """N2: with ``state_dir: ''``, config list exits 0 as 0.5.2 does, and marks that row invalid.
+
+    A non-string value (e.g. a list) already fails 0.5.2's schema validation, so it is not here.
+    """
+    root = tmp_path / "project"
+    root.mkdir()
+    _ok(_run(root, "git", "init", "-q"))
+    _ok(_run(root, _PIVOT, "init"))
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: ''\n")
+
+    listed = _run(root, _PIVOT, "config", "list")
+
+    output = listed.stdout + listed.stderr
+    assert listed.returncode == 0, output
+    assert "Traceback" not in output, output
+    assert "cache.dir = .pivot/cache (default)" in listed.stdout, listed.stdout
+    invalid_rows = [line for line in listed.stdout.splitlines() if "invalid" in line]
+    assert len(invalid_rows) == 1, listed.stdout
+    assert invalid_rows[0].startswith("core.state_dir = "), listed.stdout
+
+
+def test_warning_names_a_shadowed_global_state_dir(tmp_path: pathlib.Path) -> None:
+    """N3: when the project sets its own value, the global one is reported as shadowed."""
+    home = tmp_path / "home"
+    global_config = _write_global_state_dir(home, "globalstate")
+    root = _project(home, tmp_path / "project", "input\n")
+    _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "localstate"))
+
+    status = _run_with_home(root, home, _PIVOT, "status")
+
+    expected = (
+        f"core.state_dir in {global_config} is shadowed by "
+        f"{root / '.pivot' / 'config.yaml'} and ignored"
+    )
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert status.stderr.splitlines().count(expected) == 1, status.stderr
+    assert "set it in" not in status.stderr, status.stderr
+
+
+def test_cache_dir_completion_help_matches_pivot_052() -> None:
+    """N5: the completion description for cache.dir is 0.5.2's text."""
+    from pivot.config import models
+
+    assert models.CONFIG_KEY_DESCRIPTIONS["cache.dir"] == "Local cache directory"
