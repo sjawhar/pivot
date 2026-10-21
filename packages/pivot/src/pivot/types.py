@@ -689,6 +689,7 @@ class DataDiffResult(TypedDict):
     """Result of comparing two data files."""
 
     path: str
+    change_type: ChangeType
     old_rows: int | None
     new_rows: int | None
     old_cols: list[str] | None

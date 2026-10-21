@@ -397,63 +397,56 @@ def diff_data_files(
     old_path: pathlib.Path | None,
     new_path: pathlib.Path | None,
     path_display: str,
+    *,
+    change_type: ChangeType,
     key_columns: list[str] | None = None,
     max_rows: int = 10000,
 ) -> DataDiffResult:
-    """Compare two data files and return detailed diff result."""
-    # Handle file added/removed cases
-    if old_path is None and new_path is not None:
-        new_df = load_dataframe(new_path)
-        new_cols = list(new_df.columns)
-        new_dtypes = {col: str(dtype) for col, dtype in new_df.dtypes.items()}
-        return DataDiffResult(
-            path=path_display,
-            old_rows=None,
-            new_rows=len(new_df),
-            old_cols=None,
-            new_cols=new_cols,
-            schema_changes=[
+    """Compare two data files and return detailed diff result.
+
+    A None path is a side that does not exist, or one that ``change_type`` says exists but
+    could not be read, such as a git HEAD object missing from the local cache; that side's
+    rows and columns are None.
+    """
+    if old_path is None or new_path is None:
+        old_df = None if old_path is None else load_dataframe(old_path)
+        new_df = None if new_path is None else load_dataframe(new_path)
+        schema_changes = list[SchemaChange]()
+        if change_type == ChangeType.ADDED and new_df is not None:
+            new_dtypes = {col: str(dtype) for col, dtype in new_df.dtypes.items()}
+            schema_changes = [
                 SchemaChange(
                     column=col,
                     old_dtype=None,
                     new_dtype=new_dtypes[col],
                     change_type=ChangeType.ADDED,
                 )
-                for col in new_cols
-            ],
-            row_changes=[],
-            reorder_only=False,
-            truncated=False,
-            summary_only=True,
-        )
-
-    if old_path is not None and new_path is None:
-        old_df = load_dataframe(old_path)
-        old_cols = list(old_df.columns)
-        old_dtypes = {col: str(dtype) for col, dtype in old_df.dtypes.items()}
-        return DataDiffResult(
-            path=path_display,
-            old_rows=len(old_df),
-            new_rows=None,
-            old_cols=old_cols,
-            new_cols=None,
-            schema_changes=[
+                for col in new_df.columns
+            ]
+        elif change_type == ChangeType.REMOVED and old_df is not None:
+            old_dtypes = {col: str(dtype) for col, dtype in old_df.dtypes.items()}
+            schema_changes = [
                 SchemaChange(
                     column=col,
                     old_dtype=old_dtypes[col],
                     new_dtype=None,
                     change_type=ChangeType.REMOVED,
                 )
-                for col in old_cols
-            ],
+                for col in old_df.columns
+            ]
+        return DataDiffResult(
+            path=path_display,
+            change_type=change_type,
+            old_rows=None if old_df is None else len(old_df),
+            new_rows=None if new_df is None else len(new_df),
+            old_cols=None if old_df is None else list(old_df.columns),
+            new_cols=None if new_df is None else list(new_df.columns),
+            schema_changes=schema_changes,
             row_changes=[],
             reorder_only=False,
             truncated=False,
             summary_only=True,
         )
-
-    if old_path is None or new_path is None:  # pragma: no cover
-        raise DataError("Both old and new paths are None")
 
     # Check file sizes for large file handling - BEFORE loading
     old_size = old_path.stat().st_size
@@ -469,6 +462,7 @@ def diff_data_files(
         schema_changes = _diff_schema(old_cols, new_cols, old_dtypes, new_dtypes)
         return DataDiffResult(
             path=path_display,
+            change_type=change_type,
             old_rows=get_row_count(old_path),
             new_rows=get_row_count(new_path),
             old_cols=old_cols,
@@ -506,6 +500,7 @@ def diff_data_files(
     if reorder_only:
         return DataDiffResult(
             path=path_display,
+            change_type=change_type,
             old_rows=len(old_df),
             new_rows=len(new_df),
             old_cols=old_cols,
@@ -529,6 +524,7 @@ def diff_data_files(
 
     return DataDiffResult(
         path=path_display,
+        change_type=change_type,
         old_rows=len(old_df),
         new_rows=len(new_df),
         old_cols=old_cols,
@@ -954,8 +950,12 @@ def format_diff_summary(result: DataDiffResult) -> str:
         lines.append(f"  Rows: {old_rows:,} -> {new_rows:,} ({diff_str})")
     elif old_rows is not None:
         lines.append(f"  Rows: {old_rows:,} (removed)")
-    elif new_rows is not None:
+    elif new_rows is not None and result["change_type"] == ChangeType.ADDED:
         lines.append(f"  Rows: {new_rows:,} (added)")
+    elif new_rows is not None:
+        lines.append(f"  Rows: unknown -> {new_rows:,}")
+    else:
+        lines.append("  Rows: unknown (removed)")
 
     # Column counts
     old_cols = result["old_cols"]

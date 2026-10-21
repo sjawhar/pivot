@@ -427,8 +427,18 @@ class AgentRpcHandler:
                             old_path_file = data_mod.restore_data_from_cache(_path, _old_hash)
                         if _new_hash:
                             new_path_file = data_mod.restore_data_from_cache(_path, _new_hash)
+                        if not _old_hash:
+                            change_type = types.ChangeType.ADDED
+                        elif not _new_hash:
+                            change_type = types.ChangeType.REMOVED
+                        else:
+                            change_type = types.ChangeType.MODIFIED
                         return data_mod.diff_data_files(
-                            old_path_file, new_path_file, _path, max_rows=_max_rows
+                            old_path_file,
+                            new_path_file,
+                            _path,
+                            change_type=change_type,
+                            max_rows=_max_rows,
                         )
                     finally:
                         if old_path_file:

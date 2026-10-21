@@ -56,8 +56,16 @@ class DiffSummaryPanel(textual.widgets.Static):
             summary_lines.append(f"Rows: {old_rows:,} -> {new_rows:,} ({diff_str})")
         elif old_rows is not None:
             summary_lines.append(f"Rows: {old_rows:,} [red](removed)[/]")
-        elif new_rows is not None:
+        elif new_rows is not None and self._result["change_type"] == ChangeType.ADDED:
             summary_lines.append(f"Rows: {new_rows:,} [green](added)[/]")
+        elif new_rows is not None:
+            summary_lines.append(f"Rows: unknown -> {new_rows:,}")
+        else:
+            summary_lines.append("Rows: unknown [red](removed)[/]")
+        if old_rows is None and self._result["change_type"] != ChangeType.ADDED:
+            summary_lines.append(
+                "[yellow]Its git HEAD content is not in the local cache; run pivot pull to compare it[/]"
+            )
 
         # Column counts
         old_cols = self._result["old_cols"]

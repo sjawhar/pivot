@@ -12,6 +12,7 @@ def test_diff_summary_panel_basic() -> None:
     """DiffSummaryPanel should initialize without error."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=150,
         old_cols=["id", "name"],
@@ -31,6 +32,7 @@ def test_diff_summary_panel_reorder_only() -> None:
     """DiffSummaryPanel should handle reorder-only case."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=100,
         old_cols=["id", "name"],
@@ -97,6 +99,7 @@ def test_file_diff_screen_init() -> None:
     """FileDiffScreen should initialize with result."""
     result = DataDiffResult(
         path="test.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=10,
         new_rows=12,
         old_cols=["a", "b"],
@@ -121,6 +124,7 @@ def test_data_diff_app_init() -> None:
     results = [
         DataDiffResult(
             path="data.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=100,
             new_rows=110,
             old_cols=["id", "name"],
@@ -142,6 +146,7 @@ def test_data_diff_app_multiple_results() -> None:
     results = [
         DataDiffResult(
             path="a.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=10,
             new_rows=20,
             old_cols=["x"],
@@ -154,6 +159,7 @@ def test_data_diff_app_multiple_results() -> None:
         ),
         DataDiffResult(
             path="b.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=5,
             new_rows=5,
             old_cols=["y"],

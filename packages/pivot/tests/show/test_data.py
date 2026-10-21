@@ -532,7 +532,7 @@ def test_diff_data_files_new_file(tmp_path: Path) -> None:
     new_file = tmp_path / "data.csv"
     new_file.write_text("id,name\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(None, new_file, "data.csv")
+    result = data.diff_data_files(None, new_file, "data.csv", change_type=ChangeType.ADDED)
 
     assert result["old_rows"] is None
     assert result["new_rows"] == 2
@@ -547,11 +547,42 @@ def test_diff_data_files_deleted_file(tmp_path: Path) -> None:
     old_file = tmp_path / "data.csv"
     old_file.write_text("id,name\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(old_file, None, "data.csv")
+    result = data.diff_data_files(old_file, None, "data.csv", change_type=ChangeType.REMOVED)
 
     assert result["old_rows"] == 2
     assert result["new_rows"] is None
     assert result["summary_only"] is True
+
+
+@pytest.mark.parametrize(
+    ("new_text", "change_type", "new_rows", "new_cols"),
+    [
+        pytest.param("id\n1\n2\n3\n", ChangeType.MODIFIED, 3, ["id"], id="modified"),
+        pytest.param(None, ChangeType.REMOVED, None, None, id="removed"),
+    ],
+)
+def test_diff_data_files_reports_an_unreadable_old_side_as_unknown(
+    tmp_path: Path,
+    new_text: str | None,
+    change_type: ChangeType,
+    new_rows: int | None,
+    new_cols: list[str] | None,
+) -> None:
+    """An old side that exists but could not be read keeps its change type, with unknown
+    counts and no schema changes, and its text summary says the HEAD rows are unknown."""
+    new_file = None
+    if new_text is not None:
+        new_file = tmp_path / "data.csv"
+        new_file.write_text(new_text)
+
+    result = data.diff_data_files(None, new_file, "data.csv", change_type=change_type)
+
+    assert result["change_type"] == change_type
+    assert (result["old_rows"], result["new_rows"]) == (None, new_rows)
+    assert (result["old_cols"], result["new_cols"]) == (None, new_cols)
+    assert result["schema_changes"] == []
+    rows_line = "  Rows: unknown -> 3" if new_rows else "  Rows: unknown (removed)"
+    assert data.format_diff_summary(result) == f"data.csv:\n{rows_line}"
 
 
 def test_diff_data_files_reorder_only(tmp_path: Path) -> None:
@@ -561,7 +592,7 @@ def test_diff_data_files_reorder_only(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n3,charlie\n")
     new_file.write_text("id,name\n3,charlie\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv")
+    result = data.diff_data_files(old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED)
 
     assert result["reorder_only"] is True
     assert result["row_changes"] == []
@@ -574,7 +605,9 @@ def test_diff_data_files_with_key(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n")
     new_file.write_text("id,name\n1,alice\n2,bobby\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=["id"])
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["id"]
+    )
 
     assert result["reorder_only"] is False
     assert len(result["row_changes"]) == 1
@@ -589,7 +622,9 @@ def test_diff_data_files_missing_key_column_old(tmp_path: Path) -> None:
     new_file.write_text("id,name,extra\n1,alice,x\n")
 
     with pytest.raises(data.DataError, match="Key column.*not in old file"):
-        data.diff_data_files(old_file, new_file, "data.csv", key_columns=["extra"])
+        data.diff_data_files(
+            old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["extra"]
+        )
 
 
 def test_diff_data_files_missing_key_column_new(tmp_path: Path) -> None:
@@ -600,7 +635,9 @@ def test_diff_data_files_missing_key_column_new(tmp_path: Path) -> None:
     new_file.write_text("id,name\n1,alice\n")
 
     with pytest.raises(data.DataError, match="Key column.*not in new file"):
-        data.diff_data_files(old_file, new_file, "data.csv", key_columns=["extra"])
+        data.diff_data_files(
+            old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["extra"]
+        )
 
 
 def test_diff_data_files_large_file_summary_only(
@@ -615,7 +652,9 @@ def test_diff_data_files_large_file_summary_only(
     # Monkeypatch the size threshold to trigger large file path
     monkeypatch.setattr(data, "_MAX_IN_MEMORY_SIZE", 1)
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None)
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=None
+    )
 
     assert result["summary_only"] is True
     assert result["row_changes"] == []
@@ -635,7 +674,9 @@ def test_diff_data_files_positional_diff(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n")
     new_file.write_text("id,name\n1,alice\n2,bobby\n3,carol\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None)
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=None
+    )
 
     assert result["reorder_only"] is False
     assert result["summary_only"] is False
@@ -654,7 +695,14 @@ def test_diff_data_files_positional_truncation(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,a\n2,b\n3,c\n4,d\n5,e\n")
     new_file.write_text("id,name\n1,x\n2,y\n3,z\n4,w\n5,v\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None, max_rows=2)
+    result = data.diff_data_files(
+        old_file,
+        new_file,
+        "data.csv",
+        change_type=ChangeType.MODIFIED,
+        key_columns=None,
+        max_rows=2,
+    )
 
     assert result["truncated"] is True
     # Should only have 2 changes due to max_rows
@@ -795,6 +843,7 @@ def test_format_diff_summary_basic(tmp_path: Path) -> None:
     """Format basic diff summary."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=110,
         old_cols=["id", "name"],
@@ -823,6 +872,7 @@ def test_format_diff_summary_reorder_only() -> None:
     """Format reorder-only summary."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=100,
         old_cols=["id", "name"],
@@ -845,6 +895,7 @@ def test_format_diff_table_json() -> None:
     diffs = [
         DataDiffResult(
             path="data.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=10,
             new_rows=10,
             old_cols=["id"],
@@ -875,6 +926,7 @@ def test_format_diff_table_plain_output() -> None:
     diffs = [
         DataDiffResult(
             path="data.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=100,
             new_rows=150,
             old_cols=["id", "name"],
@@ -887,6 +939,7 @@ def test_format_diff_table_plain_output() -> None:
         ),
         DataDiffResult(
             path="train.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=50,
             new_rows=50,
             old_cols=["x", "y"],
@@ -1148,6 +1201,7 @@ def test_format_diff_summary_removed_file() -> None:
     """Format summary for removed file."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.REMOVED,
         old_rows=50,
         new_rows=None,
         old_cols=["id", "name"],
@@ -1169,6 +1223,7 @@ def test_format_diff_summary_added_file() -> None:
     """Format summary for added file."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.ADDED,
         old_rows=None,
         new_rows=100,
         old_cols=None,
@@ -1190,6 +1245,7 @@ def test_format_diff_summary_with_schema_changes() -> None:
     """Format summary with various schema changes."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=100,
         old_cols=["id", "old_col", "modified_col"],
@@ -1228,6 +1284,7 @@ def test_format_diff_summary_with_row_changes() -> None:
     """Format summary with row changes."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=105,
         old_cols=["id", "name"],

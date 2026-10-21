@@ -83,82 +83,54 @@ def diff(
             click.echo("No data file changes detected.")
         return
 
-    if no_tui or summary:
-        # Non-interactive output
-        diff_results = list[DataDiffResult]()
-        temp_files = list[pathlib.Path]()
-        try:
-            for diff_entry in hash_diffs:
-                rel_path = diff_entry["path"]
-                old_hash = diff_entry["old_hash"]
-
-                # Restore old file from cache if needed
-                old_path: pathlib.Path | None = None
-                if old_hash is not None:
-                    old_path = data_module.restore_data_from_cache(rel_path, old_hash)
-                    if old_path is not None:
-                        temp_files.append(old_path)
-                new_path = workspace_member_paths.get(rel_path)
-
-                # When --positional is set, don't use key columns
-                effective_keys = None if positional else key_columns
-                result = data_module.diff_data_files(
-                    old_path=old_path,
-                    new_path=new_path,
-                    path_display=rel_path,
-                    key_columns=effective_keys,
-                    max_rows=max_rows,
-                )
-                diff_results.append(result)
-
-            # Format output
-            output = data_module.format_diff_table(
-                diff_results,
-                output_format,
-            )
-            click.echo(output)
-        finally:
-            for temp_file in temp_files:
-                with contextlib.suppress(OSError):
-                    temp_file.unlink(missing_ok=True)
-    else:
-        # Launch TUI — compute diffs first, then pass to TUI
+    run_app = None
+    if not (no_tui or summary):
         try:
             from pivot_tui import diff as data_tui
         except ImportError as err:
             raise click.UsageError(
                 "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
             ) from err
+        run_app = data_tui.run_diff_app
 
-        diff_results = list[DataDiffResult]()
-        temp_files = list[pathlib.Path]()
-        try:
-            for diff_entry in hash_diffs:
-                rel_path = diff_entry["path"]
-                old_hash = diff_entry["old_hash"]
+    # When --positional is set, don't use key columns
+    effective_keys = None if positional else key_columns
+    diff_results = list[DataDiffResult]()
+    temp_files = list[pathlib.Path]()
+    try:
+        for diff_entry in hash_diffs:
+            rel_path = diff_entry["path"]
+            old_hash = diff_entry["old_hash"]
 
-                tui_old_path: pathlib.Path | None = None
-                if old_hash is not None:
-                    tui_old_path = data_module.restore_data_from_cache(rel_path, old_hash)
-                    if tui_old_path is not None:
-                        temp_files.append(tui_old_path)
-                new_path = workspace_member_paths.get(rel_path)
+            # Restore old file from cache if needed
+            old_path: pathlib.Path | None = None
+            if old_hash is not None:
+                old_path = data_module.restore_data_from_cache(rel_path, old_hash)
+                if old_path is None:
+                    logger.warning(
+                        "%s: its git HEAD content is not in the local cache; run pivot pull to compare it",
+                        rel_path,
+                    )
+                else:
+                    temp_files.append(old_path)
+            result = data_module.diff_data_files(
+                old_path=old_path,
+                new_path=workspace_member_paths.get(rel_path),
+                path_display=rel_path,
+                change_type=diff_entry["change_type"],
+                key_columns=effective_keys,
+                max_rows=max_rows,
+            )
+            diff_results.append(result)
 
-                effective_keys = None if positional else key_columns
-                result = data_module.diff_data_files(
-                    old_path=tui_old_path,
-                    new_path=new_path,
-                    path_display=rel_path,
-                    key_columns=effective_keys,
-                    max_rows=max_rows,
-                )
-                diff_results.append(result)
-
-            data_tui.run_diff_app(diff_results)
-        finally:
-            for temp_file in temp_files:
-                with contextlib.suppress(OSError):
-                    temp_file.unlink(missing_ok=True)
+        if run_app is None:
+            click.echo(data_module.format_diff_table(diff_results, output_format))
+        else:
+            run_app(diff_results)
+    finally:
+        for temp_file in temp_files:
+            with contextlib.suppress(OSError):
+                temp_file.unlink(missing_ok=True)
 
 
 @cli_decorators.pivot_command(auto_discover=False)

@@ -23,7 +23,7 @@ from pivot.engine.agent_rpc import (
 )
 from pivot.engine.engine import Engine
 from pivot.engine.types import EventSource, InputEvent, OutputEvent, StageStarted
-from pivot.types import DataDiffResult
+from pivot.types import ChangeType, DataDiffResult
 from tests import helpers
 
 
@@ -1806,6 +1806,7 @@ def _make_diff_result(path: str = "output.csv") -> DataDiffResult:
     """Create a minimal DataDiffResult for testing."""
     return DataDiffResult(
         path=path,
+        change_type=ChangeType.MODIFIED,
         old_rows=10,
         new_rows=12,
         old_cols=["a", "b"],

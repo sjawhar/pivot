@@ -2,28 +2,6 @@
 
 <!-- version list -->
 
-## Unreleased
-
-### Bug Fixes
-
-- **compose**: After upgrading, stages with outputs rerun once because output tags are part of
-  their fingerprint. Stages with no outputs remain cached.
-- **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff`
-  resolves them into workspace files.
-- **diff**: One selection decides, for git HEAD and the workspace, which stage outputs and
-  directory members each target names. `pivot diff .` compares every output, and a file inside a
-  `directory` or `pathlib.Path` directory output is read only through that output's member map:
-  checkout symlinks to the configured cache are members, other symlinks are left out with a
-  warning naming the output, and manifest paths containing control characters are refused. A
-  target that names no CSV, JSON or JSONL file is named in a warning and not compared. Both sides
-  are keyed by path: an output that moves to a new path is removed at the path git HEAD recorded
-  and added at its new one, and a path that holds a file at git HEAD and a directory in the
-  workspace, or the reverse, is named with both kinds and not compared.
-- **diff**: A stage whose output path changes with its loader, such as `loaders.CSV()` to
-  `loaders.DataFrameJSONL()`, no longer exits 1 with `ValueError('Invalid JSON …')`: the committed
-  file is removed at its old path and the new file added at the new one.
-
-
 ## v0.5.2 (2026-10-20)
 
 ### Bug Fixes

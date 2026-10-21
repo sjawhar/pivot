@@ -2425,6 +2425,116 @@ def test_diff_on_a_directory_output_compares_each_of_its_files(tmp_path: pathlib
     assert "data/d/bundle.dat/all.csv:\n  Rows: 3 -> 4 (+1)" in path_output, path_output
 
 
+def test_diff_json_names_each_entry_change_type(tmp_path: pathlib.Path) -> None:
+    """Every `--json` entry carries `change_type`, one of `added`, `removed` and `modified`,
+    and the text output for the same diff is unchanged."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\nkeep,5\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\nval,4\nkeep,5\n")
+    _ok(_pivot(root, "repro"))
+
+    result = _pivot(root, "diff", "--json", "d/split")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    kinds = {
+        e["path"]: (e["change_type"], e["old_rows"], e["new_rows"])
+        for e in json.loads(result.stdout)
+    }
+    assert kinds == {
+        "data/d/split/test.csv": ("removed", 1, None),
+        "data/d/split/train.csv": ("modified", 1, 2),
+        "data/d/split/val.csv": ("added", None, 1),
+    }, kinds
+    assert "local cache" not in result.stderr, result.stderr
+
+
+def _fresh_clone(tmp_path: pathlib.Path, pipeline_py: str) -> pathlib.Path:
+    """A project committed with its outputs, then cloned: the clone has no `.pivot/cache`."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _project(source, {"pipeline.py": pipeline_py, "data/raw/rows.csv": "v\n1\n2\n"})
+    _ok(_pivot(source, "repro"))
+    _commit(source, "first run")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(source), str(clone)], check=True)
+    assert not (clone / ".pivot" / "cache").exists()
+    return clone
+
+
+@pytest.mark.parametrize(
+    ("moved", "expected", "text"),
+    [
+        pytest.param(
+            False,
+            {"data/d/make.csv": ("modified", None, 3)},
+            ["data/d/make.csv:\n  Rows: unknown -> 3"],
+            id="modified",
+        ),
+        pytest.param(
+            True,
+            {
+                "data/d/make/all.csv": ("removed", None, None),
+                "data/d/make.csv": ("added", None, 3),
+            },
+            [
+                "data/d/make/all.csv:\n  Rows: unknown (removed)",
+                "data/d/make.csv:\n  Rows: 3 (added)",
+            ],
+            id="moved",
+        ),
+    ],
+)
+def test_diff_in_a_fresh_clone_reports_a_head_side_missing_from_the_cache(
+    tmp_path: pathlib.Path,
+    moved: bool,
+    expected: dict[str, tuple[str, int | None, int | None]],
+    text: list[str],
+) -> None:
+    """A clone that never pulled has no cache object for git HEAD's side. Each such entry is
+    listed at its path with its change type and unknown HEAD counts, stderr names it once with
+    the fix, and every other entry is compared, in `--json`, `--no-tui` and the TUI."""
+    clone = _fresh_clone(tmp_path, _MAKE_DIRECTORY_PIPELINE if moved else _MAKE_FILE_PIPELINE)
+    if moved:
+        (clone / "pipeline.py").write_text(_MAKE_FILE_PIPELINE)
+    (clone / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    tui_capture = _write_tui_capture_module(clone)
+    _ok(_pivot(clone, "repro"))
+    (missing,) = [path for path, (kind, _, _) in expected.items() if kind != "added"]
+    line = (
+        f"{missing}: its git HEAD content is not in the local cache; run pivot pull to compare it"
+    )
+
+    for target in ("d/make", "."):
+        result = _pivot(clone, "diff", "--json", target)
+        assert result.returncode == 0, (target, result.stdout + result.stderr)
+        entries = json.loads(result.stdout)
+        kinds = {e["path"]: (e["change_type"], e["old_rows"], e["new_rows"]) for e in entries}
+        assert kinds == expected, (target, kinds)
+        assert result.stderr.count(line) == 1, (target, result.stderr)
+
+    text_result = _pivot(clone, "diff", "--no-tui", "d/make")
+    assert text_result.returncode == 0, text_result.stdout + text_result.stderr
+    for block in text:
+        assert block in text_result.stdout, text_result.stdout
+    assert text_result.stderr.count(line) == 1, text_result.stderr
+
+    tui_result = _pivot(clone, "diff", "d/make")
+    assert tui_result.returncode == 0, tui_result.stdout + tui_result.stderr
+    tui_kinds = {
+        e["path"]: (e["change_type"], e["old_rows"], e["new_rows"])
+        for e in json.loads(tui_capture.read_text())
+    }
+    assert tui_kinds == expected, tui_kinds
+    assert tui_result.stderr.count(line) == 1, tui_result.stderr
+
+
 def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -3340,22 +3450,36 @@ with Pipeline("d") as pipeline:
             },
             id="two-moved-to-one-path",
         ),
+        pytest.param(
+            {"other": "data/d/make.csv", "make": None},
+            {
+                "d/other": {"data/d/make.csv": (1, 3), "data/d/other.csv": (None, 1)},
+                "d/make": {"data/d/make.csv": (1, 3)},
+                "data/d/make.csv": {"data/d/make.csv": (1, 3)},
+                ".": {"data/d/make.csv": (1, 3), "data/d/other.csv": (None, 1)},
+            },
+            id="moved-onto-an-output-with-no-lock",
+        ),
     ],
 )
 def test_diff_keeps_one_head_entry_for_a_path_two_locks_record(
     tmp_path: pathlib.Path,
-    head_paths: dict[str, str],
+    head_paths: dict[str, str | None],
     expected: dict[str, dict[str, tuple[int | None, int | None]]],
 ) -> None:
     """When two committed HEAD locks record one path, which takes a hand-edited lock, the path
     keeps the HEAD entry of the output that lives there, or else the first registered output's;
-    the other entry is dropped."""
+    the other entry is dropped. A moved entry placed at a current output with no HEAD entry of
+    its own stays selectable through its own stage. A None path deletes that stage's lock."""
     root = _project(
         tmp_path, {"pipeline.py": _MAKE_AND_OTHER_PIPELINE, "data/raw/rows.csv": "v\n1\n2\n"}
     )
     _ok(_pivot(root, "repro"))
     for stage_name, head_path in head_paths.items():
         lock_path = root / ".pivot" / "stages" / "d" / f"{stage_name}.lock"
+        if head_path is None:
+            lock_path.unlink()
+            continue
         lock_data = yaml.safe_load(lock_path.read_text())
         lock_data["outs"][0]["path"] = head_path
         lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
