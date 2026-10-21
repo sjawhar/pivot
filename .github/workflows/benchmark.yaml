@@ -58,10 +58,12 @@ jobs:
           || '["multi","chain-10","chain-100","chain-1000","fan-10","fan-100","fan-1000","diamond-10","diamond-100","diamond-1000"]') }}
 
     steps:
+      # A pull request is measured as GitHub merges it: the head is the merge commit, whose
+      # workflow file and harness are the ones running, and the base is its first parent.
       - name: Check out the head
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || inputs.head || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && github.sha || inputs.head || 'main' }}
           path: head
           fetch-depth: 0
 
@@ -69,11 +71,12 @@ jobs:
         id: base
         working-directory: head
         env:
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_SHA: ${{ github.sha }}
           INPUT_BASE: ${{ inputs.base }}
         run: |-
-          if [ -n "$PR_BASE" ]; then
-            echo "ref=$PR_BASE" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = pull_request ]; then
+            echo "ref=$(git rev-parse "$MERGE_SHA^1")" >> "$GITHUB_OUTPUT"
           elif [ -n "$INPUT_BASE" ]; then
             echo "ref=$INPUT_BASE" >> "$GITHUB_OUTPUT"
           else
