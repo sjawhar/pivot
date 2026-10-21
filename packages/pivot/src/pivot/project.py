@@ -12,8 +12,8 @@ _state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 _state_dir_warnings_enabled = False
 # Global config files whose ignored core.state_dir was already reported in this process.
 _reported_ignored_global_state_dirs = set[pathlib.Path]()
-# Project config files already reported as unreadable in this process.
-_reported_unreadable_configs = set[pathlib.Path]()
+# Project config files whose unusable state directory was already reported in this process.
+_reported_unusable_state_dirs = set[pathlib.Path]()
 
 STATE_GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
@@ -117,31 +117,67 @@ def _resolve_configured_state_dir(
     return state_dir
 
 
-def state_dir_if_readable(root: pathlib.Path) -> pathlib.Path | None:
-    """Return ``state_dir_for(root)``, or None when ``<root>/.pivot/config.yaml`` cannot be read.
+def state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
+    """The state directory of a command that 0.5.2 ran without one; nothing is created here.
 
-    Loading and listing a pipeline never needs its state, so they go on without it, as 0.5.2
-    did, after one warning per process once the CLI enabled warnings. Every command that uses
-    the state directory still fails reading the file, with the same message.
+    The configured directory when ``<root>/.pivot/config.yaml`` can be read, its
+    ``core.state_dir`` is a path, and that path is or can become a directory this process
+    writes (``state_dir_target_problem``). Otherwise the default ``<root>/.pivot``, after one
+    warning per config file once the CLI enabled warnings. Commands that read or write the
+    configured state resolve it with ``ensure_state_dir`` and fail where 0.5.2 failed.
     """
-    if (cached := _state_dir_cache.get(root)) is not None:
-        return cached
-
     from pivot import exceptions
-    from pivot.config import io as config_io
 
     config_path = root / ".pivot" / "config.yaml"
+    reason = "The state directory is unknown"
     try:
-        present, configured = config_io.read_config_file_value(config_path, "core.state_dir")
+        state_dir = state_dir_for(root)
     except exceptions.ConfigError as e:
-        if _state_dir_warnings_enabled and config_path not in _reported_unreadable_configs:
-            _reported_unreadable_configs.add(config_path)
-            logger.warning(
-                f"{e}. The state directory is unknown; "
-                + "commands that use it will fail until the file is fixed."
-            )
+        problem = str(e)
+    except UnicodeDecodeError as e:
+        problem = f"{config_path} is not valid UTF-8: {e}"
+    else:
+        if state_dir == root / ".pivot":
+            return state_dir
+        target_problem = state_dir_target_problem(state_dir)
+        if target_problem is None:
+            return state_dir
+        problem = f"{target_problem} (core.state_dir in {config_path})"
+        reason = "The state directory cannot be used"
+    if _state_dir_warnings_enabled and config_path not in _reported_unusable_state_dirs:
+        _reported_unusable_state_dirs.add(config_path)
+        logger.warning(f"{problem}. {reason}; commands that do not need it use the default .pivot.")
+    return root / ".pivot"
+
+
+def ensure_state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
+    """``state_dir_or_default``, created as ``ensure_state_dir`` creates it.
+
+    For a command that 0.5.2 ran and that writes where 0.5.2 wrote to ``.pivot`` (the plot
+    gallery, the completion cache).
+    """
+    state_dir = state_dir_or_default(root)
+    if state_dir != root / ".pivot":
+        ensure_state_dir(root)
+    return state_dir
+
+
+def state_dir_target_problem(target: pathlib.Path) -> str | None:
+    """Why ``target`` cannot become a state directory, or None when it is or can be one.
+
+    Its nearest existing entry must be a directory this process can create entries in and
+    search (``W_OK | X_OK``).
+    """
+    for candidate in (target, *target.parents):
+        if not os.path.lexists(candidate):
+            continue
+        role = "core.state_dir" if candidate == target else "core.state_dir parent"
+        if not os.path.isdir(candidate):
+            return f"{role} must be a directory: {candidate}"
+        if not os.access(candidate, os.W_OK | os.X_OK):
+            return f"{role} is not a writable, searchable directory: {candidate}"
         return None
-    return _resolve_configured_state_dir(root, config_path, present, configured)
+    return None
 
 
 def is_valid_state_dir_value(value: object) -> bool:
@@ -163,7 +199,7 @@ def get_state_dir() -> pathlib.Path:
 
 
 def enable_state_dir_warnings() -> None:
-    """Report an ignored global ``core.state_dir`` and an unreadable project config from now on."""
+    """Report an ignored global ``core.state_dir`` and an unusable project one from now on."""
     global _state_dir_warnings_enabled
     _state_dir_warnings_enabled = True
 
@@ -241,11 +277,25 @@ def create_gitignore_if_absent(path: pathlib.Path) -> bool:
 
 
 def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
-    """Create an initialized project's state directory and default ignore file when absent."""
+    """Return an initialized project's state directory, creating it when absent.
+
+    Raises ``ConfigError`` as ``state_dir_for`` does. A directory this call creates gets the
+    default ``.gitignore``. One that already exists is left as it is, so a deleted
+    ``.pivot/.gitignore`` stays deleted until ``init`` writes it. A directory that cannot be
+    created (``state_dir_target_problem``) is returned as it is, so the command fails where it
+    opens it, as 0.5.2 did.
+    """
     state_dir = state_dir_for(root)
-    if not (root / ".pivot").is_dir():
+    if (
+        os.path.isdir(state_dir)
+        or not (root / ".pivot").is_dir()
+        or state_dir_target_problem(state_dir) is not None
+    ):
         return state_dir
-    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        state_dir.mkdir(parents=True)
+    except FileExistsError:
+        return state_dir
     create_gitignore_if_absent(state_dir / ".gitignore")
     return state_dir
 

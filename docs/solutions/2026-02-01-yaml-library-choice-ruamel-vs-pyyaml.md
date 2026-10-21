@@ -102,7 +102,7 @@ The two libraries also fail differently: `config/io.py` reports `Invalid YAML in
 
 Exceptions, each kept to match release 0.5.2:
 
-- `pivot import` reads a source repository's `remotes` and `default_remote` with PyYAML (`import_artifact.read_remote_config`), as 0.5.2 does, and reads the same file's `core.state_dir` with `config_io.parse_config_yaml`. A comment at that call states that the two parses are deliberate.
+- `pivot import` reads a source repository's `remotes` and `default_remote` with PyYAML (`import_artifact.read_remote_config`), as 0.5.2 does, and reads the same file's `core.state_dir` with `config_io.parse_config_yaml`. A comment at that call states that the two parses are deliberate. When the ruamel parse fails where PyYAML succeeded (a duplicate key, for one), the import warns and reads the source's locks from `.pivot`, as 0.5.2 did.
 - `remote/config.py:55` (`_load_raw_config`, behind `pivot remote` and remote lookup) and `cli/completion.py:46` (`_get_config_keys`, remote-name completion) still read config files with PyYAML, as on 0.5.2. A remote named `on` therefore reads back as `True` there.
 
 ### Where Each Library Is Used in Pivot

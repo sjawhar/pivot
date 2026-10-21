@@ -231,14 +231,11 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 def _default_cache_dir() -> str:
     """``<state dir>/cache``, relative to the project root when it lies inside it.
 
-    A hand-edited ``core.state_dir`` that is not a path reports ``.pivot/cache``, as 0.5.2
-    does; commands that use the state directory still refuse that value.
+    While the state directory is unknown or cannot be used, this is 0.5.2's ``.pivot/cache``
+    (``project.state_dir_or_default``); commands that use the state directory still fail.
     """
     root = project.get_project_root()
-    try:
-        cache_dir = project.state_dir_for(root) / "cache"
-    except exceptions.ConfigError:
-        return ".pivot/cache"
+    cache_dir = project.state_dir_or_default(root) / "cache"
     try:
         return cache_dir.relative_to(root).as_posix()
     except ValueError:
@@ -348,24 +345,14 @@ def _validate_state_dir_target(value: str) -> None:
     """Reject state-directory paths that cannot become a usable directory, before persistence.
 
     A dangling link on the path is refused. Then the path the resolver will use
-    (``project.resolve_state_dir_value``) is checked: its nearest existing entry must be a
-    directory this process can create entries in and search (``W_OK | X_OK``).
+    (``project.resolve_state_dir_value``) must pass ``project.state_dir_target_problem``.
     """
     root = project.get_project_root()
     _refuse_dangling_component(root, value)
 
-    target = project.resolve_state_dir_value(root, value)
-    for candidate in (target, *target.parents):
-        if not os.path.lexists(candidate):
-            continue
-        role = "core.state_dir" if candidate == target else "core.state_dir parent"
-        if not candidate.is_dir():
-            raise exceptions.ConfigValidationError(f"{role} must be a directory: {candidate}")
-        if not os.access(candidate, os.W_OK | os.X_OK):
-            raise exceptions.ConfigValidationError(
-                f"{role} is not a writable, searchable directory: {candidate}"
-            )
-        return
+    problem = project.state_dir_target_problem(project.resolve_state_dir_value(root, value))
+    if problem is not None:
+        raise exceptions.ConfigValidationError(problem)
 
 
 def _has_runtime_state(state_dir: pathlib.Path) -> bool:
@@ -512,13 +499,15 @@ def get_cache_dir() -> pathlib.Path:
 
 
 def get_state_dir() -> pathlib.Path:
-    """Get the current project's configured state directory.
+    """Get the current project's configured state directory, created when absent.
 
     The merged config is loaded first, as 0.5.2 did here, so a config file that cannot be read
-    fails this call with its own message.
+    fails this call with its own message. A directory created here gets its ``.gitignore``, and
+    one that cannot be created is returned for the caller to fail on
+    (``project.ensure_state_dir``).
     """
     get_merged_config()
-    return project.get_state_dir()
+    return project.ensure_state_dir(project.get_project_root())
 
 
 def get_max_workers() -> int:

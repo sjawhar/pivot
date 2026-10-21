@@ -182,7 +182,8 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         raise click.UsageError("--verbose and --quiet are mutually exclusive")
     ctx.obj = CliContext(verbose=verbose, quiet=quiet)
     _setup_logging(verbose, quiet)
-    if not ctx.resilient_parsing:
+    # Like the CLI's other warnings about project files, these give way to --quiet.
+    if not ctx.resilient_parsing and not quiet:
         from pivot import project
 
         project.enable_state_dir_warnings()

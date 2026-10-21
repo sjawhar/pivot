@@ -353,14 +353,23 @@ def test_plots_show_reports_an_absolute_configured_state_dir(
 
 
 def test_completion_uses_the_configured_state_directory_cache(tmp_path: pathlib.Path) -> None:
-    """Completion's fast path reads the cache written under configured state."""
+    """Completion's fast path reads the cache written under configured state.
+
+    Listing stages never creates the configured directory, so nothing is cached until a
+    command that uses the state directory has created it.
+    """
     state_dir = _configure_state_dir(tmp_path)
     pipeline_file = tmp_path / "pipeline.py"
     pipeline_file.write_text("# pipeline\n")
+    mtime = pipeline_file.stat().st_mtime
 
-    completion._write_stages_cache(
-        tmp_path, "pipeline.py", pipeline_file.stat().st_mtime, ["test/run"]
-    )
+    completion._write_stages_cache(tmp_path, "pipeline.py", mtime, ["test/run"])
+
+    assert not state_dir.exists()
+    assert completion._get_stages_from_cache(tmp_path) is None
+
+    state_dir.mkdir()
+    completion._write_stages_cache(tmp_path, "pipeline.py", mtime, ["test/run"])
 
     assert completion._get_stages_from_cache(tmp_path) == ["test/run"]
     assert (state_dir / "cache" / "stages.cache").is_file()
@@ -485,16 +494,18 @@ def test_import_reads_locks_from_the_source_configured_state_dir(tmp_path: pathl
         pytest.param("nested/../actual-state", False, None, id="parent-segment"),
         pytest.param(".", False, None, id="repository-root"),
         pytest.param("state/..", False, None, id="root-after-parent"),
-        pytest.param("state-link", True, "symlink", id="state-symlink"),
+        # The symlink is reported and 0.5.2's .pivot is read, which this source lacks.
+        pytest.param("state-link", True, "no .pivot/stages directory", id="state-symlink"),
     ],
 )
-def test_import_normalizes_or_refuses_source_state_dir(
+def test_import_normalizes_or_ignores_source_state_dir(
     tmp_path: pathlib.Path,
     configured_state_dir: str,
     symlink: bool,
     error: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A local git import normalizes source paths and names unsupported symlink layouts."""
+    """A local git import normalizes source paths; a symlinked one falls back to `.pivot`."""
     source = tmp_path / "source"
     source.mkdir()
     init_git_repo(source)
@@ -538,10 +549,16 @@ def test_import_normalizes_or_refuses_source_state_dir(
     )
 
     if error is not None:
-        with pytest.raises(exceptions.RemoteError, match=error):
+        with (
+            caplog.at_level(logging.WARNING, logger="pivot.import_artifact"),
+            pytest.raises(exceptions.RemoteError, match=error),
+        ):
             asyncio.run(
                 import_artifact.resolve_remote_path(str(source), "test/writes_state", "main", None)
             )
+        assert "'state-link' is a symlink; reading its locks from the default .pivot" in (
+            caplog.text
+        )
     else:
         resolved = asyncio.run(
             import_artifact.resolve_remote_path(str(source), "test/writes_state", "main", None)
@@ -549,10 +566,69 @@ def test_import_normalizes_or_refuses_source_state_dir(
         assert resolved["stage"] == "test/writes_state"
 
 
-def test_import_refuses_empty_source_state_dir() -> None:
-    """A source core.state_dir follows the local empty-value validation rule."""
-    with pytest.raises(exceptions.RemoteError, match="must be a path"):
-        import_artifact._remote_state_dir({"core": {"state_dir": ""}})
+@pytest.mark.parametrize(
+    "value",
+    ["", 5, ["a"], "/abs/state", "../outside"],
+    ids=["empty", "integer", "list", "absolute", "escaping"],
+)
+def test_import_ignores_a_source_state_dir_that_is_not_a_repo_path(
+    value: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """0.5.2 read every source's locks from `.pivot`; an unusable value is reported, not refused."""
+    with caplog.at_level(logging.WARNING, logger="pivot.import_artifact"):
+        state_dir = import_artifact._remote_state_dir("/source", {"core": {"state_dir": value}})
+
+    assert state_dir == ".pivot"
+    assert f"Ignoring core.state_dir in .pivot/config.yaml of /source: {value!r}" in caplog.text
+
+
+def test_import_reads_a_source_config_with_a_duplicate_key(tmp_path: pathlib.Path) -> None:
+    """PyYAML, which 0.5.2 used, keeps the last duplicate; the import still writes its `.pvt`."""
+    source = tmp_path / "source"
+    source.mkdir()
+    init_git_repo(source)
+    subprocess.run(
+        ["git", "config", "uploadArchive.allowUnreachable", "true"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=source, check=False, capture_output=True)
+    (source / ".pivot").mkdir()
+    (source / ".pivot" / "config.yaml").write_text(
+        "core:\n  max_workers: 1\n  max_workers: 2\nremotes:\n  origin: s3://source-cache\n"
+    )
+    lock_file = source / ".pivot" / "stages" / "test" / "writes_state.lock"
+    lock_file.parent.mkdir(parents=True)
+    lock_file.write_text(
+        yaml.safe_dump(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": None, "tag": "data", "hash": "0123456789abcdef", "size": 5}],
+            }
+        )
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "duplicate key"], cwd=source, check=True, capture_output=True
+    )
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    init_git_repo(consumer)
+    assert _run_pivot(consumer, "init").returncode == 0
+
+    result = _run_pivot(
+        consumer, "import", str(source), "test/writes_state", "--out", "got.txt", "--no-download"
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert (consumer / "got.txt.pvt").is_file()
+    assert "Traceback" not in output
+    warning = f"Ignoring core.state_dir in .pivot/config.yaml of {source}: "
+    assert result.stderr.count(warning) == 1, result.stderr
 
 
 _YAML_1_1_SOURCE_CONFIG = (
@@ -619,7 +695,7 @@ def test_import_reads_the_same_source_remotes_as_pivot_052(
 
     assert url == "s3://source-cache"
     assert "default_remote in /source must be a remote name, got True; ignoring it" in caplog.text
-    assert import_artifact._remote_state_dir(source_config) == "on"
+    assert import_artifact._remote_state_dir("/source", source_config) == "on"
 
 
 def test_serve_mode_uses_the_configured_state_directory_socket(tmp_path: pathlib.Path) -> None:

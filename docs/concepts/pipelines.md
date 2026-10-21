@@ -157,6 +157,13 @@ A state directory belongs to one project. Set `core.state_dir` in the project's 
 projects at the same directory, including with an absolute path. They would share lock files
 and overwrite each other's records of what ran, so each would see the other's stages as stale.
 
+If `.pivot/config.yaml` cannot be read, or its `core.state_dir` is not a path to a directory
+Pivot can create and write, Pivot prints one warning naming the file and the problem. Commands
+that do not need the state directory (`list`, `dag`, `init --force`, `plots show` and the like)
+then use the default `.pivot`. Commands that read or write state, such as `status`, `repro`
+and `history`, fail with a one-line error until the file is fixed. `--quiet` silences the
+warning.
+
 ```
 <project_root>/
   .pivot/

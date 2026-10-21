@@ -39,20 +39,23 @@ def init(ctx: click.Context, force: bool) -> None:
     pivot_dir.mkdir(exist_ok=True)
     marker_gitignore = pivot_dir / ".gitignore"
     created_gitignores = list[pathlib.Path]()
-    if project.state_dir_is_configured(cwd):
+    # A config that cannot be read, or a core.state_dir that cannot be used, leaves 0.5.2's
+    # default layout after one warning: 0.5.2's init never read the config.
+    state_dir = project.state_dir_or_default(cwd)
+    if state_dir != pivot_dir:
         # .pivot keeps the config and its lock, so it keeps an ignore file; init is its only
         # writer. Neither ignore file is ever overwritten in a configured layout.
         if project.create_gitignore_if_absent(marker_gitignore):
             created_gitignores.append(marker_gitignore)
-        state_gitignore = project.state_dir_for(cwd) / ".gitignore"
+        state_gitignore = state_dir / ".gitignore"
         state_gitignore_existed = os.path.lexists(state_gitignore)
-        state_dir = project.ensure_state_dir(cwd)
+        project.ensure_state_dir(cwd)
         if not state_gitignore_existed:
+            project.create_gitignore_if_absent(state_gitignore)
             created_gitignores.append(state_gitignore)
-        elif force and state_gitignore != marker_gitignore and not quiet:
+        elif force and not quiet:
             click.echo(f"Leaving {state_gitignore}; Pivot does not own it.")
     else:
-        state_dir = project.ensure_state_dir(cwd)
         # Warn if overwriting existing .gitignore with custom content
         if force and marker_gitignore.exists():
             existing_content = marker_gitignore.read_text()

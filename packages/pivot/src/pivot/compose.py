@@ -401,7 +401,7 @@ def _require_same_stage(
 def _emit_stage_info(
     node: _StageNode,
     qualified_name: str,
-    state_dir: pathlib.Path | None,
+    state_dir: pathlib.Path,
 ) -> registry.RegistryStageInfo:
     func = node.original_func
     deps = dict[str, types.ArtifactRef]()
@@ -544,16 +544,14 @@ class Pipeline:
     def state_dir(self) -> pathlib.Path:
         return project.ensure_state_dir(self._root)
 
-    def _stage_state_dir(self) -> pathlib.Path | None:
-        """The state directory recorded on this pipeline's stages.
+    def _stage_state_dir(self) -> pathlib.Path:
+        """The state directory recorded on this pipeline's stages; loading never creates it.
 
-        None while the project config cannot be read: building and listing stages never needs
-        it, and every reader of a stage's state falls back to the project's state directory,
-        which then fails with the config's own error.
+        While the project config cannot be read or its ``core.state_dir`` cannot be used, the
+        stages keep 0.5.2's ``.pivot`` (``project.state_dir_or_default``), so listing them runs
+        as it did there; commands that use the configured directory fail on it themselves.
         """
-        if project.state_dir_if_readable(self._root) is None:
-            return None
-        return self.state_dir
+        return project.state_dir_or_default(self._root)
 
     @property
     def input_bindings(self) -> dict[str, str]:

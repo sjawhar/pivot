@@ -6,6 +6,7 @@ import pydantic
 
 from pivot import config, exceptions, project
 from pivot.cli import completion
+from pivot.cli import decorators as cli_decorators
 
 
 def _format_value(value: Any) -> str:
@@ -40,6 +41,7 @@ def config_cmd() -> None:
 @click.option("--global", "use_global", is_flag=True, help="Show only global config")
 @click.option("--local", "use_local", is_flag=True, help="Show only local config")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@cli_decorators.with_error_handling
 def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     """Display all configuration values."""
     data: dict[str, Any]
@@ -66,12 +68,21 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         if key == "remotes" and isinstance(value, dict):
             remotes_dict = cast("dict[str, str]", value)
             for remote_name, remote_url in remotes_dict.items():
-                _, source = config.get_config_value(f"remotes.{remote_name}")
+                if use_global:
+                    source = config.ConfigSource.GLOBAL
+                else:
+                    _, source = config.get_config_value(f"remotes.{remote_name}")
                 click.echo(f"remotes.{remote_name} = {remote_url} ({source})")
         else:
-            configured_value, source = config.get_config_value(key)
-            if source == config.ConfigSource.GLOBAL_IGNORED:
-                value = configured_value
+            if use_global:
+                # Every row comes from the global file, so every label does too.
+                source = config.ConfigSource.GLOBAL
+                if key == "core.state_dir" and project.report_ignored_global_state_dir():
+                    source = config.ConfigSource.GLOBAL_IGNORED
+            else:
+                configured_value, source = config.get_config_value(key)
+                if source == config.ConfigSource.GLOBAL_IGNORED:
+                    value = configured_value
             row = f"{key} = {_format_value(value)} ({source})"
             if key == "core.state_dir" and not project.is_valid_state_dir_value(value):
                 row += " invalid: core.state_dir must be a path"
@@ -100,6 +111,7 @@ def _get_nested_value(data: dict[str, Any], key: str) -> Any:
 @click.option("--global", "use_global", is_flag=True, help="Get from global config only")
 @click.option("--local", "use_local", is_flag=True, help="Get from local config only")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@cli_decorators.with_error_handling
 def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -> None:
     """Get a configuration value by dotted key."""
     if use_global and use_local:
@@ -135,6 +147,7 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
 @click.argument("key", shell_complete=completion.complete_config_keys)
 @click.argument("value")
 @click.option("--global", "use_global", is_flag=True, help="Set in global config")
+@cli_decorators.with_error_handling
 def config_set(key: str, value: str, use_global: bool) -> None:
     """Set a configuration value."""
     try:
@@ -158,6 +171,7 @@ def config_set(key: str, value: str, use_global: bool) -> None:
 @config_cmd.command("unset")
 @click.argument("key", shell_complete=completion.complete_config_keys)
 @click.option("--global", "use_global", is_flag=True, help="Unset from global config")
+@cli_decorators.with_error_handling
 def config_unset(key: str, use_global: bool) -> None:
     """Remove a configuration value (reverts to default or inherited value)."""
     if not config.is_valid_key(key):

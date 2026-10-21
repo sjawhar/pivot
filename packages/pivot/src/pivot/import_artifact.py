@@ -164,43 +164,80 @@ async def read_remote_config(
     # Two parses on purpose: remotes are read above as 0.5.2 reads them (YAML 1.1, as the source's
     # `pivot remote` reads them), and the returned config, which supplies core.state_dir, as every
     # other Pivot command reads its config (YAML 1.2). Each key means what it means to the source.
+    # 0.5.2 never read core.state_dir, so a file only PyYAML accepts (a duplicate key) never
+    # refuses the import: its state directory is 0.5.2's .pivot.
     try:
         source_config = config_io.parse_config_yaml(raw, "remote config")
     except exceptions.ConfigError as e:
-        raise exceptions.RemoteError(str(e)) from e
+        _warn_source_state_dir_ignored(repo_url, str(e))
+        return url, {}
     return url, source_config
 
 
-def _remote_state_dir(config_data: dict[str, object]) -> str:
-    """Return the source repo's normalized state path at the imported revision."""
-    core = config_data.get("core")
-    if not isinstance(core, dict):
-        return ".pivot"
-    state_dir = cast("dict[str, object]", core).get("state_dir")
-    if state_dir is None:
-        return ".pivot"
+def _warn_source_state_dir_ignored(repo_url: str, problem: str) -> None:
+    """Report a source ``core.state_dir`` that cannot be used; the import reads ``.pivot``."""
+    logger.warning(
+        "Ignoring core.state_dir in .pivot/config.yaml of %s: %s; "
+        + "reading its locks from the default .pivot",
+        repo_url,
+        problem,
+    )
+
+
+def _normalized_source_state_dir(state_dir: object) -> str | None:
+    """``state_dir`` as a normalized path inside the source repo, or None when it is not one."""
     if (
         not isinstance(state_dir, str)
         or not state_dir
         or pathlib.PurePosixPath(state_dir).is_absolute()
     ):
-        raise exceptions.RemoteError(
-            f"Source repo's core.state_dir must be a path inside the repo, got {state_dir!r}"
-        )
-
+        return None
     normalized_parts = list[str]()
     for part in pathlib.PurePosixPath(state_dir).parts:
         if part in {"", "."}:
             continue
         if part == "..":
             if not normalized_parts:
-                raise exceptions.RemoteError(
-                    f"Source repo's core.state_dir is outside the repo: {state_dir!r}"
-                )
+                return None
             normalized_parts.pop()
         else:
             normalized_parts.append(part)
     return pathlib.PurePosixPath(*normalized_parts).as_posix()
+
+
+def _remote_state_dir(repo_url: str, config_data: dict[str, object]) -> str:
+    """Return the source repo's normalized state path at the imported revision.
+
+    0.5.2 read every source's locks from ``.pivot``, so a value that is not a path inside the
+    repo never refuses an import: it is reported and ``.pivot`` is read.
+    """
+    core = config_data.get("core")
+    if not isinstance(core, dict):
+        return ".pivot"
+    state_dir = cast("dict[str, object]", core).get("state_dir")
+    if state_dir is None:
+        return ".pivot"
+    normalized = _normalized_source_state_dir(state_dir)
+    if normalized is None:
+        _warn_source_state_dir_ignored(repo_url, f"{state_dir!r} is not a path inside the repo")
+        return ".pivot"
+    return normalized
+
+
+async def _source_state_dir(repo_url: str, rev: str, config_data: dict[str, object]) -> str:
+    """``_remote_state_dir``, with a symlinked local git source directory reported as unusable.
+
+    Its locks are not at that path in the revision's tree, so ``.pivot`` is read instead.
+    """
+    source_state_dir = _remote_state_dir(repo_url, config_data)
+    if source_state_dir in {".", ".pivot"} or github.is_github_url(repo_url):
+        return source_state_dir
+    if await _run_blocking(
+        git_archive.path_is_symlink_from_remote_repo, repo_url, source_state_dir, rev
+    ):
+        _warn_source_state_dir_ignored(repo_url, f"{source_state_dir!r} is a symlink")
+        return ".pivot"
+    return source_state_dir
 
 
 async def _list_github_lock_paths(
@@ -374,21 +411,8 @@ async def _resolve_remote_path_with_session(
     remote_url, config_data = await read_remote_config(
         repo_url, rev_lock, token, session=gh_session
     )
-    source_state_dir = _remote_state_dir(config_data)
+    source_state_dir = await _source_state_dir(repo_url, rev_lock, config_data)
     stages_dir = "stages" if source_state_dir == "." else f"{source_state_dir}/stages"
-    if (
-        source_state_dir != "."
-        and not github.is_github_url(repo_url)
-        and await _run_blocking(
-            git_archive.path_is_symlink_from_remote_repo,
-            repo_url,
-            source_state_dir,
-            rev_lock,
-        )
-    ):
-        raise exceptions.RemoteError(
-            f"Source repo's core.state_dir is a symlink and cannot be imported: {source_state_dir}"
-        )
 
     # Use resolved SHA for all subsequent reads to avoid TOCTOU race
     stage_names = await list_remote_lock_files(

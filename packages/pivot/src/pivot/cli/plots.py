@@ -39,16 +39,13 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path | None, open_brows
     proj_root = project.get_project_root()
     _run_common.ensure_stages_registered()
 
-    if output is None:
-        output_path = project.ensure_state_dir(proj_root) / "plots" / "index.html"
-    else:
+    if output is not None:
         path_policy.require_valid_path(
             str(output),
             path_policy.PathType.CLI_OUTPUT,
             proj_root,
             context="plots show --output",
         )
-        output_path = proj_root / output
 
     if targets:
         valid_targets = cli_targets.validate_targets(targets)
@@ -65,6 +62,10 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path | None, open_brows
         click.echo("No plots found.")
         return
 
+    if output is None:
+        output_path = project.ensure_state_dir_or_default(proj_root) / "plots" / "index.html"
+    else:
+        output_path = proj_root / output
     output_path = plots_mod.render_plots_html(plot_list, output_path)
     try:
         display_path = output_path.relative_to(proj_root)

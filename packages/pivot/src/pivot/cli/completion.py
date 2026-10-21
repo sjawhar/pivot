@@ -173,10 +173,7 @@ def _get_stages_from_cache(root: pathlib.Path) -> list[str] | None:
     Returns stage names if cache exists and is valid, None otherwise.
     Cache is valid when version matches and config file mtime unchanged.
     """
-    state_dir = project.state_dir_if_readable(root)
-    if state_dir is None:
-        return None
-    cache_path = state_dir / "cache" / "stages.cache"
+    cache_path = project.state_dir_or_default(root) / "cache" / "stages.cache"
     try:
         lines = cache_path.read_text().splitlines()
     except OSError:
@@ -210,12 +207,15 @@ def _write_stages_cache(
 
     Uses temp file + rename for atomic write on POSIX.
     Cleans up temp file on failure before re-raising OSError.
-    Caller is responsible for handling write failures. Nothing is written while the project
-    config cannot be read, since the state directory is then unknown.
+    Caller is responsible for handling write failures. While the project config cannot be read
+    or its state directory cannot be used, the cache stays in 0.5.2's ``.pivot/cache``. A
+    configured state directory that does not exist yet is left for a command that uses it to
+    create, so nothing is cached.
     """
-    if project.state_dir_if_readable(root) is None:
+    state_dir = project.state_dir_or_default(root)
+    if state_dir != root / ".pivot" and not state_dir.is_dir():
         return
-    cache_dir = project.ensure_state_dir(root) / "cache"
+    cache_dir = state_dir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     cache_path = cache_dir / "stages.cache"

@@ -52,11 +52,16 @@ def _parse_lock_contents(
 def read_lock_files_from_head(
     stage_names: Sequence[str],
 ) -> dict[str, StorageLockData | None]:
-    """Batch read and parse lock files from git HEAD."""
+    """Batch read and parse lock files from git HEAD.
+
+    While the state directory is unknown or cannot be used, the locks are read from 0.5.2's
+    ``.pivot/stages`` (``project.state_dir_or_default``).
+    """
     if not stage_names:
         return {}
+    root = project.get_project_root()
     try:
-        stages_dir = lock.stages_rel_path(project.get_state_dir(), project.get_project_root())
+        stages_dir = lock.stages_rel_path(project.state_dir_or_default(root), root)
     except ValueError:
         raise exceptions.ConfigError(
             "core.state_dir is outside the project, so lock files are not in git"

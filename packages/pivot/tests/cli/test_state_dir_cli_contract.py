@@ -384,7 +384,7 @@ def test_cache_dir_completion_help_matches_pivot_052() -> None:
 
 
 _UNKNOWN_STATE_DIR = (
-    ". The state directory is unknown; commands that use it will fail until the file is fixed."
+    ". The state directory is unknown; commands that do not need it use the default .pivot."
 )
 
 

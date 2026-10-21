@@ -594,7 +594,7 @@ def _secret_key() -> bytes:
     """
     if (from_env := os.environ.get(_SECRET_KEY_ENV)) is not None:
         return _parse_secret_key(from_env, _SECRET_KEY_ENV)
-    state_dir = project.ensure_state_dir(project.get_project_root())
+    state_dir = project.ensure_state_dir_or_default(project.get_project_root())
     key_file = state_dir / _SECRET_KEY_FILE
     try:
         text = _read_no_follow(key_file)
