@@ -2497,10 +2497,10 @@ class Engine:
         If a run is active, defers the reload until the current run completes, and handles the
         data files the same watch batch changed as a data change. Otherwise the reload runs
         first: when it starts a re-run, that re-run checks those files, so they start nothing
-        of their own; when it starts none (the edit leaves the pipeline invalid), they are
-        handled as a data change once it ends, as a separate data event would be. Reloads run
-        one at a time: an edit that arrives while a reload deferred to the end of a run is still
-        in flight waits for it, then reloads again.
+        of their own; when it starts none (the edit leaves the pipeline invalid, or valid with
+        no stages), they are handled as a data change once it ends, as a separate data event
+        would be. Reloads run one at a time: an edit that arrives while a reload deferred to the
+        end of a run is still in flight waits for it, then reloads again.
         """
         while True:
             if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
