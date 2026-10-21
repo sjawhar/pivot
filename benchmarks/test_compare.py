@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 
 import pytest
@@ -130,16 +131,24 @@ def test_median_over_limit_inside_the_noise_is_not_a_regression(
     assert "REGRESSION" not in out and "95% CI" in out, out
 
 
-def test_regression_report_is_the_same_on_every_run(
-    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    base = _helper_rows([1.0, 1.1, 0.9, 1.0, 1.05, 0.95], [2.0] * 6)
-    head = _helper_rows([1.3, 1.2, 1.25, 1.35, 1.28, 1.22], [2.0] * 6)
+@pytest.mark.parametrize(
+    ("length", "expected"),
+    [
+        pytest.param(48, (1.02602795595269, 1.0805473106445675), id="48-reps"),
+        pytest.param(47, (1.02602795595269, 1.0826918658088236), id="47-reps"),
+        pytest.param(46, (1.02602795595269, 1.0786675845188924), id="46-reps"),
+        pytest.param(45, (1.02602795595269, 1.0786675845188924), id="45-reps"),
+        pytest.param(44, (1.02602795595269, 1.080679725163858), id="44-reps"),
+        pytest.param(43, (1.02602795595269, 1.0786675845188924), id="43-reps"),
+    ],
+)
+def test_bootstrap_bounds_are_fixed_by_the_seed(length: int, expected: tuple[float, float]) -> None:
+    # Six inputs of distinct lengths draw distinct resample streams. With the seed removed,
+    # none of 400 other seeds reproduced all six bounds.
+    base = _TWO_CLUSTER_BASE[:length]
+    head = [round(w * (1.05 + 0.07 * math.sin(3.7 * rep)), 4) for rep, w in enumerate(base)]
 
-    assert _helper_compare(tmp_path, base, head) == 1
-    first = capsys.readouterr().out
-    assert _helper_compare(tmp_path, base, head) == 1
-    assert capsys.readouterr().out == first, "the bootstrap must use a fixed seed"
+    assert compare.ratio_interval(base, head) == expected
 
 
 def test_unequal_rep_counts_cannot_be_compared(
@@ -150,6 +159,65 @@ def test_unequal_rep_counts_cannot_be_compared(
 
     assert _helper_compare(tmp_path, base, head) == 2
     assert "rep counts" in capsys.readouterr().err
+
+
+# 48 base wall times, in rep order, from run 39531104040's fan-100/pipeline/touch: two clusters,
+# 28 reps at 2.57-2.92 s and 20 at 3.32-3.59 s.
+_TWO_CLUSTER_BASE = [
+    3.4788, 2.803, 2.6493, 2.7654, 2.6445, 2.6971, 2.6471, 3.3751,
+    3.3989, 3.4298, 3.4075, 3.4097, 3.4259, 3.5547, 3.5885, 2.6731,
+    2.7271, 2.6318, 2.6324, 2.5991, 2.9167, 2.594, 2.5655, 2.7168,
+    2.6047, 3.3266, 3.464, 3.3441, 3.4536, 3.4816, 3.3693, 2.7162,
+    2.5851, 2.6148, 2.7203, 2.6281, 2.5904, 2.6322, 2.703, 3.3857,
+    3.3242, 2.5654, 2.6122, 2.6271, 2.5722, 2.7263, 3.3286, 3.4334,
+]  # fmt: skip
+
+
+def test_a_few_fast_head_reps_do_not_hide_a_regression(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Every rep is 10% slower except reps 0-3, which are extreme outliers on the fast side.
+    head_wall = [w * (0.01 if rep < 4 else 1.10) for rep, w in enumerate(_TWO_CLUSTER_BASE)]
+    base = _helper_rows(_TWO_CLUSTER_BASE, [2.0] * 48)
+    head = _helper_rows(head_wall, [2.0] * 48)
+    limits = {_SCENARIO: {"wall_pct": 2, "cpu_pct": 2}}
+
+    assert _helper_compare(tmp_path, base, head, limits=limits) == 1
+    assert f"REGRESSION {_SCENARIO} wall_s" in " ".join(capsys.readouterr().out.split())
+
+
+def test_reps_pair_by_rep_number_not_by_file_order(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The runner drifts slower across the job; each head rep is 15% slower than its base rep.
+    # Written in reverse order, the head pairs correctly only if reps are matched by number.
+    base_wall = [1.0 + 0.1 * rep for rep in range(12)]
+    base = _helper_rows(base_wall, [2.0] * 12)
+    head = _helper_rows([round(1.15 * w, 6) for w in base_wall], [2.0] * 12)[::-1]
+
+    assert _helper_compare(tmp_path, base, head) == 1
+    assert f"REGRESSION {_SCENARIO} wall_s" in " ".join(capsys.readouterr().out.split())
+
+
+@pytest.mark.parametrize(
+    "reps",
+    [
+        pytest.param([0, 1, 2, 3, 4, 4], id="duplicated-rep"),
+        pytest.param([0, 1, 2, 3, 4, 6], id="missing-rep"),
+        pytest.param([0, 1, 2, 3, 4, -1], id="out-of-range-rep"),
+    ],
+)
+def test_reps_that_do_not_pair_cannot_be_compared(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], reps: list[int]
+) -> None:
+    base = _helper_rows([1.0] * 6, [2.0] * 6)
+    head = _helper_rows([1.0] * 6, [2.0] * 6)
+    for row, rep in zip(head, reps, strict=True):
+        row["rep"] = rep
+
+    assert _helper_compare(tmp_path, base, head) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
 
 
 def test_failed_run_cannot_be_compared(

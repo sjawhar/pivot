@@ -12,11 +12,12 @@ alike.
 
 With --threshold-file, a scenario's metric is a REGRESSION only when both hold: the head's median
 exceeds the base's by more than that scenario's `wall_pct` or `cpu_pct` (the minimum effect),
-and a paired bootstrap 95% interval of median(head) / median(base) lies entirely above 1 (the
-change is not the job's own noise). It exits 0 when nothing regressed, 1 when something did, and
-2 when the files cannot be compared: a file is missing or cannot be parsed, a command failed, a
-scenario is on one side only or lacks a numeric limit, the two sides have different rep counts,
-or the two ran on machines with different core counts.
+and a bootstrap 95% interval of the median per-rep ratio head/base, pairing reps by their `rep`
+number, lies entirely above 1 (the change is not the job's own noise). It exits 0 when nothing
+regressed, 1 when something did, and 2 when the files cannot be compared: a file is missing or
+cannot be parsed, a timing is not a positive finite number, a limit is not finite, a command
+failed, a scenario is on one side only or lacks a limit, a side's reps are not 0 to n-1 once
+each, or the two ran on machines with different core counts.
 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
 file: for each scenario and metric, three times the largest absolute change between the two
@@ -56,6 +57,7 @@ class _Row(TypedDict):
     wall_s: float
     cpu_s: float
     cpu_count: int
+    rep: int
 
 
 class _CannotCompareError(Exception):
@@ -87,6 +89,7 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
                 wall_s=float(raw["wall_s"]),
                 cpu_s=float(raw["cpu_s"]),
                 cpu_count=int(raw["cpu_count"]),
+                rep=rep,
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise _CannotCompareError(f"{path}:{number}: not a result row ({error!r})") from None
@@ -101,10 +104,20 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
     return by_scenario
 
 
+def _by_rep(path: pathlib.Path, scenario: str, rows: list[_Row]) -> list[_Row]:
+    """Return the rows in rep order; reps must be exactly 0 .. n-1, each once."""
+    reps = sorted(row["rep"] for row in rows)
+    if reps != list(range(len(rows))):
+        raise _CannotCompareError(
+            f"{path}: {scenario} reps must be 0 to {len(rows) - 1} once each, got {reps}"
+        )
+    return sorted(rows, key=lambda row: row["rep"])
+
+
 def _paired(
     base_path: pathlib.Path, head_path: pathlib.Path
 ) -> dict[str, dict[_Metric, tuple[list[float], list[float]]]]:
-    """Return scenario -> metric -> (base values, head values), paired by rep."""
+    """Return scenario -> metric -> (base values, head values), paired by the `rep` field."""
     base = _load(base_path)
     head = _load(head_path)
     if one_side := sorted(set(base) ^ set(head)):
@@ -114,16 +127,15 @@ def _paired(
         raise _CannotCompareError(f"results come from machines with core counts {sorted(cores)}")
     if unequal := [s for s in sorted(base) if len(base[s]) != len(head[s])]:
         raise _CannotCompareError(f"base and head rep counts differ for {', '.join(unequal)}")
-    return {
-        scenario: {
-            metric: (
-                [row[metric] for row in base[scenario]],
-                [row[metric] for row in head[scenario]],
-            )
+    paired = dict[str, dict[_Metric, tuple[list[float], list[float]]]]()
+    for scenario in sorted(base):
+        base_rows = _by_rep(base_path, scenario, base[scenario])
+        head_rows = _by_rep(head_path, scenario, head[scenario])
+        paired[scenario] = {
+            metric: ([row[metric] for row in base_rows], [row[metric] for row in head_rows])
             for metric, _ in _METRICS
         }
-        for scenario in sorted(base)
-    }
+    return paired
 
 
 def _medians(
@@ -139,19 +151,24 @@ def _medians(
     }
 
 
-def _ratio_interval(base: list[float], head: list[float]) -> tuple[float, float]:
-    """Paired bootstrap 95% interval of median(head) / median(base), resampling reps by index.
+def ratio_interval(base: list[float], head: list[float]) -> tuple[float, float]:
+    """Paired bootstrap 95% interval of the median per-rep ratio head[i] / base[i].
 
     run.py interleaves base and head within each rep, so rep i of each side shares the
-    machine's state at that moment; resampling pairs keeps that.
+    machine's state at that moment. Each resample draws reps with replacement and takes the
+    median of their ratios, so a few fast or slow head reps move one ratio each rather than
+    moving the head's median from one cluster of a bimodal job to another.
     """
+    ratios = [h / b for b, h in zip(base, head, strict=True)]
     rng = random.Random(_BOOTSTRAP_SEED)
-    n = len(base)
-    ratios = sorted(
-        statistics.median(head[i] for i in picks) / statistics.median(base[i] for i in picks)
-        for picks in ([rng.randrange(n) for _ in range(n)] for _ in range(_BOOTSTRAP_RESAMPLES))
+    n = len(ratios)
+    medians = sorted(
+        statistics.median(ratios[rng.randrange(n)] for _ in range(n))
+        for _ in range(_BOOTSTRAP_RESAMPLES)
     )
-    return ratios[int(0.025 * _BOOTSTRAP_RESAMPLES)], ratios[int(0.975 * _BOOTSTRAP_RESAMPLES) - 1]
+    return medians[int(0.025 * _BOOTSTRAP_RESAMPLES)], medians[
+        int(0.975 * _BOOTSTRAP_RESAMPLES) - 1
+    ]
 
 
 def _change_pct(base: float, head: float) -> float:
@@ -310,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
             base_values, head_values = by_metric[metric]
             base, head = statistics.median(base_values), statistics.median(head_values)
             limit = limits[scenario][key]
-            low, high = _ratio_interval(base_values, head_values)
+            low, high = ratio_interval(base_values, head_values)
             verdict = "ok"
             if head > base * (1 + limit / 100) and low > 1:
                 verdict = "REGRESSION"
