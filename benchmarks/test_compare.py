@@ -490,6 +490,95 @@ def test_every_malformed_shape_exits_2_with_one_line(
     assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
 
 
+# Inputs from the round 8 completeness check (pr501r8-0f9b26/scripts/type_edges.sh:77-96).
+_BIG_INT = "1" + "0" * 400
+_NESTED_ROW = "[" * 100_000 + "]" * 100_000 + "\n"
+
+
+def _helper_with_big_int(field: str) -> bytes:
+    lines = _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6)).splitlines(keepends=True)
+    row = json.loads(lines[0])
+    row[field] = "BIG"
+    lines[0] = json.dumps(row).replace('"BIG"', _BIG_INT) + "\n"
+    return "".join(lines).encode()
+
+
+@pytest.mark.parametrize(
+    ("files", "argv"),
+    [
+        pytest.param(
+            {"head.jsonl": _helper_with_big_int("wall_s")},
+            _COMPARE_ARGV,
+            id="timing-too-large-for-a-float",
+        ),
+        pytest.param(
+            {"head.jsonl": _helper_with_big_int("cpu_s")},
+            ("base.jsonl", "head.jsonl", "--derive-threshold"),
+            id="timing-too-large-for-a-float-derive",
+        ),
+        pytest.param(
+            {"head.jsonl": _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6)).encode() + b"\xff\n"},
+            _COMPARE_ARGV,
+            id="result-file-not-utf8",
+        ),
+        pytest.param(
+            {"threshold.json": b'{"\xff": 1}'},
+            _COMPARE_ARGV,
+            id="threshold-file-not-utf8",
+        ),
+        pytest.param(
+            {
+                "head.jsonl": (
+                    _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6)) + _NESTED_ROW
+                ).encode()
+            },
+            _COMPARE_ARGV,
+            id="deeply-nested-row",
+        ),
+    ],
+)
+def test_unreadable_input_exits_2_with_one_line(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    files: dict[str, bytes],
+    argv: tuple[str, ...],
+) -> None:
+    rows = _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6)).encode()
+    limits = json.dumps({_SCENARIO: {"wall_pct": 10, "cpu_pct": 10}}).encode()
+    defaults = {"base.jsonl": rows, "head.jsonl": rows, "threshold.json": limits}
+    for name, data in {**defaults, **files}.items():
+        (tmp_path / name).write_bytes(data)
+
+    exit_code = compare.main([str(tmp_path / arg) if "." in arg else arg for arg in argv])
+
+    err = capsys.readouterr().err
+    assert exit_code == 2, f"unreadable input must exit 2, not {exit_code}: {err}"
+    assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param(("--derive-threshold",), id="derive-threshold"),
+        pytest.param(("--threshold-file",), id="threshold-file"),
+    ],
+)
+def test_non_string_scenario_cannot_be_compared(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], mode: tuple[str, ...]
+) -> None:
+    rows = [{**row, "scenario": 5} for row in _helper_rows([1.0] * 6, [2.0] * 6)]
+    (tmp_path / "base.jsonl").write_text(_helper_jsonl(rows))
+    (tmp_path / "head.jsonl").write_text(_helper_jsonl(rows))
+    (tmp_path / "threshold.json").write_text(json.dumps({"5": {"wall_pct": 10, "cpu_pct": 10}}))
+    argv = [str(tmp_path / "base.jsonl"), str(tmp_path / "head.jsonl"), *mode]
+    if mode == ("--threshold-file",):
+        argv.append(str(tmp_path / "threshold.json"))
+
+    assert compare.main(argv) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("cannot compare: ") and "scenario must be a string" in err, err
+
+
 def test_calibration_file_records_each_sample_and_rebuilds_the_same_thresholds(
     tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

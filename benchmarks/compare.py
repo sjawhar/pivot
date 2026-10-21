@@ -14,10 +14,11 @@ With --threshold-file, a scenario's metric is a REGRESSION only when both hold: 
 exceeds the base's by more than that scenario's `wall_pct` or `cpu_pct` (the minimum effect),
 and a bootstrap 95% interval of the median per-rep ratio head/base, pairing reps by their `rep`
 number, lies entirely above 1 (the change is not the job's own noise). It exits 0 when nothing
-regressed, 1 when something did, and 2 when the files cannot be compared: a file is missing or
-cannot be parsed, a timing is not a positive finite number, a limit is not finite, a command
-failed, a scenario is on one side only or lacks a limit, a side's reps are not 0 to n-1 once
-each, or the two ran on machines with different core counts.
+regressed, 1 when something did, and 2 when the files cannot be compared: a file is missing,
+is not UTF-8, or cannot be parsed (JSON nested too deeply included), a field has the wrong JSON
+type, a timing is not a positive finite number or is too large for a float, a limit is not
+finite, a command failed, a scenario is on one side only or lacks a limit, a side's reps are not
+0 to n-1 once each, or the two ran on machines with different core counts.
 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
 file: for each scenario and metric, three times the largest absolute change between the two
@@ -64,13 +65,23 @@ class _CannotCompareError(Exception):
     pass
 
 
-def _read_json(path: pathlib.Path) -> object:
+def _read_text(path: pathlib.Path) -> str:
     try:
-        return json.loads(path.read_text())
+        return path.read_text()
     except FileNotFoundError:
         raise _CannotCompareError(f"{path}: no such file") from None
+    except UnicodeDecodeError as error:
+        raise _CannotCompareError(f"{path}: not UTF-8 text ({error})") from None
+
+
+def _read_json(path: pathlib.Path) -> object:
+    text = _read_text(path)
+    try:
+        return json.loads(text)
     except json.JSONDecodeError as error:
         raise _CannotCompareError(f"{path}: not valid JSON ({error})") from None
+    except RecursionError:
+        raise _CannotCompareError(f"{path}: JSON nested too deeply to read") from None
 
 
 def _field_int(raw: dict[str, object], name: str) -> int:
@@ -95,10 +106,7 @@ def _field_str(raw: dict[str, object], name: str) -> str:
 
 
 def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
-    try:
-        lines = path.read_text().splitlines()
-    except FileNotFoundError:
-        raise _CannotCompareError(f"{path}: no such file") from None
+    lines = _read_text(path).splitlines()
     by_scenario = dict[str, list[_Row]]()
     for number, line in enumerate(lines, start=1):
         try:
@@ -114,7 +122,9 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
                 cpu_count=_field_int(raw, "cpu_count"),  # pyright: ignore[reportUnknownArgumentType] - JSON object
                 rep=rep,
             )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        except RecursionError:
+            raise _CannotCompareError(f"{path}:{number}: JSON nested too deeply to read") from None
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OverflowError) as error:
             raise _CannotCompareError(f"{path}:{number}: not a result row ({error!r})") from None
         if exit_code != 0:
             raise _CannotCompareError(f"{path}: {scenario} rep {rep} exited with code {exit_code}")
