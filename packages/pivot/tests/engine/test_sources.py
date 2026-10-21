@@ -21,8 +21,6 @@ if TYPE_CHECKING:
 
 async def test_async_oneshot_source_emits_run_requested() -> None:
     """OneShotSource emits a single RunRequested event."""
-    import anyio
-
     from pivot.engine.sources import OneShotSource
     from pivot.engine.types import InputEvent
 
@@ -85,8 +83,6 @@ async def test_async_filesystem_source_set_watch_paths() -> None:
 
 async def test_async_filesystem_source_emits_code_changed_for_py_files(tmp_path: Path) -> None:
     """FilesystemSource emits code_or_config_changed for .py files."""
-    import anyio
-
     from pivot.engine.sources import FilesystemSource
     from pivot.engine.types import InputEvent
 
@@ -126,8 +122,6 @@ async def test_async_filesystem_source_stops_promptly_when_cancelled(tmp_path: P
     """Cancelling FilesystemSource.run returns at once, not when watchfiles' 5 s wait times out."""
     import time
 
-    import anyio
-
     from pivot.engine.sources import FilesystemSource
     from pivot.engine.types import InputEvent
 
@@ -149,8 +143,6 @@ async def test_async_filesystem_source_set_watch_paths_signals_stop_event() -> N
     source = FilesystemSource(watch_paths=[Path("/tmp/a")])
 
     # Simulate running state
-    import anyio
-
     source._running = True
     source._stop_event = anyio.Event()
 
@@ -177,8 +169,6 @@ async def test_async_filesystem_source_set_watch_paths_no_op_when_not_running() 
 
 async def test_async_filesystem_source_restarts_after_set_watch_paths(tmp_path: Path) -> None:
     """FilesystemSource restarts and watches new paths after set_watch_paths() called."""
-    import anyio
-
     from pivot.engine.sources import FilesystemSource
     from pivot.engine.types import InputEvent
 
