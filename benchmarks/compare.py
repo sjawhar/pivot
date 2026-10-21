@@ -12,8 +12,9 @@ alike.
 
 With --threshold-file, exits 0 when no scenario regressed, 1 when the head's median wall time
 or median CPU exceeds the base's by more than that scenario's `wall_pct` or `cpu_pct`, and 2
-when the files cannot be compared: a file is missing, a command failed, a scenario is on one
-side only or lacks a limit, or the two ran on machines with different core counts.
+when the files cannot be compared: a file is missing or cannot be parsed, a command failed, a
+scenario is on one side only or lacks a numeric limit, or the two ran on machines with different
+core counts.
 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
 file: for each scenario and metric, three times the largest absolute change between the two
@@ -32,12 +33,24 @@ import math
 import pathlib
 import statistics
 import sys
+from typing import Any, Literal, TypedDict
 
-_METRICS = (("wall_s", "wall_pct"), ("cpu_s", "cpu_pct"))
+type _Metric = Literal["wall_s", "cpu_s"]
+type _LimitKey = Literal["wall_pct", "cpu_pct"]
+
+_METRICS: tuple[tuple[_Metric, _LimitKey], ...] = (("wall_s", "wall_pct"), ("cpu_s", "cpu_pct"))
 _FLOOR_PCT = 2
 
 # scenario -> limit key ("wall_pct" or "cpu_pct") -> percent change from base to head median
 type _Changes = dict[str, dict[str, float]]
+
+
+class _Row(TypedDict):
+    """The fields of a run.py result row that compare.py reads."""
+
+    wall_s: float
+    cpu_s: float
+    cpu_count: int
 
 
 class _CannotCompareError(Exception):
@@ -53,44 +66,47 @@ def _read_json(path: pathlib.Path) -> object:
         raise _CannotCompareError(f"{path}: not valid JSON ({error})") from None
 
 
-def _load(path: pathlib.Path) -> dict[str, list[dict[str, object]]]:
+def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
     try:
         lines = path.read_text().splitlines()
     except FileNotFoundError:
         raise _CannotCompareError(f"{path}: no such file") from None
-    by_scenario = dict[str, list[dict[str, object]]]()
+    by_scenario = dict[str, list[_Row]]()
     for number, line in enumerate(lines, start=1):
         try:
-            row = json.loads(line)
-            scenario, exit_code = row["scenario"], row["exit_code"]
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raw = json.loads(line)
+            scenario = str(raw["scenario"])
+            exit_code = int(raw["exit_code"])
+            rep = int(raw["rep"])
+            row = _Row(
+                wall_s=float(raw["wall_s"]),
+                cpu_s=float(raw["cpu_s"]),
+                cpu_count=int(raw["cpu_count"]),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise _CannotCompareError(f"{path}:{number}: not a result row ({error!r})") from None
         if exit_code != 0:
-            raise _CannotCompareError(
-                f"{path}: {scenario} rep {row['rep']} exited with code {exit_code}"
-            )
+            raise _CannotCompareError(f"{path}: {scenario} rep {rep} exited with code {exit_code}")
         by_scenario.setdefault(scenario, []).append(row)
     return by_scenario
 
 
 def _medians(
     base_path: pathlib.Path, head_path: pathlib.Path
-) -> dict[str, dict[str, tuple[float, float]]]:
+) -> dict[str, dict[_Metric, tuple[float, float]]]:
     """Return scenario -> metric -> (base median, head median)."""
     base = _load(base_path)
     head = _load(head_path)
     if one_side := sorted(set(base) ^ set(head)):
         raise _CannotCompareError(f"scenarios on one side only: {', '.join(one_side)}")
-    cores = {
-        int(str(row["cpu_count"])) for rows in (*base.values(), *head.values()) for row in rows
-    }
+    cores = {row["cpu_count"] for rows in (*base.values(), *head.values()) for row in rows}
     if len(cores) != 1:
         raise _CannotCompareError(f"results come from machines with core counts {sorted(cores)}")
     return {
         scenario: {
             metric: (
-                statistics.median(float(str(row[metric])) for row in base[scenario]),
-                statistics.median(float(str(row[metric])) for row in head[scenario]),
+                statistics.median(row[metric] for row in base[scenario]),
+                statistics.median(row[metric] for row in head[scenario]),
             )
             for metric, _ in _METRICS
         }
@@ -102,7 +118,7 @@ def _change_pct(base: float, head: float) -> float:
     return (head - base) / base * 100
 
 
-def _changes(medians: dict[str, dict[str, tuple[float, float]]]) -> _Changes:
+def _changes(medians: dict[str, dict[_Metric, tuple[float, float]]]) -> _Changes:
     return {
         scenario: {key: _change_pct(*by_metric[metric]) for metric, key in _METRICS}
         for scenario, by_metric in medians.items()
@@ -125,27 +141,44 @@ def _derive_threshold(samples: list[_Changes]) -> dict[str, dict[str, int]]:
 
 
 def _read_calibration(path: pathlib.Path) -> list[_Changes]:
-    calibration = _read_json(path)
+    # Building typed values checks the shape: any mismatch raises one of the caught errors.
+    calibration: Any = _read_json(path)
     try:
-        samples: list[_Changes] = [sample["changes"] for sample in calibration["samples"]]  # pyright: ignore[reportIndexIssue, reportUnknownVariableType] - shape checked by the except below
-    except (KeyError, TypeError) as error:
+        samples: list[_Changes] = [
+            {
+                str(scenario): {key: float(by_key[key]) for _, key in _METRICS}
+                for scenario, by_key in sample["changes"].items()
+            }
+            for sample in calibration["samples"]
+        ]
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise _CannotCompareError(f"{path}: not a calibration file ({error!r})") from None
     return samples
 
 
 def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str, float]]:
-    limits = _read_json(path)
-    if not isinstance(limits, dict) or not all(isinstance(v, dict) for v in limits.values()):  # pyright: ignore[reportUnknownVariableType] - checked here
+    raw = _read_json(path)
+    if not isinstance(raw, dict):
         raise _CannotCompareError(f"{path}: not a threshold file")
-    missing = [
-        f"{scenario} {key}"
-        for scenario in scenarios
-        for _, key in _METRICS
-        if scenario not in limits or key not in limits[scenario]
-    ]
+    limits = dict[str, dict[str, float]]()
+    missing = list[str]()
+    for scenario in scenarios:
+        by_key = raw.get(scenario)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - JSON object
+        if not isinstance(by_key, dict):
+            missing += [f"{scenario} {key}" for _, key in _METRICS]
+            continue
+        limits[scenario] = {}
+        for _, key in _METRICS:
+            value = by_key.get(key)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - JSON object
+            if value is None:
+                missing.append(f"{scenario} {key}")
+            elif isinstance(value, bool) or not isinstance(value, int | float):
+                raise _CannotCompareError(f"{path}: {scenario} {key} is not a number: {value!r}")
+            else:
+                limits[scenario][key] = float(value)
     if missing:
         raise _CannotCompareError(f"no threshold for {', '.join(missing)}")
-    return limits  # pyright: ignore[reportUnknownVariableType] - checked above
+    return limits
 
 
 def _calibration_samples(

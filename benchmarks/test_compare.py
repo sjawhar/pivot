@@ -300,6 +300,88 @@ def test_malformed_calibration_cannot_be_derived(
     assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
 
 
+def _helper_jsonl(rows: list[dict[str, object]]) -> str:
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+def _helper_first_row_edited(edit: dict[str, object], drop: tuple[str, ...] = ()) -> str:
+    rows = _helper_rows([1.0] * 6, [2.0] * 6)
+    rows[0] = {key: value for key, value in {**rows[0], **edit}.items() if key not in drop}
+    return _helper_jsonl(rows)
+
+
+_COMPARE_ARGV = ("base.jsonl", "head.jsonl", "--threshold-file", "threshold.json")
+_DERIVE_ARGV = ("--derive-threshold", "--calibration", "calibration.json")
+
+
+@pytest.mark.parametrize(
+    ("files", "argv"),
+    [
+        pytest.param(
+            {"head.jsonl": _helper_first_row_edited({}, drop=("cpu_s",))},
+            _COMPARE_ARGV,
+            id="row-without-cpu_s",
+        ),
+        pytest.param(
+            {"head.jsonl": _helper_first_row_edited({}, drop=("cpu_count",))},
+            _COMPARE_ARGV,
+            id="row-without-cpu_count",
+        ),
+        pytest.param(
+            {"head.jsonl": _helper_first_row_edited({"wall_s": "fast"})},
+            _COMPARE_ARGV,
+            id="non-numeric-wall_s",
+        ),
+        pytest.param(
+            {"head.jsonl": _helper_first_row_edited({"exit_code": 1}, drop=("rep",))},
+            _COMPARE_ARGV,
+            id="failed-row-without-rep",
+        ),
+        pytest.param(
+            {"head.jsonl": _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6))[:-40]},
+            _COMPARE_ARGV,
+            id="truncated-last-row",
+        ),
+        pytest.param(
+            {"threshold.json": json.dumps({_SCENARIO: {"wall_pct": "ten", "cpu_pct": 10}})},
+            _COMPARE_ARGV,
+            id="non-numeric-limit",
+        ),
+        pytest.param(
+            {
+                "calibration.json": json.dumps(
+                    {"samples": [{"changes": {_SCENARIO: {"wall_pct": 0.1}}}]}
+                )
+            },
+            _DERIVE_ARGV,
+            id="calibration-change-without-cpu_pct",
+        ),
+        pytest.param(
+            {"calibration.json": json.dumps({"samples": [{"changes": [0.1, 0.2]}]})},
+            _DERIVE_ARGV,
+            id="calibration-changes-not-a-mapping",
+        ),
+    ],
+)
+def test_every_malformed_shape_exits_2_with_one_line(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    files: dict[str, str],
+    argv: tuple[str, ...],
+) -> None:
+    rows = _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6))
+    limits = json.dumps({_SCENARIO: {"wall_pct": 10, "cpu_pct": 10}})
+    defaults = {"base.jsonl": rows, "head.jsonl": rows, "threshold.json": limits}
+    for name, text in {**defaults, **files}.items():
+        (tmp_path / name).write_text(text)
+
+    exit_code = compare.main([str(tmp_path / arg) if "." in arg else arg for arg in argv])
+
+    err = capsys.readouterr().err
+    assert exit_code == 2, f"malformed input must exit 2, not {exit_code}: {err}"
+    assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
+
+
 def test_calibration_file_records_each_sample_and_rebuilds_the_same_thresholds(
     tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

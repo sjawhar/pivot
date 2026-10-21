@@ -76,6 +76,7 @@ jobs:
           INPUT_BASE: ${{ inputs.base }}
         run: |-
           if [ "$EVENT_NAME" = pull_request ]; then
+            git rev-parse --verify "$MERGE_SHA^1"
             echo "ref=$(git rev-parse "$MERGE_SHA^1")" >> "$GITHUB_OUTPUT"
           elif [ -n "$INPUT_BASE" ]; then
             echo "ref=$INPUT_BASE" >> "$GITHUB_OUTPUT"
