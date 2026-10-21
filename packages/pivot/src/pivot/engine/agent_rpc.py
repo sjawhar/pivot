@@ -45,9 +45,13 @@ _MAX_VERSION = 2**63 - 1
 
 
 def _json_default(obj: object) -> object:
-    """Custom JSON encoder for enums and other non-serializable types."""
+    """Encode enums by value, and numpy integers, floats and bools as their Python types."""
     if isinstance(obj, enum.Enum):
         return obj.value
+    import numpy
+
+    if isinstance(obj, (numpy.integer, numpy.floating, numpy.bool_)):
+        return obj.item()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
@@ -406,6 +410,8 @@ class AgentRpcHandler:
                     raise ValueError("old_hash must be string or null")
                 if new_hash is not None and not isinstance(new_hash, str):
                     raise ValueError("new_hash must be string or null")
+                if not old_hash and not new_hash:
+                    raise ValueError("old_hash or new_hash must be given")
 
                 max_rows = params.get("max_rows", 50)
                 if not isinstance(max_rows, int) or isinstance(max_rows, bool):

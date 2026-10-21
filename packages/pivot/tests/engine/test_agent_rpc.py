@@ -1896,16 +1896,15 @@ async def test_handler_diff_output_invalid_new_hash_type() -> None:
 
 
 @pytest.mark.anyio
-async def test_handler_diff_output_null_hashes(
+async def test_handler_diff_output_null_old_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """diff_output works with null hashes (file added/removed cases)."""
+    """diff_output restores only the side whose hash the request names (an added file)."""
     mock_engine = MagicMock()
     handler = AgentRpcHandler(engine=mock_engine)
 
     expected = _make_diff_result("new_file.csv")
 
-    # restore_data_from_cache should NOT be called for null hashes
     restore_calls = list[str]()
 
     def _mock_restore(rel_path: str, file_hash: str) -> Path | None:
@@ -1917,6 +1916,7 @@ async def test_handler_diff_output_null_hashes(
         "pivot.show.data.diff_data_files",
         _helper_diff_data_files,
     )
+    monkeypatch.setattr("pathlib.Path.unlink", _helper_path_unlink)
 
     _diff_expected = expected
     try:
@@ -1924,14 +1924,25 @@ async def test_handler_diff_output_null_hashes(
             "DataDiffResult",
             await handler.handle_query(
                 "diff_output",
-                {"path": "new_file.csv", "old_hash": None, "new_hash": None},
+                {"path": "new_file.csv", "old_hash": None, "new_hash": "def4560000000000"},
             ),
         )
     finally:
         _diff_expected = None
 
     assert result["path"] == "new_file.csv", "Should return correct path"
-    assert restore_calls == [], "Should not call restore for null hashes"
+    assert restore_calls == ["def4560000000000"], "Should restore only the named side"
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_refuses_a_request_naming_neither_hash() -> None:
+    """A request naming neither hash names no file to compare, so it is refused."""
+    handler = AgentRpcHandler(engine=MagicMock())
+
+    with pytest.raises(ValueError, match="old_hash or new_hash must be given"):
+        await handler.handle_query(
+            "diff_output", {"path": "out.csv", "old_hash": None, "new_hash": None}
+        )
 
 
 @pytest.mark.anyio
@@ -1955,7 +1966,7 @@ async def test_handler_diff_output_max_rows_default(
 
     await handler.handle_query(
         "diff_output",
-        {"path": "out.csv", "old_hash": None, "new_hash": None},
+        {"path": "out.csv", "old_hash": None, "new_hash": "def4560000000000"},
     )
 
     assert captured_kwargs.get("max_rows") == 50, "Default max_rows should be 50"
@@ -1982,7 +1993,7 @@ async def test_handler_diff_output_custom_max_rows(
 
     await handler.handle_query(
         "diff_output",
-        {"path": "out.csv", "old_hash": None, "new_hash": None, "max_rows": 100},
+        {"path": "out.csv", "old_hash": None, "new_hash": "def4560000000000", "max_rows": 100},
     )
 
     assert captured_kwargs.get("max_rows") == 100, "Should use custom max_rows"
@@ -2022,3 +2033,20 @@ async def test_handler_diff_output_passes_the_change_type_its_hashes_name(
     )
 
     assert captured_kwargs.get("change_type") == change_type, captured_kwargs
+
+
+def test_encode_wire_writes_numpy_scalars_as_python_values() -> None:
+    """A diff result's row values can be numpy integers, floats and bools; the RPC writes them
+    as plain JSON numbers and booleans instead of dropping the connection."""
+    import numpy
+
+    from pivot.engine import agent_rpc
+
+    message = {
+        "old_values": {"n": numpy.int64(2), "x": numpy.float64(0.5), "ok": numpy.bool_(True)}
+    }
+
+    wire = json.loads(agent_rpc._encode_wire(message))
+
+    assert wire == {"old_values": {"n": 2, "x": 0.5, "ok": True}}
+    assert [type(value) for value in wire["old_values"].values()] == [int, float, bool]

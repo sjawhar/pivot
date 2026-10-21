@@ -2508,7 +2508,7 @@ def test_diff_in_a_fresh_clone_reports_a_head_side_missing_from_the_cache(
     _ok(_pivot(clone, "repro"))
     (missing,) = [path for path, (kind, _, _) in expected.items() if kind != "added"]
     line = (
-        f"{missing}: its git HEAD content is not in the local cache; run pivot pull to compare it"
+        f"{missing}: its git HEAD content is not in the local cache; run pivot fetch to compare it"
     )
 
     for target in ("d/make", "."):
@@ -2533,6 +2533,130 @@ def test_diff_in_a_fresh_clone_reports_a_head_side_missing_from_the_cache(
     }
     assert tui_kinds == expected, tui_kinds
     assert tui_result.stderr.count(line) == 1, tui_result.stderr
+
+
+_FETCH_FIX_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def mod(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("part")}
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    mod(rows)
+    split(rows)
+"""
+
+
+@pytest.mark.parametrize(
+    ("change", "target", "before_fix", "after_fix"),
+    [
+        pytest.param(
+            "modified",
+            "data/d/mod.csv",
+            ("modified", None, 3),
+            ("modified", 2, 3),
+            id="modified-output",
+        ),
+        pytest.param(
+            "deleted",
+            "data/d/mod.csv",
+            ("removed", None, None),
+            ("removed", 2, None),
+            id="deleted-output",
+        ),
+        pytest.param(
+            "deleted",
+            "data/d/split/train.csv",
+            ("removed", None, None),
+            ("removed", 1, None),
+            id="deleted-directory-member",
+        ),
+    ],
+)
+def test_diff_names_a_fix_that_compares_the_entry_without_touching_the_workspace(
+    tmp_path: pathlib.Path,
+    moto_services: dict[str, str],
+    change: str,
+    target: str,
+    before_fix: tuple[str, int | None, int | None],
+    after_fix: tuple[str, int | None, int | None],
+) -> None:
+    """In a fresh clone whose cache lacks git HEAD's objects, the warning names a command.
+    Running it makes the same diff compare the entry with git HEAD's counts known, and leaves
+    the workspace side as it was: a deleted output stays deleted, a changed one stays changed."""
+    env = _env(
+        AWS_ENDPOINT_URL=moto_services["s3"],
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"fetch-fix-{uuid.uuid4().hex[:8]}"
+    boto3.client(
+        "s3",
+        endpoint_url=moto_services["s3"],
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    ).create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _project(
+        source,
+        {"pipeline.py": _FETCH_FIX_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"},
+    )
+    _ok(_pivot(source, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(source, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(source, "repro", env=env))
+    _ok(_pivot(source, "push", env=env))
+    _commit(source, "first run")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(source), str(clone)], check=True)
+    assert not (clone / ".pivot" / "cache").exists()
+    if change == "modified":
+        (clone / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntest,2\ntrain,3\n")
+        _ok(_pivot(clone, "repro", env=env))
+    else:
+        (clone / target).unlink()
+    workspace_before = (clone / target).read_bytes() if (clone / target).exists() else None
+
+    def _entry(
+        result: subprocess.CompletedProcess[str],
+    ) -> dict[str, tuple[str, int | None, int | None]]:
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            e["path"]: (e["change_type"], e["old_rows"], e["new_rows"])
+            for e in json.loads(result.stdout)
+        }
+
+    first = _pivot(clone, "diff", "--json", target, env=env)
+    assert _entry(first) == {target: before_fix}, first.stdout
+    line = (
+        f"{target}: its git HEAD content is not in the local cache; run pivot fetch to compare it"
+    )
+    assert first.stderr.count(line) == 1, first.stderr
+
+    _ok(_pivot(clone, "fetch", env=env))
+
+    after = _pivot(clone, "diff", "--json", target, env=env)
+    assert _entry(after) == {target: after_fix}, after.stdout
+    assert "local cache" not in after.stderr, after.stderr
+    workspace_after = (clone / target).read_bytes() if (clone / target).exists() else None
+    assert workspace_after == workspace_before
 
 
 def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(

@@ -64,7 +64,7 @@ class DiffSummaryPanel(textual.widgets.Static):
             summary_lines.append("Rows: unknown [red](removed)[/]")
         if old_rows is None and self._result["change_type"] != ChangeType.ADDED:
             summary_lines.append(
-                "[yellow]Its git HEAD content is not in the local cache; run pivot pull to compare it[/]"
+                "[yellow]Its git HEAD content is not in the local cache; run pivot fetch to compare it[/]"
             )
 
         # Column counts

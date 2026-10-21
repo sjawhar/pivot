@@ -574,9 +574,9 @@ pivot diff TARGETS... [OPTIONS]
 
 Each `--json` entry carries `change_type`: `added`, `removed` or `modified`. A kind change has
 no entry, only its warning. When git HEAD's side of an entry is not in the local cache, as in a
-clone that has not run `pivot pull`, the entry keeps its change type with that side's rows and
-columns `null`. A warning names the path and says to run `pivot pull`, and every other entry is
-compared as usual.
+fresh clone, the entry keeps its change type with that side's rows and columns `null`. A warning
+names the path and says to run `pivot fetch`, which fills the cache without touching the
+workspace, so the next diff compares that entry; every other entry is compared as usual.
 
 **Options:**
 

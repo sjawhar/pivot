@@ -108,7 +108,7 @@ def diff(
                 old_path = data_module.restore_data_from_cache(rel_path, old_hash)
                 if old_path is None:
                     logger.warning(
-                        "%s: its git HEAD content is not in the local cache; run pivot pull to compare it",
+                        "%s: its git HEAD content is not in the local cache; run pivot fetch to compare it",
                         rel_path,
                     )
                 else:

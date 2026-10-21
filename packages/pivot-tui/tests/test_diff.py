@@ -65,7 +65,7 @@ class _SummaryPanelApp(textual.app.App[None]):
         yield data_tui.DiffSummaryPanel(self._result)
 
 
-_CACHE_NOTE = "Its git HEAD content is not in the local cache; run pivot pull to compare it"
+_CACHE_NOTE = "Its git HEAD content is not in the local cache; run pivot fetch to compare it"
 
 
 @pytest.mark.asyncio
