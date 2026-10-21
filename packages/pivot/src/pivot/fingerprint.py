@@ -1157,6 +1157,15 @@ def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
         return None
 
 
+def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
+    """Parse the source `inspect.getsource(func)` returns: for a functools.wraps wrapper, the
+    function at the end of its `__wrapped__` chain."""
+    try:
+        return ast.parse(textwrap.dedent(inspect.getsource(func)))
+    except (OSError, TypeError, SyntaxError):
+        return None
+
+
 def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
     """Refuse `getattr` with a computed name, `globals()`/`locals()`, and `x.import_module(...)`.
 
@@ -1200,9 +1209,15 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     func_name = getattr(func, "__name__", "<lambda>")
     manifest[f"self:{func_name}"] = hash_function_ast(func)
 
-    tree = _source_tree(func) if is_user_code(func) else None
-    if tree is not None:
-        _check_dynamic_name_access(func, tree)
+    tree: ast.Module | None = None
+    if is_user_code(func):
+        tree = _source_tree(func)
+        # The refusals read the source `inspect.getsource` returns, which follows a
+        # functools.wraps chain to the wrapped function, as on main; the body-import walk below
+        # reads the wrapper's own source.
+        check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
+        if check_tree is not None:
+            _check_dynamic_name_access(func, check_tree)
 
     _t_closure = metrics.start()
     try:

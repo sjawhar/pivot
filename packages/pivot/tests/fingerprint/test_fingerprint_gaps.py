@@ -1185,3 +1185,99 @@ def test_user_class_reached_only_through_a_loaded_input(
     edited = _run(project, "repro", "--json", pythonpath=src)
     assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
     assert _count(project) == 600
+
+
+_WRAP_TAIL = (
+    "\n\n@stage\n@deco\ndef count(text: str) -> dict:\n"
+    '    return {"v": len(text.splitlines())}\n\n\n'
+    'with Pipeline("t") as pipeline:\n'
+    '    count(pipeline.input("lines.txt", t=str))\n'
+)
+
+
+def _wrapper_pipeline(wrapper_body: str) -> str:
+    return (
+        "import functools\nimport importlib\n\nfrom pivot import Pipeline, stage\n\n\n"
+        "def deco(fn):\n"
+        "    @functools.wraps(fn)\n"
+        "    def wrapper(text):\n" + wrapper_body + "\n    return wrapper" + _WRAP_TAIL
+    )
+
+
+_WRAPPER_BODIES_MAIN_RUNS = {
+    "getattr-computed-name": {
+        "pipeline.py": _wrapper_pipeline(
+            '        name = "upper"\n        return fn(getattr(text, name)())\n'
+        )
+    },
+    "import-module": {
+        "pipeline.py": _wrapper_pipeline(
+            '        importlib.import_module("json")\n        return fn(text)\n'
+        )
+    },
+    "globals": {
+        "pipeline.py": _wrapper_pipeline("        _ = len(globals())\n        return fn(text)\n")
+    },
+    "decorator-in-helper-module": {
+        "helpers/__init__.py": "",
+        "helpers/deco.py": (
+            "import functools\n\nNAME = 'upper'\n\n\ndef deco(fn):\n"
+            "    @functools.wraps(fn)\n"
+            "    def wrapper(text):\n"
+            "        return fn(getattr(text, NAME)())\n\n"
+            "    return wrapper\n"
+        ),
+        "pipeline.py": (
+            "from helpers.deco import deco\n\nfrom pivot import Pipeline, stage\n" + _WRAP_TAIL
+        ),
+    },
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_WRAPPER_BODIES_MAIN_RUNS))
+def test_dynamic_name_refusals_read_the_wrapped_function_source(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """As on main, the definition-time refusals for a functools.wraps stage read
+    `inspect.getsource` of the stage, which follows `__wrapped__`: a computed `getattr`,
+    `import_module` or `globals()` in the wrapper's own body runs and caches."""
+    project = _project(tmp_path, _WRAPPER_BODIES_MAIN_RUNS[shape])
+
+    first = _run(project, "repro")
+    again = _run(project, "repro", "--json")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    assert _count(project) == 3
+
+
+def test_dynamic_name_refusal_reads_a_function_reached_only_through_wrapped(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A wrapper that calls `wrapper.__wrapped__` never reaches its function through the walk;
+    the refusal still reads the wrapped source, so a computed `getattr` there is refused at
+    definition, as on main."""
+    project = _project(
+        tmp_path,
+        {
+            "pipeline.py": (
+                "import functools\n\nfrom pivot import Pipeline, stage\n\n\n"
+                "def deco(fn):\n"
+                "    @functools.wraps(fn)\n"
+                "    def wrapper(text):\n"
+                "        return wrapper.__wrapped__(text)\n\n"
+                "    return wrapper\n\n\n"
+                "@stage\n@deco\ndef count(text: str) -> dict:\n"
+                '    name = "upper"\n'
+                '    return {"v": len(getattr(text, name)().splitlines())}\n\n\n'
+                'with Pipeline("t") as pipeline:\n'
+                '    count(pipeline.input("lines.txt", t=str))\n'
+            )
+        },
+    )
+
+    result = _run(project, "repro")
+
+    message = result.stdout + result.stderr
+    assert result.returncode != 0, message
+    assert "'count' uses getattr() with non-literal attribute" in message, message

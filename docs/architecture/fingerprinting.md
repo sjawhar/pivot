@@ -113,7 +113,10 @@ def process():
 
 An import whose module is named at run time cannot be resolved statically. A call
 `x.import_module(...)` is refused with `StageDefinitionError`, as are `getattr()` with a
-computed name and `globals()`/`locals()` (`fingerprint._check_dynamic_name_access`). Other
+computed name and `globals()`/`locals()` (`fingerprint._check_dynamic_name_access`). For a
+`functools.wraps` wrapper these refusals read the source `inspect.getsource` returns, which is
+the wrapped function's, so a computed `getattr` in the wrapper's own body is not refused and one
+in the wrapped function is, even when the wrapper reaches it only through `__wrapped__`. Other
 spellings (`__import__`, an alias of `importlib.import_module`, a `functools.partial` of it,
 `vars(module)[name]`, `operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs)
 are not refused at definition. A user module one of them loads while the stage runs is caught by
