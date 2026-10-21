@@ -196,6 +196,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | A resolved helper receiving `"import_module"` | ✅ | `test_fingerprint_gaps.py::test_resolved_helper_accepts_import_module_argument_name` |
 | Library that creates modules without a source file (`pyexpat.errors`) | ✅ | `test_fingerprint_gaps.py::test_library_that_creates_fileless_modules_caches` |
 | Body import of a loaded module that imports other user modules | ✅ | `test_fingerprint_gaps.py::test_body_import_of_loaded_module_that_imports_user_modules_is_reused`, `test_fingerprint_gaps.py::test_uncovered_dynamic_import_after_a_covered_import_still_warns` |
+| Body import of a loaded module that registers a module without the hooks (`exec_module`, `EntryPoint.load()`, `importlib.__import__`) | ✅ (cached, as on main) | `test_fingerprint_gaps.py::test_body_import_of_module_that_registers_a_module_without_the_hooks_is_reused` |
+| Thread import after the covered import returned | ✅ (not reused) | `test_fingerprint_gaps.py::test_thread_import_after_the_covered_import_returned_still_warns`, `execution/test_worker_contracts.py::test_hooked_import_on_another_thread_during_a_covered_import_is_still_counted` |
+| Body import a raising `sys.meta_path` finder rejects | ✅ (runs and caches, as on main) | `test_fingerprint_gaps.py::test_body_import_a_raising_meta_path_finder_rejects_runs_and_caches` |
 | User class reached only through a pickled input | ✅ (not reused; annotation covers it) | `test_fingerprint_gaps.py::test_user_class_reached_only_through_a_loaded_input` |
 | Unloaded package located only by a `sys.meta_path` finder | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_package_found_by_a_meta_path_finder_is_refused` |
 | `runpy.run_path` / `runpy.run_module` of a top-level module | ❌ (stated limit) | `test_runtime_import_limits.py::test_d2_runpy_load_of_a_user_file_is_caught_or_listed_as_a_limit` |

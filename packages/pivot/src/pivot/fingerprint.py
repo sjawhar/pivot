@@ -1504,8 +1504,11 @@ def _module_spec_without_import(name: str) -> importlib.machinery.ModuleSpec | N
     """Resolve `name` through finders without running package initializers.
 
     A top-level name the filesystem finder does not locate is asked of every `sys.meta_path`
-    finder (`importlib.util.find_spec`), which for a top-level name imports nothing: an editable
-    install's finder (setuptools' PEP 660) locates its package this way.
+    finder (`importlib.util.find_spec`): an editable install's finder (setuptools' PEP 660)
+    locates its package this way. `find_spec` runs no package initializer for a top-level name,
+    but a finder may import modules of its own (setuptools' distutils shim imports
+    `setuptools._distutils`). A finder that raises is treated as not finding the name, so the
+    lookup never refuses a stage over an error in a finder.
     """
     path: Sequence[str] | None = None
     spec: importlib.machinery.ModuleSpec | None = None
@@ -1518,12 +1521,12 @@ def _module_spec_without_import(name: str) -> importlib.machinery.ModuleSpec | N
             if not isinstance(spec, importlib.machinery.ModuleSpec):
                 return None
         else:
-            spec = importlib.machinery.PathFinder.find_spec(part, path)
-            if spec is None and index == 0:
-                try:
+            try:
+                spec = importlib.machinery.PathFinder.find_spec(part, path)
+                if spec is None and index == 0:
                     spec = importlib.util.find_spec(part)
-                except (ImportError, ValueError):
-                    spec = None
+            except Exception:  # noqa: BLE001 - any finder error means "not found"
+                spec = None
             if spec is None:
                 return None
         path = spec.submodule_search_locations

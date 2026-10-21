@@ -1061,6 +1061,145 @@ def test_uncovered_dynamic_import_after_a_covered_import_still_warns(
     assert "helpers.util" not in message, message
 
 
+_UNHOOKED_REGISTRATIONS = {
+    "exec-module": (
+        "import importlib.util\nimport pathlib\nimport sys\n\n"
+        "_path = pathlib.Path(__file__).resolve().parent.parent / 'plugin.py'\n"
+        "_spec = importlib.util.spec_from_file_location('plugin', _path)\n"
+        "_module = importlib.util.module_from_spec(_spec)\n"
+        "sys.modules['plugin'] = _module\n"
+        "_spec.loader.exec_module(_module)\n\n"
+        "VALUE = 1\n"
+    ),
+    "entry-point-load": (
+        "import importlib.metadata\n\n"
+        "_factor = importlib.metadata.EntryPoint(name='p', value='plugin:FACTOR', group='g').load()"
+        "\n\nVALUE = 1\n"
+    ),
+    "importlib-dunder-import": "import importlib\n\n_p = importlib.__import__('plugin')\nVALUE = 1\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNHOOKED_REGISTRATIONS))
+def test_body_import_of_module_that_registers_a_module_without_the_hooks_is_reused(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """A loaded `helpers.lib` whose top level registers `plugin` without `__import__` or
+    `importlib.import_module` (`exec_module`, `EntryPoint.load()`, `importlib.__import__`): every
+    module that becomes resident during the stage's covered import of it is excused, as a
+    module-level import would leave it. The stage warns nothing, caches, and reruns on an edit to
+    `helpers/lib.py`."""
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/lib.py": _UNHOOKED_REGISTRATIONS[shape],
+            "plugin.py": "FACTOR = 1\n",
+            "pipeline.py": _transitive_pipeline("import helpers.lib\n", "helpers.lib.VALUE"),
+        },
+    )
+
+    first = _run(project, "repro")
+    again = _run(project, "repro", "--json")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    _edit(project, *_EDIT_LIB_VALUE)
+    edited = _run(project, "repro")
+    assert edited.returncode == 0, edited.stdout + edited.stderr
+    assert _count(project) == 103
+
+
+_LATE_THREAD_IMPORTS = {
+    "hooked": 'exec("import late")',
+    "unhooked": 'importlib.__import__("late")',
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(_LATE_THREAD_IMPORTS))
+def test_thread_import_after_the_covered_import_returned_still_warns(
+    tmp_path: pathlib.Path, spelling: str
+) -> None:
+    """The excusal window closes when the covered import returns: a second thread the stage
+    starts afterwards, importing an uncovered user module, still makes the result not
+    reusable, whether or not its import goes through the hooks."""
+    files, body_import, read = _TRANSITIVE_LAYOUTS["lib-imports-sibling"]
+    thread = (
+        "    import threading\n\n"
+        f"    loader = threading.Thread(target=lambda: {_LATE_THREAD_IMPORTS[spelling]})\n"
+        "    loader.start()\n"
+        "    loader.join()\n"
+    )
+    project = _project(
+        tmp_path,
+        {
+            **files,
+            "late.py": "VALUE = 0\n",
+            "pipeline.py": _transitive_pipeline(body_import, read, thread),
+        },
+    )
+
+    first = _run(project, "repro")
+
+    _assert_not_reusable(project, first)
+    message = " ".join((first.stdout + first.stderr).split())
+    assert "does not cover: late." in message, message
+    assert "helpers.util" not in message, message
+
+
+_RAISING_FINDER = (
+    "import sys\n\n\n"
+    "class _Raising:\n"
+    "    @classmethod\n"
+    "    def find_spec(cls, fullname, path=None, target=None):\n"
+    "        if fullname in ('optmod', 'winonly'):\n"
+    "            raise RuntimeError('finder boom')\n"
+    "        return None\n\n\n"
+    "sys.meta_path.append(_Raising)\n"
+)
+_RAISING_FINDER_BODIES = {
+    "caught-optional-import": (
+        "    try:\n"
+        "        import optmod\n"
+        "    except Exception:\n"
+        "        optmod = None\n"
+        '    return {"v": (optmod is None) + len(text.splitlines())}\n',
+        4,
+    ),
+    "untaken-branch": (
+        "    if len(text) < 0:\n"
+        "        import winonly\n\n"
+        '        return {"v": winonly.VALUE}\n'
+        '    return {"v": len(text.splitlines())}\n',
+        3,
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_RAISING_FINDER_BODIES))
+def test_body_import_a_raising_meta_path_finder_rejects_runs_and_caches(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """A `sys.meta_path` finder that raises something other than ImportError for a name it is
+    asked about does not refuse the stage: the definition-time lookup treats it as not found,
+    and the stage runs and caches, as on main."""
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(_RAISING_FINDER)
+    body, expected = _RAISING_FINDER_BODIES[shape]
+    project = _project(
+        tmp_path, {"pipeline.py": _pipeline("", "@stage\ndef count(text: str) -> dict:\n" + body)}
+    )
+
+    first = _run(project, "repro", pythonpath=site)
+    again = _run(project, "repro", "--json", pythonpath=site)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    assert _count(project) == expected
+
+
 def test_dunder_import_with_cpython_keywords_runs_in_a_stage(tmp_path: pathlib.Path) -> None:
     """The worker's `__import__` takes CPython's keyword names (`globals=`, `locals=`)."""
     project = _project(

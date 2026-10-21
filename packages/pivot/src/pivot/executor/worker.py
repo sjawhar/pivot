@@ -89,7 +89,10 @@ class _StageImports:
     imported: set[str] = dataclasses.field(default_factory=set[str])
     # Modules that became resident while this stage's thread ran a covered module's own first
     # import: that module's module-level imports, which a module-level import of it would have
-    # made before the stage ran.
+    # made before the stage ran. Every `sys.modules` key added between the outermost covered
+    # import's entry and its return counts, however it was registered (`exec_module`,
+    # `EntryPoint.load()`, `importlib.__import__`); a key another thread adds in that window is
+    # counted too, since a delta cannot tell threads apart.
     excused: set[str] = dataclasses.field(default_factory=set[str])
 
 
@@ -173,8 +176,8 @@ def _imports_only_covered(tracked: _StageImports, name: str, fromlist: Sequence[
 def _covered_import(
     tracked: _StageImports, name: str | None, fromlist: Sequence[str]
 ) -> Generator[None]:
-    """Treat what this thread imports while it first-imports a covered module as that module's
-    own module-level imports (`_StageImports.excused`)."""
+    """Treat what becomes resident while this thread first-imports a covered module as that
+    module's own module-level imports (`_StageImports.excused`)."""
     state = _covered_import_state
     if state.depth == 0 and (name is None or not _imports_only_covered(tracked, name, fromlist)):
         yield
@@ -187,7 +190,11 @@ def _covered_import(
     finally:
         state.depth -= 1
         if state.depth == 0:
+            added = set(sys.modules) - state.resident_before
             state.resident_before = frozenset()
+            with _stage_imports_lock:
+                if _stage_imports is tracked:
+                    tracked.excused.update(added)
 
 
 def _tracked_import(

@@ -59,12 +59,13 @@ While a stage runs, its worker records the user modules it imports through
 Python's `__import__` and `importlib.import_module` entry points, including a
 module a warm worker already holds, and compares the `sys.modules` keys before
 and after the stage to catch a newly registered user module loaded from a
-source file. The modules a covered module itself imports the first time the
-stage imports it count as that module's own imports, as they would for a
-module-level import. A stage that imported a user module its fingerprint does
-not cover still succeeds, with one warning naming the module, but its result
-is never reused: Pivot files no run-cache entry and writes a lock the next run
-cannot match, and `pivot status --explain` and `pivot repro --dry-run --explain`
+source file. Everything that becomes resident while the stage first imports a
+covered module counts as that module's own imports, as it would for a
+module-level import, however it was registered. A stage that imported a user
+module its fingerprint does not cover still succeeds, with one warning naming
+the module, but its result is never reused: Pivot files no run-cache entry and
+writes a lock the next run cannot match, and `pivot status --explain` and
+`pivot repro --dry-run --explain`
 show the stage as stale with that reason. `pivot commit` keeps that mark when it
 records the same outputs, so the stage still reruns. A user class reached only
 through a loaded input (an object in a `loaders.Pickle()` input whose class the
@@ -94,6 +95,14 @@ check:
 - an import from a thread that outlives its stage: the import is charged to
   whichever stage is running when it happens, or to none; join the thread
   before the stage returns;
+- a user module another thread of the stage registers without `__import__` or
+  `import_module` (for example with `exec_module`) while the stage's own thread
+  is inside a covered module's first import: it is excused with that import's
+  other new modules; import user modules statically, or before starting threads;
+- a user module a covered module loads at import time through `importlib.util`
+  and `exec_module`, or `EntryPoint.load()`: it is excused but not
+  fingerprinted, as on main, so an edit to it is seen only when the covered
+  module changes; import it statically;
 - a package resource read through `importlib.resources` (for example
   `files(helpers).joinpath("table.txt")`): it is data, not code; declare it
   with `pipeline.input`;

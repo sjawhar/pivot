@@ -467,8 +467,8 @@ def test_stage_import_tracking_records_cached_module_per_stage(
 def test_covered_module_first_import_excuses_only_its_own_imports(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A covered module's own module-level imports are excused, on the importing thread only; a
-    covered module importing a module already resident excuses nothing."""
+    """What becomes resident during a covered module's first import is excused; a later import
+    of another user module is counted."""
     for name, text in {
         "cov_lib.py": "import cov_dep\n\nVALUE = 1\n",
         "cov_dep.py": "VALUE = 2\n",
@@ -483,8 +483,51 @@ def test_covered_module_first_import_excuses_only_its_own_imports(
         importlib.import_module("cov_lib")
         importlib.import_module("cov_other")
 
-    assert tracked.excused == {"cov_dep"}
+    assert tracked.excused == {"cov_lib", "cov_dep"}
     assert tracked.imported == {"cov_lib", "cov_other"}
+
+
+def test_hooked_import_on_another_thread_during_a_covered_import_is_still_counted(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second thread's hooked import made while the first thread is inside a covered import
+    is recorded as the stage's own: the excusal of hooked names is per thread. Its new
+    `sys.modules` key falls inside the window's delta, which cannot tell threads apart."""
+    sync = type(sys)("cov_sync")
+    sync.started = threading.Event()
+    sync.done = threading.Event()
+    monkeypatch.setitem(sys.modules, "cov_sync", sync)
+    for name, text in {
+        "cov_lib.py": (
+            "import cov_dep\nimport cov_sync\n\n"
+            "cov_sync.started.set()\n"
+            "assert cov_sync.done.wait(10)\n\n"
+            "VALUE = 1\n"
+        ),
+        "cov_dep.py": "VALUE = 2\n",
+        "cov_other.py": "VALUE = 3\n",
+    }.items():
+        (tmp_path / name).write_text(text)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in ("cov_lib", "cov_dep", "cov_other"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    def other_thread() -> None:
+        assert sync.started.wait(10)
+        importlib.import_module("cov_other")
+        sync.done.set()
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        importlib.import_module("cov_lib")
+        thread.join(10)
+
+    assert not thread.is_alive()
+    assert "cov_other" in tracked.imported, "a hooked import on another thread is counted"
+    assert "cov_dep" in tracked.excused
+    assert "cov_dep" not in tracked.imported
+    assert "cov_other" in tracked.excused, "the window's delta includes the other thread's key"
 
 
 def test_import_hooks_keep_cpythons_signature_and_are_not_installed_on_import() -> None:
