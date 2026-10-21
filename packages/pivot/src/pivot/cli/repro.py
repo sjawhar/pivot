@@ -572,6 +572,13 @@ def _run_serve_mode(
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)
 
+    if threading.current_thread() is not threading.main_thread():
+        # Python delivers signals only to the main thread, and only it may install handlers.
+        # Serve on another thread gets no stop-signal handling; its caller stops it.
+        with contextlib.suppress(KeyboardInterrupt):
+            anyio.run(_serve)
+        return
+
     # A service manager stops a server with SIGTERM, often more than once (GNU timeout signals
     # the process and then its group). The event loop receives SIGTERM, and Ctrl-C unless it was
     # inherited as ignored; the first cancels the serve task group, so the engine unwinds,

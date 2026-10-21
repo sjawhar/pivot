@@ -722,6 +722,52 @@ with pipeline:
     assert "SIGTERM stopped it" in result.stdout, result.stdout
 
 
+@pytest.mark.parametrize("entry", ["main", "click"])
+def test_serve_from_a_worker_thread_answers_and_leaves_signal_handlers_alone(
+    tmp_path: pathlib.Path, entry: str
+) -> None:
+    """Python delivers signals only to the main thread, so an embedder that runs serve on
+    another thread gets it without stop-signal handling: it answers, and the process's SIGINT
+    and SIGTERM handlers stay the embedder's. Stopping it is the embedder's job."""
+    project = tmp_path / "project"
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text("""\
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def noop() -> None:
+    pass
+
+
+with pipeline:
+    noop()
+""")
+    probe = pathlib.Path(__file__).with_name("inproc_thread_serve.py")
+    result = subprocess.run(
+        [sys.executable, str(probe), str(project), entry],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env={**os.environ, "PIVOT_CACHE_DIR": str(tmp_path / "cache")},
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    report = json.loads(lines[-1])
+    assert report["answer"] and '"result"' in report["answer"], (
+        f"serve on a worker thread did not answer status: {report}\n{result.stderr[-2000:]}"
+    )
+    assert lines[0].removeprefix("before: ") == lines[1].removeprefix("serving: "), (
+        f"serve on a worker thread changed the process's signal handlers: {lines[:2]}"
+    )
+
+
 def test_group_sigterm_during_a_stage_is_not_logged_as_a_failure(tmp_path: pathlib.Path) -> None:
     """`systemctl stop` sends SIGTERM to the whole cgroup. A running worker receives that
     signal directly, but a deliberate service stop must not emit a stage-failure traceback."""
