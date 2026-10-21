@@ -1986,3 +1986,39 @@ async def test_handler_diff_output_custom_max_rows(
     )
 
     assert captured_kwargs.get("max_rows") == 100, "Should use custom max_rows"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("old_hash", "new_hash", "change_type"),
+    [
+        pytest.param(None, "def4560000000000", ChangeType.ADDED, id="added"),
+        pytest.param("abc1230000000000", None, ChangeType.REMOVED, id="removed"),
+        pytest.param("abc1230000000000", "def4560000000000", ChangeType.MODIFIED, id="modified"),
+    ],
+)
+async def test_handler_diff_output_passes_the_change_type_its_hashes_name(
+    monkeypatch: pytest.MonkeyPatch,
+    old_hash: str | None,
+    new_hash: str | None,
+    change_type: ChangeType,
+) -> None:
+    """A request naming only a new hash is an added file, only an old hash a removed file, and
+    both a modified file, whether or not either object is in the cache."""
+    handler = AgentRpcHandler(engine=MagicMock())
+    captured_kwargs = dict[str, object]()
+
+    def _mock_diff(
+        old_path: object, new_path: object, path_display: str, **kwargs: object
+    ) -> DataDiffResult:
+        captured_kwargs.update(kwargs)
+        return _make_diff_result(path_display)
+
+    monkeypatch.setattr("pivot.show.data.restore_data_from_cache", _helper_restore_data_none)
+    monkeypatch.setattr("pivot.show.data.diff_data_files", _mock_diff)
+
+    await handler.handle_query(
+        "diff_output", {"path": "out.csv", "old_hash": old_hash, "new_hash": new_hash}
+    )
+
+    assert captured_kwargs.get("change_type") == change_type, captured_kwargs
