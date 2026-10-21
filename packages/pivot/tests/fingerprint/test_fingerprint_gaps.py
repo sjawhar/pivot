@@ -866,3 +866,59 @@ def test_eval_lambda_is_hashed_by_its_code_object(tmp_path: pathlib.Path) -> Non
     edited = _run(project, "repro", "--json")
     assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
     assert _count(project) == 103
+
+
+_WARNING_FIXES = {
+    "import-module-through-dict": (
+        "\nimport helpers.lib\n",
+        'load = importlib.__dict__["import_module"]\n'
+        '    return {"v": load("helpers.lib").VALUE + len(text.splitlines())}',
+        'return {"v": helpers.lib.VALUE + len(text.splitlines())}',
+    ),
+    "resources-files": (
+        "\nimport importlib.resources\n\nimport helpers\n",
+        'data = importlib.resources.files("helpers").joinpath("table.txt").read_text()\n'
+        '    return {"v": int(data) + len(text.splitlines())}',
+        'data = importlib.resources.files(helpers).joinpath("table.txt").read_text()\n'
+        '    return {"v": int(data) + len(text.splitlines())}',
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_WARNING_FIXES))
+def test_following_the_uncovered_import_warning_fix_clears_it(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """The warning's fix (import the module and read it by name in the stage's own code) clears
+    it: a module-level import alone does not, and after the fix the stage is cached again."""
+    imports, as_written, fixed = _WARNING_FIXES[shape]
+
+    def stage_body(body: str) -> str:
+        return f"@stage\ndef count(text: str) -> dict:\n    {body}\n"
+
+    project = _project(
+        tmp_path,
+        {
+            **_LIB_VALUE,
+            "helpers/table.txt": "1\n",
+            "pipeline.py": _pipeline(imports, stage_body(as_written)),
+        },
+    )
+    flagged = _run(project, "repro")
+    message = " ".join((flagged.stdout + flagged.stderr).split())
+    assert flagged.returncode == 0, message
+    assert message.count("imported user modules its fingerprint does not cover") == 1, message
+    assert "read them by name in the stage's own code" in message, message
+    assert "pipeline.py)" not in message, message
+    (project / "pipeline.py").write_text(_pipeline(imports, stage_body(fixed)))
+
+    first = _run(project, "repro")
+    again = _run(project, "repro", "--json")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    if shape == "import-module-through-dict":
+        _edit(project, *_EDIT_LIB_VALUE)
+        assert _run(project, "repro").returncode == 0
+        assert _count(project) == 103

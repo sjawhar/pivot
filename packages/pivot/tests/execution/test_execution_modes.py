@@ -83,6 +83,7 @@ def _make_stage_info(
         collection_params={},
         incremental_inputs={},
         unsafe_fingerprint=False,
+        no_fingerprint=False,
     )
 
 

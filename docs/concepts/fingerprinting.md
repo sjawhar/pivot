@@ -61,15 +61,25 @@ module a warm worker already holds, and compares the `sys.modules` keys before
 and after the stage to catch a newly registered user module. A stage that
 imported a user module its fingerprint does not cover still succeeds, with one
 warning naming the module, but its result is never reused: Pivot files no
-run-cache entry and writes a lock the next run cannot match, and `pivot status`
-and `pivot explain` show the stage as stale with that reason.
+run-cache entry and writes a lock the next run cannot match, and
+`pivot status --explain` and `pivot repro --dry-run --explain` show the stage as
+stale with that reason. `pivot commit` keeps that mark when it records the same
+outputs, so the stage still reruns. To clear the warning, import the module
+statically and read it by name in the stage's own code (`import pkg.mod`, then
+`pkg.mod.NAME`, or pass `pkg.mod` itself to the call that needs it), so the
+walk covers it, or move the value into `StageParams`. An import in
+`pipeline.py` alone does not cover a module for a stage that never reads it,
+and a body import that only silences the warning while the stage still reads
+values through the object a dynamic import returned leaves those values
+untracked. A `@no_fingerprint` stage is not checked: its declared `code_deps`
+are its code.
 
 That check does not see every way a stage can reach code. In these cases Pivot
 reuses a result whose fingerprint missed the code, as it would without the
 check:
 
 - a read of a module already in `sys.modules` without an import, or
-  `importlib.reload`: import the module at module level instead;
+  `importlib.reload`: import the module where the stage reads it;
 - private import machinery, or a loader that replaces a module already in
   `sys.modules` or never registers one: import it statically, or move the value
   into `StageParams`;
@@ -78,10 +88,13 @@ check:
 - an import from a thread that outlives its stage: the import is charged to
   whichever stage is running when it happens, or to none; join the thread
   before the stage returns;
-- `pivot repro --no-commit` followed by `pivot commit`: `pivot commit` records
-  the outputs on disk against the static fingerprint, as it records any
-  output; run `pivot repro` without `--no-commit` for a stage that imports
-  dynamically.
+- a package resource read through `importlib.resources` (for example
+  `files(helpers).joinpath("table.txt")`): it is data, not code; declare it
+  with `pipeline.input`;
+- `pivot repro --no-commit` followed by `pivot commit`: no lock exists to carry
+  the mark, so `pivot commit` records the outputs on disk against the static
+  fingerprint, as it records any output; run `pivot repro` without
+  `--no-commit` for a stage that imports dynamically.
 
 
 ### Transitive Tracking

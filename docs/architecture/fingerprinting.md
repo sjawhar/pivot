@@ -38,7 +38,7 @@ Pivot's fingerprinting system:
 | Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
 | Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
 | Class attributes a stage reads | Yes (value) | `Cls.NAME` read directly on a user class that the function names (a global, cell or default holding the class), or reaches through a user module (`settings.Config.SCALE`). When `NAME` is written in a user class body, it follows the module-level rule: scalars, exact tuples and frozensets of scalars, and compiled regexes are recorded; mutable or nested values are refused; a plain function is walked; and a member of a user Enum is recorded by name and value. A pydantic or StageParams class read this way is covered by its schema hash, field defaults included. Attributes a library base or the language defines (an inherited stdlib dict, `NamedTuple._fields`, an Enum's `_member_names_`), and descriptors (property, classmethod, staticmethod), are left to the class AST hash |
-| Other class-level and module reads | No | Not tracked: `cls.SCALE` inside a classmethod, `Outer.Inner.X`, an attribute read through an instance (`Config().SCALE`), a `ClassVar` on a `StageParams` class, a module read through a local alias (`s = settings; s.SCALE`), a literal `getattr(settings, "SCALE")`, and a module held in a class attribute (`Holder.lib.SCALE`). Put such configuration in the stage's `StageParams` |
+| Other class-level and module reads | No | Not tracked: `cls.SCALE` inside a classmethod, `Outer.Inner.X`, an attribute read through an instance (`Config().SCALE`), a `ClassVar` on a `StageParams` class, a module read through a local alias (`s = settings; s.SCALE`) or through the object a dynamic import returns (`load("settings").SCALE`), a literal `getattr(settings, "SCALE")`, and a module held in a class attribute (`Holder.lib.SCALE`). Put such configuration in the stage's `StageParams` |
 
 **Note:** The class AST and callable-member walk cover a class's code and the module values callable members read. Non-callable class attributes are only tracked in the direct `Cls.NAME` and `module.Cls.NAME` shapes above, plus dataclass and Pydantic field defaults. A value read as `module.NAME` follows the rule it follows as a global: a library function is an `ext:` entry, a `functools.partial` is walked, and a logger is ignored.
 
@@ -128,22 +128,35 @@ check below; an attribute read on a module already loaded is not.
 
 The worker wraps `builtins.__import__` and `importlib.import_module`, recording each user module
 (and its user packages) a stage requests, including one already in `sys.modules`, and compares the
-`sys.modules` keys before and after the stage. A recorded module the stage's manifest does not
-cover (`module:<name>` keys) makes the result not reusable: the stage succeeds and logs one
-warning naming the modules; its lock carries an `uncovered-import:<modules>` key no fingerprint
-matches, so the next `repro` reruns it and `status`/`explain` report "Previous run imported modules
-its fingerprint does not cover"; and no run-cache entry is filed. Under `--no-commit` the warning
-adds that `pivot commit` will record the outputs as current.
+`sys.modules` keys before and after the stage. The modules a manifest covers come from one function,
+`fingerprint.covered_user_modules`: `module:<name>` keys, and the `dep:<parameter>:module:<name>` and
+`out:<output>:module:<name>` keys a user loader's walk adds. A recorded module outside that set makes
+the result not reusable: the stage succeeds and logs one warning naming the modules; its lock
+carries an `uncovered-import:<modules>` key no fingerprint matches, so the next `repro` reruns it
+and `status --explain` and `repro --dry-run --explain` report "Previous run imported modules its
+fingerprint does not cover"; and no run-cache entry is filed. `pivot commit` carries that key into
+the lock it writes when the static fingerprint is otherwise unchanged, and files no run-cache entry
+for it (`skip.carry_uncovered_import`). Under `--no-commit` the warning adds that `pivot commit`
+will record the outputs as current.
+
+The warning's fix is a static import with the module read by name in the stage's own code
+(`pkg.mod.NAME`, or `pkg.mod` passed itself), which the walk then covers, or `StageParams`. An import
+in `pipeline.py` alone does not add the module to a stage that never reads it, and a body import
+that only silences the warning leaves values read through the object a dynamic import returned
+untracked, like the local-alias read in [What Gets Tracked](#what-gets-tracked). A
+`@no_fingerprint` stage is not checked (`WorkerStageInfo.no_fingerprint`): its `code_deps`
+declaration is its contract.
 
 The check does not see these paths, which behave as they would without it:
 
 | Path | Remedy |
 |------|--------|
-| Reading a module already in `sys.modules` without an import; `importlib.reload` | Import the module at module level |
+| Reading a module already in `sys.modules` without an import; `importlib.reload` | Import the module where the stage reads it |
 | Private import machinery; a loader that replaces a key already in `sys.modules` or never registers one | Import statically, or move the value into `StageParams` |
 | An import in a child process | Declare the code the child runs as an input, or use `@no_fingerprint(code_deps=[...])` |
 | An import from a thread that outlives its stage | Join the thread before the stage returns; its import is charged to whichever stage is running, or to none |
-| `pivot repro --no-commit`, then `pivot commit` | `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
+| A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
+| `pivot repro --no-commit`, then `pivot commit` | No lock exists to carry the mark, so `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
 
 ### Module-Level Instances
 

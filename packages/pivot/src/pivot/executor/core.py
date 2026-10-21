@@ -390,6 +390,7 @@ def prepare_worker_info(
         project_state_dir=default_state_dir,
         collection_params=stage_info["collection_params"],
         unsafe_fingerprint=stage_info["unsafe_fingerprint"],
+        no_fingerprint=stage_info["no_fingerprint"],
     )
 
 

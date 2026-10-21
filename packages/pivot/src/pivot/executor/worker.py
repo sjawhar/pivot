@@ -387,6 +387,8 @@ class WorkerStageInfo(TypedDict):
     incremental_inputs: dict[str, types.ArtifactIdentity]
     # The fingerprint downgraded a refusal to a warning: the run cache is neither read nor written.
     unsafe_fingerprint: bool
+    # The stage is `@no_fingerprint`: its declared files are its code, so imports are not checked.
+    no_fingerprint: bool
 
 
 def _make_result(
@@ -649,7 +651,13 @@ def _execute_stage(
                     module = sys.modules.get(module_name)
                     if isinstance(module, type(sys)) and fingerprint.is_user_code(module):
                         imported_modules.add(module_name)
-                uncovered = imported_modules - _covered_user_modules(current_fingerprint)
+                # A @no_fingerprint stage declares its code as files (`code_deps`); that
+                # declaration is its contract, so its imports are not checked.
+                uncovered = (
+                    set[str]()
+                    if stage_info["no_fingerprint"]
+                    else imported_modules - fingerprint.covered_user_modules(current_fingerprint)
+                )
                 lock_manifest = current_fingerprint
                 if uncovered:
                     modules = ", ".join(sorted(uncovered))
@@ -659,8 +667,9 @@ def _execute_stage(
                     logger.warning(
                         "Stage '%s' imported user modules its fingerprint does not cover: %s. "
                         + "Its result will not be reused; the next run reruns it.%s Fix: import "
-                        + "them at module level (or in pipeline.py), or move the values into "
-                        + "StageParams.",
+                        + "them statically and read them by name in the stage's own code "
+                        + "(`import pkg.mod`, then `pkg.mod.NAME`, or pass `pkg.mod` itself), or "
+                        + "move the values into StageParams.",
                         stage_name,
                         modules,
                         commit_note,
@@ -772,10 +781,6 @@ def user_code_files() -> list[str]:
         except OSError:
             files.add(str(pathlib.Path(module_file).absolute()))
     return sorted(files)
-
-
-def _covered_user_modules(manifest: dict[str, str]) -> set[str]:
-    return {key.removeprefix("module:") for key in manifest if key.startswith("module:")}
 
 
 def _begin_stage() -> None:

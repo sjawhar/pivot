@@ -145,6 +145,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Library module imported in the body | ✅ | `test_fingerprint_gaps.py::test_body_import_of_a_library_module_is_not_refused` |
 | User module loaded only at run time (partial, `vars`, `exec`, manual loader) | ✅ (not reused) | `test_fingerprint_gaps.py::test_runtime_dynamic_import_makes_result_not_reusable` |
 | Import from a thread an earlier stage left running | ✅ (not reused) | `test_fingerprint_gaps.py::test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage` |
+| `@no_fingerprint(code_deps=...)` stage importing a user module | ✅ (not checked; `code_deps` tracked) | `test_runtime_import_contract.py::test_d1_no_fingerprint_stage_with_body_import_is_reused` |
+| User loader `load`/`save` importing a loaded module (`dep:`/`out:` module keys) | ✅ | `test_runtime_import_contract.py::test_d2_user_loader_body_import_of_loaded_module_is_covered`, `test_fingerprint.py::test_covered_user_modules_reads_every_module_key_form` |
+| `pivot commit` after a flagged `repro` keeps the stage stale | ✅ | `test_runtime_import_contract.py::test_d3_commit_after_a_flagged_committing_repro_is_described`, `core/test_skip.py::test_carry_uncovered_import_keeps_marker_when_static_fingerprint_is_unchanged` |
+| Following the warning's fix clears it | ✅ | `test_fingerprint_gaps.py::test_following_the_uncovered_import_warning_fix_clears_it`, `test_runtime_import_contract.py::test_d4_uncovered_import_warning_names_a_fix_that_applies` |
 
 ---
 

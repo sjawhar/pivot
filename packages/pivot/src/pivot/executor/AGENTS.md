@@ -25,6 +25,7 @@ differ.
 | `outs` | Output artifact references |
 | `incremental_inputs` | Parameter-to-own-output identities for prior incremental values |
 | `unsafe_fingerprint` | The fingerprint downgraded a refusal to a warning; the run cache is neither read nor written |
+| `no_fingerprint` | The stage is `@no_fingerprint`: its declared files are its code, so the worker does not check the user modules it imports |
 | `project_root` | Absolute path to project root |
 | `state_dir` | Absolute path to `.pivot/` directory |
 

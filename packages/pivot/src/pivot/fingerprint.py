@@ -1617,6 +1617,27 @@ def _mark_module_covered(module_name: str, manifest: dict[str, str]) -> None:
             manifest.setdefault(f"module:{name}", "")
 
 
+# Loader manifests are merged into a stage's manifest under these prefixes (`dep:<parameter>:`,
+# `out:<output>:`), so a module a user loader covers appears as `dep:n:module:helpers.lib`.
+_LOADER_KEY_PREFIXES = ("dep:", "out:")
+
+
+def covered_user_modules(manifest: dict[str, str]) -> set[str]:
+    """Names of the user modules a stage manifest covers, from every key form that marks one:
+    `module:NAME`, and `dep:…:module:NAME` / `out:…:module:NAME` for a loader's walk."""
+    covered = set[str]()
+    for key in manifest:
+        if key.startswith("module:"):
+            name = key.removeprefix("module:")
+        elif key.startswith(_LOADER_KEY_PREFIXES) and ":module:" in key:
+            name = key.rpartition(":module:")[2]
+        else:
+            continue
+        if name and ":" not in name:
+            covered.add(name)
+    return covered
+
+
 def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
     """Whether a top-level module's spec locates library code (`is_library_path`), or no file."""
     if spec.has_location and spec.origin is not None:

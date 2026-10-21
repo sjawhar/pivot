@@ -36,6 +36,29 @@ def uncovered_import_reason(manifest: dict[str, str]) -> str | None:
     return None
 
 
+def carry_uncovered_import(
+    previous: dict[str, str] | None, fingerprint: dict[str, str]
+) -> dict[str, str]:
+    """The code manifest `pivot commit` records: `fingerprint`, plus the previous lock's
+    uncovered-import key when the static fingerprint is otherwise unchanged.
+
+    That key records that the run which produced these outputs imported code its fingerprint does
+    not cover. Committing those same outputs keeps the record, so the stage still reruns; a code
+    edit since then drops it, because the next run decides afresh.
+    """
+    if previous is None:
+        return fingerprint
+    markers = {
+        key: value for key, value in previous.items() if key.startswith(UNCOVERED_IMPORT_KEY_PREFIX)
+    }
+    if not markers:
+        return fingerprint
+    static = {key: value for key, value in previous.items() if key not in markers}
+    if static != fingerprint:
+        return fingerprint
+    return {**fingerprint, **markers}
+
+
 def check_stage(
     lock_data: LockData | None,
     fingerprint: dict[str, str],

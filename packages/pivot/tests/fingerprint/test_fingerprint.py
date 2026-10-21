@@ -1458,6 +1458,22 @@ def test_get_loader_fingerprint_returns_manifest():
     assert len(fp) > 0
 
 
+def test_covered_user_modules_reads_every_module_key_form():
+    """Bare `module:` keys and the `dep:`/`out:`-prefixed keys a loader's walk adds both count;
+    other keys that mention a module do not."""
+    manifest = {
+        "self:count": "a",
+        "module:helpers": "",
+        "dep:n:module:helpers.lib": "",
+        "out:t/count:out:module:other.mod": "",
+        "func:helpers.lib.value": "b",
+        "const:module.NAME": "1",
+        "dep:n:loader:helpers.myloader.Scaled:load": "c",
+    }
+
+    assert fingerprint.covered_user_modules(manifest) == {"helpers", "helpers.lib", "other.mod"}
+
+
 def test_loader_fingerprint_includes_load_method():
     """Should fingerprint the load method."""
     from pivot import loaders

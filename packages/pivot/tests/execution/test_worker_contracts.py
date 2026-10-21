@@ -117,6 +117,7 @@ def _stage_info(
         collection_params={},
         incremental_inputs={},
         unsafe_fingerprint=unsafe_fingerprint,
+        no_fingerprint=False,
     )
 
 

@@ -112,6 +112,7 @@ def _worker_info(
         collection_params={},
         incremental_inputs={"previous": output.identity},
         unsafe_fingerprint=False,
+        no_fingerprint=False,
     )
 
 
