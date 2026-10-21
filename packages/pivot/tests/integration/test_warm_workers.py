@@ -1565,10 +1565,10 @@ with Pipeline("warm") as pipeline:
 """
 
 
-def _helper_live_worker_pids() -> set[int]:
-    """The worker processes of Pivot's reusable loky executor."""
-    reusable_executor = importlib.import_module("loky.reusable_executor")
-    return set(cast("Any", reusable_executor)._executor._processes)
+def _helper_pool_worker_pids(pool: WorkerPool | None) -> set[int]:
+    """The worker processes of the executor ``pool`` holds."""
+    assert pool is not None and pool._executor is not None, "the pool holds no executor"
+    return set(pool._executor._processes)
 
 
 @pytest.mark.anyio
@@ -1581,14 +1581,14 @@ async def test_watch_reload_restarts_one_warm_worker(
     recorder = _Recorder()
     restarted = list[set[int]]()
     after_run = set[int]()
-    restart_workers = executor_core.restart_workers
+    restart = WorkerPool.restart
 
-    def recording_restart(max_workers: int, *, idle_timeout_s: float | None) -> int:
-        workers = restart_workers(max_workers, idle_timeout_s=idle_timeout_s)
-        restarted.append(_helper_live_worker_pids())
+    def recording_restart(self: WorkerPool, *, max_workers: int) -> int:
+        workers = restart(self, max_workers=max_workers)
+        restarted.append(_helper_pool_worker_pids(self))
         return workers
 
-    monkeypatch.setattr(executor_core, "restart_workers", recording_restart)
+    monkeypatch.setattr(WorkerPool, "restart", recording_restart)
     async with engine_mod.Engine(pipeline=pipeline) as eng:
         eng.add_sink(recorder)
         eng.add_source(sources.FilesystemSource(watch_paths=[root], debounce_ms=50))
@@ -1602,7 +1602,7 @@ async def test_watch_reload_restarts_one_warm_worker(
                 start=first_idle,
             )
             await recorder.wait_for(_helper_engine_state(EngineState.IDLE), start=reload)
-            after_run = _helper_live_worker_pids()
+            after_run = _helper_pool_worker_pids(eng._worker_pool)
             tg.cancel_scope.cancel()
 
     assert [len(pids) for pids in restarted] == [1], "the reload starts one warm worker"
