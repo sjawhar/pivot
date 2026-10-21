@@ -14,6 +14,7 @@ exclude = [
   "**/.pytest_cache/**",
   "**/.ruff_cache/**",
   "**/.venv/**",
+  "**/.worktrees/**",
   "benchmarks",
   "docs",
   "experiments",
