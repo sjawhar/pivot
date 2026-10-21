@@ -337,6 +337,51 @@ async def test_sink_error_does_not_crash_engine(test_pipeline: Pipeline) -> None
 # CLI Serve Mode E2E Tests
 # =============================================================================
 
+_NOOP_PIPELINE = """\
+import pathlib
+
+from pivot.compose import Pipeline, stage
+
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+
+@stage
+def noop() -> None:
+    pass
+
+
+with pipeline:
+    noop()
+"""
+
+# Runs serve in-process through pivot's embedding entry points; its docstring gives the modes.
+_INPROC_SERVE = pathlib.Path(__file__).with_name("inproc_serve.py")
+
+
+def _helper_project(project: pathlib.Path) -> None:
+    """Create a project at ``project`` whose pipeline has one stage that does nothing."""
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text(_NOOP_PIPELINE)
+
+
+def _helper_wait_for_status(
+    proc: subprocess.Popen[bytes], socket_path: pathlib.Path, deadline: float
+) -> dict[str, object] | None:
+    """Return serve's answer to ``status``, or None once ``proc`` exits or ``deadline`` passes.
+
+    Binding creates the socket file before the listener accepts connections, so this retries
+    the RPC rather than treating the socket's existence as readiness.
+    """
+    response: dict[str, object] | None = None
+    while response is None and proc.poll() is None and time.monotonic() < deadline:
+        try:
+            response = send_rpc(socket_path, "status")
+        except (ConnectionRefusedError, FileNotFoundError):
+            time.sleep(0.1)
+    return response
+
 
 def test_serve_mode_cli_responds_to_status_query(
     tmp_path: pathlib.Path,
@@ -384,22 +429,13 @@ with pipeline:
     )
 
     try:
-        # Binding creates the socket file before the listener accepts connections. Retry the
-        # first RPC rather than treating socket existence as readiness.
-        response: dict[str, object] | None = None
-        deadline = time.monotonic() + 10
-        while response is None and proc.poll() is None and time.monotonic() < deadline:
-            try:
-                response = send_rpc(socket_path, "status")
-            except (ConnectionRefusedError, FileNotFoundError):
-                time.sleep(0.1)
+        response = _helper_wait_for_status(proc, socket_path, time.monotonic() + 10)
         if response is None:
             stdout, stderr = proc.communicate(timeout=1)
             pytest.fail(
                 "Serve mode did not answer status within 10s.\n"
                 + f"exit: {proc.poll()}\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}"
             )
-        assert response is not None
         # Should get valid status response, NOT "Method not found" error
         assert "error" not in response, f"Expected status result, got error: {response}"
         assert "result" in response
@@ -442,25 +478,7 @@ def test_serve_mode_serves_a_project_whose_socket_path_exceeds_the_unix_socket_l
     An agent in the project connects to ``.pivot/agent.sock`` by its relative path.
     """
     project = tmp_path / ("deep-project-" * 10)
-    (project / ".pivot").mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "pipeline.py").write_text("""\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop_stage() -> None:
-    pass
-
-
-with pipeline:
-    noop_stage()
-""")
+    _helper_project(project)
     socket_path = project / ".pivot" / "agent.sock"
     assert len(os.fsencode(socket_path)) > 108, "the socket path must exceed every platform limit"
     stdout_path = tmp_path / "serve.stdout"
@@ -478,14 +496,9 @@ with pipeline:
         )
     monkeypatch.chdir(project)
     try:
-        response: dict[str, object] | None = None
-        deadline = time.monotonic() + 30
-        while response is None and proc.poll() is None and time.monotonic() < deadline:
-            try:
-                response = send_rpc(pathlib.Path(".pivot", "agent.sock"), "status")
-            except (ConnectionRefusedError, FileNotFoundError):
-                time.sleep(0.1)
-
+        response = _helper_wait_for_status(
+            proc, pathlib.Path(".pivot", "agent.sock"), time.monotonic() + 30
+        )
         assert response is not None, (
             f"serve mode did not answer on .pivot/agent.sock (exit code {proc.poll()}).\n"
             + f"stdout: {stdout_path.read_text(errors='replace')}\n"
@@ -563,25 +576,7 @@ def test_serve_mode_stopped_by_signals_exits_cleanly_and_leaves_nothing_behind(
     shuts down as Ctrl-C does whatever arrives: exit 0, no task failing during shutdown, and
     neither its socket nor multiprocessing's manager directory left behind."""
     project = tmp_path / "project"
-    (project / ".pivot").mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "pipeline.py").write_text("""\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop_stage() -> None:
-    pass
-
-
-with pipeline:
-    noop_stage()
-""")
+    _helper_project(project)
     socket_path = project / ".pivot" / "agent.sock"
     # Short, because multiprocessing binds its manager's socket under TMPDIR.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
@@ -605,13 +600,8 @@ with pipeline:
             signal.signal(signal.SIGINT, previous_sigint)
         monkeypatch.chdir(project)
         try:
-            response: dict[str, object] | None = None
             deadline = time.monotonic() + 30
-            while response is None and proc.poll() is None and time.monotonic() < deadline:
-                try:
-                    response = send_rpc(pathlib.Path(".pivot", "agent.sock"), "status")
-                except (ConnectionRefusedError, FileNotFoundError):
-                    time.sleep(0.1)
+            response = _helper_wait_for_status(proc, pathlib.Path(".pivot", "agent.sock"), deadline)
             assert response is not None, f"serve mode did not answer (exit {proc.poll()})"
             while not list(private_tmp.glob("pymp-*")) and time.monotonic() < deadline:
                 time.sleep(0.1)
@@ -652,35 +642,16 @@ def test_inprocess_serve_restores_stop_signals_for_children(
     """An application that invokes pivot's CLI in-process can still stop a child it starts
     afterward. The standalone pivot command exits immediately, but CLI embedders do not."""
     project = tmp_path / "project"
-    (project / ".pivot").mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "pipeline.py").write_text("""\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop() -> None:
-    pass
-
-
-with pipeline:
-    noop()
-""")
-    probe = pathlib.Path(__file__).with_name("inproc_serve.py")
+    _helper_project(project)
     result = subprocess.run(
-        [sys.executable, str(probe), str(project), signame],
+        [sys.executable, str(_INPROC_SERVE), str(project), "click", signame],
         capture_output=True,
         text=True,
         timeout=40,
     )
     assert result.returncode == 0, result.stderr
     assert "serve returned" in result.stdout, result.stdout
-    assert "after:  SIGINT=default_int_handler SIGTERM=0" in result.stdout, result.stdout
+    assert "after: SIGINT=default_int_handler SIGTERM=0" in result.stdout, result.stdout
     assert "SIGTERM stopped it" in result.stdout, result.stdout
 
 
@@ -691,28 +662,9 @@ def test_public_main_restores_stop_signals_for_children(
     """The public `pivot.cli.main()` function is also an embedding API, not only the console
     script's entry point. It restores its caller's stop handlers after serve returns."""
     project = tmp_path / "project"
-    (project / ".pivot").mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "pipeline.py").write_text("""\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop() -> None:
-    pass
-
-
-with pipeline:
-    noop()
-""")
-    probe = pathlib.Path(__file__).with_name("inproc_main_serve.py")
+    _helper_project(project)
     result = subprocess.run(
-        [sys.executable, str(probe), str(project), signame],
+        [sys.executable, str(_INPROC_SERVE), str(project), "main", signame],
         capture_output=True,
         text=True,
         timeout=40,
@@ -730,33 +682,14 @@ def test_serve_from_a_worker_thread_answers_and_leaves_signal_handlers_alone(
     another thread gets it without stop-signal handling: it answers, and the process's SIGINT
     and SIGTERM handlers stay the embedder's. Stopping it is the embedder's job."""
     project = tmp_path / "project"
-    (project / ".pivot").mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "pipeline.py").write_text("""\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop() -> None:
-    pass
-
-
-with pipeline:
-    noop()
-""")
-    probe = pathlib.Path(__file__).with_name("inproc_thread_serve.py")
+    _helper_project(project)
     # Short, because multiprocessing binds its manager's socket under TMPDIR. The probe exits
     # while serve still runs, so the manager's directory stays there until this removes it.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
     env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
     try:
         result = subprocess.run(
-            [sys.executable, str(probe), str(project), entry],
+            [sys.executable, str(_INPROC_SERVE), str(project), entry, "thread"],
             capture_output=True,
             text=True,
             timeout=90,
@@ -840,25 +773,7 @@ def test_stopping_first_live_serve_keeps_replacement_socket(
     """A newer serve takes the project's socket path as current startup behavior permits. When
     the older serve stops, it must leave the newer socket in place."""
     project = tmp_path / (("deep-project-" * 10) if long_path else "project")
-    (project / ".pivot").mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "pipeline.py").write_text("""\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop() -> None:
-    pass
-
-
-with pipeline:
-    noop()
-""")
+    _helper_project(project)
     socket_path = project / ".pivot" / "agent.sock"
     if long_path:
         assert len(os.fsencode(socket_path)) > 108
