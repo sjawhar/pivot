@@ -2451,9 +2451,11 @@ class Engine:
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
         if self.is_reloading:
-            # Only a reload deferred to the end of a run overlaps the input loop; the re-run it
-            # starts checks every stage against the inputs as they are now.
-            _logger.debug("Data changed during a reload - its re-run covers the change")
+            # Only a reload deferred to the end of a run overlaps the input loop; if it succeeds,
+            # the re-run it starts checks every stage against the inputs as they are now.
+            _logger.debug(
+                "Data changed during a reload - handled by its re-run if the reload succeeds"
+            )
             return
         paths = [pathlib.Path(path) for path in event["paths"]]
         filtered_paths = list[pathlib.Path]()
