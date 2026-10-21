@@ -3013,6 +3013,7 @@ def _kind_project(tmp_path: pathlib.Path) -> pathlib.Path:
     [
         pytest.param("data/d/bundle.dat/notes.txt", id="non-data-member"),
         pytest.param("data/d/split/absent.csv", id="absent-member"),
+        pytest.param("data/d/split/sub", id="missing-subdirectory"),
     ],
 )
 def test_diff_warns_about_a_target_inside_an_output_that_selects_no_data_file(
@@ -3079,6 +3080,192 @@ def test_diff_names_an_output_whose_kind_changed_and_compares_nothing_for_it(
     compared = {entry["path"] for entry in json.loads(every_output.stdout)}
     assert not any(path == output or path.startswith(f"{output}/") for path in compared)
     assert "data/d/bundle.dat/all.csv" in compared
+
+
+_MAKE_DIRECTORY_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {"all.csv": raw}
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+_MAKE_FILE_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+
+@pytest.mark.parametrize("keep_old_output", [True, False], ids=["old-output-kept", "old-removed"])
+@pytest.mark.parametrize(
+    ("before", "after", "removed", "added"),
+    [
+        pytest.param(
+            _MAKE_DIRECTORY_PIPELINE,
+            _MAKE_FILE_PIPELINE,
+            "data/d/make/all.csv",
+            "data/d/make.csv",
+            id="directory-to-file",
+        ),
+        pytest.param(
+            _MAKE_FILE_PIPELINE,
+            _MAKE_DIRECTORY_PIPELINE,
+            "data/d/make.csv",
+            "data/d/make/all.csv",
+            id="file-to-directory",
+        ),
+    ],
+)
+def test_diff_compares_a_moved_output_by_path(
+    tmp_path: pathlib.Path,
+    before: str,
+    after: str,
+    removed: str,
+    added: str,
+    keep_old_output: bool,
+) -> None:
+    """A stage whose output moved to a new path and kind lists HEAD's file as removed at the
+    path HEAD recorded, and the workspace file as added at the new one, with no warning."""
+    root = _project(tmp_path, {"pipeline.py": before, "data/raw/rows.csv": "v\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "pipeline.py").write_text(after)
+    (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    _ok(_pivot(root, "repro"))
+    old_output = root / "data" / "d" / ("make.csv" if removed == "data/d/make.csv" else "make")
+    assert old_output.exists()
+    if not keep_old_output:
+        shutil.rmtree(old_output) if old_output.is_dir() else old_output.unlink()
+
+    new_output = "data/d/make.csv" if added == "data/d/make.csv" else "data/d/make"
+    old_output_path = "data/d/make" if new_output == "data/d/make.csv" else "data/d/make.csv"
+    expected = {removed: (2, None), added: (None, 3)}
+    selections = {
+        "d/make": expected,
+        ".": expected,
+        new_output: {added: (None, 3)},
+        old_output_path: {removed: (2, None)},
+    }
+    for target, answer in selections.items():
+        result = _pivot(root, "diff", "--json", target)
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = {e["path"]: (e["old_rows"], e["new_rows"]) for e in json.loads(result.stdout)}
+        assert rows == answer, (target, rows)
+        assert "at git HEAD and" not in result.stderr, (target, result.stderr)
+        assert "No CSV, JSON or JSONL" not in result.stderr, (target, result.stderr)
+
+    text_output = _ok(_pivot(root, "diff", "--no-tui", "d/make"))
+    assert "Rows: 2 (removed)" in text_output, text_output
+    assert "Rows: 3 (added)" in text_output, text_output
+
+
+_ALIAS_SHAPE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+from shapes import Shape, make_value
+
+
+@stage
+def make(raw: pd.DataFrame) -> Shape:
+    return make_value(raw)
+
+
+with Pipeline("k") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+_DATAFRAME_FILE_SHAPE = """\
+import pandas as pd
+
+Shape = pd.DataFrame
+
+
+def make_value(raw):
+    return raw
+"""
+
+_DATAFRAME_DIRECTORY_SHAPE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import directory, loaders
+
+Shape = Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]
+
+
+def make_value(raw):
+    return {"part.csv": raw}
+"""
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "removed", "added"),
+    [
+        pytest.param(
+            _DATAFRAME_DIRECTORY_SHAPE,
+            _DATAFRAME_FILE_SHAPE,
+            "data/k/make/part.csv",
+            "data/k/make.jsonl",
+            id="directory-to-file",
+        ),
+        pytest.param(
+            _DATAFRAME_FILE_SHAPE,
+            _DATAFRAME_DIRECTORY_SHAPE,
+            "data/k/make.jsonl",
+            "data/k/make/part.csv",
+            id="file-to-directory",
+        ),
+    ],
+)
+def test_diff_compares_an_output_moved_by_a_type_alias_switch(
+    tmp_path: pathlib.Path, first: str, second: str, removed: str, added: str
+) -> None:
+    """A type-alias switch that moves an output between `data/k/make` and `data/k/make.jsonl`
+    is a move: HEAD's file is removed at the HEAD path and the new file added, with no
+    kind-change line naming either path."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _ALIAS_SHAPE_PIPELINE,
+            "shapes.py": first,
+            "data/raw/rows.csv": "v\n1\n2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "shapes.py").write_text(second)
+    _ok(_pivot(root, "repro"))
+
+    result = _pivot(root, "diff", "--json", "k/make")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    rows = {e["path"]: (e["old_rows"], e["new_rows"]) for e in json.loads(result.stdout)}
+    assert rows == {removed: (2, None), added: (None, 2)}, rows
+    assert "git HEAD" not in result.stderr, result.stderr
 
 
 _SHOUT_PIPELINE = """\

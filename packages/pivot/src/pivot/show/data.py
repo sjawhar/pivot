@@ -543,14 +543,20 @@ def diff_data_files(
 
 @dataclasses.dataclass(frozen=True)
 class _DiffOutput:
-    """A stage output `pivot diff` can compare, and whether it compares as a directory.
+    """A path `pivot diff` can compare: what git HEAD recorded there, and whether a current
+    stage output lives there.
 
-    ``changed_kind`` holds the output's kind at git HEAD and in the workspace when the two
-    disagree, as in a file output replaced by a directory; such an output is not compared.
+    ``head`` is the HEAD lock entry recorded at this path, and ``in_workspace`` says a current
+    output writes here; an output that moved has one of each, at its HEAD path and at its
+    current path. ``is_directory`` is the path's kind for selection: the current output's kind
+    when there is one, else HEAD's. ``changed_kind`` holds HEAD's and the workspace's kind when
+    one path holds a file at HEAD and a directory in the workspace, or the reverse; such a path
+    is not compared.
     """
 
     path: str
     head: types.HashInfo | None
+    in_workspace: bool
     is_directory: bool
     changed_kind: tuple[str, str] | None
 
@@ -591,13 +597,15 @@ def _diff_outputs(
     stage_infos: Mapping[str, RegistryStageInfo],
     store: store_mod.WorkspaceStore,
     proj_root: pathlib.Path,
-) -> dict[str, _DiffOutput]:
-    """Map each comparable stage output's path to its HEAD hash and its kind.
+) -> tuple[dict[str, _DiffOutput], dict[types.ArtifactIdentity, list[str]]]:
+    """Map each comparable path to what HEAD recorded there and the output that lives there.
 
-    An output compares as a directory when the registry tags it DIRECTORY, its HEAD lock
-    records a manifest, or it is a directory on disk. Any other output is comparable when its
-    loader or extension is CSV, JSON or JSONL. An output whose HEAD lock and workspace hold
-    different kinds records both in ``changed_kind``.
+    Each output's HEAD entry is placed at the path its HEAD lock records, and its workspace
+    side at its current path, so an output that moved is compared as removed at the old path
+    and added at the new one. A path compares as a directory when the registry tags its
+    output DIRECTORY, its HEAD entry records a manifest, or it is a directory on disk. Any other
+    path is comparable when its loader or extension is CSV, JSON or JSONL. Also returns the
+    paths each output identity owns, at HEAD and now, for stage targets.
     """
     outs_by_stage = dict[str, list[types.ArtifactRef]]()
     for stage_name, stage_info in stage_infos.items():
@@ -610,48 +618,67 @@ def _diff_outputs(
             outs_by_stage[stage_name] = outs
 
     lock_data_by_stage = common.read_lock_files_from_head(list(outs_by_stage))
-    result = dict[str, _DiffOutput]()
+    moved_heads = dict[str, types.HashInfo]()
+    current = list[tuple[types.ArtifactRef, pathlib.Path, str, types.HashInfo | None]]()
+    paths_by_identity = dict[types.ArtifactIdentity, list[str]]()
     for stage_name, outs in outs_by_stage.items():
         lock_data = lock_data_by_stage[stage_name]
         entries = {} if lock_data is None else {entry["key"]: entry for entry in lock_data["outs"]}
         for out in outs:
             output_path = store.resolve_display_path(out)
+            rel_path = project.to_relative_path(output_path, proj_root)
+            paths = paths_by_identity.setdefault(out.identity, [rel_path])
             entry = entries.get(out.identity.key)
             head = None if entry is None else lock.entry_hash_info(entry)
-            head_is_directory = head is not None and types.is_dir_hash(head)
-            workspace_is_directory = output_path.is_dir()
-            is_directory = (
-                out.tag is types.ArtifactTag.DIRECTORY
-                or head_is_directory
-                or workspace_is_directory
-            )
-            changed_kind = None
-            if (
-                head is not None
-                and output_path.exists()
-                and (head_is_directory != workspace_is_directory)
-            ):
-                changed_kind = (_kind(head_is_directory), _kind(workspace_is_directory))
-            if is_directory or _is_data_output(out, store, proj_root):
-                rel_path = project.to_relative_path(output_path, proj_root)
-                result[rel_path] = _DiffOutput(rel_path, head, is_directory, changed_kind)
-    return result
+            head_path = rel_path if entry is None else entry.get("path", rel_path)
+            if head is not None and head_path != rel_path:
+                moved_heads[head_path] = head
+                paths.append(head_path)
+                head = None
+            current.append((out, output_path, rel_path, head))
+
+    result = dict[str, _DiffOutput]()
+    for out, output_path, rel_path, own_head in current:
+        head = own_head if own_head is not None else moved_heads.pop(rel_path, None)
+        head_is_directory = head is not None and types.is_dir_hash(head)
+        workspace_is_directory = output_path.is_dir()
+        is_directory = (
+            out.tag is types.ArtifactTag.DIRECTORY or head_is_directory or workspace_is_directory
+        )
+        changed_kind = None
+        if (
+            head is not None
+            and output_path.exists()
+            and head_is_directory != workspace_is_directory
+        ):
+            changed_kind = (_kind(head_is_directory), _kind(workspace_is_directory))
+        if is_directory or _is_data_output(out, store, proj_root):
+            result[rel_path] = _DiffOutput(rel_path, head, True, is_directory, changed_kind)
+
+    for head_path, head in moved_heads.items():
+        head_is_directory = types.is_dir_hash(head)
+        if (
+            head_is_directory
+            or detect_format(pathlib.Path(head_path)) is not DataFileFormat.UNKNOWN
+        ):
+            result[head_path] = _DiffOutput(head_path, head, False, head_is_directory, None)
+    return result, paths_by_identity
 
 
 def _select_outputs(
     targets: Sequence[str],
     outputs: Mapping[str, _DiffOutput],
+    paths_by_identity: Mapping[types.ArtifactIdentity, list[str]],
     stage_infos: Mapping[str, RegistryStageInfo],
-    store: store_mod.WorkspaceStore,
     proj_root: pathlib.Path,
 ) -> tuple[dict[str, frozenset[str] | None], list[tuple[str, str | None]]]:
     """Map each selected output to its selected member prefixes, or None for every member.
 
-    ``.`` selects every output, a stage its outputs, and a path the output at it, every output
-    below it, or, inside a directory output, the members at or below it. Also returns, in
-    target order, each target that selects no output (paired with None) and each target
-    inside a directory output (paired with its path), which matches only if a selected member
-    lies at or below that path.
+    ``.`` selects every output, a stage the paths its outputs have at HEAD and now, and a path
+    the output at it, every output below it, or, inside a directory output, the members at or
+    below it. Also returns, in target order, each target that selects no output (paired with
+    None) and each target inside a directory output (paired with its path), which matches only
+    if a selected member lies at or below that path.
     """
     from pivot.cli import targets as cli_targets
 
@@ -665,11 +692,12 @@ def _select_outputs(
     for target in targets:
         resolved = cli_targets.resolve_cli_target(target, stage_infos)
         if resolved is not None:
-            ref_paths = (
-                project.to_relative_path(store.resolve_display_path(ref), proj_root)
+            hits = [
+                path
                 for ref in resolved["refs"]
-            )
-            hits = [ref_path for ref_path in ref_paths if ref_path in outputs]
+                for path in paths_by_identity.get(ref.identity, [])
+                if path in outputs
+            ]
         else:
             path = project.to_relative_path(project.normalize_path(target), proj_root)
             if path == ".":
@@ -722,9 +750,13 @@ def _workspace_members(
 
     A directory output's members come from the record-time walker: a symlink it leaves out,
     and everything below one, is not a member and is never read. The warning names only the
-    left-out symlinks inside the selected members, under the output's own path.
+    left-out symlinks inside the selected members, under the output's own path. A path only
+    HEAD recorded, the old path of an output that moved, has no workspace side and is never
+    read.
     """
     location = proj_root / output.path
+    if not output.in_workspace:
+        return {}
     if not output.is_directory:
         if not location.exists():
             return {}
@@ -766,17 +798,19 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     """Select the data files ``targets`` name, at git HEAD and in the workspace.
 
     One selection serves both sides (see ``_select_outputs``), and one walk per selected
-    directory output builds its workspace members. A selected output whose kind differs
-    between git HEAD and the workspace is named in a warning and not compared, and every
-    target that selects no CSV, JSON or JSONL file on either side is named in one warning.
-    Returns None when no registered stage has an output `pivot diff` can compare.
+    directory output builds its workspace members. Both sides are keyed by path: an output
+    that moved is removed at the path git HEAD recorded and added at its current one. A path
+    that holds a file at git HEAD and a directory in the workspace, or the reverse, is named in
+    a warning and not compared, and every target that selects no CSV, JSON or JSONL file on
+    either side is named in one warning. Returns None when no registered stage has an output
+    `pivot diff` can compare.
     """
     from pivot.cli import helpers as cli_helpers
 
     store = cli_helpers.require_workspace_store()
     proj_root = project.get_project_root()
     stage_infos = {name: cli_helpers.get_stage(name) for name in cli_helpers.list_stages()}
-    outputs = _diff_outputs(stage_infos, store, proj_root)
+    outputs, paths_by_identity = _diff_outputs(stage_infos, store, proj_root)
     if not outputs:
         return None
 
@@ -784,7 +818,9 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     workspace_hashes = dict[str, str]()
     workspace_paths = dict[str, pathlib.Path]()
     cache_dir = config.get_cache_dir() / "files"
-    selection, unresolved = _select_outputs(targets, outputs, stage_infos, store, proj_root)
+    selection, unresolved = _select_outputs(
+        targets, outputs, paths_by_identity, stage_infos, proj_root
+    )
     for path, prefixes in selection.items():
         output = outputs[path]
         if output.changed_kind is not None:
