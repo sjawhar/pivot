@@ -112,8 +112,10 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         data = config.load_config_file(config.get_global_config_path())
         value = _get_nested_value(data, key)
         source = config.ConfigScope.GLOBAL
-        if key == "core.state_dir" and value is not None:
-            project.report_ignored_global_state_dir()
+        # Outside a project nothing ignores the value. An unreadable local config only drops
+        # the warning: labeling a global value never needs the local file.
+        global_state_dir = key == "core.state_dir" and value is not None
+        if global_state_dir and project.report_ignored_global_state_dir():
             source = config.ConfigSource.GLOBAL_IGNORED
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())

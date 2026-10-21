@@ -1,4 +1,6 @@
+import os
 import pathlib
+import stat
 
 import click.testing
 import pytest
@@ -53,15 +55,21 @@ _PIVOT_052_GITIGNORE = b"""\
 
 
 def test_default_init_writes_the_pivot_052_ignore_bytes(tmp_path: pathlib.Path) -> None:
-    """Default init must preserve the released byte-for-byte ignore contract."""
+    """Default init must preserve the released byte-for-byte ignore contract, and its mode."""
     runner = click.testing.CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path):
         project._project_root_cache = None
-
-        result = runner.invoke(cli.cli, ["init"])
+        previous_umask = os.umask(0o002)
+        try:
+            result = runner.invoke(cli.cli, ["init"])
+        finally:
+            os.umask(previous_umask)
 
         assert result.exit_code == 0, result.output
-        assert pathlib.Path(".pivot/.gitignore").read_bytes() == _PIVOT_052_GITIGNORE
+        gitignore = pathlib.Path(".pivot/.gitignore")
+        assert gitignore.read_bytes() == _PIVOT_052_GITIGNORE
+        # 0.5.2 writes it with write_text, so the umask alone sets its mode.
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o664
 
 
 def test_default_config_set_keeps_the_released_config_lock_file(tmp_path: pathlib.Path) -> None:

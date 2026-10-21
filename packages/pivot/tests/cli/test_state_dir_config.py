@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import pathlib
 import signal
@@ -24,6 +25,7 @@ from pivot.storage import restore
 
 if TYPE_CHECKING:
     import click.testing
+    from pytest_mock import MockerFixture
 
 
 @compose.stage
@@ -551,6 +553,73 @@ def test_import_refuses_empty_source_state_dir() -> None:
     """A source core.state_dir follows the local empty-value validation rule."""
     with pytest.raises(exceptions.RemoteError, match="must be a path"):
         import_artifact._remote_state_dir({"core": {"state_dir": ""}})
+
+
+_YAML_1_1_SOURCE_CONFIG = (
+    "core:\n  state_dir: on\nremotes:\n  on: s3://source-cache\ndefault_remote: on\n"
+)
+
+
+def test_import_reads_a_source_state_dir_named_like_a_yaml_1_1_scalar(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`config set core.state_dir on` keeps state in `on/`; import reads that source's locks."""
+    source = tmp_path / "source"
+    source.mkdir()
+    init_git_repo(source)
+    subprocess.run(
+        ["git", "config", "uploadArchive.allowUnreachable", "true"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=source, check=False, capture_output=True)
+    (source / ".pivot").mkdir()
+    (source / ".pivot" / "config.yaml").write_text(_YAML_1_1_SOURCE_CONFIG)
+    lock_file = source / "on" / "stages" / "test" / "writes_state.lock"
+    lock_file.parent.mkdir(parents=True)
+    lock_file.write_text(
+        yaml.safe_dump(
+            {
+                "code_manifest": {},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": None, "tag": "data", "hash": "0123456789abcdef"}],
+            }
+        )
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "state in on/"], cwd=source, check=True, capture_output=True
+    )
+
+    resolved = asyncio.run(
+        import_artifact.resolve_remote_path(str(source), "test/writes_state", "main", None)
+    )
+
+    assert resolved["stage"] == "test/writes_state"
+    assert resolved["remote_url"] == "s3://source-cache"
+
+
+def test_import_reads_the_same_source_remotes_as_pivot_052(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Remotes keep 0.5.2's parse: `default_remote: on` is not a name there, so it is ignored."""
+    mocker.patch.object(
+        import_artifact,
+        "_read_remote_file",
+        autospec=True,
+        return_value=_YAML_1_1_SOURCE_CONFIG.encode(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="pivot.import_artifact"):
+        url, source_config = asyncio.run(
+            import_artifact.read_remote_config("/source", "main", None)
+        )
+
+    assert url == "s3://source-cache"
+    assert "default_remote in /source must be a remote name, got True; ignoring it" in caplog.text
+    assert import_artifact._remote_state_dir(source_config) == "on"
 
 
 def test_serve_mode_uses_the_configured_state_directory_socket(tmp_path: pathlib.Path) -> None:

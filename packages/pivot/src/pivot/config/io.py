@@ -47,20 +47,25 @@ def _config_lock_path(path: pathlib.Path) -> pathlib.Path:
     return path.with_name(f"{path.name}.lock")
 
 
+def _parse_yaml(stream: Any, source: object, *, as_dict: bool) -> Any:
+    """Parse config YAML as ``config set`` writes it (YAML 1.2), with 0.5.2's error message."""
+    try:
+        data = ruamel.yaml.YAML(typ="rt").load(stream)
+    except ruamel.yaml.YAMLError as e:
+        raise exceptions.ConfigError(f"Invalid YAML in {source}: {e}") from e
+    if as_dict:
+        return dict(data) if data is not None else {}
+    return data
+
+
 def _load_yaml(path: pathlib.Path, *, as_dict: bool) -> Any:
     """Load YAML config with error handling."""
     if not path.exists():
         return {} if as_dict else None
 
     try:
-        yaml = ruamel.yaml.YAML(typ="rt")
         with path.open() as f:
-            data = yaml.load(f)
-            if as_dict:
-                return dict(data) if data is not None else {}
-            return data
-    except ruamel.yaml.YAMLError as e:
-        raise exceptions.ConfigError(f"Invalid YAML in {path}: {e}") from e
+            return _parse_yaml(f, path, as_dict=as_dict)
     except PermissionError:
         raise exceptions.ConfigError(f"Permission denied reading {path}") from None
     except OSError as e:
@@ -75,6 +80,11 @@ def _load_config_raw(path: pathlib.Path) -> dict[str, Any]:
 def _load_config_preserving_structure(path: pathlib.Path) -> Any:
     """Load YAML config preserving ruamel structure for comments."""
     return _load_yaml(path, as_dict=False)
+
+
+def parse_config_yaml(raw: bytes, source: str) -> dict[str, Any]:
+    """Parse config file contents exactly as ``load_config_file`` parses a file."""
+    return _parse_yaml(raw, source, as_dict=True)
 
 
 def _save_config(path: pathlib.Path, data: dict[str, Any]) -> None:
@@ -131,6 +141,21 @@ def edit_config(
 def load_config_file(path: pathlib.Path) -> dict[str, Any]:
     """Load YAML config, returns empty dict if missing."""
     return _load_config_raw(path)
+
+
+def read_config_file_value(path: pathlib.Path, key: str) -> tuple[bool, Any]:
+    """Read one dotted key from one config file: (present, value).
+
+    The file is parsed as ``load_config_file`` parses it; a file that is not a mapping holds no
+    key.
+    """
+    data = _load_config_preserving_structure(path)
+    if not isinstance(data, dict):
+        return False, None
+    value = get_nested(cast("dict[str, Any]", data), parse_dotted_key(key))
+    if value is _NOT_FOUND:
+        return False, None
+    return True, value
 
 
 def parse_dotted_key(key: str) -> list[str]:
@@ -487,7 +512,12 @@ def get_cache_dir() -> pathlib.Path:
 
 
 def get_state_dir() -> pathlib.Path:
-    """Get the current project's configured state directory."""
+    """Get the current project's configured state directory.
+
+    The merged config is loaded first, as 0.5.2 did here, so a config file that cannot be read
+    fails this call with its own message.
+    """
+    get_merged_config()
     return project.get_state_dir()
 
 

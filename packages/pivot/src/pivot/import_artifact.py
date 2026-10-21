@@ -14,6 +14,7 @@ import aiohttp
 import yaml
 
 from pivot import exceptions, project, types
+from pivot.config import io as config_io
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
 from pivot.storage import cache, track
@@ -159,7 +160,15 @@ async def read_remote_config(
     url = str(remotes[default_remote])
     _ = remote_config.validate_remote_url(url)
     logger.info("Using source remote: %s", url)
-    return url, config_data
+
+    # Two parses on purpose: remotes are read above as 0.5.2 reads them (YAML 1.1, as the source's
+    # `pivot remote` reads them), and the returned config, which supplies core.state_dir, as every
+    # other Pivot command reads its config (YAML 1.2). Each key means what it means to the source.
+    try:
+        source_config = config_io.parse_config_yaml(raw, "remote config")
+    except exceptions.ConfigError as e:
+        raise exceptions.RemoteError(str(e)) from e
+    return url, source_config
 
 
 def _remote_state_dir(config_data: dict[str, object]) -> str:

@@ -68,27 +68,6 @@ def get_project_root() -> pathlib.Path:
     return _project_root_cache
 
 
-def _read_core_state_dir(config_path: pathlib.Path) -> tuple[bool, object]:
-    """Read ``core.state_dir`` from one config file: (present, value)."""
-    import yaml
-
-    from pivot import exceptions
-
-    try:
-        data: object = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return False, None
-    except yaml.YAMLError as e:
-        raise exceptions.ConfigError(f"Error reading {config_path}: {e}") from e
-    if not isinstance(data, dict):
-        return False, None
-    core = typing.cast("dict[str, object]", data).get("core")
-    if not isinstance(core, dict):
-        return False, None
-    core_data = typing.cast("dict[str, object]", core)
-    return "state_dir" in core_data, core_data.get("state_dir")
-
-
 def resolve_state_dir_value(root: pathlib.Path, value: str) -> pathlib.Path:
     """Return the directory a ``core.state_dir`` value names, as the kernel will open it.
 
@@ -112,9 +91,10 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
         return cached
 
     from pivot import exceptions
+    from pivot.config import io as config_io
 
     config_path = root / ".pivot" / "config.yaml"
-    present, configured = _read_core_state_dir(config_path)
+    present, configured = config_io.read_config_file_value(config_path, "core.state_dir")
     warn_if_global_state_dir_ignored(root, shadowed=present)
 
     if configured is None:
@@ -135,7 +115,10 @@ def is_valid_state_dir_value(value: object) -> bool:
 
 def state_dir_is_configured(root: pathlib.Path) -> bool:
     """Return whether the local configuration explicitly contains core.state_dir."""
-    return _read_core_state_dir(root / ".pivot" / "config.yaml")[0]
+    from pivot.config import io as config_io
+
+    config_path = root / ".pivot" / "config.yaml"
+    return config_io.read_config_file_value(config_path, "core.state_dir")[0]
 
 
 def get_state_dir() -> pathlib.Path:
@@ -161,29 +144,49 @@ def ignored_global_state_dir_message(
     return f"core.state_dir in {global_path} is ignored; set it in {local_path}"
 
 
-def warn_if_global_state_dir_ignored(root: pathlib.Path | None, *, shadowed: bool) -> None:
+def warn_if_global_state_dir_ignored(root: pathlib.Path, *, shadowed: bool) -> None:
     """Log, once per process, that the global config's ``core.state_dir`` is ignored.
 
     Silent until ``enable_ignored_global_state_dir_warning`` runs. ``shadowed`` says the project
-    sets its own value.
+    sets its own value. The global file is read only to decide whether to warn: when it cannot
+    be read, this says nothing, and reporting that stays with the normal config load.
     """
     if not _ignored_global_state_dir_warning_enabled:
         return
+    from pivot import exceptions
     from pivot.config import io as config_io
 
     global_path = config_io.get_global_config_path()
     if global_path in _reported_ignored_global_state_dirs:
         return
-    if not _read_core_state_dir(global_path)[0]:
+    try:
+        present, _ = config_io.read_config_file_value(global_path, "core.state_dir")
+    except (exceptions.ConfigError, UnicodeDecodeError):
+        return
+    if not present:
         return
     _reported_ignored_global_state_dirs.add(global_path)
     logger.warning(ignored_global_state_dir_message(global_path, root, shadowed=shadowed))
 
 
-def report_ignored_global_state_dir() -> None:
-    """Report the ignored global value for the current project, as ``state_dir_for`` does."""
-    root = get_project_root()
-    warn_if_global_state_dir_ignored(root, shadowed=state_dir_is_configured(root))
+def report_ignored_global_state_dir() -> bool:
+    """Report an ignored global value from a config command; return whether a project ignores it.
+
+    Outside a project nothing ignores the value, so nothing is reported. Neither config file has
+    to load here: when the local one cannot be read, the warning is left out.
+    """
+    from pivot import exceptions
+
+    try:
+        root = get_project_root()
+    except exceptions.ProjectNotInitializedError:
+        return False
+    try:
+        shadowed = state_dir_is_configured(root)
+    except (exceptions.ConfigError, UnicodeDecodeError):
+        return True
+    warn_if_global_state_dir_ignored(root, shadowed=shadowed)
+    return True
 
 
 def create_gitignore_if_absent(path: pathlib.Path) -> bool:
@@ -193,7 +196,7 @@ def create_gitignore_if_absent(path: pathlib.Path) -> bool:
     Returns whether the file was created.
     """
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     except FileExistsError:
         return False
     with os.fdopen(descriptor, "w") as gitignore:
