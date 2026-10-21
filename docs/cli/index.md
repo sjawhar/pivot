@@ -567,7 +567,9 @@ pivot diff TARGETS... [OPTIONS]
 - `TARGETS` - Stage outputs to compare (required): a stage name, or a path at, inside or above a
   stage output. `.` compares every output. A directory output compares its CSV, JSON, and JSONL
   files one by one, and a path inside it compares the files at or below that path. A target that
-  names no CSV, JSON, or JSONL stage output is named in a warning and not compared.
+  names no CSV, JSON, or JSONL file is named in a warning and not compared. An output that is a
+  file at git HEAD and a directory in the workspace, or the reverse, is named in a warning with
+  both kinds and not compared.
 
 **Options:**
 

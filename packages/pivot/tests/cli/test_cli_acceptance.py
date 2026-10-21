@@ -17,6 +17,7 @@ import sysconfig
 import time
 import urllib.request
 import uuid
+from typing import TYPE_CHECKING
 
 import boto3
 import pytest
@@ -25,6 +26,9 @@ import yaml
 
 from pivot import loaders
 from pivot.storage import cache
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -2948,6 +2952,133 @@ def test_diff_warns_only_about_symlinks_inside_the_selected_targets(
     assert "leaves out" not in direct, direct
     assert "Directory artifact data/d/split leaves out symlink test.csv" in whole, whole
     assert "TOP_SECRET_VALUE" not in direct + whole
+
+
+_KIND_DIFF_PIPELINE = """\
+import pathlib
+import tempfile
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("part")}
+
+
+@stage
+def bundle(raw: pd.DataFrame) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "bundle"
+    out.mkdir()
+    raw.to_csv(out / "all.csv", index=False)
+    (out / "notes.txt").write_text(f"rows={len(raw)}\\n")
+    return out
+
+
+@stage
+def double(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    split(rows)
+    bundle(rows)
+    double(rows)
+"""
+
+
+def _kind_project(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A committed project with a directory, a `pathlib.Path` directory and a file output,
+    whose workspace then gains one row."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _KIND_DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\ntest,2\n")
+    _ok(_pivot(root, "repro"))
+    return root
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("data/d/bundle.dat/notes.txt", id="non-data-member"),
+        pytest.param("data/d/split/absent.csv", id="absent-member"),
+    ],
+)
+def test_diff_warns_about_a_target_inside_an_output_that_selects_no_data_file(
+    tmp_path: pathlib.Path, target: str
+) -> None:
+    """A target inside a directory output that selects no data file on either side is named
+    in the unmatched-target warning, while a data member beside it is compared silently."""
+    root = _kind_project(tmp_path)
+    warning = f"No CSV, JSON or JSONL stage output matches {target!r}"
+
+    json_result = _pivot(root, "diff", "--json", target)
+    text_output = _ok(_pivot(root, "diff", "--no-tui", target))
+    control = _ok(_pivot(root, "diff", "--json", "data/d/bundle.dat/all.csv"))
+
+    assert json_result.returncode == 0, json_result.stdout + json_result.stderr
+    assert json.loads(json_result.stdout) == []
+    assert warning in json_result.stderr, json_result.stderr
+    assert warning in text_output, text_output
+    assert "No CSV, JSON or JSONL" not in control, control
+    assert '"path": "data/d/bundle.dat/all.csv"' in control, control
+
+
+def _file_output_replaced_by_a_directory(root: pathlib.Path) -> tuple[str, str, str]:
+    output = root / "data" / "d" / "double.csv"
+    output.unlink()
+    output.mkdir()
+    (output / "a.csv").write_text("part,v\ntrain,1\n")
+    return "data/d/double.csv", "a file", "a directory"
+
+
+def _directory_output_replaced_by_a_file(root: pathlib.Path) -> tuple[str, str, str]:
+    output = root / "data" / "d" / "split"
+    shutil.rmtree(output)
+    output.write_text("part,v\ntrain,1\n")
+    return "data/d/split", "a directory", "a file"
+
+
+@pytest.mark.parametrize(
+    "replace",
+    [
+        pytest.param(_file_output_replaced_by_a_directory, id="file-replaced-by-directory"),
+        pytest.param(_directory_output_replaced_by_a_file, id="directory-replaced-by-file"),
+    ],
+)
+def test_diff_names_an_output_whose_kind_changed_and_compares_nothing_for_it(
+    tmp_path: pathlib.Path, replace: Callable[[pathlib.Path], tuple[str, str, str]]
+) -> None:
+    """An output recorded at git HEAD as one kind and found in the workspace as the other is
+    named in one line with both kinds, and none of its files is compared."""
+    root = _kind_project(tmp_path)
+    output, head_kind, workspace_kind = replace(root)
+    line = f"Output {output} is {head_kind} at git HEAD and {workspace_kind} in the workspace"
+
+    json_result = _pivot(root, "diff", "--json", output)
+    text_output = _ok(_pivot(root, "diff", "--no-tui", output))
+    every_output = _pivot(root, "diff", "--json", ".")
+
+    assert json_result.returncode == 0, json_result.stdout + json_result.stderr
+    assert json.loads(json_result.stdout) == []
+    assert json_result.stderr.count(line) == 1, json_result.stderr
+    assert text_output.count(line) == 1, text_output
+    assert "No data file changes detected." in text_output, text_output
+    assert every_output.stderr.count(line) == 1, every_output.stderr
+    compared = {entry["path"] for entry in json.loads(every_output.stdout)}
+    assert not any(path == output or path.startswith(f"{output}/") for path in compared)
+    assert "data/d/bundle.dat/all.csv" in compared
 
 
 _SHOUT_PIPELINE = """\

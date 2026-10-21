@@ -15,7 +15,9 @@
   `directory` or `pathlib.Path` directory output is read only through that output's member map:
   checkout symlinks to the configured cache are members, other symlinks are left out with a
   warning naming the output, and manifest paths containing control characters are refused. A
-  target that names no CSV, JSON or JSONL stage output is named in a warning and not compared.
+  target that names no CSV, JSON or JSONL file is named in a warning and not compared, and an
+  output that is a file at git HEAD and a directory in the workspace, or the reverse, is named
+  with both kinds and not compared.
 
 
 ## v0.5.2 (2026-10-20)

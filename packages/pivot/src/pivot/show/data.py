@@ -543,11 +543,16 @@ def diff_data_files(
 
 @dataclasses.dataclass(frozen=True)
 class _DiffOutput:
-    """A stage output `pivot diff` can compare, and whether it compares as a directory."""
+    """A stage output `pivot diff` can compare, and whether it compares as a directory.
+
+    ``changed_kind`` holds the output's kind at git HEAD and in the workspace when the two
+    disagree, as in a file output replaced by a directory; such an output is not compared.
+    """
 
     path: str
     head: types.HashInfo | None
     is_directory: bool
+    changed_kind: tuple[str, str] | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -578,6 +583,10 @@ def _member_selected(relpath: str, prefixes: frozenset[str] | None) -> bool:
     )
 
 
+def _kind(is_directory: bool) -> str:
+    return "a directory" if is_directory else "a file"
+
+
 def _diff_outputs(
     stage_infos: Mapping[str, RegistryStageInfo],
     store: store_mod.WorkspaceStore,
@@ -587,7 +596,8 @@ def _diff_outputs(
 
     An output compares as a directory when the registry tags it DIRECTORY, its HEAD lock
     records a manifest, or it is a directory on disk. Any other output is comparable when its
-    loader or extension is CSV, JSON or JSONL.
+    loader or extension is CSV, JSON or JSONL. An output whose HEAD lock and workspace hold
+    different kinds records both in ``changed_kind``.
     """
     outs_by_stage = dict[str, list[types.ArtifactRef]]()
     for stage_name, stage_info in stage_infos.items():
@@ -608,14 +618,23 @@ def _diff_outputs(
             output_path = store.resolve_display_path(out)
             entry = entries.get(out.identity.key)
             head = None if entry is None else lock.entry_hash_info(entry)
+            head_is_directory = head is not None and types.is_dir_hash(head)
+            workspace_is_directory = output_path.is_dir()
             is_directory = (
                 out.tag is types.ArtifactTag.DIRECTORY
-                or (head is not None and types.is_dir_hash(head))
-                or output_path.is_dir()
+                or head_is_directory
+                or workspace_is_directory
             )
+            changed_kind = None
+            if (
+                head is not None
+                and output_path.exists()
+                and (head_is_directory != workspace_is_directory)
+            ):
+                changed_kind = (_kind(head_is_directory), _kind(workspace_is_directory))
             if is_directory or _is_data_output(out, store, proj_root):
                 rel_path = project.to_relative_path(output_path, proj_root)
-                result[rel_path] = _DiffOutput(rel_path, head, is_directory)
+                result[rel_path] = _DiffOutput(rel_path, head, is_directory, changed_kind)
     return result
 
 
@@ -625,12 +644,14 @@ def _select_outputs(
     stage_infos: Mapping[str, RegistryStageInfo],
     store: store_mod.WorkspaceStore,
     proj_root: pathlib.Path,
-) -> dict[str, frozenset[str] | None]:
+) -> tuple[dict[str, frozenset[str] | None], list[tuple[str, str | None]]]:
     """Map each selected output to its selected member prefixes, or None for every member.
 
     ``.`` selects every output, a stage its outputs, and a path the output at it, every output
-    below it, or, inside a directory output, the members at or below it. A file that is no
-    stage output is never compared: a target that selects no output is named in a warning.
+    below it, or, inside a directory output, the members at or below it. Also returns, in
+    target order, each target that selects no output (paired with None) and each target
+    inside a directory output (paired with its path), which matches only if a selected member
+    lies at or below that path.
     """
     from pivot.cli import targets as cli_targets
 
@@ -640,7 +661,7 @@ def _select_outputs(
             below[parent].append(output_path)
 
     selected = dict[str, set[str] | None]()
-    unmatched = list[str]()
+    unresolved = list[tuple[str, str | None]]()
     for target in targets:
         resolved = cli_targets.resolve_cli_target(target, stage_infos)
         if resolved is not None:
@@ -663,21 +684,18 @@ def _select_outputs(
                     prefixes = selected.setdefault(container, set[str]())
                     if prefixes is not None:
                         prefixes.add(path[len(container) + 1 :])
+                    unresolved.append((target, path))
                     continue
         for hit in hits:
             selected[hit] = None
         if not hits:
-            unmatched.append(target)
+            unresolved.append((target, None))
 
-    if unmatched:
-        logger.warning(
-            "No CSV, JSON or JSONL stage output matches %s, so it is not compared",
-            ", ".join(repr(target) for target in unmatched),
-        )
-    return {
+    selection = {
         path: None if prefixes is None else frozenset(prefixes)
         for path, prefixes in selected.items()
     }
+    return selection, unresolved
 
 
 def _head_members(output: _DiffOutput, prefixes: frozenset[str] | None) -> dict[str, str | None]:
@@ -748,8 +766,10 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     """Select the data files ``targets`` name, at git HEAD and in the workspace.
 
     One selection serves both sides (see ``_select_outputs``), and one walk per selected
-    directory output builds its workspace members. Returns None when no registered stage has
-    an output `pivot diff` can compare.
+    directory output builds its workspace members. A selected output whose kind differs
+    between git HEAD and the workspace is named in a warning and not compared, and every
+    target that selects no CSV, JSON or JSONL file on either side is named in one warning.
+    Returns None when no registered stage has an output `pivot diff` can compare.
     """
     from pivot.cli import helpers as cli_helpers
 
@@ -764,14 +784,36 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     workspace_hashes = dict[str, str]()
     workspace_paths = dict[str, pathlib.Path]()
     cache_dir = config.get_cache_dir() / "files"
-    for path, prefixes in _select_outputs(targets, outputs, stage_infos, store, proj_root).items():
+    selection, unresolved = _select_outputs(targets, outputs, stage_infos, store, proj_root)
+    for path, prefixes in selection.items():
         output = outputs[path]
+        if output.changed_kind is not None:
+            head_kind, workspace_kind = output.changed_kind
+            logger.warning(
+                "Output %s is %s at git HEAD and %s in the workspace, so it is not compared",
+                path,
+                head_kind,
+                workspace_kind,
+            )
+            continue
         head_hashes.update(_head_members(output, prefixes))
         for member, (file_hash, file_path) in _workspace_members(
             output, prefixes, proj_root, cache_dir
         ).items():
             workspace_hashes[member] = file_hash
             workspace_paths[member] = file_path
+
+    covered = set[str]()
+    if any(path is not None for _, path in unresolved):
+        for member in [*head_hashes, *workspace_hashes]:
+            covered.add(member)
+            covered.update(_parents(member))
+    unmatched = [target for target, path in unresolved if path is None or path not in covered]
+    if unmatched:
+        logger.warning(
+            "No CSV, JSON or JSONL stage output matches %s, so it is not compared",
+            ", ".join(repr(target) for target in unmatched),
+        )
     return DataSelection(head_hashes, workspace_hashes, workspace_paths)
 
 
