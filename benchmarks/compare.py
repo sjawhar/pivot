@@ -73,6 +73,27 @@ def _read_json(path: pathlib.Path) -> object:
         raise _CannotCompareError(f"{path}: not valid JSON ({error})") from None
 
 
+def _field_int(raw: dict[str, object], name: str) -> int:
+    value = raw[name]
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer, got {value!r}")
+    return value
+
+
+def _field_number(raw: dict[str, object], name: str) -> float:
+    value = raw[name]
+    if type(value) not in (int, float):
+        raise TypeError(f"{name} must be a number, got {value!r}")
+    return float(value)  # pyright: ignore[reportArgumentType] - int or float, checked above
+
+
+def _field_str(raw: dict[str, object], name: str) -> str:
+    value = raw[name]
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string, got {value!r}")
+    return value
+
+
 def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
     try:
         lines = path.read_text().splitlines()
@@ -82,13 +103,15 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
     for number, line in enumerate(lines, start=1):
         try:
             raw = json.loads(line)
-            scenario = str(raw["scenario"])
-            exit_code = int(raw["exit_code"])
-            rep = int(raw["rep"])
+            if not isinstance(raw, dict):
+                raise TypeError(f"a result row must be a JSON object, got {raw!r}")
+            scenario = _field_str(raw, "scenario")  # pyright: ignore[reportUnknownArgumentType] - JSON object
+            exit_code = _field_int(raw, "exit_code")  # pyright: ignore[reportUnknownArgumentType] - JSON object
+            rep = _field_int(raw, "rep")  # pyright: ignore[reportUnknownArgumentType] - JSON object
             row = _Row(
-                wall_s=float(raw["wall_s"]),
-                cpu_s=float(raw["cpu_s"]),
-                cpu_count=int(raw["cpu_count"]),
+                wall_s=_field_number(raw, "wall_s"),  # pyright: ignore[reportUnknownArgumentType] - JSON object
+                cpu_s=_field_number(raw, "cpu_s"),  # pyright: ignore[reportUnknownArgumentType] - JSON object
+                cpu_count=_field_int(raw, "cpu_count"),  # pyright: ignore[reportUnknownArgumentType] - JSON object
                 rep=rep,
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:

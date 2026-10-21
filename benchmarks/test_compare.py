@@ -441,6 +441,11 @@ _DERIVE_ARGV = ("--derive-threshold", "--calibration", "calibration.json")
             id="failed-row-without-rep",
         ),
         pytest.param(
+            {"head.jsonl": _helper_first_row_edited({"cpu_count": float("inf")})},
+            _COMPARE_ARGV,
+            id="infinite-cpu_count",
+        ),
+        pytest.param(
             {"head.jsonl": _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6))[:-40]},
             _COMPARE_ARGV,
             id="truncated-last-row",
