@@ -117,6 +117,41 @@ def test_head_within_threshold_of_base_medians_passes(
     assert _helper_compare(tmp_path, base, head) == 0
 
 
+def test_median_over_limit_inside_the_noise_is_not_a_regression(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _helper_rows([1.0] * 6, [2.0] * 6)
+    # The head's median wall time is 20% above the base's, past the 10% limit, but the reps
+    # scatter on both sides of the base, so the paired bootstrap interval includes no change.
+    head = _helper_rows([0.7, 0.8, 0.9, 1.5, 1.6, 1.7], [2.0] * 6)
+
+    assert _helper_compare(tmp_path, base, head) == 0, "noise alone must not fail the job"
+    out = capsys.readouterr().out
+    assert "REGRESSION" not in out and "95% CI" in out, out
+
+
+def test_regression_report_is_the_same_on_every_run(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _helper_rows([1.0, 1.1, 0.9, 1.0, 1.05, 0.95], [2.0] * 6)
+    head = _helper_rows([1.3, 1.2, 1.25, 1.35, 1.28, 1.22], [2.0] * 6)
+
+    assert _helper_compare(tmp_path, base, head) == 1
+    first = capsys.readouterr().out
+    assert _helper_compare(tmp_path, base, head) == 1
+    assert capsys.readouterr().out == first, "the bootstrap must use a fixed seed"
+
+
+def test_unequal_rep_counts_cannot_be_compared(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _helper_rows([1.0] * 6, [2.0] * 6)
+    head = _helper_rows([1.0] * 5, [2.0] * 5)
+
+    assert _helper_compare(tmp_path, base, head) == 2
+    assert "rep counts" in capsys.readouterr().err
+
+
 def test_failed_run_cannot_be_compared(
     tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

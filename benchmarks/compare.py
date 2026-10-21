@@ -10,11 +10,13 @@ The threshold file gives each scenario its own limits, {"<scenario>": {"wall_pct
 "cpu_pct": N}}, because scenarios differ in noise: a warm no-op and a cold build do not vary
 alike.
 
-With --threshold-file, exits 0 when no scenario regressed, 1 when the head's median wall time
-or median CPU exceeds the base's by more than that scenario's `wall_pct` or `cpu_pct`, and 2
-when the files cannot be compared: a file is missing or cannot be parsed, a command failed, a
-scenario is on one side only or lacks a numeric limit, or the two ran on machines with different
-core counts.
+With --threshold-file, a scenario's metric is a REGRESSION only when both hold: the head's median
+exceeds the base's by more than that scenario's `wall_pct` or `cpu_pct` (the minimum effect),
+and a paired bootstrap 95% interval of median(head) / median(base) lies entirely above 1 (the
+change is not the job's own noise). It exits 0 when nothing regressed, 1 when something did, and
+2 when the files cannot be compared: a file is missing or cannot be parsed, a command failed, a
+scenario is on one side only or lacks a numeric limit, the two sides have different rep counts,
+or the two ran on machines with different core counts.
 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
 file: for each scenario and metric, three times the largest absolute change between the two
@@ -31,6 +33,7 @@ import argparse
 import json
 import math
 import pathlib
+import random
 import statistics
 import sys
 from typing import Any, Literal, TypedDict
@@ -40,6 +43,8 @@ type _LimitKey = Literal["wall_pct", "cpu_pct"]
 
 _METRICS: tuple[tuple[_Metric, _LimitKey], ...] = (("wall_s", "wall_pct"), ("cpu_s", "cpu_pct"))
 _FLOOR_PCT = 2
+_BOOTSTRAP_RESAMPLES = 10_000
+_BOOTSTRAP_SEED = 0
 
 # scenario -> limit key ("wall_pct" or "cpu_pct") -> percent change from base to head median
 type _Changes = dict[str, dict[str, float]]
@@ -91,10 +96,10 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
     return by_scenario
 
 
-def _medians(
+def _paired(
     base_path: pathlib.Path, head_path: pathlib.Path
-) -> dict[str, dict[_Metric, tuple[float, float]]]:
-    """Return scenario -> metric -> (base median, head median)."""
+) -> dict[str, dict[_Metric, tuple[list[float], list[float]]]]:
+    """Return scenario -> metric -> (base values, head values), paired by rep."""
     base = _load(base_path)
     head = _load(head_path)
     if one_side := sorted(set(base) ^ set(head)):
@@ -102,16 +107,46 @@ def _medians(
     cores = {row["cpu_count"] for rows in (*base.values(), *head.values()) for row in rows}
     if len(cores) != 1:
         raise _CannotCompareError(f"results come from machines with core counts {sorted(cores)}")
+    if unequal := [s for s in sorted(base) if len(base[s]) != len(head[s])]:
+        raise _CannotCompareError(f"base and head rep counts differ for {', '.join(unequal)}")
     return {
         scenario: {
             metric: (
-                statistics.median(row[metric] for row in base[scenario]),
-                statistics.median(row[metric] for row in head[scenario]),
+                [row[metric] for row in base[scenario]],
+                [row[metric] for row in head[scenario]],
             )
             for metric, _ in _METRICS
         }
         for scenario in sorted(base)
     }
+
+
+def _medians(
+    base_path: pathlib.Path, head_path: pathlib.Path
+) -> dict[str, dict[_Metric, tuple[float, float]]]:
+    """Return scenario -> metric -> (base median, head median)."""
+    return {
+        scenario: {
+            metric: (statistics.median(base), statistics.median(head))
+            for metric, (base, head) in by_metric.items()
+        }
+        for scenario, by_metric in _paired(base_path, head_path).items()
+    }
+
+
+def _ratio_interval(base: list[float], head: list[float]) -> tuple[float, float]:
+    """Paired bootstrap 95% interval of median(head) / median(base), resampling reps by index.
+
+    run.py interleaves base and head within each rep, so rep i of each side shares the
+    machine's state at that moment; resampling pairs keeps that.
+    """
+    rng = random.Random(_BOOTSTRAP_SEED)
+    n = len(base)
+    ratios = sorted(
+        statistics.median(head[i] for i in picks) / statistics.median(base[i] for i in picks)
+        for picks in ([rng.randrange(n) for _ in range(n)] for _ in range(_BOOTSTRAP_RESAMPLES))
+    )
+    return ratios[int(0.025 * _BOOTSTRAP_RESAMPLES)], ratios[int(0.975 * _BOOTSTRAP_RESAMPLES) - 1]
 
 
 def _change_pct(base: float, head: float) -> float:
@@ -175,7 +210,7 @@ def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str
             elif isinstance(value, bool) or not isinstance(value, int | float):
                 raise _CannotCompareError(f"{path}: {scenario} {key} is not a number: {value!r}")
             else:
-                limits[scenario][key] = float(value)
+                limits[scenario][key] = value
     if missing:
         raise _CannotCompareError(f"no threshold for {', '.join(missing)}")
     return limits
@@ -252,24 +287,27 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             print(json.dumps(_derive_threshold(samples), indent=2, sort_keys=True))
             return 0
-        medians = _medians(result_files[0], result_files[1])
-        limits = _read_limits(pathlib.Path(args.threshold_file), list(medians))
+        paired = _paired(result_files[0], result_files[1])
+        limits = _read_limits(pathlib.Path(args.threshold_file), list(paired))
     except _CannotCompareError as error:
         print(f"cannot compare: {error}", file=sys.stderr)
         return 2
 
     regressed = False
-    for scenario, by_metric in medians.items():
+    for scenario, by_metric in paired.items():
         for metric, key in _METRICS:
-            base, head = by_metric[metric]
+            base_values, head_values = by_metric[metric]
+            base, head = statistics.median(base_values), statistics.median(head_values)
             limit = limits[scenario][key]
+            low, high = _ratio_interval(base_values, head_values)
             verdict = "ok"
-            if head > base * (1 + limit / 100):
+            if head > base * (1 + limit / 100) and low > 1:
                 verdict = "REGRESSION"
                 regressed = True
             print(
                 f"{verdict:10} {scenario} {metric}: base {base:.3f} head {head:.3f} "
-                + f"({_change_pct(base, head):+.1f}%, limit +{limit}%)"
+                + f"({_change_pct(base, head):+.1f}%, limit +{limit}%; "
+                + f"95% CI {(low - 1) * 100:+.1f}% to {(high - 1) * 100:+.1f}%)"
             )
     return 1 if regressed else 0
 
