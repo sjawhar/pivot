@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import anyio
 import pytest
+import watchfiles
 
 from pivot import discovery, project
 from pivot.engine import agent_rpc, sources
@@ -28,7 +29,9 @@ from pivot_tui import event_poller, rpc_client_impl
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
+
+    from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
     from pivot.registry import PipelineLike
 
@@ -105,6 +108,33 @@ class _Recorder:
             if event["type"] == "stage_completed" and event["stage"] == stage:
                 return event["status"]
         raise AssertionError(f"{stage} did not complete in events[{start}:{end}]")
+
+
+type _Batch = set[tuple[watchfiles.Change, str]]
+
+
+class _ScriptedWatch:
+    """Stands in for ``watchfiles.awatch`` and yields exactly the batches a test reports.
+
+    With real watching, the OS and the debounce decide which changes share a batch; here the
+    test does. The watched paths do not matter, so a watch-path update does not restart it.
+    """
+
+    _send: MemoryObjectSendStream[_Batch]
+    _recv: MemoryObjectReceiveStream[_Batch]
+
+    def __init__(self) -> None:
+        self._send, self._recv = anyio.create_memory_object_stream[_Batch](8)
+
+    async def report(self, *paths: pathlib.Path) -> None:
+        """Report ``paths`` as modified, all in one batch."""
+        await self._send.send({(watchfiles.Change.modified, str(path)) for path in paths})
+
+    async def awatch(
+        self, *_paths: object, debounce: int, stop_event: anyio.Event
+    ) -> AsyncGenerator[_Batch]:
+        async for batch in self._recv:
+            yield batch
 
 
 def _helper_is_idle(event: OutputEvent) -> bool:
@@ -817,6 +847,53 @@ async def test_data_edit_while_a_run_is_cancelling_waits_for_it(
             await recorder.wait_for(_helper_is_idle, start=done)
             assert a_output.read_text() == "a3-a", "the second a.txt edit is picked up"
             assert b_output.read_text() == "b2-b", "the b.txt edit made while cancelling is too"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_pipeline_and_data_edits_in_one_batch_run_each_stage_once(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pipeline.py edit the watcher reports in one batch with a data edit runs each stage once.
+
+    The data edit was made before the reload the batch starts, so the reload's re-run covers
+    it, and the re-run is not cancelled and restarted for it. An editor that saves every buffer
+    at once, or a checkout that changes both files, makes such a batch.
+    """
+    watch = _ScriptedWatch()
+    monkeypatch.setattr(watchfiles, "awatch", watch.awatch)
+    pipeline_py = watch_project / "pipeline.py"
+    input_txt = watch_project / "data" / "raw" / "input.txt"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
+    pipeline = _helper_discover(watch_project)
+    keep_output = _helper_output_path(watch_project, pipeline, "reload/keep")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await _helper_wait_until_watching(eng)
+
+            pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
+            input_txt.write_text("y")
+            await watch.report(pipeline_py, input_txt)
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            await recorder.wait_for(_helper_is_idle, start=reload_index)
+
+            completions = sorted(
+                (event["stage"], event["status"])
+                for event in recorder.events[reload_index:]
+                if event["type"] == "stage_completed"
+            )
+            assert completions == [
+                ("reload/added", StageStatus.RAN),
+                ("reload/change", StageStatus.RAN),
+                ("reload/keep", StageStatus.RAN),
+            ], "each stage runs once: the batch's data edit does not cancel the reload's re-run"
+            assert keep_output.read_text() == "y-keep", "the re-run reads the data edit"
             tg.cancel_scope.cancel()
 
 

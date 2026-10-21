@@ -81,10 +81,15 @@ class DataArtifactChanged(TypedDict):
 
 
 class CodeOrConfigChanged(TypedDict):
-    """Python files or pipeline.py changed."""
+    """Python files or pipeline.py changed.
+
+    ``data_paths`` are the other files the same watch batch changed. They changed before the
+    reload this event starts, so that reload's re-run already checks them.
+    """
 
     type: Literal["code_or_config_changed"]
     paths: list[str]
+    data_paths: list[str]
 
 
 class RunRequested(TypedDict):

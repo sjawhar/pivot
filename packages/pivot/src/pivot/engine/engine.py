@@ -857,8 +857,11 @@ class Engine:
                 if reload_pending is not None:
                     self._reload_pending = None
                     reload_paths = sorted(reload_pending)
+                    # Its batches' data files were handled as data changes when they arrived
                     await self._handle_code_or_config_changed(
-                        CodeOrConfigChanged(type="code_or_config_changed", paths=reload_paths)
+                        CodeOrConfigChanged(
+                            type="code_or_config_changed", paths=reload_paths, data_paths=[]
+                        )
                     )
 
                 # Replay a restart no reload re-run absorbed (taken before the call)
@@ -2491,9 +2494,11 @@ class Engine:
     async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
         """Handle code/config changes by reloading registry and re-running.
 
-        If a run is active, defers the reload until the current run completes. Reloads run one
-        at a time: an edit that arrives while a reload deferred to the end of a run is still in
-        flight waits for it, then reloads again.
+        If a run is active, defers the reload until the current run completes, and handles the
+        data files the same watch batch changed as a data change. Otherwise the reload's re-run
+        checks those files, so they start nothing of their own. Reloads run one at a time: an
+        edit that arrives while a reload deferred to the end of a run is still in flight waits
+        for it, then reloads again.
         """
         while True:
             if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
@@ -2502,11 +2507,17 @@ class Engine:
                     self._reload_pending = set(event["paths"])
                 else:
                     self._reload_pending.update(event["paths"])
+                if event["data_paths"]:
+                    await self._handle_data_artifact_changed(
+                        DataArtifactChanged(type="data_artifact_changed", paths=event["data_paths"])
+                    )
                 return
             if not self.is_reloading:
                 break
             await self._reload_done.wait()
 
+        if event["data_paths"]:
+            _logger.debug("Data changed with the code - the reload's re-run covers the change")
         self._reload_done = anyio.Event()
         try:
             await self._reload_and_rerun(event)
