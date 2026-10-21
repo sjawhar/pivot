@@ -46,6 +46,21 @@ def _helper_wait_for_release(ready_dir: str, release: str) -> int:
     return os.getpid()
 
 
+def _helper_fail_warm_up() -> None:
+    raise OSError("injected warm-up failure")
+
+
+def _helper_live_loky_workers() -> set[int]:
+    found = set[int]()
+    for child in psutil.Process().children(recursive=True):
+        try:
+            if "popen_loky_posix" in " ".join(child.cmdline()):
+                found.add(child.pid)
+        except psutil.NoSuchProcess:  # exited (or a zombie) between listing and inspecting
+            continue
+    return found
+
+
 def test_unknown_loky_reusable_executor_layout_names_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -279,6 +294,49 @@ def test_reload_restart_whose_fresh_worker_dies_leaves_the_pool_able_to_run(
             pool.end_run()
     finally:
         pool.hard_cancel()
+
+
+def test_failed_reload_restart_leaves_no_worker_beyond_the_cap(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload restart whose warm-up task fails after loky started the fresh worker must stop
+    that worker. On loky 3.7 it belongs to the reload thread's executor, which no pool holds,
+    so every later run would keep one worker beyond the cap for the rest of the session."""
+    cap = 2
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    release = tmp_path / "release"
+    baseline = _helper_live_loky_workers()
+    pool = WorkerPool()
+    reload_thread = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        pool.start(max_workers=cap, idle_timeout_s=None)
+        assert pool.submit(_helper_pid).result(timeout=60) > 0
+        pool.end_run()
+
+        with monkeypatch.context() as patched:
+            patched.setattr(executor_core, "_noop", _helper_fail_warm_up)
+            restart = reload_thread.submit(lambda: pool.restart(max_workers=cap))
+            with pytest.raises(OSError, match="injected warm-up failure"):
+                _ = restart.result(timeout=120)
+
+        pool.start(max_workers=cap, idle_timeout_s=None)
+        running = [
+            pool.submit(_helper_wait_for_release, str(ready_dir), str(release)) for _ in range(cap)
+        ]
+        deadline = time.monotonic() + 60
+        while len(list(ready_dir.iterdir())) < cap:
+            assert time.monotonic() < deadline, "the re-run's workers did not start"
+            time.sleep(0.01)
+        live = _helper_live_loky_workers() - baseline
+        release.write_text("")
+        for future in running:
+            _ = future.result(timeout=60)
+        pool.end_run()
+        assert len(live) <= cap, f"{len(live)} workers live with a cap of {cap}: {sorted(live)}"
+    finally:
+        pool.hard_cancel()
+        reload_thread.shutdown(wait=True)
 
 
 @pytest.mark.slow

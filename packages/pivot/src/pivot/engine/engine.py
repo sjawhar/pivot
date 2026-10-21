@@ -2602,8 +2602,8 @@ class Engine:
         if stages:
             # Restart the worker pool with one fresh worker so the next run picks up reloaded
             # code. Run in thread to avoid blocking the event loop during process kill/spawn.
-            # Catch errors so dispatch-time source validation can rebuild the pool on its next
-            # use.
+            # A failed restart leaves the pool without an executor, so the re-run's start()
+            # creates new workers; the failure is logged rather than ending the session.
             coordinator = self._get_watch_coordinator()
             if coordinator is not None and coordinator.should_restart_workers(
                 parallel=self._stored_parallel

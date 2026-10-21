@@ -103,7 +103,10 @@ that let loky swap it for a new timeout would leave the restart's worker alive.
 The pool forgets the old executor as soon as it is shut down. If the fresh worker then fails to
 start, the Engine logs the failed restart and the pool holds no executor, so the next run's
 `start()` creates one as on first use. A shut-down executor rejects every submission, so
-keeping it would make that run fail.
+keeping it would make that run fail. `restart_workers()` also shuts down the executor it just
+created, killing its workers, before the error propagates: on loky 3.7 that executor sits in the
+reload thread's slot, where no pool holds it, so its fresh worker would otherwise outlive the
+failure and run beside the next run's workers, one beyond the cap.
 
 ### Cleanup on Exit
 
