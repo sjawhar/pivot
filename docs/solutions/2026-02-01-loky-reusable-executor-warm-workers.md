@@ -83,7 +83,9 @@ first shuts down the executor the pool holds with `kill_workers=True`, then call
 ```python
 def _replace_executor(self, idle_timeout_s: float | None) -> loky.ProcessPoolExecutor:
     if self._executor is not None:
-        self._executor.shutdown(wait=True, kill_workers=True)
+        executor = self._executor
+        self._executor = None
+        executor.shutdown(wait=True, kill_workers=True)
     executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
     return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 ```
@@ -93,6 +95,11 @@ Loky 3.7 keeps one reusable executor per thread, and the reload restarts from an
 thread that never created the pool's executor, so `get_reusable_executor(kill_workers=True)`
 there finds no executor and leaves the previous workers alive. `reuse=False` still makes loky
 replace a compatible live executor instead of returning it unchanged.
+
+The pool forgets the old executor as soon as it is shut down. If the fresh worker then fails to
+start, the Engine logs the failed restart and the pool holds no executor, so the next run's
+`start()` creates one as on first use. A shut-down executor rejects every submission, so
+keeping it would make that run fail.
 
 ### Cleanup on Exit
 

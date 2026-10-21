@@ -189,6 +189,71 @@ def test_restart_from_another_thread_stops_the_pools_previous_workers() -> None:
         pool.hard_cancel()
 
 
+# Loaded by every Python process started while PYTHONPATH names its directory; only a loky
+# worker that finds the marker file deletes it and exits, so exactly one fresh worker dies.
+# Once a test imports joblib, its vendored loky re-registers the "loky" multiprocessing
+# context, and workers launch from joblib's copy of the launcher module instead.
+_DIE_ONCE_HOOK = """\
+import os
+import sys
+
+_LAUNCHERS = ("loky.backend.popen_loky_posix", "joblib.externals.loky.backend.popen_loky_posix")
+if sys.orig_argv[1:2] == ["-m"] and sys.orig_argv[2:3] and sys.orig_argv[2] in _LAUNCHERS:
+    try:
+        os.unlink(os.environ["PIVOT_TEST_DIE_ONCE"])
+    except (KeyError, FileNotFoundError):
+        pass
+    else:
+        os._exit(1)
+"""
+
+
+def test_reload_restart_whose_fresh_worker_dies_leaves_the_pool_able_to_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watch reload restarts workers off the loop thread. When the restart's fresh worker
+    dies at startup, the Engine logs the failed restart and re-runs
+    (``Engine._reload_and_rerun``); that re-run, and every later one, must still run stages."""
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_DIE_ONCE_HOOK)
+    marker = tmp_path / "die-once"
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=2)
+        assert pool.submit(_helper_pid).result(timeout=60) > 0
+        pool.end_run()
+
+        failures = list[BaseException]()
+
+        def _reload_restart() -> None:
+            try:
+                _ = pool.restart(max_workers=2)
+            except Exception as exc:  # the Engine catches and logs this
+                failures.append(exc)
+
+        marker.write_text("")
+        with monkeypatch.context() as patched:
+            patched.setenv("PIVOT_TEST_DIE_ONCE", str(marker))
+            patched.setenv(
+                "PYTHONPATH",
+                os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])),
+            )
+            restarted = threading.Thread(target=_reload_restart)
+            restarted.start()
+            restarted.join(timeout=120)
+        assert not restarted.is_alive(), "restart did not finish"
+        assert not marker.exists(), "no fresh worker started during the restart"
+        assert failures, "the restart's dead worker never reached the caller"
+
+        for run in range(2):
+            pool.start(max_workers=2)
+            assert pool.submit(_helper_pid).result(timeout=60) > 0, f"re-run {run} failed"
+            pool.end_run()
+    finally:
+        pool.hard_cancel()
+
+
 @pytest.mark.slow
 def test_warm_workers_survive_lokys_default_idle_timeout() -> None:
     """Long-lived workers stay warm after a pause longer than loky's default timeout."""

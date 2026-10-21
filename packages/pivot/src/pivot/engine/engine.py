@@ -2623,7 +2623,7 @@ class Engine:
                     _logger.info("Worker pool restarted for code reload (%d workers)", workers)
                 except Exception:
                     _logger.warning(
-                        "Failed to restart worker pool - continuing with existing workers",
+                        "Failed to restart worker pool - the next run starts new workers",
                         exc_info=True,
                     )
 

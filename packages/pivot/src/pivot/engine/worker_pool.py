@@ -116,7 +116,11 @@ class WorkerPool:
         self._in_run = True
 
     def restart(self, *, max_workers: int) -> int:
-        """Replace every worker before a reload starts its next run."""
+        """Replace every worker before a reload starts its next run.
+
+        If starting the fresh worker fails, the pool holds no executor and the next
+        ``start()`` creates one, as on first use.
+        """
         self._max_workers = max(self._max_workers, max_workers)
         self._executor = self._replace_executor(self._idle_timeout_s)
         self._restamp_user_code_files()
@@ -127,10 +131,14 @@ class WorkerPool:
 
         The pool stops the executor it holds rather than asking loky for "the" reusable
         executor: loky 3.7 keeps one per thread, and a watch reload restarts from an anyio
-        worker thread that never created this pool's executor.
+        worker thread that never created this pool's executor. The pool forgets the old
+        executor as soon as it is shut down, so a failure starting the fresh worker never
+        leaves it holding one that rejects work.
         """
         if self._executor is not None:
-            self._executor.shutdown(wait=True, kill_workers=True)
+            executor = self._executor
+            self._executor = None
+            executor.shutdown(wait=True, kill_workers=True)
         executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
         return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 
