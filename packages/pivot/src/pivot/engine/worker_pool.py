@@ -96,15 +96,15 @@ class WorkerPool:
             return
         self._max_workers = max(self._max_workers, max_workers)
         executor = self._executor
-        fresh_workers = False
-        if executor is None or self._idle_timeout_s != idle_timeout_s:
+        fresh_workers = True
+        if executor is None:
             executor = executor_core.create_executor(
                 self._max_workers, idle_timeout_s=idle_timeout_s
             )
-            fresh_workers = executor is not self._executor
-        if executor is self._executor and self._has_stale_user_code():
+        elif self._idle_timeout_s != idle_timeout_s or self._has_stale_user_code():
             executor = self._replace_executor(idle_timeout_s)
-            fresh_workers = True
+        else:
+            fresh_workers = False
         if fresh_workers:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
@@ -131,9 +131,9 @@ class WorkerPool:
 
         The pool stops the executor it holds rather than asking loky for "the" reusable
         executor: loky 3.7 keeps one per thread, and a watch reload restarts from an anyio
-        worker thread that never created this pool's executor. The pool forgets the old
-        executor as soon as it is shut down, so a failure starting the fresh worker never
-        leaves it holding one that rejects work.
+        worker thread, so the executor this pool holds need not be the one loky finds on the
+        calling thread. The pool forgets the old executor as soon as it is shut down, so a
+        failure starting the fresh worker never leaves it holding one that rejects work.
         """
         if self._executor is not None:
             executor = self._executor

@@ -189,6 +189,33 @@ def test_restart_from_another_thread_stops_the_pools_previous_workers() -> None:
         pool.hard_cancel()
 
 
+def test_timeout_change_after_a_reload_restart_stops_the_restarts_worker() -> None:
+    """A run with a new idle timeout replaces the executor the pool holds. After a reload
+    restarted it from an anyio worker thread, which outlives the reload, loky 3.7's lookup on
+    this thread never sees that executor, so the pool must stop it itself."""
+    pool = WorkerPool()
+    reload_thread = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        pool.start(max_workers=2, idle_timeout_s=None)
+        pool.end_run()
+        reload_thread.submit(lambda: pool.restart(max_workers=2)).result(timeout=120)
+        pool.start(max_workers=2, idle_timeout_s=None)
+        restart_pid = pool.submit(_helper_pid).result(timeout=60)
+        pool.end_run()
+
+        pool.start(max_workers=2, idle_timeout_s=executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S)
+
+        deadline = time.monotonic() + 10
+        while psutil.pid_exists(restart_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not psutil.pid_exists(restart_pid), (
+            f"the timeout change left the restart's worker alive: {restart_pid}"
+        )
+    finally:
+        pool.hard_cancel()
+        reload_thread.shutdown(wait=True)
+
+
 # Loaded by every Python process started while PYTHONPATH names its directory; only a loky
 # worker that finds the marker file deletes it and exits, so exactly one fresh worker dies.
 # Once a test imports joblib, its vendored loky re-registers the "loky" multiprocessing

@@ -94,7 +94,11 @@ The pool shuts down the executor it holds rather than asking loky for "the" reus
 Loky 3.7 keeps one reusable executor per thread, and the reload restarts from an anyio worker
 thread that never created the pool's executor, so `get_reusable_executor(kill_workers=True)`
 there finds no executor and leaves the previous workers alive. `reuse=False` still makes loky
-replace a compatible live executor instead of returning it unchanged.
+replace a compatible live executor instead of returning it unchanged. Every path that replaces
+the pool's executor goes through `_replace_executor`: a reload's `restart()`, and a `start()`
+that finds stale user code or a different idle timeout. After a restart from another thread,
+loky's lookup on the calling thread no longer finds the executor the pool holds, so a `start()`
+that let loky swap it for a new timeout would leave the restart's worker alive.
 
 The pool forgets the old executor as soon as it is shut down. If the fresh worker then fails to
 start, the Engine logs the failed restart and the pool holds no executor, so the next run's
