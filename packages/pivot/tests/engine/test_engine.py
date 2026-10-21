@@ -1312,6 +1312,29 @@ async def test_engine_restart_after_deferred_reload_skips_removed_stages() -> No
 
 
 @pytest.mark.anyio
+async def test_engine_code_change_while_running_handles_its_batch_data_at_once() -> None:
+    """A code change made while a run is in progress waits for that run; its batch's data files
+    are handled at once as a data change, as a batch with no code change would be."""
+    handled = list[list[str]]()
+
+    async with Engine() as engine:
+        engine._run_state = engine_mod._RunState.RUNNING
+
+        async def record_data_change(event: DataArtifactChanged) -> None:
+            handled.append(event["paths"])
+
+        engine._handle_data_artifact_changed = record_data_change
+        await engine._handle_code_or_config_changed(
+            CodeOrConfigChanged(
+                type="code_or_config_changed", paths=["pipeline.py"], data_paths=["input.csv"]
+            )
+        )
+
+        assert engine._reload_pending == {"pipeline.py"}, "the reload waits for the run"
+        assert handled == [["input.csv"]], "the batch's data file is handled at once"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("steps", "replayed"),
     [
