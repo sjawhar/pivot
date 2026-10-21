@@ -39,7 +39,7 @@ import pathlib
 import random
 import statistics
 import sys
-from typing import Any, Literal, TypedDict, TypeGuard
+from typing import Any, Literal, TypedDict, TypeGuard, cast
 
 type _Metric = Literal["wall_s", "cpu_s"]
 type _LimitKey = Literal["wall_pct", "cpu_pct"]
@@ -123,16 +123,17 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
     by_scenario = dict[str, list[_Row]]()
     for number, line in enumerate(lines, start=1):
         try:
-            raw = json.loads(line)
-            if not isinstance(raw, dict):
-                raise TypeError(f"a result row must be a JSON object, got {raw!r}")
-            scenario = _field_str(raw, "scenario")  # pyright: ignore[reportUnknownArgumentType] - JSON object
-            exit_code = _field_int(raw, "exit_code")  # pyright: ignore[reportUnknownArgumentType] - JSON object
-            rep = _field_int(raw, "rep")  # pyright: ignore[reportUnknownArgumentType] - JSON object
+            parsed = json.loads(line)
+            if not isinstance(parsed, dict):
+                raise TypeError(f"a result row must be a JSON object, got {parsed!r}")
+            raw = cast("dict[str, object]", parsed)
+            scenario = _field_str(raw, "scenario")
+            exit_code = _field_int(raw, "exit_code")
+            rep = _field_int(raw, "rep")
             row = _Row(
-                wall_s=_field_number(raw, "wall_s"),  # pyright: ignore[reportUnknownArgumentType] - JSON object
-                cpu_s=_field_number(raw, "cpu_s"),  # pyright: ignore[reportUnknownArgumentType] - JSON object
-                cpu_count=_field_int(raw, "cpu_count"),  # pyright: ignore[reportUnknownArgumentType] - JSON object
+                wall_s=_field_number(raw, "wall_s"),
+                cpu_s=_field_number(raw, "cpu_s"),
+                cpu_count=_field_int(raw, "cpu_count"),
                 rep=rep,
             )
         except RecursionError:
@@ -152,12 +153,13 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
 
 def _by_rep(path: pathlib.Path, scenario: str, rows: list[_Row]) -> list[_Row]:
     """Return the rows in rep order; reps must be exactly 0 .. n-1, each once."""
-    reps = sorted(row["rep"] for row in rows)
+    ordered = sorted(rows, key=lambda row: row["rep"])
+    reps = [row["rep"] for row in ordered]
     if reps != list(range(len(rows))):
         raise _CannotCompareError(
             f"{path}: {scenario} reps must be 0 to {len(rows) - 1} once each, got {reps}"
         )
-    return sorted(rows, key=lambda row: row["rep"])
+    return ordered
 
 
 def _paired(
@@ -184,19 +186,6 @@ def _paired(
     return paired
 
 
-def _medians(
-    base_path: pathlib.Path, head_path: pathlib.Path
-) -> dict[str, dict[_Metric, tuple[float, float]]]:
-    """Return scenario -> metric -> (base median, head median)."""
-    return {
-        scenario: {
-            metric: (statistics.median(base), statistics.median(head))
-            for metric, (base, head) in by_metric.items()
-        }
-        for scenario, by_metric in _paired(base_path, head_path).items()
-    }
-
-
 def ratio_interval(base: list[float], head: list[float]) -> tuple[float, float]:
     """Paired bootstrap 95% interval of the median per-rep ratio head[i] / base[i].
 
@@ -221,12 +210,13 @@ def _change_pct(base: float, head: float) -> float:
     return (head - base) / base * 100
 
 
-def _changes(medians: dict[str, dict[_Metric, tuple[float, float]]]) -> _Changes:
+def _changes(base_path: pathlib.Path, head_path: pathlib.Path) -> _Changes:
     changes = dict[str, dict[str, float]]()
-    for scenario, by_metric in medians.items():
+    for scenario, by_metric in _paired(base_path, head_path).items():
         changes[scenario] = {}
         for metric, key in _METRICS:
-            base, head = by_metric[metric]
+            base_values, head_values = by_metric[metric]
+            base, head = statistics.median(base_values), statistics.median(head_values)
             change = _change_pct(base, head)
             if not math.isfinite(change):
                 raise _CannotCompareError(
@@ -322,7 +312,7 @@ def _calibration_samples(
             parser.error(
                 f"--sample needs integer SAMPLE RUN ATTEMPT JOB, got {sample} {run} {attempt} {job}"
             )
-        changes = _changes(_medians(pathlib.Path(base), pathlib.Path(head)))
+        changes = _changes(pathlib.Path(base), pathlib.Path(head))
         samples.append({**source, "changes": changes})
     return samples
 
@@ -365,20 +355,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.write_calibration:
             samples = _calibration_samples(parser, sample_specs)
             text = json.dumps({"samples": samples}, indent=2, sort_keys=True) + "\n"
-            pathlib.Path(args.write_calibration).write_text(text)
+            args.write_calibration.write_text(text)
             return 0
         if args.derive_threshold:
             if calibration:
                 samples = _read_calibration(calibration)
             else:
                 samples = [
-                    _changes(_medians(result_files[index], result_files[index + 1]))
-                    for index in range(0, len(result_files), 2)
+                    _changes(base, head)
+                    for base, head in zip(result_files[::2], result_files[1::2], strict=True)
                 ]
             print(json.dumps(_derive_threshold(samples), indent=2, sort_keys=True))
             return 0
         paired = _paired(result_files[0], result_files[1])
-        limits = _read_limits(pathlib.Path(args.threshold_file), list(paired))
+        limits = _read_limits(args.threshold_file, list(paired))
     except _CannotCompareError as error:
         # One line, whatever a path or a scenario name holds.
         print(f"cannot compare: {error}".replace("\n", "\\n"), file=sys.stderr)

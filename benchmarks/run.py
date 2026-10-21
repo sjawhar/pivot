@@ -51,18 +51,12 @@ class Measurement(TypedDict):
     leftover_procs: int
 
 
-class Row(TypedDict):
+class Row(Measurement):
     scenario: str
     variant: str
     rep: int
-    wall_s: float
-    cpu_s: float
-    exit_code: int
-    load1: float
-    cpu_count: int
     ran: int | None
     cached: int | None
-    leftover_procs: int
 
 
 def _session_members(sid: int) -> list[int]:
