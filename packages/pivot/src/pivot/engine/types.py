@@ -83,8 +83,9 @@ class DataArtifactChanged(TypedDict):
 class CodeOrConfigChanged(TypedDict):
     """Python files or pipeline.py changed.
 
-    ``data_paths`` are the other files the same watch batch changed. They changed before the
-    reload this event starts, so that reload's re-run already checks them.
+    ``data_paths`` are the other files the same watch batch changed. A reload that starts a
+    re-run covers them. A reload that leaves the pipeline invalid, or one deferred because a run
+    is in progress, hands them to the data-change handler, as a separate data event would be.
     """
 
     type: Literal["code_or_config_changed"]

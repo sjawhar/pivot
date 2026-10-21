@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+import anyio
+import pytest
+import watchfiles
 
 from pivot.engine import sources, types
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 # =============================================================================
 # OneShotSource
@@ -226,3 +234,38 @@ def test_is_code_or_config_ignores_pivot_yaml() -> None:
     assert sources._is_code_or_config("pipeline.py") is True
     assert sources._is_code_or_config("pivot.yaml") is False
     assert sources._is_code_or_config("pivot.yml") is False
+
+
+async def _helper_one_batch(
+    *_paths: object, debounce: int, stop_event: anyio.Event
+) -> AsyncGenerator[set[tuple[watchfiles.Change, str]]]:
+    """Stands in for ``watchfiles.awatch``: one batch with a code and a data file, then waits."""
+    yield {
+        (watchfiles.Change.modified, "/project/pipeline.py"),
+        (watchfiles.Change.modified, "/project/data/input.csv"),
+    }
+    await stop_event.wait()
+
+
+async def test_filesystem_source_sends_one_event_for_a_mixed_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch with a code file and a data file becomes one CodeOrConfigChanged carrying the
+    data file, and no DataArtifactChanged."""
+    monkeypatch.setattr(watchfiles, "awatch", _helper_one_batch)
+    send, recv = anyio.create_memory_object_stream[types.InputEvent](10)
+    source = sources.FilesystemSource(watch_paths=[Path("/project")], debounce_ms=50)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        with anyio.fail_after(5):
+            event = await recv.receive()
+        await anyio.wait_all_tasks_blocked()
+        assert event == types.CodeOrConfigChanged(
+            type="code_or_config_changed",
+            paths=["/project/pipeline.py"],
+            data_paths=["/project/data/input.csv"],
+        )
+        with pytest.raises(anyio.WouldBlock):
+            recv.receive_nowait()
+        tg.cancel_scope.cancel()

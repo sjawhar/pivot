@@ -2495,10 +2495,12 @@ class Engine:
         """Handle code/config changes by reloading registry and re-running.
 
         If a run is active, defers the reload until the current run completes, and handles the
-        data files the same watch batch changed as a data change. Otherwise the reload's re-run
-        checks those files, so they start nothing of their own. Reloads run one at a time: an
-        edit that arrives while a reload deferred to the end of a run is still in flight waits
-        for it, then reloads again.
+        data files the same watch batch changed as a data change. Otherwise the reload runs
+        first: when it starts a re-run, that re-run checks those files, so they start nothing
+        of their own; when it starts none (the edit leaves the pipeline invalid), they are
+        handled as a data change once it ends, as a separate data event would be. Reloads run
+        one at a time: an edit that arrives while a reload deferred to the end of a run is still
+        in flight waits for it, then reloads again.
         """
         while True:
             if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
@@ -2516,16 +2518,26 @@ class Engine:
                 break
             await self._reload_done.wait()
 
-        if event["data_paths"]:
-            _logger.debug("Data changed with the code - the reload's re-run covers the change")
         self._reload_done = anyio.Event()
         try:
-            await self._reload_and_rerun(event)
+            reran = await self._reload_and_rerun(event)
         finally:
             self._reload_done.set()
+        if not event["data_paths"]:
+            return
+        if reran:
+            _logger.debug("Data changed with the code - the reload's re-run covers the change")
+            return
+        await self._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=event["data_paths"])
+        )
 
-    async def _reload_and_rerun(self, event: CodeOrConfigChanged) -> None:
-        """Reload the edited pipeline off the event loop, then re-run every stage."""
+    async def _reload_and_rerun(self, event: CodeOrConfigChanged) -> bool:
+        """Reload the edited pipeline off the event loop, then re-run every stage.
+
+        Returns whether a re-run started: none does when the edit leaves the pipeline invalid
+        or it has no stages.
+        """
         _logger.info("Code/config changed - reloading pipeline")
 
         # Invalidate caches
@@ -2543,7 +2555,7 @@ class Engine:
                 extra={"pivot_condition": (PIPELINE_ERROR_CONDITION, reload_result)},
             )
             await self._emit_pipeline_error(reload_result)
-            return
+            return False
         old_stages = reload_result
 
         # Emit reload event
@@ -2617,6 +2629,8 @@ class Engine:
                     )
 
             await self._execute_affected_stages(stages)
+            return True
+        return False
 
     async def _execute_affected_stages(self, stages: list[str]) -> None:
         """Execute the specified stages via non-blocking run handling.

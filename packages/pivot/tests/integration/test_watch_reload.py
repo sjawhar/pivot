@@ -898,6 +898,59 @@ async def test_pipeline_and_data_edits_in_one_batch_run_each_stage_once(
 
 
 @pytest.mark.anyio
+async def test_still_broken_pipeline_and_data_edit_in_one_batch_run_nothing_until_fixed(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A batch with a still-broken pipeline.py and a data edit handles the data edit as an
+    invalid pipeline does: it is dropped, and the edit that fixes the pipeline reruns it.
+
+    The reload this batch starts leaves the pipeline invalid and starts no re-run, so nothing
+    covers the data edit but the data-change handler.
+    """
+    caplog.set_level(logging.DEBUG, logger="pivot.engine.engine")
+    watch = _ScriptedWatch()
+    monkeypatch.setattr(watchfiles, "awatch", watch.awatch)
+    pipeline_py = watch_project / "pipeline.py"
+    input_txt = watch_project / "data" / "raw" / "input.txt"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
+    pipeline = _helper_discover(watch_project)
+    keep_output = _helper_output_path(watch_project, pipeline, "reload/keep")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await _helper_wait_until_watching(eng)
+
+            pipeline_py.write_text("def broken(:\n")
+            await watch.report(pipeline_py)
+            first_invalid = await recorder.wait_for(_helper_is_invalid_pipeline)
+
+            input_txt.write_text("y")
+            await watch.report(pipeline_py, input_txt)
+            await recorder.wait_for(_helper_is_invalid_pipeline, start=first_invalid + 1)
+            with anyio.fail_after(10):
+                while "ignoring run request" not in caplog.text:
+                    await anyio.sleep(0.05)
+            assert "re-run covers the change" not in caplog.text, "no re-run started to cover it"
+
+            pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
+            await watch.report(pipeline_py)
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            await recorder.wait_for(_helper_is_idle, start=reload_index)
+
+            assert not any(
+                event["type"] == "stage_completed" for event in recorder.events[:reload_index]
+            ), "nothing ran while the pipeline was invalid"
+            assert keep_output.read_text() == "y-keep", "the fixed pipeline's run reads the edit"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("refused", [False, True], ids=["valid", "refused"])
 async def test_run_requested_during_startup_snapshot_is_refused_at_once(
     watch_project: pathlib.Path,
