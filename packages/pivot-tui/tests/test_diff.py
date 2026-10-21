@@ -86,7 +86,7 @@ async def test_diff_summary_panel_shows_the_cache_note_only_for_an_unknown_head_
     rows_line: str,
     note: bool,
 ) -> None:
-    """A HEAD side whose rows are unknown (a cache miss) shows the `pivot pull` note; a known
+    """A HEAD side whose rows are unknown (a cache miss) shows the `pivot fetch` note; a known
     HEAD side, and an added file, which has no HEAD side, do not."""
     result = DataDiffResult(
         path="data.csv",

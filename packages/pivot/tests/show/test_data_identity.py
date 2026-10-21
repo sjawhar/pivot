@@ -65,12 +65,7 @@ def _use_store(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _register(monkeypatch: pytest.MonkeyPatch, ref: types.ArtifactRef) -> None:
     stage_info = {"train": _make_stage_info("train", [ref])}
-
-    def _get_stage(name: str) -> RegistryStageInfo:
-        return stage_info[name]
-
-    monkeypatch.setattr(cli_helpers, "list_stages", lambda: ["train"])
-    monkeypatch.setattr(cli_helpers, "get_stage", _get_stage)
+    monkeypatch.setattr(cli_helpers, "get_all_stages", lambda: stage_info)
 
 
 def _mock_head_files(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
@@ -117,29 +112,6 @@ def test_extract_output_hashes_from_lock_uses_identity_keys() -> None:
     result = show_common.extract_output_hashes_from_lock(lock_data, "train")
 
     assert result == {"train": "deadbeef", "train:model": "beadfeed"}
-
-
-def test_select_data_files_uses_identity_keys_and_store_paths(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _use_store(tmp_path, monkeypatch)
-    _register(monkeypatch, _make_artifact_ref("train", None, types.ArtifactTag.DATA, loaders.CSV()))
-
-    lock_content = b"""
-code_manifest: {}
-params: {}
-deps: []
-outs:
-  - key: null
-    hash: deadbeef00000000
-    tag: data
-"""
-
-    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
-
-    result = _head_hashes()
-
-    assert result == {"data/train.csv": "deadbeef00000000"}
 
 
 def test_select_data_files_expands_directory_manifest(

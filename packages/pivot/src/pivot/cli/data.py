@@ -71,7 +71,6 @@ def diff(
     if selection is None:
         click.echo("No data files found in registered stages.")
         return
-    workspace_member_paths = selection.workspace_paths
 
     # Quick hash comparison to find changed files
     hash_diffs = data_module.diff_data_hashes(selection.head_hashes, selection.workspace_hashes)
@@ -115,7 +114,7 @@ def diff(
                     temp_files.append(old_path)
             result = data_module.diff_data_files(
                 old_path=old_path,
-                new_path=workspace_member_paths.get(rel_path),
+                new_path=selection.workspace_paths.get(rel_path),
                 path_display=rel_path,
                 change_type=diff_entry["change_type"],
                 key_columns=effective_keys,

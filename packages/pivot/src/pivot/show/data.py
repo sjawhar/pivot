@@ -111,18 +111,6 @@ def _format_from_loader(
     return None
 
 
-def _is_data_output(
-    out: types.ArtifactRef, store: store_mod.WorkspaceStore, project_root: pathlib.Path
-) -> bool:
-    """True for a stage output that `pivot diff` can compare (CSV, JSON or JSONL data)."""
-    if out.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
-        return False
-    if _format_from_loader(out.format) is not None:
-        return True
-    rel_path = project.to_relative_path(store.resolve_display_path(out), project_root)
-    return detect_format(pathlib.Path(rel_path)) != DataFileFormat.UNKNOWN
-
-
 def load_dataframe(path: pathlib.Path) -> pandas.DataFrame:
     """Load data file as pandas DataFrame."""
     match detect_format(path):
@@ -544,10 +532,10 @@ class _DiffOutput:
 
     ``head`` is the HEAD lock entry recorded at this path, and ``in_workspace`` says a current
     output writes here; an output that moved has one of each, at its HEAD path and at its
-    current path. ``is_directory`` is the path's kind for selection: the current output's kind
-    when there is one, else HEAD's. ``changed_kind`` holds HEAD's and the workspace's kind when
-    one path holds a file at HEAD and a directory in the workspace, or the reverse; such a path
-    is not compared.
+    current path. ``is_directory`` is true when the current output at this path is tagged
+    DIRECTORY or is a directory on disk, or the HEAD entry here records a manifest.
+    ``changed_kind`` holds HEAD's and the workspace's kind when one path holds a file at HEAD and
+    a directory in the workspace, or the reverse; such a path is not compared.
     """
 
     path: str
@@ -653,7 +641,11 @@ def _diff_outputs(
             and head_is_directory != workspace_is_directory
         ):
             changed_kind = (_kind(head_is_directory), _kind(workspace_is_directory))
-        if is_directory or _is_data_output(out, store, proj_root):
+        if (
+            is_directory
+            or _format_from_loader(out.format) is not None
+            or detect_format(pathlib.Path(rel_path)) is not DataFileFormat.UNKNOWN
+        ):
             result[rel_path] = _DiffOutput(rel_path, head, True, is_directory, changed_kind)
 
     for head_path, (head, moved_paths) in moved_heads.items():
@@ -811,7 +803,7 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
 
     store = cli_helpers.require_workspace_store()
     proj_root = project.get_project_root()
-    stage_infos = {name: cli_helpers.get_stage(name) for name in cli_helpers.list_stages()}
+    stage_infos = cli_helpers.get_all_stages()
     outputs, paths_by_identity = _diff_outputs(stage_infos, store, proj_root)
     if not outputs:
         return None
@@ -843,7 +835,7 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
 
     covered = set[str]()
     if any(path is not None for _, path in unresolved):
-        for member in [*head_hashes, *workspace_hashes]:
+        for member in head_hashes.keys() | workspace_hashes.keys():
             covered.add(member)
             covered.update(_parents(member))
     unmatched = [target for target, path in unresolved if path is None or path not in covered]

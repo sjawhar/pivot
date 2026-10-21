@@ -95,11 +95,6 @@ class UnsafeLockPath:
         return f"{self.field}: {self.value!r} is not a project-relative POSIX path"
 
 
-def lock_data_error(data: object) -> str | UnsafeLockPath | None:
-    """Return the first reason parsed data cannot safely be consumed as a lock."""
-    return _lock_shape_error(data)
-
-
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     """Validate that parsed YAML has the storage format's shape, field by field.
 
@@ -215,10 +210,12 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | UnsafeLockPath
     return None
 
 
-def _lock_shape_error(data: object) -> str | UnsafeLockPath | None:
-    """Return the first field that breaks StorageLockData, or None if none does.
+def lock_data_error(data: object) -> str | UnsafeLockPath | None:
+    """Return the first reason parsed data cannot safely be consumed as a lock, or None.
 
-    Extra top-level keys are allowed for forward compatibility.
+    The reason is the first field that breaks StorageLockData, or an ``UnsafeLockPath`` for a
+    recorded path that is not project-relative POSIX form. Extra top-level keys are allowed for
+    forward compatibility.
     """
     if not isinstance(data, dict):
         return "<document>"

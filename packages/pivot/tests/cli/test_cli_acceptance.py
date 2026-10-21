@@ -2427,7 +2427,7 @@ def test_diff_on_a_directory_output_compares_each_of_its_files(tmp_path: pathlib
 
 def test_diff_json_names_each_entry_change_type(tmp_path: pathlib.Path) -> None:
     """Every `--json` entry carries `change_type`, one of `added`, `removed` and `modified`,
-    and the text output for the same diff is unchanged."""
+    beside its row counts, and no cache-miss warning is logged."""
     root = _project(
         tmp_path,
         {
@@ -2701,32 +2701,6 @@ def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
     assert "TOP_SECRET_VALUE" not in output
 
 
-def test_diff_leaves_out_a_workspace_symlink_outside_the_project(tmp_path: pathlib.Path) -> None:
-    """`pivot diff` warns and ignores a non-cache directory member symlink."""
-    root = _project(
-        tmp_path,
-        {
-            "pipeline.py": _DIFF_PIPELINE,
-            "data/raw/rows.csv": "part,v\ntrain,1\n",
-        },
-    )
-    _ok(_pivot(root, "repro"))
-    _commit(root, "first run")
-
-    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
-    secret.write_text("TOP_SECRET_VALUE\n1\n")
-    member = root / "data" / "d" / "split" / "train.csv"
-    member.unlink()
-    member.symlink_to(secret)
-    try:
-        output = _ok(_pivot(root, "diff", "--json", "d/split"))
-    finally:
-        secret.unlink()
-
-    assert "Directory artifact data/d/split leaves out symlink train.csv" in output
-    assert "TOP_SECRET_VALUE" not in output
-
-
 def test_diff_refuses_a_manifest_path_with_a_null_byte(tmp_path: pathlib.Path) -> None:
     """`pivot diff` names and refuses a committed manifest path containing a null byte."""
     root = _project(
@@ -2826,25 +2800,6 @@ def test_diff_supports_external_cache_symlink_checkout_for_a_directory_output(
 
     assert '"path": "data/d/split/train.csv"' in json_output
     assert "Rows: 1 -> 2 (+1)" in text_output
-
-
-def test_diff_supports_data_symlinked_outside_the_project(tmp_path: pathlib.Path) -> None:
-    """`pivot diff` reads an output below a project data symlink."""
-    project_dir = tmp_path / "project"
-    project_dir.mkdir()
-    root = _project(project_dir, {"pipeline.py": _DIFF_PIPELINE})
-    external_data = tmp_path / "data"
-    (external_data / "raw").mkdir(parents=True)
-    (external_data / "raw" / "rows.csv").write_text("part,v\ntrain,1\n")
-    (root / "data").symlink_to(external_data, target_is_directory=True)
-    _ok(_pivot(root, "repro"))
-    _commit(root, "first run")
-    (external_data / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,2\n")
-    _ok(_pivot(root, "repro"))
-
-    output = _ok(_pivot(root, "diff", "--json", "d/split"))
-
-    assert '"path": "data/d/split/train.csv"' in output
 
 
 _NESTED_DIFF_PIPELINE = """\

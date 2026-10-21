@@ -171,7 +171,7 @@ def hash_file(
     return file_hash, file_stat
 
 
-def cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str | None:
+def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str | None:
     """Return the cache key a symlink resolves to, if its target is an object in ``cache_dir``.
 
     Cache objects live at ``<cache_dir>/XX/YYYY...`` named by their content hash; a file-by-file
@@ -186,10 +186,10 @@ def cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str 
     return key
 
 
-def is_artifact_file_member(path: pathlib.Path, cache_dir: pathlib.Path | None) -> bool:
+def _is_artifact_file_member(path: pathlib.Path, cache_dir: pathlib.Path | None) -> bool:
     """Whether ``path`` is a regular artifact member or a checkout symlink to its cache object."""
     return path.is_file() and (
-        not path.is_symlink() or cache_object_key(path, cache_dir) is not None
+        not path.is_symlink() or _cache_object_key(path, cache_dir) is not None
     )
 
 
@@ -197,7 +197,7 @@ def is_artifact_member_content(
     path: pathlib.Path, file_hash: str, cache_dir: pathlib.Path | None
 ) -> bool:
     """Whether a candidate member has the content its cache-object symlink names."""
-    return not path.is_symlink() or file_hash == cache_object_key(path, cache_dir)
+    return not path.is_symlink() or file_hash == _cache_object_key(path, cache_dir)
 
 
 def scandir_artifact_members(
@@ -225,7 +225,7 @@ def scandir_artifact_members(
     with os.scandir(path) as entries:
         for entry in entries:
             if entry.is_symlink():
-                if is_artifact_file_member(pathlib.Path(entry.path), cache_dir):
+                if _is_artifact_file_member(pathlib.Path(entry.path), cache_dir):
                     yield entry
                 else:
                     left_out.append(pathlib.Path(entry.path))
@@ -1261,7 +1261,7 @@ def _publish_tree(
             name
             for name in names
             if (link := pathlib.Path(directory, name)).is_symlink()
-            and cache_object_key(link, cache_dir) is None
+            and _cache_object_key(link, cache_dir) is None
         ]
 
     cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
