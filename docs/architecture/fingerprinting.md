@@ -118,10 +118,11 @@ computed name and `globals()`/`locals()` (`fingerprint._check_dynamic_name_acces
 the wrapped function's, so a computed `getattr` in the wrapper's own body is not refused and one
 in the wrapped function is, even when the wrapper reaches it only through `__wrapped__`. Other
 spellings (`__import__`, an alias of `importlib.import_module`, a `functools.partial` of it,
-`vars(module)[name]`, `operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs)
-are not refused at definition. A user module one of them loads while the stage runs is caught by
-the worker's check below, and a library module costs nothing; an attribute read on a module
-already loaded is not seen.
+`vars(module)[name]`, `operator.attrgetter`, `exec`, and `importlib.util` loader APIs) are not
+refused at definition. A user module one of them loads and registers while the stage runs is
+caught by the worker's check below, and a library module costs nothing. `runpy.run_path` and
+`runpy.run_module` of a top-level module run the file without registering it, so the check does
+not see them (see its limits); an attribute read on a module already loaded is not seen either.
 
 **Workaround:** Import the module statically.
 
@@ -169,12 +170,13 @@ The check does not see these paths, which behave as they would without it:
 | Path | Remedy |
 |------|--------|
 | Reading a module already in `sys.modules` without an import; `importlib.reload` | Import the module where the stage reads it |
-| Private import machinery; a loader that replaces a key already in `sys.modules` or never registers one | Import statically, or move the value into `StageParams` |
+| Private import machinery; a loader that replaces a key already in `sys.modules` or never registers one, such as `runpy.run_path("helpers/lib.py")` and `runpy.run_module("toplib")` for a top-level module | Import statically, or move the value into `StageParams` |
 | An import in a child process | Declare the code the child runs as an input, or use `@no_fingerprint(code_deps=[...])` |
 | An import from a thread that outlives its stage | Join the thread before the stage returns; its import is charged to whichever stage is running, or to none |
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
 | `pivot repro --no-commit`, then `pivot commit` | No lock exists to carry the mark, so `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
+| A result cached by an earlier Pivot version | Upgrading Pivot alone reruns nothing: `_CACHE_SCHEMA_VERSION` keys only the state.lmdb caches, not the lock. The check marks a stage the next time that stage runs under this version; until then a cached result is reused until its code or inputs change, as before the upgrade. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically |
 
 ### Module-Level Instances
 

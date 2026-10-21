@@ -86,8 +86,9 @@ check:
 - a read of a module already in `sys.modules` without an import, or
   `importlib.reload`: import the module where the stage reads it;
 - private import machinery, or a loader that replaces a module already in
-  `sys.modules` or never registers one: import it statically, or move the value
-  into `StageParams`;
+  `sys.modules` or never registers one, such as `runpy.run_path("helpers/lib.py")`
+  or `runpy.run_module("toplib")` for a top-level module: import it statically,
+  or move the value into `StageParams`;
 - an import in a child process: declare the code the child runs as an input,
   or list it in `@no_fingerprint(code_deps=[...])`;
 - an import from a thread that outlives its stage: the import is charged to
@@ -101,7 +102,12 @@ check:
 - `pivot repro --no-commit` followed by `pivot commit`: no lock exists to carry
   the mark, so `pivot commit` records the outputs on disk against the static
   fingerprint, as it records any output; run `pivot repro` without
-  `--no-commit` for a stage that imports dynamically.
+  `--no-commit` for a stage that imports dynamically;
+- a result cached by an earlier Pivot version: upgrading Pivot alone reruns
+  nothing. The check marks a stage the next time that stage runs under this
+  version; until then a cached result is reused until its code or inputs
+  change, as before the upgrade. Run `pivot repro --force <stage>` once to
+  re-check a stage you know imports dynamically.
 
 
 ### Transitive Tracking
