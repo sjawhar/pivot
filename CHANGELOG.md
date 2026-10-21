@@ -19,6 +19,9 @@
   are keyed by path: an output that moves to a new path is removed at the path git HEAD recorded
   and added at its new one, and a path that holds a file at git HEAD and a directory in the
   workspace, or the reverse, is named with both kinds and not compared.
+- **diff**: A stage whose output path changes with its loader, such as `loaders.CSV()` to
+  `loaders.DataFrameJSONL()`, no longer exits 1 with `ValueError('Invalid JSON …')`: the committed
+  file is removed at its old path and the new file added at the new one.
 
 
 ## v0.5.2 (2026-10-20)

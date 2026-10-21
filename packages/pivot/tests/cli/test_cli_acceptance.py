@@ -3116,14 +3116,18 @@ with Pipeline("d") as pipeline:
     make(pipeline.input("rows.csv"))
 """
 
+_MAKE_JSONL_PIPELINE = _MAKE_FILE_PIPELINE.replace("loaders.CSV()", "loaders.DataFrameJSONL()")
+
 
 @pytest.mark.parametrize("keep_old_output", [True, False], ids=["old-output-kept", "old-removed"])
 @pytest.mark.parametrize(
-    ("before", "after", "removed", "added"),
+    ("before", "after", "old_output", "new_output", "removed", "added"),
     [
         pytest.param(
             _MAKE_DIRECTORY_PIPELINE,
             _MAKE_FILE_PIPELINE,
+            "data/d/make",
+            "data/d/make.csv",
             "data/d/make/all.csv",
             "data/d/make.csv",
             id="directory-to-file",
@@ -3132,8 +3136,19 @@ with Pipeline("d") as pipeline:
             _MAKE_FILE_PIPELINE,
             _MAKE_DIRECTORY_PIPELINE,
             "data/d/make.csv",
+            "data/d/make",
+            "data/d/make.csv",
             "data/d/make/all.csv",
             id="file-to-directory",
+        ),
+        pytest.param(
+            _MAKE_FILE_PIPELINE,
+            _MAKE_JSONL_PIPELINE,
+            "data/d/make.csv",
+            "data/d/make.jsonl",
+            "data/d/make.csv",
+            "data/d/make.jsonl",
+            id="csv-to-dataframe-jsonl",
         ),
     ],
 )
@@ -3141,32 +3156,37 @@ def test_diff_compares_a_moved_output_by_path(
     tmp_path: pathlib.Path,
     before: str,
     after: str,
+    old_output: str,
+    new_output: str,
     removed: str,
     added: str,
     keep_old_output: bool,
 ) -> None:
-    """A stage whose output moved to a new path and kind lists HEAD's file as removed at the
-    path HEAD recorded, and the workspace file as added at the new one, with no warning."""
+    """A stage whose output moved to a new path, by a kind or loader switch, lists HEAD's file
+    as removed at the path HEAD recorded, and the workspace file as added at the new one, with
+    no warning."""
     root = _project(tmp_path, {"pipeline.py": before, "data/raw/rows.csv": "v\n1\n2\n"})
     _ok(_pivot(root, "repro"))
     _commit(root, "first run")
     (root / "pipeline.py").write_text(after)
     (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
     _ok(_pivot(root, "repro"))
-    old_output = root / "data" / "d" / ("make.csv" if removed == "data/d/make.csv" else "make")
-    assert old_output.exists()
+    old_output_on_disk = root / old_output
+    assert old_output_on_disk.exists()
     if not keep_old_output:
-        shutil.rmtree(old_output) if old_output.is_dir() else old_output.unlink()
+        if old_output_on_disk.is_dir():
+            shutil.rmtree(old_output_on_disk)
+        else:
+            old_output_on_disk.unlink()
 
-    new_output = "data/d/make.csv" if added == "data/d/make.csv" else "data/d/make"
-    old_output_path = "data/d/make" if new_output == "data/d/make.csv" else "data/d/make.csv"
     expected = {removed: (2, None), added: (None, 3)}
     selections = {
         "d/make": expected,
         ".": expected,
         new_output: {added: (None, 3)},
-        old_output_path: {removed: (2, None)},
+        old_output: {removed: (2, None)},
     }
+
     for target, answer in selections.items():
         result = _pivot(root, "diff", "--json", target)
         assert result.returncode == 0, result.stdout + result.stderr
@@ -3266,6 +3286,88 @@ def test_diff_compares_an_output_moved_by_a_type_alias_switch(
     rows = {e["path"]: (e["old_rows"], e["new_rows"]) for e in json.loads(result.stdout)}
     assert rows == {removed: (2, None), added: (None, 2)}, rows
     assert "git HEAD" not in result.stderr, result.stderr
+
+
+_MAKE_AND_OTHER_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+@stage
+def other(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw.head(1)
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    make(rows)
+    other(rows)
+"""
+
+
+@pytest.mark.parametrize(
+    ("head_paths", "expected"),
+    [
+        pytest.param(
+            {"other": "data/d/make.csv"},
+            {
+                "d/make": {"data/d/make.csv": (2, 3)},
+                "data/d/make.csv": {"data/d/make.csv": (2, 3)},
+                "d/other": {"data/d/other.csv": (None, 1)},
+                ".": {"data/d/make.csv": (2, 3), "data/d/other.csv": (None, 1)},
+            },
+            id="moved-onto-a-current-output",
+        ),
+        pytest.param(
+            {"make": "data/d/old.csv", "other": "data/d/old.csv"},
+            {
+                "d/make": {"data/d/old.csv": (2, None), "data/d/make.csv": (None, 3)},
+                "data/d/old.csv": {"data/d/old.csv": (2, None)},
+                "d/other": {"data/d/other.csv": (None, 1)},
+                ".": {
+                    "data/d/old.csv": (2, None),
+                    "data/d/make.csv": (None, 3),
+                    "data/d/other.csv": (None, 1),
+                },
+            },
+            id="two-moved-to-one-path",
+        ),
+    ],
+)
+def test_diff_keeps_one_head_entry_for_a_path_two_locks_record(
+    tmp_path: pathlib.Path,
+    head_paths: dict[str, str],
+    expected: dict[str, dict[str, tuple[int | None, int | None]]],
+) -> None:
+    """When two committed HEAD locks record one path, which takes a hand-edited lock, the path
+    keeps the HEAD entry of the output that lives there, or else the first registered output's;
+    the other entry is dropped."""
+    root = _project(
+        tmp_path, {"pipeline.py": _MAKE_AND_OTHER_PIPELINE, "data/raw/rows.csv": "v\n1\n2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    for stage_name, head_path in head_paths.items():
+        lock_path = root / ".pivot" / "stages" / "d" / f"{stage_name}.lock"
+        lock_data = yaml.safe_load(lock_path.read_text())
+        lock_data["outs"][0]["path"] = head_path
+        lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
+    _commit(root, "hand-edited locks")
+    (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    _ok(_pivot(root, "repro"))
+
+    for target, answer in expected.items():
+        result = _pivot(root, "diff", "--json", target)
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = {e["path"]: (e["old_rows"], e["new_rows"]) for e in json.loads(result.stdout)}
+        assert rows == answer, (target, rows)
 
 
 _SHOUT_PIPELINE = """\

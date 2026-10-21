@@ -602,10 +602,12 @@ def _diff_outputs(
 
     Each output's HEAD entry is placed at the path its HEAD lock records, and its workspace
     side at its current path, so an output that moved is compared as removed at the old path
-    and added at the new one. A path compares as a directory when the registry tags its
-    output DIRECTORY, its HEAD entry records a manifest, or it is a directory on disk. Any other
-    path is comparable when its loader or extension is CSV, JSON or JSONL. Also returns the
-    paths each output identity owns, at HEAD and now, for stage targets.
+    and added at the new one. A moved entry is dropped when its HEAD path is a current output's
+    path that has its own HEAD entry, or an earlier moved entry's HEAD path. A path compares as a
+    directory when the registry tags its output DIRECTORY, its HEAD entry records a manifest, or
+    it is a directory on disk. Any other path is comparable when its loader or extension is CSV,
+    JSON or JSONL. Also returns the paths each output identity owns, at HEAD and now, for stage
+    targets.
     """
     outs_by_stage = dict[str, list[types.ArtifactRef]]()
     for stage_name, stage_info in stage_infos.items():
@@ -618,7 +620,7 @@ def _diff_outputs(
             outs_by_stage[stage_name] = outs
 
     lock_data_by_stage = common.read_lock_files_from_head(list(outs_by_stage))
-    moved_heads = dict[str, types.HashInfo]()
+    moved_heads = dict[str, tuple[types.HashInfo, list[str]]]()
     current = list[tuple[types.ArtifactRef, pathlib.Path, str, types.HashInfo | None]]()
     paths_by_identity = dict[types.ArtifactIdentity, list[str]]()
     for stage_name, outs in outs_by_stage.items():
@@ -632,14 +634,17 @@ def _diff_outputs(
             head = None if entry is None else lock.entry_hash_info(entry)
             head_path = rel_path if entry is None else entry.get("path", rel_path)
             if head is not None and head_path != rel_path:
-                moved_heads[head_path] = head
-                paths.append(head_path)
+                moved_heads.setdefault(head_path, (head, paths))
                 head = None
             current.append((out, output_path, rel_path, head))
 
     result = dict[str, _DiffOutput]()
     for out, output_path, rel_path, own_head in current:
-        head = own_head if own_head is not None else moved_heads.pop(rel_path, None)
+        moved = moved_heads.pop(rel_path, None)
+        head = own_head
+        if head is None and moved is not None:
+            head, moved_paths = moved
+            moved_paths.append(rel_path)
         head_is_directory = head is not None and types.is_dir_hash(head)
         workspace_is_directory = output_path.is_dir()
         is_directory = (
@@ -655,12 +660,13 @@ def _diff_outputs(
         if is_directory or _is_data_output(out, store, proj_root):
             result[rel_path] = _DiffOutput(rel_path, head, True, is_directory, changed_kind)
 
-    for head_path, head in moved_heads.items():
+    for head_path, (head, moved_paths) in moved_heads.items():
         head_is_directory = types.is_dir_hash(head)
         if (
             head_is_directory
             or detect_format(pathlib.Path(head_path)) is not DataFileFormat.UNKNOWN
         ):
+            moved_paths.append(head_path)
             result[head_path] = _DiffOutput(head_path, head, False, head_is_directory, None)
     return result, paths_by_identity
 
