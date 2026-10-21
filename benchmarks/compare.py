@@ -92,6 +92,11 @@ def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
             raise _CannotCompareError(f"{path}:{number}: not a result row ({error!r})") from None
         if exit_code != 0:
             raise _CannotCompareError(f"{path}: {scenario} rep {rep} exited with code {exit_code}")
+        for metric, _ in _METRICS:
+            if not (math.isfinite(row[metric]) and row[metric] > 0):
+                raise _CannotCompareError(
+                    f"{path}:{number}: {metric} must be a positive finite number, got {row[metric]!r}"
+                )
         by_scenario.setdefault(scenario, []).append(row)
     return by_scenario
 
@@ -207,8 +212,14 @@ def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str
             value = by_key.get(key)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - JSON object
             if value is None:
                 missing.append(f"{scenario} {key}")
-            elif isinstance(value, bool) or not isinstance(value, int | float):
-                raise _CannotCompareError(f"{path}: {scenario} {key} is not a number: {value!r}")
+            elif (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+            ):
+                raise _CannotCompareError(
+                    f"{path}: {scenario} {key} is not a finite number: {value!r}"
+                )
             else:
                 limits[scenario][key] = value
     if missing:
