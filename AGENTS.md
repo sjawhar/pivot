@@ -208,3 +208,5 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright              
 ```
 
 **Run all quality checks before returning to user or pushing.**
+
+**CI runs the test suite without uv on PATH**, so a test that starts pivot runs `pathlib.Path(sys.executable).parent / "pivot"`.
