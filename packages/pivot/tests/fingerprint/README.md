@@ -189,6 +189,8 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `eval()` / `exec()` of code reading other names | ❌        | **NO TEST** - can't analyze dynamically |
 | Lambda created by `eval()` (no source) | ✅        | `test_fingerprint_gaps.py::test_eval_lambda_is_hashed_by_its_code_object` |
 | `x.import_module(...)` call | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_import_module` (main's refusal) |
+| `functools.wraps` wrapper whose own body uses a computed `getattr`, `import_module` or `globals()` (decorator in `pipeline.py` or in a helper module) | ✅ (runs, as on main: the refusals read the wrapped function's source) | `test_fingerprint_gaps.py::test_dynamic_name_refusals_read_the_wrapped_function_source` (4 cases) |
+| Computed `getattr` in a function a wrapper reaches only through `__wrapped__` | ✅ (error, as on main) | `test_fingerprint_gaps.py::test_dynamic_name_refusal_reads_a_function_reached_only_through_wrapped` |
 | Other dynamic spelling of a user module (alias, `__import__`, partial, default, literal `getattr`) | ✅ (not reused) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_of_a_user_module_makes_result_not_reusable` |
 | Dynamic import of a library (`__import__("json")`, an `import_module` alias) | ✅ | `test_fingerprint_gaps.py::test_dynamic_import_of_a_library_runs_and_caches` |
 | A resolved helper receiving `"import_module"` | ✅ | `test_fingerprint_gaps.py::test_resolved_helper_accepts_import_module_argument_name` |
