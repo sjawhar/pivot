@@ -14,7 +14,9 @@ drives loky's private `_max_workers` to the submitted work count, so idle worker
 respawned until a stage needs one. Parents running past half the one-shot idle timeout
 periodically ping idle workers pre-started for their direct consumers. The pings stop when the
 parent resolves, so the workers then follow the normal idle timeout. Keep
-`reuse=False if kill_workers else "auto"` in the shared executor policy.
+`reuse=False if kill_workers else "auto"` in the shared executor policy. A restart stops the
+executor `WorkerPool` holds before asking loky for a new one: loky 3.7 keeps its reusable
+executor per thread, and the watch reload restarts from an anyio worker thread.
 
 Pivot supports `loky>=3.5.6,<3.8`: 3.5.6 and 3.6 keep the reusable executor in the legacy
 `_executor` singleton; 3.7 keeps it in `_executor_storage`. Reject an unknown layout with an

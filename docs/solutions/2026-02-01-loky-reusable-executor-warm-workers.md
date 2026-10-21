@@ -76,19 +76,23 @@ Pivot's normal worker output queue continues to capture stage logs.
 
 ### Killing Workers for Code Reload
 
-In watch mode, code changes require fresh workers with updated imports. `restart_workers()`
-kills the reusable executor and starts one fresh worker; subsequent workers start on demand:
+In watch mode, code changes require fresh workers with updated imports. `WorkerPool.restart()`
+first shuts down the executor the pool holds with `kill_workers=True`, then calls
+`restart_workers()` to start one fresh worker; subsequent workers start on demand:
 
 ```python
-def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
-    """Replace stale workers and leave one fresh worker ready for the next dispatch."""
-    pool = _get_executor(max_workers, idle_timeout_s=idle_timeout_s, kill_workers=True)
-    submit(pool, max_workers, _noop).result()
-    return 1
+def _replace_executor(self, idle_timeout_s: float | None) -> loky.ProcessPoolExecutor:
+    if self._executor is not None:
+        self._executor.shutdown(wait=True, kill_workers=True)
+    executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
+    return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 ```
 
-`reuse=False` makes loky replace a compatible live executor instead of returning it unchanged,
-ensuring updated imports are loaded.
+The pool shuts down the executor it holds rather than asking loky for "the" reusable executor.
+Loky 3.7 keeps one reusable executor per thread, and the reload restarts from an anyio worker
+thread that never created the pool's executor, so `get_reusable_executor(kill_workers=True)`
+there finds no executor and leaves the previous workers alive. `reuse=False` still makes loky
+replace a compatible live executor instead of returning it unchanged.
 
 ### Cleanup on Exit
 

@@ -11,8 +11,12 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
+import time
+import typing
 
+import psutil
 import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
@@ -102,6 +106,54 @@ if sys.orig_argv[1:3] == ["-m", "loky.backend.popen_loky_posix"]:
 """
 
 
+_WATCH_CAP = 4
+
+# Four independent stages, so one run starts the whole capped pool. Each stage records its
+# worker pid; the `generation` constant is what the test edits to trigger a code reload.
+_WATCH_PIPELINE = """\
+import os
+import pathlib
+
+from pivot import Pipeline, stage
+
+generation = {generation}
+
+
+@stage
+def wide() -> dict:
+    return {{"pid": os.getpid(), "generation": generation}}
+
+
+with Pipeline("watch") as pipeline:
+    for index in range({cap}):
+        with pipeline.variant(str(index)):
+            wide()
+"""
+
+
+def _live_workers(pivot: subprocess.Popen[str]) -> set[int]:
+    """Return the pids of the loky workers the pivot process currently holds."""
+    found = set[int]()
+    try:
+        children = psutil.Process(pivot.pid).children(recursive=True)
+    except psutil.NoSuchProcess:
+        return found
+    for child in children:
+        try:
+            if "loky.backend.popen_loky_posix" in " ".join(child.cmdline()):
+                found.add(child.pid)
+        except psutil.NoSuchProcess:
+            continue
+    return found
+
+
+def _wait_for(condition: typing.Callable[[], bool], what: str, timeout_s: float = 120) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.1)
+
+
 def _run(
     args: list[str],
     cwd: pathlib.Path,
@@ -158,11 +210,8 @@ def test_wheel_installed_in_fresh_venv_runs_init_repro_status_dag(tmp_path: path
     assert (project / "data" / "smoke" / "total.yaml").read_text().strip() == "sum: 100"
 
 
-@pytest.mark.parametrize("loky_version", ["3.5.6", "3.6.0", "3.7.0"])
-@pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
-def test_fresh_wheel_keeps_prestarted_fan_workers_warm(
-    tmp_path: pathlib.Path, loky_version: str
-) -> None:
+def _install_wheel_with_loky(tmp_path: pathlib.Path, loky_version: str) -> str:
+    """Build pivot's wheel, install it with ``loky_version`` into a new venv, return ``pivot``."""
     uv = shutil.which("uv")
     assert uv is not None, "CI installs uv before running tests"
     dist = tmp_path / "dist"
@@ -185,7 +234,15 @@ def test_fresh_wheel_keeps_prestarted_fan_workers_warm(
         tmp_path,
     )
     assert install.returncode == 0, install.stderr
-    pivot = str(venv / "bin" / "pivot")
+    return str(venv / "bin" / "pivot")
+
+
+@pytest.mark.parametrize("loky_version", ["3.5.6", "3.6.0", "3.7.0"])
+@pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
+def test_fresh_wheel_keeps_prestarted_fan_workers_warm(
+    tmp_path: pathlib.Path, loky_version: str
+) -> None:
+    pivot = _install_wheel_with_loky(tmp_path, loky_version)
 
     project = tmp_path / "project"
     project.mkdir()
@@ -213,3 +270,72 @@ def test_fresh_wheel_keeps_prestarted_fan_workers_warm(
     assert len(started) == 4, f"loky {loky_version} started {len(started)} workers"
     # 13 s after the fan, only the worker running `linger` is left; the others timed out idle.
     assert live_workers.read_text() == "1", f"loky {loky_version} kept idle workers alive"
+
+
+@pytest.mark.parametrize("loky_version", ["3.5.6", "3.6.0", "3.7.0"])
+@pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
+def test_fresh_wheel_watch_reload_replaces_workers_within_the_cap(
+    tmp_path: pathlib.Path, loky_version: str
+) -> None:
+    """A code edit under `repro --watch` replaces the previous run's workers: none survives
+    the reload, and the session never holds more workers than `core.max_workers`."""
+    pivot = _install_wheel_with_loky(tmp_path, loky_version)
+    project = tmp_path / "project"
+    project.mkdir()
+    pipeline_file = project / "pipeline.py"
+    pipeline_file.write_text(_WATCH_PIPELINE.format(generation=0, cap=_WATCH_CAP))
+    assert _run(["git", "init", "-q"], project).returncode == 0
+    init = _run([pivot, "init"], project)
+    assert init.returncode == 0, init.stdout + init.stderr
+    (project / ".pivot" / "config.yaml").write_text(f"core:\n  max_workers: {_WATCH_CAP}\n")
+    outputs = [project / "data" / "watch" / f"wide@{index}.yaml" for index in range(_WATCH_CAP)]
+
+    def generation_done(generation: int) -> bool:
+        return all(
+            out.exists() and f"generation: {generation}" in out.read_text() for out in outputs
+        )
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("VIRTUAL_ENV", "PYTHONPATH"))}
+    log = tmp_path / "watch.log"
+    with log.open("w") as output:
+        watch = subprocess.Popen(
+            [pivot, "repro", "--watch", "--force"],
+            cwd=project,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    peak = 0
+    try:
+        _wait_for(lambda: generation_done(0), "the first run")
+        previous = _live_workers(watch)
+        assert previous, "the first run left no warm worker to replace"
+        for generation in (1, 2):
+            pipeline_file.write_text(_WATCH_PIPELINE.format(generation=generation, cap=_WATCH_CAP))
+
+            def reloaded(generation: int = generation) -> bool:
+                nonlocal peak
+                peak = max(peak, len(_live_workers(watch)))
+                return generation_done(generation)
+
+            _wait_for(reloaded, f"reload {generation}")
+            survivors = previous & _live_workers(watch)
+            assert not survivors, (
+                f"loky {loky_version}: reload {generation} left the previous run's workers "
+                f"alive: {sorted(survivors)}\n{log.read_text()}"
+            )
+            previous = _live_workers(watch)
+    finally:
+        if watch.poll() is None:
+            watch.send_signal(signal.SIGINT)
+            try:
+                watch.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                watch.kill()
+                watch.wait()
+    assert peak <= _WATCH_CAP, (
+        f"loky {loky_version}: the watch session held {peak} workers, over the cap of "
+        f"{_WATCH_CAP}\n{log.read_text()}"
+    )

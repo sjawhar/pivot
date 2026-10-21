@@ -103,10 +103,7 @@ class WorkerPool:
             )
             fresh_workers = executor is not self._executor
         if executor is self._executor and self._has_stale_user_code():
-            executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
-            executor = executor_core.create_executor(
-                self._max_workers, idle_timeout_s=idle_timeout_s
-            )
+            executor = self._replace_executor(idle_timeout_s)
             fresh_workers = True
         if fresh_workers:
             self._restamp_user_code_files()
@@ -121,14 +118,21 @@ class WorkerPool:
     def restart(self, *, max_workers: int) -> int:
         """Replace every worker before a reload starts its next run."""
         self._max_workers = max(self._max_workers, max_workers)
-        workers = executor_core.restart_workers(
-            self._max_workers, idle_timeout_s=self._idle_timeout_s
-        )
-        self._executor = executor_core.create_executor(
-            self._max_workers, idle_timeout_s=self._idle_timeout_s
-        )
+        self._executor = self._replace_executor(self._idle_timeout_s)
         self._restamp_user_code_files()
-        return workers
+        return 1
+
+    def _replace_executor(self, idle_timeout_s: float | None) -> loky.ProcessPoolExecutor:
+        """Stop this pool's workers, then return a fresh executor holding one warm worker.
+
+        The pool stops the executor it holds rather than asking loky for "the" reusable
+        executor: loky 3.7 keeps one per thread, and a watch reload restarts from an anyio
+        worker thread that never created this pool's executor.
+        """
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, kill_workers=True)
+        executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
+        return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 
     def _new_output_queue(self) -> object:
         """Return a fresh queue from the engine-lifetime manager, replacing it if unreachable."""

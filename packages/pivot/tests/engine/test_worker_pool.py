@@ -163,6 +163,30 @@ def test_restart_workers_replaces_live_workers() -> None:
     executor_core._cleanup_worker_pool()
 
 
+def test_restart_from_another_thread_stops_the_pools_previous_workers() -> None:
+    """A watch reload restarts workers from an anyio worker thread; the pool's old workers
+    must still be stopped even when loky keeps its reusable executor per thread."""
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=2, idle_timeout_s=None)
+        old_pids = {pool.submit(_helper_pid).result(timeout=60) for _ in range(2)}
+        pool.end_run()
+
+        restarted = threading.Thread(target=lambda: pool.restart(max_workers=2))
+        restarted.start()
+        restarted.join(timeout=120)
+        assert not restarted.is_alive(), "restart did not finish"
+
+        deadline = time.monotonic() + 10
+        alive = {pid for pid in old_pids if psutil.pid_exists(pid)}
+        while alive and time.monotonic() < deadline:
+            time.sleep(0.05)
+            alive = {pid for pid in old_pids if psutil.pid_exists(pid)}
+        assert not alive, f"restart left the previous workers alive: {sorted(alive)}"
+    finally:
+        pool.hard_cancel()
+
+
 @pytest.mark.slow
 def test_warm_workers_survive_lokys_default_idle_timeout() -> None:
     """Long-lived workers stay warm after a pause longer than loky's default timeout."""
