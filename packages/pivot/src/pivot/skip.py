@@ -75,10 +75,17 @@ def check_stage(
     When explain=False (engine/repro), short-circuits at first detected change.
     When explain=True (status/explain), evaluates all comparisons exhaustively.
 
+    A lock written by a run that imported user modules its fingerprint does not cover (an
+    `uncovered-import:` key) is never satisfied from the run cache: an entry at the stage's input
+    hash was filed by a run the check did not see, so the stage must run.
+
     Callers are responsible for:
     - Tier 1 (generation check via can_skip_via_generation) before calling this
-    - Tier 3 (run cache) after this returns changed=True
+    - Tier 3 (run cache) after this returns changed=True, when run_cache_allowed
     """
+    if lock_data is not None and uncovered_import_reason(lock_data["code_manifest"]) is not None:
+        run_cache_allowed = False
+
     if force and not explain:
         return ChangeDecision(changed=True, reason="forced", run_cache_allowed=run_cache_allowed)
 

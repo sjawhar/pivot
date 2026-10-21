@@ -487,12 +487,9 @@ def test_covered_module_first_import_excuses_only_its_own_imports(
     assert tracked.imported == {"cov_lib", "cov_other"}
 
 
-def test_hooked_import_on_another_thread_during_a_covered_import_is_still_counted(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A second thread's hooked import made while the first thread is inside a covered import
-    is recorded as the stage's own: the excusal of hooked names is per thread. Its new
-    `sys.modules` key falls inside the window's delta, which cannot tell threads apart."""
+def _blocking_covered_lib(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Write `cov_lib`, whose top level imports `cov_dep` and then waits until `cov_sync.done`
+    is set, so another thread can act while the covered import is open."""
     sync = type(sys)("cov_sync")
     sync.started = threading.Event()
     sync.done = threading.Event()
@@ -511,23 +508,72 @@ def test_hooked_import_on_another_thread_during_a_covered_import_is_still_counte
     monkeypatch.syspath_prepend(str(tmp_path))
     for name in ("cov_lib", "cov_dep", "cov_other"):
         monkeypatch.delitem(sys.modules, name, raising=False)
+    return sync
 
+
+def _import_on_another_thread_during_cov_lib(sync: object) -> worker._StageImports:
     def other_thread() -> None:
-        assert sync.started.wait(10)
+        assert sync.started.wait(10)  # pyright: ignore[reportAttributeAccessIssue]
         importlib.import_module("cov_other")
-        sync.done.set()
+        sync.done.set()  # pyright: ignore[reportAttributeAccessIssue]
 
     with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
         thread = threading.Thread(target=other_thread)
         thread.start()
         importlib.import_module("cov_lib")
         thread.join(10)
-
     assert not thread.is_alive()
-    assert "cov_other" in tracked.imported, "a hooked import on another thread is counted"
+    return tracked
+
+
+def test_newly_resident_module_another_thread_imports_during_a_covered_import_is_excused(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While a covered import is open, a module that becomes resident on any thread is that
+    import's own: another thread's hooked import of a new `cov_other` is excused."""
+    sync = _blocking_covered_lib(tmp_path, monkeypatch)
+
+    tracked = _import_on_another_thread_during_cov_lib(sync)
+
+    assert {"cov_dep", "cov_other"} <= tracked.excused
+    assert tracked.imported == {"cov_lib"}
+
+
+def test_already_resident_module_another_thread_imports_during_a_covered_import_is_counted(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window does not excuse another thread's hooked import of a user module that was
+    resident before it opened: that is the import the hook exists to see."""
+    sync = _blocking_covered_lib(tmp_path, monkeypatch)
+    importlib.import_module("cov_other")
+
+    tracked = _import_on_another_thread_during_cov_lib(sync)
+
+    assert "cov_other" in tracked.imported
+    assert "cov_other" not in tracked.excused
     assert "cov_dep" in tracked.excused
-    assert "cov_dep" not in tracked.imported
-    assert "cov_other" in tracked.excused, "the window's delta includes the other thread's key"
+
+
+def test_covered_import_of_an_already_resident_dependency_is_excused_on_its_own_thread(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A warm worker already holds `cov_dep`; the covered `cov_lib` importing it on its own
+    thread is part of that import, as in a cold worker, so it is not counted."""
+    for name, text in {
+        "cov_lib.py": "import cov_dep\n\nVALUE = 1\n",
+        "cov_dep.py": "VALUE = 2\n",
+    }.items():
+        (tmp_path / name).write_text(text)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in ("cov_lib", "cov_dep"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    importlib.import_module("cov_dep")
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        importlib.import_module("cov_lib")
+
+    assert "cov_dep" in tracked.excused
+    assert tracked.imported == {"cov_lib"}
 
 
 def test_import_hooks_keep_cpythons_signature_and_are_not_installed_on_import() -> None:

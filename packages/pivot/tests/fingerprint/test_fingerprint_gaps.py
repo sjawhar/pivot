@@ -1148,6 +1148,112 @@ def test_thread_import_after_the_covered_import_returned_still_warns(
     assert "helpers.util" not in message, message
 
 
+_THREADED_COVERED_IMPORTS = {
+    "thread-dunder-import": (
+        "import threading\n\n"
+        "_t = threading.Thread(target=lambda: __import__('plugin'))\n"
+        "_t.start()\n_t.join()\n\n"
+        "VALUE = 1\n"
+    ),
+    "pool-import-module": (
+        "import concurrent.futures\nimport importlib\n\n"
+        "with concurrent.futures.ThreadPoolExecutor(2) as _pool:\n"
+        "    _plugins = list(_pool.map(importlib.import_module, ['plugin']))\n\n"
+        "VALUE = 1\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_THREADED_COVERED_IMPORTS))
+def test_body_import_of_module_whose_import_thread_imports_a_user_module_is_reused(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """A loaded `helpers.lib` whose top level starts a thread that imports `plugin` through
+    `__import__` or `importlib.import_module` and joins it: `plugin` becomes resident while the
+    covered import is open, so it is excused whatever thread loaded it, as a module-level import
+    would leave it. The stage warns nothing, caches, and reruns on an edit to `helpers/lib.py`."""
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/lib.py": _THREADED_COVERED_IMPORTS[shape],
+            "plugin.py": "FACTOR = 1\n",
+            "pipeline.py": _transitive_pipeline("import helpers.lib\n", "helpers.lib.VALUE"),
+        },
+    )
+
+    first = _run(project, "repro")
+    again = _run(project, "repro", "--json")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    _edit(project, *_EDIT_LIB_VALUE)
+    edited = _run(project, "repro")
+    assert edited.returncode == 0, edited.stdout + edited.stderr
+    assert _count(project) == 103
+
+
+_WARM_DEPENDENCY_PIPELINE = """\
+import helpers.lib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def scaled(text: str) -> str:
+    import helpers.util
+
+    return text * helpers.util.SCALE
+
+
+@stage
+def count(text: str) -> dict:
+    import helpers.lib
+
+    return {"v": helpers.lib.VALUE + len(text.splitlines())}
+
+
+with Pipeline("t") as pipeline:
+    count(scaled(pipeline.input("lines.txt", t=str)))
+"""
+
+
+def test_covered_import_of_a_dependency_an_earlier_stage_loaded_is_reused_warm_or_cold(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`scaled` imports `helpers.util`; `count` then body-imports `helpers.lib`, whose top level
+    imports `helpers.util`, in the same worker. That import belongs to the covered `helpers.lib`
+    whether `helpers.util` is already resident (warm worker, first run) or not (a fresh worker
+    when only `count` reruns): `count` warns nothing and caches either way."""
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/util.py": "SCALE = 1\n",
+            "helpers/lib.py": "from helpers.util import SCALE\n\nVALUE = 1\n",
+            "pipeline.py": _WARM_DEPENDENCY_PIPELINE,
+        },
+    )
+    configured = _run(project, "config", "set", "core.max_workers", "1")
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+
+    warm = _run(project, "repro")
+    warm_again = _run(project, "repro", "--json")
+    _edit(project, *_EDIT_LIB_VALUE)
+    cold = _run(project, "repro", "--json")
+    cold_again = _run(project, "repro", "--json")
+
+    for result in (warm, warm_again, cold, cold_again):
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "does not cover" not in " ".join((result.stdout + result.stderr).split())
+    assert '"stage": "t/count", "status": "cached"' in warm_again.stdout, warm_again.stdout
+    assert '"stage": "t/scaled", "status": "cached"' in cold.stdout, cold.stdout
+    assert '"stage": "t/count", "status": "ran"' in cold.stdout, cold.stdout
+    assert '"stage": "t/count", "status": "cached"' in cold_again.stdout, cold_again.stdout
+    assert _count(project) == 103
+
+
 _RAISING_FINDER = (
     "import sys\n\n\n"
     "class _Raising:\n"

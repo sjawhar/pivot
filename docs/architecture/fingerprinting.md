@@ -138,24 +138,35 @@ before and after the stage, counting a newly resident module only when it has a 
 `fingerprint.covered_user_modules`: `module:<name>` keys, and the `dep:<parameter>:module:<name>`
 and `out:<output>:module:<name>` keys a user loader's walk adds.
 
-When a stage's own import first loads a covered module, everything that becomes resident during
-that one import is that module's module-level imports, which a module-level import of it would have
-made before the stage ran, so none of it is counted (`_StageImports.excused`). That is every
-`sys.modules` key added between the outermost covered import's entry and its return on that
-thread, however it was registered (`__import__`, `importlib.util` and `exec_module`,
-`EntryPoint.load()`, `importlib.__import__`). Hooked imports another thread makes during that
-window are still counted, and so are the stage's own later imports. A covered module is never
-imported ahead of the stage: discovery pickles `pipeline.py` and other modules under the project
-root by value, and importing one of them in the worker would run it again there.
+When a stage's own import first loads a covered module, the imports that module makes are its
+module-level imports, which a module-level import of it would have made before the stage ran, so
+they are not counted (`_StageImports.excused`). The window is open from the outermost covered
+import's entry to its return, and while any thread is inside one:
+
+- on the thread running a covered import, every import nested inside it is excused, already
+  resident or not, so a warm worker and a cold one give the same answer;
+- on any other thread while the window is open, a module that becomes newly resident is excused,
+  however it was registered (`__import__`, `importlib.import_module`, `importlib.util` and
+  `exec_module`, `EntryPoint.load()`, `importlib.__import__`), and a hooked import of a module that
+  was resident before the window opened is counted;
+- outside every window, nothing is excused, and the stage's own later imports are counted.
+
+A covered module is never imported ahead of the stage: discovery pickles `pipeline.py` and other
+modules under the project root by value, and importing one of them in the worker would run it
+again there.
 
 A recorded module outside the covered set makes the result not reusable: the stage succeeds and
 logs one warning naming the modules; its lock carries an `uncovered-import:<modules>` key no
 fingerprint matches, so the next `repro` reruns it and `status --explain` and
 `repro --dry-run --explain` report "Previous run imported modules its fingerprint does not cover";
-and no run-cache entry is filed. `pivot commit` carries that key into the lock it writes when the
-static fingerprint is otherwise unchanged, and files no run-cache entry for it
-(`skip.carry_uncovered_import`). Under `--no-commit` the warning adds that `pivot commit` will
-record the outputs as current. A user class reached only through a loaded input (an object in a
+and no run-cache entry is filed. A marked lock is never satisfied from the run cache
+(`skip.check_stage` returns `run_cache_allowed=False` for it), and the flagged run deletes any
+run-cache entry at its own input hash, so an entry an earlier run filed (0.5.2, or `pivot commit`)
+cannot restore an output the check never saw. `pivot commit` carries that key into the lock it
+writes when the static fingerprint is otherwise unchanged, files no run-cache entry for it, and
+deletes any entry at its input hash (`skip.carry_uncovered_import`). Under `--no-commit` the
+warning adds that `pivot commit` will record the outputs as current. A user class reached only
+through a loaded input (an object in a
 `loaders.Pickle()` input whose class the stage never names) counts as a module the stage imported,
 because unpickling imports its module while the stage runs; naming the class in the parameter's
 annotation (`Annotated[Box, loaders.Pickle()]`) covers it.
@@ -176,8 +187,8 @@ The check does not see these paths, which behave as they would without it:
 | Private import machinery; a loader that replaces a key already in `sys.modules` or never registers one, such as `runpy.run_path("helpers/lib.py")` and `runpy.run_module("toplib")` for a top-level module | Import statically, or move the value into `StageParams` |
 | An import in a child process | Declare the code the child runs as an input, or use `@no_fingerprint(code_deps=[...])` |
 | An import from a thread that outlives its stage | Join the thread before the stage returns; its import is charged to whichever stage is running, or to none |
-| Another thread of the stage registers a user module without `__import__` or `import_module` (for example with `exec_module`) while the stage's own thread is inside a covered module's first import | Its key is excused with that import's other new keys, because a `sys.modules` delta cannot say which thread added a key. Import user modules statically, or before starting threads |
-| A user module that a covered module loads at import time through `importlib.util` and `exec_module`, or `EntryPoint.load()` | It is excused but not fingerprinted, as on main: an edit to it is seen only when the covered module changes. Import it statically |
+| Another thread of the stage newly loads a user module, by any route, while any thread is inside a covered module's first import | It is excused with that import's own, so an edit to it is seen only through values the stage reads from the covered module, or when the covered module changes. A hooked import of a module already resident before the window opened is still counted. Import user modules statically, or before starting threads |
+| A user module that a covered module loads at import time through `importlib.util` and `exec_module`, `EntryPoint.load()` or `importlib.__import__` | It is excused, as on main, and not fingerprinted itself: an edit to it is seen only through values the stage reads from the covered module, or when the covered module changes. Import it statically |
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
 | `pivot repro --no-commit`, then `pivot commit` | No lock exists to carry the mark, so `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |

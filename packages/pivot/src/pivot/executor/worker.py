@@ -87,20 +87,26 @@ class _StageImports:
     covered: frozenset[str]
     # User modules the stage requested through `__import__` or `importlib.import_module`.
     imported: set[str] = dataclasses.field(default_factory=set[str])
-    # Modules that became resident while this stage's thread ran a covered module's own first
-    # import: that module's module-level imports, which a module-level import of it would have
-    # made before the stage ran. Every `sys.modules` key added between the outermost covered
-    # import's entry and its return counts, however it was registered (`exec_module`,
-    # `EntryPoint.load()`, `importlib.__import__`); a key another thread adds in that window is
-    # counted too, since a delta cannot tell threads apart.
+    # The modules a covered module's first import accounts for, as a module-level import of it
+    # would have before the stage ran:
+    # - on the thread running that import, every module imported inside it, already resident or
+    #   not, so a warm worker and a cold one give the same answer;
+    # - on any other thread while that import is open, a module that became resident during it,
+    #   however it was registered (`__import__`, `exec_module`, `EntryPoint.load()`,
+    #   `importlib.__import__`); a hooked import there of a module resident before the window
+    #   opened is still counted.
+    # Outside every window nothing is excused.
     excused: set[str] = dataclasses.field(default_factory=set[str])
+    # How many threads are inside a covered module's first import, and the `sys.modules` keys at
+    # the moment the first of them entered. Guarded by `_stage_imports_lock`.
+    window_depth: int = 0
+    window_resident_before: frozenset[str] = frozenset()
 
 
 class _CoveredImportState(threading.local):
-    """This thread's covered-module import: its nesting depth, and `sys.modules` keys at entry."""
+    """How deep this thread is inside a covered module's first import."""
 
     depth: int = 0
-    resident_before: frozenset[str] = frozenset()
 
 
 _stage_imports: _StageImports | None = None
@@ -131,9 +137,10 @@ def _package_chain(name: str) -> list[str]:
 def _record_stage_import(names: Sequence[str]) -> None:
     """Record each of `names` that is resident user source, for the running stage.
 
-    Inside a covered module's first import on this thread, a module that was not resident when
-    that import began is excused, and one that was is that module's own import of code already
-    loaded: neither is counted.
+    On the thread running a covered import, every import nested inside it is excused. On any
+    other thread while a covered import is open, a module that became resident after that window
+    opened is excused, and one already resident is counted. Outside every window, everything is
+    counted.
     """
     tracked = _stage_imports
     if tracked is None:
@@ -141,15 +148,17 @@ def _record_stage_import(names: Sequence[str]) -> None:
     found = [name for name in names if _is_user_source_module(sys.modules.get(name))]
     if not found:
         return
-    state = _covered_import_state
-    if state.depth:
-        found = [module_name for module_name in found if module_name not in state.resident_before]
-        target = tracked.excused
-    else:
-        target = tracked.imported
+    nested = _covered_import_state.depth > 0
     with _stage_imports_lock:
-        if _stage_imports is tracked:
-            target.update(found)
+        if _stage_imports is not tracked:
+            return
+        for module_name in found:
+            if nested or (
+                tracked.window_depth and module_name not in tracked.window_resident_before
+            ):
+                tracked.excused.add(module_name)
+            else:
+                tracked.imported.add(module_name)
 
 
 def _imports_only_covered(tracked: _StageImports, name: str, fromlist: Sequence[str]) -> bool:
@@ -176,25 +185,31 @@ def _imports_only_covered(tracked: _StageImports, name: str, fromlist: Sequence[
 def _covered_import(
     tracked: _StageImports, name: str | None, fromlist: Sequence[str]
 ) -> Generator[None]:
-    """Treat what becomes resident while this thread first-imports a covered module as that
-    module's own module-level imports (`_StageImports.excused`)."""
+    """Open the stage's covered-import window while this thread first-imports a covered module.
+
+    The window stays open while any thread is inside such an import. When the last one returns,
+    every `sys.modules` key added since the window opened is excused (`_StageImports.excused`).
+    """
     state = _covered_import_state
     if state.depth == 0 and (name is None or not _imports_only_covered(tracked, name, fromlist)):
         yield
         return
     if state.depth == 0:
-        state.resident_before = frozenset(sys.modules)
+        with _stage_imports_lock:
+            if tracked.window_depth == 0:
+                tracked.window_resident_before = frozenset(sys.modules)
+            tracked.window_depth += 1
     state.depth += 1
     try:
         yield
     finally:
         state.depth -= 1
         if state.depth == 0:
-            added = set(sys.modules) - state.resident_before
-            state.resident_before = frozenset()
             with _stage_imports_lock:
-                if _stage_imports is tracked:
-                    tracked.excused.update(added)
+                tracked.window_depth -= 1
+                if tracked.window_depth == 0 and _stage_imports is tracked:
+                    tracked.excused.update(set(sys.modules) - tracked.window_resident_before)
+                    tracked.window_resident_before = frozenset()
 
 
 def _tracked_import(
@@ -1961,7 +1976,9 @@ def _build_deferred_writes(
     """Build deferred writes for coordinator to apply.
 
     A result that is not ``reusable`` (its run imported user modules its fingerprint does not
-    cover) files no run-cache entry; its lock carries a key no fingerprint has, so no tier skips it.
+    cover) files no run-cache entry and deletes any entry at its input hash; its lock carries a
+    key no fingerprint has and `skip.check_stage` never consults the run cache for it, so no tier
+    skips it.
     """
     result: DeferredWrites = {}
 
@@ -1990,13 +2007,16 @@ def _build_deferred_writes(
         if path in cached_paths
     ]
     # An unsafe fingerprint may match a run whose captured values differed; a non-reusable
-    # result imported code its fingerprint does not cover. Never file either.
+    # result imported code its fingerprint does not cover. Never file either. A non-reusable run
+    # also removes any entry an earlier run filed at its key, which the check never saw.
     if output_entries and reusable and not stage_info["unsafe_fingerprint"]:
         result["run_cache_input_hash"] = input_hash
         result["run_cache_entry"] = run_history.RunCacheEntry(
             run_id=stage_info["run_id"],
             output_hashes=output_entries,
         )
+    if not reusable:
+        result["run_cache_delete_input_hash"] = input_hash
 
     if file_hash_entries:
         result["file_hash_entries"] = file_hash_entries

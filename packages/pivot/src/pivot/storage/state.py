@@ -1023,6 +1023,11 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_input_hash']}".encode()
                     )
                     txn.put(key, run_history.serialize_to_bytes(deferred["run_cache_entry"]))
+                if "run_cache_delete_input_hash" in deferred:
+                    txn.delete(
+                        _RUNCACHE_PREFIX
+                        + f"{stage_name}:{deferred['run_cache_delete_input_hash']}".encode()
+                    )
 
                 # File hash entries
                 if "file_hash_entries" in deferred:
