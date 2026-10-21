@@ -49,6 +49,8 @@ def _read_json(path: pathlib.Path) -> object:
         return json.loads(path.read_text())
     except FileNotFoundError:
         raise _CannotCompareError(f"{path}: no such file") from None
+    except json.JSONDecodeError as error:
+        raise _CannotCompareError(f"{path}: not valid JSON ({error})") from None
 
 
 def _load(path: pathlib.Path) -> dict[str, list[dict[str, object]]]:
@@ -57,13 +59,17 @@ def _load(path: pathlib.Path) -> dict[str, list[dict[str, object]]]:
     except FileNotFoundError:
         raise _CannotCompareError(f"{path}: no such file") from None
     by_scenario = dict[str, list[dict[str, object]]]()
-    for line in lines:
-        row = json.loads(line)
-        if row["exit_code"] != 0:
+    for number, line in enumerate(lines, start=1):
+        try:
+            row = json.loads(line)
+            scenario, exit_code = row["scenario"], row["exit_code"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise _CannotCompareError(f"{path}:{number}: not a result row ({error!r})") from None
+        if exit_code != 0:
             raise _CannotCompareError(
-                f"{path}: {row['scenario']} rep {row['rep']} exited with code {row['exit_code']}"
+                f"{path}: {scenario} rep {row['rep']} exited with code {exit_code}"
             )
-        by_scenario.setdefault(row["scenario"], []).append(row)
+        by_scenario.setdefault(scenario, []).append(row)
     return by_scenario
 
 
@@ -119,12 +125,18 @@ def _derive_threshold(samples: list[_Changes]) -> dict[str, dict[str, int]]:
 
 
 def _read_calibration(path: pathlib.Path) -> list[_Changes]:
-    calibration: dict[str, list[dict[str, object]]] = _read_json(path)  # pyright: ignore[reportAssignmentType] - JSON file written by --write-calibration
-    return [sample["changes"] for sample in calibration["samples"]]  # pyright: ignore[reportReturnType] - see above
+    calibration = _read_json(path)
+    try:
+        samples: list[_Changes] = [sample["changes"] for sample in calibration["samples"]]  # pyright: ignore[reportIndexIssue, reportUnknownVariableType] - shape checked by the except below
+    except (KeyError, TypeError) as error:
+        raise _CannotCompareError(f"{path}: not a calibration file ({error!r})") from None
+    return samples
 
 
 def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str, float]]:
-    limits: dict[str, dict[str, float]] = _read_json(path)  # pyright: ignore[reportAssignmentType] - JSON threshold file
+    limits = _read_json(path)
+    if not isinstance(limits, dict) or not all(isinstance(v, dict) for v in limits.values()):  # pyright: ignore[reportUnknownVariableType] - checked here
+        raise _CannotCompareError(f"{path}: not a threshold file")
     missing = [
         f"{scenario} {key}"
         for scenario in scenarios
@@ -133,7 +145,7 @@ def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str
     ]
     if missing:
         raise _CannotCompareError(f"no threshold for {', '.join(missing)}")
-    return limits
+    return limits  # pyright: ignore[reportUnknownVariableType] - checked above
 
 
 def _calibration_samples(

@@ -250,6 +250,56 @@ def test_missing_file_cannot_be_compared(
     assert f"{tmp_path / missing}: no such file" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("threshold_text", "head_tail"),
+    [
+        pytest.param("", "", id="empty-threshold-file"),
+        pytest.param('{"chain-10/pipeline/cold": 5}', "", id="threshold-not-a-mapping"),
+        pytest.param(
+            '{"chain-10/pipeline/cold": {"wall_pct": 10, "cpu_pct": 10}}',
+            '{"scenario": "chain-10',
+            id="truncated-result-line",
+        ),
+    ],
+)
+def test_malformed_input_cannot_be_compared(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    threshold_text: str,
+    head_tail: str,
+) -> None:
+    rows = "".join(json.dumps(row) + "\n" for row in _helper_rows([1.0] * 6, [2.0] * 6))
+    (tmp_path / "base.jsonl").write_text(rows)
+    (tmp_path / "head.jsonl").write_text(rows + head_tail)
+    (tmp_path / "threshold.json").write_text(threshold_text)
+    argv = [str(tmp_path / "base.jsonl"), str(tmp_path / "head.jsonl")]
+
+    assert compare.main([*argv, "--threshold-file", str(tmp_path / "threshold.json")]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
+
+
+@pytest.mark.parametrize(
+    "calibration_text",
+    [
+        pytest.param("{}", id="no-samples"),
+        pytest.param('{"samples": [{"sample": 1}]}', id="sample-without-changes"),
+        pytest.param("not json", id="not-json"),
+    ],
+)
+def test_malformed_calibration_cannot_be_derived(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], calibration_text: str
+) -> None:
+    (tmp_path / "calibration.json").write_text(calibration_text)
+
+    assert (
+        compare.main(["--derive-threshold", "--calibration", str(tmp_path / "calibration.json")])
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
+
+
 def test_calibration_file_records_each_sample_and_rebuilds_the_same_thresholds(
     tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
