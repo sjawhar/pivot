@@ -750,22 +750,29 @@ with pipeline:
     noop()
 """)
     probe = pathlib.Path(__file__).with_name("inproc_thread_serve.py")
-    result = subprocess.run(
-        [sys.executable, str(probe), str(project), entry],
-        capture_output=True,
-        text=True,
-        timeout=90,
-        env={**os.environ, "PIVOT_CACHE_DIR": str(tmp_path / "cache")},
-    )
-    assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    report = json.loads(lines[-1])
-    assert report["answer"] and '"result"' in report["answer"], (
-        f"serve on a worker thread did not answer status: {report}\n{result.stderr[-2000:]}"
-    )
-    assert lines[0].removeprefix("before: ") == lines[1].removeprefix("serving: "), (
-        f"serve on a worker thread changed the process's signal handlers: {lines[:2]}"
-    )
+    # Short, because multiprocessing binds its manager's socket under TMPDIR. The probe exits
+    # while serve still runs, so the manager's directory stays there until this removes it.
+    private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
+    env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    try:
+        result = subprocess.run(
+            [sys.executable, str(probe), str(project), entry],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.splitlines()
+        report = json.loads(lines[-1])
+        assert report["answer"] and '"result"' in report["answer"], (
+            f"serve on a worker thread did not answer status: {report}\n{result.stderr[-2000:]}"
+        )
+        assert lines[0].removeprefix("before: ") == lines[1].removeprefix("serving: "), (
+            f"serve on a worker thread changed the process's signal handlers: {lines[:2]}"
+        )
+    finally:
+        shutil.rmtree(private_tmp)
 
 
 def test_group_sigterm_during_a_stage_is_not_logged_as_a_failure(tmp_path: pathlib.Path) -> None:
