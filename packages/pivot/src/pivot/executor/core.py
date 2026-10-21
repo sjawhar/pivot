@@ -100,9 +100,11 @@ def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.Proce
 
 def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
     """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
-    (``worker.unwind_when_stopped``), and import user code through discovery's checked loader
+    (``worker.unwind_when_stopped``), record the user modules each stage imports
+    (``worker.install_import_hooks``), and import user code through discovery's checked loader
     when a discovery's import session for ``user_code_root`` lasts."""
     worker.unwind_when_stopped(parent_pid)
+    worker.install_import_hooks()
     if user_code_root is not None:
         discovery.install_user_code_loader(user_code_root)
 

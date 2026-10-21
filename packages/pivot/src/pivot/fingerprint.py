@@ -1,6 +1,5 @@
 import ast
 import atexit
-import builtins
 import contextlib
 import contextvars
 import dataclasses
@@ -650,7 +649,6 @@ class _ValueKind(enum.Enum):
     """How the walk treats a value read through a global, a cell, a default or `module.NAME`."""
 
     PARTIAL = "partial"
-    DYNAMIC_IMPORT = "dynamic_import"
     REFUSED = "refused"
     USER = "user"
     EXTERNAL = "external"
@@ -677,15 +675,8 @@ def _immutable_value_text(value: Any) -> str | None:
     return None
 
 
-def _is_dynamic_import(value: Any) -> bool:
-    """Whether `value` imports a module by a runtime-selected name."""
-    return value is importlib.import_module or value is builtins.__import__
-
-
 def _value_kind(value: Any) -> _ValueKind:
     """Classify a value a walked function reads; the walk and a cache hit share this."""
-    if _is_dynamic_import(value):
-        return _ValueKind.DYNAMIC_IMPORT
     # functools.partial and partialmethod fail is_user_code() (module is functools/stdlib).
     if isinstance(value, (functools.partial, functools.partialmethod)):
         return _ValueKind.PARTIAL
@@ -1166,123 +1157,35 @@ def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
         return None
 
 
-def _dynamic_import_error(func: Callable[..., Any]) -> exceptions.StageDefinitionError:
-    qualname = getattr(func, "__qualname__", "?")
-    return exceptions.StageDefinitionError(
-        f"'{qualname}' uses dynamic imports. Use static imports instead."
-    )
-
-
-def _static_value(node: ast.expr, globals_dict: dict[str, Any]) -> Any:
-    """Resolve a name or safe module/class attribute without executing user code."""
-    if isinstance(node, ast.Name):
-        return globals_dict.get(node.id, _UNREAD)
-    if not isinstance(node, ast.Attribute):
-        return _UNREAD
-    owner = _static_value(node.value, globals_dict)
-    if not isinstance(owner, (types.ModuleType, type)):
-        return _UNREAD
-    raw = vars(owner).get(node.attr, _UNREAD)
-    if isinstance(raw, (classmethod, staticmethod)):
-        return cast("Any", raw.__func__)
-    return raw
-
-
-def _getattr_aliases(tree: ast.Module, globals_dict: dict[str, Any]) -> set[str]:
-    """Return names assigned directly from the builtin ``getattr`` in reached source."""
-    aliases = set[str]()
-    if globals_dict.get("getattr", builtins.getattr) is builtins.getattr:
-        aliases.add("getattr")
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            value: ast.expr | None
-            targets: list[ast.expr]
-            if isinstance(node, ast.Assign):
-                value, targets = node.value, node.targets
-            elif isinstance(node, ast.AnnAssign):
-                value, targets = node.value, [node.target]
-            else:
-                continue
-            if not isinstance(value, ast.Name) or value.id not in aliases:
-                continue
-            for target in targets:
-                if isinstance(target, ast.Name) and target.id not in aliases:
-                    aliases.add(target.id)
-                    changed = True
-    return aliases
-
-
 def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
-    """Refuse statically visible aliases of ``import_module`` and ``__import__``."""
-    func_globals: dict[str, Any] = getattr(func, "__globals__", {})
-    getattr_aliases = _getattr_aliases(tree, func_globals)
-    local_functions = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    """Refuse `getattr` with a computed name, `globals()`/`locals()`, and `x.import_module(...)`.
+
+    Other dynamic imports are left to the worker's stage-import check, which makes a stage that
+    loads uncovered user code at run time not reusable.
+    """
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.ImportFrom)
-            and node.module in ("importlib", "builtins")
-            and any(alias.name in ("import_module", "__import__") for alias in node.names)
-        ):
-            raise _dynamic_import_error(func)
-        if (
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Load)
-            and (node.id == "__import__" or _is_dynamic_import(func_globals.get(node.id)))
-        ):
-            raise _dynamic_import_error(func)
-        if isinstance(node, ast.Attribute) and node.attr in ("import_module", "__import__"):
-            receiver = _static_value(node.value, func_globals)
-            if receiver in (importlib, builtins) or _is_dynamic_import(
-                _static_value(node, func_globals)
-            ):
-                raise _dynamic_import_error(func)
-            if receiver is _UNREAD:
-                raise _dynamic_import_error(func)
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        if not isinstance(node, ast.Call):
             continue
-        name = node.func.id
-        is_getattr = name in getattr_aliases or func_globals.get(name) is builtins.getattr
-        if not is_getattr:
-            if name in ("globals", "locals"):
-                qualname = getattr(func, "__qualname__", "?")
-                raise exceptions.StageDefinitionError(
-                    f"'{qualname}' uses {name}() which bypasses fingerprint tracking."
+        if isinstance(node.func, ast.Name):
+            if node.func.id == "getattr" and len(node.args) >= 2:
+                if not isinstance(node.args[1], ast.Constant):
+                    message = (
+                        f"'{getattr(func, '__qualname__', '?')}' uses getattr() "
+                        + "with non-literal attribute. Use direct attribute access."
+                    )
+                    raise exceptions.StageDefinitionError(message)
+            elif node.func.id in ("globals", "locals"):
+                message = (
+                    f"'{getattr(func, '__qualname__', '?')}' uses {node.func.id}() "
+                    + "which bypasses fingerprint tracking."
                 )
-            if _static_value(node.func, func_globals) is not _UNREAD or name in local_functions:
-                continue
-            if (
-                len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value in ("import_module", "__import__")
-            ):
-                raise _dynamic_import_error(func)
-            continue
-        if len(node.args) < 2:
-            continue
-        attribute = node.args[1]
-        if not isinstance(attribute, ast.Constant):
-            qualname = getattr(func, "__qualname__", "?")
-            raise exceptions.StageDefinitionError(
-                f"'{qualname}' uses getattr() with non-literal attribute. Use direct attribute access."
+                raise exceptions.StageDefinitionError(message)
+        elif isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+            message = (
+                f"'{getattr(func, '__qualname__', '?')}' uses dynamic imports. "
+                + "Use static imports instead."
             )
-        if attribute.value in ("import_module", "__import__"):
-            receiver = _static_value(node.args[0], func_globals)
-            resolved = _static_value(
-                ast.Attribute(value=node.args[0], attr=attribute.value, ctx=ast.Load()),
-                func_globals,
-            )
-            if (
-                receiver is _UNREAD
-                or receiver in (importlib, builtins)
-                or _is_dynamic_import(resolved)
-            ):
-                raise _dynamic_import_error(func)
+            raise exceptions.StageDefinitionError(message)
 
 
 def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> dict[str, str]:
@@ -1503,7 +1406,7 @@ def _user_member_value(value: Any) -> Any:
         return _UNREAD
     if isinstance(value, type):
         return value if is_user_code(value) else _UNREAD
-    if _is_dynamic_import(value) or _is_callable_instance(value) or _carries_instance(value):
+    if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
         unwrapped = inspect.unwrap(value)
@@ -1583,7 +1486,12 @@ def _body_import_module(name: str) -> types.ModuleType | None:
 
 
 def _module_spec_without_import(name: str) -> importlib.machinery.ModuleSpec | None:
-    """Resolve `name` through filesystem finders without running package initializers."""
+    """Resolve `name` through finders without running package initializers.
+
+    A top-level name the filesystem finder does not locate is asked of every `sys.meta_path`
+    finder (`importlib.util.find_spec`), which for a top-level name imports nothing: an editable
+    install's finder (setuptools' PEP 660) locates its package this way.
+    """
     path: Sequence[str] | None = None
     spec: importlib.machinery.ModuleSpec | None = None
     parts = name.split(".")
@@ -1596,6 +1504,11 @@ def _module_spec_without_import(name: str) -> importlib.machinery.ModuleSpec | N
                 return None
         else:
             spec = importlib.machinery.PathFinder.find_spec(part, path)
+            if spec is None and index == 0:
+                try:
+                    spec = importlib.util.find_spec(part)
+                except (ImportError, ValueError):
+                    spec = None
             if spec is None:
                 return None
         path = spec.submodule_search_locations
@@ -2149,8 +2062,6 @@ def _process_captured_value(
     `parameter` names the parameter when the value is a default argument.
     """
     match _value_kind(value):
-        case _ValueKind.DYNAMIC_IMPORT:
-            raise _dynamic_import_error(func)
         case _ValueKind.PARTIAL:
             _process_partial_dependency(binding_ref, value, manifest, visited)
         case _ValueKind.USER:
@@ -2415,11 +2326,6 @@ def _process_partial_dependency(
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
-    if _is_dynamic_import(underlying):
-        stage_name = _current_stage_name.get() or "<unknown>"
-        raise exceptions.StageDefinitionError(
-            f"Stage '{stage_name}': '{binding_ref}' uses dynamic imports. Use static imports instead."
-        )
     if _value_kind(underlying) is _ValueKind.REFUSED:
         with _walking("pf"):
             _check_non_scalar_capture(
@@ -2484,11 +2390,6 @@ def _process_bound_values(
     `default_rng(SEED).normal`), is refused, as it is when a stage reads one: what it reads
     from its instance is not walked, and its repr does not record that state.
     """
-    if _is_dynamic_import(value):
-        stage_name = _current_stage_name.get() or "<unknown>"
-        raise exceptions.StageDefinitionError(
-            f"Stage '{stage_name}': '{binding_ref}' uses dynamic imports. Use static imports instead."
-        )
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
         _process_bound_member(

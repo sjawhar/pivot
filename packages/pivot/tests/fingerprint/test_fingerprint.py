@@ -1173,38 +1173,6 @@ def test_check_dynamic_name_access_rejects_import_module():
         _helper_check_dynamic(_helper_uses_import_module)
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        pytest.param(
-            "import importlib\ndef stage():\n    return importlib.import_module('json')\n",
-            id="attribute-import-module",
-        ),
-        pytest.param(
-            "from importlib import import_module as load\ndef stage():\n    return load('json')\n",
-            id="aliased-import-module",
-        ),
-        pytest.param("def stage():\n    return __import__('json')\n", id="dunder-import"),
-    ],
-)
-def test_dynamic_import_is_refused(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, source: str
-) -> None:
-    """A stage that imports a module by a runtime name is refused, under any spelling."""
-    path = tmp_path / "dyn_import_mod.py"
-    path.write_text(source)
-    spec = importlib.util.spec_from_file_location("dyn_import_mod", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    # is_user_code finds a function's module through sys.modules; unregistered, the stage
-    # would not count as user code and no check would run.
-    monkeypatch.setitem(sys.modules, "dyn_import_mod", module)
-    spec.loader.exec_module(module)
-    assert fingerprint.is_user_code(module.stage), "the stage must count as user code"
-    with pytest.raises(exceptions.StageDefinitionError, match="dynamic imports"):
-        fingerprint.get_stage_fingerprint(module.stage)
-
-
 def test_compute_function_hash_warns_when_source_unavailable_for_user_code(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,

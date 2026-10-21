@@ -70,7 +70,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Mapping, Sequence
     from inspect import Signature
     from multiprocessing import Queue
     from types import TracebackType
@@ -79,80 +79,204 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_stage_imports: set[str] | None = None
+@dataclasses.dataclass(slots=True)
+class _StageImports:
+    """User modules one stage call imported, and the modules its covered imports pulled in."""
+
+    # The user modules the stage's manifest covers (`fingerprint.covered_user_modules`).
+    covered: frozenset[str]
+    # User modules the stage requested through `__import__` or `importlib.import_module`.
+    imported: set[str] = dataclasses.field(default_factory=set[str])
+    # Modules that became resident while this stage's thread ran a covered module's own first
+    # import: that module's module-level imports, which a module-level import of it would have
+    # made before the stage ran.
+    excused: set[str] = dataclasses.field(default_factory=set[str])
+
+
+class _CoveredImportState(threading.local):
+    """This thread's covered-module import: its nesting depth, and `sys.modules` keys at entry."""
+
+    depth: int = 0
+    resident_before: frozenset[str] = frozenset()
+
+
+_stage_imports: _StageImports | None = None
 _stage_imports_lock = threading.Lock()
+_covered_import_state = _CoveredImportState()
 _original_import = builtins.__import__
 _original_import_module = importlib.import_module
+_hooks_installed = False
 
 
-def _record_stage_import(name: str, package: str | None = None) -> None:
-    with _stage_imports_lock:
-        tracked = _stage_imports
-        if tracked is None:
-            return
-    try:
-        absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
-    except (ImportError, ValueError):
+def _is_user_source_module(module: object) -> bool:
+    """Whether `module` is user code loaded from a source file.
+
+    A module created without a file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) has
+    no source to fingerprint, so the stage-import check ignores it.
+    """
+    if not isinstance(module, type(sys)):
+        return False
+    return isinstance(vars(module).get("__file__"), str) and fingerprint.is_user_code(module)
+
+
+def _package_chain(name: str) -> list[str]:
+    """`name` and its packages: `a.b.c` gives `a`, `a.b`, `a.b.c`."""
+    parts = name.split(".")
+    return [".".join(parts[:index]) for index in range(1, len(parts) + 1)]
+
+
+def _record_stage_import(names: Sequence[str]) -> None:
+    """Record each of `names` that is resident user source, for the running stage.
+
+    Inside a covered module's first import on this thread, a module that was not resident when
+    that import began is excused, and one that was is that module's own import of code already
+    loaded: neither is counted.
+    """
+    tracked = _stage_imports
+    if tracked is None:
         return
-    candidates = set[str]()
-    parts = absolute.split(".")
-    for index in range(1, len(parts) + 1):
-        candidates.add(".".join(parts[:index]))
-    for module_name in candidates:
-        module = sys.modules.get(module_name)
-        if isinstance(module, type(sys)) and fingerprint.is_user_code(module):
-            with _stage_imports_lock:
-                if _stage_imports is not None:
-                    _stage_imports.add(module_name)
+    found = [name for name in names if _is_user_source_module(sys.modules.get(name))]
+    if not found:
+        return
+    state = _covered_import_state
+    if state.depth:
+        found = [module_name for module_name in found if module_name not in state.resident_before]
+        target = tracked.excused
+    else:
+        target = tracked.imported
+    with _stage_imports_lock:
+        if _stage_imports is tracked:
+            target.update(found)
+
+
+def _imports_only_covered(tracked: _StageImports, name: str, fromlist: Sequence[str]) -> bool:
+    """Whether importing `name` (with `fromlist`, for a `from` import) first-imports at least
+    one module, and every module it first-imports by name is one the stage's manifest covers.
+
+    When `name` is resident, a `from` name its module does not hold yet is a submodule the
+    import will load. When it is not, the `from` names cannot be told from attributes before the
+    import runs; a submodule among them is recorded after the import (`_tracked_import`).
+    """
+    pending = [prefix for prefix in _package_chain(name) if prefix not in sys.modules]
+    parent = sys.modules.get(name)
+    if parent is not None:
+        namespace: dict[str, object] = getattr(parent, "__dict__", {})
+        pending.extend(
+            f"{name}.{item}"
+            for item in fromlist
+            if f"{name}.{item}" not in sys.modules and item not in namespace
+        )
+    return bool(pending) and all(module in tracked.covered for module in pending)
+
+
+@contextlib.contextmanager
+def _covered_import(
+    tracked: _StageImports, name: str | None, fromlist: Sequence[str]
+) -> Generator[None]:
+    """Treat what this thread imports while it first-imports a covered module as that module's
+    own module-level imports (`_StageImports.excused`)."""
+    state = _covered_import_state
+    if state.depth == 0 and (name is None or not _imports_only_covered(tracked, name, fromlist)):
+        yield
+        return
+    if state.depth == 0:
+        state.resident_before = frozenset(sys.modules)
+    state.depth += 1
+    try:
+        yield
+    finally:
+        state.depth -= 1
+        if state.depth == 0:
+            state.resident_before = frozenset()
 
 
 def _tracked_import(
     name: str,
-    globals_dict: dict[str, object] | None = None,
-    locals_dict: dict[str, object] | None = None,
-    fromlist: tuple[str, ...] | None = None,
+    globals: Mapping[str, object] | None = None,  # noqa: A002 - CPython's `__import__` signature
+    locals: Mapping[str, object] | None = None,  # noqa: A002 - CPython's `__import__` signature
+    fromlist: Sequence[str] | None = (),
     level: int = 0,
 ) -> object:
-    result = _original_import(name, globals_dict, locals_dict, fromlist, level)
-    package = globals_dict.get("__package__") if globals_dict is not None else None
-    if not isinstance(package, str):
-        package = None
-    relative = "." * level + name if level else name
-    _record_stage_import(relative, package)
+    tracked = _stage_imports
+    if tracked is None:
+        return _original_import(name, globals, locals, fromlist or (), level)
+    package = globals.get("__package__") if globals is not None else None
+    absolute: str | None = name
     if level:
         try:
-            base = importlib.util.resolve_name(relative, package)
+            absolute = importlib.util.resolve_name(
+                "." * level + name, package if isinstance(package, str) else None
+            )
         except (ImportError, ValueError):
-            return result
-    else:
-        base = name
-    for imported in fromlist or ():
-        if imported != "*":
-            _record_stage_import(f"{base}.{imported}")
+            absolute = None
+    items = [item for item in fromlist or () if item != "*"]
+    with _covered_import(tracked, absolute, items):
+        result = _original_import(name, globals, locals, fromlist or (), level)
+    if absolute is not None:
+        _record_stage_import(_package_chain(absolute) + [f"{absolute}.{item}" for item in items])
     return result
 
 
 def _tracked_import_module(name: str, package: str | None = None) -> object:
-    result = _original_import_module(name, package)
-    _record_stage_import(name, package)
+    tracked = _stage_imports
+    if tracked is None:
+        return _original_import_module(name, package)
+    try:
+        absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
+    except (ImportError, ValueError):
+        absolute = None
+    with _covered_import(tracked, absolute, []):
+        result = _original_import_module(name, package)
+    if absolute is not None:
+        _record_stage_import(_package_chain(absolute))
     return result
 
 
-builtins.__import__ = _tracked_import
-importlib.import_module = _tracked_import_module
+def install_import_hooks() -> None:
+    """Route `builtins.__import__` and `importlib.import_module` through the stage-import check.
+
+    The worker initializer (`executor.core._init_worker`) calls this; nothing else in Pivot's
+    own process installs it. The hooks record nothing while no stage is running.
+    """
+    global _original_import, _original_import_module, _hooks_installed
+    if _hooks_installed:
+        return
+    _original_import = builtins.__import__
+    _original_import_module = importlib.import_module
+    builtins.__import__ = _tracked_import
+    importlib.import_module = _tracked_import_module
+    _hooks_installed = True
+
+
+def _uninstall_import_hooks() -> None:
+    global _hooks_installed
+    builtins.__import__ = _original_import
+    importlib.import_module = _original_import_module
+    _hooks_installed = False
 
 
 @contextlib.contextmanager
-def _track_stage_imports() -> Generator[set[str]]:
+def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
+    """Record the user modules one stage call imports.
+
+    A stage executed in a process without the worker initializer (`execute_stage` called
+    directly) gets the hooks for this call only.
+    """
     global _stage_imports
+    installed_here = not _hooks_installed
+    if installed_here:
+        install_import_hooks()
+    tracked = _StageImports(covered=covered)
     with _stage_imports_lock:
         assert _stage_imports is None, "Worker cannot execute two stages concurrently"
-        _stage_imports = set[str]()
+        _stage_imports = tracked
     try:
-        yield _stage_imports
+        yield tracked
     finally:
         with _stage_imports_lock:
             _stage_imports = None
+        if installed_here:
+            _uninstall_import_hooks()
 
 
 # How long a stopped worker's running stage may take to unwind before the worker exits.
@@ -628,8 +752,9 @@ def _execute_stage(
                                 deferred_writes=deferred,
                             )
 
+                covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
                 before_modules = set(sys.modules)
-                with _track_stage_imports() as imported_modules:
+                with _track_stage_imports(covered_modules) as stage_imports:
                     output_paths = _run_stage_function_with_store(
                         stage_info["func"],
                         stage_name,
@@ -647,16 +772,16 @@ def _execute_stage(
                         project_state_dir,
                         project_root,
                     )
-                for module_name in set(sys.modules) - before_modules:
-                    module = sys.modules.get(module_name)
-                    if isinstance(module, type(sys)) and fingerprint.is_user_code(module):
+                imported_modules = set(stage_imports.imported)
+                for module_name in set(sys.modules) - before_modules - stage_imports.excused:
+                    if _is_user_source_module(sys.modules.get(module_name)):
                         imported_modules.add(module_name)
                 # A @no_fingerprint stage declares its code as files (`code_deps`); that
                 # declaration is its contract, so its imports are not checked.
                 uncovered = (
                     set[str]()
                     if stage_info["no_fingerprint"]
-                    else imported_modules - fingerprint.covered_user_modules(current_fingerprint)
+                    else imported_modules - covered_modules
                 )
                 lock_manifest = current_fingerprint
                 if uncovered:

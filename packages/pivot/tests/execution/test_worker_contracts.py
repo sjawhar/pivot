@@ -455,13 +455,59 @@ def test_stage_import_tracking_records_cached_module_per_stage(
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.delitem(sys.modules, module_name, raising=False)
 
-    with worker._track_stage_imports() as first:
+    with worker._track_stage_imports(frozenset()) as first:
         importlib.import_module(module_name)
-    with worker._track_stage_imports() as second:
+    with worker._track_stage_imports(frozenset()) as second:
         importlib.import_module(module_name)
 
-    assert module_name in first
-    assert module_name in second
+    assert module_name in first.imported
+    assert module_name in second.imported
+
+
+def test_covered_module_first_import_excuses_only_its_own_imports(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A covered module's own module-level imports are excused, on the importing thread only; a
+    covered module importing a module already resident excuses nothing."""
+    for name, text in {
+        "cov_lib.py": "import cov_dep\n\nVALUE = 1\n",
+        "cov_dep.py": "VALUE = 2\n",
+        "cov_other.py": "VALUE = 3\n",
+    }.items():
+        (tmp_path / name).write_text(text)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in ("cov_lib", "cov_dep", "cov_other"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        importlib.import_module("cov_lib")
+        importlib.import_module("cov_other")
+
+    assert tracked.excused == {"cov_dep"}
+    assert tracked.imported == {"cov_lib", "cov_other"}
+
+
+def test_import_hooks_keep_cpythons_signature_and_are_not_installed_on_import() -> None:
+    """`import pivot.executor.worker` leaves the interpreter's `__import__` alone, and a hooked
+    `__import__` accepts CPython's keyword names."""
+    script = "\n".join(
+        [
+            "import builtins",
+            "original = builtins.__import__",
+            "import pivot.executor.worker as worker",
+            "assert builtins.__import__ is original",
+            "worker.install_import_hooks()",
+            "assert builtins.__import__ is not original",
+            "json = builtins.__import__('json', globals=None, locals=None, fromlist=(), level=0)",
+            "print(json.__name__)",
+        ]
+    )
+    probe = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.strip() == "json"
 
 
 @pytest.mark.parametrize(

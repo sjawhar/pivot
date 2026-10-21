@@ -188,10 +188,14 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `func_dict[key]()` dispatch              | ✅        | `test_change_detection.py::test_dynamic_dispatch_change_detected`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
 | `eval()` / `exec()` of code reading other names | ❌        | **NO TEST** - can't analyze dynamically |
 | Lambda created by `eval()` (no source) | ✅        | `test_fingerprint_gaps.py::test_eval_lambda_is_hashed_by_its_code_object` |
-| Visible `importlib.import_module` / `__import__` spelling | ✅ (error) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_is_refused` |
-| A user method named `import_module` | ✅ | `test_fingerprint_gaps.py::test_user_method_named_import_module_runs` |
+| `x.import_module(...)` call | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_import_module` (main's refusal) |
+| Other dynamic spelling of a user module (alias, `__import__`, partial, default, literal `getattr`) | ✅ (not reused) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_of_a_user_module_makes_result_not_reusable` |
+| Dynamic import of a library (`__import__("json")`, an `import_module` alias) | ✅ | `test_fingerprint_gaps.py::test_dynamic_import_of_a_library_runs_and_caches` |
 | A resolved helper receiving `"import_module"` | ✅ | `test_fingerprint_gaps.py::test_resolved_helper_accepts_import_module_argument_name` |
-| Unresolved receiver of `import_module` / `__import__` | ✅ (error) | The receiver could be a dynamic loader |
+| Library that creates modules without a source file (`pyexpat.errors`) | ✅ | `test_fingerprint_gaps.py::test_library_that_creates_fileless_modules_caches` |
+| Body import of a loaded module that imports other user modules | ✅ | `test_fingerprint_gaps.py::test_body_import_of_loaded_module_that_imports_user_modules_is_reused`, `test_fingerprint_gaps.py::test_uncovered_dynamic_import_after_a_covered_import_still_warns` |
+| User class reached only through a pickled input | ✅ (not reused; annotation covers it) | `test_fingerprint_gaps.py::test_user_class_reached_only_through_a_loaded_input` |
+| Unloaded package located only by a `sys.meta_path` finder | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_package_found_by_a_meta_path_finder_is_refused` |
 | Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss` |
 | Callback/function passed as argument     | ❌        | **NO TEST** - not tracked |
 | Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source) |
@@ -339,7 +343,7 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
 4. **Docstrings/comments ignored**: These don't affect behavior, so they're stripped from AST.
 
-5. **Imports inside function bodies are walked**: each `import` and `from ... import` statement in a user function's body is resolved (a relative one against the function's package) and what it binds is walked as a module-level import would be. A dynamic import (`importlib.import_module` under any name, `__import__`) is refused.
+5. **Imports inside function bodies are walked**: each `import` and `from ... import` statement in a user function's body is resolved (a relative one against the function's package) and what it binds is walked as a module-level import would be. A call `x.import_module(...)` is refused, as on main; other dynamic spellings are left to the worker's stage-import check.
 
 6. **Non-scalar module values are refused**: A stage may capture module-level `bool`, `int`,
    `float`, `str`, `bytes`, and `None` values, a `tuple` or `frozenset` whose members are all

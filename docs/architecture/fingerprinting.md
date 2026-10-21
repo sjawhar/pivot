@@ -111,33 +111,47 @@ def process():
     return importlib.import_module(name).run()  # Module chosen at run time
 ```
 
-An import whose module is named at run time cannot be resolved statically:
-visible references to `importlib.import_module` or `__import__`, including aliases, default
-arguments, `functools.partial`, and literal `getattr` lookups through a resolved loader, are
-refused with `StageDefinitionError`. A resolved user helper or API may receive either string
-without becoming a loader. An attribute receiver or call callee that cannot be resolved
-statically is refused for these spellings.
-Computed attribute names and alternate loading APIs (`vars(module)[name]`,
-`operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs) are not refused at
-definition. A user module one of them loads while the stage runs is caught by the worker's
-check below; an attribute read on a module already loaded is not.
+An import whose module is named at run time cannot be resolved statically. A call
+`x.import_module(...)` is refused with `StageDefinitionError`, as are `getattr()` with a
+computed name and `globals()`/`locals()` (`fingerprint._check_dynamic_name_access`). Other
+spellings (`__import__`, an alias of `importlib.import_module`, a `functools.partial` of it,
+`vars(module)[name]`, `operator.attrgetter`, `exec`, `runpy`, and `importlib.util` loader APIs)
+are not refused at definition. A user module one of them loads while the stage runs is caught by
+the worker's check below, and a library module costs nothing; an attribute read on a module
+already loaded is not seen.
 
 **Workaround:** Import the module statically.
 
 ### Imports a Stage Makes While It Runs
 
-The worker wraps `builtins.__import__` and `importlib.import_module`, recording each user module
-(and its user packages) a stage requests, including one already in `sys.modules`, and compares the
-`sys.modules` keys before and after the stage. The modules a manifest covers come from one function,
-`fingerprint.covered_user_modules`: `module:<name>` keys, and the `dep:<parameter>:module:<name>` and
-`out:<output>:module:<name>` keys a user loader's walk adds. A recorded module outside that set makes
-the result not reusable: the stage succeeds and logs one warning naming the modules; its lock
-carries an `uncovered-import:<modules>` key no fingerprint matches, so the next `repro` reruns it
-and `status --explain` and `repro --dry-run --explain` report "Previous run imported modules its
-fingerprint does not cover"; and no run-cache entry is filed. `pivot commit` carries that key into
-the lock it writes when the static fingerprint is otherwise unchanged, and files no run-cache entry
-for it (`skip.carry_uncovered_import`). Under `--no-commit` the warning adds that `pivot commit`
-will record the outputs as current.
+The worker initializer (`executor.core._init_worker`) wraps `builtins.__import__` and
+`importlib.import_module` (`worker.install_import_hooks`); importing `pivot.executor.worker` alone
+changes neither, and a stage executed in a process without that initializer gets the hooks for its
+call only. While a stage runs, the hooks record each user module (and its user packages) the stage
+requests, including one already in `sys.modules`, and the worker compares the `sys.modules` keys
+before and after the stage, counting a newly resident module only when it has a `__file__` that
+`is_user_code` accepts. The modules a manifest covers come from one function,
+`fingerprint.covered_user_modules`: `module:<name>` keys, and the `dep:<parameter>:module:<name>`
+and `out:<output>:module:<name>` keys a user loader's walk adds.
+
+When a stage's own import first loads a covered module, the modules that become resident on that
+thread during that one import are that module's module-level imports, which a module-level import
+of it would have made before the stage ran: they are not counted (`_StageImports.excused`). Imports
+on other threads, and the stage's own later imports, still are. A covered module is never imported
+ahead of the stage: discovery pickles `pipeline.py` and other modules under the project root by
+value, and importing one of them in the worker would run it again there.
+
+A recorded module outside the covered set makes the result not reusable: the stage succeeds and
+logs one warning naming the modules; its lock carries an `uncovered-import:<modules>` key no
+fingerprint matches, so the next `repro` reruns it and `status --explain` and
+`repro --dry-run --explain` report "Previous run imported modules its fingerprint does not cover";
+and no run-cache entry is filed. `pivot commit` carries that key into the lock it writes when the
+static fingerprint is otherwise unchanged, and files no run-cache entry for it
+(`skip.carry_uncovered_import`). Under `--no-commit` the warning adds that `pivot commit` will
+record the outputs as current. A user class reached only through a loaded input (an object in a
+`loaders.Pickle()` input whose class the stage never names) counts as a module the stage imported,
+because unpickling imports its module while the stage runs; naming the class in the parameter's
+annotation (`Annotated[Box, loaders.Pickle()]`) covers it.
 
 The warning's fix is a static import with the module read by name in the stage's own code
 (`pkg.mod.NAME`, or `pkg.mod` passed itself), which the walk then covers, or `StageParams`. An import
@@ -156,6 +170,7 @@ The check does not see these paths, which behave as they would without it:
 | An import in a child process | Declare the code the child runs as an input, or use `@no_fingerprint(code_deps=[...])` |
 | An import from a thread that outlives its stage | Join the thread before the stage returns; its import is charged to whichever stage is running, or to none |
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
+| A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
 | `pivot repro --no-commit`, then `pivot commit` | No lock exists to carry the mark, so `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
 
 ### Module-Level Instances

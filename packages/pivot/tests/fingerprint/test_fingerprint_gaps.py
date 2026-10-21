@@ -41,12 +41,16 @@ def _pipeline(imports: str, body: str) -> str:
     return _HEADER + imports + _NORMALIZE + "\n" + body + _FOOTER
 
 
-def _run(project: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    project: pathlib.Path, *args: str, pythonpath: pathlib.Path | None = None
+) -> subprocess.CompletedProcess[str]:
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
     }
+    if pythonpath is not None:
+        env["PYTHONPATH"] = str(pythonpath)
     return subprocess.run(
         [str(_PIVOT), *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
     )
@@ -326,15 +330,58 @@ def test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage(
 
 
 @pytest.mark.parametrize("shape", sorted(_DYNAMIC_IMPORT_SHAPES))
-def test_dynamic_import_spelling_is_refused(tmp_path: pathlib.Path, shape: str) -> None:
-    files, _edit_spec = _DYNAMIC_IMPORT_SHAPES[shape]
+def test_dynamic_import_spelling_of_a_user_module_makes_result_not_reusable(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """Spellings main does not refuse at definition run; the user module they load at run time
+    makes the result not reusable, and an edit to it is seen without `--force`."""
+    files, edit_spec = _DYNAMIC_IMPORT_SHAPES[shape]
     project = _project(tmp_path, files)
 
-    result = _run(project, "repro")
+    first = _run(project, "repro")
 
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "fingerprinting failed" in result.stdout + result.stderr
-    assert "dynamic imports" in result.stdout + result.stderr
+    _assert_not_reusable(project, first)
+    assert _count(project) == 4
+    _edit(project, *edit_spec)
+    second = _run(project, "repro")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _count(project) == 103
+
+
+_LIBRARY_DYNAMIC_IMPORTS = {
+    "dunder-import": 'json = __import__("json")\n    return {"v": len(json.dumps([1]))}',
+    "dunder-import-keywords": (
+        'json = __import__("json", globals=None, locals=None, fromlist=(), level=0)\n'
+        '    return {"v": len(json.dumps([1]))}'
+    ),
+    "import-module-alias": (
+        'load = importlib.import_module\n    return {"v": len(load("json").dumps([1]))}'
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_LIBRARY_DYNAMIC_IMPORTS))
+def test_dynamic_import_of_a_library_runs_and_caches(tmp_path: pathlib.Path, shape: str) -> None:
+    """As on main: a dynamic import of a library module runs, warns nothing, and caches."""
+    project = _project(
+        tmp_path,
+        {
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n    "
+                + _LIBRARY_DYNAMIC_IMPORTS[shape]
+                + "\n",
+            )
+        },
+    )
+
+    first = _run(project, "repro")
+    again = _run(project, "repro", "--json")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    assert _count(project) == 3
 
 
 _UNLOADED_BODY_IMPORTS = {
@@ -422,31 +469,6 @@ def test_body_import_of_a_library_module_is_not_refused(tmp_path: pathlib.Path) 
     result = _run(project, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_user_method_named_import_module_runs(tmp_path: pathlib.Path) -> None:
-    project = _project(
-        tmp_path,
-        {
-            "helpers/__init__.py": "",
-            "helpers/formatter.py": (
-                "class Formatter:\n"
-                "    @staticmethod\n"
-                "    def import_module(text: str) -> int:\n"
-                "        return len(text.strip())\n"
-            ),
-            "pipeline.py": _pipeline(
-                "\nfrom helpers.formatter import Formatter\n",
-                "@stage\ndef count(text: str) -> dict:\n"
-                '    return {"v": Formatter.import_module(text)}\n',
-            ),
-        },
-    )
-
-    result = _run(project, "repro")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert _count(project) == len(_LINES.strip())
 
 
 def test_resolved_helper_accepts_import_module_argument_name(tmp_path: pathlib.Path) -> None:
@@ -922,3 +944,244 @@ def test_following_the_uncovered_import_warning_fix_clears_it(
         _edit(project, *_EDIT_LIB_VALUE)
         assert _run(project, "repro").returncode == 0
         assert _count(project) == 103
+
+
+_FILELESS_LIBRARY_BODIES = {
+    "xml-etree": (
+        "import xml.etree.ElementTree as ET\n"
+        '    return {"v": len(ET.fromstring("<a><b/></a>")) + len(text.splitlines())}'
+    ),
+    "networkx": (
+        "import networkx\n"
+        '    return {"v": networkx.path_graph(2).number_of_nodes() + len(text.splitlines())}'
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_FILELESS_LIBRARY_BODIES))
+def test_library_that_creates_fileless_modules_caches(tmp_path: pathlib.Path, shape: str) -> None:
+    """A library that creates modules without a source file (`pyexpat.errors`) is not user
+    code to the stage-import check: the stage caches and `pivot verify` passes, as on main."""
+    project = _project(
+        tmp_path,
+        {
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n    "
+                + _FILELESS_LIBRARY_BODIES[shape]
+                + "\n",
+            )
+        },
+    )
+
+    first = _run(project, "repro")
+    again = _run(project, "repro", "--json")
+    verify = _run(project, "verify")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    assert verify.returncode == 0, verify.stdout + verify.stderr
+
+
+_TRANSITIVE_LAYOUTS = {
+    "lib-imports-sibling": (
+        {
+            "helpers/__init__.py": "",
+            "helpers/util.py": "SCALE = 1\n",
+            "helpers/lib.py": "from helpers.util import SCALE\n\nVALUE = 1\n",
+        },
+        "from helpers.lib import VALUE\n",
+        "VALUE",
+    ),
+    "package-init-reexports": (
+        {
+            "helpers/__init__.py": "from helpers import other  # noqa: F401\n",
+            "helpers/other.py": "OTHER = 1\n",
+            "helpers/lib.py": "VALUE = 1\n",
+        },
+        "import helpers.lib\n",
+        "helpers.lib.VALUE",
+    ),
+}
+
+
+def _transitive_pipeline(body_import: str, read: str, extra: str = "") -> str:
+    return _pipeline(
+        "\nimport helpers.lib\n",
+        "@stage\ndef count(text: str) -> dict:\n"
+        f"    {body_import}{extra}"
+        f'    return {{"v": {read} + len(text.splitlines())}}\n',
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(_TRANSITIVE_LAYOUTS))
+def test_body_import_of_loaded_module_that_imports_user_modules_is_reused(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """A body import of a loaded module is walked like a module-level import even when that
+    module imports other user modules: no warning, cached, and an edit reruns the stage."""
+    files, body_import, read = _TRANSITIVE_LAYOUTS[shape]
+    project = _project(tmp_path, {**files, "pipeline.py": _transitive_pipeline(body_import, read)})
+    configured = _run(project, "config", "set", "core.max_workers", "1")
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+
+    first = _run(project, "repro")
+    again = _run(project, "repro", "--json")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
+    assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
+    _edit(project, *_EDIT_LIB_VALUE)
+    edited = _run(project, "repro")
+    assert edited.returncode == 0, edited.stdout + edited.stderr
+    assert _count(project) == 103
+
+
+def test_uncovered_dynamic_import_after_a_covered_import_still_warns(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The covered module's own import of a sibling is excused; a later runtime import of a
+    third, uncovered user module in the same stage still makes the result not reusable."""
+    files, body_import, read = _TRANSITIVE_LAYOUTS["lib-imports-sibling"]
+    project = _project(
+        tmp_path,
+        {
+            **files,
+            "late.py": "VALUE = 0\n",
+            "pipeline.py": _transitive_pipeline(body_import, read, '    exec("import late")\n'),
+        },
+    )
+
+    first = _run(project, "repro")
+
+    _assert_not_reusable(project, first)
+    message = " ".join((first.stdout + first.stderr).split())
+    assert "does not cover: late." in message, message
+    assert "helpers.util" not in message, message
+
+
+def test_dunder_import_with_cpython_keywords_runs_in_a_stage(tmp_path: pathlib.Path) -> None:
+    """The worker's `__import__` takes CPython's keyword names (`globals=`, `locals=`)."""
+    project = _project(
+        tmp_path,
+        {
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    scope = {}\n"
+                "    exec(\"json = __import__('json', globals=globals(), locals=None)\", scope)\n"
+                '    return {"v": len(scope["json"].dumps([1])) + len(text.splitlines())}\n',
+            )
+        },
+    )
+
+    result = _run(project, "repro")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(project) == 6
+
+
+def test_unloaded_package_found_by_a_meta_path_finder_is_refused(tmp_path: pathlib.Path) -> None:
+    """A package only a `sys.meta_path` finder locates (a setuptools PEP 660 editable install)
+    is an unloaded user module like any other: its body import is refused at definition."""
+    package = tmp_path / "ext" / "src" / "extpkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 1\n")
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        "import importlib.util\nimport sys\n\n\n"
+        "class _EditableFinder:\n"
+        "    @classmethod\n"
+        "    def find_spec(cls, fullname, path=None, target=None):\n"
+        "        if fullname != 'extpkg':\n"
+        "            return None\n"
+        "        return importlib.util.spec_from_file_location(\n"
+        f"            'extpkg', {str(package / '__init__.py')!r},\n"
+        f"            submodule_search_locations=[{str(package)!r}],\n"
+        "        )\n\n\n"
+        "sys.meta_path.append(_EditableFinder)\n"
+    )
+    project = _project(
+        tmp_path,
+        {
+            "pipeline.py": _pipeline(
+                "",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    import extpkg\n\n"
+                '    return {"v": extpkg.VALUE + len(text.splitlines())}\n',
+            )
+        },
+    )
+
+    result = _run(project, "repro", pythonpath=site)
+
+    message = result.stdout + result.stderr
+    assert result.returncode != 0, message
+    assert "imports user module 'extpkg'" in message, message
+
+
+_BOX = (
+    "class Box:\n"
+    "    def __init__(self, value):\n"
+    "        self.value = value\n\n"
+    "    def doubled(self):\n"
+    "        return self.value * 2\n"
+)
+
+
+def _pickled_box_pipeline(annotation: str, body: str) -> str:
+    make = (
+        '    return {"box": Box(len(text.splitlines()))}\n'
+        if annotation == "Box"
+        else '    return {"box": {"b": Box(len(text.splitlines()))}}\n'
+    )
+    return (
+        "from typing import Annotated, TypedDict\n\n"
+        "from mypkg.models import Box\n"
+        "from pivot import Pipeline, loaders, stage\n\n\n"
+        f"class Made(TypedDict):\n    box: Annotated[{annotation}, loaders.Pickle()]\n\n\n"
+        "@stage\ndef make(text: str) -> Made:\n" + make + "\n\n"
+        f"@stage\ndef count(box: Annotated[{annotation}, loaders.Pickle()]) -> dict:\n"
+        f'    return {{"v": {body}}}\n\n\n'
+        'with Pipeline("t") as pipeline:\n'
+        '    count(make(pipeline.input("lines.txt", t=str))["box"])\n'
+    )
+
+
+@pytest.mark.parametrize(
+    ("annotation", "body", "warns"),
+    [
+        pytest.param("dict", 'box["b"].doubled()', True, id="plain-dict"),
+        pytest.param("Box", "box.doubled()", False, id="annotation-names-class"),
+    ],
+)
+def test_user_class_reached_only_through_a_loaded_input(
+    tmp_path: pathlib.Path, annotation: str, body: str, warns: bool
+) -> None:
+    """A user class a stage reaches only through a pickled input counts as a module the stage
+    imported: the stage warns and reruns, so an edit to the class is seen. Naming the class in
+    the parameter's annotation covers it: the stage caches, and an edit still reruns it."""
+    project = _project(
+        tmp_path,
+        {
+            "src/mypkg/__init__.py": "",
+            "src/mypkg/models.py": _BOX,
+            "pipeline.py": _pickled_box_pipeline(annotation, body),
+        },
+    )
+    src = project / "src"
+
+    first = _run(project, "repro", pythonpath=src)
+    again = _run(project, "repro", "--json", pythonpath=src)
+
+    message = " ".join((first.stdout + first.stderr).split())
+    assert first.returncode == 0, message
+    assert ("does not cover: mypkg, mypkg.models" in message) is warns, message
+    count_status = "ran" if warns else "cached"
+    assert f'"stage": "t/count", "status": "{count_status}"' in again.stdout, again.stdout
+    _edit(project, "src/mypkg/models.py", "self.value * 2", "self.value * 200")
+    edited = _run(project, "repro", "--json", pythonpath=src)
+    assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
+    assert _count(project) == 600

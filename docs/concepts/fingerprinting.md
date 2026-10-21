@@ -58,21 +58,26 @@ locked version. Any difference triggers re-execution.
 While a stage runs, its worker records the user modules it imports through
 Python's `__import__` and `importlib.import_module` entry points, including a
 module a warm worker already holds, and compares the `sys.modules` keys before
-and after the stage to catch a newly registered user module. A stage that
-imported a user module its fingerprint does not cover still succeeds, with one
-warning naming the module, but its result is never reused: Pivot files no
-run-cache entry and writes a lock the next run cannot match, and
-`pivot status --explain` and `pivot repro --dry-run --explain` show the stage as
-stale with that reason. `pivot commit` keeps that mark when it records the same
-outputs, so the stage still reruns. To clear the warning, import the module
-statically and read it by name in the stage's own code (`import pkg.mod`, then
-`pkg.mod.NAME`, or pass `pkg.mod` itself to the call that needs it), so the
-walk covers it, or move the value into `StageParams`. An import in
-`pipeline.py` alone does not cover a module for a stage that never reads it,
-and a body import that only silences the warning while the stage still reads
-values through the object a dynamic import returned leaves those values
-untracked. A `@no_fingerprint` stage is not checked: its declared `code_deps`
-are its code.
+and after the stage to catch a newly registered user module loaded from a
+source file. The modules a covered module itself imports the first time the
+stage imports it count as that module's own imports, as they would for a
+module-level import. A stage that imported a user module its fingerprint does
+not cover still succeeds, with one warning naming the module, but its result
+is never reused: Pivot files no run-cache entry and writes a lock the next run
+cannot match, and `pivot status --explain` and `pivot repro --dry-run --explain`
+show the stage as stale with that reason. `pivot commit` keeps that mark when it
+records the same outputs, so the stage still reruns. A user class reached only
+through a loaded input (an object in a `loaders.Pickle()` input whose class the
+stage never names) counts as a module the stage imported; name the class in the
+parameter's annotation (`Annotated[Box, loaders.Pickle()]`) to cover it. To
+clear the warning, import the module statically and read it by name in the
+stage's own code (`import pkg.mod`, then `pkg.mod.NAME`, or pass `pkg.mod`
+itself to the call that needs it), so the walk covers it, or move the value
+into `StageParams`. An import in `pipeline.py` alone does not cover a module
+for a stage that never reads it, and a body import that only silences the
+warning while the stage still reads values through the object a dynamic import
+returned leaves those values untracked. A `@no_fingerprint` stage is not
+checked: its declared `code_deps` are its code.
 
 That check does not see every way a stage can reach code. In these cases Pivot
 reuses a result whose fingerprint missed the code, as it would without the
@@ -91,6 +96,8 @@ check:
 - a package resource read through `importlib.resources` (for example
   `files(helpers).joinpath("table.txt")`): it is data, not code; declare it
   with `pipeline.input`;
+- a module created without a source file (CPython's `pyexpat.errors`,
+  Cython's `_cython_3_3_0`): it has no source to fingerprint;
 - `pivot repro --no-commit` followed by `pivot commit`: no lock exists to carry
   the mark, so `pivot commit` records the outputs on disk against the static
   fingerprint, as it records any output; run `pivot repro` without
@@ -190,14 +197,13 @@ Pivot rejects patterns that bypass static analysis:
 
 - `globals()` / `locals()` — runtime namespace access
 - `getattr(obj, variable)` — dynamic attribute lookup
-- a visible reference to `importlib.import_module` or `__import__`, including an alias,
-  default argument, `functools.partial`, or a literal `getattr` lookup through the real
-  loader — dynamic imports
+- `importlib.import_module()` — dynamic imports
 
-A resolved user helper or API can receive either string without becoming a loader. An unresolved
-receiver or call callee for either spelling is refused. Computed dictionary/attribute lookups and
-alternate loading APIs remain outside this check.
-Use direct attribute access and static imports instead.
+All of these silently introduce dependencies that fingerprinting can't
+track. Use direct attribute access and static imports instead. Other dynamic
+import spellings (`__import__`, an alias of `import_module`, `exec`) are not
+refused: a user module one of them loads while the stage runs makes its result
+not reusable, as described above, and a library module costs nothing.
 
 ## @pivot.no_fingerprint()
 
