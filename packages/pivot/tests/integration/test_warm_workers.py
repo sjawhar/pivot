@@ -808,7 +808,9 @@ with Pipeline("fan") as pipeline:
 
 
 # The parent fails while an independent stage outlives the idle timeout and then counts the
-# live workers; workers reserved for the failed parent's fan must be gone by then.
+# live workers; workers reserved for the failed parent's fan must be gone by then. A worker
+# that loses loky's process-lock race when its timeout fires waits one more timeout (loky
+# `_process_worker`), so the bystander allows up to two.
 _FAILED_PARENT_FAN_PIPELINE = """\
 import os
 import pathlib
@@ -830,15 +832,26 @@ def fan(value: str) -> str:
     return value
 
 
+def _live_workers() -> int:
+    count = 0
+    for child in psutil.Process(os.getppid()).children():
+        try:
+            if "loky.backend.popen_loky_posix" in " ".join(child.cmdline()):
+                count += 1
+        except psutil.NoSuchProcess:  # exited (or a zombie) between listing and inspecting
+            continue
+    return count
+
+
 @stage
 def bystander() -> str:
     time.sleep({wait_s!r})
-    live = [
-        child
-        for child in psutil.Process(os.getppid()).children()
-        if "loky.backend.popen_loky_posix" in " ".join(child.cmdline())
-    ]
-    pathlib.Path({live_path!r}).write_text(str(len(live)))
+    deadline = time.monotonic() + {timeout_s!r}
+    live = _live_workers()
+    while live != 1 and time.monotonic() < deadline:
+        time.sleep(0.1)
+        live = _live_workers()
+    pathlib.Path({live_path!r}).write_text(str(live))
     return "bystander"
 
 
@@ -1032,6 +1045,7 @@ def test_workers_reserved_for_a_failed_parent_exit_within_the_idle_timeout(
         _FAILED_PARENT_FAN_PIPELINE.format(
             parent_s=parent_s,
             wait_s=wait_s,
+            timeout_s=executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S,
             live_path=str(live_path),
         ),
     )

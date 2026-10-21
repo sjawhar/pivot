@@ -72,15 +72,27 @@ def fan(value: str) -> str:
     return value
 
 
+def _live_workers() -> int:
+    count = 0
+    for child in psutil.Process(os.getppid()).children():
+        try:
+            if "loky.backend.popen_loky_posix" in " ".join(child.cmdline()):
+                count += 1
+        except psutil.NoSuchProcess:  # exited (or a zombie) between listing and inspecting
+            continue
+    return count
+
+
 @stage
 def linger(value: str) -> str:
-    time.sleep(13)
-    live = [
-        child
-        for child in psutil.Process(os.getppid()).children()
-        if "loky.backend.popen_loky_posix" in " ".join(child.cmdline())
-    ]
-    pathlib.Path(os.environ["PIVOT_FRESH_LIVE_WORKERS"]).write_text(str(len(live)))
+    # An idle worker exits after its 10 s timeout, or after a second one when it loses loky's
+    # process-lock race at that moment (loky `_process_worker`), so wait up to two timeouts.
+    deadline = time.monotonic() + 25
+    live = _live_workers()
+    while live != 1 and time.monotonic() < deadline:
+        time.sleep(0.1)
+        live = _live_workers()
+    pathlib.Path(os.environ["PIVOT_FRESH_LIVE_WORKERS"]).write_text(str(live))
     return value
 
 
@@ -268,7 +280,7 @@ def test_fresh_wheel_keeps_prestarted_fan_workers_warm(
     assert run.returncode == 0, run.stdout + run.stderr
     started = worker_log.read_text().splitlines()
     assert len(started) == 4, f"loky {loky_version} started {len(started)} workers"
-    # 13 s after the fan, only the worker running `linger` is left; the others timed out idle.
+    # Within two idle timeouts of the fan, only the worker running `linger` is left.
     assert live_workers.read_text() == "1", f"loky {loky_version} kept idle workers alive"
 
 

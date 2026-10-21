@@ -131,7 +131,9 @@ def test_idle_workers_exit_while_another_stage_runs(tmp_path: pathlib.Path) -> N
     pool = WorkerPool()
     try:
         pool.start(max_workers=4, idle_timeout_s=idle_timeout_s)
-        slow = pool.submit(_helper_sleep, idle_timeout_s + 5)
+        # A worker that loses loky's process-lock race when its timeout fires waits one more
+        # timeout (loky `_process_worker`); the slow stage outlives both.
+        slow = pool.submit(_helper_sleep, 2 * idle_timeout_s + 5)
         waiting = [
             pool.submit(_helper_wait_for_release, str(ready_dir), str(release)) for _ in range(3)
         ]
@@ -142,7 +144,7 @@ def test_idle_workers_exit_while_another_stage_runs(tmp_path: pathlib.Path) -> N
         release.write_text("")
         idle_pids = {future.result(timeout=60) for future in waiting}
 
-        deadline = time.monotonic() + idle_timeout_s + 5
+        deadline = time.monotonic() + 2 * idle_timeout_s + 5
         while any(psutil.pid_exists(pid) for pid in idle_pids):
             assert not slow.done(), "the slow stage ended before idle workers exited"
             assert time.monotonic() < deadline, "idle workers stayed alive"
