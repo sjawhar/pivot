@@ -14,10 +14,11 @@ With --threshold-file, a scenario's metric is a REGRESSION only when both hold: 
 exceeds the base's by more than that scenario's `wall_pct` or `cpu_pct` (the minimum effect),
 and a bootstrap 95% interval of the median per-rep ratio head/base, pairing reps by their `rep`
 number, lies entirely above 1 (the change is not the job's own noise). It exits 0 when nothing
-regressed, 1 when something did, and 2 when the files cannot be compared: a file is missing,
-is not UTF-8, or cannot be parsed (JSON nested too deeply included), a field has the wrong JSON
-type, a timing is not a positive finite number or is too large for a float, a limit is not
-finite, a command failed, a scenario is on one side only or lacks a limit, a side's reps are not
+regressed, 1 when something did, and 2 when the files cannot be compared: a file is missing or
+cannot be read, is not UTF-8, or cannot be parsed (JSON nested too deeply, or an integer too long
+to read, included), a field has the wrong JSON type, a timing is not a positive finite number or
+is too large for a float, a limit, an A/A change or the threshold derived from it is not a finite
+number, a command failed, a scenario is on one side only or lacks a limit, a side's reps are not
 0 to n-1 once each, or the two ran on machines with different core counts.
 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
@@ -38,7 +39,7 @@ import pathlib
 import random
 import statistics
 import sys
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, TypeGuard
 
 type _Metric = Literal["wall_s", "cpu_s"]
 type _LimitKey = Literal["wall_pct", "cpu_pct"]
@@ -70,6 +71,8 @@ def _read_text(path: pathlib.Path) -> str:
         return path.read_text()
     except FileNotFoundError:
         raise _CannotCompareError(f"{path}: no such file") from None
+    except OSError as error:
+        raise _CannotCompareError(f"{path}: cannot read ({error.strerror})") from None
     except UnicodeDecodeError as error:
         raise _CannotCompareError(f"{path}: not UTF-8 text ({error})") from None
 
@@ -78,10 +81,10 @@ def _read_json(path: pathlib.Path) -> object:
     text = _read_text(path)
     try:
         return json.loads(text)
-    except json.JSONDecodeError as error:
-        raise _CannotCompareError(f"{path}: not valid JSON ({error})") from None
     except RecursionError:
         raise _CannotCompareError(f"{path}: JSON nested too deeply to read") from None
+    except ValueError as error:  # a JSONDecodeError, or an integer with too many digits to read
+        raise _CannotCompareError(f"{path}: not valid JSON ({error})") from None
 
 
 def _field_int(raw: dict[str, object], name: str) -> int:
@@ -103,6 +106,16 @@ def _field_str(raw: dict[str, object], name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a string, got {value!r}")
     return value
+
+
+def _is_finite_number(value: object) -> TypeGuard[int | float]:
+    """Whether a JSON value is an int or float, not a bool, that is finite as a float."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an integer too large for a float
+        return False
 
 
 def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
@@ -209,10 +222,18 @@ def _change_pct(base: float, head: float) -> float:
 
 
 def _changes(medians: dict[str, dict[_Metric, tuple[float, float]]]) -> _Changes:
-    return {
-        scenario: {key: _change_pct(*by_metric[metric]) for metric, key in _METRICS}
-        for scenario, by_metric in medians.items()
-    }
+    changes = dict[str, dict[str, float]]()
+    for scenario, by_metric in medians.items():
+        changes[scenario] = {}
+        for metric, key in _METRICS:
+            base, head = by_metric[metric]
+            change = _change_pct(base, head)
+            if not math.isfinite(change):
+                raise _CannotCompareError(
+                    f"{scenario} {metric}: the change from {base!r} to {head!r} is not finite"
+                )
+            changes[scenario][key] = change
+    return changes
 
 
 def _derive_threshold(samples: list[_Changes]) -> dict[str, dict[str, int]]:
@@ -222,12 +243,24 @@ def _derive_threshold(samples: list[_Changes]) -> dict[str, dict[str, int]]:
             seen = largest.setdefault(scenario, {key: 0.0 for _, key in _METRICS})
             for _, key in _METRICS:
                 seen[key] = max(seen[key], abs(by_key[key]))
-    return {
-        scenario: {
-            key: max(_FLOOR_PCT, math.ceil(round(3 * spread, 6))) for key, spread in by_key.items()
-        }
-        for scenario, by_key in sorted(largest.items())
-    }
+    thresholds = dict[str, dict[str, int]]()
+    for scenario, by_key in sorted(largest.items()):
+        thresholds[scenario] = {}
+        for key, spread in by_key.items():
+            limit = round(3 * spread, 6)
+            if not math.isfinite(limit):
+                raise _CannotCompareError(
+                    f"{scenario} {key}: an A/A change of {spread!r}% is too large for a threshold"
+                )
+            thresholds[scenario][key] = max(_FLOOR_PCT, math.ceil(limit))
+    return thresholds
+
+
+def _calibration_change(by_key: dict[str, object], key: str) -> float:
+    value = by_key[key]
+    if not _is_finite_number(value):
+        raise ValueError(f"{key} must be a finite number, got {value!r}")
+    return float(value)
 
 
 def _read_calibration(path: pathlib.Path) -> list[_Changes]:
@@ -236,7 +269,7 @@ def _read_calibration(path: pathlib.Path) -> list[_Changes]:
     try:
         samples: list[_Changes] = [
             {
-                str(scenario): {key: float(by_key[key]) for _, key in _METRICS}
+                str(scenario): {key: _calibration_change(by_key, key) for _, key in _METRICS}
                 for scenario, by_key in sample["changes"].items()
             }
             for sample in calibration["samples"]
@@ -262,11 +295,7 @@ def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str
             value = by_key.get(key)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - JSON object
             if value is None:
                 missing.append(f"{scenario} {key}")
-            elif (
-                isinstance(value, bool)
-                or not isinstance(value, int | float)
-                or not math.isfinite(value)
-            ):
+            elif not _is_finite_number(value):  # pyright: ignore[reportUnknownArgumentType] - JSON object
                 raise _CannotCompareError(
                     f"{path}: {scenario} {key} is not a finite number: {value!r}"
                 )
@@ -351,7 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         paired = _paired(result_files[0], result_files[1])
         limits = _read_limits(pathlib.Path(args.threshold_file), list(paired))
     except _CannotCompareError as error:
-        print(f"cannot compare: {error}", file=sys.stderr)
+        # One line, whatever a path or a scenario name holds.
+        print(f"cannot compare: {error}".replace("\n", "\\n"), file=sys.stderr)
         return 2
 
     regressed = False

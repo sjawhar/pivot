@@ -354,6 +354,34 @@ def test_missing_file_cannot_be_compared(
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("head.jsonl", id="result-file"),
+        pytest.param("threshold.json", id="threshold-file"),
+    ],
+)
+def test_input_path_that_is_a_directory_cannot_be_compared(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    rows = _helper_jsonl(_helper_rows([1.0] * 6, [2.0] * 6))
+    (tmp_path / "base.jsonl").write_text(rows)
+    (tmp_path / "head.jsonl").write_text(rows)
+    (tmp_path / "threshold.json").write_text(
+        json.dumps({_SCENARIO: {"wall_pct": 10, "cpu_pct": 10}})
+    )
+    (tmp_path / name).unlink()
+    (tmp_path / name).mkdir()
+    argv = [str(tmp_path / "base.jsonl"), str(tmp_path / "head.jsonl")]
+
+    exit_code = compare.main([*argv, "--threshold-file", str(tmp_path / "threshold.json")])
+
+    err = capsys.readouterr().err
+    assert exit_code == 2, f"a directory must exit 2, not {exit_code}: {err}"
+    assert err.startswith(f"cannot compare: {tmp_path / name}: cannot read"), err
+    assert err.count("\n") == 1, err
+
+
+@pytest.mark.parametrize(
     ("threshold_text", "head_tail"),
     [
         pytest.param("", "", id="empty-threshold-file"),
@@ -400,6 +428,30 @@ def test_malformed_calibration_cannot_be_derived(
         == 2
     )
     err = capsys.readouterr().err
+    assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param("5", id="string"),
+        pytest.param(True, id="boolean"),
+    ],
+)
+def test_calibration_change_that_is_not_a_finite_number_cannot_be_derived(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], change: object
+) -> None:
+    calibration = {"samples": [{"changes": {_SCENARIO: {"wall_pct": change, "cpu_pct": 1.0}}}]}
+    (tmp_path / "calibration.json").write_text(json.dumps(calibration))
+
+    exit_code = compare.main(
+        ["--derive-threshold", "--calibration", str(tmp_path / "calibration.json")]
+    )
+
+    err = capsys.readouterr().err
+    assert exit_code == 2, f"calibration change {change!r} must exit 2, not {exit_code}: {err}"
     assert err.startswith("cannot compare: ") and err.count("\n") == 1, err
 
 
@@ -492,6 +544,8 @@ def test_every_malformed_shape_exits_2_with_one_line(
 
 # Inputs from the round 8 completeness check (pr501r8-0f9b26/scripts/type_edges.sh:77-96).
 _BIG_INT = "1" + "0" * 400
+# More digits than Python reads as an int (sys.get_int_max_str_digits() defaults to 4300).
+_LONG_INT = "1" + "0" * 5000
 _NESTED_ROW = "[" * 100_000 + "]" * 100_000 + "\n"
 
 
@@ -501,6 +555,14 @@ def _helper_with_big_int(field: str) -> bytes:
     row[field] = "BIG"
     lines[0] = json.dumps(row).replace('"BIG"', _BIG_INT) + "\n"
     return "".join(lines).encode()
+
+
+def _helper_limits(wall_pct: str) -> bytes:
+    return f'{{"{_SCENARIO}": {{"wall_pct": {wall_pct}, "cpu_pct": 10}}}}'.encode()
+
+
+def _helper_calibration(wall_pct: str) -> bytes:
+    return f'{{"samples": [{{"changes": {{"{_SCENARIO}": {{"wall_pct": {wall_pct}, "cpu_pct": 1}}}}}}]}}'.encode()
 
 
 @pytest.mark.parametrize(
@@ -534,6 +596,52 @@ def _helper_with_big_int(field: str) -> bytes:
             },
             _COMPARE_ARGV,
             id="deeply-nested-row",
+        ),
+        pytest.param(
+            {"threshold.json": _helper_limits(_BIG_INT)},
+            _COMPARE_ARGV,
+            id="limit-too-large-for-a-float",
+        ),
+        pytest.param(
+            {"threshold.json": _helper_limits(_LONG_INT)},
+            _COMPARE_ARGV,
+            id="limit-too-long-to-read",
+        ),
+        pytest.param(
+            {"calibration.json": _helper_calibration(_BIG_INT)},
+            _DERIVE_ARGV,
+            id="calibration-change-too-large-for-a-float",
+        ),
+        pytest.param(
+            {"calibration.json": _helper_calibration("1e308")},
+            _DERIVE_ARGV,
+            id="calibration-change-too-large-for-a-threshold",
+        ),
+        pytest.param(
+            {
+                "base.jsonl": _helper_jsonl(_helper_rows([1e-310] * 6, [2.0] * 6)).encode(),
+                "head.jsonl": _helper_jsonl(_helper_rows([1e10] * 6, [2.0] * 6)).encode(),
+            },
+            ("base.jsonl", "head.jsonl", "--derive-threshold"),
+            id="change-between-medians-not-finite",
+        ),
+        pytest.param(
+            {
+                "base.jsonl": _helper_jsonl(_helper_rows([1e-310] * 6, [2.0] * 6)).encode(),
+                "head.jsonl": _helper_jsonl(_helper_rows([1e10] * 6, [2.0] * 6)).encode(),
+            },
+            ("--write-calibration", "calibration.json")
+            + ("--sample", "1", "1", "1", "1", "base.jsonl", "head.jsonl"),
+            id="change-between-medians-not-finite-write-calibration",
+        ),
+        pytest.param(
+            {
+                "head.jsonl": _helper_jsonl(
+                    _helper_rows([1.0] * 6, [2.0] * 6, scenario=f"{_SCENARIO}\nwarm")
+                ).encode()
+            },
+            _COMPARE_ARGV,
+            id="scenario-name-with-a-newline",
         ),
     ],
 )
