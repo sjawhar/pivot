@@ -124,7 +124,6 @@ _WATCH_CAP = 4
 # worker pid; the `generation` constant is what the test edits to trigger a code reload.
 _WATCH_PIPELINE = """\
 import os
-import pathlib
 
 from pivot import Pipeline, stage
 
@@ -166,20 +165,25 @@ def _wait_for(condition: typing.Callable[[], bool], what: str, timeout_s: float 
         time.sleep(0.1)
 
 
+def _clean_env() -> dict[str, str]:
+    """Return ``os.environ`` without the workspace's ``VIRTUAL_ENV*`` and ``PYTHONPATH*``."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("VIRTUAL_ENV", "PYTHONPATH"))}
+
+
 def _run(
     args: list[str],
     cwd: pathlib.Path,
     *,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("VIRTUAL_ENV", "PYTHONPATH"))}
+    env = _clean_env()
     if extra_env is not None:
         env.update(extra_env)
     return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=600)
 
 
-@pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
-def test_wheel_installed_in_fresh_venv_runs_init_repro_status_dag(tmp_path: pathlib.Path) -> None:
+def _install_wheel(tmp_path: pathlib.Path, *requirements: str) -> str:
+    """Build pivot's wheel, install it and ``requirements`` into a new venv, return ``pivot``."""
     uv = shutil.which("uv")
     assert uv is not None, "CI installs uv before running tests"
     dist = tmp_path / "dist"
@@ -190,10 +194,16 @@ def test_wheel_installed_in_fresh_venv_runs_init_repro_status_dag(tmp_path: path
     venv = tmp_path / "venv"
     assert _run([uv, "venv", "--python", "3.13", str(venv)], tmp_path).returncode == 0
     install = _run(
-        [uv, "pip", "install", "--python", str(venv / "bin" / "python"), str(wheel)], tmp_path
+        [uv, "pip", "install", "--python", str(venv / "bin" / "python"), str(wheel), *requirements],
+        tmp_path,
     )
     assert install.returncode == 0, install.stderr
-    pivot = str(venv / "bin" / "pivot")
+    return str(venv / "bin" / "pivot")
+
+
+@pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
+def test_wheel_installed_in_fresh_venv_runs_init_repro_status_dag(tmp_path: pathlib.Path) -> None:
+    pivot = _install_wheel(tmp_path)
 
     project = tmp_path / "project"
     (project / "data" / "raw").mkdir(parents=True)
@@ -222,39 +232,12 @@ def test_wheel_installed_in_fresh_venv_runs_init_repro_status_dag(tmp_path: path
     assert (project / "data" / "smoke" / "total.yaml").read_text().strip() == "sum: 100"
 
 
-def _install_wheel_with_loky(tmp_path: pathlib.Path, loky_version: str) -> str:
-    """Build pivot's wheel, install it with ``loky_version`` into a new venv, return ``pivot``."""
-    uv = shutil.which("uv")
-    assert uv is not None, "CI installs uv before running tests"
-    dist = tmp_path / "dist"
-    build = _run([uv, "build", "--package", "pivot", "--wheel", "--out-dir", str(dist)], _REPO_ROOT)
-    assert build.returncode == 0, build.stderr
-    wheel = next(dist.glob("pivot-*.whl"))
-
-    venv = tmp_path / "venv"
-    assert _run([uv, "venv", "--python", "3.13", str(venv)], tmp_path).returncode == 0
-    install = _run(
-        [
-            uv,
-            "pip",
-            "install",
-            "--python",
-            str(venv / "bin" / "python"),
-            str(wheel),
-            f"loky=={loky_version}",
-        ],
-        tmp_path,
-    )
-    assert install.returncode == 0, install.stderr
-    return str(venv / "bin" / "pivot")
-
-
 @pytest.mark.parametrize("loky_version", ["3.5.6", "3.6.0", "3.7.0"])
 @pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
 def test_fresh_wheel_keeps_prestarted_fan_workers_warm(
     tmp_path: pathlib.Path, loky_version: str
 ) -> None:
-    pivot = _install_wheel_with_loky(tmp_path, loky_version)
+    pivot = _install_wheel(tmp_path, f"loky=={loky_version}")
 
     project = tmp_path / "project"
     project.mkdir()
@@ -291,7 +274,7 @@ def test_fresh_wheel_watch_reload_replaces_workers_within_the_cap(
 ) -> None:
     """A code edit under `repro --watch` replaces the previous run's workers: none survives
     the reload, and the session never holds more workers than `core.max_workers`."""
-    pivot = _install_wheel_with_loky(tmp_path, loky_version)
+    pivot = _install_wheel(tmp_path, f"loky=={loky_version}")
     project = tmp_path / "project"
     project.mkdir()
     pipeline_file = project / "pipeline.py"
@@ -307,13 +290,12 @@ def test_fresh_wheel_watch_reload_replaces_workers_within_the_cap(
             out.exists() and f"generation: {generation}" in out.read_text() for out in outputs
         )
 
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("VIRTUAL_ENV", "PYTHONPATH"))}
     log = tmp_path / "watch.log"
     with log.open("w") as output:
         watch = subprocess.Popen(
             [pivot, "repro", "--watch", "--force"],
             cwd=project,
-            env=env,
+            env=_clean_env(),
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,
