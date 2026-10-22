@@ -11,6 +11,7 @@ import pytest
 from pivot import loaders
 from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import data
+from pivot.show import selection as selection_module
 from pivot.types import (
     ArtifactIdentity,
     ArtifactRef,
@@ -761,8 +762,8 @@ def test_diff_data_hashes_change(
 # =============================================================================
 
 
-def _select(targets: list[str]) -> data.DataSelection:
-    selection = data.select_data_files(targets)
+def _select(targets: list[str]) -> selection_module.DataSelection:
+    selection = selection_module.select_data_files(targets)
     assert selection is not None
     return selection
 
@@ -779,8 +780,8 @@ def test_select_data_files_hashes_a_workspace_output(
 
     selection = _select(["process_data"])
 
-    assert len(selection.workspace_hashes["data/process_data.csv"]) == 16  # xxhash64 hex
-    assert selection.workspace_paths == {"data/process_data.csv": output}
+    assert len(selection["workspace_hashes"]["data/process_data.csv"]) == 16  # xxhash64 hex
+    assert selection["workspace_paths"] == {"data/process_data.csv": output}
 
 
 def test_select_data_files_leaves_a_missing_workspace_output_absent(
@@ -792,9 +793,9 @@ def test_select_data_files_leaves_a_missing_workspace_output_absent(
 
     selection = _select(["data/process_data.csv"])
 
-    assert selection.head_hashes == {"data/process_data.csv": None}
-    assert selection.workspace_hashes == {}
-    assert selection.workspace_paths == {}
+    assert selection["head_hashes"] == {"data/process_data.csv": None}
+    assert selection["workspace_hashes"] == {}
+    assert selection["workspace_paths"] == {}
 
 
 def test_select_data_files_expands_a_path_directory_output(
@@ -814,7 +815,7 @@ def test_select_data_files_expands_a_path_directory_output(
 
     selection = _select(["."])
 
-    assert list(selection.workspace_hashes) == ["data/results.dat/one.csv"]
+    assert list(selection["workspace_hashes"]) == ["data/results.dat/one.csv"]
 
 
 def test_select_data_files_warns_about_a_target_that_names_no_output(
@@ -829,8 +830,8 @@ def test_select_data_files_warns_about_a_target_that_names_no_output(
 
     selection = _select(["loose.csv"])
 
-    assert selection.head_hashes == {}
-    assert selection.workspace_hashes == {}
+    assert selection["head_hashes"] == {}
+    assert selection["workspace_hashes"] == {}
     assert "No CSV, JSON or JSONL stage output matches 'loose.csv'" in caplog.text
 
 
@@ -1476,7 +1477,7 @@ def test_select_data_files_only_includes_data_outputs_at_head(
     )
     _mock_head_lock(monkeypatch, None)
 
-    result = _select(["."]).head_hashes
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
@@ -1499,7 +1500,7 @@ outs:
 """
     _mock_head_lock(monkeypatch, lock_content)
 
-    result = _select(["."]).head_hashes
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": "deadbeef00000000"}
 
@@ -1512,7 +1513,7 @@ def test_select_data_files_head_no_lock_file(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, None)
 
-    result = _select(["."]).head_hashes
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
@@ -1525,7 +1526,7 @@ def test_select_data_files_head_invalid_yaml(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"invalid: yaml: content: [")
 
-    result = _select(["."]).head_hashes
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
@@ -1538,7 +1539,7 @@ def test_select_data_files_head_missing_outs_key(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"fingerprint: abc123\n")
 
-    result = _select(["."]).head_hashes
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
@@ -1551,6 +1552,6 @@ def test_select_data_files_head_outs_not_list(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"outs: not_a_list\n")
 
-    result = _select(["."]).head_hashes
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}

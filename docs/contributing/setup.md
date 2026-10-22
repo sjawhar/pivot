@@ -58,7 +58,7 @@ src/pivot/
 ├── executor/            # Stage execution
 ├── pipeline/            # Pipeline loading
 ├── remote/              # S3 and GCS remote storage
-├── show/                # Display commands
+├── show/                # selection.py: output selection; data.py: decoding and comparison
 ├── storage/             # Cache and lock files
 ├── tui/                 # Terminal UI
 ├── watch/               # Watch mode

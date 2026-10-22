@@ -17,6 +17,7 @@ packages/pivot/src/pivot/
 ├── executor/      # Worker process execution (see executor/AGENTS.md)
 ├── remote/        # S3 and GCS remote cache storage (see remote/AGENTS.md)
 ├── storage/       # StateDB, lock files, cache management (see storage/AGENTS.md)
+├── show/           # selection.py: HEAD/workspace output selection; data.py: decoding, comparison, formatting
 ├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot/incremental/directory tags, format inference
 ├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection

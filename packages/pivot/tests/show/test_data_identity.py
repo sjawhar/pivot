@@ -11,6 +11,7 @@ from pivot.cli import helpers as cli_helpers
 from pivot.registry import RegistryStageInfo
 from pivot.show import common as show_common
 from pivot.show import data as data_module
+from pivot.show import selection as selection_module
 from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
 
@@ -76,9 +77,9 @@ def _mock_head_files(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -
 
 
 def _head_hashes() -> dict[str, str | None]:
-    selection = data_module.select_data_files(["."])
+    selection = selection_module.select_data_files(["."])
     assert selection is not None
-    return selection.head_hashes
+    return selection["head_hashes"]
 
 
 def test_select_data_files_detects_format_from_ref_loader(
@@ -192,11 +193,10 @@ def test_select_data_files_expands_an_unlocked_path_directory_from_the_workspace
     (directory / "rows.csv").write_text("id\n1\n")
     _mock_head_files(monkeypatch, {})
 
-    selection = data_module.select_data_files(["data/train.dat/rows.csv"])
-
+    selection = selection_module.select_data_files(["data/train.dat/rows.csv"])
     assert selection is not None
-    assert selection.head_hashes == {}
-    assert list(selection.workspace_paths) == ["data/train.dat/rows.csv"]
+    assert selection["head_hashes"] == {}
+    assert list(selection["workspace_paths"]) == ["data/train.dat/rows.csv"]
 
 
 def test_select_data_files_reads_a_path_directory_output_as_a_directory_from_its_lock(
@@ -223,8 +223,7 @@ outs:
 """
     _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
 
-    selection = data_module.select_data_files(["data/train.dat/rows.csv"])
-
+    selection = selection_module.select_data_files(["data/train.dat/rows.csv"])
     assert selection is not None
-    assert selection.head_hashes == {"data/train.dat/rows.csv": "abcd123400000000"}
-    assert selection.workspace_paths == {}
+    assert selection["head_hashes"] == {"data/train.dat/rows.csv": "abcd123400000000"}
+    assert selection["workspace_paths"] == {}

@@ -52,6 +52,7 @@ def diff(
     deletions, and modifications. Detects reorder-only changes.
     """
     from pivot.show import data as data_module
+    from pivot.show import selection as selection_module
 
     max_rows = max_rows if max_rows is not None else config.get_diff_max_rows()
 
@@ -67,13 +68,15 @@ def diff(
         raise click.ClickException("Cannot use both --key and --positional")
 
     # One selection decides, for HEAD and the workspace, the data files the targets name
-    selection = data_module.select_data_files(targets)
+    selection = selection_module.select_data_files(targets)
     if selection is None:
         click.echo("No data files found in registered stages.")
         return
 
     # Quick hash comparison to find changed files
-    hash_diffs = data_module.diff_data_hashes(selection.head_hashes, selection.workspace_hashes)
+    hash_diffs = data_module.diff_data_hashes(
+        selection["head_hashes"], selection["workspace_hashes"]
+    )
 
     if not hash_diffs:
         if output_format == OutputFormat.JSON:
@@ -114,7 +117,7 @@ def diff(
                     temp_files.append(old_path)
             result = data_module.diff_data_files(
                 old_path=old_path,
-                new_path=selection.workspace_paths.get(rel_path),
+                new_path=selection["workspace_paths"].get(rel_path),
                 path_display=rel_path,
                 change_type=diff_entry["change_type"],
                 key_columns=effective_keys,
