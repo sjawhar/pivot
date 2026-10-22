@@ -8,6 +8,7 @@ import importlib
 import itertools
 import linecache
 import logging
+import os
 import pathlib
 import queue
 import threading
@@ -151,15 +152,24 @@ class _WatchOutputSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class _MissingDependencyRun:
-    """A watch run a missing input stopped, with the paths where its missing inputs would appear."""
+    """A watch run a missing input stopped, and both forms of where it could appear."""
 
     request: RunRequested
-    # Absolute paths of the missing inputs; empty when only a stage output is missing
+    # Absolute paths from pipeline inputs; empty when only a stage output is missing
     input_paths: frozenset[pathlib.Path]
+    # ``realpath`` forms of ``input_paths``, resolving the input's existing symlink prefix
+    resolved_input_paths: frozenset[pathlib.Path]
 
     def awaits(self, path: pathlib.Path) -> bool:
-        """Whether ``path`` is a missing input or a directory that would contain one."""
-        return any(missing.is_relative_to(path) for missing in self.input_paths)
+        """Whether either form of ``path`` is a missing input or contains one."""
+        resolved_path = pathlib.Path(os.path.realpath(path))
+        for missing in self.input_paths:
+            if missing.is_relative_to(path) or missing.is_relative_to(resolved_path):
+                return True
+        return any(
+            missing.is_relative_to(path) or missing.is_relative_to(resolved_path)
+            for missing in self.resolved_input_paths
+        )
 
 
 def _merge_run_requests(earlier: RunRequested, later: RunRequested) -> RunRequested:
@@ -1103,12 +1113,16 @@ class Engine:
             # checks again and replays this run (see _handle_run_requested)
             if self._running_request is None:
                 raise RuntimeError("A watch run stopped by a missing input has no run request")
+            input_paths = frozenset(
+                project.normalize_path(err.input_path)
+                for err in dep_errors
+                if err.input_path is not None
+            )
             self._missing_dependency_run = _MissingDependencyRun(
                 request=self._running_request,
-                input_paths=frozenset(
-                    project.normalize_path(err.input_path)
-                    for err in dep_errors
-                    if err.input_path is not None
+                input_paths=input_paths,
+                resolved_input_paths=frozenset(
+                    pathlib.Path(os.path.realpath(path)) for path in input_paths
                 ),
             )
             await self._invalidate_pipeline([missing.format_user_message()])
