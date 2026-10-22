@@ -1,23 +1,15 @@
-"""A further signal during run.py's interrupt cleanup must neither orphan the command nor hang run.py.
+"""A signal burst during runner cleanup must neither orphan the command nor hang run.py.
 
-When run.py is interrupted, `_stop` sends the measured command SIGINT, waits out a grace period,
-and then, in a `finally`, kills the command and SIGKILLs whatever is left in its session. Two ways
-a further Ctrl-C or SIGTERM breaks that:
+The measured command gets SIGINT, a grace period, a kill, a session sweep, and reaping in that
+order. Further SIGINTs and SIGTERMs cannot interrupt that cleanup.
 
-- It arrives while the `finally` runs. It raises out of the kill or the sweep, and what is left
-  of the command's session keeps running at PPID 1. A burst of signals from a supervisor or a
-  script does this every time; so does a second Ctrl-C about 0.26 s after the first.
-- Its handler runs just after CPython's `Popen.poll()` or `Popen.wait(timeout)` has taken the
-  Popen's internal lock with a non-blocking acquire, before the `try` that releases it. The
-  lock stays held, so the `finally`'s `proc.wait()` blocks forever and run.py never exits.
-  `pkill -TERM -f run.py` on a `uv run` run (pkill's SIGTERM and the one uv forwards) hung it
-  this way on a real pivot.
+The lock-window probe models a raising handler immediately after a non-blocking Popen lock
+acquire. Cleanup must reap directly rather than depend on that possibly stranded lock.
 """
 
 from __future__ import annotations
 
 import contextlib
-import os
 import pathlib
 import signal
 import subprocess
@@ -27,19 +19,10 @@ import time
 import pytest
 
 import run
+import run_test_helpers
 
 _BENCHMARKS = pathlib.Path(run.__file__).parent
 _RUN_PY = pathlib.Path(run.__file__)
-# A stand-in for pivot whose `repro` ignores SIGINT, as a pivot whose shutdown outlasts the grace
-# period would, so run.py's cleanup has to kill it. It writes its session id, and a marker once
-# SIGINT has reached it.
-_DEAF = """#!/bin/sh
-case "$1" in
-  init) mkdir -p .pivot ;;
-  repro) trap 'echo int > {sigint_file}' INT
-         sleep 600 & ps -o sid= -p $$ > {sid_file}; while :; do wait; done ;;
-esac
-"""
 # A stand-in that exits on SIGINT, leaving `sleep 600` in its session for the sweep, as pivot
 # leaves loky's resource tracker. Once run.measure() is waiting for it, it interrupts its parent,
 # the probe, with `first`.
@@ -51,10 +34,9 @@ sleep 0.5
 kill -{first} $PPID
 while :; do wait; done
 """
-# Calls run.measure() in this process, as run.py's main loop does, with run.py's SIGTERM handler.
-# Popen's internal lock is wrapped so that, once the first signal has arrived, the next
-# non-blocking acquire that succeeds is followed at once by a real SIGTERM to this process: the
-# moment at which a signal handler that raises leaves the lock held.
+# Calls run.measure() with a custom Popen lock. Once the first signal arrives, the next
+# non-blocking acquire sends SIGTERM before it returns, modeling a raising handler in that window.
+# Direct reaping must not depend on the lock.
 _PROBE = """
 import os, signal, subprocess, sys, threading
 sys.path.insert(0, sys.argv[1])
@@ -135,22 +117,13 @@ def _helper_semaphores(sid: int) -> list[pathlib.Path]:
     return list(pathlib.Path("/dev/shm").glob(f"sem.loky-{sid}-*"))
 
 
-def _helper_kill_session(sid: int) -> None:
-    for pid in run.session_members(sid) if sid else []:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-
-
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
 def test_a_burst_of_signals_during_cleanup_still_stops_the_command(
     tmp_path: pathlib.Path, signum: signal.Signals
 ) -> None:
     sid_file, sigint_file = tmp_path / "sid", tmp_path / "got-sigint"
-    pivot = tmp_path / "stand-in-pivot"
-    pivot.write_text(_DEAF.format(sid_file=sid_file, sigint_file=sigint_file))
-    pivot.chmod(0o755)
-    argv = [sys.executable, str(_RUN_PY), "--project", "chain-10", "--variant", f"a={pivot}"]
-    argv += ["--reps", "1", "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
+    pivot = run_test_helpers.make_stand_in(tmp_path, run_test_helpers.DEAF_STAND_IN)
+    argv = [sys.executable, str(_RUN_PY), *run_test_helpers.run_argv(tmp_path, pivot)]
     harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     sid = 0
     try:
@@ -174,17 +147,18 @@ def test_a_burst_of_signals_during_cleanup_still_stops_the_command(
         if harness.poll() is None:
             harness.kill()
             harness.wait()
-        _helper_kill_session(sid)
+        if sid:
+            run_test_helpers.kill_session(sid)
 
 
 @pytest.mark.parametrize(
     "first",
     [
-        # The second signal lands in _stop itself, in the Popen.poll() that Popen.send_signal()
-        # makes before it sends pivot SIGINT.
+        # SIGTERM arms the injected lock before cleanup. A Popen-based cleanup would take it
+        # again through its non-blocking poll.
         pytest.param(signal.SIGTERM, id="sigterm-then-sigterm"),
-        # The second signal lands in the 0.25 s that CPython's Popen.wait() waits for the child
-        # after a KeyboardInterrupt, before run.py's own cleanup starts.
+        # SIGINT arms the lock while Popen's wait unwinds. A Popen-based cleanup would take it
+        # again after its interrupt handling.
         pytest.param(signal.SIGINT, id="ctrl-c-then-sigterm"),
     ],
 )
@@ -214,4 +188,5 @@ def test_a_second_signal_in_popens_lock_window_does_not_hang_run_py(
         if probe.poll() is None:
             probe.kill()
             probe.wait()
-        _helper_kill_session(sid)
+        if sid:
+            run_test_helpers.kill_session(sid)

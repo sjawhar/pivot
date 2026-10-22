@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import os
 import pathlib
 import signal
 import subprocess
@@ -13,6 +12,7 @@ import time
 import pytest
 
 import run
+import run_test_helpers
 
 _PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _RUN_PY = pathlib.Path(run.__file__)
@@ -60,12 +60,6 @@ def _helper_wait_for_cleanup(
     return left, semaphores
 
 
-def _helper_kill_session(sid: int) -> None:
-    for pid in run.session_members(sid):
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-
-
 @pytest.mark.parametrize(
     ("first", "second", "delay_s"),
     [
@@ -91,7 +85,6 @@ def test_real_pivot_second_signal_keeps_graceful_cleanup(
     before = set(pathlib.Path("/dev/shm").glob("sem.loky-*"))
     harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     sid = 0
-    semaphores = set[pathlib.Path]()
     try:
         sid = _helper_session(_helper_repro_pid(harness))
         assert len(_helper_wait_for_members(sid)) >= 4, "pivot did not start its worker session"
@@ -109,7 +102,7 @@ def test_real_pivot_second_signal_keeps_graceful_cleanup(
         if harness.poll() is None:
             harness.kill()
             harness.wait()
-        _helper_kill_session(sid)
+        run_test_helpers.kill_session(sid)
         for path in _helper_semaphores(sid) - before:
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
