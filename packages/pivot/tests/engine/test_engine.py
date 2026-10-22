@@ -1312,6 +1312,29 @@ async def test_engine_restart_after_deferred_reload_skips_removed_stages() -> No
 
 
 @pytest.mark.anyio
+async def test_engine_code_change_while_running_handles_its_batch_data_at_once() -> None:
+    """A code change made while a run is in progress waits for that run; its batch's data files
+    are handled at once as a data change, as a batch with no code change would be."""
+    handled = list[list[str]]()
+
+    async with Engine() as engine:
+        engine._run_state = engine_mod._RunState.RUNNING
+
+        async def record_data_change(event: DataArtifactChanged) -> None:
+            handled.append(event["paths"])
+
+        engine._handle_data_artifact_changed = record_data_change
+        await engine._handle_code_or_config_changed(
+            CodeOrConfigChanged(
+                type="code_or_config_changed", paths=["pipeline.py"], data_paths=["input.csv"]
+            )
+        )
+
+        assert engine._reload_pending == {"pipeline.py"}, "the reload waits for the run"
+        assert handled == [["input.csv"]], "the batch's data file is handled at once"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("steps", "replayed"),
     [
@@ -1492,7 +1515,7 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
 
         monkeypatch.setattr("pivot.engine.engine.engine_graph.build_graph", mock_build_graph)
         await engine._handle_code_or_config_changed(
-            CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
+            CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"], data_paths=[])
         )
 
     assert restart_calls == expected_restart_calls
@@ -1526,6 +1549,7 @@ async def test_engine_code_reload_restores_project_watch_root(
             CodeOrConfigChanged(
                 type="code_or_config_changed",
                 paths=[str(tmp_path / "pipeline.py")],
+                data_paths=[],
             )
         )
 
@@ -1553,7 +1577,9 @@ async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
         engine._reload_registry = _helper_reload_failed  # type: ignore[assignment] - test mock
         engine._invalidate_caches = lambda: None  # type: ignore[assignment] - test mock
 
-        event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
+        event = CodeOrConfigChanged(
+            type="code_or_config_changed", paths=["pipeline.py"], data_paths=[]
+        )
         await engine._handle_code_or_config_changed(event)
 
         assert len(restart_calls) == 0, "Should not restart workers on failed reload"
@@ -1599,7 +1625,9 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
         def mock_build_graph(*_a: object) -> MagicMock:
             return MagicMock()
 
-        event = CodeOrConfigChanged(type="code_or_config_changed", paths=["pipeline.py"])
+        event = CodeOrConfigChanged(
+            type="code_or_config_changed", paths=["pipeline.py"], data_paths=[]
+        )
         await engine._handle_code_or_config_changed(event)
 
         assert len(executed) == 1, "Execution should proceed despite restart failure"
