@@ -2,6 +2,28 @@
 
 <!-- version list -->
 
+## v0.5.5 (2026-10-22)
+
+### Bug Fixes
+
+- **watch**: A reload that adds a stage whose input is missing reports the pipeline invalid and
+  keeps watching, instead of ending the session ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+- **watch**: Creating the missing input, including inside a new directory or through a symlink in
+  the project, runs the stopped stages once ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+- **watch**: Keep watching when a reload adds a stage whose input is missing
+  ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+- **watch**: While an input is missing, only a change at that input or a directory above it
+  re-checks the pipeline; other changes are handled as before
+  ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+
 ## v0.5.4 (2026-10-22)
 
 ### Bug Fixes
