@@ -154,7 +154,7 @@ def ensure_state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
     """``state_dir_or_default``, created as ``ensure_state_dir`` creates it.
 
     For a command that 0.5.2 ran and that writes where 0.5.2 wrote to ``.pivot`` (the plot
-    gallery, the completion cache).
+    gallery, the secret key).
     """
     state_dir = state_dir_or_default(root)
     if state_dir != root / ".pivot":
