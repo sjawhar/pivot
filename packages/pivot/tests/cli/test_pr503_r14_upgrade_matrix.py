@@ -1,10 +1,13 @@
 """Round 14 B8: the deep audit's `upgdrv.py`, case for case, as a test.
 
-A project is built and committed in the default `.pivot` layout, which is byte-identical to the
-layout Pivot 0.5.2 writes. Each case then sets `core.state_dir` as `upgdrv.py` does (none, a
-relative `altstate`, an absolute directory outside the project) and runs one command per copy.
-Every command keeps 0.5.2's exit code (0). Configured layouts read the legacy locks and cache and
-print the migration warning; the unconfigured layout prints none.
+`upgdrv.py` built each project with Pivot 0.5.2 (`init`, `config set core.state_dir`, `repro`,
+then `git add -A` and a commit). This test writes the layout 0.5.2 left, as the driver recorded
+it on pivot-slices: locks, cache and run history in `.pivot`; in the configured state directory
+only `locks/` and `state.lmdb`, with no `.gitignore`, so a relative one is committed with
+`.pivot/config.yaml`. The default `.pivot` layout is byte-identical to 0.5.2's, so the head builds
+it. Each case (none, a relative `altstate`, an absolute directory outside the project) then runs
+one command per copy. Every command keeps 0.5.2's exit code (0). Configured layouts read the
+legacy locks and cache and print the migration warning once; the unconfigured layout prints none.
 """
 
 from __future__ import annotations
@@ -94,6 +97,12 @@ def test_legacy_layout_command_matrix(
     if state_dir is not None:
         value = state_dir.format(outside=copy / "outside")
         (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {value}\n")
+        # 0.5.2 wrote only its state database and artifact locks to the configured directory.
+        configured = root / value
+        (configured / "locks").mkdir(parents=True)
+        shutil.copytree(root / ".pivot" / "state.lmdb", configured / "state.lmdb")
+        assert _run(root, copy / "home", "git", "add", "-A").returncode == 0
+        assert _run(root, copy / "home", "git", "commit", "-qm", "configured").returncode == 0
     if command == "checkout-deleted":
         (root / "data" / "test" / "process.txt").unlink()
     args, reads_legacy = _COMMANDS[command]
