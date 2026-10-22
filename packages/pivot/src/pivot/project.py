@@ -16,6 +16,8 @@ _reported_ignored_global_state_dirs = set[pathlib.Path]()
 _reported_unusable_state_dirs = set[pathlib.Path]()
 # Configured state directories whose 0.5.2 lock layout was already reported in this process.
 _reported_legacy_state_dirs = set[pathlib.Path]()
+# Effective cache directories that overlap the stage-lock directory already reported this process.
+_reported_cache_stage_overlaps = set[tuple[pathlib.Path, pathlib.Path]]()
 
 
 STATE_GITIGNORE_CONTENT = """\
@@ -119,14 +121,14 @@ def _resolve_configured_state_dir(
     return state_dir
 
 
-def state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
+def state_dir_or_default(root: pathlib.Path, *, warn: bool = True) -> pathlib.Path:
     """The state directory of a command that 0.5.2 ran without one; nothing is created here.
 
     The configured directory when ``<root>/.pivot/config.yaml`` can be read, its
     ``core.state_dir`` is a path, and that path is or can become a directory this process
-    writes (``state_dir_target_problem``). Otherwise the default ``<root>/.pivot``, after one
-    warning per config file once the CLI enabled warnings. Commands that read or write the
-    configured state resolve it with ``ensure_state_dir`` and fail where 0.5.2 failed.
+    writes (``state_dir_target_problem``). Otherwise the default ``<root>/.pivot``. Callers
+    that merely display stored configuration pass ``warn=False``; a command that reads or writes
+    state uses the warning-enabled resolver and then fails where 0.5.2 failed.
     """
     from pivot import exceptions
 
@@ -146,7 +148,7 @@ def state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
             return state_dir
         problem = f"{target_problem} (core.state_dir in {config_path})"
         reason = "The state directory cannot be used"
-    if _state_dir_warnings_enabled and config_path not in _reported_unusable_state_dirs:
+    if warn and _state_dir_warnings_enabled and config_path not in _reported_unusable_state_dirs:
         _reported_unusable_state_dirs.add(config_path)
         logger.warning(f"{problem}. {reason}; Pivot uses the default .pivot.")
     return root / ".pivot"
@@ -259,6 +261,24 @@ def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
         state_dir,
         legacy,
         move,
+    )
+
+
+def report_cache_stage_overlap(
+    cache_dir: pathlib.Path, stages_dir: pathlib.Path, fallback_cache_dir: pathlib.Path
+) -> None:
+    """Warn once that an effective cache directory overlaps durable stage locks."""
+    if not _state_dir_warnings_enabled:
+        return
+    key = (cache_dir, stages_dir)
+    if key in _reported_cache_stage_overlaps:
+        return
+    _reported_cache_stage_overlaps.add(key)
+    logger.warning(
+        "cache directory %s overlaps the stage-lock directory %s; Pivot uses %s.",
+        cache_dir,
+        stages_dir,
+        fallback_cache_dir,
     )
 
 

@@ -122,3 +122,41 @@ def test_metrics_diff_reads_a_legacy_cache_object(tmp_path: pathlib.Path) -> Non
     assert "modified" in diff.stdout.lower(), diff.stdout
     assert "added" not in diff.stdout.lower(), diff.stdout
     assert diff.stderr.count("Pivot 0.5.2 stored locks and cache") == 1, diff.stderr
+
+
+def test_metrics_diff_does_not_read_a_symlinked_legacy_cache_object(
+    tmp_path: pathlib.Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "project"
+    root.mkdir()
+    for args in (
+        ("init", "-q"),
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "t"),
+    ):
+        assert _run(root, home, "git", *args).returncode == 0
+    assert _run(root, home, _PIVOT, "init").returncode == 0
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "input.txt").write_text("1\n")
+    (root / "pipeline.py").write_text(_METRIC_PIPELINE)
+    assert _run(root, home, _PIVOT, "repro").returncode == 0
+    (root / ".gitignore").write_text("/metrics/\n")
+    assert _run(root, home, "git", "add", "-A").returncode == 0
+    assert _run(root, home, "git", "commit", "-qm", "metric base").returncode == 0
+    lock_data = yaml.safe_load((root / ".pivot" / "stages" / "test" / "process.lock").read_text())
+    file_hash = lock_data["outs"][0]["hash"]
+    cache_object = root / ".pivot" / "cache" / "files" / file_hash[:2] / file_hash[2:]
+    cache_object.parent.mkdir(parents=True, exist_ok=True)
+    cache_object.unlink(missing_ok=True)
+    private_metric = root / "private-metrics.json"
+    private_metric.write_text('{"score": 999}\n')
+    cache_object.symlink_to(private_metric)
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
+    (root / "metrics" / "test" / "process.yaml").write_text("score: 2\n")
+
+    diff = _run(root, home, _PIVOT, "metrics", "diff", "metrics/test/process.yaml")
+
+    assert diff.returncode == 0, diff.stdout + diff.stderr
+    assert "999" not in diff.stdout

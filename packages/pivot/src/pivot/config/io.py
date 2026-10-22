@@ -229,13 +229,9 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def _default_cache_dir() -> str:
-    """``<state dir>/cache``, relative to the project root when it lies inside it.
-
-    While the state directory is unknown or cannot be used, this is 0.5.2's ``.pivot/cache``
-    (``project.state_dir_or_default``); commands that use the state directory still fail.
-    """
+    """Return the default cache display path without resolving or warning about project state."""
     root = project.get_project_root()
-    cache_dir = project.state_dir_or_default(root) / "cache"
+    cache_dir = project.state_dir_or_default(root, warn=False) / "cache"
     try:
         return cache_dir.relative_to(root).as_posix()
     except ValueError:
@@ -495,17 +491,24 @@ def locate_cache_dir() -> pathlib.Path:
 
 
 def get_cache_dir() -> pathlib.Path:
-    """Get the cache directory, initializing project state before a nested cache writer runs.
-
-    Call ``locate_cache_dir`` for a display-only lookup that must not create state.
-    """
+    """Return a writer-facing cache directory without overlapping durable stage locks."""
     root = project.get_project_root()
     cache_dir = locate_cache_dir()
     state_dir = project.state_dir_or_default(root)
     resolved_cache_dir = pathlib.Path(os.path.realpath(cache_dir))
+    stages_dir = state_dir / "stages"
+    fallback_cache_dir = state_dir / "cache"
+    if (
+        resolved_cache_dir == stages_dir
+        or resolved_cache_dir.is_relative_to(stages_dir)
+        or stages_dir.is_relative_to(resolved_cache_dir)
+    ):
+        project.report_cache_stage_overlap(resolved_cache_dir, stages_dir, fallback_cache_dir)
+        cache_dir = fallback_cache_dir
+        resolved_cache_dir = fallback_cache_dir
     if state_dir != root / ".pivot" and resolved_cache_dir.is_relative_to(state_dir):
         project.ensure_state_dir(root)
-        if resolved_cache_dir != state_dir / "cache":
+        if resolved_cache_dir != fallback_cache_dir:
             project.make_nested_cache_dir(resolved_cache_dir)
     return cache_dir
 

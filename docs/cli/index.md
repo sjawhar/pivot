@@ -49,7 +49,9 @@ All commands support:
 resolved against the project root. Empty or whitespace-only values are treated as unset, falling
 back to the config file or `<state dir>/cache`. A cache directory that Pivot creates inside a
 configured state directory, other than `<state dir>/cache`, gets its own `.gitignore` that
-ignores everything in it.
+ignores everything in it. A cache directory that equals, contains, or is inside
+`<state dir>/stages` instead warns once and uses `<state dir>/cache`, so it cannot hide committed
+stage locks.
 
 ---
 

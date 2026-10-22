@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from pivot import project
 from pivot.remote import sync
 from pivot.show import data, metrics
+from pivot.storage import cache
 
 if TYPE_CHECKING:
     import pathlib
@@ -78,3 +79,21 @@ def test_current_cache_scan_stays_silent(
 
     assert hashes == {_HASH}
     assert "Pivot 0.5.2 stored locks and cache" not in caplog.text
+
+
+def test_cache_object_resolver_rejects_a_primary_symlink(
+    set_project_root: pathlib.Path,
+) -> None:
+    _configure_state_dir(set_project_root)
+    primary = set_project_root / "altstate" / "cache" / "files" / _HASH[:2] / _HASH[2:]
+    primary.parent.mkdir(parents=True)
+    secret = set_project_root / "secret"
+    secret.write_text("untrusted\n")
+    primary.symlink_to(secret)
+
+    resolved = cache.resolve_cache_object_path(
+        set_project_root / "altstate" / "cache" / "files", _HASH
+    )
+
+    assert not resolved.exists()
+    assert not resolved.is_symlink()

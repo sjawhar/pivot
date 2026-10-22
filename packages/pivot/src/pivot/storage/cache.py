@@ -371,19 +371,32 @@ def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     return cache_dir / file_hash[:2] / file_hash[2:]
 
 
+def _cache_object_is_readable(path: pathlib.Path) -> bool:
+    """Whether a resolver may return this cache object without following a symlink."""
+    if path.is_symlink():
+        logger.debug("Ignoring symlinked cache object %s", path)
+        return False
+    return path.exists()
+
+
+def _missing_cache_object_path(path: pathlib.Path) -> pathlib.Path:
+    """Return a non-existent path when a cache object is unsafe or absent."""
+    return path.with_name(f".pivot-missing-cache-object-{path.name}")
+
+
 def resolve_cache_object_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
-    """Return an existing cache object, falling back to the matching 0.5.2 cache once."""
+    """Return an existing regular cache object, falling back to the matching 0.5.2 cache once."""
     cache_path = get_cache_path(cache_dir, file_hash)
-    if cache_path.exists():
+    if _cache_object_is_readable(cache_path):
         return cache_path
     legacy_files_dir = project.legacy_cache_files_dir_for(cache_dir)
     if legacy_files_dir is None:
-        return cache_path
+        return _missing_cache_object_path(cache_path)
     legacy_path = get_cache_path(legacy_files_dir, file_hash)
-    if legacy_path.exists():
+    if _cache_object_is_readable(legacy_path):
         project.report_legacy_state_dir(cache_dir.parent.parent)
         return legacy_path
-    return cache_path
+    return _missing_cache_object_path(cache_path)
 
 
 def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: BaseException) -> None:
