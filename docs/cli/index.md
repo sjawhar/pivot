@@ -42,13 +42,19 @@ current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` 
 project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
 `../data/x.csv`.
 
-An absolute path typed through a symlink to the project root, or to a directory inside the
-project, counts as the place it points to in `diff`, `checkout`, `repro`, `dag`, `push`,
-`fetch`, `pull` and `track`: from a `link -> project` symlink, `link/data/x.csv` names
-`data/x.csv`. `pivot get` refuses every absolute path ("Path traversal not allowed in
-target"). `pivot check-ignore` keeps a path under the symlink as typed, so a pattern anchored
-to the project root, such as `data/*.tmp`, does not match it. Give those two the path relative
-to the project root.
+An absolute path that reaches the project through a symlink outside it counts as the place it
+points to in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch`, `pull` and `track`. The
+symlink can point to the project root, to one of its ancestors, or to a directory inside the
+project: from a `link -> project` symlink, `link/data/x.csv` names `data/x.csv`. A symlink
+inside the project is not followed: from `project/dlink -> data`, `dlink/x.csv` matches no
+output in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch` and `pull`, so give the path it
+points to, `data/x.csv`. `track` tracks a file through such a symlink, with a warning that the
+file is inside a symlinked directory.
+
+`pivot get` refuses every absolute path ("Path traversal not allowed in target").
+`pivot check-ignore` keeps a path under a symlink as typed, so a pattern anchored to the project
+root, such as `data/*.tmp`, does not match it. Give those two the path relative to the project
+root.
 
 A path that leaves the project, including `link/../x.csv`, is refused by `checkout`, `push`,
 `fetch`, `pull` and `track` (`resolves outside project root`) and matches no output in
