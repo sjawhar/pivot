@@ -2,6 +2,110 @@
 
 <!-- version list -->
 
+## v0.5.4 (2026-10-22)
+
+### Bug Fixes
+
+- Serve and TUI at any project path; run the suite without uv on PATH
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **rpc**: A stopping serve removes only the socket it bound, and a cancelled bind still cleans up
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **serve**: A worker stopped by the same group stop is not reported as a failed stage
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **serve**: The pivot command takes over a stop signal only when it is at its default, and leaves a
+  launcher's disposition alone ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **serve**: The pivot command's serve mode stops cleanly on SIGTERM, repeated SIGTERM or a
+  process-group SIGTERM, and removes its socket ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **socket**: Serve and the TUI work when the project's agent socket path is longer than a Unix
+  socket address ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **tui**: Pivot-tui carries its own long-path socket code, so its wheel works beside any pivot
+  release ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+### Testing
+
+- Replace the help timing test with a check that help imports no heavy modules
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- Run the test suite without uv on PATH, and check it in CI
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+
+## v0.5.3 (2026-10-22)
+
+### Bug Fixes
+
+- **engine**: Say a deferred reload covers a data change only if it succeeds
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+- **watch**: Hand a batch's data to the data handler when its reload starts no re-run
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+- **watch**: Run each stage once when one watch batch edits code and data
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+### Chores
+
+- Exclude .worktrees/ from basedpyright ([#506](https://github.com/sjawhar/pivot/pull/506),
+  [`38238f8`](https://github.com/sjawhar/pivot/commit/38238f8f0e7baffdf4b663861cf14b657defee93))
+
+- Ignore agent worktrees under .worktrees/ ([#506](https://github.com/sjawhar/pivot/pull/506),
+  [`38238f8`](https://github.com/sjawhar/pivot/commit/38238f8f0e7baffdf4b663861cf14b657defee93))
+
+### Continuous Integration
+
+- Hold releases while main carries a known regression
+  ([#505](https://github.com/sjawhar/pivot/pull/505),
+  [`cf66ba9`](https://github.com/sjawhar/pivot/commit/cf66ba99c6234037f6e64a1fec79a1ecf1e5d26a))
+
+- Run known-regressions on pushes to main only, as intended
+  ([#505](https://github.com/sjawhar/pivot/pull/505),
+  [`cf66ba9`](https://github.com/sjawhar/pivot/commit/cf66ba99c6234037f6e64a1fec79a1ecf1e5d26a))
+
+- The known-regressions header asks for the fix's PR only once one is open
+  ([#505](https://github.com/sjawhar/pivot/pull/505),
+  [`cf66ba9`](https://github.com/sjawhar/pivot/commit/cf66ba99c6234037f6e64a1fec79a1ecf1e5d26a))
+
+### Documentation
+
+- **engine**: Define CodeOrConfigChanged.data_paths without the handler policy
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+- **watch**: Describe the no-stages branch of a batch's data paths
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+### Refactoring
+
+- **engine**: State the reloads that start no re-run in one docstring
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+### Testing
+
+- **engine**: Cover a code change's batch data while a run is in progress
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+
 ## v0.5.2 (2026-10-20)
 
 ### Bug Fixes

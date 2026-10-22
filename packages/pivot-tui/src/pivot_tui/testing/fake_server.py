@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import anyio  # type: ignore[reportMissingImports] - runtime dependency
 
+from pivot_tui import unix_socket
+
 if TYPE_CHECKING:
     from anyio.abc import SocketListener, SocketStream, TaskGroup
 
@@ -149,7 +151,7 @@ class FakeRpcServer:
         with contextlib.suppress(OSError):
             if socket_path.exists():
                 socket_path.unlink()
-        self._listener = await anyio.create_unix_listener(socket_path)
+        self._listener = await unix_socket.create_unix_listener(socket_path)
         self._task_group = anyio.create_task_group()
         task_group = self._task_group
         assert task_group is not None

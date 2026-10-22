@@ -49,6 +49,7 @@ def test_code_or_config_changed_event() -> None:
     event: types.CodeOrConfigChanged = {
         "type": "code_or_config_changed",
         "paths": ["/path/to/stages.py"],
+        "data_paths": ["/path/to/data.csv"],
     }
     assert event["type"] == "code_or_config_changed"
 
@@ -104,7 +105,7 @@ def test_input_event_union() -> None:
     # This test verifies the type alias exists and accepts all event types
     events: list[types.InputEvent] = [
         {"type": "data_artifact_changed", "paths": []},
-        {"type": "code_or_config_changed", "paths": []},
+        {"type": "code_or_config_changed", "paths": [], "data_paths": []},
         {
             "type": "run_requested",
             "stages": None,

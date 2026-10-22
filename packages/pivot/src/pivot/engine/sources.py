@@ -196,10 +196,16 @@ class FilesystemSource:
                                 data_paths.append(path_str)
 
                         if code_paths:
+                            # One event for the batch: its data files changed before the reload
+                            # this starts, so the engine must not treat them as a later edit
                             await send.send(
-                                CodeOrConfigChanged(type="code_or_config_changed", paths=code_paths)
+                                CodeOrConfigChanged(
+                                    type="code_or_config_changed",
+                                    paths=code_paths,
+                                    data_paths=data_paths,
+                                )
                             )
-                        if data_paths:
+                        elif data_paths:
                             await send.send(
                                 DataArtifactChanged(type="data_artifact_changed", paths=data_paths)
                             )

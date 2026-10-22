@@ -1,16 +1,8 @@
-"""Integration tests for serve mode (headless daemon via Engine).
-
-Tests E2E flow: socket creation, status queries, event broadcast.
-"""
+"""Component integration tests for AgentRpcSource, event sinks and event buffers."""
 
 from __future__ import annotations
 
 import json
-import os
-import signal
-import socket
-import subprocess
-import time
 from typing import TYPE_CHECKING
 
 import anyio
@@ -322,112 +314,6 @@ async def test_sink_error_does_not_crash_engine(test_pipeline: Pipeline) -> None
     assert len(collecting_sink.events) > 0
     event_types = [e.get("type") for e in collecting_sink.events if isinstance(e, dict)]
     assert "engine_state_changed" in event_types
-
-
-# =============================================================================
-# CLI Serve Mode E2E Tests
-# =============================================================================
-
-
-def test_serve_mode_cli_responds_to_status_query(
-    tmp_path: pathlib.Path,
-) -> None:
-    """E2E test: pivot repro --watch --serve creates working RPC endpoint.
-
-    This test verifies the complete CLI integration - that _run_serve_mode
-    correctly wires up AgentRpcHandler and EventSink. Without this test,
-    we caught bugs where components worked individually but weren't connected.
-    """
-
-    # Create minimal project structure with a valid pipeline
-    (tmp_path / ".pivot").mkdir(exist_ok=True)
-    (tmp_path / ".git").mkdir(exist_ok=True)
-    pipeline_code = """\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop_stage() -> None:
-    pass
-
-
-with pipeline:
-    noop_stage()
-"""
-    (tmp_path / "pipeline.py").write_text(pipeline_code)
-
-    socket_path = tmp_path / ".pivot" / "agent.sock"
-
-    # Start serve mode as subprocess
-    env = os.environ.copy()
-    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
-    proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--serve"],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    try:
-        # A filesystem socket can exist before the server calls listen(). Wait for an actual
-        # JSON-RPC response rather than treating creation as readiness.
-        response: dict[str, object] | None = None
-        for _ in range(100):
-            if socket_path.exists():
-                try:
-                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                        sock.settimeout(5.0)
-                        sock.connect(str(socket_path))
-                        request = '{"jsonrpc":"2.0","method":"status","id":1}\n'
-                        sock.sendall(request.encode())
-                        response = json.loads(sock.recv(1024).decode().strip())
-                        break
-                except (ConnectionRefusedError, FileNotFoundError):
-                    pass
-            time.sleep(0.1)
-        assert response is not None, "Agent socket did not become RPC-ready within 10s"
-        status_response = response
-
-        # Should get valid status response, NOT "Method not found" error
-        assert "error" not in status_response, (
-            f"Expected status result, got error: {status_response}"
-        )
-        assert "result" in status_response
-        status_result = status_response["result"]
-        assert isinstance(status_result, dict)
-        assert status_result["state"] in ("idle", "active")
-
-        # Also test stages query
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5.0)
-            sock.connect(str(socket_path))
-            request = '{"jsonrpc":"2.0","method":"stages","id":2}\n'
-            sock.sendall(request.encode())
-            stages_response = json.loads(sock.recv(1024).decode().strip())
-
-        assert isinstance(stages_response, dict)
-        assert "error" not in stages_response, (
-            f"Expected stages result, got error: {stages_response}"
-        )
-        assert "result" in stages_response
-        stages_result = stages_response["result"]
-        assert isinstance(stages_result, dict)
-        assert "stages" in stages_result
-
-    finally:
-        # Clean up subprocess
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
 
 
 # =============================================================================

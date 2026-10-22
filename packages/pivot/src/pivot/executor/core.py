@@ -7,6 +7,7 @@ import logging
 import multiprocessing as mp
 import os
 import pathlib
+import signal
 import threading
 from multiprocessing import managers
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
@@ -51,6 +52,18 @@ def _exit_when_parent_dies(parent_pid: int) -> None:
     worker._start_pivot_thread(  # pyright: ignore[reportPrivateUsage] - worker owns coverage bypass
         threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch")
     )
+
+
+def _init_manager(parent_pid: int) -> None:
+    """Initialize the output-queue manager process.
+
+    A service manager's stop (systemd, GNU ``timeout``) signals the whole process group. The
+    manager ignores SIGTERM, as multiprocessing already makes it ignore SIGINT, so it stays up
+    until its owner shuts it down and its finalizer removes its ``pymp-*`` directory. If the
+    owner dies instead, the parent-death watcher exits it.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _exit_when_parent_dies(parent_pid)
 
 
 def configured_worker_count(override: int | None = None) -> int:
@@ -114,7 +127,7 @@ def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
 def create_manager() -> managers.SyncManager:
     """Start a spawn-context manager that exits when this process dies."""
     manager = managers.SyncManager(ctx=mp.get_context("spawn"))
-    manager.start(initializer=_exit_when_parent_dies, initargs=(os.getpid(),))
+    manager.start(initializer=_init_manager, initargs=(os.getpid(),))
     return manager
 
 

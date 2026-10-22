@@ -1,6 +1,6 @@
 [project]
 name = "pivot"
-version = "0.5.2"
+version = "0.5.4"
 description = "High-performance Python pipeline tool with automatic code change detection"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
@@ -84,7 +84,7 @@ dev = [
 ]
 
 [project.scripts]
-pivot = "pivot.cli:main"
+pivot = "pivot.cli:_console_main"
 
 [project.urls]
 Homepage = "https://github.com/sjawhar/pivot"
