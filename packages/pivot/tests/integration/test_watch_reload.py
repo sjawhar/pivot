@@ -1245,14 +1245,15 @@ async def test_reload_adding_a_stage_with_a_missing_input_waits_for_the_file(
 ) -> None:
     """A reload whose re-run finds an input missing leaves watch up with the pipeline invalid.
 
-    Nothing runs, not even on a data change, until the input appears; the data change that
-    creates it runs the re-run the missing input stopped, so the new stage runs once.
+    No stage runs while the input is absent. A write to another existing input is ignored; the
+    missing input itself, or a directory that could contain it, re-checks and resumes the run.
     """
     pipeline_py = watch_project / "pipeline.py"
     pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
     pipeline = _helper_discover(watch_project)
     change_output = _helper_output_path(watch_project, pipeline, "reload/change")
     recorder = _Recorder()
+    caplog.set_level(logging.DEBUG, logger="pivot.engine.engine")
 
     async with engine_mod.Engine(pipeline=pipeline) as eng:
         eng.add_sink(recorder)
@@ -1301,17 +1302,30 @@ async def test_reload_adding_a_stage_with_a_missing_input_waits_for_the_file(
             with pytest.raises(anyio.WouldBlock):
                 run_recv.receive_nowait()
 
+            event_start = len(recorder.events)
+            log_start = len(caplog.records)
             (watch_project / "data" / "raw" / "input.txt").write_text("y")
-            recheck_index = await recorder.wait_for(
-                _helper_is_invalid_pipeline, start=invalid_index + 1
+            with anyio.fail_after(5):
+                while not any(
+                    "ignoring run request" in record.getMessage()
+                    for record in caplog.records[log_start:]
+                ) and not any(
+                    event["type"] == "pipeline_reloaded" for event in recorder.events[event_start:]
+                ):
+                    await anyio.sleep(0.05)
+            assert any(
+                "ignoring run request" in record.getMessage()
+                for record in caplog.records[log_start:]
             )
-            await recorder.wait_for(_helper_is_idle, start=recheck_index)
+            assert not any(
+                event["type"] == "pipeline_reloaded" for event in recorder.events[event_start:]
+            ), "an existing input does not re-check a missing input"
             assert eng.pipeline_error == invalid["error"], "the input is still missing"
 
             (watch_project / "data" / "raw" / "missing.txt").write_text("m")
             valid_index = await recorder.wait_for(
                 _helper_is_reload,
-                start=recheck_index,
+                start=invalid_index + 1,
             )
             late_done = await recorder.wait_for(_helper_completes("reload/late"), start=valid_index)
             await recorder.wait_for(_helper_is_idle, start=late_done)

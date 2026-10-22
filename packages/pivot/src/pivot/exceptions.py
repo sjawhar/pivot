@@ -1,3 +1,4 @@
+import pathlib
 from difflib import get_close_matches
 from typing import override
 
@@ -72,27 +73,31 @@ class DependencyNotFoundError(DAGError):
     _stage: str
     _dep: str
     _available: list[str]
-    _input_path: str | None
+    _input_path: pathlib.Path | None
+    _input_path_display: str | None
 
     def __init__(
         self,
         stage: str,
         dep: str,
         available_outputs: list[str] | None = None,
-        input_path: str | None = None,
+        input_path: pathlib.Path | None = None,
+        input_path_display: str | None = None,
     ) -> None:
         self._stage = stage
         self._dep = dep
         self._available = available_outputs or []
         self._input_path = input_path
+        self._input_path_display = input_path_display
         if input_path is None:
             message = (
                 f"Stage '{stage}' depends on '{dep}' which is not produced by any stage "
                 + "and does not exist on disk"
             )
         else:
+            display_path = input_path_display or str(input_path)
             message = (
-                f"Stage '{stage}' depends on input '{dep}' (path {input_path}), "
+                f"Stage '{stage}' depends on input '{dep}' (path {display_path}), "
                 + "which does not exist"
             )
         super().__init__(message)
@@ -102,8 +107,8 @@ class DependencyNotFoundError(DAGError):
         return self._stage
 
     @property
-    def input_path(self) -> str | None:
-        """The missing input's path as the message shows it; None for a missing stage output."""
+    def input_path(self) -> pathlib.Path | None:
+        """The missing input's filesystem path; None for a missing stage output."""
         return self._input_path
 
     @override
@@ -118,8 +123,13 @@ class DependencyNotFoundError(DAGError):
         return "Ensure the file exists or is produced by another stage"
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[str, str, list[str], str | None]]:
-        return (self.__class__, (self._stage, self._dep, self._available, self._input_path))
+    def __reduce__(
+        self,
+    ) -> tuple[type, tuple[str, str, list[str], pathlib.Path | None, str | None]]:
+        return (
+            self.__class__,
+            (self._stage, self._dep, self._available, self._input_path, self._input_path_display),
+        )
 
 
 class MultipleDependencyError(DAGError):

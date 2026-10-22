@@ -165,9 +165,11 @@ async def test_oneshot_source_passes_orchestration_params(
 
     class EventCapturingEngine(engine_mod.Engine):
         @override
-        async def _handle_run_requested(self, event: RunRequested) -> None:
+        async def _handle_run_requested(
+            self, event: RunRequested, *, recover_missing: bool = False
+        ) -> None:
             captured_events.append(event)
-            await super()._handle_run_requested(event)
+            await super()._handle_run_requested(event, recover_missing=recover_missing)
 
     helpers.register_test_stage(_helper_noop, name="param_test")
 

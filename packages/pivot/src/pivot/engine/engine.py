@@ -783,14 +783,17 @@ class Engine:
             case "code_or_config_changed":
                 await self._handle_code_or_config_changed(event)
 
-    async def _handle_run_requested(self, event: RunRequested) -> None:
+    async def _handle_run_requested(
+        self, event: RunRequested, *, recover_missing: bool = False
+    ) -> None:
         """Handle a RunRequested event by spawning a non-blocking execution task.
 
         If already running, coalesces into a restart: cancels the current run and queues the new
         event, replayed with the cancelled run's stages once that run ends. While a run is
         cancelling, the event joins the queued restart. An explicit cancel, before or after,
         keeps the cancelled run's stages out of the replay. A restart waiting behind a deferred
-        reload is folded into that reload's re-run.
+        reload is folded into that reload's re-run. ``recover_missing`` is only set after a
+        filesystem event was admitted as a missing-input recovery.
         """
         self._stored_no_commit = event["no_commit"]
         self._stored_on_error = event["on_error"]
@@ -799,12 +802,11 @@ class Engine:
         self._stored_resource_capacity = dict(event["resource_capacity"])
 
         if self._pipeline_error is not None:
-            if self._missing_dependency_run is None:
+            missing = self._missing_dependency_run
+            if missing is None or not recover_missing:
                 _logger.debug("Pipeline invalid - ignoring run request until it is fixed")
                 return
-            # The request may follow the creation of the missing input: check again, with the
-            # stopped run's stages too
-            event = _merge_run_requests(self._missing_dependency_run.request, event)
+            event = _merge_run_requests(missing.request, event)
 
         if self._run_state == _RunState.RUNNING:
             # Coalesce: hold the cancelled run's request apart, merged in only at replay
@@ -1111,9 +1113,7 @@ class Engine:
             if self._running_request is None:
                 raise RuntimeError("A watch run stopped by a missing input has no run request")
             input_paths = frozenset(
-                project.normalize_path(err.input_path)
-                for err in dep_errors
-                if err.input_path is not None
+                err.input_path for err in dep_errors if err.input_path is not None
             )
             self._missing_dependency_run = _MissingDependencyRun(
                 request=self._running_request,
@@ -2541,17 +2541,18 @@ class Engine:
         if not filtered_paths:
             return
 
+        missing = self._missing_dependency_run
+        if missing is not None and any(
+            missing.awaits(project.normalize_path(path)) for path in filtered_paths
+        ):
+            # A missing input that arrives inside a new directory is reported as the directory
+            # alone, which maps to no stage.
+            _logger.info("Data changed where a missing input belongs - checking again")
+            await self._handle_run_requested(missing.request, recover_missing=True)
+            return
+
         affected = self._get_affected_stages_for_paths(filtered_paths)
         if not affected:
-            missing = self._missing_dependency_run
-            if missing is None or not any(
-                missing.awaits(project.normalize_path(path)) for path in filtered_paths
-            ):
-                return
-            # A missing input that arrives inside a new directory is reported as the directory
-            # alone, which maps to no stage
-            _logger.info("Data changed where a missing input belongs - checking again")
-            await self._handle_run_requested(missing.request)
             return
 
         _logger.info(
