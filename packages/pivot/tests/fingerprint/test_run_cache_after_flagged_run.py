@@ -4,7 +4,8 @@
 
 An entry filed for the same input hash by an earlier run (0.5.2, or `pivot commit`) would restore
 an output the check never saw over the flagged run's output. A marked lock never consults the
-run cache, and a flagged run deletes any entry at its own input hash.
+run cache, at any input hash, and a flagged run or a `pivot commit` that carries the mark deletes
+any entry at its own input hash.
 """
 
 import json
@@ -226,20 +227,76 @@ def test_status_explain_reports_a_marked_stage_as_will_run_not_run_cache(
 ) -> None:
     """`pivot status --explain` on a stage whose lock carries the uncovered-import mark, with a
     0.5.2 run-cache entry at its input hash: the stage will run with the uncovered-import reason,
-    never as cached from the run cache; `repro` then runs it."""
+    never as cached from the run cache, and `pivot verify` fails it with that reason; `repro`
+    then runs it."""
     project = _project(tmp_path)
     _leave_0_5_2_state(project)
     _ok(_run(project, "repro", "--force", "t/count"))
     _edit_lib(project)
 
     explain = _run(project, "status", "--explain", "t/count")
+    verify = _run(project, "verify")
 
     _ok(explain)
     text = " ".join((explain.stdout + explain.stderr).split())
     assert "Status: WILL RUN" in text, text
     assert "Previous run imported modules its fingerprint does not cover" in text, text
     assert "run cache" not in text, text
+    verified = " ".join((verify.stdout + verify.stderr).split())
+    assert verify.returncode == 1, verified
+    assert "t/count: failed" in verified, verified
+    assert "Previous run imported modules its fingerprint does not cover" in verified, verified
     rerun = _run(project, "repro", "--json")
     _ok(rerun)
     assert '"stage": "t/count", "status": "ran"' in rerun.stdout, rerun.stdout
     assert _value(project) == 103
+
+
+def _set_lines(project: pathlib.Path, text: str) -> None:
+    (project / "data" / "raw" / "lines.txt").write_text(text)
+
+
+def _run_cache_keys(project: pathlib.Path) -> list[bytes]:
+    with state.StateDB(project / ".pivot", readonly=True) as db:
+        return [key for key, _ in db.iter_prefix(b"runcache:t/count:")]
+
+
+def test_marked_lock_is_not_satisfied_from_an_entry_at_another_input_hash(
+    tmp_path: pathlib.Path,
+) -> None:
+    """0.5.2 filed an entry for input Y. The input changes to X, the imported module is edited,
+    and `repro --force` at X marks the lock (deleting only X's entry). Back at Y, the marked lock
+    must not be satisfied from Y's entry: the stage runs and gives 103, not 0.5.2's 4."""
+    project = _project(tmp_path)
+    _leave_0_5_2_state(project)
+    _set_lines(project, _LINES + "Lemma b\n")
+    _edit_lib(project)
+    _ok(_run(project, "repro", "--force", "t/count"))
+    assert _value(project) == 104
+    assert _run_cache_keys(project), "the entry 0.5.2 filed for Y is gone"
+
+    _set_lines(project, _LINES)
+    _ok(_run(project, "repro"))
+
+    assert _value(project) == 103, "the marked lock was satisfied from Y's 0.5.2 entry"
+
+
+def test_commit_carrying_the_mark_deletes_the_entry_at_its_input_hash(
+    tmp_path: pathlib.Path,
+) -> None:
+    """0.5.2 filed an entry for input Y. A forced run at X marks the lock; back at Y,
+    `repro --no-commit` then `pivot commit` records Y's outputs and carries the mark, so it
+    deletes the entry at Y's input hash: no run-cache entry for the stage remains."""
+    project = _project(tmp_path)
+    _leave_0_5_2_state(project)
+    _set_lines(project, _LINES + "Lemma b\n")
+    _ok(_run(project, "repro", "--force", "t/count"))
+    _set_lines(project, _LINES)
+    _ok(_run(project, "repro", "--no-commit"))
+    assert _run_cache_keys(project), "the entry 0.5.2 filed for Y is gone before the commit"
+
+    _ok(_run(project, "commit"))
+
+    assert _run_cache_keys(project) == []
+    lock = (project / ".pivot" / "stages" / "t" / "count.lock").read_text()
+    assert "uncovered-import:" in lock

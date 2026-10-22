@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 import fcntl
 import importlib
+import importlib.util
 import io
 import logging
 import os
@@ -50,6 +51,7 @@ from pivot.types import (
 if TYPE_CHECKING:
     import multiprocessing as mp
     from collections.abc import Callable
+    from types import ModuleType
 
 _STAGE = "skip/consume"
 
@@ -464,94 +466,49 @@ def test_stage_import_tracking_records_cached_module_per_stage(
     assert module_name in second.imported
 
 
-def test_covered_module_first_import_excuses_only_its_own_imports(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """What becomes resident during a covered module's first import is excused; a later import
-    of another user module is counted."""
-    for name, text in {
-        "cov_lib.py": "import cov_dep\n\nVALUE = 1\n",
-        "cov_dep.py": "VALUE = 2\n",
-        "cov_other.py": "VALUE = 3\n",
-    }.items():
-        (tmp_path / name).write_text(text)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    for name in ("cov_lib", "cov_dep", "cov_other"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
-
-    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
-        importlib.import_module("cov_lib")
-        importlib.import_module("cov_other")
-
-    assert tracked.excused == {"cov_lib", "cov_dep"}
-    assert tracked.imported == {"cov_lib", "cov_other"}
-
-
-def _blocking_covered_lib(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Write `cov_lib`, whose top level imports `cov_dep` and then waits until `cov_sync.done`
-    is set, so another thread can act while the covered import is open."""
+def _user_modules(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str]
+) -> ModuleType:
+    """Write each of `files` as a top-level module under `tmp_path`, none of them resident, and
+    return `cov_sync`: a module without a source file whose `go` and `done` events the modules
+    can wait on."""
     sync = type(sys)("cov_sync")
-    sync.started = threading.Event()
+    sync.go = threading.Event()
     sync.done = threading.Event()
     monkeypatch.setitem(sys.modules, "cov_sync", sync)
-    for name, text in {
-        "cov_lib.py": (
-            "import cov_dep\nimport cov_sync\n\n"
-            "cov_sync.started.set()\n"
-            "assert cov_sync.done.wait(10)\n\n"
-            "VALUE = 1\n"
-        ),
-        "cov_dep.py": "VALUE = 2\n",
-        "cov_other.py": "VALUE = 3\n",
-    }.items():
-        (tmp_path / name).write_text(text)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    for name in ("cov_lib", "cov_dep", "cov_other"):
+    for name, text in files.items():
+        (tmp_path / f"{name}.py").write_text(text)
         monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.syspath_prepend(str(tmp_path))
     return sync
 
 
-def _import_on_another_thread_during_cov_lib(sync: object) -> worker._StageImports:
-    def other_thread() -> None:
-        assert sync.started.wait(10)  # pyright: ignore[reportAttributeAccessIssue]
-        importlib.import_module("cov_other")
-        sync.done.set()  # pyright: ignore[reportAttributeAccessIssue]
+def _register_without_the_hooks(name: str, path: pathlib.Path) -> None:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+
+
+def test_covered_module_first_import_excuses_only_its_own_imports(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What a covered module's first import loads is excused; a later import of another user
+    module is counted."""
+    _user_modules(
+        tmp_path,
+        monkeypatch,
+        {"cov_lib": "import cov_dep\n\nVALUE = 1\n", "cov_dep": "VALUE = 2\n", "cov_other": ""},
+    )
 
     with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
-        thread = threading.Thread(target=other_thread)
-        thread.start()
         importlib.import_module("cov_lib")
-        thread.join(10)
-    assert not thread.is_alive()
-    return tracked
+        importlib.import_module("cov_other")
 
-
-def test_newly_resident_module_another_thread_imports_during_a_covered_import_is_excused(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """While a covered import is open, a module that becomes resident on any thread is that
-    import's own: another thread's hooked import of a new `cov_other` is excused."""
-    sync = _blocking_covered_lib(tmp_path, monkeypatch)
-
-    tracked = _import_on_another_thread_during_cov_lib(sync)
-
-    assert {"cov_dep", "cov_other"} <= tracked.excused
-    assert tracked.imported == {"cov_lib"}
-
-
-def test_already_resident_module_another_thread_imports_during_a_covered_import_is_counted(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The window does not excuse another thread's hooked import of a user module that was
-    resident before it opened: that is the import the hook exists to see."""
-    sync = _blocking_covered_lib(tmp_path, monkeypatch)
-    importlib.import_module("cov_other")
-
-    tracked = _import_on_another_thread_during_cov_lib(sync)
-
-    assert "cov_other" in tracked.imported
-    assert "cov_other" not in tracked.excused
-    assert "cov_dep" in tracked.excused
+    assert {"cov_lib", "cov_dep"} <= tracked.added_in_window
+    assert tracked.imported == {"cov_lib", "cov_other"}
+    assert tracked.uncovered() == {"cov_other"}
 
 
 def test_covered_import_of_an_already_resident_dependency_is_excused_on_its_own_thread(
@@ -559,34 +516,222 @@ def test_covered_import_of_an_already_resident_dependency_is_excused_on_its_own_
 ) -> None:
     """A warm worker already holds `cov_dep`; the covered `cov_lib` importing it on its own
     thread is part of that import, as in a cold worker, so it is not counted."""
-    for name, text in {
-        "cov_lib.py": "import cov_dep\n\nVALUE = 1\n",
-        "cov_dep.py": "VALUE = 2\n",
-    }.items():
-        (tmp_path / name).write_text(text)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    for name in ("cov_lib", "cov_dep"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
+    _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": "import cov_dep\n\nVALUE = 1\n", "cov_dep": ""}
+    )
     importlib.import_module("cov_dep")
 
     with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
         importlib.import_module("cov_lib")
 
-    assert "cov_dep" in tracked.excused
     assert tracked.imported == {"cov_lib"}
+    assert tracked.uncovered() == set()
+
+
+# `cov_lib`'s top level starts a loader and returns; the loader waits for `cov_sync.go`, loads
+# `cov_other`, and sets `cov_sync.done`. Each spelling starts the loader a different way.
+_LOADER_STARTS = {
+    "thread": "threading.Thread(target=_load).start()\n",
+    "timer": "threading.Timer(0, _load).start()\n",
+    "pool": (
+        "_pool = concurrent.futures.ThreadPoolExecutor(1)\n"
+        "_pool.submit(_load)\n"
+        "_pool.shutdown(wait=False)\n"
+    ),
+    "start-new-thread": "_thread.start_new_thread(_load, ())\n",
+    "nested-thread": (
+        "threading.Thread(target=lambda: threading.Thread(target=_load).start()).start()\n"
+    ),
+}
+_LOADER_ROUTES = {
+    "hooked": "    importlib.import_module('cov_other')\n",
+    "unhooked": (
+        "    spec = importlib.util.spec_from_file_location(\n"
+        "        'cov_other', pathlib.Path(__file__).with_name('cov_other.py')\n"
+        "    )\n"
+        "    module = importlib.util.module_from_spec(spec)\n"
+        "    sys.modules['cov_other'] = module\n"
+        "    spec.loader.exec_module(module)\n"
+    ),
+}
+
+
+def _loader_lib(start: str, route: str) -> str:
+    return (
+        "import _thread\nimport concurrent.futures\nimport importlib\nimport importlib.util\n"
+        "import pathlib\nimport sys\nimport threading\n\nimport cov_sync\n\n\n"
+        "def _load():\n"
+        "    assert cov_sync.go.wait(10)\n"
+        f"{_LOADER_ROUTES[route]}"
+        "    cov_sync.done.set()\n\n\n"
+        f"{_LOADER_STARTS[start]}\nVALUE = 1\n"
+    )
+
+
+@pytest.mark.parametrize("resident", [False, True], ids=["new", "resident"])
+@pytest.mark.parametrize("route", sorted(_LOADER_ROUTES))
+@pytest.mark.parametrize("start", sorted(_LOADER_STARTS))
+def test_thread_a_covered_import_starts_is_covered_after_the_import_returns(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str,
+    route: str,
+    resident: bool,
+) -> None:
+    """A thread a covered module's first import starts (directly, as a `threading.Timer`, as a
+    `ThreadPoolExecutor` worker, through `_thread.start_new_thread`, or from a thread it started)
+    is a covered thread for the rest of the stage: what it loads after that import returned is
+    not counted, by either route, whether or not the module was already resident."""
+    sync = _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": _loader_lib(start, route), "cov_other": ""}
+    )
+    if resident:
+        importlib.import_module("cov_other")
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        importlib.import_module("cov_lib")
+        sync.go.set()
+        assert sync.done.wait(10)
+
+    assert tracked.imported == {"cov_lib"}
+    assert tracked.uncovered() == set()
+
+
+def test_a_covered_thread_gets_its_own_run_method_back_when_it_ends(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Making a thread covered wraps its `run` only while it runs."""
+    sync = _user_modules(
+        tmp_path,
+        monkeypatch,
+        {
+            "cov_lib": (
+                "import threading\n\nimport cov_sync\n\n"
+                "LOADER = threading.Thread(target=cov_sync.go.wait, args=(10,))\n"
+                "LOADER.start()\n"
+            )
+        },
+    )
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})):
+        loader = importlib.import_module("cov_lib").LOADER
+        assert "run" in vars(loader)
+        sync.go.set()
+        loader.join(10)
+
+    assert not loader.is_alive()
+    assert "run" not in vars(loader)
+
+
+def _thread_blocking_in_cov_lib(sync: ModuleType, target: Callable[[], object]) -> None:
+    """Run `target` on a thread the stage starts, while the stage's own thread is inside the
+    covered `cov_lib`'s first import (which waits for `cov_sync.done`)."""
+
+    def other_thread() -> None:
+        assert sync.go.wait(10)
+        target()
+        sync.done.set()
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    importlib.import_module("cov_lib")
+    thread.join(10)
+    assert not thread.is_alive()
+
+
+_BLOCKING_COV_LIB = "import cov_sync\n\ncov_sync.go.set()\nassert cov_sync.done.wait(10)\n"
+
+
+@pytest.mark.parametrize("resident", [False, True], ids=["new", "resident"])
+def test_hooked_import_on_a_thread_no_covered_thread_started_is_counted(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, resident: bool
+) -> None:
+    """A thread the stage started before its covered import is not a covered thread: its hooked
+    import while the covered import is open is counted, whether or not the module was already
+    resident."""
+    sync = _user_modules(tmp_path, monkeypatch, {"cov_lib": _BLOCKING_COV_LIB, "cov_other": ""})
+    if resident:
+        importlib.import_module("cov_other")
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        _thread_blocking_in_cov_lib(sync, lambda: importlib.import_module("cov_other"))
+
+    assert tracked.uncovered() == {"cov_other"}
+
+
+def test_unhooked_registration_on_another_thread_while_a_covered_thread_runs_is_excused(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `sys.modules` snapshot cannot tell threads apart: a module any thread registers
+    without the hooks while a covered thread runs is excused (a stated limit)."""
+    sync = _user_modules(tmp_path, monkeypatch, {"cov_lib": _BLOCKING_COV_LIB, "cov_other": ""})
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        _thread_blocking_in_cov_lib(
+            sync, lambda: _register_without_the_hooks("cov_other", tmp_path / "cov_other.py")
+        )
+
+    assert "cov_other" in tracked.added_in_window
+    assert tracked.uncovered() == set()
+
+
+@pytest.mark.parametrize("registration", ["exec_module", "importlib.__import__", "__import__"])
+def test_module_the_stage_loads_outside_every_window_stays_counted_when_a_covered_import_uses_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, registration: str
+) -> None:
+    """The stage's own thread loads `cov_late` while no covered thread runs; the covered
+    `cov_lib` then imports it. The earlier load is still counted, by any route."""
+    _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": "import cov_late\n\nVALUE = 1\n", "cov_late": ""}
+    )
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        if registration == "exec_module":
+            _register_without_the_hooks("cov_late", tmp_path / "cov_late.py")
+        elif registration == "importlib.__import__":
+            importlib.__import__("cov_late")
+        else:
+            __import__("cov_late")
+        importlib.import_module("cov_lib")
+
+    assert tracked.uncovered() == {"cov_late"}
+
+
+def test_covered_thread_of_an_earlier_stage_is_not_covered_in_a_later_stage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A covered thread is covered only for the stage whose covered import started it: its
+    import while a later stage runs in the same worker is counted for that stage."""
+    sync = _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": _loader_lib("thread", "hooked"), "cov_other": ""}
+    )
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as first:
+        importlib.import_module("cov_lib")
+    with worker._track_stage_imports(frozenset()) as second:
+        sync.go.set()
+        assert sync.done.wait(10)
+
+    assert first.uncovered() == set()
+    assert second.uncovered() == {"cov_other"}
 
 
 def test_import_hooks_keep_cpythons_signature_and_are_not_installed_on_import() -> None:
-    """`import pivot.executor.worker` leaves the interpreter's `__import__` alone, and a hooked
-    `__import__` accepts CPython's keyword names."""
+    """`import pivot.executor.worker` leaves the interpreter's `__import__` and thread starts
+    alone, and a hooked `__import__` accepts CPython's keyword names."""
     script = "\n".join(
         [
+            "import _thread",
             "import builtins",
-            "original = builtins.__import__",
+            "import threading",
+            "originals = (builtins.__import__, threading.Thread.start, _thread.start_new_thread)",
             "import pivot.executor.worker as worker",
-            "assert builtins.__import__ is original",
+            "assert (builtins.__import__, threading.Thread.start, _thread.start_new_thread)"
+            + " == originals",
             "worker.install_import_hooks()",
-            "assert builtins.__import__ is not original",
+            "assert builtins.__import__ is not originals[0]",
+            "assert threading.Thread.start is not originals[1]",
+            "assert _thread.start_new_thread is not originals[2]",
             "json = builtins.__import__('json', globals=None, locals=None, fromlist=(), level=0)",
             "print(json.__name__)",
         ]

@@ -1121,9 +1121,9 @@ _LATE_THREAD_IMPORTS = {
 def test_thread_import_after_the_covered_import_returned_still_warns(
     tmp_path: pathlib.Path, spelling: str
 ) -> None:
-    """The excusal window closes when the covered import returns: a second thread the stage
-    starts afterwards, importing an uncovered user module, still makes the result not
-    reusable, whether or not its import goes through the hooks."""
+    """A second thread the stage itself starts after its covered import returned is not a
+    covered thread: its import of an uncovered user module still makes the result not reusable,
+    whether or not the import goes through the hooks."""
     files, body_import, read = _TRANSITIVE_LAYOUTS["lib-imports-sibling"]
     thread = (
         "    import threading\n\n"
@@ -1169,9 +1169,9 @@ def test_body_import_of_module_whose_import_thread_imports_a_user_module_is_reus
     tmp_path: pathlib.Path, shape: str
 ) -> None:
     """A loaded `helpers.lib` whose top level starts a thread that imports `plugin` through
-    `__import__` or `importlib.import_module` and joins it: `plugin` becomes resident while the
-    covered import is open, so it is excused whatever thread loaded it, as a module-level import
-    would leave it. The stage warns nothing, caches, and reruns on an edit to `helpers/lib.py`."""
+    `__import__` or `importlib.import_module` and joins it: that thread is a covered thread, so
+    its import belongs to the covered import, as a module-level import would leave it. The stage
+    warns nothing, caches, and reruns on an edit to `helpers/lib.py`."""
     project = _project(
         tmp_path,
         {

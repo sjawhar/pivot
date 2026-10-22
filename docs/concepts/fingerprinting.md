@@ -59,16 +59,22 @@ While a stage runs, its worker records the user modules it imports through
 Python's `__import__` and `importlib.import_module` entry points, including a
 module a warm worker already holds, and compares the `sys.modules` keys before
 and after the stage to catch a newly registered user module loaded from a
-source file. While the stage first imports a covered module, the imports that
-module makes count as its own, as they would for a module-level import: every
-import nested inside it on its own thread, and every module another thread
-newly loads while it is open, however that module was registered. A stage that
-imported a user module its fingerprint does not cover still succeeds, with one
-warning naming the module, but its result is never reused: Pivot files no
-run-cache entry, removes any entry an earlier run filed for the same inputs,
-never restores one for that stage, and writes a lock the next run cannot match;
-`pivot status --explain` and `pivot repro --dry-run --explain` show the stage
-as stale with that reason. `pivot commit` keeps that mark when it
+source file. What a covered module's first import starts belongs to that
+import, as it would for a module-level import: every import on the thread
+running it, every hooked import on a thread it started (and on threads those
+start) for the rest of the stage, already resident or not, and every module
+any thread registers without the hooks while such an import or thread runs.
+A hooked import on any other thread is counted, already resident or not, and
+so is a module registered without the hooks at any other time, even when a
+covered import later imports it. A stage that imported a user module its
+fingerprint does not cover still succeeds, with one warning naming the module,
+but its result is never reused:
+Pivot files no run-cache entry, removes any entry an earlier run filed for the
+same inputs, never restores one for that stage, and writes a lock the next run
+cannot match; `pivot status --explain` and `pivot repro --dry-run --explain`
+show the stage as stale with that reason, and `pivot verify` reports it as
+failed with that reason until it reruns without an uncovered import.
+`pivot commit` keeps that mark when it
 records the same outputs, so the stage still reruns. A user class reached only
 through a loaded input (an object in a `loaders.Pickle()` input whose class the
 stage never names) counts as a module the stage imported; name the class in the
@@ -84,7 +90,8 @@ checked: its declared `code_deps` are its code.
 
 That check does not see every way a stage can reach code. In these cases Pivot
 reuses a result whose fingerprint missed the code, as it would without the
-check:
+check, or, for a thread that existed before a covered import, reruns a stage
+it could have reused:
 
 - a read of a module already in `sys.modules` without an import, or
   `importlib.reload`: import the module where the stage reads it;
@@ -95,13 +102,22 @@ check:
 - an import in a child process: declare the code the child runs as an input,
   or list it in `@no_fingerprint(code_deps=[...])`;
 - an import from a thread that outlives its stage: the import is charged to
-  whichever stage is running when it happens, or to none; join the thread
+  whichever stage is running when it happens, or to none; a covered thread
+  still running in a later stage is not covered for it; join the thread
   before the stage returns;
-- a user module another thread of the stage newly loads, by any route, while
-  any thread is inside a covered module's first import: it is excused with that
-  import's own, so an edit to it is seen only through values the stage reads
-  from the covered module, or when the covered module changes; import user
-  modules statically, or before starting threads;
+- a covered module that hands work at import time to a thread that existed
+  before its import, such as a pool an earlier import created: that thread is
+  not covered, so its imports are counted and the stage reruns; start the
+  thread or pool inside the module, or import the module statically;
+- a user module a covered thread imports that has nothing to do with the
+  covered module: it is excused and not fingerprinted, as on main, so an edit
+  to it is seen only through values the stage reads from the covered module,
+  or when the covered module changes; import user modules statically;
+- a user module another thread registers without the hooks while a covered
+  import or covered thread runs: it is excused with that import's own, so an
+  edit to it is seen only through values the stage reads from the covered
+  module, or when the covered module changes; import user modules statically,
+  or before starting threads;
 - a user module a covered module loads at import time through `importlib.util`
   and `exec_module`, `EntryPoint.load()` or `importlib.__import__`: it is
   excused, as on main, and not fingerprinted itself, so an edit to it is seen

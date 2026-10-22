@@ -128,28 +128,37 @@ not see them (see its limits); an attribute read on a module already loaded is n
 
 ### Imports a Stage Makes While It Runs
 
-The worker initializer (`executor.core._init_worker`) wraps `builtins.__import__` and
-`importlib.import_module` (`worker.install_import_hooks`); importing `pivot.executor.worker` alone
-changes neither, and a stage executed in a process without that initializer gets the hooks for its
-call only. While a stage runs, the hooks record each user module (and its user packages) the stage
-requests, including one already in `sys.modules`, and the worker compares the `sys.modules` keys
-before and after the stage, counting a newly resident module only when it has a `__file__` that
+The worker initializer (`executor.core._init_worker`) wraps `builtins.__import__`,
+`importlib.import_module`, `threading.Thread.start` and `_thread.start_new_thread`
+(`worker.install_import_hooks`); importing `pivot.executor.worker` alone changes none of them, and
+a stage executed in a process without that initializer gets the hooks for its call only. While a
+stage runs, the import hooks record each user module (and its user packages) the stage requests,
+including one already in `sys.modules`, and the worker compares the `sys.modules` keys before and
+after the stage, counting a newly resident module only when it has a `__file__` that
 `is_user_code` accepts. The modules a manifest covers come from one function,
 `fingerprint.covered_user_modules`: `module:<name>` keys, and the `dep:<parameter>:module:<name>`
 and `out:<output>:module:<name>` keys a user loader's walk adds.
 
-When a stage's own import first loads a covered module, the imports that module makes are its
-module-level imports, which a module-level import of it would have made before the stage ran, so
-they are not counted (`_StageImports.excused`). The window is open from the outermost covered
-import's entry to its return, and while any thread is inside one:
+What a covered module's first import starts belongs to that import, whichever thread runs it and
+whenever it runs during the stage, as a module-level import of the module would have made it
+before the stage ran (the covered thread rule, `_StageImports`):
 
-- on the thread running a covered import, every import nested inside it is excused, already
-  resident or not, so a warm worker and a cold one give the same answer;
-- on any other thread while the window is open, a module that becomes newly resident is excused,
-  however it was registered (`__import__`, `importlib.import_module`, `importlib.util` and
-  `exec_module`, `EntryPoint.load()`, `importlib.__import__`), and a hooked import of a module that
-  was resident before the window opened is counted;
-- outside every window, nothing is excused, and the stage's own later imports are counted.
+- **Covered threads.** A thread is covered while it is inside a covered module's first import. A
+  thread started while its starting thread is covered is covered for the rest of the stage, and so
+  is a thread such a thread starts; `threading.Timer`, `ThreadPoolExecutor` workers and
+  `_thread.start_new_thread` threads count. A thread covered for one stage is not covered for a
+  later stage in the same worker.
+- **Hooked imports** (`__import__`, `importlib.import_module`). One made on a covered thread is
+  excused, whether or not the module was already resident, so a warm worker and a cold one give
+  the same answer. One made on any other thread is counted, whether or not the module was already
+  resident: the stage's own thread outside a covered import, and threads the stage started outside
+  one.
+- **Unhooked registrations** (`importlib.util` and `exec_module`, `EntryPoint.load()`,
+  `importlib.__import__`, a manual `sys.modules` insertion), seen only by the `sys.modules`
+  comparison. A module that becomes newly resident while any thread is inside a covered import,
+  or any covered thread of the stage is running, is excused; one that becomes resident at any
+  other time is counted, even when a covered import later imports it. The comparison cannot tell
+  which thread registered a key, so this part is by time.
 
 A covered module is never imported ahead of the stage: discovery pickles `pipeline.py` and other
 modules under the project root by value, and importing one of them in the worker would run it
@@ -164,9 +173,10 @@ and no run-cache entry is filed. A marked lock is never satisfied from the run c
 run-cache entry at its own input hash, so an entry an earlier run filed (0.5.2, or `pivot commit`)
 cannot restore an output the check never saw. `pivot commit` carries that key into the lock it
 writes when the static fingerprint is otherwise unchanged, files no run-cache entry for it, and
-deletes any entry at its input hash (`skip.carry_uncovered_import`). Under `--no-commit` the
-warning adds that `pivot commit` will record the outputs as current. A user class reached only
-through a loaded input (an object in a
+deletes any entry at its input hash (`skip.carry_uncovered_import`). `pivot verify` reports a
+marked stage as failed, with the uncovered-import reason, until it reruns without an uncovered
+import. Under `--no-commit` the warning adds that `pivot commit` will record the outputs as
+current. A user class reached only through a loaded input (an object in a
 `loaders.Pickle()` input whose class the stage never names) counts as a module the stage imported,
 because unpickling imports its module while the stage runs; naming the class in the parameter's
 annotation (`Annotated[Box, loaders.Pickle()]`) covers it.
@@ -179,15 +189,18 @@ untracked, like the local-alias read in [What Gets Tracked](#what-gets-tracked).
 `@no_fingerprint` stage is not checked (`WorkerStageInfo.no_fingerprint`): its `code_deps`
 declaration is its contract.
 
-The check does not see these paths, which behave as they would without it:
+The check does not see these paths, which behave as they would without it, and the covered thread
+rule above draws its line for threads at the rows that name them. Each has a remedy:
 
 | Path | Remedy |
 |------|--------|
 | Reading a module already in `sys.modules` without an import; `importlib.reload` | Import the module where the stage reads it |
 | Private import machinery; a loader that replaces a key already in `sys.modules` or never registers one, such as `runpy.run_path("helpers/lib.py")` and `runpy.run_module("toplib")` for a top-level module | Import statically, or move the value into `StageParams` |
 | An import in a child process | Declare the code the child runs as an input, or use `@no_fingerprint(code_deps=[...])` |
-| An import from a thread that outlives its stage | Join the thread before the stage returns; its import is charged to whichever stage is running, or to none |
-| Another thread of the stage newly loads a user module, by any route, while any thread is inside a covered module's first import | It is excused with that import's own, so an edit to it is seen only through values the stage reads from the covered module, or when the covered module changes. A hooked import of a module already resident before the window opened is still counted. Import user modules statically, or before starting threads |
+| An import from a thread that outlives its stage | Join the thread before the stage returns; its import is charged to whichever stage is running, or to none. A covered thread still running in a later stage is not covered for that stage |
+| A covered module hands work at import time to a thread that existed before its import, such as a pool an earlier import created | That thread is not a covered thread, so its imports are counted: the stage warns and reruns. Start the thread or pool inside the module, or import the module statically |
+| A covered thread imports a user module unrelated to the covered module | It is excused and not fingerprinted, as on main: an edit to it is seen only through values the stage reads from the covered module, or when the covered module changes. Import user modules statically |
+| While any thread is inside a covered import, or any covered thread of the stage runs, another thread registers a user module without the hooks (`importlib.util` and `exec_module`, `EntryPoint.load()`, `importlib.__import__`) | It is excused with the covered import's own, so an edit to it is seen only through values the stage reads from the covered module, or when the covered module changes. A hooked import on that thread is counted. Import user modules statically, or before starting threads |
 | A user module that a covered module loads at import time through `importlib.util` and `exec_module`, `EntryPoint.load()` or `importlib.__import__` | It is excused, as on main, and not fingerprinted itself: an edit to it is seen only through values the stage reads from the covered module, or when the covered module changes. Import it statically |
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |

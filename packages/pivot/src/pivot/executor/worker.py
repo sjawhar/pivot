@@ -6,6 +6,7 @@ Must be module-level and picklable.
 
 from __future__ import annotations
 
+import _thread
 import builtins
 import codecs
 import collections
@@ -81,32 +82,47 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass(slots=True)
 class _StageImports:
-    """User modules one stage call imported, and the modules its covered imports pulled in."""
+    """The user modules one stage call imported, under the covered thread rule.
+
+    A covered thread is one inside a covered module's first import, or a thread a covered thread
+    started during this stage (`_on_covered_thread`). What a covered thread imports belongs to
+    the covered import, as a module-level import of it would have before the stage ran.
+    """
 
     # The user modules the stage's manifest covers (`fingerprint.covered_user_modules`).
     covered: frozenset[str]
-    # User modules the stage requested through `__import__` or `importlib.import_module`.
+    # User modules the stage requested through `__import__` or `importlib.import_module` on a
+    # thread that is not a covered thread, already resident or not. The same request on a covered
+    # thread is not recorded, already resident or not, so a warm worker and a cold one agree.
     imported: set[str] = dataclasses.field(default_factory=set[str])
-    # The modules a covered module's first import accounts for, as a module-level import of it
-    # would have before the stage ran:
-    # - on the thread running that import, every module imported inside it, already resident or
-    #   not, so a warm worker and a cold one give the same answer;
-    # - on any other thread while that import is open, a module that became resident during it,
-    #   however it was registered (`__import__`, `exec_module`, `EntryPoint.load()`,
-    #   `importlib.__import__`); a hooked import there of a module resident before the window
-    #   opened is still counted.
-    # Outside every window nothing is excused.
-    excused: set[str] = dataclasses.field(default_factory=set[str])
-    # How many threads are inside a covered module's first import, and the `sys.modules` keys at
-    # the moment the first of them entered. Guarded by `_stage_imports_lock`.
+    # `sys.modules` keys added while the window below was open, however they were registered
+    # (`exec_module`, `EntryPoint.load()`, `importlib.__import__`). The snapshot cannot tell
+    # which thread registered a key, so this part of the rule is by time.
+    added_in_window: set[str] = dataclasses.field(default_factory=set[str])
+    # User source modules that became resident during the stage outside the window, by any
+    # route: the `sys.modules` snapshot's count, set when the stage returns. A covered import
+    # that requests such a module later does not remove it.
+    new_outside_window: set[str] = dataclasses.field(default_factory=set[str])
+    # The window is open while any thread is inside a covered module's first import or any
+    # covered thread of this stage is running: `window_depth` counts those holds, and
+    # `window_resident_before` holds the `sys.modules` keys at the moment it opened. Guarded by
+    # `_stage_imports_lock`.
     window_depth: int = 0
     window_resident_before: frozenset[str] = frozenset()
 
+    def uncovered(self) -> set[str]:
+        """The user modules the stage imported that its manifest does not cover."""
+        return (self.imported | self.new_outside_window) - self.covered
+
 
 class _CoveredImportState(threading.local):
-    """How deep this thread is inside a covered module's first import."""
+    """This thread's part in the covered thread rule: how deep it is inside a covered module's
+    first import and for which stage, and the stage it is a covered thread of when a covered
+    thread started it (`_tracked_thread_start`)."""
 
     depth: int = 0
+    importing_for: _StageImports | None = None
+    covered_for: _StageImports | None = None
 
 
 _stage_imports: _StageImports | None = None
@@ -114,7 +130,36 @@ _stage_imports_lock = threading.Lock()
 _covered_import_state = _CoveredImportState()
 _original_import = builtins.__import__
 _original_import_module = importlib.import_module
+_original_thread_start = threading.Thread.start
+_original_start_new_thread = _thread.start_new_thread
+_original_start_new = _thread.start_new
 _hooks_installed = False
+
+
+def _on_covered_thread(tracked: _StageImports) -> bool:
+    """Whether this thread is a covered thread of the stage `tracked` records: inside a covered
+    module's first import for that stage, or a thread a covered thread started during it."""
+    state = _covered_import_state
+    return (state.depth > 0 and state.importing_for is tracked) or state.covered_for is tracked
+
+
+def _open_window(tracked: _StageImports) -> None:
+    """Hold the stage's window for unhooked registrations open (`_StageImports.window_depth`)."""
+    with _stage_imports_lock:
+        if tracked.window_depth == 0:
+            tracked.window_resident_before = frozenset(sys.modules)
+        tracked.window_depth += 1
+
+
+def _close_window(tracked: _StageImports) -> None:
+    """Release one hold on the window. When the last is released, every `sys.modules` key added
+    while it was open is recorded (`_StageImports.added_in_window`)."""
+    with _stage_imports_lock:
+        tracked.window_depth -= 1
+        if tracked.window_depth == 0:
+            if _stage_imports is tracked:
+                tracked.added_in_window.update(set(sys.modules) - tracked.window_resident_before)
+            tracked.window_resident_before = frozenset()
 
 
 def _is_user_source_module(module: object) -> bool:
@@ -135,30 +180,17 @@ def _package_chain(name: str) -> list[str]:
 
 
 def _record_stage_import(names: Sequence[str]) -> None:
-    """Record each of `names` that is resident user source, for the running stage.
-
-    On the thread running a covered import, every import nested inside it is excused. On any
-    other thread while a covered import is open, a module that became resident after that window
-    opened is excused, and one already resident is counted. Outside every window, everything is
-    counted.
-    """
+    """Record each of `names` that is resident user source for the running stage, whether or not
+    it was resident before. On a covered thread of that stage nothing is recorded."""
     tracked = _stage_imports
-    if tracked is None:
+    if tracked is None or _on_covered_thread(tracked):
         return
     found = [name for name in names if _is_user_source_module(sys.modules.get(name))]
     if not found:
         return
-    nested = _covered_import_state.depth > 0
     with _stage_imports_lock:
-        if _stage_imports is not tracked:
-            return
-        for module_name in found:
-            if nested or (
-                tracked.window_depth and module_name not in tracked.window_resident_before
-            ):
-                tracked.excused.add(module_name)
-            else:
-                tracked.imported.add(module_name)
+        if _stage_imports is tracked:
+            tracked.imported.update(found)
 
 
 def _imports_only_covered(tracked: _StageImports, name: str, fromlist: Sequence[str]) -> bool:
@@ -185,31 +217,93 @@ def _imports_only_covered(tracked: _StageImports, name: str, fromlist: Sequence[
 def _covered_import(
     tracked: _StageImports, name: str | None, fromlist: Sequence[str]
 ) -> Generator[None]:
-    """Open the stage's covered-import window while this thread first-imports a covered module.
-
-    The window stays open while any thread is inside such an import. When the last one returns,
-    every `sys.modules` key added since the window opened is excused (`_StageImports.excused`).
-    """
+    """Make this thread a covered thread while it first-imports a covered module, and hold the
+    stage's window for unhooked registrations open meanwhile (`_open_window`)."""
     state = _covered_import_state
     if state.depth == 0 and (name is None or not _imports_only_covered(tracked, name, fromlist)):
         yield
         return
     if state.depth == 0:
-        with _stage_imports_lock:
-            if tracked.window_depth == 0:
-                tracked.window_resident_before = frozenset(sys.modules)
-            tracked.window_depth += 1
+        state.importing_for = tracked
+        _open_window(tracked)
     state.depth += 1
     try:
         yield
     finally:
         state.depth -= 1
         if state.depth == 0:
-            with _stage_imports_lock:
-                tracked.window_depth -= 1
-                if tracked.window_depth == 0 and _stage_imports is tracked:
-                    tracked.excused.update(set(sys.modules) - tracked.window_resident_before)
-                    tracked.window_resident_before = frozenset()
+            state.importing_for = None
+            _close_window(tracked)
+
+
+def _run_as_covered_thread(tracked: _StageImports, function: Callable[[], object]) -> None:
+    """Run a thread's body as a covered thread of the stage `tracked` records, then release the
+    hold on that stage's window its start took."""
+    _covered_import_state.covered_for = tracked
+    try:
+        function()
+    finally:
+        _covered_import_state.covered_for = None
+        _close_window(tracked)
+
+
+def _tracked_thread_start(self: threading.Thread) -> None:
+    """Start `self`; when a covered thread of the running stage starts it, `self` is a covered
+    thread of that stage until its `run` returns, and holds the stage's window open until then.
+
+    `threading.Timer` and `concurrent.futures.ThreadPoolExecutor` workers start through here.
+    """
+    tracked = _stage_imports
+    if tracked is None or not _on_covered_thread(tracked):
+        _original_thread_start(self)
+        return
+    run = self.run
+    own_run = "run" in vars(self)
+
+    def restore_run() -> None:
+        if own_run:
+            self.run = run
+        else:
+            vars(self).pop("run", None)
+
+    def covered_run() -> None:
+        try:
+            _run_as_covered_thread(tracked, run)
+        finally:
+            restore_run()
+
+    self.run = covered_run
+    _open_window(tracked)
+    try:
+        _original_thread_start(self)
+    except BaseException:
+        restore_run()
+        _close_window(tracked)
+        raise
+
+
+def _tracked_start_new_thread(
+    function: Callable[..., object],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any] | None = None,
+    /,
+) -> int:
+    """`_thread.start_new_thread` and its synonym `start_new`, under the rule
+    `_tracked_thread_start` applies."""
+    call_kwargs = {} if kwargs is None else kwargs
+    tracked = _stage_imports
+    if tracked is None or not callable(function) or not _on_covered_thread(tracked):
+        return _original_start_new_thread(function, args, call_kwargs)
+
+    def covered_function(*call_args: object, **named: object) -> None:
+        _run_as_covered_thread(tracked, lambda: function(*call_args, **named))
+
+    _open_window(tracked)
+    try:
+        return _original_start_new_thread(covered_function, args, call_kwargs)
+    except BaseException:
+        _close_window(tracked)
+        raise
 
 
 def _tracked_import(
@@ -255,18 +349,27 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
 
 
 def install_import_hooks() -> None:
-    """Route `builtins.__import__` and `importlib.import_module` through the stage-import check.
+    """Route `builtins.__import__` and `importlib.import_module` through the stage-import check,
+    and thread starts (`threading.Thread.start`, `_thread.start_new_thread`) through the covered
+    thread rule.
 
     The worker initializer (`executor.core._init_worker`) calls this; nothing else in Pivot's
     own process installs it. The hooks record nothing while no stage is running.
     """
     global _original_import, _original_import_module, _hooks_installed
+    global _original_thread_start, _original_start_new_thread, _original_start_new
     if _hooks_installed:
         return
     _original_import = builtins.__import__
     _original_import_module = importlib.import_module
+    _original_thread_start = threading.Thread.start
+    _original_start_new_thread = _thread.start_new_thread
+    _original_start_new = _thread.start_new
     builtins.__import__ = _tracked_import
     importlib.import_module = _tracked_import_module
+    threading.Thread.start = _tracked_thread_start
+    _thread.start_new_thread = _tracked_start_new_thread
+    _thread.start_new = _tracked_start_new_thread
     _hooks_installed = True
 
 
@@ -274,6 +377,9 @@ def _uninstall_import_hooks() -> None:
     global _hooks_installed
     builtins.__import__ = _original_import
     importlib.import_module = _original_import_module
+    threading.Thread.start = _original_thread_start
+    _thread.start_new_thread = _original_start_new_thread
+    _thread.start_new = _original_start_new
     _hooks_installed = False
 
 
@@ -282,7 +388,11 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
     """Record the user modules one stage call imports.
 
     A stage executed in a process without the worker initializer (`execute_stage` called
-    directly) gets the hooks for this call only.
+    directly) gets the hooks for this call only. When the stage returns, every user source module
+    that became resident during it outside the window is recorded
+    (`_StageImports.new_outside_window`). A covered thread still running then holds the window
+    open, so the keys added since it opened count as added in it; that thread is not a covered
+    thread of a later stage.
     """
     global _stage_imports
     installed_here = not _hooks_installed
@@ -291,12 +401,21 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
     tracked = _StageImports(covered=covered)
     with _stage_imports_lock:
         assert _stage_imports is None, "Worker cannot execute two stages concurrently"
+        resident_before = frozenset(sys.modules)
         _stage_imports = tracked
     try:
         yield tracked
     finally:
         with _stage_imports_lock:
+            resident_after = set(sys.modules)
+            if tracked.window_depth:
+                tracked.added_in_window.update(resident_after - tracked.window_resident_before)
             _stage_imports = None
+        tracked.new_outside_window.update(
+            name
+            for name in resident_after - resident_before - tracked.added_in_window
+            if _is_user_source_module(sys.modules.get(name))
+        )
         if installed_here:
             _uninstall_import_hooks()
 
@@ -775,7 +894,6 @@ def _execute_stage(
                             )
 
                 covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
-                before_modules = set(sys.modules)
                 with _track_stage_imports(covered_modules) as stage_imports:
                     output_paths = _run_stage_function_with_store(
                         stage_info["func"],
@@ -794,16 +912,10 @@ def _execute_stage(
                         project_state_dir,
                         project_root,
                     )
-                imported_modules = set(stage_imports.imported)
-                for module_name in set(sys.modules) - before_modules - stage_imports.excused:
-                    if _is_user_source_module(sys.modules.get(module_name)):
-                        imported_modules.add(module_name)
                 # A @no_fingerprint stage declares its code as files (`code_deps`); that
                 # declaration is its contract, so its imports are not checked.
                 uncovered = (
-                    set[str]()
-                    if stage_info["no_fingerprint"]
-                    else imported_modules - covered_modules
+                    set[str]() if stage_info["no_fingerprint"] else stage_imports.uncovered()
                 )
                 lock_manifest = current_fingerprint
                 if uncovered:
