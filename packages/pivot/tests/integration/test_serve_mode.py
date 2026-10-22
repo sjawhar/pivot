@@ -831,25 +831,48 @@ def test_cli_module_run_as_a_script_owns_stop_signals(
         shutil.rmtree(private_tmp)
 
 
+# A sitecustomize module, which Python imports at start from PYTHONPATH before it runs the script:
+# a launcher can install a Python SIGTERM handler this way. As the LD_PRELOAD library does, it
+# drops its marker from the environment, so the Python processes pivot starts do not install it.
+_LAUNCHER_SITECUSTOMIZE = """\
+import os
+import signal
+
+
+def _launcher_handler(_signum, _frame):
+    os.write(2, b"host-handler: SIGTERM\\n")
+
+
+if os.environ.pop("PIVOT_TEST_LAUNCHER_HANDLER", None):
+    signal.signal(signal.SIGTERM, _launcher_handler)
+"""
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses LD_PRELOAD and /proc")
-@pytest.mark.parametrize("launcher", ["embedding-host", "ld-preload"])
+@pytest.mark.parametrize("launcher", ["embedding-host", "ld-preload", "sitecustomize"])
 def test_pivot_command_leaves_a_sigterm_handler_its_launcher_installed(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, launcher: str
 ) -> None:
-    """What launched the `pivot` command can install SIGTERM's handler in C before Python
-    starts: a C program that embeds Python and runs the script, or an LD_PRELOAD library. That
-    launcher owns SIGTERM, so serve leaves it alone, as on main: the launcher's handler runs on
-    SIGTERM, serve keeps answering, and Ctrl-C stops serve, which exits 0 and removes its
-    socket."""
+    """What launched the `pivot` command can give SIGTERM a handler before the script runs: in C
+    before Python starts (a C program that embeds Python, an LD_PRELOAD library), or in Python
+    (a sitecustomize module). That launcher owns SIGTERM, so serve leaves it alone, as on main:
+    the launcher's handler runs on SIGTERM, serve keeps answering, and Ctrl-C stops serve, which
+    exits 0 and removes its socket."""
     project = tmp_path / "project"
     _helper_project(project)
     pivot_script = pathlib.Path(_PIVOT_BIN)
     env = {**os.environ, "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    argv = [str(pivot_script)]
     if launcher == "embedding-host":
         argv = [str(_helper_embedding_host(tmp_path)), sys.executable, str(pivot_script)]
-    else:
+    elif launcher == "ld-preload":
         env["LD_PRELOAD"] = str(_helper_host_handler_library(tmp_path))
-        argv = [str(pivot_script)]
+    else:
+        site_dir = tmp_path / "site"
+        site_dir.mkdir()
+        (site_dir / "sitecustomize.py").write_text(_LAUNCHER_SITECUSTOMIZE)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(site_dir), env.get("PYTHONPATH")]))
+        env["PIVOT_TEST_LAUNCHER_HANDLER"] = "1"
     # Short, because multiprocessing binds its manager's socket under TMPDIR.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
     env["TMPDIR"] = str(private_tmp)
@@ -876,10 +899,10 @@ def test_pivot_command_leaves_a_sigterm_handler_its_launcher_installed(
             assert proc.poll() is None, (
                 f"SIGTERM stopped serve (exit {proc.returncode}):\n{stderr_path.read_text()[-2000:]}"
             )
-            assert send_rpc(socket_path, "status") is not None, "serve stopped answering"
             assert "host-handler: SIGTERM" in stderr_path.read_text(), (
                 f"the launcher's SIGTERM handler did not run:\n{stderr_path.read_text()[-2000:]}"
             )
+            assert send_rpc(socket_path, "status") is not None, "serve stopped answering"
             proc.send_signal(signal.SIGINT)
             exit_code = proc.wait(timeout=20)
         finally:
@@ -888,6 +911,80 @@ def test_pivot_command_leaves_a_sigterm_handler_its_launcher_installed(
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
         assert exit_code == 0, f"exit {exit_code} after Ctrl-C:\n{stderr_path.read_text()[-2000:]}"
+        assert not (project / socket_path).exists(), "serve left its socket"
+    finally:
+        shutil.rmtree(private_tmp)
+
+
+def _helper_disposition(pid: int, signum: int) -> str:
+    """Return whether the kernel reports ``signum`` ignored, caught or at its default action for
+    process ``pid`` (SigIgn and SigCgt in /proc/<pid>/status)."""
+    masks = {
+        key: int(value, 16)
+        for key, _, value in (
+            line.partition(":")
+            for line in pathlib.Path(f"/proc/{pid}/status").read_text().splitlines()
+        )
+        if key in ("SigIgn", "SigCgt")
+    }
+    bit = 1 << (signum - 1)
+    return "ignored" if masks["SigIgn"] & bit else "caught" if masks["SigCgt"] & bit else "default"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc/<pid>/status")
+def test_pivot_command_leaves_sigint_ignored_when_its_launcher_ignores_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launcher can start the `pivot` command with Ctrl-C ignored (a background job of a
+    non-interactive shell, `trap '' INT`). That launcher owns SIGINT, so serve leaves it ignored:
+    a SIGINT changes nothing and serve keeps answering. SIGTERM, still at its default, stops
+    serve, which exits 0 and removes its socket."""
+    project = tmp_path / "project"
+    _helper_project(project)
+    # Short, because multiprocessing binds its manager's socket under TMPDIR.
+    private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
+    env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    stderr_path = tmp_path / "serve.stderr"
+    socket_path = pathlib.Path(".pivot", "agent.sock")
+    try:
+        # The launcher ignores SIGINT; the child inherits SIG_IGN across exec.
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with stderr_path.open("wb") as stderr_file:
+                proc = subprocess.Popen(
+                    [_PIVOT_BIN, "repro", "--watch", "--serve"],
+                    cwd=project,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        monkeypatch.chdir(project)
+        try:
+            response = _helper_wait_for_status(proc, socket_path, time.monotonic() + 30)
+            assert response is not None, (
+                f"serve did not answer (exit {proc.poll()}):\n{stderr_path.read_text()[-2000:]}"
+            )
+            serving = _helper_disposition(proc.pid, signal.SIGINT)
+            proc.send_signal(signal.SIGINT)
+            time.sleep(2)
+            assert proc.poll() is None, (
+                f"the launcher ignored SIGINT, but SIGINT stopped serve (exit {proc.returncode}); "
+                + f"SIGINT while serving was {serving}:\n{stderr_path.read_text()[-2000:]}"
+            )
+            assert serving == "ignored", f"serve replaced the launcher's SIG_IGN: SIGINT {serving}"
+            assert send_rpc(socket_path, "status") is not None, "serve stopped answering"
+            proc.send_signal(signal.SIGTERM)
+            exit_code = proc.wait(timeout=20)
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        assert exit_code == 0, f"exit {exit_code} after SIGTERM:\n{stderr_path.read_text()[-2000:]}"
         assert not (project / socket_path).exists(), "serve left its socket"
     finally:
         shutil.rmtree(private_tmp)

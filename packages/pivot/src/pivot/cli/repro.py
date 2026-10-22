@@ -577,12 +577,16 @@ def _run_serve_mode(
 
     stop_signals = list[signal.Signals]()
     if is_standalone_invocation() and threading.current_thread() is threading.main_thread():
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            handler = signal.getsignal(signum)
-            # None: what launched pivot (a C host that embeds Python, an LD_PRELOAD library)
-            # installed this handler before Python started, so that launcher owns the signal.
-            # Ctrl-C inherited as ignored (a background job of a non-interactive shell) stays so.
-            if handler is not None and not (signum == signal.SIGINT and handler is signal.SIG_IGN):
+        # Serve takes a stop signal only at its default, as Python sets it at start when nothing
+        # else did. Any other disposition was set by whatever launched pivot, which owns that
+        # signal: SIG_IGN (`env --ignore-signal`, `trap ''`, a background job of a
+        # non-interactive shell), a C handler installed before Python started (getsignal() is
+        # None), or a Python handler.
+        for signum, default in (
+            (signal.SIGTERM, signal.SIG_DFL),
+            (signal.SIGINT, signal.default_int_handler),
+        ):
+            if signal.getsignal(signum) is default:
                 stop_signals.append(signum)
     if not stop_signals:
         # Only the `pivot` command owns its process, and only on the main thread may Python
