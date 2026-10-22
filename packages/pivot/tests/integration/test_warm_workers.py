@@ -566,6 +566,138 @@ def test_killed_pivot_leaves_no_child_processes(
                 os.kill(pid, signal.SIGKILL)
 
 
+# Each stage starts a child in its own session, so only the stage's cleanup or Pivot can stop
+# it, then holds its worker until it is stopped; its cleanup stops the child and says it ran.
+_HOLDING_PIPELINE = """\
+import os
+import pathlib
+import subprocess
+import time
+
+from pivot.compose import Pipeline, stage
+
+MARKERS = {markers!r}
+
+
+def _hold(name):
+    child = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    (pathlib.Path(MARKERS) / (name + ".pid")).write_text(str(os.getpid()))
+    try:
+        time.sleep(300)
+    finally:
+        child.kill()
+        child.wait()
+        (pathlib.Path(MARKERS) / (name + ".cleaned")).write_text("")
+    return name
+
+
+@stage
+def hold_a() -> str:
+    return _hold("hold_a")
+
+
+@stage
+def hold_b() -> str:
+    return _hold("hold_b")
+
+
+with Pipeline("warm") as pipeline:
+    hold_a()
+    hold_b()
+"""
+
+
+class _RaiseWhileStagesHold:
+    """Event source that fails mid-run: once every holding stage runs on a worker, it records
+    the pool's workers with every process they started, then raises."""
+
+    _markers: pathlib.Path
+    _stages: list[str]
+    _eng: engine_mod.Engine
+    workers: set[int]
+    processes: dict[int, str]
+
+    def __init__(self, markers: pathlib.Path, stages: list[str], eng: engine_mod.Engine) -> None:
+        self._markers = markers
+        self._stages = stages
+        self._eng = eng
+        self.workers = set[int]()
+        self.processes = dict[int, str]()
+
+    async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
+        del send
+        with anyio.fail_after(60):
+            while not all((self._markers / f"{stage}.pid").exists() for stage in self._stages):
+                await anyio.sleep(0.05)
+        self.workers = _helper_pool_worker_pids(self._eng._worker_pool)
+        table = _helper_process_table()
+        self.processes = {pid: table[pid][1] for pid in self.workers}
+        for pid in self.workers:
+            self.processes.update(_helper_descendants(pid))
+        raise RuntimeError("source failed mid-run")
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the /proc process table")
+async def test_exception_exit_stops_running_workers_before_hard_cancel_returns(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An Engine that exits on an exception hard-cancels its pool. Each running stage is
+    stopped so its cleanup runs, and every worker, with each process it started, is gone once
+    ``hard_cancel`` returns: none is left to loky's later kill or to a new parent such as init."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _HOLDING_PIPELINE.format(markers=str(markers)))
+    stages = ["hold_a", "hold_b"]
+    source: _RaiseWhileStagesHold | None = None
+    survivors = list[dict[int, str]]()
+    hard_cancel = WorkerPool.hard_cancel
+
+    def checking_hard_cancel(self: WorkerPool) -> None:
+        hard_cancel(self)
+        # hard_cancel waits for the workers it stops; allow one 0.1 s poll after it returns.
+        assert source is not None
+        deadline = time.monotonic() + 0.1
+        while True:
+            table = _helper_process_table()
+            alive = {
+                pid: started
+                for pid, started in source.processes.items()
+                if pid in table and table[pid][1] == started
+            }
+            if not alive or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        survivors.append(alive)
+
+    monkeypatch.setattr(WorkerPool, "hard_cancel", checking_hard_cancel)
+    try:
+        with pytest.raises(ExceptionGroup) as raised:
+            async with engine_mod.Engine(pipeline=pipeline) as eng:
+                source = _RaiseWhileStagesHold(markers, stages, eng)
+                eng.add_source(
+                    sources.OneShotSource(stages=None, force=True, reason="test", max_workers=2)
+                )
+                eng.add_source(source)
+                await eng.run(exit_on_completion=False)
+        assert raised.group_contains(RuntimeError, match="source failed mid-run")
+        assert len(survivors) == 1, "the exception exit should hard-cancel the pool"
+        assert source is not None
+        stage_pids = {int((markers / f"{stage}.pid").read_text()) for stage in stages}
+        assert stage_pids <= source.workers, "each stage should run on one of the pool's workers"
+        assert not survivors[0], "processes outlived hard_cancel:\n" + "\n".join(
+            f"{pid}: {_helper_cmdline(pid)}" for pid in survivors[0]
+        )
+        uncleaned = [stage for stage in stages if not (markers / f"{stage}.cleaned").exists()]
+        assert not uncleaned, f"the stop cut off the cleanup of {uncleaned}"
+    finally:
+        for alive in survivors:
+            for pid in alive:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+
+
 @pytest.mark.anyio
 async def test_watch_reload_restarts_workers_after_user_code_changes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch

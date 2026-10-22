@@ -124,7 +124,8 @@ ordinary idle workers. Consequently, live workers stay bounded by actual schedul
 `local_grade: 2` limit therefore starts at most two workers for an otherwise-wide grade wave.
 Cached and skipped stages do not start workers.
 
-For a one-shot Engine, an idle worker exits after 10 seconds. The timeout is 126 times the
+For a one-shot Engine, an idle worker exits after the 10-second idle timeout, or occasionally
+after a second one, when loky's worker loses its process-lock race. The timeout is 126 times the
 78.898 ms maximum coordinator handoff gap measured on a 100-stage pandas/NumPy chain, while
 remaining short compared with remote-stage waits. A persistent watch, serve or TUI Engine keeps
 idle workers alive between its runs for a warm next run.
