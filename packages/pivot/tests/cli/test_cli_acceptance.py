@@ -2729,6 +2729,194 @@ def test_diff_refuses_a_manifest_path_with_a_null_byte(tmp_path: pathlib.Path) -
     assert "not a project-relative POSIX path" in output
 
 
+_RECORDED_NAME_DIRECTORY_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {{"plain.csv": raw, {name!r}: raw}}
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+# A `pathlib.Path` directory output writes its files itself, so any name the filesystem takes
+# reaches the lock: a CSV through pandas, any other name as raw bytes.
+_RECORDED_NAME_PATH_PIPELINE = """\
+import pathlib
+import tempfile
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "make"
+    out.mkdir()
+    raw.to_csv(out / "plain.csv", index=False)
+    name = {name!r}
+    if name.endswith(".csv"):
+        raw.to_csv(out / name, index=False)
+    else:
+        (out / name).write_bytes(b"image-bytes")
+    return out
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+
+def _run_recorded_name_project(
+    tmp_path: pathlib.Path, pipeline_py: str, output: str, name: str
+) -> tuple[pathlib.Path, str]:
+    """Run a stage whose directory output holds ``plain.csv`` and ``name``, commit, grow the
+    input by one row and run again. Returns the root and both runs' output."""
+    root = _project(
+        tmp_path,
+        {"pipeline.py": pipeline_py.format(name=name), "data/raw/rows.csv": "v\n1\n2\n"},
+    )
+    first = _ok(_pivot(root, "repro"))
+    lock_data = yaml.safe_load((root / ".pivot" / "stages" / "d" / "make.lock").read_text())
+    assert lock_data["outs"][0]["path"] == output
+    assert sorted(entry["relpath"] for entry in lock_data["outs"][0]["manifest"]) == sorted(
+        ["plain.csv", name]
+    )
+    status = _ok(_pivot(root, "status"))
+    assert "1 stages: 1 cached, 0 stale" in status, status
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    second = _ok(_pivot(root, "repro"))
+    return root, first + second
+
+
+def _assert_recorded_name_is_read(root: pathlib.Path, output: str, name: str) -> None:
+    """status, verify, diff --json, params diff and checkout all read the recorded name."""
+    status = _ok(_pivot(root, "status"))
+    assert "1 stages: 1 cached, 0 stale" in status, status
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+    diff = _pivot(root, "diff", "--json", "d/make")
+    assert diff.returncode == 0, diff.stdout + diff.stderr
+    changed = {"plain.csv", name} if name.endswith(".csv") else {"plain.csv"}
+    assert {
+        (entry["path"], entry["change_type"], entry["old_rows"], entry["new_rows"])
+        for entry in json.loads(diff.stdout)
+    } == {(f"{output}/{member}", "modified", 2, 3) for member in changed}
+    params = _pivot(root, "params", "diff")
+    assert params.returncode == 0, params.stdout + params.stderr
+    shutil.rmtree(root / output)
+    assert "Restored 2 file(s)" in _ok(_pivot(root, "checkout"))
+    assert sorted(path.name for path in (root / output).iterdir()) == sorted(["plain.csv", name])
+
+
+@pytest.mark.parametrize(
+    ("pipeline_py", "output", "name"),
+    [
+        pytest.param(
+            _RECORDED_NAME_DIRECTORY_PIPELINE,
+            "data/d/make",
+            "Screenshot 2024-01-01 at 10.00.00\u202fAM.csv",
+            id="directory-narrow-no-break-space",
+        ),
+        pytest.param(
+            _RECORDED_NAME_DIRECTORY_PIPELINE,
+            "data/d/make",
+            "caf\u00e9\u00a0menu.csv",
+            id="directory-no-break-space",
+        ),
+        pytest.param(
+            _RECORDED_NAME_DIRECTORY_PIPELINE,
+            "data/d/make",
+            "team\u200dlead.csv",
+            id="directory-zero-width-joiner",
+        ),
+        pytest.param(
+            _RECORDED_NAME_PATH_PIPELINE,
+            "data/d/make.dat",
+            "Screenshot 2024-01-01 at 10.00.00\u202fAM.csv",
+            id="path-narrow-no-break-space",
+        ),
+        pytest.param(
+            _RECORDED_NAME_PATH_PIPELINE,
+            "data/d/make.dat",
+            "Screenshot 2024-01-01 at 10.00.00\u202fAM.png",
+            id="path-macos-screenshot-png",
+        ),
+        pytest.param(
+            _RECORDED_NAME_PATH_PIPELINE,
+            "data/d/make.dat",
+            "\u8cc7\u6599\u3000\u4e00\u89a7.png",
+            id="path-ideographic-space-png",
+        ),
+    ],
+)
+def test_a_member_name_with_a_space_or_format_character_is_recorded_and_read(
+    tmp_path: pathlib.Path, pipeline_py: str, output: str, name: str
+) -> None:
+    """A name with a no-break, narrow or ideographic space or a zero-width joiner, as in a
+    macOS screenshot, is recorded without a warning, and every command reads the lock."""
+    root, runs = _run_recorded_name_project(tmp_path, pipeline_py, output, name)
+
+    assert "WARNING" not in runs, runs
+    _assert_recorded_name_is_read(root, output, name)
+
+
+def test_a_member_name_with_a_control_character_is_recorded_with_a_warning(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A TAB in a member name is recorded and read back, as on 0.5.2; each run that records it
+    warns once, naming the file, that a later release will refuse it."""
+    name = "a\tb.csv"
+    root, runs = _run_recorded_name_project(
+        tmp_path, _RECORDED_NAME_DIRECTORY_PIPELINE, "data/d/make", name
+    )
+
+    warning = (
+        "Stage 'd/make' records 'data/d/make/a\\tb.csv', whose name holds a control character; "
+        + "a later release will refuse such names, so rename it"
+    )
+    assert " ".join(runs.split()).count(warning) == 2, runs
+    _assert_recorded_name_is_read(root, "data/d/make", name)
+
+
+def test_a_member_name_with_a_backslash_fails_the_stage_and_records_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A lock never records a name its read refuses: a backslash fails the run and `pivot
+    commit`, naming the file, and writes no lock."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _RECORDED_NAME_PATH_PIPELINE.format(name="b\\s.csv"),
+            "data/raw/rows.csv": "v\n1\n2\n",
+        },
+    )
+    lock_path = root / ".pivot" / "stages" / "d" / "make.lock"
+    refusal = (
+        "Stage 'd/make' cannot record 'data/d/make.dat/b\\\\s.csv': it contains a backslash; "
+        + "rename it"
+    )
+
+    run = _pivot(root, "repro")
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert refusal in " ".join((run.stdout + run.stderr).split()), run.stdout + run.stderr
+    assert not lock_path.exists()
+
+    _ok(_pivot(root, "repro", "--no-commit"))
+    commit = _pivot(root, "commit", "d/make")
+    assert commit.returncode == 1, commit.stdout + commit.stderr
+    assert f"{refusal} — skipping" in " ".join(commit.stderr.split()), commit.stderr
+    assert not lock_path.exists()
+
+
 _EXTERNAL_CACHE_DIFF_PIPELINE = """\
 import pandas as pd
 
@@ -3141,6 +3329,127 @@ def test_diff_warns_only_about_symlinks_inside_the_selected_targets(
     assert "leaves out" not in direct, direct
     assert "Directory artifact data/d/split leaves out symlink test.csv" in whole, whole
     assert "TOP_SECRET_VALUE" not in direct + whole
+
+
+def _symlinked_project(
+    tmp_path: pathlib.Path, files: dict[str, str]
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """A project at ``<tmp>/project``, a symlink ``<tmp>/link`` to it, and a CSV outside it."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _project(root, files)
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+    outside = tmp_path / "outside.csv"
+    outside.write_text("part,v\nx,1\n")
+    return root, link, outside
+
+
+def test_diff_takes_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """From a cwd reached through a symlink to the project, an absolute target under that
+    symlink names the output the relative target names; a path outside stays unmatched."""
+    root, link, outside = _symlinked_project(
+        tmp_path, {"pipeline.py": _DIFF_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\ntest,2\n")
+    _ok(_pivot(root, "repro"))
+
+    relative = _pivot(link, "diff", "--json", "data/d/split/train.csv")
+    absolute = _pivot(link, "diff", "--json", str(link / "data" / "d" / "split" / "train.csv"))
+    refused = _pivot(link, "diff", "--json", str(outside))
+
+    assert relative.returncode == 0, relative.stdout + relative.stderr
+    assert absolute.returncode == 0, absolute.stdout + absolute.stderr
+    entries = json.loads(absolute.stdout)
+    assert entries == json.loads(relative.stdout)
+    assert [(e["path"], e["old_rows"], e["new_rows"]) for e in entries] == [
+        ("data/d/split/train.csv", 1, 2)
+    ]
+    assert "outside base" not in absolute.stderr, absolute.stderr
+    assert refused.returncode == 0, refused.stdout + refused.stderr
+    assert json.loads(refused.stdout) == []
+    assert (
+        f"No CSV, JSON or JSONL stage output matches {str(outside)!r}, so it is not compared"
+        in " ".join(refused.stderr.split())
+    ), refused.stderr
+
+
+def test_checkout_takes_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An absolute target under a symlink to the project restores what the relative target
+    restores; a path outside the project is refused as before."""
+    root, link, outside = _symlinked_project(
+        tmp_path, {"pipeline.py": _DIFF_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    output = root / "data" / "d" / "split"
+
+    for target in ("data/d/split", str(link / "data" / "d" / "split")):
+        shutil.rmtree(output)
+        assert "Restored 2 file(s)" in _ok(_pivot(link, "checkout", target)), target
+        assert sorted(path.name for path in output.iterdir()) == ["test.csv", "train.csv"]
+    refused = _pivot(link, "checkout", str(outside))
+
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert f"Target '{outside}' resolves outside project root" in refused.stderr, refused.stderr
+
+
+@pytest.mark.parametrize(
+    ("command", "line"),
+    [
+        ("push", "Would push 2 file(s) to 'origin'"),
+        ("fetch", "Would fetch 2 file(s) from 'origin'"),
+        ("pull", "Would pull 2 file(s) from 'origin'"),
+    ],
+)
+def test_remote_commands_take_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path, command: str, line: str
+) -> None:
+    """push, fetch and pull read an absolute target under a symlink to the project as the
+    relative target; a path outside the project is refused as before."""
+    root, link, outside = _symlinked_project(
+        tmp_path, {"pipeline.py": _DIFF_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    _ok(_pivot(root, "config", "set", "default_remote", "origin"))
+    # With the local cache gone, fetch and pull have both of the output's files to name.
+    shutil.rmtree(root / ".pivot" / "cache" / "files")
+    env = _env(AWS_ENDPOINT_URL="http://127.0.0.1:9", AWS_DEFAULT_REGION="us-east-1")
+
+    relative = _ok(_pivot(link, command, "--dry-run", "data/d/split", env=env))
+    absolute = _ok(_pivot(link, command, "--dry-run", str(link / "data" / "d" / "split"), env=env))
+    refused = _pivot(link, command, "--dry-run", str(outside), env=env)
+
+    assert line in relative, relative
+    assert line in absolute, absolute
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert f"Target '{outside}' resolves outside project root" in refused.stderr, refused.stderr
+
+
+def test_track_takes_an_absolute_path_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An absolute path under a symlink to the project is tracked as the relative path is;
+    a path outside the project is refused as before."""
+    root, link, outside = _symlinked_project(tmp_path, {"notes.txt": "notes\n"})
+    pvt = root / "notes.txt.pvt"
+    recorded = dict[str, str]()
+
+    for path in ("notes.txt", str(link / "notes.txt")):
+        pvt.unlink(missing_ok=True)
+        assert f"Tracked: {path}" in _ok(_pivot(link, "track", path)), path
+        recorded[path] = pvt.read_text()
+    refused = _pivot(link, "track", str(outside))
+
+    assert recorded["notes.txt"] == recorded[str(link / "notes.txt")]
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert f"Path '{outside}' resolves outside project root" in refused.stderr, refused.stderr
 
 
 _KIND_DIFF_PIPELINE = """\

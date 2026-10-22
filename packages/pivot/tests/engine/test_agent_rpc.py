@@ -2050,3 +2050,60 @@ def test_encode_wire_writes_numpy_scalars_as_python_values() -> None:
 
     assert wire == {"old_values": {"n": 2, "x": 0.5, "ok": True}}
     assert [type(value) for value in wire["old_values"].values()] == [int, float, bool]
+
+
+@pytest.mark.anyio
+async def test_rpc_diff_output_answers_a_modified_file_with_a_datetime_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A modified file's rows can hold timestamps; the reply writes them as text, as
+    `pivot diff --json` does, instead of dropping the connection."""
+    import shutil
+
+    import pandas
+
+    from pivot import config, loaders
+    from pivot.storage import cache
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
+    hashes = list[str]()
+    for rows in (2, 3):
+        frame = pandas.DataFrame({"v": range(1, rows + 1)})
+        frame["when"] = pandas.Timestamp("2024-01-01") + pandas.to_timedelta(frame["v"], unit="D")
+        source = tmp_path / f"stamp{rows}.jsonl"
+        loaders.DataFrameJSONL().save(frame, source)
+        file_hash, _ = cache.hash_file(source)
+        cached = cache.get_cache_path(cache_dir / "files", file_hash)
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, cached)
+        hashes.append(file_hash)
+    socket_path = tmp_path / "agent.sock"
+    request = {
+        "jsonrpc": "2.0",
+        "method": "diff_output",
+        "params": {"path": "data/d/stamp.jsonl", "old_hash": hashes[0], "new_hash": hashes[1]},
+        "id": 1,
+    }
+
+    reply = b""
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
+        source = AgentRpcSource(socket_path=socket_path, handler=AgentRpcHandler(engine=engine))
+        send, _ = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await helpers.wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                await conn.send(json.dumps(request).encode() + b"\n")
+                while not reply.endswith(b"\n"):
+                    reply += await conn.receive(65536)
+
+            tg.cancel_scope.cancel()
+
+    result = json.loads(reply)["result"]
+    assert (result["change_type"], result["old_rows"], result["new_rows"]) == ("modified", 2, 3)
+    assert [change["new_values"] for change in result["row_changes"]] == [
+        {"v": 3, "when": "2024-01-04 00:00:00"}
+    ]

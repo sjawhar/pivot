@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import posixpath
 import threading
 from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
+from pivot import exceptions
 from pivot.storage import lock
 from pivot.types import (
     ArtifactIdentity,
@@ -497,6 +499,26 @@ _MANIFEST_ENTRY: dict[str, object] = {
             id="inner-traversal-dep-manifest-relpath",
         ),
         pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "nul\0.csv"}]}]},
+            id="nul-manifest-relpath",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "back\\slash.csv"}]}]},
+            id="backslash-manifest-relpath",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "a//b.csv"}]}]},
+            id="empty-segment-manifest-relpath",
+        ),
+        pytest.param(
+            "outs[0].manifest[0].relpath",
+            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "a/./b.csv"}]}]},
+            id="dot-segment-manifest-relpath",
+        ),
+        pytest.param(
             "outs[0].manifest[0].hash",
             {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "hash": "abc"}]}]},
             id="short-manifest-hash",
@@ -569,6 +591,149 @@ def test_lock_read_warns_naming_the_lock_and_its_unsafe_manifest_path(
     (record,) = caplog.records
     assert str(stage_lock.path) in record.getMessage()
     assert "outs[0].manifest[0].relpath: '../../secret.csv'" in record.getMessage()
+
+
+def _directory_lock_data(relpath: str, *, empty_dir: str | None = None) -> LockData:
+    """A lock whose directory output records one member at ``relpath``."""
+    identity = _id("p/stage", "o")
+    output = DirHash(
+        hash="fedcba9876543210",
+        manifest=[DirManifestEntry(relpath=relpath, hash="00112233445566ff", size=1, isexec=False)],
+    )
+    if empty_dir is not None:
+        output["empty_dirs"] = [empty_dir]
+    return LockData(
+        code_manifest={"self:stage": "h"},
+        params={},
+        dep_hashes={},
+        output_hashes={identity: output},
+        output_paths={identity: "data/p/stage/o"},
+    )
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    [
+        pytest.param("Screenshot 2024-01-01 at 10.00.00\u202fAM.png", id="narrow-no-break-space"),
+        pytest.param("caf\u00e9\u00a0menu.csv", id="no-break-space"),
+        pytest.param("\u8cc7\u6599\u3000\u4e00\u89a7.png", id="ideographic-space"),
+        pytest.param("team\u200dlead.csv", id="zero-width-joiner"),
+        pytest.param("soft\u00adhyphen.csv", id="soft-hyphen"),
+        pytest.param("\ufeffbom.csv", id="byte-order-mark"),
+        pytest.param("line\u2028sep.csv", id="line-separator"),
+    ],
+)
+def test_lock_records_and_reads_a_member_name_with_any_non_control_character(
+    relpath: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A space separator or format character is part of an ordinary file name (a macOS
+    screenshot holds U+202F): the lock records it without a warning and reads it back."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    data = _directory_lock_data(relpath)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
+        stage_lock.write(data)
+        assert stage_lock.read() == data
+
+    assert caplog.records == [], caplog.text
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    [
+        pytest.param("a\tb.csv", id="tab"),
+        pytest.param("x\x01y.csv", id="soh"),
+        pytest.param("e\x1b[31mred.csv", id="esc"),
+        pytest.param("d\x7fel.csv", id="del"),
+        pytest.param("n\x85l.csv", id="nel"),
+    ],
+)
+def test_lock_records_a_control_character_name_with_one_warning_and_reads_it_back(
+    relpath: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A control character is recorded and read back, as on 0.5.2, with one warning that names
+    the file under its output's path and says a later release will refuse it."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    data = _directory_lock_data(relpath)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
+        stage_lock.write(data)
+        assert stage_lock.read() == data
+
+    (record,) = caplog.records
+    assert record.getMessage() == (
+        f"Stage 'p/stage' records {'data/p/stage/o/' + relpath!r}, whose name holds a control "
+        + "character; a later release will refuse such names, so rename it"
+    )
+
+
+def test_lock_write_names_every_control_character_name_in_one_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A member and an empty directory with control characters share one warning."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
+        stage_lock.write(_directory_lock_data("a\tb.csv", empty_dir="e\x1bmpty"))
+
+    (record,) = caplog.records
+    assert record.getMessage() == (
+        "Stage 'p/stage' records 'data/p/stage/o/a\\tb.csv', 'data/p/stage/o/e\\x1bmpty', "
+        + "whose names hold a control character; a later release will refuse such names, so "
+        + "rename them"
+    )
+
+
+@pytest.mark.parametrize(
+    ("relpath", "reason"),
+    [
+        pytest.param("b\\s.csv", "it contains a backslash", id="backslash"),
+        pytest.param("nul\0.csv", "it contains a NUL byte", id="nul"),
+        pytest.param("../escaped.csv", "it has an empty, '.' or '..' segment", id="traversal"),
+        pytest.param("/abs.csv", "it is absolute", id="absolute"),
+    ],
+)
+def test_lock_write_refuses_a_name_read_would_refuse_and_leaves_the_old_lock(
+    relpath: str, reason: str, tmp_path: Path
+) -> None:
+    """Pivot never writes a lock its own read refuses: the write names the file and why, and
+    the lock already on disk is kept."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    previous = _directory_lock_data("plain.csv")
+    stage_lock.write(previous)
+
+    with pytest.raises(exceptions.InvalidPathError) as excinfo:
+        stage_lock.write(_directory_lock_data(relpath))
+
+    shown = posixpath.join("data/p/stage/o", relpath)
+    assert str(excinfo.value) == (f"Stage 'p/stage' cannot record {shown!r}: {reason}; rename it")
+    assert stage_lock.read() == previous
+
+
+def test_lock_write_names_a_dependency_member_with_its_dependency(tmp_path: Path) -> None:
+    """A directory dependency's member is named with the dependency it belongs to."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    dep = DirHash(
+        hash="0123456789abcdef",
+        manifest=[
+            DirManifestEntry(relpath="b\\s.csv", hash="00112233445566ff", size=1, isexec=False)
+        ],
+    )
+
+    with pytest.raises(exceptions.InvalidPathError) as excinfo:
+        stage_lock.write(
+            LockData(
+                code_manifest={},
+                params={},
+                dep_hashes={_id("p/a", "parts"): dep},
+                output_hashes={},
+            )
+        )
+
+    assert str(excinfo.value) == (
+        "Stage 'p/stage' cannot record 'b\\\\s.csv' in dependency 'p/a:parts': it contains a "
+        + "backslash; rename it"
+    )
 
 
 def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:

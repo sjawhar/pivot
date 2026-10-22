@@ -97,15 +97,16 @@ def _track_single_path(
     Returns:
         TrackResult with optional warning and the tracked path for the caller to handle output.
     """
-    # Normalize path from cwd (preserving symlinks) for consistency with registry/pvt
-    path = project.normalize_path(path_str, base=pathlib.Path.cwd())
-
-    # Validate resolved path is within project root
+    # Normalize path from cwd (preserving symlinks) for consistency with registry/pvt, and
+    # validate it is within project root; a path typed through a symlink to the project is
+    # placed under the project root
     project_root = project.get_project_root()
-    try:
-        path.relative_to(project_root)
-    except ValueError:
-        raise click.ClickException(f"Path '{path_str}' resolves outside project root") from None
+    relative = project.relative_within(
+        project.normalize_path(path_str, base=pathlib.Path.cwd()), project_root
+    )
+    if relative is None:
+        raise click.ClickException(f"Path '{path_str}' resolves outside project root")
+    path = project_root / relative
 
     abs_path_str = str(path)
 

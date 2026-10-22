@@ -37,6 +37,13 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
+A path argument is read from the current directory and must lie inside the project. A path
+typed through a symlink to the project root, or to a directory inside the project, counts as
+the place it points to: from a `link -> project` symlink, `link/data/x.csv` names
+`data/x.csv`. A path that leaves the project, including `link/../x.csv`, is refused by
+commands that restore, transfer or track files (`resolves outside project root`) and matches
+no output elsewhere.
+
 ---
 
 ## Environment Variables

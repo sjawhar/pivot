@@ -8,7 +8,7 @@ import logging
 import os
 import pathlib
 import re
-from typing import TYPE_CHECKING, Any, TypedDict, cast, override
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy
 import pandas
@@ -55,29 +55,33 @@ _MAX_IN_MEMORY_SIZE = 100 * 1024 * 1024
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
-class _NumpyEncoder(json.JSONEncoder):
-    """JSON encoder that handles numpy types by converting to Python equivalents."""
+def json_default(o: object) -> object:
+    """Encode the numpy and pandas values a diff result holds as plain JSON values.
 
-    @override
-    def default(self, o: object) -> object:
-        if isinstance(o, numpy.integer):
-            return int(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.integer stub is generic
-        if isinstance(o, numpy.floating):
-            return float(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.floating stub is generic
-        if isinstance(o, numpy.bool_):
-            return bool(o)
-        if isinstance(o, numpy.ndarray):
-            return o.tolist()
-        if isinstance(o, (pandas.Timestamp, pandas.Timedelta)):
-            return str(o)
-        # Handle NaN/NaT values (float, numpy.floating, pandas.NaT, etc.)
-        # Cast to Any for pandas.isna() which accepts dynamic types from JSON
-        try:
-            if pandas.isna(cast("Any", o)):
-                return None
-        except (TypeError, ValueError):  # pragma: no cover
-            pass
-        return super().default(o)  # pragma: no cover
+    ``pivot diff --json`` and the ``diff_output`` RPC both encode through this, so a row value
+    reads the same in each: a numpy scalar as its Python value, a timestamp or timedelta as its
+    text, and NaN, NaT or NA as null.
+    """
+    if isinstance(o, numpy.integer):
+        return int(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.integer stub is generic
+    if isinstance(o, numpy.floating):
+        return float(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.floating stub is generic
+    if isinstance(o, numpy.bool_):
+        return bool(o)
+    if isinstance(o, numpy.ndarray):
+        return o.tolist()
+    if isinstance(o, (pandas.Timestamp, pandas.Timedelta)):
+        return str(o)
+    # Handle NaN/NaT values (float, numpy.floating, pandas.NaT, etc.)
+    # Cast to Any for pandas.isna() which accepts dynamic types from JSON
+    try:
+        if pandas.isna(cast("Any", o)):
+            return None
+    except (TypeError, ValueError):  # pragma: no cover
+        pass
+    raise TypeError(  # pragma: no cover
+        f"Object of type {type(o).__name__} is not JSON serializable"
+    )
 
 
 class DataDiffEntry(TypedDict):
@@ -998,7 +1002,7 @@ def format_diff_table(
 ) -> str:
     """Format diff results for display."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(diffs, indent=2, cls=_NumpyEncoder)
+        return json.dumps(diffs, indent=2, default=json_default)
 
     if not diffs:
         return "No data file changes."
@@ -1018,7 +1022,7 @@ def format_row_changes_table(
 ) -> str:
     """Format row changes as a table."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(row_changes, indent=2, cls=_NumpyEncoder)
+        return json.dumps(row_changes, indent=2, default=json_default)
 
     if not row_changes:
         return "No row changes."

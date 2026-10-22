@@ -45,14 +45,12 @@ _MAX_VERSION = 2**63 - 1
 
 
 def _json_default(obj: object) -> object:
-    """Encode enums by value, and numpy integers, floats and bools as their Python types."""
+    """Encode enums by value, and a diff result's numpy and pandas values as `--json` does."""
     if isinstance(obj, enum.Enum):
         return obj.value
-    import numpy
+    from pivot.show import data as data_mod
 
-    if isinstance(obj, (numpy.integer, numpy.floating, numpy.bool_)):
-        return obj.item()
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    return data_mod.json_default(obj)
 
 
 def _identity_json(ref: types.ArtifactRef) -> types.ArtifactIdentityJson:

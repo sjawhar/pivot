@@ -1056,67 +1056,67 @@ def test_restore_data_from_cache_symlink_blocked(
 
 
 # =============================================================================
-# Numpy Encoder Tests
+# JSON encoding of diff values
 # =============================================================================
 
 
-def test_numpy_encoder_integer() -> None:
+def test_json_default_integer() -> None:
     """Encode numpy integer types."""
     import numpy
 
-    result = json.dumps({"value": numpy.int64(42)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.int64(42)}, default=data.json_default)
     assert json.loads(result) == {"value": 42}
 
 
-def test_numpy_encoder_floating() -> None:
-    """Encode numpy floating types (float32 needs custom encoder, float64 is native)."""
+def test_json_default_floating() -> None:
+    """Encode numpy floating types (float32 needs the default, float64 is native)."""
     import numpy
 
-    # numpy.float32 needs custom encoder (numpy.float64 serializes natively)
-    result = json.dumps({"value": numpy.float32(3.14)}, cls=data._NumpyEncoder)
+    # numpy.float32 needs the default (numpy.float64 serializes natively)
+    result = json.dumps({"value": numpy.float32(3.14)}, default=data.json_default)
     parsed = json.loads(result)
     assert abs(parsed["value"] - 3.14) < 0.001
 
 
-def test_numpy_encoder_bool() -> None:
+def test_json_default_bool() -> None:
     """Encode numpy boolean types."""
     import numpy
 
-    result = json.dumps({"value": numpy.bool_(True)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.bool_(True)}, default=data.json_default)
     assert json.loads(result) == {"value": True}
 
 
-def test_numpy_encoder_array() -> None:
+def test_json_default_array() -> None:
     """Encode numpy arrays."""
     import numpy
 
-    result = json.dumps({"value": numpy.array([1, 2, 3])}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.array([1, 2, 3])}, default=data.json_default)
     assert json.loads(result) == {"value": [1, 2, 3]}
 
 
-def test_numpy_encoder_timestamp() -> None:
+def test_json_default_timestamp() -> None:
     """Encode pandas Timestamp."""
-    result = json.dumps({"value": pandas.Timestamp("2024-01-01")}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.Timestamp("2024-01-01")}, default=data.json_default)
     parsed = json.loads(result)
     assert "2024-01-01" in parsed["value"]
 
 
-def test_numpy_encoder_timedelta() -> None:
+def test_json_default_timedelta() -> None:
     """Encode pandas Timedelta."""
-    result = json.dumps({"value": pandas.Timedelta(days=1)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.Timedelta(days=1)}, default=data.json_default)
     parsed = json.loads(result)
     assert "1 day" in parsed["value"]
 
 
-def test_numpy_encoder_pandas_na() -> None:
+def test_json_default_pandas_na() -> None:
     """Encode pandas.NA as None."""
-    result = json.dumps({"value": pandas.NA}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.NA}, default=data.json_default)
     assert json.loads(result) == {"value": None}
 
 
-def test_numpy_encoder_nat() -> None:
+def test_json_default_nat() -> None:
     """Encode NaT as None."""
-    result = json.dumps({"value": pandas.NaT}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.NaT}, default=data.json_default)
     assert json.loads(result) == {"value": None}
 
 

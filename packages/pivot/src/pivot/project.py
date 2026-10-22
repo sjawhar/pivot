@@ -106,10 +106,32 @@ def resolve_path_for_comparison(path: str, context: str) -> pathlib.Path:
         raise OSError(f"Filesystem error for {context} '{path}': {e}") from e
 
 
+def relative_within(path: pathlib.Path, base: pathlib.Path) -> pathlib.Path | None:
+    """Return absolute ``path`` relative to ``base``, or None if it lies outside base.
+
+    A path inside base by its spelling is relative from base. Otherwise the outermost of the
+    path and its ancestors that resolves to base or a directory inside it stands for that place:
+    an absolute target typed under a symlink to the project root, or to a directory in it, is
+    inside. Symlinks below that one are kept, as ``normalize_path`` keeps them. A path holding
+    ``..`` or a NUL byte is placed by its spelling alone, so ``<link>/../x`` stays outside.
+    """
+    if path.is_relative_to(base):
+        return path.relative_to(base)
+    if ".." in path.parts or "\0" in str(path):
+        return None
+    resolved_base = base.resolve()
+    for ancestor in (*reversed(path.parents), path):
+        resolved = ancestor.resolve()
+        if resolved.is_relative_to(resolved_base):
+            return resolved.relative_to(resolved_base) / path.relative_to(ancestor)
+    return None
+
+
 def to_relative_path(abs_path: str | pathlib.Path, base: pathlib.Path | None = None) -> str:
     """Convert absolute path to relative from base (default: project root).
 
-    If path is already relative or outside base, returns as-is with warning for outside paths.
+    A path is inside base by the rule of ``relative_within``. If path is already relative or
+    outside base, returns as-is with warning for outside paths.
     """
     path = pathlib.Path(abs_path)
     if not path.is_absolute():
@@ -118,8 +140,8 @@ def to_relative_path(abs_path: str | pathlib.Path, base: pathlib.Path | None = N
     if base is None:
         base = get_project_root()
 
-    try:
-        return str(path.relative_to(base))
-    except ValueError:
+    relative = relative_within(path, base)
+    if relative is None:
         logger.warning(f"Path '{abs_path}' is outside base '{base}', keeping absolute")
         return str(abs_path)
+    return str(relative)

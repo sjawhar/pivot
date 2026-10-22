@@ -618,6 +618,7 @@ def _execute_stage(
             exceptions.OutputMissingError,
             exceptions.CacheRestoreError,
             exceptions.StageDefinitionError,
+            exceptions.InvalidPathError,
         ) as exc:
             return _make_result(
                 StageStatus.FAILED, exc.format_user_message(), ring_buffer, input_hash=input_hash

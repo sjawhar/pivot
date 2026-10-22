@@ -332,12 +332,13 @@ def _validate_and_build_files(
             files.update(cached)
             continue
 
-        # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs
-        abs_path = project.normalize_path(target)
-        # Validate path is within project root (replaces literal ".." check)
-        if not abs_path.is_relative_to(project.get_project_root()):
+        # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs;
+        # a target typed through a symlink to the project is placed under the project root
+        project_root = project.get_project_root()
+        relative = project.relative_within(project.normalize_path(target), project_root)
+        if relative is None:
             raise click.ClickException(f"Target '{target}' resolves outside project root")
-        abs_path_str = str(abs_path)
+        abs_path_str = str(project_root / relative)
 
         # Check if it's a tracked file
         if abs_path_str in tracked_files:

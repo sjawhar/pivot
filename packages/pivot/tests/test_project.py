@@ -85,3 +85,65 @@ def test_normalize_path_default_base_is_project_root(
     result = project.normalize_path("relative/path.txt")
 
     assert result == tmp_path / "relative" / "path.txt"
+
+
+def _helper_linked_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """A project at ``<tmp>/project`` holding ``data/d``, and a symlink ``<tmp>/link`` to it."""
+    root = tmp_path / "project"
+    (root / "data" / "d").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+    return root, link
+
+
+def test_relative_within_takes_a_path_typed_through_a_symlink_to_the_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A path under a symlink to the root is placed under the root, members not yet on disk
+    included."""
+    root, link = _helper_linked_project(tmp_path)
+
+    assert project.relative_within(link / "data" / "d" / "new.csv", root) == pathlib.Path(
+        "data/d/new.csv"
+    )
+    assert project.relative_within(link, root) == pathlib.Path(".")
+    assert project.to_relative_path(link / "data" / "d", root) == "data/d"
+
+
+def test_relative_within_takes_a_path_typed_through_a_symlink_into_the_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A symlink outside the root to a directory inside it places a path at that directory."""
+    root, _ = _helper_linked_project(tmp_path)
+    into = tmp_path / "into"
+    into.symlink_to(root / "data", target_is_directory=True)
+
+    assert project.relative_within(into / "d" / "x.csv", root) == pathlib.Path("data/d/x.csv")
+
+
+def test_relative_within_keeps_a_symlink_inside_the_root_unresolved(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A symlink inside the root keeps its own path, as normalize_path keeps it."""
+    root, link = _helper_linked_project(tmp_path)
+    (root / "alias").symlink_to(root / "data", target_is_directory=True)
+
+    assert project.relative_within(link / "alias" / "d", root) == pathlib.Path("alias/d")
+    assert project.relative_within(root / "alias" / "d", root) == pathlib.Path("alias/d")
+
+
+@pytest.mark.parametrize(
+    "outside",
+    [
+        pytest.param("outside.csv", id="beside-the-root"),
+        pytest.param("link/../outside.csv", id="dotdot-through-the-link"),
+        pytest.param("link/da\0ta", id="nul-byte"),
+    ],
+)
+def test_relative_within_refuses_a_path_outside_the_root(
+    tmp_path: pathlib.Path, outside: str
+) -> None:
+    root, _ = _helper_linked_project(tmp_path)
+    (tmp_path / "outside.csv").write_text("x")
+
+    assert project.relative_within(tmp_path / outside, root) is None

@@ -4,6 +4,7 @@ import enum
 import logging
 import os
 import pathlib
+import re
 from typing import Literal, TypedDict
 
 from pivot import exceptions
@@ -82,6 +83,36 @@ def validate_path_syntax(path: str) -> str | None:
     if has_path_traversal(path):
         return "contains path traversal (..)"
     return None
+
+
+def recorded_path_error(value: str) -> str | None:
+    """Return why ``value`` cannot be a path a lock records, or None if it can.
+
+    A recorded path is project-relative POSIX form: not empty, no NUL byte or backslash, not
+    absolute, and no empty, ``.`` or ``..`` segment. Lock files are written and read under this
+    one rule, so Pivot never writes a lock it later refuses. Every other character is accepted,
+    a control character included (see ``has_control_character``).
+    """
+    if not value:
+        return "it is empty"
+    if "\0" in value:
+        return "it contains a NUL byte"
+    if "\\" in value:
+        return "it contains a backslash"
+    if value.startswith("/"):
+        return "it is absolute"
+    if any(segment in {"", ".", ".."} for segment in value.split("/")):
+        return "it has an empty, '.' or '..' segment"
+    return None
+
+
+# Unicode category Cc is exactly these code points: C0 controls, DEL and C1 controls.
+_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def has_control_character(value: str) -> bool:
+    """Whether ``value`` holds a control character (Unicode category Cc: C0, DEL or C1)."""
+    return _CONTROL_CHARACTER.search(value) is not None
 
 
 def validate_path(

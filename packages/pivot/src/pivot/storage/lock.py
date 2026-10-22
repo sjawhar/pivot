@@ -12,13 +12,13 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-import pathlib
+import posixpath
 import re
-from typing import TypeGuard, cast, override
+from typing import TYPE_CHECKING, TypeGuard, cast, override
 
 import yaml
 
-from pivot import yaml_config
+from pivot import exceptions, path_policy, yaml_config
 from pivot.storage import cache
 from pivot.types import (
     ArtifactIdentity,
@@ -31,8 +31,12 @@ from pivot.types import (
     OutEntry,
     StorageLockData,
     identity_from_key,
+    identity_key,
     is_dir_hash,
 )
+
+if TYPE_CHECKING:
+    import pathlib
 
 logger = logging.getLogger(__name__)
 
@@ -118,20 +122,7 @@ def _is_nonempty_str(value: object) -> bool:
 
 
 def _is_project_relative_posix_path(value: object) -> bool:
-    if (
-        not isinstance(value, str)
-        or not value
-        or "\0" in value
-        or "\\" in value
-        or not value.isprintable()
-    ):
-        return False
-    path = pathlib.PurePosixPath(value)
-    return (
-        not path.is_absolute()
-        and path.as_posix() == value
-        and all(part not in {".", ".."} for part in path.parts)
-    )
+    return isinstance(value, str) and path_policy.recorded_path_error(value) is None
 
 
 def _path_error(value: object, field: str) -> str | UnsafeLockPath | None:
@@ -300,6 +291,39 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     )
 
 
+def _member_relpaths(entry: DepEntry | OutEntry) -> list[str]:
+    """The manifest relpaths and empty directories a directory entry records."""
+    members = [item["relpath"] for item in entry["manifest"]] if "manifest" in entry else []
+    if "empty_dirs" in entry:
+        members.extend(entry["empty_dirs"])
+    return members
+
+
+def _recorded_paths(data: StorageLockData) -> list[tuple[str, str]]:
+    """Return ``(recorded, shown)`` for every path a lock records.
+
+    These are each output's own path, and each manifest relpath and empty directory of a
+    directory dependency or output. ``shown`` names the path where a user finds it: an output's
+    member under the output's path, and a dependency's member with that dependency.
+    """
+    paths = list[tuple[str, str]]()
+    for dep in data["deps"]:
+        dependency = identity_key(ArtifactIdentity(dep["producer"], dep["key"]))
+        paths.extend(
+            (relpath, f"{relpath!r} in dependency {dependency!r}")
+            for relpath in _member_relpaths(dep)
+        )
+    for out in data["outs"]:
+        out_path = out["path"] if "path" in out else None
+        if out_path is not None:
+            paths.append((out_path, repr(out_path)))
+        paths.extend(
+            (relpath, repr(relpath if out_path is None else posixpath.join(out_path, relpath)))
+            for relpath in _member_relpaths(out)
+        )
+    return paths
+
+
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
     """Convert storage format (list-based) to internal LockData (identity-keyed)."""
     dep_hashes = dict[ArtifactIdentity, HashInfo]()
@@ -377,8 +401,33 @@ class StageLock:
             return None
 
     def write(self, data: LockData) -> None:
-        """Write lock file atomically, converting to storage format."""
+        """Write lock file atomically, converting to storage format.
+
+        Every recorded path must pass ``path_policy.recorded_path_error``, the rule ``read``
+        applies, so this never writes a lock that ``read`` refuses; a path that fails raises
+        InvalidPathError naming it. A recorded name that holds a control character is written,
+        and one warning names every such name.
+        """
         storage_data = _convert_to_storage_format(data)
+        with_control = list[str]()
+        for recorded, shown in _recorded_paths(storage_data):
+            reason = path_policy.recorded_path_error(recorded)
+            if reason is not None:
+                raise exceptions.InvalidPathError(
+                    f"Stage '{self.stage_name}' cannot record {shown}: {reason}; rename it"
+                )
+            if path_policy.has_control_character(recorded):
+                with_control.append(shown)
+        if with_control:
+            one = len(with_control) == 1
+            logger.warning(
+                "Stage '%s' records %s, whose %s a control character; a later release will "
+                + "refuse such names, so rename %s",
+                self.stage_name,
+                ", ".join(with_control),
+                "name holds" if one else "names hold",
+                "it" if one else "them",
+            )
 
         def write_yaml(fd: int) -> None:
             with os.fdopen(fd, "w") as f:
