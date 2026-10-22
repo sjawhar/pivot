@@ -64,9 +64,10 @@ import, as it would for a module-level import: every import on the thread
 running it, every hooked import on a thread it started (and on threads those
 start) for the rest of the stage, already resident or not, and every module
 any thread registers without the hooks while such an import or thread runs.
-Every way to start a thread counts: each start function `_thread` exposes
+Every thread Python starts counts: each start function `_thread` exposes
 (`start_new_thread`, `start_new`, `start_joinable_thread`), which
 `threading.Thread`, `threading.Timer` and `ThreadPoolExecutor` start through.
+A thread native code starts outside `_thread` is not covered.
 A hooked import on any other thread is counted, already resident or not, and
 so is a module registered without the hooks at any other time, even when a
 covered import later imports it. A stage that imported a user module its
@@ -93,10 +94,10 @@ checked: its declared `code_deps` are its code.
 
 That check does not see every way a stage can reach code. In most of these
 cases Pivot reuses a result whose fingerprint missed the code, as it would
-without the check. In two it reruns a stage it could have reused: a thread
-that existed before a covered import, and a thread left from an earlier stage
-(a covered thread of that stage included) that imports while a later stage
-runs:
+without the check. In three it reruns a stage it could have reused: a thread
+that existed before a covered import, a thread left from an earlier stage (a
+covered thread of that stage included) that imports while a later stage runs,
+and a thread native code starts outside `_thread`:
 
 - a read of a module already in `sys.modules` without an import, or
   `importlib.reload`: import the module where the stage reads it;
@@ -112,8 +113,15 @@ runs:
   it; join the thread before the stage returns;
 - a covered module that hands work at import time to a thread that existed
   before its import, such as a pool an earlier import created: that thread is
-  not covered, so its imports are counted and the stage reruns; start the
-  thread or pool inside the module, or import the module statically;
+  not covered, so its imports are counted and the stage reruns. When an earlier
+  stage in the same worker started the thread, whether the stage warns depends
+  on which stage ran first there: where the covered import itself starts the
+  thread, the thread is covered and the stage caches. Start the thread or pool
+  inside the module, or import the module statically;
+- a thread native code starts outside `_thread`, such as one a C extension
+  starts or `pthread_create` called through `ctypes`: no start hook sees it, so
+  its imports are counted and the stage warns and reruns; import the module
+  statically;
 - a user module a covered thread imports that has nothing to do with the
   covered module: it is excused and not fingerprinted, as on main, so an edit
   to it is seen only through values the stage reads from the covered module,
