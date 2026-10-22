@@ -26,6 +26,7 @@ from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
+    from collections.abc import Mapping
 
     from pivot.engine import types as engine_types
     from pivot.registry import RegistryStageInfo
@@ -78,32 +79,85 @@ def configured_worker_count(override: int | None = None) -> int:
     return max(1, max_workers)
 
 
-def _reusable_worker_target(max_workers: int, *, kill_workers: bool) -> int:
+def _current_reusable_executor() -> tuple[
+    loky.ProcessPoolExecutor | None, Mapping[str, object] | None
+]:
+    """Return loky's current reusable executor and the arguments that created it."""
+    if hasattr(loky.reusable_executor, "_executor"):
+        return (
+            loky.reusable_executor._executor,  # pyright: ignore[reportPrivateUsage]
+            loky.reusable_executor._executor_kwargs,  # pyright: ignore[reportPrivateUsage]
+        )
+
+    storage = getattr(loky.reusable_executor, "_executor_storage", None)
+    if (
+        storage is None
+        or not hasattr(storage, "executor")
+        or not hasattr(storage, "executor_kwargs")
+    ):
+        version = getattr(loky, "__version__", "unknown")
+        raise RuntimeError(f"Unsupported loky {version}: no reusable-executor singleton")
+    return storage.executor, storage.executor_kwargs
+
+
+def is_executor_usable(
+    executor: loky.ProcessPoolExecutor | None,
+    max_workers: int,
+    *,
+    current_kwargs: Mapping[str, object] | None = None,
+    requested_kwargs: Mapping[str, object] | None = None,
+) -> bool:
+    """Whether ``executor`` can serve a pool with ``max_workers``.
+
+    When callers provide argument mappings, the test also matches loky's ``reuse="auto"``
+    predicate: an executor whose initializer, timeout or another creation argument differs is
+    replaced and must be created at the requested width.
+    """
+    return (
+        executor is not None
+        and not executor._flags.shutdown
+        and executor._flags.broken is None
+        and executor.queue_size >= max_workers
+        and (requested_kwargs is None or current_kwargs == requested_kwargs)
+    )
+
+
+def _requested_reusable_executor_kwargs(
+    idle_timeout_s: float | None, user_code_root: pathlib.Path | None
+) -> dict[str, object]:
+    """Return the constructor arguments loky compares to decide whether to reuse its executor."""
+    return {
+        "context": None,
+        "timeout": idle_timeout_s,
+        "job_reducers": None,
+        "result_reducers": None,
+        "initializer": _init_worker,
+        "initargs": (os.getpid(), None if user_code_root is None else str(user_code_root)),
+        "env": None,
+    }
+
+
+def _reusable_worker_target(
+    max_workers: int,
+    *,
+    kill_workers: bool,
+    requested_kwargs: Mapping[str, object] | None = None,
+) -> int:
     """Keep reuse from invoking loky's blocking ``_resize`` between runs.
 
     The live executor's own width is passed back only when loky will reuse it. When loky will
-    replace it (shut down, broken, or a call queue too small for ``max_workers``, loky's own
-    reuse test), the requested width is passed, so the new executor's queue fits it.
+    replace it (missing, shut down, broken, argument mismatch or a call queue too small for
+    ``max_workers``), the requested width is passed, so the new executor's queue fits it.
     """
-    if hasattr(loky.reusable_executor, "_executor"):
-        executor = cast(
-            "loky.ProcessPoolExecutor | None",
-            getattr(loky.reusable_executor, "_executor"),  # noqa: B009 - loky 3.5/3.6 singleton
-        )
-    else:
-        storage = getattr(loky.reusable_executor, "_executor_storage", None)  # loky 3.7 singleton
-        if storage is None or not hasattr(storage, "executor"):
-            version = getattr(loky, "__version__", "unknown")
-            raise RuntimeError(f"Unsupported loky {version}: no reusable-executor singleton")
-        executor = cast("loky.ProcessPoolExecutor | None", storage.executor)
-    if (
-        kill_workers
-        or executor is None
-        or executor._flags.shutdown
-        or executor._flags.broken is not None
-        or executor.queue_size < max_workers
+    executor, current_kwargs = _current_reusable_executor()
+    if kill_workers or not is_executor_usable(
+        executor,
+        max_workers,
+        current_kwargs=current_kwargs,
+        requested_kwargs=requested_kwargs,
     ):
         return max_workers
+    assert executor is not None
     return executor._max_workers
 
 
@@ -123,8 +177,13 @@ def _get_executor(
     _ensure_deterministic_environment()
     _ensure_cleanup_registered()
     root = discovery.import_session_root()
+    requested_kwargs = _requested_reusable_executor_kwargs(idle_timeout_s, root)
     return loky.get_reusable_executor(
-        max_workers=_reusable_worker_target(max_workers, kill_workers=kill_workers),
+        max_workers=_reusable_worker_target(
+            max_workers,
+            kill_workers=kill_workers,
+            requested_kwargs=requested_kwargs,
+        ),
         timeout=idle_timeout_s,
         kill_workers=kill_workers,
         reuse=False if kill_workers else "auto",
@@ -191,7 +250,7 @@ def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> None:
     workers killed, before the error propagates. Loky 3.7 keeps it in the calling thread's
     slot, which no ``WorkerPool`` holds, so nothing else would stop its worker.
     """
-    pool = _get_executor(max_workers, idle_timeout_s=idle_timeout_s, kill_workers=True)
+    pool = create_fresh_executor(max_workers, idle_timeout_s=idle_timeout_s)
     try:
         submit(pool, max_workers, _noop).result()
     except BaseException:
@@ -202,7 +261,7 @@ def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> None:
 def _cleanup_worker_pool() -> None:
     """Kill loky worker pool on process exit to prevent orphaned workers."""
     with contextlib.suppress(Exception):
-        _get_executor(1, idle_timeout_s=None, kill_workers=True)
+        create_fresh_executor(1, idle_timeout_s=None)
 
 
 @functools.cache  # Ensures single atexit registration across threads
@@ -407,6 +466,13 @@ def create_executor(
 ) -> loky.ProcessPoolExecutor:
     """Get Pivot's reusable executor without growing it before work is submitted."""
     return _get_executor(max_workers, idle_timeout_s=idle_timeout_s)
+
+
+def create_fresh_executor(
+    max_workers: int, *, idle_timeout_s: float | None = None
+) -> loky.ProcessPoolExecutor:
+    """Force loky to replace its reusable executor without waiting for a worker to warm."""
+    return _get_executor(max_workers, idle_timeout_s=idle_timeout_s, kill_workers=True)
 
 
 def prepare_worker_info(

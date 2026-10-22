@@ -104,12 +104,15 @@ class WorkerPool:
         elif (
             self._idle_timeout_s != idle_timeout_s
             or self._has_stale_user_code()
-            # loky's own reuse test: a call queue too small for the width holds stages back.
-            or executor.queue_size < self._max_workers
+            or not executor_core.is_executor_usable(executor, self._max_workers)
         ):
-            executor = self._replace_executor(idle_timeout_s)
+            executor = self._replace_executor(idle_timeout_s, warm=False)
         else:
             fresh_workers = False
+        # An argument change can make loky replace a live reusable executor during first use.
+        # Recheck every acquisition so this pool never keeps its narrowed call queue.
+        if not executor_core.is_executor_usable(executor, self._max_workers):
+            executor = self._replace_executor(idle_timeout_s, warm=False)
         if fresh_workers:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
@@ -127,24 +130,32 @@ class WorkerPool:
         ``start()`` creates one, as on first use.
         """
         self._max_workers = max(self._max_workers, max_workers)
-        self._executor = self._replace_executor(self._idle_timeout_s)
+        self._executor = self._replace_executor(self._idle_timeout_s, warm=True)
         self._restamp_user_code_files()
 
-    def _replace_executor(self, idle_timeout_s: float | None) -> loky.ProcessPoolExecutor:
-        """Stop this pool's workers, then return a fresh executor holding one warm worker.
+    def _replace_executor(
+        self, idle_timeout_s: float | None, *, warm: bool
+    ) -> loky.ProcessPoolExecutor:
+        """Stop this pool's workers, then return a fresh executor.
 
         The pool stops the executor it holds rather than asking loky for "the" reusable
         executor: loky 3.7 keeps one per thread, and a watch reload restarts from an anyio
         worker thread, so the executor this pool holds need not be the one loky finds on the
         calling thread. The pool forgets the old executor as soon as it is shut down, so a
         failure starting the fresh worker never leaves it holding one that rejects work.
+
+        A reload may warm one worker before its next run. A replacement that ``start()`` makes
+        belongs to that run's critical path, so it returns an unwarmed executor and lets its
+        submitted stages start every worker they need in parallel.
         """
         if self._executor is not None:
             executor = self._executor
             self._executor = None
             executor.shutdown(wait=True, kill_workers=True)
-        executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
-        return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
+        if warm:
+            executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
+            return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
+        return executor_core.create_fresh_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 
     def _new_output_queue(self) -> object:
         """Return a fresh queue from the engine-lifetime manager, replacing it if unreachable."""

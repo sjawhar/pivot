@@ -68,12 +68,14 @@ each. An upgrade must recheck reusable-executor lookup plus `_max_workers` and
 
 loky fixes an executor's call queue when it creates the executor: `queue_size` is
 2 × max(cpu, width) + 1. It refuses to reuse an executor whose queue is smaller than the
-requested width. Because `submit()` narrows loky's `_max_workers`, Pivot applies the same test
-itself. `_reusable_worker_target` passes the requested width whenever loky will replace the
-executor (shut down, broken, or a queue too small). `WorkerPool.start()` replaces a held executor
-whose queue is smaller than the pool's width. Without both, a wide run after a narrow one could
-get a queue that holds submitted stages back until a slot frees. An upgrade must also recheck
-`queue_size` and `_flags`.
+requested width. Because `submit()` narrows loky's `_max_workers`, Pivot applies loky's whole
+reuse test itself. `_reusable_worker_target` passes the requested width whenever loky will replace
+the executor (missing, shut down, broken, arguments changed or a queue too small).
+`WorkerPool.start()` retains only an executor that exists, is neither shut down nor broken, and
+has a queue that fits the pool's width; it rechecks every newly acquired executor too. Without
+both, a wide run after a narrow one could get a queue that holds submitted stages back until a
+slot frees. An upgrade must also recheck `queue_size`, `_flags` and reusable-executor argument
+storage.
 
 ### Starting Process Trackers for the TUI
 
@@ -88,17 +90,23 @@ Pivot's normal worker output queue continues to capture stage logs.
 ### Killing Workers for Code Reload
 
 In watch mode, code changes require fresh workers with updated imports. `WorkerPool.restart()`
-first shuts down the executor the pool holds with `kill_workers=True`, then calls
-`restart_workers()` to start one fresh worker; subsequent workers start on demand:
+first shuts down the executor the pool holds with `kill_workers=True`, then starts one fresh warm
+worker; additional workers start on demand. A replacement that `start()` makes for its own run
+does not wait for that warm-up, so the run submits every stage at once and loky starts them in
+parallel:
 
 ```python
-def _replace_executor(self, idle_timeout_s: float | None) -> loky.ProcessPoolExecutor:
+def _replace_executor(
+    self, idle_timeout_s: float | None, *, warm: bool
+) -> loky.ProcessPoolExecutor:
     if self._executor is not None:
         executor = self._executor
         self._executor = None
         executor.shutdown(wait=True, kill_workers=True)
-    executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
-    return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
+    if warm:
+        executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
+        return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
+    return executor_core.create_fresh_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 ```
 
 The pool shuts down the executor it holds rather than asking loky for "the" reusable executor.
@@ -107,10 +115,10 @@ thread that never created the pool's executor, so `get_reusable_executor(kill_wo
 there finds no executor and leaves the previous workers alive. `reuse=False` still makes loky
 replace a compatible live executor instead of returning it unchanged. Every path that replaces
 the pool's executor goes through `_replace_executor`: a reload's `restart()`, and a `start()`
-that finds stale user code, a different idle timeout, or a call queue smaller than the pool's
-width. After a restart from another thread, loky's lookup on the calling thread no longer finds
-the executor the pool holds, so a `start()` that let loky swap it for a new timeout would leave
-the restart's worker alive.
+that finds stale user code, a different idle timeout or an unusable executor (missing, shut
+down, broken or a call queue smaller than the pool's width). After a restart from another thread,
+loky's lookup on the calling thread no longer finds the executor the pool holds, so a `start()`
+that let loky swap it for a new timeout would leave the restart's worker alive.
 
 The pool forgets the old executor as soon as it is shut down. If the fresh worker then fails to
 start, the Engine logs the failed restart and the pool holds no executor, so the next run's

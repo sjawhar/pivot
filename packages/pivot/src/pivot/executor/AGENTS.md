@@ -14,17 +14,19 @@ drives loky's private `_max_workers` to the submitted work count, so idle worker
 respawned until a stage needs one. Parents running past half the one-shot idle timeout
 periodically ping idle workers pre-started for their direct consumers. The pings stop when the
 parent resolves, so the workers then follow the normal idle timeout. Keep
-`reuse=False if kill_workers else "auto"` in the shared executor policy. Every replacement of
-the executor `WorkerPool` holds (a restart, stale user code, a new idle timeout, a call queue too
-small for the pool's width) stops that executor before asking loky for a new one: loky 3.7 keeps
-its reusable executor per thread, and the watch reload restarts from an anyio worker thread.
+`reuse=False if kill_workers else "auto"` in the shared executor policy. A pool retains an
+executor only if `core.is_executor_usable` finds one that exists, is neither shut down nor broken,
+and has a call queue at least as wide as the pool. A restart, stale user code, a new idle timeout
+or an unusable held executor replaces through `WorkerPool._replace_executor`, which stops the
+executor the pool holds before asking loky for a new one. Loky 3.7 keeps its reusable executor per
+thread, and the watch reload restarts from an anyio worker thread.
 
 loky fixes an executor's call queue at creation (`queue_size`, 2 × max(cpu, width) + 1) and
 will not reuse one whose queue is smaller than the requested width. `submit()` lowers loky's
 `_max_workers` to the pending work, so `core._reusable_worker_target` passes that narrowed width
-back only when loky will reuse the executor. When loky will replace it (shut down, broken, or a
-queue too small for the request), it passes the requested width, so the executor that replaces
-it gets a queue that fits.
+back only when loky will reuse the executor. When loky will replace it (missing, shut down,
+broken, arguments changed or a queue too small for the request), it passes the requested width,
+so the executor that replaces it gets a queue that fits.
 
 Pivot supports `loky>=3.5.6,<3.8`: 3.5.6 and 3.6 keep the reusable executor in the legacy
 `_executor` singleton; 3.7 keeps it in `_executor_storage`. Reject an unknown layout with an

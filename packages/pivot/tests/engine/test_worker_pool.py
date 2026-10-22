@@ -339,9 +339,87 @@ def test_failed_reload_restart_leaves_no_worker_beyond_the_cap(
         reload_thread.shutdown(wait=True)
 
 
-# loky sizes an executor's call queue once, at creation: 2 * max(cpu_count, max_workers) + 1.
-# One more than a narrow executor's queue, so a narrow executor's queue cannot fit it.
+def test_run_after_an_idle_worker_died_between_runs_still_runs() -> None:
+    """An OS kill of an idle warm worker between watch runs (the OOM killer, a stray SIGKILL)
+    leaves loky's executor broken. The next run's ``start()`` must hand it a working executor,
+    as loky's own reuse test (``_flags.broken``) does, rather than keep the broken one."""
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=2)
+        assert pool.submit(_helper_pid).result(timeout=60) > 0
+        pool.end_run()
+        assert pool._executor is not None
+        workers = [p.pid for p in pool._executor._processes.values() if p.pid is not None]
+        assert workers, "the run left no warm worker to kill"
+        os.kill(workers[0], signal.SIGKILL)
+        deadline = time.monotonic() + 30
+        while pool._executor._flags.broken is None:
+            assert time.monotonic() < deadline, "loky never noticed the killed worker"
+            time.sleep(0.05)
+
+        for run in range(2):
+            pool.start(max_workers=2)
+            assert pool.submit(_helper_pid).result(timeout=60) > 0, f"run {run} after the kill"
+            pool.end_run()
+    finally:
+        pool.hard_cancel()
+
+
+# One more than a narrow executor's call queue (2 * max(cpu_count, 1) + 1), so the wide run
+# needs a new executor.
 _WIDER_THAN_A_NARROW_QUEUE = 2 * (loky.cpu_count() or 1) + 2
+_STARTUP_S = 3.0
+_STAGE_S = 4.0
+
+# Loaded by every Python process started while PYTHONPATH names its directory; a loky worker
+# sleeps at startup, standing in for a worker that imports a heavy pipeline.
+_SLOW_STARTUP_HOOK = f"""\
+import sys
+import time
+
+_LAUNCHERS = ("loky.backend.popen_loky_posix", "joblib.externals.loky.backend.popen_loky_posix")
+if sys.orig_argv[1:2] == ["-m"] and sys.orig_argv[2:3] and sys.orig_argv[2] in _LAUNCHERS:
+    time.sleep({_STARTUP_S!r})
+"""
+
+
+def _helper_started_at(seconds: float) -> float:
+    started = time.time()
+    time.sleep(seconds)
+    return started
+
+
+def test_wider_run_after_a_narrow_one_starts_its_stages_together(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watch session's wide run after a narrow one needs a new executor (its call queue is too
+    small). Replacing it must not start one stage a whole worker start-up ahead of the rest:
+    on main every stage of the wide run starts together; none may start more than half a stage
+    after the first (the late count PR 502's own makespan probe uses)."""
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_SLOW_STARTUP_HOOK)
+    width = _WIDER_THAN_A_NARROW_QUEUE
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1)
+        assert pool.submit(_helper_identity, 1).result(timeout=60) == 1
+        pool.end_run()
+
+        with monkeypatch.context() as patched:
+            patched.setenv(
+                "PYTHONPATH",
+                os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])),
+            )
+            pool.start(max_workers=width)
+            futures = [pool.submit(_helper_started_at, _STAGE_S) for _ in range(width)]
+            starts = sorted(future.result(timeout=120) for future in futures)
+        pool.end_run()
+        offsets = [round(start - starts[0], 2) for start in starts]
+        late = [offset for offset in offsets if offset > _STAGE_S / 2]
+        assert not late, f"{len(late)} of {width} stages started late: offsets {offsets}"
+    finally:
+        pool.shutdown()
 
 
 def _helper_narrow_run(pool: WorkerPool) -> None:
@@ -391,6 +469,55 @@ def test_second_pool_after_a_wide_run_gets_a_queue_that_fits() -> None:
     pool = WorkerPool()
     try:
         assert _helper_wide_queue_size(pool) >= _WIDER_THAN_A_NARROW_QUEUE
+    finally:
+        pool.shutdown()
+
+
+def test_reusable_worker_target_uses_requested_width_when_live_queue_is_too_small() -> None:
+    executor_core.restart_workers(1, idle_timeout_s=None)
+    executor = executor_core.create_executor(1, idle_timeout_s=None)
+    width = executor.queue_size + 1
+    try:
+        assert executor_core._reusable_worker_target(width, kill_workers=False) == width
+    finally:
+        executor_core._cleanup_worker_pool()
+
+
+def test_reusable_worker_target_uses_requested_width_when_executor_is_broken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Flags:
+        shutdown: bool = False
+        broken: BaseException | None = RuntimeError("worker died")
+
+    class _Executor:
+        _max_workers: int = 1
+        queue_size: int = 2
+        _flags: _Flags = _Flags()
+
+    executor = _Executor()
+    if hasattr(loky.reusable_executor, "_executor"):
+        monkeypatch.setattr(loky.reusable_executor, "_executor", executor)
+    else:
+        storage = loky.reusable_executor._executor_storage
+        monkeypatch.setattr(storage, "executor", executor)
+
+    assert executor_core._reusable_worker_target(2, kill_workers=False) == 2
+
+
+def test_argument_changed_singleton_gets_a_queue_that_fits() -> None:
+    """A live reusable executor narrowed by its last submission must still get the requested
+    width when loky replaces it because only the idle timeout changed."""
+    width = 16
+    executor_core.restart_workers(width, idle_timeout_s=None)
+    before = executor_core.create_executor(width, idle_timeout_s=None)
+    assert before._max_workers == 1
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=width, idle_timeout_s=10.0)
+        assert pool._executor is not None
+        assert pool._executor is not before
+        assert pool._executor.queue_size >= width
     finally:
         pool.shutdown()
 
