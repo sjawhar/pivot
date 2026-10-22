@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import os
 import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
+import signal
 import sys
 import threading
 import time
@@ -514,6 +515,18 @@ def test_manager_parent_watchdog_exits_after_parent_death(mocker: MockerFixture)
     with pytest.raises(SystemExit):
         target()
     exit_process.assert_called_once_with(0)
+
+
+def test_manager_ignores_sigterm_and_watches_its_parent(mocker: MockerFixture) -> None:
+    """A stop sent to the whole process group leaves the manager to its owner's shutdown, which
+    removes its pymp-* directory; the parent-death watcher still covers a killed owner."""
+    set_handler = mocker.patch.object(signal, "signal", autospec=True)
+    watch = mocker.patch.object(executor_core, "_exit_when_parent_dies", autospec=True)
+
+    executor_core._init_manager(42)
+
+    set_handler.assert_called_once_with(signal.SIGTERM, signal.SIG_IGN)
+    watch.assert_called_once_with(42)
 
 
 def _resource_root(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:

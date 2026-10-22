@@ -296,3 +296,6 @@ $RECYCLE.BIN/
 
 # OhMyOpenCode session state
 .omo/
+
+# Agent worktrees and jj workspaces kept inside the checkout
+/.worktrees/

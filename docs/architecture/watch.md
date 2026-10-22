@@ -69,7 +69,7 @@ A watched engine fingerprints every stage before it starts any other source or h
 
 When a dependency file changes:
 
-1. FilesystemSource emits `DataArtifactChanged(paths=[...])`
+1. FilesystemSource emits `DataArtifactChanged(paths=[...])` for a batch of changes that touches no code or config file
 2. WatchCoordinator computes affected stages from bipartite graph
 3. Engine executes affected stages and their downstream dependencies
 4. StageStarted/StageCompleted events emitted to sinks
@@ -80,11 +80,13 @@ A change that arrives while a run is in progress cancels that run and queues one
 
 When Python files or `pipeline.py` change:
 
-1. FilesystemSource emits `CodeOrConfigChanged(paths=[...])`
+1. FilesystemSource emits `CodeOrConfigChanged(paths=[...], data_paths=[...])`, one event for the whole batch: `data_paths` holds the batch's other changed files
 2. Engine invalidates caches and reloads registry
 3. Engine rebuilds bipartite graph and updates WatchCoordinator
 4. Engine updates FilesystemSource watch paths
 5. Engine re-runs all stages
+
+The files in `data_paths` changed before the reload starts. If the reload starts a re-run, that re-run checks them and they start no run of their own: an editor that saves several buffers at once, or a checkout that changes `pipeline.py` and an input together, runs each stage once. If the reload starts no re-run, `data_paths` is handled as a data change once the reload ends: a pipeline left invalid drops it with a debug log (see below), and a valid pipeline with no stages finds no stage to run. If a run is in progress, the reload waits for that run to end, and `data_paths` is handled at once as a data change.
 
 A reload re-imports `pipeline.py`, fingerprints every stage and checks `params.yaml` in one daemon thread, so the RPC server, the TUI's event polling and cancellation keep running. That thread does every `sys.modules` change the reload makes (dropping project modules, importing the edited ones); the event loop then swaps in the new pipeline, emits `PipelineReloaded` and starts the re-run. Until the re-run has started, `run` and `commit` are refused at once with error `-32004` ("Engine is reloading"), and `explain` waits for the new pipeline. Reloads run one at a time. Ctrl-C stops watch mode at once, even while an import is slow or never returns: the engine abandons the reload thread, and interpreter shutdown does not wait for a daemon thread. Cancelling the `FilesystemSource` also sets its watcher's stop event, so the watch thread ends within one poll step instead of at its 5 s timeout.
 

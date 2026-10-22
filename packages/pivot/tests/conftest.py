@@ -10,6 +10,7 @@ import multiprocessing as mp
 import os
 import pathlib
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -59,6 +60,18 @@ GitRepo = tuple[pathlib.Path, Callable[[str], str]]
 _MEMORY_PER_WORKER_BYTES = 2 * 1024**3
 # Hard cap on worker count to prevent resource exhaustion
 _MAX_WORKERS_CAP = 16
+
+
+def pytest_configure() -> None:
+    """Give every process the suite starts SIGINT at its default disposition.
+
+    A background job of a non-interactive shell (``cmd &`` in a script) starts with SIGINT
+    ignored, and an ignored signal stays ignored across exec, through ``uv run`` too. The tests
+    that press Ctrl-C on pivot would then wait out their timeouts. A handled signal resets to the
+    default on exec, so installing Python's own handler here gives each child the default.
+    """
+    if signal.getsignal(signal.SIGINT) is signal.SIG_IGN:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)

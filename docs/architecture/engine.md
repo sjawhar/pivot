@@ -158,7 +158,7 @@ async with Engine(pipeline=pipeline) as engine:
 | Event | Trigger | Action |
 |-------|---------|--------|
 | `DataArtifactChanged` | File modified | Run affected stages |
-| `CodeOrConfigChanged` | Python/config modified | Reload registry, run all |
+| `CodeOrConfigChanged` | Python/config modified, with the same watch batch's data files | Reload registry, run all |
 | `RunRequested` | CLI/RPC command | Run specified stages |
 | `CancelRequested` | User interrupt | Stop starting new stages |
 

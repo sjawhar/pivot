@@ -98,5 +98,44 @@ jobs:
           uv sync --all-extras --all-groups --locked
           echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
 
-      - name: Run tests for ${{ matrix.package.name }}
-        run: pytest ${{ matrix.package.path }} -n auto ${{ matrix.package.extra_args }}
+      - name: Run tests for ${{ matrix.package.name }} without uv on PATH
+        # The suite must pass where uv is not on PATH. Only the wheel smoke test uses uv, by the
+        # absolute path recorded here before every directory holding uv leaves PATH.
+        run: |-
+          uv="$(command -v uv)" || { echo "::error::setup-uv left no uv on PATH to record"; exit 1; }
+          kept=""
+          IFS=:
+          for dir in $PATH; do
+            if [ ! -x "$dir/uv" ]; then
+              kept="${kept:+$kept:}$dir"
+            fi
+          done
+          unset IFS
+          PATH="$kept"
+          if found="$(command -v uv)"; then
+            echo "::error::uv is still on PATH at $found"
+            exit 1
+          fi
+          echo "uv is not on PATH: $PATH"
+          PIVOT_TEST_UV="$uv" pytest ${{ matrix.package.path }} -n auto ${{ matrix.package.extra_args }}
+
+  known-regressions:
+    # Runs on pushes to main only, so a PR that records or fixes a regression can still merge.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Hold releases while main carries a known regression
+        run: |-
+          status=0
+          regressions="$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' .github/known-regressions)" || status=$?
+          if [ "$status" -gt 1 ]; then
+            exit "$status"
+          fi
+          if [ -n "$regressions" ]; then
+            printf '%s\n' "$regressions"
+            echo "::error file=.github/known-regressions::main carries the known regressions above, so nothing publishes until their fixes delete these lines"
+            exit 1
+          fi

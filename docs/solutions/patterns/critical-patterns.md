@@ -33,8 +33,9 @@ def test_rpc_source_accepts_connections(): ...
 # ALSO: E2E test for the complete CLI path
 def test_serve_mode_cli_responds_to_status_query(tmp_path):
     """E2E test: exercises actual CLI, not just components."""
-    # 1. Start actual CLI command
-    proc = subprocess.Popen(["uv", "run", "pivot", "run", "--watch", "--serve"], ...)
+    # 1. Start actual CLI command: the pivot beside the interpreter running pytest, not PATH's
+    pivot_bin = str(pathlib.Path(sys.executable).parent / "pivot")
+    proc = subprocess.Popen([pivot_bin, "repro", "--watch", "--serve"], ...)
 
     # 2. Exercise through public interface
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

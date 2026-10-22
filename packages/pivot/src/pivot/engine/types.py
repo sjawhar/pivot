@@ -81,10 +81,16 @@ class DataArtifactChanged(TypedDict):
 
 
 class CodeOrConfigChanged(TypedDict):
-    """Python files or pipeline.py changed."""
+    """Python files or pipeline.py changed.
+
+    ``data_paths`` are the other files the same watch batch changed. It is empty when the
+    engine replays reloads it deferred during a run, whose batches' data files it already
+    handled.
+    """
 
     type: Literal["code_or_config_changed"]
     paths: list[str]
+    data_paths: list[str]
 
 
 class RunRequested(TypedDict):

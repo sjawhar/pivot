@@ -119,6 +119,10 @@ pivot repro --watch --serve
 
 This creates `<state dir>/agent.sock` — a JSON-RPC 2.0 endpoint that the TUI or external tools
 can connect to for status queries and triggering runs. `core.state_dir` defaults to `.pivot`.
+Ctrl-C or SIGTERM (a service manager's stop, sent once or several times, to the server or its
+whole process group) shuts the `pivot` command's server down, removes the socket and exits 0.
+Run in-process through `pivot.cli.main()`, serve leaves the caller's signal handlers alone, so
+the caller decides what SIGTERM does.
 
 ## Error Handling
 

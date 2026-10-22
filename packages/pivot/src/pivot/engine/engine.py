@@ -857,8 +857,11 @@ class Engine:
                 if reload_pending is not None:
                     self._reload_pending = None
                     reload_paths = sorted(reload_pending)
+                    # Its batches' data files were handled as data changes when they arrived
                     await self._handle_code_or_config_changed(
-                        CodeOrConfigChanged(type="code_or_config_changed", paths=reload_paths)
+                        CodeOrConfigChanged(
+                            type="code_or_config_changed", paths=reload_paths, data_paths=[]
+                        )
                     )
 
                 # Replay a restart no reload re-run absorbed (taken before the call)
@@ -1268,6 +1271,11 @@ class Engine:
                                     )
 
                                 except Exception as e:
+                                    # A service manager can SIGTERM the worker cgroup at the
+                                    # same time it stops pivot. Let cancellation win over a late
+                                    # TerminatedWorkerError so a deliberate stop is not logged
+                                    # as a stage failure.
+                                    await anyio.lowlevel.checkpoint_if_cancelled()
                                     _logger.exception("Stage %s failed with exception", stage_name)
                                     self._worker_pool.mark_workers_unverified()
                                     failed_result = StageResult(
@@ -2448,9 +2456,11 @@ class Engine:
     async def _handle_data_artifact_changed(self, event: DataArtifactChanged) -> None:
         """Handle data artifact changes by running affected stages."""
         if self.is_reloading:
-            # Only a reload deferred to the end of a run overlaps the input loop; the re-run it
-            # starts checks every stage against the inputs as they are now.
-            _logger.debug("Data changed during a reload - its re-run covers the change")
+            # Only a reload deferred to the end of a run overlaps the input loop; if it succeeds,
+            # the re-run it starts checks every stage against the inputs as they are now.
+            _logger.debug(
+                "Data changed during a reload - handled by its re-run if the reload succeeds"
+            )
             return
         paths = [pathlib.Path(path) for path in event["paths"]]
         filtered_paths = list[pathlib.Path]()
@@ -2491,9 +2501,12 @@ class Engine:
     async def _handle_code_or_config_changed(self, event: CodeOrConfigChanged) -> None:
         """Handle code/config changes by reloading registry and re-running.
 
-        If a run is active, defers the reload until the current run completes. Reloads run one
-        at a time: an edit that arrives while a reload deferred to the end of a run is still in
-        flight waits for it, then reloads again.
+        If a run is active, defers the reload until the current run completes, and handles the
+        data files the same watch batch changed as a data change. Otherwise the reload runs
+        first: when it starts a re-run, that re-run checks those files, so they start nothing
+        of their own; when it starts none, they are handled as a data change once it ends, as
+        a separate data event would be. Reloads run one at a time: an edit that arrives while a
+        reload deferred to the end of a run is still in flight waits for it, then reloads again.
         """
         while True:
             if self._run_state in (_RunState.RUNNING, _RunState.CANCELLING):
@@ -2502,6 +2515,10 @@ class Engine:
                     self._reload_pending = set(event["paths"])
                 else:
                     self._reload_pending.update(event["paths"])
+                if event["data_paths"]:
+                    await self._handle_data_artifact_changed(
+                        DataArtifactChanged(type="data_artifact_changed", paths=event["data_paths"])
+                    )
                 return
             if not self.is_reloading:
                 break
@@ -2509,12 +2526,24 @@ class Engine:
 
         self._reload_done = anyio.Event()
         try:
-            await self._reload_and_rerun(event)
+            reran = await self._reload_and_rerun(event)
         finally:
             self._reload_done.set()
+        if not event["data_paths"]:
+            return
+        if reran:
+            _logger.debug("Data changed with the code - the reload's re-run covers the change")
+            return
+        await self._handle_data_artifact_changed(
+            DataArtifactChanged(type="data_artifact_changed", paths=event["data_paths"])
+        )
 
-    async def _reload_and_rerun(self, event: CodeOrConfigChanged) -> None:
-        """Reload the edited pipeline off the event loop, then re-run every stage."""
+    async def _reload_and_rerun(self, event: CodeOrConfigChanged) -> bool:
+        """Reload the edited pipeline off the event loop, then re-run every stage.
+
+        Returns whether a re-run started: none does when the edit leaves the pipeline invalid
+        or it has no stages.
+        """
         _logger.info("Code/config changed - reloading pipeline")
 
         # Invalidate caches
@@ -2532,7 +2561,7 @@ class Engine:
                 extra={"pivot_condition": (PIPELINE_ERROR_CONDITION, reload_result)},
             )
             await self._emit_pipeline_error(reload_result)
-            return
+            return False
         old_stages = reload_result
 
         # Emit reload event
@@ -2606,6 +2635,8 @@ class Engine:
                     )
 
             await self._execute_affected_stages(stages)
+            return True
+        return False
 
     async def _execute_affected_stages(self, stages: list[str]) -> None:
         """Execute the specified stages via non-blocking run handling.
