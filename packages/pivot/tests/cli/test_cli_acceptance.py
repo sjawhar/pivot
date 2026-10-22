@@ -2803,12 +2803,10 @@ def _assert_recorded_name_is_read(root: pathlib.Path, output: str, name: str) ->
     status = _ok(_pivot(root, "status"))
     assert "1 stages: 1 cached, 0 stale" in status, status
     assert "Verification passed" in _ok(_pivot(root, "verify"))
-    diff = _pivot(root, "diff", "--json", "d/make")
-    assert diff.returncode == 0, diff.stdout + diff.stderr
     changed = {"plain.csv", name} if name.endswith(".csv") else {"plain.csv"}
     assert {
         (entry["path"], entry["change_type"], entry["old_rows"], entry["new_rows"])
-        for entry in json.loads(diff.stdout)
+        for entry in _json_diff(root, "d/make")
     } == {(f"{output}/{member}", "modified", 2, 3) for member in changed}
     params = _pivot(root, "params", "diff")
     assert params.returncode == 0, params.stdout + params.stderr

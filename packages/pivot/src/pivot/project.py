@@ -115,10 +115,10 @@ def relative_within(path: pathlib.Path, base: pathlib.Path) -> pathlib.Path | No
     inside. Symlinks below that one are kept, as ``normalize_path`` keeps them. A path holding
     ``..`` or a NUL byte is placed by its spelling alone, so ``<link>/../x`` stays outside.
     """
-    if path.is_relative_to(base):
-        return path.relative_to(base)
     if ".." in path.parts or "\0" in str(path):
         return None
+    if path.is_relative_to(base):
+        return path.relative_to(base)
     resolved_base = base.resolve()
     for ancestor in (*reversed(path.parents), path):
         resolved = ancestor.resolve()

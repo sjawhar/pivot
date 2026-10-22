@@ -112,7 +112,6 @@ def test_lock_write_never_produces_a_lock_read_refuses(relpath: str, empty_dir: 
     )
     with tempfile.TemporaryDirectory() as tmp:
         stage_lock = lock.StageLock("p/stage", pathlib.Path(tmp))
-        stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             stage_lock.write(data)
         except exceptions.InvalidPathError:

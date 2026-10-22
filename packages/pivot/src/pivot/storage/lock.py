@@ -37,6 +37,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -121,14 +122,10 @@ def _is_nonempty_str(value: object) -> bool:
     return isinstance(value, str) and value != ""
 
 
-def _is_project_relative_posix_path(value: object) -> bool:
-    return isinstance(value, str) and path_policy.recorded_path_error(value) is None
-
-
 def _path_error(value: object, field: str) -> str | UnsafeLockPath | None:
     if not isinstance(value, str) or not value:
         return field
-    if not _is_project_relative_posix_path(value):
+    if path_policy.recorded_path_error(value) is not None:
         return UnsafeLockPath(field, value)
     return None
 
@@ -291,37 +288,32 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     )
 
 
-def _member_relpaths(entry: DepEntry | OutEntry) -> list[str]:
-    """The manifest relpaths and empty directories a directory entry records."""
-    members = [item["relpath"] for item in entry["manifest"]] if "manifest" in entry else []
+def _member_relpaths(entry: DepEntry | OutEntry) -> Iterator[str]:
+    """Yield the manifest relpaths and empty directories a directory entry records."""
+    if "manifest" in entry:
+        for item in entry["manifest"]:
+            yield item["relpath"]
     if "empty_dirs" in entry:
-        members.extend(entry["empty_dirs"])
-    return members
+        yield from entry["empty_dirs"]
 
 
-def _recorded_paths(data: StorageLockData) -> list[tuple[str, str]]:
-    """Return ``(recorded, shown)`` for every path a lock records.
+def _recorded_paths(data: StorageLockData) -> Iterator[tuple[str, str | None, str | None]]:
+    """Yield each path a lock records with its output path or dependency name.
 
-    These are each output's own path, and each manifest relpath and empty directory of a
-    directory dependency or output. ``shown`` names the path where a user finds it: an output's
-    member under the output's path, and a dependency's member with that dependency.
+    A yielded output path names the directory that owns a member. A yielded dependency names
+    the directory dependency that owns its member. The caller formats either only when it must
+    report a validation refusal or control-character warning.
     """
-    paths = list[tuple[str, str]]()
     for dep in data["deps"]:
         dependency = identity_key(ArtifactIdentity(dep["producer"], dep["key"]))
-        paths.extend(
-            (relpath, f"{relpath!r} in dependency {dependency!r}")
-            for relpath in _member_relpaths(dep)
-        )
+        for relpath in _member_relpaths(dep):
+            yield relpath, None, dependency
     for out in data["outs"]:
         out_path = out["path"] if "path" in out else None
         if out_path is not None:
-            paths.append((out_path, repr(out_path)))
-        paths.extend(
-            (relpath, repr(relpath if out_path is None else posixpath.join(out_path, relpath)))
-            for relpath in _member_relpaths(out)
-        )
-    return paths
+            yield out_path, None, None
+        for relpath in _member_relpaths(out):
+            yield relpath, out_path, None
 
 
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
@@ -410,14 +402,22 @@ class StageLock:
         """
         storage_data = _convert_to_storage_format(data)
         with_control = list[str]()
-        for recorded, shown in _recorded_paths(storage_data):
+        for recorded, out_path, dependency in _recorded_paths(storage_data):
             reason = path_policy.recorded_path_error(recorded)
+            has_control = reason is None and path_policy.has_control_character(recorded)
+            if reason is None and not has_control:
+                continue
+            if dependency is not None:
+                shown = f"{recorded!r} in dependency {dependency!r}"
+            elif out_path is not None:
+                shown = repr(posixpath.join(out_path, recorded))
+            else:
+                shown = repr(recorded)
             if reason is not None:
                 raise exceptions.InvalidPathError(
                     f"Stage '{self.stage_name}' cannot record {shown}: {reason}; rename it"
                 )
-            if path_policy.has_control_character(recorded):
-                with_control.append(shown)
+            with_control.append(shown)
         if with_control:
             one = len(with_control) == 1
             logger.warning(

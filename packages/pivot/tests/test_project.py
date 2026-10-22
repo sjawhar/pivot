@@ -147,3 +147,13 @@ def test_relative_within_refuses_a_path_outside_the_root(
     (tmp_path / "outside.csv").write_text("x")
 
     assert project.relative_within(tmp_path / outside, root) is None
+
+
+def test_relative_within_refuses_traversal_through_a_symlink_inside_the_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A lexically contained path can still leave through an in-project symlink and ``..``."""
+    root, _ = _helper_linked_project(tmp_path)
+    (root / "escape").symlink_to(tmp_path, target_is_directory=True)
+
+    assert project.relative_within(root / "escape" / ".." / "outside.csv", root) is None
