@@ -58,6 +58,8 @@ _INTERRUPT_GRACE_S = 10
 
 _STOP_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
 _first_stop_signal: int | None = None
+_stop_signal_read_fd: int | None = None
+_stop_signal_write_fd: int | None = None
 _SUMMARY = re.compile(r"Summary: (\d+) ran, (\d+) cached")
 _MARKER = re.compile(r"^    _edit_marker = .*\n", re.MULTILINE)
 _KEEP_IN_PIVOT_DIR = frozenset({".gitignore", "config.yaml"})
@@ -96,40 +98,44 @@ def session_members(sid: int) -> list[int]:
 
 def measure(argv: list[str], cwd: pathlib.Path) -> tuple[Measurement, str]:
     """Run one command to completion; return its measurement and combined output."""
-    env = {key: value for key, value in os.environ.items() if key not in _DROPPED_VARS}
-    load1 = os.getloadavg()[0]
-    # Output goes to a file, not a pipe: a leftover process holding the pipe open would
-    # otherwise keep the harness waiting after the command itself exits.
-    with tempfile.TemporaryFile("w+") as log:
-        before = resource.getrusage(resource.RUSAGE_CHILDREN)
-        start = time.perf_counter()
-        proc = subprocess.Popen(
-            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, set[signal.Signals]())
+    try:
+        env = {key: value for key, value in os.environ.items() if key not in _DROPPED_VARS}
+        load1 = os.getloadavg()[0]
+        # Output goes to a file, not a pipe: a leftover process holding the pipe open would
+        # otherwise keep the harness waiting after the command itself exits.
+        with tempfile.TemporaryFile("w+") as log:
+            before = resource.getrusage(resource.RUSAGE_CHILDREN)
+            start = time.perf_counter()
+            proc = subprocess.Popen(
+                argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            )
+            try:
+                proc.wait()
+            except BaseException:
+                signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+                _stop(proc)
+                raise
+            wall = time.perf_counter() - start
+            after = resource.getrusage(resource.RUSAGE_CHILDREN)
+            log.seek(0)
+            output = log.read()
+        leftovers = session_members(proc.pid)
+        for pid in leftovers:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+        measurement = Measurement(
+            wall_s=round(wall, 4),
+            cpu_s=round(cpu, 4),
+            exit_code=proc.returncode,
+            load1=load1,
+            cpu_count=os.process_cpu_count() or 1,
+            leftover_procs=len(leftovers),
         )
-        try:
-            proc.wait()
-        except BaseException:
-            signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
-            _stop(proc)
-            raise
-        wall = time.perf_counter() - start
-        after = resource.getrusage(resource.RUSAGE_CHILDREN)
-        log.seek(0)
-        output = log.read()
-    leftovers = session_members(proc.pid)
-    for pid in leftovers:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
-    measurement = Measurement(
-        wall_s=round(wall, 4),
-        cpu_s=round(cpu, 4),
-        exit_code=proc.returncode,
-        load1=load1,
-        cpu_count=os.process_cpu_count() or 1,
-        leftover_procs=len(leftovers),
-    )
-    return measurement, output
+        return measurement, output
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 def _reaped(proc: subprocess.Popen[bytes], *, block: bool) -> bool:
@@ -146,30 +152,48 @@ def _reaped(proc: subprocess.Popen[bytes], *, block: bool) -> bool:
     return True
 
 
+def _discard_pending_stop_signals() -> None:
+    """Discard stop signals that arrived after the first one started cleanup."""
+    while signal.sigtimedwait(_STOP_SIGNALS, 0) is not None:
+        pass
+
+
 def _stop(proc: subprocess.Popen[bytes]) -> None:
-    """Stop an interrupted command without letting another stop signal interrupt cleanup."""
+    """Finish a fixed stop sequence despite further SIGINT or SIGTERM deliveries."""
     mask = signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
     try:
-        if proc.returncode is None:
+        if not _reaped(proc, block=False):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(proc.pid, signal.SIGINT)
-        deadline = time.monotonic() + _INTERRUPT_GRACE_S
-        while not _reaped(proc, block=False):
-            remaining = deadline - time.monotonic()
-            again = (
-                signal.sigtimedwait(_STOP_SIGNALS, min(max(remaining, 0), 0.05))
-                if remaining > 0
-                else None
-            )
-            if remaining <= 0 or again is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(proc.pid, signal.SIGKILL)
-                _reaped(proc, block=True)
+            deadline = time.monotonic() + _INTERRUPT_GRACE_S
+            while not _reaped(proc, block=False):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(proc.pid, signal.SIGKILL)
+                    break
+                time.sleep(min(remaining, 0.05))
         for pid in session_members(proc.pid):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+        _reaped(proc, block=True)
     finally:
+        _discard_pending_stop_signals()
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
+def _first_queued_stop_signal(fallback: int) -> int:
+    """Return the first delivered stop signal, using the wakeup pipe's arrival order."""
+    if _stop_signal_read_fd is None:
+        return fallback
+    try:
+        queued = os.read(_stop_signal_read_fd, 4_096)
+    except BlockingIOError:
+        return fallback
+    for signum in queued:
+        if signum in _STOP_SIGNALS:
+            return signum
+    return fallback
 
 
 def _stop_on_signal(signum: int, _frame: object) -> None:
@@ -178,10 +202,10 @@ def _stop_on_signal(signum: int, _frame: object) -> None:
     signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
     if _first_stop_signal is not None:
         return
-    _first_stop_signal = signum
-    if signum == signal.SIGINT:
+    _first_stop_signal = _first_queued_stop_signal(signum)
+    if _first_stop_signal == signal.SIGINT:
         raise KeyboardInterrupt
-    raise SystemExit(128 + signum)
+    raise SystemExit(128 + _first_stop_signal)
 
 
 def _reset(root: pathlib.Path) -> None:
@@ -296,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    _stop_signal_read_fd, _stop_signal_write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    signal.set_wakeup_fd(_stop_signal_write_fd)
     signal.signal(signal.SIGINT, _stop_on_signal)
     signal.signal(signal.SIGTERM, _stop_on_signal)
     sys.exit(main())

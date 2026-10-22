@@ -136,6 +136,9 @@ def test_second_signal_during_the_grace_period_still_stops_the_command(
 
     harness.send_signal(second)
 
+    time.sleep(0.1)
+    assert harness.poll() is None, "a second signal must not shorten the graceful stop"
+
     exit_code = harness.wait(timeout=30)
     assert not _helper_session_alive(sid), "a second signal must not orphan the measured session"
     # The first signal decides run.py's status; later signals only wait for its stop to finish.

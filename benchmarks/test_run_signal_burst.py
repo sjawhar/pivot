@@ -131,6 +131,10 @@ def _helper_alive_after_settling(sid: int) -> list[int]:
     return alive
 
 
+def _helper_semaphores(sid: int) -> list[pathlib.Path]:
+    return list(pathlib.Path("/dev/shm").glob(f"sem.loky-{sid}-*"))
+
+
 def _helper_kill_session(sid: int) -> None:
     for pid in run.session_members(sid) if sid else []:
         with contextlib.suppress(ProcessLookupError):
@@ -155,8 +159,7 @@ def test_a_burst_of_signals_during_cleanup_still_stops_the_command(
         # The stand-in has its SIGINT, so run.py is waiting out the grace period.
         _helper_read_when_written(sigint_file)
 
-        # One signal a millisecond until run.py exits: the first ends the grace period, and the
-        # rest arrive while run.py kills the command and sweeps its session.
+        # Further signals stay blocked until the measured session has been cleaned up.
         deadline = time.monotonic() + 2
         while harness.poll() is None and time.monotonic() < deadline:
             with contextlib.suppress(ProcessLookupError):
@@ -166,6 +169,7 @@ def test_a_burst_of_signals_during_cleanup_still_stops_the_command(
 
         left = _helper_alive_after_settling(sid)
         assert not left, f"a burst of signals during cleanup orphaned the measured session: {left}"
+        assert not _helper_semaphores(sid), "the burst leaked loky semaphore files"
     finally:
         if harness.poll() is None:
             harness.kill()
