@@ -68,9 +68,9 @@ eng.add_sink(AgentEventSink())  # Broadcast events to connected agents
 ```python
 def test_serve_mode_cli_responds_to_status_query(tmp_path):
     """E2E test: pivot repro --watch --serve creates working RPC endpoint."""
-    # 1. Start serve mode as subprocess
+    # 1. Start serve mode as subprocess, with the pivot beside the interpreter running pytest
     proc = subprocess.Popen(
-        ["uv", "run", "pivot", "run", "--watch", "--serve"],
+        [str(pathlib.Path(sys.executable).parent / "pivot"), "repro", "--watch", "--serve"],
         cwd=tmp_path, ...
     )
 

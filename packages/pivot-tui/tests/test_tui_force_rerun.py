@@ -8,8 +8,10 @@ to avoid watch path issues with non-existent output files.
 from __future__ import annotations
 
 import os
+import pathlib
 import signal
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -18,8 +20,9 @@ import pytest
 from conftest import send_rpc, wait_for_engine_ready
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Generator
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 @pytest.fixture
@@ -67,7 +70,7 @@ pipeline = _cp
     # the server logs on every RPC connection close, so a pipe fills and blocks it.
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
+            [_PIVOT_BIN, "repro", "--watch", "--serve", "--force"],
             cwd=tmp_path,
             env=env,
             stdout=stdout_file,

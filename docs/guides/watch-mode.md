@@ -117,7 +117,7 @@ For headless environments (CI watchers, remote dev servers), serve mode runs the
 pivot repro --watch --serve
 ```
 
-This creates `.pivot/agent.sock` — a JSON-RPC 2.0 endpoint that the TUI or external tools can connect to for status queries and triggering runs.
+This creates `.pivot/agent.sock` — a JSON-RPC 2.0 endpoint that the TUI or external tools can connect to for status queries and triggering runs. Ctrl-C or SIGTERM (a service manager's stop, sent once or several times, to the server or its whole process group) shuts the `pivot` command's server down, removes the socket and exits 0. Run in-process through `pivot.cli.main()`, serve leaves the caller's signal handlers alone, so the caller decides what SIGTERM does.
 
 ## Error Handling
 

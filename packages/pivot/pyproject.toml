@@ -84,7 +84,7 @@ dev = [
 ]
 
 [project.scripts]
-pivot = "pivot.cli:main"
+pivot = "pivot.cli:_console_main"
 
 [project.urls]
 Homepage = "https://github.com/sjawhar/pivot"

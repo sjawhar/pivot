@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
     import click.testing
 
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
+
 # =============================================================================
 # Module-level stage functions (required for pickling)
 # =============================================================================
@@ -740,7 +742,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     # The child logs every RPC disconnect. Files avoid a PIPE filling and blocking it.
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+            [_PIVOT_BIN, "repro", "--watch", "--serve"],
             cwd=tmp_path,
             env=env,
             stdout=stdout_file,
@@ -809,7 +811,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
 
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+            [_PIVOT_BIN, "repro", "--watch", "--serve"],
             cwd=project,
             env=env,
             stdout=stdout_file,
@@ -1616,9 +1618,6 @@ def test_repro_included_pipeline_file_target_runs(
 
     assert result.exit_code == 0, result.output
     assert summary in result.output, result.output
-
-
-_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 def _pivot_with_hash_seed(

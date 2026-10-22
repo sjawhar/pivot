@@ -167,7 +167,7 @@ uv run ruff check .
 uv run basedpyright .
 
 # 4. Run tests with coverage
-uv run pytest tests/ -n auto --cov=src/pivot --cov-fail-under=90
+uv run pytest packages/pivot/tests -n auto --cov --cov-fail-under=90
 ```
 
 Or create a pre-commit hook:
@@ -284,7 +284,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run tests
-        run: uv run pytest tests/ -n auto
+        run: uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto
 ```
 
 This makes type errors visible before test execution.
@@ -343,7 +343,7 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright .
 | Find all usages of a TypedDict | `grep -r "TypedDictName" tests/` |
 | Type check locally | `uv run basedpyright .` |
 | Full quality check | `uv run ruff format . && uv run ruff check . && uv run basedpyright .` |
-| Run tests with type checks | `uv run pytest tests/ -n auto --co` (shows collection phase errors) |
+| Run tests with type checks | `uv run pytest packages/pivot/tests packages/pivot-tui/tests --co` (shows collection phase errors) |
 | Enable IDE type checking | Set `basedpyright.analysis.typeCheckingMode: strict` in VS Code settings |
 
 ---
