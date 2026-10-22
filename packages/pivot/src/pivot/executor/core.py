@@ -79,7 +79,12 @@ def configured_worker_count(override: int | None = None) -> int:
 
 
 def _reusable_worker_target(max_workers: int, *, kill_workers: bool) -> int:
-    """Keep reuse from invoking loky's blocking ``_resize`` between runs."""
+    """Keep reuse from invoking loky's blocking ``_resize`` between runs.
+
+    The live executor's own width is passed back only when loky will reuse it. When loky will
+    replace it (shut down, broken, or a call queue too small for ``max_workers``, loky's own
+    reuse test), the requested width is passed, so the new executor's queue fits it.
+    """
     if hasattr(loky.reusable_executor, "_executor"):
         executor = cast(
             "loky.ProcessPoolExecutor | None",
@@ -91,7 +96,13 @@ def _reusable_worker_target(max_workers: int, *, kill_workers: bool) -> int:
             version = getattr(loky, "__version__", "unknown")
             raise RuntimeError(f"Unsupported loky {version}: no reusable-executor singleton")
         executor = cast("loky.ProcessPoolExecutor | None", storage.executor)
-    if kill_workers or executor is None:
+    if (
+        kill_workers
+        or executor is None
+        or executor._flags.shutdown
+        or executor._flags.broken is not None
+        or executor.queue_size < max_workers
+    ):
         return max_workers
     return executor._max_workers
 
@@ -173,7 +184,7 @@ def create_manager() -> managers.SyncManager:
     return manager
 
 
-def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
+def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> None:
     """Replace stale workers and leave one fresh worker ready for the next dispatch.
 
     If the fresh worker's warm-up fails, the executor this call created is shut down, its
@@ -186,7 +197,6 @@ def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
     except BaseException:
         pool.shutdown(wait=True, kill_workers=True)
         raise
-    return 1
 
 
 def _cleanup_worker_pool() -> None:

@@ -1458,9 +1458,8 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
     """A parallel reload starts one fresh worker before its reloaded pipeline runs."""
     restart_calls = list[tuple[int, float | None]]()
 
-    def mock_restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
+    def mock_restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> None:
         restart_calls.append((max_workers, idle_timeout_s))
-        return 1
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 
@@ -1539,9 +1538,8 @@ async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
 
     restart_calls = list[object]()
 
-    def mock_restart_workers(*args: object, **kwargs: object) -> int:
+    def mock_restart_workers(*args: object, **kwargs: object) -> None:
         restart_calls.append(args)
-        return 1
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 
@@ -1564,7 +1562,7 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
 ) -> None:
     """_handle_code_or_config_changed continues if restart_workers raises."""
 
-    def mock_restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> int:
+    def mock_restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> None:
         del max_workers, idle_timeout_s
         raise RuntimeError("loky pool broken")
 
@@ -1614,9 +1612,8 @@ async def test_engine_handle_data_artifact_changed_does_not_restart_workers(
     """_handle_data_artifact_changed does NOT restart worker pool (data-only change)."""
     restart_calls = list[object]()
 
-    def mock_restart_workers(*args: object, **kwargs: object) -> int:
+    def mock_restart_workers(*args: object, **kwargs: object) -> None:
         restart_calls.append(args)
-        return 1
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 

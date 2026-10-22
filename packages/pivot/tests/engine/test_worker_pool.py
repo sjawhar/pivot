@@ -339,6 +339,62 @@ def test_failed_reload_restart_leaves_no_worker_beyond_the_cap(
         reload_thread.shutdown(wait=True)
 
 
+# loky sizes an executor's call queue once, at creation: 2 * max(cpu_count, max_workers) + 1.
+# One more than a narrow executor's queue, so a narrow executor's queue cannot fit it.
+_WIDER_THAN_A_NARROW_QUEUE = 2 * (loky.cpu_count() or 1) + 2
+
+
+def _helper_narrow_run(pool: WorkerPool) -> None:
+    pool.start(max_workers=1, idle_timeout_s=None)
+    assert pool.submit(_helper_identity, 1).result(timeout=60) == 1
+    pool.end_run()
+
+
+def _helper_wide_queue_size(pool: WorkerPool) -> int:
+    pool.start(max_workers=_WIDER_THAN_A_NARROW_QUEUE, idle_timeout_s=None)
+    assert pool._executor is not None
+    return pool._executor.queue_size
+
+
+def test_wider_run_after_a_narrow_one_gets_a_queue_that_fits() -> None:
+    """A long-lived pool's narrow run must not leave a later wider run a call queue too small
+    for its width, which would hold submitted stages back until a slot frees."""
+    pool = WorkerPool()
+    try:
+        _helper_narrow_run(pool)
+        assert _helper_wide_queue_size(pool) >= _WIDER_THAN_A_NARROW_QUEUE
+    finally:
+        pool.shutdown()
+
+
+def test_second_pool_after_a_narrow_one_gets_a_queue_that_fits() -> None:
+    """A second Engine in one process (two ``pivot.executor.run`` calls) must not inherit the
+    narrow width a shut-down pool left in loky's reusable executor."""
+    first = WorkerPool()
+    _helper_narrow_run(first)
+    first.shutdown()
+    pool = WorkerPool()
+    try:
+        assert _helper_wide_queue_size(pool) >= _WIDER_THAN_A_NARROW_QUEUE
+    finally:
+        pool.shutdown()
+
+
+def test_second_pool_after_a_wide_run_gets_a_queue_that_fits() -> None:
+    """A wide run's last submission lowers loky's ``_max_workers``; a later pool must still get
+    a queue that fits its own width."""
+    first = WorkerPool()
+    first.start(max_workers=_WIDER_THAN_A_NARROW_QUEUE, idle_timeout_s=None)
+    assert first.submit(_helper_identity, 1).result(timeout=60) == 1
+    first.end_run()
+    first.shutdown()
+    pool = WorkerPool()
+    try:
+        assert _helper_wide_queue_size(pool) >= _WIDER_THAN_A_NARROW_QUEUE
+    finally:
+        pool.shutdown()
+
+
 @pytest.mark.slow
 def test_warm_workers_survive_lokys_default_idle_timeout() -> None:
     """Long-lived workers stay warm after a pause longer than loky's default timeout."""

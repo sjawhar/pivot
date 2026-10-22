@@ -66,6 +66,15 @@ fresh-wheel test installs 3.5.6, 3.6.0 and 3.7.0 and checks the worker count and
 each. An upgrade must recheck reusable-executor lookup plus `_max_workers` and
 `_pending_work_items` submission accounting; an upstream change can reintroduce refill churn.
 
+loky fixes an executor's call queue when it creates the executor: `queue_size` is
+2 × max(cpu, width) + 1. It refuses to reuse an executor whose queue is smaller than the
+requested width. Because `submit()` narrows loky's `_max_workers`, Pivot applies the same test
+itself. `_reusable_worker_target` passes the requested width whenever loky will replace the
+executor (shut down, broken, or a queue too small). `WorkerPool.start()` replaces a held executor
+whose queue is smaller than the pool's width. Without both, a wide run after a narrow one could
+get a queue that holds submitted stages back until a slot frees. An upgrade must also recheck
+`queue_size` and `_flags`.
+
 ### Starting Process Trackers for the TUI
 
 Textual captures `sys.stderr` with an object whose `fileno()` is -1. Both loky's and
@@ -98,9 +107,10 @@ thread that never created the pool's executor, so `get_reusable_executor(kill_wo
 there finds no executor and leaves the previous workers alive. `reuse=False` still makes loky
 replace a compatible live executor instead of returning it unchanged. Every path that replaces
 the pool's executor goes through `_replace_executor`: a reload's `restart()`, and a `start()`
-that finds stale user code or a different idle timeout. After a restart from another thread,
-loky's lookup on the calling thread no longer finds the executor the pool holds, so a `start()`
-that let loky swap it for a new timeout would leave the restart's worker alive.
+that finds stale user code, a different idle timeout, or a call queue smaller than the pool's
+width. After a restart from another thread, loky's lookup on the calling thread no longer finds
+the executor the pool holds, so a `start()` that let loky swap it for a new timeout would leave
+the restart's worker alive.
 
 The pool forgets the old executor as soon as it is shut down. If the fresh worker then fails to
 start, the Engine logs the failed restart and the pool holds no executor, so the next run's

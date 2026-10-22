@@ -2617,10 +2617,8 @@ class Engine:
                     self._worker_pool = worker_pool_mod.WorkerPool()
                 worker_pool = self._worker_pool
                 try:
-                    workers = await anyio.to_thread.run_sync(
-                        lambda: worker_pool.restart(max_workers=width)
-                    )
-                    _logger.info("Worker pool restarted for code reload (%d workers)", workers)
+                    await anyio.to_thread.run_sync(lambda: worker_pool.restart(max_workers=width))
+                    _logger.info("Worker pool restarted for code reload")
                 except Exception:
                     _logger.warning(
                         "Failed to restart worker pool - the next run starts new workers",

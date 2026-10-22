@@ -101,7 +101,12 @@ class WorkerPool:
             executor = executor_core.create_executor(
                 self._max_workers, idle_timeout_s=idle_timeout_s
             )
-        elif self._idle_timeout_s != idle_timeout_s or self._has_stale_user_code():
+        elif (
+            self._idle_timeout_s != idle_timeout_s
+            or self._has_stale_user_code()
+            # loky's own reuse test: a call queue too small for the width holds stages back.
+            or executor.queue_size < self._max_workers
+        ):
             executor = self._replace_executor(idle_timeout_s)
         else:
             fresh_workers = False
@@ -115,7 +120,7 @@ class WorkerPool:
         self._accepting = True
         self._in_run = True
 
-    def restart(self, *, max_workers: int) -> int:
+    def restart(self, *, max_workers: int) -> None:
         """Replace every worker before a reload starts its next run.
 
         If starting the fresh worker fails, the pool holds no executor and the next
@@ -124,7 +129,6 @@ class WorkerPool:
         self._max_workers = max(self._max_workers, max_workers)
         self._executor = self._replace_executor(self._idle_timeout_s)
         self._restamp_user_code_files()
-        return 1
 
     def _replace_executor(self, idle_timeout_s: float | None) -> loky.ProcessPoolExecutor:
         """Stop this pool's workers, then return a fresh executor holding one warm worker.

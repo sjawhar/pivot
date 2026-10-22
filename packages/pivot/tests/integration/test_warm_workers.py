@@ -1715,10 +1715,9 @@ async def test_watch_reload_restarts_one_warm_worker(
     after_run = set[int]()
     restart = WorkerPool.restart
 
-    def recording_restart(self: WorkerPool, *, max_workers: int) -> int:
-        workers = restart(self, max_workers=max_workers)
+    def recording_restart(self: WorkerPool, *, max_workers: int) -> None:
+        restart(self, max_workers=max_workers)
         restarted.append(_helper_pool_worker_pids(self))
-        return workers
 
     monkeypatch.setattr(WorkerPool, "restart", recording_restart)
     async with engine_mod.Engine(pipeline=pipeline) as eng:
