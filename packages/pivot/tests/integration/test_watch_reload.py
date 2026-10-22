@@ -1240,6 +1240,101 @@ async def test_run_that_finds_params_yaml_broken_marks_the_pipeline_invalid(
 
 
 @pytest.mark.anyio
+async def test_reload_adding_a_stage_with_a_missing_input_waits_for_the_file(
+    watch_project: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reload whose re-run finds an input missing leaves watch up with the pipeline invalid.
+
+    Nothing runs, not even on a data change, until the input appears; the data change that
+    creates it runs the re-run the missing input stopped, so the new stage runs once.
+    """
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    change_output = _helper_output_path(watch_project, pipeline, "reload/change")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        rpc_source = agent_rpc.AgentRpcSource(
+            socket_path=watch_project / "unused.sock",
+            handler=agent_rpc.AgentRpcHandler(engine=eng),
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert change_output.read_text() == "x-v1"
+
+            # Edits `change` and adds `late`, which reads an input that does not exist yet
+            pipeline_py.write_text(
+                _helper_pipeline_source("-v2", third="late").replace(
+                    "    late(raw)\n", '    late(pipeline.input("missing.txt"))\n'
+                )
+            )
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            invalid = recorder.events[invalid_index]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert (
+                "Stage 'reload/late' depends on input 'missing.txt' (path data/raw/missing.txt), "
+                + "which does not exist"
+            ) in invalid["error"]
+            assert eng.pipeline_error == invalid["error"]
+            assert (
+                "Pipeline invalid: Stage 'reload/late' depends on input 'missing.txt'"
+                in caplog.text
+            )
+            assert "Pipeline invalid - waiting for fix" in caplog.text
+            await recorder.wait_for(_helper_is_idle, start=invalid_index)
+
+            run_send, run_recv = anyio.create_memory_object_stream[InputEvent](1)
+            response = await rpc_source._handle_request(
+                {"jsonrpc": "2.0", "method": "run", "id": 1}, run_send
+            )
+            assert response is not None
+            assert "error" in response, "RPC run is refused while the input is missing"
+            assert response["error"]["code"] == -32003
+            with pytest.raises(anyio.WouldBlock):
+                run_recv.receive_nowait()
+
+            (watch_project / "data" / "raw" / "input.txt").write_text("y")
+            recheck_index = await recorder.wait_for(
+                _helper_is_invalid_pipeline, start=invalid_index + 1
+            )
+            await recorder.wait_for(_helper_is_idle, start=recheck_index)
+            assert eng.pipeline_error == invalid["error"], "the input is still missing"
+
+            (watch_project / "data" / "raw" / "missing.txt").write_text("m")
+            valid_index = await recorder.wait_for(
+                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                start=recheck_index,
+            )
+            late_done = await recorder.wait_for(_helper_completes("reload/late"), start=valid_index)
+            await recorder.wait_for(_helper_is_idle, start=late_done)
+
+            assert eng.pipeline_error is None, "the input's arrival makes the pipeline valid"
+            assert not any(
+                event["type"] == "stage_completed"
+                for event in recorder.events[first_idle:valid_index]
+            ), "nothing ran while the input was missing"
+            completed = [
+                event["stage"] for event in recorder.events if event["type"] == "stage_completed"
+            ]
+            assert completed.count("reload/late") == 1, "the new stage runs once"
+            assert recorder.completed("reload/late", start=valid_index) == StageStatus.RAN
+            assert recorder.completed("reload/change", start=valid_index) == StageStatus.RAN, (
+                "the stopped re-run runs the stage the reload edited"
+            )
+            assert change_output.read_text() == "y-v2", "on the input edited while waiting"
+            assert change_output.with_stem("late").read_text() == "m-late"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
 async def test_stage_completed_output_identity_reaches_tui_as_artifact_identity(
     watch_project: pathlib.Path,
 ) -> None:

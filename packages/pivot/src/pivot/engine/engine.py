@@ -271,9 +271,14 @@ class Engine:
 
     # Set once a watched engine's startup fingerprint snapshot has finished
     _startup_fingerprinted: anyio.Event
-    # Why the pipeline is invalid: set by the startup snapshot or any rejected reload, cleared
-    # by the next good reload. While set, no run starts (RPC run, data change, or startup).
+    # Why the pipeline is invalid: set by the startup snapshot, a rejected reload, or a watch run
+    # that a missing input leaves with no stage to run; cleared by the next good reload, or by
+    # the first run that missing inputs no longer stop. While set, no stage runs (RPC run, data
+    # change, or startup).
     _pipeline_error: str | None
+    # The watch run a missing input stopped. While set, a data change checks the dependencies
+    # again instead of being dropped, and runs this run's stages too.
+    _missing_dependency_run: RunRequested | None
     # Set while no code reload is in flight; replaced by a fresh Event when one starts
     _reload_done: anyio.Event
 
@@ -335,6 +340,7 @@ class Engine:
 
         self._startup_fingerprinted = anyio.Event()
         self._pipeline_error = None
+        self._missing_dependency_run = None
         self._reload_done = anyio.Event()
         self._reload_done.set()
 
@@ -773,8 +779,12 @@ class Engine:
         self._stored_resource_capacity = dict(event["resource_capacity"])
 
         if self._pipeline_error is not None:
-            _logger.debug("Pipeline invalid - ignoring run request until it is fixed")
-            return
+            if self._missing_dependency_run is None:
+                _logger.debug("Pipeline invalid - ignoring run request until it is fixed")
+                return
+            # The request may follow the creation of the missing input: check again, with the
+            # stopped run's stages too
+            event = _merge_run_requests(self._missing_dependency_run, event)
 
         if self._run_state == _RunState.RUNNING:
             # Coalesce: hold the cancelled run's request apart, merged in only at replay
@@ -1064,16 +1074,36 @@ class Engine:
         runnable, dep_errors = engine_graph.get_runnable_stages(
             all_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
         )
-        if runnable is None:
-            if len(dep_errors) == 1:
-                raise dep_errors[0]
-            raise pivot_exceptions.MultipleDependencyError(dep_errors)
-        if dep_errors:
+        if runnable is not None:
             # Skip broken stages but continue with healthy pipelines
             for err in dep_errors:
                 _logger.warning("Skipping: %s", err.format_user_message())
-            if not runnable:
-                raise pivot_exceptions.MultipleDependencyError(dep_errors)
+        if runnable is None or (dep_errors and not runnable):
+            missing = (
+                dep_errors[0]
+                if runnable is None and len(dep_errors) == 1
+                else pivot_exceptions.MultipleDependencyError(dep_errors)
+            )
+            if not self._watches_filesystem():
+                raise missing
+            # Watch mode waits for the input: a data change, such as the input's creation,
+            # checks again and replays this run (see _handle_run_requested)
+            if self._running_request is None:
+                raise RuntimeError("A watch run stopped by a missing input has no run request")
+            self._missing_dependency_run = self._running_request
+            await self._invalidate_pipeline([missing.format_user_message()])
+            return {}
+        if self._missing_dependency_run is not None:
+            # This run replays the one a missing input stopped, and no input is missing now
+            self._missing_dependency_run = None
+            self._pipeline_error = None
+            await self._emit_pipeline_error(None)
+            if stages and dep_errors:
+                # Across all pipelines with keep-going, a stage still missing an input stays out
+                stages = [stage for stage in stages if stage in runnable]
+                if not stages:
+                    return {}
+        if dep_errors:
             graph = engine_graph.build_graph(runnable)
         all_stages = runnable
         self._graph = graph
@@ -2382,8 +2412,11 @@ class Engine:
         _logger.error("Pipeline invalid - waiting for fix", extra=condition)
         await self._emit_pipeline_error(self._pipeline_error)
 
-    async def _emit_pipeline_error(self, message: str) -> None:
-        """Report an invalid pipeline; the stage list stays the loaded pipeline's."""
+    async def _emit_pipeline_error(self, message: str | None) -> None:
+        """Report why the pipeline is invalid, or None once it is valid again without a reload.
+
+        The stage list stays the loaded pipeline's.
+        """
         stages = self._pipeline.list_stages() if self._pipeline is not None else list[str]()
         await self.emit(
             PipelineReloaded(
@@ -2744,6 +2777,9 @@ class Engine:
         """
         old_pipeline = self._pipeline
         old_stages = old_pipeline.snapshot() if old_pipeline else {}
+        # A good reload re-runs every stage and a rejected one waits for its own fix, so neither
+        # replays the run a missing input stopped
+        self._missing_dependency_run = None
         root = project.get_project_root()
         try:
             new_pipeline, errors = await _run_in_daemon_thread(lambda: self._load_pipeline(root))
