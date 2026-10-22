@@ -18,7 +18,7 @@ also removes PIVOT_CACHE_DIR, so each variant writes its own project's .pivot/ca
 
 An interrupted run (Ctrl-C, or SIGTERM from `kill` or `timeout`) stops the command it is
 measuring: pivot gets SIGINT, its own Ctrl-C path, and up to 10 s to exit; then it, and anything
-left in its session, is killed.
+left in its session, is killed. Further SIGINTs and SIGTERMs cannot interrupt that stop.
 """
 
 from __future__ import annotations
@@ -55,6 +55,9 @@ _DROPPED_VARS = frozenset(
     {"OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "PIVOT_CACHE_DIR"}
 )
 _INTERRUPT_GRACE_S = 10
+
+_STOP_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
+_first_stop_signal: int | None = None
 _SUMMARY = re.compile(r"Summary: (\d+) ran, (\d+) cached")
 _MARKER = re.compile(r"^    _edit_marker = .*\n", re.MULTILINE)
 _KEEP_IN_PIVOT_DIR = frozenset({".gitignore", "config.yaml"})
@@ -106,6 +109,7 @@ def measure(argv: list[str], cwd: pathlib.Path) -> tuple[Measurement, str]:
         try:
             proc.wait()
         except BaseException:
+            signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
             _stop(proc)
             raise
         wall = time.perf_counter() - start
@@ -128,26 +132,56 @@ def measure(argv: list[str], cwd: pathlib.Path) -> tuple[Measurement, str]:
     return measurement, output
 
 
-def _stop(proc: subprocess.Popen[bytes]) -> None:
-    """Stop an interrupted command: SIGINT, a grace period, then SIGKILL its whole session.
-
-    SIGKILLing the session first would skip pivot's shutdown, which leaves loky's named
-    semaphores in /dev/shm. The kill and the sweep run even if a second Ctrl-C or SIGTERM
-    arrives during the grace period.
-    """
+def _reaped(proc: subprocess.Popen[bytes], *, block: bool) -> bool:
+    """Reap `proc` directly, avoiding Popen's lock after an interrupt."""
+    if proc.returncode is not None:
+        return True
     try:
-        with contextlib.suppress(ProcessLookupError):
-            proc.send_signal(signal.SIGINT)
-        proc.wait(timeout=_INTERRUPT_GRACE_S)
-    except subprocess.TimeoutExpired:
-        pass
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+        pid, status = os.waitpid(proc.pid, 0 if block else os.WNOHANG)
+    except ChildProcessError:
+        return True
+    if pid == 0:
+        return False
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    return True
+
+
+def _stop(proc: subprocess.Popen[bytes]) -> None:
+    """Stop an interrupted command without letting another stop signal interrupt cleanup."""
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+    try:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(proc.pid, signal.SIGINT)
+        deadline = time.monotonic() + _INTERRUPT_GRACE_S
+        while not _reaped(proc, block=False):
+            remaining = deadline - time.monotonic()
+            again = (
+                signal.sigtimedwait(_STOP_SIGNALS, min(max(remaining, 0), 0.05))
+                if remaining > 0
+                else None
+            )
+            if remaining <= 0 or again is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(proc.pid, signal.SIGKILL)
+                _reaped(proc, block=True)
         for pid in session_members(proc.pid):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
+def _stop_on_signal(signum: int, _frame: object) -> None:
+    """Raise once so the stop sequence reports the first SIGINT or SIGTERM."""
+    global _first_stop_signal
+    signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+    if _first_stop_signal is not None:
+        return
+    _first_stop_signal = signum
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    raise SystemExit(128 + signum)
 
 
 def _reset(root: pathlib.Path) -> None:
@@ -262,6 +296,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    # SIGTERM raises SystemExit, so measure() stops the command it is running before run.py exits.
-    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
+    signal.signal(signal.SIGINT, _stop_on_signal)
+    signal.signal(signal.SIGTERM, _stop_on_signal)
     sys.exit(main())

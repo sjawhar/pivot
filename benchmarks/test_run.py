@@ -138,7 +138,8 @@ def test_second_signal_during_the_grace_period_still_stops_the_command(
 
     exit_code = harness.wait(timeout=30)
     assert not _helper_session_alive(sid), "a second signal must not orphan the measured session"
-    assert exit_code in (-second, 128 + second), exit_code
+    # The first signal decides run.py's status; later signals only wait for its stop to finish.
+    assert exit_code in (-signal.SIGINT, 128 + signal.SIGINT), exit_code
 
 
 def test_main_leaves_the_callers_sigterm_handler_in_place(tmp_path: pathlib.Path) -> None:

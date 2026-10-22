@@ -24,8 +24,8 @@ reps are not 0 to n-1 once each, or the two ran on machines with different core 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
 file: for each scenario and metric, three times the largest absolute change between the two
 medians of any A/A run that measured it, rounded up to a whole percent and at least 2. The A/A
-runs are either result-file pairs or the samples of a calibration file, whose `samples` must be
-a non-empty list (an empty one derives no limits, and exits 2).
+runs are either result-file pairs or samples from a calibration file. Its `samples` must be a
+non-empty list that names at least one scenario; otherwise it derives no limits and exits 2.
 
 --write-calibration records each A/A run's per-scenario changes, with the GitHub Actions run,
 attempt and job that produced it, so the thresholds can be rebuilt after the artifacts expire.
@@ -244,6 +244,8 @@ def _derive_threshold(samples: list[_Changes]) -> dict[str, dict[str, int]]:
             seen = largest.setdefault(scenario, {key: 0.0 for _, key in _METRICS})
             for _, key in _METRICS:
                 seen[key] = max(seen[key], abs(by_key[key]))
+    if not largest:
+        raise _CannotCompareError("the A/A runs measured no scenario, so they derive no limits")
     thresholds = dict[str, dict[str, int]]()
     for scenario, by_key in sorted(largest.items()):
         thresholds[scenario] = {}
