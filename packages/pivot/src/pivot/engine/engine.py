@@ -163,12 +163,9 @@ class _MissingDependencyRun:
     def awaits(self, path: pathlib.Path) -> bool:
         """Whether either form of ``path`` is a missing input or contains one."""
         resolved_path = pathlib.Path(os.path.realpath(path))
-        for missing in self.input_paths:
-            if missing.is_relative_to(path) or missing.is_relative_to(resolved_path):
-                return True
         return any(
             missing.is_relative_to(path) or missing.is_relative_to(resolved_path)
-            for missing in self.resolved_input_paths
+            for missing in itertools.chain(self.input_paths, self.resolved_input_paths)
         )
 
 
@@ -1128,7 +1125,7 @@ class Engine:
             await self._invalidate_pipeline([missing.format_user_message()])
             return {}
         if self._missing_dependency_run is not None:
-            # This run replays the one a missing input stopped, and no input is missing now
+            # Missing inputs no longer prevent this run; keep-going may still skip broken stages.
             self._missing_dependency_run = None
             self._pipeline_error = None
             await self._emit_pipeline_error(None)

@@ -1310,7 +1310,7 @@ async def test_reload_adding_a_stage_with_a_missing_input_waits_for_the_file(
 
             (watch_project / "data" / "raw" / "missing.txt").write_text("m")
             valid_index = await recorder.wait_for(
-                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                _helper_is_reload,
                 start=recheck_index,
             )
             late_done = await recorder.wait_for(_helper_completes("reload/late"), start=valid_index)
@@ -1418,7 +1418,7 @@ async def test_missing_input_that_arrives_with_its_directory_makes_the_pipeline_
             os.rename(staging / "newdir", watch_project / "newdir")
 
             valid_index = await recorder.wait_for(
-                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                _helper_is_reload,
                 start=idle_index,
                 timeout=30.0,
             )
@@ -1493,7 +1493,7 @@ async def test_output_written_inside_the_project_does_not_recheck_a_missing_inpu
 
             (watch_project / "data" / "raw" / "missing.txt").write_text("m")
             valid_index = await recorder.wait_for(
-                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                _helper_is_reload,
                 start=idle_index,
             )
             await recorder.wait_for(_helper_completes("reload/late"), start=valid_index)
