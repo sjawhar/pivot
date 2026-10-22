@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping, Sequence
     from inspect import Signature
     from multiprocessing import Queue
-    from types import TracebackType
+    from types import ModuleType, TracebackType
 
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ class _StageImports:
 class _CoveredImportState(threading.local):
     """This thread's part in the covered thread rule: how deep it is inside a covered module's
     first import and for which stage, and the stage it is a covered thread of when a covered
-    thread started it (`_tracked_thread_start`)."""
+    thread started it (`_run_as_covered_thread`)."""
 
     depth: int = 0
     importing_for: _StageImports | None = None
@@ -130,9 +130,18 @@ _stage_imports_lock = threading.Lock()
 _covered_import_state = _CoveredImportState()
 _original_import = builtins.__import__
 _original_import_module = importlib.import_module
-_original_thread_start = threading.Thread.start
 _original_start_new_thread = _thread.start_new_thread
-_original_start_new = _thread.start_new
+_original_start_joinable_thread = _thread.start_joinable_thread
+# The attributes each thread start is replaced at while the hooks are installed, and the value
+# each held before: every start function `_thread` exposes, and `threading`'s own binding of
+# `start_joinable_thread`, which `threading.Thread.start` calls.
+_THREAD_START_ATTRIBUTES: tuple[tuple[ModuleType, str], ...] = (
+    (_thread, "start_new_thread"),
+    (_thread, "start_new"),
+    (_thread, "start_joinable_thread"),
+    (threading, "_start_joinable_thread"),
+)
+_replaced_thread_starts: dict[tuple[ModuleType, str], object] = {}
 _hooks_installed = False
 
 
@@ -247,49 +256,15 @@ def _run_as_covered_thread(tracked: _StageImports, function: Callable[[], object
         _close_window(tracked)
 
 
-def _tracked_thread_start(self: threading.Thread) -> None:
-    """Start `self`; when a covered thread of the running stage starts it, `self` is a covered
-    thread of that stage until its `run` returns, and holds the stage's window open until then.
-
-    `threading.Timer` and `concurrent.futures.ThreadPoolExecutor` workers start through here.
-    """
-    tracked = _stage_imports
-    if tracked is None or not _on_covered_thread(tracked):
-        _original_thread_start(self)
-        return
-    run = self.run
-    own_run = "run" in vars(self)
-
-    def restore_run() -> None:
-        if own_run:
-            self.run = run
-        else:
-            vars(self).pop("run", None)
-
-    def covered_run() -> None:
-        try:
-            _run_as_covered_thread(tracked, run)
-        finally:
-            restore_run()
-
-    self.run = covered_run
-    _open_window(tracked)
-    try:
-        _original_thread_start(self)
-    except BaseException:
-        restore_run()
-        _close_window(tracked)
-        raise
-
-
 def _tracked_start_new_thread(
     function: Callable[..., object],
     args: tuple[Any, ...],
     kwargs: dict[str, Any] | None = None,
     /,
 ) -> int:
-    """`_thread.start_new_thread` and its synonym `start_new`, under the rule
-    `_tracked_thread_start` applies."""
+    """`_thread.start_new_thread` and its synonym `start_new`. A thread a covered thread of the
+    running stage starts is a covered thread of that stage until its function returns, and holds
+    the stage's window open until then."""
     call_kwargs = {} if kwargs is None else kwargs
     tracked = _stage_imports
     if tracked is None or not callable(function) or not _on_covered_thread(tracked):
@@ -304,6 +279,38 @@ def _tracked_start_new_thread(
     except BaseException:
         _close_window(tracked)
         raise
+
+
+def _tracked_start_joinable_thread(
+    function: Callable[[], object],
+    handle: _thread._ThreadHandle | None = None,  # pyright: ignore[reportPrivateUsage] - `start_joinable_thread`'s own signature
+    daemon: bool = True,
+) -> _thread._ThreadHandle:  # pyright: ignore[reportPrivateUsage] - `start_joinable_thread`'s own signature
+    """`_thread.start_joinable_thread`, under the rule `_tracked_start_new_thread` applies.
+
+    `threading.Thread.start` starts every `threading.Thread` through it, so `threading.Timer`
+    and `concurrent.futures.ThreadPoolExecutor` workers follow the rule too.
+    """
+    tracked = _stage_imports
+    if tracked is None or not callable(function) or not _on_covered_thread(tracked):
+        return _original_start_joinable_thread(function, handle=handle, daemon=daemon)
+    _open_window(tracked)
+    try:
+        return _original_start_joinable_thread(
+            lambda: _run_as_covered_thread(tracked, function), handle=handle, daemon=daemon
+        )
+    except BaseException:
+        _close_window(tracked)
+        raise
+
+
+# The hook each of `_THREAD_START_ATTRIBUTES` is replaced by.
+_THREAD_START_HOOKS: dict[str, Callable[..., object]] = {
+    "start_new_thread": _tracked_start_new_thread,
+    "start_new": _tracked_start_new_thread,
+    "start_joinable_thread": _tracked_start_joinable_thread,
+    "_start_joinable_thread": _tracked_start_joinable_thread,
+}
 
 
 def _tracked_import(
@@ -350,26 +357,24 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
 
 def install_import_hooks() -> None:
     """Route `builtins.__import__` and `importlib.import_module` through the stage-import check,
-    and thread starts (`threading.Thread.start`, `_thread.start_new_thread`) through the covered
-    thread rule.
+    and every thread start (`_THREAD_START_ATTRIBUTES`) through the covered thread rule.
 
     The worker initializer (`executor.core._init_worker`) calls this; nothing else in Pivot's
     own process installs it. The hooks record nothing while no stage is running.
     """
     global _original_import, _original_import_module, _hooks_installed
-    global _original_thread_start, _original_start_new_thread, _original_start_new
+    global _original_start_new_thread, _original_start_joinable_thread
     if _hooks_installed:
         return
     _original_import = builtins.__import__
     _original_import_module = importlib.import_module
-    _original_thread_start = threading.Thread.start
     _original_start_new_thread = _thread.start_new_thread
-    _original_start_new = _thread.start_new
+    _original_start_joinable_thread = _thread.start_joinable_thread
     builtins.__import__ = _tracked_import
     importlib.import_module = _tracked_import_module
-    threading.Thread.start = _tracked_thread_start
-    _thread.start_new_thread = _tracked_start_new_thread
-    _thread.start_new = _tracked_start_new_thread
+    for module, name in _THREAD_START_ATTRIBUTES:
+        _replaced_thread_starts[module, name] = vars(module)[name]
+        vars(module)[name] = _THREAD_START_HOOKS[name]
     _hooks_installed = True
 
 
@@ -377,9 +382,9 @@ def _uninstall_import_hooks() -> None:
     global _hooks_installed
     builtins.__import__ = _original_import
     importlib.import_module = _original_import_module
-    threading.Thread.start = _original_thread_start
-    _thread.start_new_thread = _original_start_new_thread
-    _thread.start_new = _original_start_new
+    for (module, name), original in _replaced_thread_starts.items():
+        vars(module)[name] = original
+    _replaced_thread_starts.clear()
     _hooks_installed = False
 
 

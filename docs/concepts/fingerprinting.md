@@ -64,6 +64,9 @@ import, as it would for a module-level import: every import on the thread
 running it, every hooked import on a thread it started (and on threads those
 start) for the rest of the stage, already resident or not, and every module
 any thread registers without the hooks while such an import or thread runs.
+Every way to start a thread counts: each start function `_thread` exposes
+(`start_new_thread`, `start_new`, `start_joinable_thread`), which
+`threading.Thread`, `threading.Timer` and `ThreadPoolExecutor` start through.
 A hooked import on any other thread is counted, already resident or not, and
 so is a module registered without the hooks at any other time, even when a
 covered import later imports it. A stage that imported a user module its
@@ -88,10 +91,12 @@ warning while the stage still reads values through the object a dynamic import
 returned leaves those values untracked. A `@no_fingerprint` stage is not
 checked: its declared `code_deps` are its code.
 
-That check does not see every way a stage can reach code. In these cases Pivot
-reuses a result whose fingerprint missed the code, as it would without the
-check, or, for a thread that existed before a covered import, reruns a stage
-it could have reused:
+That check does not see every way a stage can reach code. In most of these
+cases Pivot reuses a result whose fingerprint missed the code, as it would
+without the check. In two it reruns a stage it could have reused: a thread
+that existed before a covered import, and a thread left from an earlier stage
+(a covered thread of that stage included) that imports while a later stage
+runs:
 
 - a read of a module already in `sys.modules` without an import, or
   `importlib.reload`: import the module where the stage reads it;
@@ -102,9 +107,9 @@ it could have reused:
 - an import in a child process: declare the code the child runs as an input,
   or list it in `@no_fingerprint(code_deps=[...])`;
 - an import from a thread that outlives its stage: the import is charged to
-  whichever stage is running when it happens, or to none; a covered thread
-  still running in a later stage is not covered for it; join the thread
-  before the stage returns;
+  whichever stage is running when it happens, which then warns and reruns, or
+  to none; a covered thread still running in a later stage is not covered for
+  it; join the thread before the stage returns;
 - a covered module that hands work at import time to a thread that existed
   before its import, such as a pool an earlier import created: that thread is
   not covered, so its imports are counted and the stage reruns; start the
