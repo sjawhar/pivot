@@ -15,7 +15,6 @@ exclude = [
   "**/.ruff_cache/**",
   "**/.venv/**",
   "**/.worktrees/**",
-  "benchmarks",
   "docs",
   "experiments",
   "pipelines",
@@ -56,6 +55,10 @@ reportRedeclaration = false
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
+
+[[tool.basedpyright.executionEnvironments]]
+root = "benchmarks"
+extraPaths = ["benchmarks"]
 
 [tool.coverage.run]
 source = ["packages/pivot/src/pivot"]
@@ -104,8 +107,8 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["packages/pivot/src", "packages/pivot/tests", "packages/pivot-tui/src", "packages/pivot-tui/tests"]
-exclude = ["benchmarks", "experiments"]
+src = ["packages/pivot/src", "packages/pivot/tests", "packages/pivot-tui/src", "packages/pivot-tui/tests", "benchmarks"]
+exclude = ["experiments"]
 
 [tool.ruff.lint]
 select = [
