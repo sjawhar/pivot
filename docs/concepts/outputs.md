@@ -175,7 +175,7 @@ hash-named file anywhere else is a user symlink.
 A lock records each file of a directory artifact by its path inside the
 directory, and Pivot reads back every path it writes. Any character a file name
 holds is recorded, spaces and format characters included (a macOS screenshot's
-narrow no-break space, `Screenshot … 10.00.00 AM.png`). A name with a
+narrow no-break space, `Screenshot … 10.00.00 AM.png`). A name with a
 backslash cannot be recorded: the stage, or `pivot commit`, fails and names the
 file, and the previous lock is kept. A name with a control character (a TAB,
 an escape, DEL) is recorded with a warning naming it; a later release refuses

@@ -37,12 +37,22 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
-A path argument is read from the current directory and must lie inside the project. A path
-typed through a symlink to the project root, or to a directory inside the project, counts as
-the place it points to: from a `link -> project` symlink, `link/data/x.csv` names
-`data/x.csv`. A path that leaves the project, including `link/../x.csv`, is refused by
-commands that restore, transfer or track files (`resolves outside project root`) and matches
-no output elsewhere.
+**Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
+current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
+project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
+`../data/x.csv`.
+
+An absolute path typed through a symlink to the project root, or to a directory inside the
+project, counts as the place it points to in `diff`, `checkout`, `repro`, `dag`, `push`,
+`fetch`, `pull` and `track`: from a `link -> project` symlink, `link/data/x.csv` names
+`data/x.csv`. `pivot get` refuses every absolute path ("Path traversal not allowed in
+target"). `pivot check-ignore` keeps a path under the symlink as typed, so a pattern anchored
+to the project root, such as `data/*.tmp`, does not match it. Give those two the path relative
+to the project root.
+
+A path that leaves the project, including `link/../x.csv`, is refused by `checkout`, `push`,
+`fetch`, `pull` and `track` (`resolves outside project root`) and matches no output in
+`diff`, `repro` and `dag`.
 
 ---
 
