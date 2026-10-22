@@ -133,7 +133,11 @@ The worker initializer (`executor.core._init_worker`) wraps `builtins.__import__
 `start_new` and `start_joinable_thread`, the last also at `threading._start_joinable_thread`, the
 binding `threading.Thread.start` calls (`worker.install_import_hooks`). Importing
 `pivot.executor.worker` alone changes none of them, and a stage executed in a process without
-that initializer gets the hooks for its call only. While a
+that initializer gets the hooks for its call only. For a relative `builtins.__import__`, the hook
+uses CPython 3.13's `_calc___package__` order (`__package__`, `__spec__.parent`, then
+`__name__`/`__path__`) before it records the absolute module. Pivot-owned threads start through
+`worker._start_pivot_thread`, which bypasses coverage: a pipe reader, parent watcher or
+stop-grace timer is not user work and cannot excuse a later user module registration. While a
 stage runs, the import hooks record each user module (and its user packages) the stage requests,
 including one already in `sys.modules`, and the worker compares the `sys.modules` keys before and
 after the stage, counting a newly resident module only when it has a `__file__` that
@@ -200,6 +204,7 @@ a thread native code starts outside `_thread`. Each has a remedy:
 | Path | Remedy |
 |------|--------|
 | Reading a module already in `sys.modules` without an import; `importlib.reload` | Import the module where the stage reads it |
+| A warm `EntryPoint.load()` or `importlib.__import__` of a user module another stage already made resident | It does not create a new `sys.modules` key, and the loader may hold an importer before the hook: it is not fingerprinted, as on main. Import the module statically |
 | Private import machinery; a loader that replaces a key already in `sys.modules` or never registers one, such as `runpy.run_path("helpers/lib.py")` and `runpy.run_module("toplib")` for a top-level module | Import statically, or move the value into `StageParams` |
 | An import in a child process | Declare the code the child runs as an input, or use `@no_fingerprint(code_deps=[...])` |
 | An import from a thread that outlives its stage | Join the thread before the stage returns. Its import is charged to whichever stage is running, which then warns and reruns where it would otherwise be reused, or to none. A covered thread still running in a later stage is not covered for that stage |
@@ -211,7 +216,7 @@ a thread native code starts outside `_thread`. Each has a remedy:
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
 | `pivot repro --no-commit`, then `pivot commit` | No lock exists to carry the mark, so `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
-| A result cached by an earlier Pivot version | Upgrading Pivot alone reruns nothing: `_CACHE_SCHEMA_VERSION` keys only the state.lmdb caches, not the lock. The check marks a stage the next time that stage runs under this version; until then a cached result is reused until its code or inputs change, as before the upgrade. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically |
+| A result cached by an earlier Pivot version | If its static fingerprint is unchanged, it may be reused: `_CACHE_SCHEMA_VERSION` keys only the state.lmdb caches, not the lock. A stage whose static walk reaches a user class method or a user module gains entries in its manifest, so it reruns once as Code changed after the upgrade. That accepted one-time rerun writes the current manifest; later runs reuse it until code or inputs change. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically |
 
 ### Module-Level Instances
 

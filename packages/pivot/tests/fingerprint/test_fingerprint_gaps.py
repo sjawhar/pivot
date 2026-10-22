@@ -258,6 +258,207 @@ def test_runtime_dynamic_import_makes_result_not_reusable(
     assert _count(project) == 103
 
 
+_RELATIVE_IMPORT_FALLBACKS = {
+    "by-name": (
+        'm = __import__("lib", {"__name__": "helpers.shim"}, None, ("VALUE",), 1)\n'
+        '    return {"v": m.VALUE + len(text.splitlines())}'
+    ),
+    "by-spec": (
+        "import helpers\n"
+        "    import sys\n"
+        '    g = {"__name__": "x", "__spec__": sys.modules["helpers"].__spec__}\n'
+        '    m = __import__("lib", g, None, ("VALUE",), 1)\n'
+        '    return {"v": m.VALUE + len(text.splitlines())}'
+    ),
+    "exec-moduletype": (
+        "import types\n"
+        '    m = types.ModuleType("helpers.shim")\n'
+        '    exec("from . import lib as L", vars(m))\n'
+        '    return {"v": vars(m)["L"].VALUE + len(text.splitlines())}'
+    ),
+    "by-package-control": (
+        'm = __import__("lib", {"__package__": "helpers"}, None, ("VALUE",), 1)\n'
+        '    return {"v": m.VALUE + len(text.splitlines())}'
+    ),
+}
+
+
+def _relative_import_pipeline(statement: str, *, warm: bool) -> str:
+    if not warm:
+        return (
+            "import helpers.lib\n\n"
+            "from pivot import Pipeline, stage\n\n\n"
+            "@stage\n"
+            "def count(text: str) -> dict:\n"
+            f"    {statement}\n\n\n"
+            'with Pipeline("t") as pipeline:\n'
+            '    count(pipeline.input("lines.txt", t=str))\n'
+        )
+    return (
+        "import helpers.lib\n\n"
+        "from pivot import Pipeline, stage\n\n\n"
+        "@stage\n"
+        "def a(text: str) -> str:\n"
+        "    import helpers.lib\n\n"
+        "    return text\n\n\n"
+        "@stage\n"
+        "def count(a: str) -> dict:\n"
+        f"    text = a\n    {statement}\n\n\n"
+        'with Pipeline("t") as pipeline:\n'
+        '    count(a(pipeline.input("lines.txt", t=str)))\n'
+    )
+
+
+@pytest.mark.parametrize("fallback", sorted(_RELATIVE_IMPORT_FALLBACKS))
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+def test_relative_builtins_import_uses_cpythons_package_fallback(
+    tmp_path: pathlib.Path, fallback: str, warm: bool
+) -> None:
+    """A relative `builtins.__import__` records the same user module CPython imports when the
+    package comes from `__name__`, `__spec__.parent` or a `ModuleType` fallback, cold or after an
+    upstream stage made the module resident. The explicit `__package__` spelling is the control."""
+    project = _project(
+        tmp_path,
+        {
+            **_LIB_VALUE,
+            "pipeline.py": _relative_import_pipeline(
+                _RELATIVE_IMPORT_FALLBACKS[fallback], warm=warm
+            ),
+        },
+    )
+    _run(project, "config", "set", "core.max_workers", "1")
+
+    first = _run(project, "repro")
+
+    _assert_not_reusable(project, first)
+    assert "helpers" in first.stdout + first.stderr
+    assert _count(project) == 4
+    _edit(project, *_EDIT_LIB_VALUE)
+    second = _run(project, "repro")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _count(project) == 103
+
+
+_PIVOT_THREAD_LOADS = {
+    "fileno-manual-loader": (
+        "import sys\n\nsys.stdout.fileno()\n\nVALUE = 1\n",
+        "import importlib.util\n"
+        "    import sys\n"
+        "    spec = importlib.util.spec_from_file_location('late', 'late.py')\n"
+        "    assert spec is not None and spec.loader is not None\n"
+        "    m = importlib.util.module_from_spec(spec)\n"
+        "    sys.modules['late'] = m\n"
+        "    spec.loader.exec_module(m)\n"
+        '    return {"v": m.VALUE + len(text.splitlines())}',
+    ),
+    "faulthandler-manual-loader": (
+        "import faulthandler\nimport sys\n\nfaulthandler.enable(sys.stderr)\n\nVALUE = 1\n",
+        "import importlib.util\n"
+        "    import sys\n"
+        "    spec = importlib.util.spec_from_file_location('late', 'late.py')\n"
+        "    assert spec is not None and spec.loader is not None\n"
+        "    m = importlib.util.module_from_spec(spec)\n"
+        "    sys.modules['late'] = m\n"
+        "    spec.loader.exec_module(m)\n"
+        '    return {"v": m.VALUE + len(text.splitlines())}',
+    ),
+    "fileno-entrypoint-loader": (
+        "import sys\n\nsys.stdout.fileno()\n\nVALUE = 1\n",
+        "import importlib.metadata\n"
+        "    ep = importlib.metadata.EntryPoint(name='late', value='late:VALUE', group='g')\n"
+        '    return {"v": ep.load() + len(text.splitlines())}',
+    ),
+}
+
+
+@pytest.mark.parametrize("surface", sorted(_PIVOT_THREAD_LOADS))
+def test_pivot_thread_started_inside_a_covered_import_does_not_excuse_a_later_manual_load(
+    tmp_path: pathlib.Path, surface: str
+) -> None:
+    """A pipe reader, parent watcher or stop-grace thread Pivot starts is not user work. Starting
+    the reader through `fileno()` or `faulthandler.enable()` inside a covered import must not
+    excuse a later manual or `EntryPoint.load()` load of `late`."""
+    lib, body = _PIVOT_THREAD_LOADS[surface]
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/lib.py": lib,
+            "late.py": "VALUE = 1\n",
+            "pipeline.py": _pipeline(
+                "import helpers.lib\n",
+                f"@stage\ndef count(text: str) -> dict:\n    import helpers.lib\n\n    {body}\n",
+            ),
+        },
+    )
+
+    first = _run(project, "repro")
+
+    _assert_not_reusable(project, first)
+    assert "late" in first.stdout + first.stderr
+    assert _count(project) == 4
+    _edit(project, "late.py", "VALUE = 1\n", "VALUE = 100\n")
+    second = _run(project, "repro")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _count(project) == 103
+
+
+def test_pivot_reader_started_before_a_covered_import_does_not_excuse_a_later_manual_load(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The audit control: when the stage starts the pipe reader before importing the covered
+    module, the later manual load is already counted. The F2 fix makes the inside-import cases
+    behave the same way."""
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/lib.py": "import sys\n\nsys.stdout.fileno()\n\nVALUE = 1\n",
+            "late.py": "VALUE = 1\n",
+            "pipeline.py": _pipeline(
+                "import helpers.lib\n",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    import importlib.util\n"
+                "    import sys\n\n"
+                "    sys.stdout.fileno()\n"
+                "    import helpers.lib\n"
+                "    spec = importlib.util.spec_from_file_location('late', 'late.py')\n"
+                "    assert spec is not None and spec.loader is not None\n"
+                "    m = importlib.util.module_from_spec(spec)\n"
+                "    sys.modules['late'] = m\n"
+                "    spec.loader.exec_module(m)\n"
+                '    return {"v": m.VALUE + len(text.splitlines())}\n',
+            ),
+        },
+    )
+
+    _assert_not_reusable(project, _run(project, "repro"))
+
+
+def test_pivot_thread_started_inside_a_covered_import_does_not_hide_a_hooked_load(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The P6 control: a later hooked `__import__` stays counted even while a reader Pivot
+    started in the covered import is still alive."""
+    project = _project(
+        tmp_path,
+        {
+            "helpers/__init__.py": "",
+            "helpers/lib.py": "import sys\n\nsys.stdout.fileno()\n\nVALUE = 1\n",
+            "late.py": "VALUE = 1\n",
+            "pipeline.py": _pipeline(
+                "import helpers.lib\n",
+                "@stage\ndef count(text: str) -> dict:\n"
+                "    import helpers.lib\n\n"
+                "    m = __import__('late')\n"
+                '    return {"v": m.VALUE + len(text.splitlines())}\n',
+            ),
+        },
+    )
+
+    _assert_not_reusable(project, _run(project, "repro"))
+
+
 def test_runtime_dynamic_import_under_no_commit_warns_that_commit_records_outputs(
     tmp_path: pathlib.Path,
 ) -> None:

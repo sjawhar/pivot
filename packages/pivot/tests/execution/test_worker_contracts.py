@@ -8,6 +8,7 @@ parallelism, and the value plumbing between the store and the stage function.
 from __future__ import annotations
 
 import array
+import ast
 import contextlib
 import dataclasses
 import fcntl
@@ -837,6 +838,36 @@ def test_every_thread_start_function_is_hooked() -> None:
     assert result["untouched"], "importing pivot.executor.worker replaced a thread start"
     assert result["unhooked"] == [], f"thread starts not hooked: {result['unhooked']}"
     assert result["restored"], "a thread start was not restored"
+
+
+def test_pivot_owned_worker_threads_start_through_the_bypass_helper() -> None:
+    """Every direct `threading.Thread` start that can run in a worker goes through
+    `_start_pivot_thread`, so an internal pipe reader, parent watcher or stop-grace timer cannot
+    inherit user-code coverage. Adding another direct constructor fails this test until it uses
+    the helper or is explicitly kept outside a worker."""
+    expected = {
+        pathlib.Path(worker.__file__).resolve(): {
+            "_start_exit_timer",
+            "unwind_when_stopped",
+            "_ensure_pipe",
+        },
+        pathlib.Path(worker.__file__).resolve().with_name("core.py"): {
+            "_exit_when_parent_dies",
+        },
+    }
+    for path, expected_functions in expected.items():
+        source = path.read_text()
+        tree = ast.parse(source)
+        found = {
+            function.name: ast.get_source_segment(source, function)
+            for function in ast.walk(tree)
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and "threading.Thread(" in (ast.get_source_segment(source, function) or "")
+        }
+        assert found.keys() == expected_functions, path
+        for name, body in found.items():
+            assert body is not None
+            assert "_start_pivot_thread(" in body, f"{path}:{name} bypasses the helper"
 
 
 @pytest.mark.parametrize(

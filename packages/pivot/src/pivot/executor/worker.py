@@ -14,6 +14,7 @@ import collections.abc as collections_abc
 import contextlib
 import dataclasses
 import importlib
+import importlib._bootstrap as importlib_bootstrap
 import importlib.util
 import logging
 import os
@@ -123,6 +124,9 @@ class _CoveredImportState(threading.local):
     depth: int = 0
     importing_for: _StageImports | None = None
     covered_for: _StageImports | None = None
+    # A Pivot-owned thread start is not user code and must not inherit the starting user's
+    # coverage. `_start_pivot_thread` sets this only around its `thread.start()` call.
+    starting_pivot_thread: bool = False
 
 
 _stage_imports: _StageImports | None = None
@@ -267,7 +271,12 @@ def _tracked_start_new_thread(
     the stage's window open until then."""
     call_kwargs = {} if kwargs is None else kwargs
     tracked = _stage_imports
-    if tracked is None or not callable(function) or not _on_covered_thread(tracked):
+    if (
+        tracked is None
+        or _covered_import_state.starting_pivot_thread
+        or not callable(function)
+        or not _on_covered_thread(tracked)
+    ):
         return _original_start_new_thread(function, args, call_kwargs)
 
     def covered_function(*call_args: object, **named: object) -> None:
@@ -292,7 +301,12 @@ def _tracked_start_joinable_thread(
     and `concurrent.futures.ThreadPoolExecutor` workers follow the rule too.
     """
     tracked = _stage_imports
-    if tracked is None or not callable(function) or not _on_covered_thread(tracked):
+    if (
+        tracked is None
+        or _covered_import_state.starting_pivot_thread
+        or not callable(function)
+        or not _on_covered_thread(tracked)
+    ):
         return _original_start_joinable_thread(function, handle=handle, daemon=daemon)
     _open_window(tracked)
     try:
@@ -313,6 +327,23 @@ _THREAD_START_HOOKS: dict[str, Callable[..., object]] = {
 }
 
 
+def _import_package(globals: Mapping[str, object] | None) -> str | None:
+    """The package CPython will use for a relative ``__import__``.
+
+    CPython 3.13's ``importlib._bootstrap._calc___package__`` first reads ``__package__``, then
+    ``__spec__.parent``, then falls back to ``__name__`` and ``__path__`` (CPython
+    ``Lib/importlib/_bootstrap.py:1442-1459``). The hook must resolve the same module as the
+    original import before it can record it.
+    """
+    if globals is None:
+        return None
+    calc_package = cast(
+        "Callable[[Mapping[str, object]], str]",
+        vars(importlib_bootstrap)["_calc___package__"],
+    )
+    return calc_package(globals)
+
+
 def _tracked_import(
     name: str,
     globals: Mapping[str, object] | None = None,  # noqa: A002 - CPython's `__import__` signature
@@ -323,7 +354,7 @@ def _tracked_import(
     tracked = _stage_imports
     if tracked is None:
         return _original_import(name, globals, locals, fromlist or (), level)
-    package = globals.get("__package__") if globals is not None else None
+    package = _import_package(globals) if level else None
     absolute: str | None = name
     if level:
         try:
@@ -386,6 +417,22 @@ def _uninstall_import_hooks() -> None:
         vars(module)[name] = original
     _replaced_thread_starts.clear()
     _hooks_installed = False
+
+
+def _start_pivot_thread(thread: threading.Thread) -> None:
+    """Start a thread Pivot owns without letting it inherit user-code coverage.
+
+    A Pivot thread can start while a covered import is running (the pipe reader is the critical
+    case). It remains outside the covered thread rule, so later user loads still count. All
+    Pivot-owned starts in a worker route through this helper.
+    """
+    covered_state = _covered_import_state
+    was_starting_pivot_thread = covered_state.starting_pivot_thread
+    covered_state.starting_pivot_thread = True
+    try:
+        thread.start()
+    finally:
+        covered_state.starting_pivot_thread = was_starting_pivot_thread
 
 
 @contextlib.contextmanager
@@ -490,7 +537,9 @@ def _start_exit_timer() -> None:
         if _stop.exit_timer_started:
             return
         _stop.exit_timer_started = True
-    threading.Thread(target=_exit_after_grace, daemon=True, name="pivot-stop-grace").start()
+    _start_pivot_thread(
+        threading.Thread(target=_exit_after_grace, daemon=True, name="pivot-stop-grace")
+    )
 
 
 def _interrupt_stage(_signum: int, _frame: object) -> None:
@@ -556,7 +605,9 @@ def unwind_when_stopped(parent_pid: int) -> None:
         _start_exit_timer()
         signal.pthread_kill(main_thread, signal.SIGTERM)
 
-    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
+    _start_pivot_thread(
+        threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch")
+    )
 
 
 class _QueueLoggingHandler(logging.Handler):
@@ -1842,7 +1893,7 @@ class _QueueWriter:
         self._reader_thread = threading.Thread(
             target=self._pipe_reader, daemon=True, name=f"pipe-reader-{self._stage_name}"
         )
-        self._reader_thread.start()
+        _start_pivot_thread(self._reader_thread)
 
     def __enter__(self) -> _QueueWriter:
         self._redirect.__enter__()

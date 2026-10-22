@@ -101,6 +101,10 @@ and a thread native code starts outside `_thread`:
 
 - a read of a module already in `sys.modules` without an import, or
   `importlib.reload`: import the module where the stage reads it;
+- a warm `EntryPoint.load()` or `importlib.__import__` of a user module another
+  stage already made resident: it creates no new `sys.modules` key, and the
+  loader may hold an importer before the hook, so it is not fingerprinted, as
+  on main; import the module statically;
 - private import machinery, or a loader that replaces a module already in
   `sys.modules` or never registers one, such as `runpy.run_path("helpers/lib.py")`
   or `runpy.run_module("toplib")` for a top-level module: import it statically,
@@ -145,11 +149,14 @@ and a thread native code starts outside `_thread`:
   the mark, so `pivot commit` records the outputs on disk against the static
   fingerprint, as it records any output; run `pivot repro` without
   `--no-commit` for a stage that imports dynamically;
-- a result cached by an earlier Pivot version: upgrading Pivot alone reruns
-  nothing. The check marks a stage the next time that stage runs under this
-  version; until then a cached result is reused until its code or inputs
-  change, as before the upgrade. Run `pivot repro --force <stage>` once to
-  re-check a stage you know imports dynamically.
+- a result cached by an earlier Pivot version: if its static fingerprint is
+  unchanged, it may be reused because `_CACHE_SCHEMA_VERSION` keys only the
+  state.lmdb caches, not the lock. A stage whose static walk reaches a user
+  class method or a user module gains entries in its manifest, so it reruns
+  once as Code changed after the upgrade. That accepted one-time rerun writes
+  the current manifest; later runs reuse it until code or inputs change. Run
+  `pivot repro --force <stage>` once to re-check a stage you know imports
+  dynamically.
 
 
 ### Transitive Tracking

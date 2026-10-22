@@ -192,6 +192,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | `functools.wraps` wrapper whose own body uses a computed `getattr`, `import_module` or `globals()` (decorator in `pipeline.py` or in a helper module) | ✅ (runs, as on main: the refusals read the wrapped function's source) | `test_fingerprint_gaps.py::test_dynamic_name_refusals_read_the_wrapped_function_source` (4 cases) |
 | Computed `getattr` in a function a wrapper reaches only through `__wrapped__` | ✅ (error, as on main) | `test_fingerprint_gaps.py::test_dynamic_name_refusal_reads_a_function_reached_only_through_wrapped` |
 | Other dynamic spelling of a user module (alias, `__import__`, partial, default, literal `getattr`) | ✅ (not reused) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_of_a_user_module_makes_result_not_reusable` |
+| Relative `builtins.__import__` with package from `__name__`, `__spec__.parent` or `ModuleType` fallback | ✅ (not reused, cold or warm) | `test_fingerprint_gaps.py::test_relative_builtins_import_uses_cpythons_package_fallback` |
 | Dynamic import of a library (`__import__("json")`, an `import_module` alias) | ✅ | `test_fingerprint_gaps.py::test_dynamic_import_of_a_library_runs_and_caches` |
 | A resolved helper receiving `"import_module"` | ✅ | `test_fingerprint_gaps.py::test_resolved_helper_accepts_import_module_argument_name` |
 | Library that creates modules without a source file (`pyexpat.errors`) | ✅ | `test_fingerprint_gaps.py::test_library_that_creates_fileless_modules_caches` |
@@ -206,6 +207,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Thread native code starts outside `_thread` (a C extension, `pthread_create` through `ctypes`) | ❌ (stated limit: not covered, so not reused) | Documented in `docs/architecture/fingerprinting.md` and `docs/concepts/fingerprinting.md`; import the module statically |
 | Covered thread of one stage importing during the next stage | ✅ (counted for the next stage) | `test_covered_threads.py::test_covered_thread_of_one_stage_is_not_covered_in_the_next`, `execution/test_worker_contracts.py::test_covered_thread_of_an_earlier_stage_is_not_covered_in_a_later_stage` |
 | Unhooked registration on another thread while a covered thread runs (stated limit) | ✅ (excused) | `execution/test_worker_contracts.py::test_unhooked_registration_on_another_thread_while_a_covered_thread_runs_is_excused` |
+| Pipe reader, parent watcher or stop-grace timer Pivot starts inside a covered import | ✅ (not reused: later manual load is counted) | `test_fingerprint_gaps.py::test_pivot_thread_started_inside_a_covered_import_does_not_excuse_a_later_manual_load`, `execution/test_worker_contracts.py::test_pivot_owned_worker_threads_start_through_the_bypass_helper` |
 | Stage registers a module without the hooks after every covered thread ended | ✅ (not reused) | `execution/test_worker_contracts.py::test_module_the_stage_registers_after_every_covered_thread_ended_is_counted` |
 | Covered thread still running when the stage returns, having loaded a module by either route | ✅ (excused) | `execution/test_worker_contracts.py::test_what_a_covered_thread_loads_is_excused_when_the_thread_outlives_the_stage` |
 | Every `_thread` start function hooked (`start_new_thread`, `start_new`, `start_joinable_thread`) | ✅ | `execution/test_worker_contracts.py::test_every_thread_start_function_is_hooked` |
@@ -218,6 +220,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Unloaded package located only by a `sys.meta_path` finder | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_package_found_by_a_meta_path_finder_is_refused` |
 | `runpy.run_path` / `runpy.run_module` of a top-level module | ❌ (stated limit) | `test_runtime_import_limits.py::test_d2_runpy_load_of_a_user_file_is_caught_or_listed_as_a_limit` |
 | Result cached by 0.5.2 for a dynamic-import stage | ❌ until `repro --force` (stated limit) | `test_runtime_import_limits.py::test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it` |
+| Upgrade where the static walk gains a user class method or user module | ✅ (one `Code changed` rerun, then reuse) | `test_runtime_import_limits.py::test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it`; audit upgrade probes |
 | Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss` |
 | Callback/function passed as argument     | ❌        | **NO TEST** - not tracked |
 | Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source) |

@@ -2,8 +2,10 @@
 
 """Stated limits of the worker's stage-import check, driven through the installed ``pivot`` CLI.
 
-A result an earlier Pivot cached is reused until the stage runs again, and ``runpy`` loads that
-never register a module are not seen; both docs list each case with its remedy.
+A stage whose static manifest is unchanged may reuse a result an earlier Pivot cached. A stage
+whose static walk gains entries (a user class method or a user module) reruns once after an
+upgrade; after that its current manifest reuses normally. `runpy` loads that never register a
+module are not seen. The docs list each case with its remedy.
 """
 
 import os
@@ -107,10 +109,12 @@ outs:
 def test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Upgrading Pivot alone reruns nothing. A stage whose 0.5.2 lock matches its static
-    fingerprint is served from that lock without running, so the stage-import check has nothing
-    to see. `pivot repro --force <stage>` runs it once under this version: the check marks it,
-    and the next edit to the module it imports reruns it. Both docs list the case."""
+    """A stage whose 0.5.2 lock matches its unchanged static fingerprint is served from that lock
+    without running, so the stage-import check has nothing to see. A static walk that gains a
+    user class method or a user module reruns once as Code changed; after that it reuses normally.
+    `pivot repro --force <stage>` runs a dynamically importing stage once under this version: the
+    check marks it, and the next edit to the module it imports reruns it. Both docs list the
+    boundary."""
     project = _project(tmp_path, {**_LIB, "pipeline.py": _RUNTIME_IMPORT}, lines=_LINES_0_5_2)
     flagged = _run(project, "repro")
     assert flagged.returncode == 0, flagged.stdout + flagged.stderr
@@ -140,6 +144,10 @@ def test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it(
     architecture = _section("architecture", "The check does not see these paths")
     for doc, text in (("concepts", concepts), ("architecture", architecture)):
         assert "earlier Pivot version" in text, f"{doc}: the upgrade case is not a stated limit"
+        assert "static fingerprint is unchanged" in text, f"{doc}: unchanged-lock boundary missing"
+        assert "static walk reaches a user class method or a user module" in text, (
+            f"{doc}: one-time expanded-manifest rerun missing"
+        )
         assert "pivot repro --force <stage>" in text, f"{doc}: the upgrade remedy is missing"
 
 

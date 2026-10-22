@@ -48,7 +48,9 @@ def _exit_when_parent_dies(parent_pid: int) -> None:
             poll.wait(1)
         os._exit(0)
 
-    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
+    worker._start_pivot_thread(  # pyright: ignore[reportPrivateUsage] - worker owns coverage bypass
+        threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch")
+    )
 
 
 def configured_worker_count(override: int | None = None) -> int:
