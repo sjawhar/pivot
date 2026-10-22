@@ -14,6 +14,9 @@ _state_dir_warnings_enabled = False
 _reported_ignored_global_state_dirs = set[pathlib.Path]()
 # Project config files whose unusable state directory was already reported in this process.
 _reported_unusable_state_dirs = set[pathlib.Path]()
+# Configured state directories whose 0.5.2 lock layout was already reported in this process.
+_reported_legacy_state_dirs = set[pathlib.Path]()
+
 
 STATE_GITIGNORE_CONTENT = """\
 # Cache directory (stage outputs, file hashes)
@@ -146,7 +149,7 @@ def state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
         reason = "The state directory cannot be used"
     if _state_dir_warnings_enabled and config_path not in _reported_unusable_state_dirs:
         _reported_unusable_state_dirs.add(config_path)
-        logger.warning(f"{problem}. {reason}; commands that do not need it use the default .pivot.")
+        logger.warning(f"{problem}. {reason}; Pivot uses the default .pivot.")
     return root / ".pivot"
 
 
@@ -194,8 +197,70 @@ def state_dir_is_configured(root: pathlib.Path) -> bool:
 
 
 def get_state_dir() -> pathlib.Path:
-    """Return the state directory of the current project."""
+    """Return the configured state directory of the current project."""
     return state_dir_for(get_project_root())
+
+
+def _configured_state_dir_is_empty(root: pathlib.Path) -> bool:
+    """Whether the local config's sole invalid state-dir value is an empty string."""
+    from pivot.config import io as config_io
+
+    present, configured = config_io.read_config_file_value(
+        root / ".pivot" / "config.yaml", "core.state_dir"
+    )
+    return present and configured == ""
+
+
+def legacy_state_dir_for(state_dir: pathlib.Path) -> pathlib.Path | None:
+    """Return the 0.5.2 state directory paired with ``state_dir``, if this project has one."""
+    from pivot import exceptions
+
+    try:
+        root = get_project_root()
+        configured = state_dir_for(root)
+    except (exceptions.ConfigError, exceptions.ProjectNotInitializedError, UnicodeDecodeError):
+        return None
+    legacy = root / ".pivot"
+    if configured != state_dir or configured == legacy:
+        return None
+    return legacy
+
+
+def legacy_stages_dir_for(stages_dir: pathlib.Path) -> pathlib.Path | None:
+    """Return the old stages directory corresponding to a configured stages directory."""
+    legacy = legacy_state_dir_for(stages_dir.parent)
+    return None if legacy is None else legacy / "stages"
+
+
+def legacy_cache_files_dir_for(cache_files_dir: pathlib.Path) -> pathlib.Path | None:
+    """Return the old cache object directory corresponding to a default configured cache."""
+    legacy = legacy_state_dir_for(cache_files_dir.parent.parent)
+    if legacy is None:
+        return None
+    return legacy / "cache" / "files"
+
+
+def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
+    """Warn once that reads fall back to the 0.5.2 state layout for ``state_dir``."""
+    if not _state_dir_warnings_enabled or state_dir in _reported_legacy_state_dirs:
+        return
+    legacy = legacy_state_dir_for(state_dir)
+    if legacy is None:
+        return
+    _reported_legacy_state_dirs.add(state_dir)
+    root = get_project_root()
+    try:
+        target = (state_dir / "stages").relative_to(root)
+    except ValueError:
+        move = f"mv {legacy / 'stages'} {state_dir / 'stages'}"
+    else:
+        move = f"git mv .pivot/stages {target}"
+    logger.warning(
+        "core.state_dir is %s, but Pivot 0.5.2 stored locks and cache in %s. Pivot reads missing locks and cache entries there; move the locks with `%s`.",
+        state_dir,
+        legacy,
+        move,
+    )
 
 
 def enable_state_dir_warnings() -> None:
@@ -276,28 +341,41 @@ def create_gitignore_if_absent(path: pathlib.Path) -> bool:
     return True
 
 
-def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
-    """Return an initialized project's state directory, creating it when absent.
-
-    Raises ``ConfigError`` as ``state_dir_for`` does. A directory this call creates gets the
-    default ``.gitignore``. One that already exists is left as it is, so a deleted
-    ``.pivot/.gitignore`` stays deleted until ``init`` writes it. A directory that cannot be
-    created (``state_dir_target_problem``) is returned as it is, so the command fails where it
-    opens it, as 0.5.2 did.
-    """
-    state_dir = state_dir_for(root)
-    if (
-        os.path.isdir(state_dir)
-        or not (root / ".pivot").is_dir()
-        or state_dir_target_problem(state_dir) is not None
-    ):
-        return state_dir
+def make_state_dir(state_dir: pathlib.Path) -> pathlib.Path:
+    """Create ``state_dir`` and its default ignore file when this call makes the directory."""
     try:
         state_dir.mkdir(parents=True)
     except FileExistsError:
         return state_dir
     create_gitignore_if_absent(state_dir / ".gitignore")
     return state_dir
+
+
+def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
+    """Return an initialized project's state directory, creating it when absent.
+
+    An empty hand-edited ``core.state_dir`` uses the default state directory as 0.5.2 did.
+    Other invalid config values still raise ``ConfigError``. A directory this call creates gets
+    the default ``.gitignore``. One that already exists is left as it is, so a deleted
+    ``.pivot/.gitignore`` stays deleted until ``init`` writes it. A directory that cannot be
+    created (``state_dir_target_problem``) is returned as it is, so the command fails where it
+    opens it, as 0.5.2 did.
+    """
+    from pivot import exceptions
+
+    try:
+        state_dir = state_dir_for(root)
+    except exceptions.ConfigError:
+        if _configured_state_dir_is_empty(root):
+            return state_dir_or_default(root)
+        raise
+    if (
+        os.path.isdir(state_dir)
+        or not (root / ".pivot").is_dir()
+        or state_dir_target_problem(state_dir) is not None
+    ):
+        return state_dir
+    return make_state_dir(state_dir)
 
 
 def resolve_path(path: str | pathlib.Path) -> pathlib.Path:

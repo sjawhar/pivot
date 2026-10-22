@@ -17,7 +17,7 @@ from typing import TypeGuard, cast
 
 import yaml
 
-from pivot import yaml_config
+from pivot import project, yaml_config
 from pivot.storage import cache
 from pivot.types import (
     ArtifactIdentity,
@@ -314,6 +314,7 @@ class StageLock:
 
     stage_name: str
     path: pathlib.Path
+    stages_dir: pathlib.Path
 
     def __init__(self, stage_name: str, stages_dir: pathlib.Path) -> None:
         """Initialize a stage lock for the given stage in stages_dir."""
@@ -321,22 +322,36 @@ class StageLock:
         if reason is not None:
             raise ValueError(f"Invalid stage name {stage_name!r}: {reason}")
         self.stage_name = stage_name
+        self.stages_dir = stages_dir
         self.path = stages_dir / f"{stage_name}.lock"
 
-    def read(self) -> LockData | None:
-        """Read lock file, converting storage format to internal format."""
+    def _read_path(self, path: pathlib.Path) -> tuple[bool, LockData | None]:
+        """Read one lock path, returning whether the path existed."""
         try:
-            with open(self.path) as f:
+            with open(path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not is_lock_data(data):
-                logger.debug("Lock file %s failed validation; treating it as missing", self.path)
-                return None
-            return _convert_from_storage_format(data, stage_name=self.stage_name)
+                logger.debug("Lock file %s failed validation; treating it as missing", path)
+                return True, None
+            return True, _convert_from_storage_format(data, stage_name=self.stage_name)
         except FileNotFoundError:
-            return None  # Normal case - lock doesn't exist yet
+            return False, None
         except (UnicodeDecodeError, yaml.YAMLError) as e:
-            logger.warning("Failed to parse lock file %s: %s", self.path, e)
+            logger.warning("Failed to parse lock file %s: %s", path, e)
+            return True, None
+
+    def read(self) -> LockData | None:
+        """Read the configured lock, falling back to a matching 0.5.2 lock when absent."""
+        exists, data = self._read_path(self.path)
+        if exists:
+            return data
+        legacy_stages_dir = project.legacy_stages_dir_for(self.stages_dir)
+        if legacy_stages_dir is None:
             return None
+        exists, data = self._read_path(legacy_stages_dir / f"{self.stage_name}.lock")
+        if exists:
+            project.report_legacy_state_dir(self.stages_dir.parent)
+        return data
 
     def write(self, data: LockData) -> None:
         """Write lock file atomically, converting to storage format."""

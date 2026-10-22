@@ -621,7 +621,7 @@ def restore_data_from_cache(
     if not _HASH_PATTERN.fullmatch(file_hash.lower()):
         return None
 
-    cache_dir = config.get_cache_dir() / "files"
+    cache_dir = config.locate_cache_dir() / "files"
     cached_path = cache_dir / file_hash[:2] / file_hash[2:]
 
     # Prevent symlink escape attacks

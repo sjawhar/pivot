@@ -365,8 +365,9 @@ def prepare_worker_info(
     # Use stage's state_dir if set, otherwise fall back to default
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
 
-    # Ensure state directory exists (workers open StateDB in readonly mode)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # Create the state directory through the common path so a newly configured directory has
+    # its state ignore file before a worker writes under it.
+    project.make_state_dir(state_dir)
 
     return worker.WorkerStageInfo(
         func=stage_info["func"],

@@ -37,10 +37,10 @@ Rules for `pipeline.py`:
 - Errors in the block (unsupported argument types, wrong arity) are collected
   and reported together when the block exits.
 
-`Pipeline(name, root=None)` takes the pipeline name. A pipeline always keeps its
-lock files and state in the project's `.pivot/` and its outputs in the project's
-`data/`, so `root` may only be the project root (the top-most directory that
-contains `.pivot/`) or omitted; discovery refuses any other `root`.
+`Pipeline(name, root=None)` takes the pipeline name. A pipeline keeps its lock files and state in
+the project's configured state directory and its outputs in the project's `data/`, so `root` may
+only be the project root (the top-most directory that contains `.pivot/`) or omitted; discovery
+refuses any other `root`.
 
 ### Where Pivot looks
 
@@ -157,12 +157,16 @@ A state directory belongs to one project. Set `core.state_dir` in the project's 
 projects at the same directory, including with an absolute path. They would share lock files
 and overwrite each other's records of what ran, so each would see the other's stages as stale.
 
-If `.pivot/config.yaml` cannot be read, or its `core.state_dir` is not a path to a directory
-Pivot can create and write, Pivot prints one warning naming the file and the problem. Commands
-that do not need the state directory (`list`, `dag`, `init --force`, `plots show` and the like)
-then use the default `.pivot`. Commands that read or write state, such as `status`, `repro`
-and `history`, fail with a one-line error until the file is fixed. `--quiet` silences the
+If `.pivot/config.yaml` cannot be read, or its `core.state_dir` is not a writable,
+searchable directory (including a read-only directory), Pivot prints one warning naming the file
+and the problem. Every command that Pivot 0.5.2 ran keeps its exit code and uses the default
+`.pivot`; a command that 0.5.2 failed still fails in one error line. `--quiet` silences the
 warning.
+
+When a project created by Pivot 0.5.2 sets `core.state_dir`, Pivot reads a stage lock missing
+from the configured directory, and its cached objects, from `.pivot` until the state is moved.
+Pivot warns once per command and directs new writes to the configured state directory; move the
+tracked locks with `git mv .pivot/stages <state_dir>/stages`.
 
 ```
 <project_root>/

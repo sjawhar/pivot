@@ -60,7 +60,7 @@ model = pipeline.input("model.pkl")
 ### What Happens
 
 1. Pivot resolves the git ref to a commit SHA
-2. Reads the source repo's `.pivot/config.yaml` to find its remote storage URL and its `core.state_dir`. A `core.state_dir` that cannot be read or is not a directory path inside the repo is reported in one warning, and the locks are read from the default `.pivot`
+2. Reads the source repo's `.pivot/config.yaml` to find its remote storage URL and its `core.state_dir`. A `core.state_dir` that cannot be read, is not a directory path inside the repo, or has no readable `stages` directory at the imported revision is reported in one warning, and the locks are read from the default `.pivot`
 3. Reads the source lock files to find the artifact and its content hash
 4. Downloads the file from the source's remote, S3 or GCS (hash-verified)
 5. Creates a `.pvt` file tracking the import source

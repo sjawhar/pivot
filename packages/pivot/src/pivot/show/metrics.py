@@ -318,7 +318,7 @@ def collect_metrics_from_head(
 
     Returns {path: {key: value}} for files found.
     """
-    cache_dir = config.get_cache_dir() / "files"
+    cache_dir = config.locate_cache_dir() / "files"
     result = dict[str, MetricData]()
 
     # Collect paths that need git fallback

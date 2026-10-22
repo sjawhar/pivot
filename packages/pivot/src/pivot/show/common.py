@@ -52,23 +52,38 @@ def _parse_lock_contents(
 def read_lock_files_from_head(
     stage_names: Sequence[str],
 ) -> dict[str, StorageLockData | None]:
-    """Batch read and parse lock files from git HEAD.
-
-    While the state directory is unknown or cannot be used, the locks are read from 0.5.2's
-    ``.pivot/stages`` (``project.state_dir_or_default``).
-    """
+    """Batch read lock files from HEAD, falling back to 0.5.2's tracked lock layout."""
     if not stage_names:
         return {}
     root = project.get_project_root()
+    state_dir = project.state_dir_or_default(root)
     try:
-        stages_dir = lock.stages_rel_path(project.state_dir_or_default(root), root)
+        stages_dir = lock.stages_rel_path(state_dir, root)
     except ValueError:
+        stages_dir = None
+
+    result = dict[str, StorageLockData | None]()
+    if stages_dir is not None:
+        lock_paths = [f"{stages_dir}/{name}.lock" for name in stage_names]
+        result = _parse_lock_contents(stage_names, git.read_files_from_head(lock_paths), stages_dir)
+    else:
+        result = dict.fromkeys(stage_names)
+
+    legacy_stages_dir = ".pivot/stages"
+    missing = [name for name, data in result.items() if data is None]
+    if missing and stages_dir != legacy_stages_dir:
+        lock_paths = [f"{legacy_stages_dir}/{name}.lock" for name in missing]
+        legacy = _parse_lock_contents(
+            missing, git.read_files_from_head(lock_paths), legacy_stages_dir
+        )
+        if any(data is not None for data in legacy.values()):
+            project.report_legacy_state_dir(state_dir)
+        result.update({name: data for name, data in legacy.items() if data is not None})
+    if stages_dir is None and not any(data is not None for data in result.values()):
         raise exceptions.ConfigError(
             "core.state_dir is outside the project, so lock files are not in git"
-        ) from None
-    lock_paths = [f"{stages_dir}/{name}.lock" for name in stage_names]
-    lock_contents = git.read_files_from_head(lock_paths)
-    return _parse_lock_contents(stage_names, lock_contents, stages_dir)
+        )
+    return result
 
 
 def extract_output_hashes_from_lock(

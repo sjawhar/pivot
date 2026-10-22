@@ -23,28 +23,26 @@ logger = logging.getLogger(__name__)
 
 
 def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
-    """Scan local cache and return all content hashes.
-
-    Uses os.scandir for efficiency - DirEntry caches stat results, eliminating
-    redundant syscalls compared to pathlib.iterdir + is_file/is_dir.
-    """
+    """Scan current and legacy default caches for all local content hashes."""
     _t = metrics.start()
-    files_dir = cache_dir / "files"
-    if not files_dir.exists():
-        metrics.end("sync.get_local_cache_hashes", _t)
-        return set()
+    files_dirs = [cache_dir / "files"]
+    if (legacy_files_dir := project.legacy_cache_files_dir_for(files_dirs[0])) is not None:
+        files_dirs.append(legacy_files_dir)
 
     hashes = set[str]()
-    with os.scandir(files_dir) as prefix_entries:
-        for prefix_entry in prefix_entries:
-            if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
-                continue
-            with os.scandir(prefix_entry.path) as hash_entries:
-                for hash_entry in hash_entries:
-                    if hash_entry.is_file():
-                        full_hash = prefix_entry.name + hash_entry.name
-                        if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
-                            hashes.add(full_hash)
+    for files_dir in files_dirs:
+        if not files_dir.exists():
+            continue
+        with os.scandir(files_dir) as prefix_entries:
+            for prefix_entry in prefix_entries:
+                if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
+                    continue
+                with os.scandir(prefix_entry.path) as hash_entries:
+                    for hash_entry in hash_entries:
+                        if hash_entry.is_file():
+                            full_hash = prefix_entry.name + hash_entry.name
+                            if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
+                                hashes.add(full_hash)
 
     metrics.end("sync.get_local_cache_hashes", _t)
     return hashes
@@ -137,7 +135,11 @@ def _get_file_hash_from_stages(
 
     stages_dir = lock.get_stages_dir(state_dir)
     if not stages_dir.exists():
-        return None
+        legacy_stages_dir = project.legacy_stages_dir_for(stages_dir)
+        if legacy_stages_dir is None or not legacy_stages_dir.exists():
+            return None
+        project.report_legacy_state_dir(state_dir)
+        stages_dir = legacy_stages_dir
 
     for lock_file in stages_dir.rglob("*.lock"):
         stage_name = lock_file.relative_to(stages_dir).with_suffix("").as_posix()

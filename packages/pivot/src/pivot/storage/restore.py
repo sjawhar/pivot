@@ -97,16 +97,28 @@ def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | None:
 def get_lock_data_from_revision(
     stage_name: str, rev: str, state_dir: pathlib.Path
 ) -> StorageLockData | None:
-    """Read and parse lock file for a stage from a git revision."""
+    """Read a stage lock from a revision, including a matching 0.5.2 lock location."""
+    root = project.get_project_root()
     try:
-        stages_dir = lock.stages_rel_path(state_dir, project.get_project_root())
+        stages_dir = lock.stages_rel_path(state_dir, root)
     except ValueError:
-        raise exceptions.ConfigError(
-            "core.state_dir is outside the project, so lock files are not in git"
-        ) from None
-    content = git.read_file_from_revision(f"{stages_dir}/{stage_name}.lock", rev)
-    if content is None:
+        stages_dir = None
+    if stages_dir is not None:
+        content = git.read_file_from_revision(f"{stages_dir}/{stage_name}.lock", rev)
+        if content is not None:
+            return _parse_lock_data_from_bytes(content)
+
+    legacy_stages_dir = ".pivot/stages"
+    if stages_dir == legacy_stages_dir:
         return None
+    content = git.read_file_from_revision(f"{legacy_stages_dir}/{stage_name}.lock", rev)
+    if content is None:
+        if stages_dir is None:
+            raise exceptions.ConfigError(
+                "core.state_dir is outside the project, so lock files are not in git"
+            ) from None
+        return None
+    project.report_legacy_state_dir(state_dir)
     return _parse_lock_data_from_bytes(content)
 
 

@@ -28,6 +28,8 @@ import tempfile
 
 import pytest
 
+from pivot import project
+
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 _PIPELINE = """\
@@ -44,6 +46,7 @@ with Pipeline("test") as pipeline:
 """
 
 _CASES = {
+    "empty": "core:\n  state_dir: ''\n",
     "invalid-yaml": "core: [unclosed\n",
     "integer": "core:\n  state_dir: 5\n",
     "boolean": "core:\n  state_dir: True\n",
@@ -87,10 +90,40 @@ _COMMANDS: dict[str, tuple[str, ...]] = {
 }
 
 # The tail of the one warning a command that runs prints about the unusable configuration.
-_DEFAULT_WARNING = "; commands that do not need it use the default .pivot."
+_DEFAULT_WARNING = "; Pivot uses the default .pivot."
 
 # Captured from pivot 0.5.2 by running this file (see the module docstring).
 _052_EXIT_CODES: dict[str, dict[str, int]] = {
+    "empty": {
+        "check-ignore": 0,
+        "checkout": 0,
+        "commit": 0,
+        "completion": 0,
+        "config": 0,
+        "dag": 0,
+        "diff": 0,
+        "doctor": 0,
+        "fetch": 1,
+        "fingerprint": 0,
+        "get": 0,
+        "history": 0,
+        "import": 1,
+        "init": 0,
+        "list": 0,
+        "metrics": 0,
+        "params": 0,
+        "plots": 0,
+        "pull": 1,
+        "push": 1,
+        "remote": 0,
+        "repro": 0,
+        "run": 0,
+        "show": 1,
+        "status": 0,
+        "track": 0,
+        "update": 0,
+        "verify": 0,
+    },
     "invalid-yaml": {
         "check-ignore": 0,
         "checkout": 1,
@@ -361,15 +394,34 @@ def test_command_exits_as_on_052(
     if os.geteuid() == 0 and case in {"unwritable-absolute", "read-only-parent"}:
         pytest.skip("root ignores permission bits")
     home, root = _case(base_project, tmp_path, case)
-
     result = _run(root, home, _PIVOT, *_COMMANDS[command])
-
     output = result.stdout + result.stderr
     assert "Traceback" not in output, output
-    assert result.returncode == _052_EXIT_CODES[case][command], output
+    # Ruling (main, 11:16Z): 0.5.2 treats '' as the project root, so show sees no runs;
+    # head uses .pivot and retains its run history.
+    expected = 0 if (case, command) == ("empty", "show") else _052_EXIT_CODES[case][command]
+    assert result.returncode == expected, output
     if result.returncode != 0:
         errors = [line for line in result.stderr.splitlines() if line.startswith("Error")]
         assert len(errors) == 1, result.stderr
+
+
+@pytest.mark.parametrize("command", list(_COMMANDS))
+def test_every_created_configured_state_directory_has_the_template(
+    base_project: pathlib.Path, tmp_path: pathlib.Path, command: str
+) -> None:
+    """A command that creates a configured state directory preserves its state files from git."""
+    copy = tmp_path / "copy"
+    shutil.copytree(base_project, copy, symlinks=True)
+    home = copy / "home"
+    root = copy / "project"
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: fresh\n")
+
+    _ = _run(root, home, _PIVOT, *_COMMANDS[command])
+
+    fresh = root / "fresh"
+    if fresh.exists():
+        assert (fresh / ".gitignore").read_text() == project.STATE_GITIGNORE_CONTENT
 
 
 def test_the_table_covers_every_help_command() -> None:

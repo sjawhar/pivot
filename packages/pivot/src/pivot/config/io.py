@@ -485,16 +485,25 @@ def get_run_history_retention() -> int:
     return merged.core.run_history_retention
 
 
-def get_cache_dir() -> pathlib.Path:
-    """Get cache directory, checking env var first.
-
-    Precedence: PIVOT_CACHE_DIR env var > config file > the current state directory's cache.
-    Relative paths are resolved against the project root.
-    """
+def locate_cache_dir() -> pathlib.Path:
+    """Return the configured cache location without creating project state."""
     env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
     cache_dir = pathlib.Path(env_cache or get_merged_config().cache.dir)
     if not cache_dir.is_absolute():
         cache_dir = project.get_project_root() / cache_dir
+    return cache_dir
+
+
+def get_cache_dir() -> pathlib.Path:
+    """Get the cache directory, creating a configured default state directory when needed.
+
+    The default cache belongs to the configured state directory. Call ``locate_cache_dir`` for a
+    display-only lookup that must not create it.
+    """
+    root = project.get_project_root()
+    cache_dir = locate_cache_dir()
+    if cache_dir == project.state_dir_or_default(root) / "cache":
+        project.ensure_state_dir(root)
     return cache_dir
 
 
@@ -504,10 +513,14 @@ def get_state_dir() -> pathlib.Path:
     The merged config is loaded first, as 0.5.2 did here, so a config file that cannot be read
     fails this call with its own message. A directory created here gets its ``.gitignore``, and
     one that cannot be created is returned for the caller to fail on
-    (``project.ensure_state_dir``).
+    (``project.ensure_state_dir``). An empty hand-edited path uses the default ``.pivot``.
     """
     get_merged_config()
-    return project.ensure_state_dir(project.get_project_root())
+    root = project.get_project_root()
+    try:
+        return project.ensure_state_dir(root)
+    except exceptions.ConfigError:
+        return project.ensure_state_dir_or_default(root)
 
 
 def get_max_workers() -> int:

@@ -383,9 +383,7 @@ def test_cache_dir_completion_help_matches_pivot_052() -> None:
     assert models.CONFIG_KEY_DESCRIPTIONS["cache.dir"] == "Local cache directory"
 
 
-_UNKNOWN_STATE_DIR = (
-    ". The state directory is unknown; commands that do not need it use the default .pivot."
-)
+_UNKNOWN_STATE_DIR = ". The state directory is unknown; Pivot uses the default .pivot."
 
 
 def _project_with_invalid_local_config(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:

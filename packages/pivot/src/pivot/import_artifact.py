@@ -274,14 +274,15 @@ async def _list_github_lock_paths(
     return lock_paths
 
 
-async def list_remote_lock_files(
+async def _try_list_remote_lock_files(
     repo_url: str,
     rev: str,
     token: str | None,
     stages_dir: str,
     *,
     session: aiohttp.ClientSession | None = None,
-) -> list[str]:
+) -> list[str] | None:
+    """List source lock files, returning None only when the lock directory cannot be listed."""
     if github.is_github_url(repo_url):
         owner, repo = github.parse_github_url(repo_url)
         entries = await _list_github_lock_paths(
@@ -296,14 +297,28 @@ async def list_remote_lock_files(
         )
 
     if entries is None:
-        raise exceptions.RemoteError(f"Remote repo has no {stages_dir} directory")
+        return None
 
-    # Entries are relative to the lock directory, so nested paths are pipeline-prefixed names.
     stage_names = [entry.removesuffix(".lock") for entry in entries if entry.endswith(".lock")]
-
     if not stage_names:
         raise exceptions.RemoteError("Remote repo has no lock files")
+    return stage_names
 
+
+async def list_remote_lock_files(
+    repo_url: str,
+    rev: str,
+    token: str | None,
+    stages_dir: str,
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> list[str]:
+    """List source lock files, reporting a missing stages directory."""
+    stage_names = await _try_list_remote_lock_files(
+        repo_url, rev, token, stages_dir, session=session
+    )
+    if stage_names is None:
+        raise exceptions.RemoteError(f"Remote repo has no {stages_dir} directory")
     return stage_names
 
 
@@ -414,10 +429,22 @@ async def _resolve_remote_path_with_session(
     source_state_dir = await _source_state_dir(repo_url, rev_lock, config_data)
     stages_dir = "stages" if source_state_dir == "." else f"{source_state_dir}/stages"
 
-    # Use resolved SHA for all subsequent reads to avoid TOCTOU race
-    stage_names = await list_remote_lock_files(
+    # Pivot 0.5.2 always wrote source locks below .pivot. A source still carrying that layout
+    # must remain importable while its configured directory cannot be read from this revision.
+    stage_names = await _try_list_remote_lock_files(
         repo_url, rev_lock, token, stages_dir, session=gh_session
     )
+    if stage_names is None and stages_dir != ".pivot/stages":
+        _warn_source_state_dir_ignored(
+            repo_url, f"{stages_dir!r} cannot be read at revision {rev_lock}"
+        )
+        stages_dir = ".pivot/stages"
+        stage_names = await list_remote_lock_files(
+            repo_url, rev_lock, token, stages_dir, session=gh_session
+        )
+    elif stage_names is None:
+        raise exceptions.RemoteError(f"Remote repo has no {stages_dir} directory")
+
     lock_datas = await asyncio.gather(
         *[
             read_remote_lock_file(repo_url, stage, rev_lock, token, stages_dir, session=gh_session)

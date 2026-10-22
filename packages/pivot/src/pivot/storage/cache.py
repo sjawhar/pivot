@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import xxhash
 
-from pivot import exceptions, metrics
+from pivot import exceptions, metrics, project
 from pivot.config import CheckoutMode as CheckoutMode
 from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_hash
 
@@ -361,7 +361,7 @@ def is_valid_hash(value: object) -> bool:
 
 
 def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
-    """Get cache path for a hash (XX/XXXX... structure)."""
+    """Get the read path for a hash, checking a matching 0.5.2 cache on a primary miss."""
     if len(file_hash) != XXHASH64_HEX_LENGTH:
         raise exceptions.SecurityValidationError(
             f"Hash must be exactly {XXHASH64_HEX_LENGTH} characters, got {len(file_hash)}"
@@ -369,7 +369,17 @@ def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     # Prevents path traversal via malicious hashes
     if not is_valid_hash(file_hash):
         raise exceptions.SecurityValidationError(f"Hash contains invalid characters: {file_hash!r}")
-    return cache_dir / file_hash[:2] / file_hash[2:]
+    cache_path = cache_dir / file_hash[:2] / file_hash[2:]
+    if cache_path.exists():
+        return cache_path
+    legacy_files_dir = project.legacy_cache_files_dir_for(cache_dir)
+    if legacy_files_dir is None:
+        return cache_path
+    legacy_path = legacy_files_dir / file_hash[:2] / file_hash[2:]
+    if legacy_path.exists():
+        project.report_legacy_state_dir(cache_dir.parent.parent)
+        return legacy_path
+    return cache_path
 
 
 def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: BaseException) -> None:

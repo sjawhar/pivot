@@ -113,12 +113,14 @@ def test_tab_completion_still_lists_stages(tmp_path: pathlib.Path, value: str) -
 
 @pytest.mark.parametrize("value", list(_VALUES), ids=list(_VALUES))
 def test_status_still_refuses_in_one_line(tmp_path: pathlib.Path, value: str) -> None:
-    """Control, passes at ce74ad41: a state command exits 1 with one `Error:` line, no traceback."""
+    """A state command keeps the 0.5.2 exit code without a traceback."""
     home, root = _project(tmp_path, _VALUES[value])
 
     result = _run(root, home, _PIVOT, "status")
 
     output = result.stdout + result.stderr
     assert "Traceback" not in output, output
-    assert result.returncode == 1, output
-    assert any(line.startswith("Error") for line in result.stderr.splitlines()), output
+    expected = 0 if value == "empty" else 1
+    assert result.returncode == expected, output
+    if expected != 0:
+        assert any(line.startswith("Error") for line in result.stderr.splitlines()), output
