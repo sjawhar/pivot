@@ -1428,3 +1428,74 @@ async def test_missing_input_that_arrives_with_its_directory_makes_the_pipeline_
             assert recorder.completed("reload/late", start=valid_index) == StageStatus.RAN
             assert eng.pipeline_error is None, "the input's arrival makes the pipeline valid"
             tg.cancel_scope.cancel()
+
+
+class _FileSink:
+    """Sink that appends each event's type to a file, as ``--jsonl > <file>`` writes it."""
+
+    _path: pathlib.Path
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self._path = path
+
+    async def handle(self, event: OutputEvent) -> None:
+        with self._path.open("a") as handle:
+            handle.write(f"{event['type']}\n")
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.anyio
+async def test_output_written_inside_the_project_does_not_recheck_a_missing_input(
+    watch_project: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """While an input is missing, the session's own output inside the project re-checks nothing.
+
+    A session whose output lands in the watched root (``--jsonl > events.jsonl``, a log file)
+    writes on every re-check. Only a change at a missing input's path, or at a directory that
+    would contain it, checks the inputs again.
+    """
+    caplog.set_level(logging.INFO, logger="pivot.engine.engine")
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_sink(_FileSink(watch_project / "events.jsonl"))
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+
+            pipeline_py.write_text(
+                _helper_pipeline_source("-v1", third="late").replace(
+                    "    late(raw)\n", '    late(pipeline.input("missing.txt"))\n'
+                )
+            )
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            idle_index = await recorder.wait_for(_helper_is_idle, start=invalid_index)
+            log_offset = len(caplog.text)
+
+            await anyio.sleep(10)
+            rechecks = [
+                event
+                for event in recorder.events[idle_index:]
+                if event["type"] == "pipeline_reloaded"
+            ]
+            assert not rechecks, f"{len(rechecks)} re-checks fed by the session's own output"
+            assert "checking again" not in caplog.text[log_offset:]
+
+            (watch_project / "data" / "raw" / "missing.txt").write_text("m")
+            valid_index = await recorder.wait_for(
+                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                start=idle_index,
+            )
+            await recorder.wait_for(_helper_completes("reload/late"), start=valid_index)
+            assert recorder.completed("reload/late", start=valid_index) == StageStatus.RAN
+            tg.cancel_scope.cancel()

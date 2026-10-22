@@ -149,6 +149,19 @@ class _WatchOutputSnapshot:
     entries: dict[pathlib.Path, _WatchOutputSignature]
 
 
+@dataclass(frozen=True, slots=True)
+class _MissingDependencyRun:
+    """A watch run a missing input stopped, with the paths where its missing inputs would appear."""
+
+    request: RunRequested
+    # Absolute paths of the missing inputs; empty when only a stage output is missing
+    input_paths: frozenset[pathlib.Path]
+
+    def awaits(self, path: pathlib.Path) -> bool:
+        """Whether ``path`` is a missing input or a directory that would contain one."""
+        return any(missing.is_relative_to(path) for missing in self.input_paths)
+
+
 def _merge_run_requests(earlier: RunRequested, later: RunRequested) -> RunRequested:
     """One request that runs everything ``earlier`` and ``later`` would run.
 
@@ -278,7 +291,7 @@ class Engine:
     _pipeline_error: str | None
     # The watch run a missing input stopped. While set, a data change checks the dependencies
     # again instead of being dropped, and runs this run's stages too.
-    _missing_dependency_run: RunRequested | None
+    _missing_dependency_run: _MissingDependencyRun | None
     # Set while no code reload is in flight; replaced by a fresh Event when one starts
     _reload_done: anyio.Event
 
@@ -784,7 +797,7 @@ class Engine:
                 return
             # The request may follow the creation of the missing input: check again, with the
             # stopped run's stages too
-            event = _merge_run_requests(self._missing_dependency_run, event)
+            event = _merge_run_requests(self._missing_dependency_run.request, event)
 
         if self._run_state == _RunState.RUNNING:
             # Coalesce: hold the cancelled run's request apart, merged in only at replay
@@ -1090,7 +1103,14 @@ class Engine:
             # checks again and replays this run (see _handle_run_requested)
             if self._running_request is None:
                 raise RuntimeError("A watch run stopped by a missing input has no run request")
-            self._missing_dependency_run = self._running_request
+            self._missing_dependency_run = _MissingDependencyRun(
+                request=self._running_request,
+                input_paths=frozenset(
+                    project.normalize_path(err.input_path)
+                    for err in dep_errors
+                    if err.input_path is not None
+                ),
+            )
             await self._invalidate_pipeline([missing.format_user_message()])
             return {}
         if self._missing_dependency_run is not None:
@@ -2512,12 +2532,15 @@ class Engine:
 
         affected = self._get_affected_stages_for_paths(filtered_paths)
         if not affected:
-            if self._missing_dependency_run is None:
+            missing = self._missing_dependency_run
+            if missing is None or not any(
+                missing.awaits(project.normalize_path(path)) for path in filtered_paths
+            ):
                 return
-            # A missing input can arrive inside a new directory, which maps to no stage. The
-            # re-check only asks whether the missing inputs exist now, so any change triggers it.
-            _logger.info("Data changed while an input is missing - checking again")
-            await self._handle_run_requested(self._missing_dependency_run)
+            # A missing input that arrives inside a new directory is reported as the directory
+            # alone, which maps to no stage
+            _logger.info("Data changed where a missing input belongs - checking again")
+            await self._handle_run_requested(missing.request)
             return
 
         _logger.info(

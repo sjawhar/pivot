@@ -101,6 +101,11 @@ class DependencyNotFoundError(DAGError):
     def stage(self) -> str:
         return self._stage
 
+    @property
+    def input_path(self) -> str | None:
+        """The missing input's path as the message shows it; None for a missing stage output."""
+        return self._input_path
+
     @override
     def format_user_message(self) -> str:
         msg = str(self)
