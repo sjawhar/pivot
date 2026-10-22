@@ -1,13 +1,14 @@
 """Run serve in-process, as an application that embeds pivot's CLI does, and report what the
 application sees.
 
-Usage: <venv>/bin/python inproc_serve.py <project> <main|click> <TERM|INT|thread>
+Usage: <venv>/bin/python inproc_serve.py <project> <main|click> <TERM|INT|thread> [wakeup]
 
 ``main`` calls the public ``pivot.cli.main()``; ``click`` calls the Click group with
 ``standalone_mode=False``. With TERM or INT, serve runs on the main thread until the probe sends
-itself that signal; the probe then reports its stop handlers and whether SIGTERM stops a child
-it starts afterwards. With ``thread``, serve runs on a worker thread; the probe reports whether
-it answers and its stop handlers, then exits with serve still running.
+itself that signal; the probe then reports its stop handlers as Python and the kernel see them,
+and whether SIGTERM stops a child it starts afterwards. ``wakeup`` first sets a signal wakeup fd
+and reports it again after serve. With ``thread``, serve runs on a worker thread; the probe
+reports whether it answers and its stop handlers, then exits with serve still running.
 """
 
 from __future__ import annotations
@@ -35,6 +36,22 @@ def _handlers() -> str:
     return f"SIGINT={names[0]} SIGTERM={names[1]}"
 
 
+def _kernel() -> str:
+    """Return how the kernel disposes of SIGINT and SIGTERM for this process."""
+    masks = dict[str, int]()
+    for line in pathlib.Path("/proc/self/status").read_text().splitlines():
+        key, _, value = line.partition(":")
+        if key in ("SigIgn", "SigCgt"):
+            masks[key] = int(value, 16)
+    names = list[str]()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        bit = 1 << (signum - 1)
+        names.append(
+            "ignored" if masks["SigIgn"] & bit else "caught" if masks["SigCgt"] & bit else "default"
+        )
+    return f"SIGINT={names[0]} SIGTERM={names[1]}"
+
+
 def _status() -> str | None:
     with socket.socket(socket.AF_UNIX) as client:
         try:
@@ -58,7 +75,7 @@ def _serve(entry: str) -> str:
     return "returned"
 
 
-def _serve_until_signalled(entry: str, sig: signal.Signals) -> None:
+def _serve_until_signalled(entry: str, sig: signal.Signals, wakeup: bool) -> None:
     def _signal_once_serving() -> None:
         deadline = time.monotonic() + 30
         while '"result"' not in (_status() or "") and time.monotonic() < deadline:
@@ -66,7 +83,13 @@ def _serve_until_signalled(entry: str, sig: signal.Signals) -> None:
         time.sleep(1)
         os.kill(os.getpid(), sig)
 
+    if wakeup:
+        _reader, writer = socket.socketpair()
+        writer.setblocking(False)
+        signal.set_wakeup_fd(writer.fileno())
+        print(f"wakeup fd before: {writer.fileno()}")
     print(f"before: {_handlers()}")
+    print(f"kernel before: {_kernel()}")
     threading.Thread(target=_signal_once_serving, daemon=True).start()
     started = time.monotonic()
     outcome = _serve(entry)
@@ -75,6 +98,11 @@ def _serve_until_signalled(entry: str, sig: signal.Signals) -> None:
         + f"socket left: {_SOCKET.exists()}"
     )
     print(f"after: {_handlers()}")
+    print(f"kernel after: {_kernel()}")
+    if wakeup:
+        current = signal.set_wakeup_fd(-1)
+        signal.set_wakeup_fd(current)
+        print(f"wakeup fd after: {current}")
     child = subprocess.Popen(["/bin/sleep", "30"])
     time.sleep(0.2)
     ignored = next(
@@ -116,7 +144,7 @@ def main() -> None:
     if stop == "thread":
         _serve_on_a_worker_thread(entry)
     else:
-        _serve_until_signalled(entry, getattr(signal, f"SIG{stop}"))
+        _serve_until_signalled(entry, getattr(signal, f"SIG{stop}"), "wakeup" in sys.argv[4:])
 
 
 if __name__ == "__main__":

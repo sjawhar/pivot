@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import anyio  # type: ignore[reportMissingImports] - runtime dependency
 
-from pivot import unix_socket
+from pivot_tui import unix_socket
 
 if TYPE_CHECKING:
     from anyio.abc import SocketListener, SocketStream, TaskGroup

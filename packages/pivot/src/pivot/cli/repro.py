@@ -13,6 +13,7 @@ import json
 import logging
 import pathlib
 import signal
+import socket
 import threading
 import time
 import uuid
@@ -42,6 +43,8 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     import networkx as nx
 
     from pivot.cli import console as tui_console
@@ -572,49 +575,71 @@ def _run_serve_mode(
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)
 
-    if threading.current_thread() is not threading.main_thread():
+    previous_handlers: dict[signal.Signals, Callable[[int, FrameType | None], object] | int] = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            handler = signal.getsignal(signum)
+            # getsignal() is None for a handler installed outside Python (a C host's), which
+            # Python cannot put back, so serve leaves that signal alone. Ctrl-C inherited as
+            # ignored stays ignored.
+            if handler is not None and not (signum == signal.SIGINT and handler is signal.SIG_IGN):
+                previous_handlers[signum] = handler
+    if not previous_handlers:
         # Python delivers signals only to the main thread, and only it may install handlers.
-        # Serve on another thread gets no stop-signal handling; its caller stops it.
+        # Serve with no stop signal it may handle runs as it does on main; its caller stops it.
         with contextlib.suppress(KeyboardInterrupt):
             anyio.run(_serve)
         return
 
     # A service manager stops a server with SIGTERM, often more than once (GNU timeout signals
-    # the process and then its group). The event loop receives SIGTERM, and Ctrl-C unless it was
-    # inherited as ignored; the first cancels the serve task group, so the engine unwinds,
-    # removes the socket and shuts down the worker pool, and later ones are no-ops.
-    stop_signals = [signal.SIGTERM]
-    if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
-        stop_signals.append(signal.SIGINT)
-    previous_handlers = {signum: signal.getsignal(signum) for signum in stop_signals}
+    # the process and then its group). Serve installs its own handler for each stop signal and
+    # its own signal wakeup fd: whichever thread the kernel picks runs Python's C-level handler,
+    # which writes the signal's number to that fd, and the event loop reads it there. The first
+    # stop cancels the serve task group, so the engine unwinds, removes the socket and shuts
+    # down the worker pool; later ones are no-ops. No stop signal is reset to its default
+    # action while serve runs, which would let one kill the process mid-shutdown.
+    stop_numbers = {int(signum) for signum in previous_handlers}
+    wakeup_reader, wakeup_writer = socket.socketpair()
+    wakeup_reader.setblocking(False)
+    wakeup_writer.setblocking(False)
 
     async def serve_main() -> None:
-        try:
-            with anyio.open_signal_receiver(*stop_signals) as received:
-                async with anyio.create_task_group() as tg:
+        async with anyio.create_task_group() as tg:
 
-                    async def _cancel_on_stop() -> None:
-                        async for _ in received:
+            async def _cancel_on_stop() -> None:
+                while True:
+                    await anyio.wait_readable(wakeup_reader)
+                    with contextlib.suppress(BlockingIOError):
+                        if stop_numbers.intersection(wakeup_reader.recv(4096)):
                             tg.cancel_scope.cancel()
                             return
 
-                    tg.start_soon(_cancel_on_stop)
-                    await _serve()
-                    tg.cancel_scope.cancel()
-        finally:
-            # The stop is under way; a stop signal during the rest of the shutdown changes
-            # nothing. Restore the caller's dispositions after anyio.run has fully returned.
-            for signum in stop_signals:
-                signal.signal(signum, signal.SIG_IGN)
+            tg.start_soon(_cancel_on_stop)
+            await _serve()
+            tg.cancel_scope.cancel()
 
-    try:
-        # Ctrl-C before the loop receives it stops startup.
-        with contextlib.suppress(KeyboardInterrupt):
-            anyio.run(serve_main)
-    finally:
-        if not is_standalone_invocation():
-            for signum, handler in previous_handlers.items():
-                signal.signal(signum, handler)
+    with contextlib.ExitStack() as restore:
+        # Callbacks run last-registered first, each on its own, so one that fails leaves no
+        # other signal ignored. The caller's wakeup fd is set again before the pair closes.
+        restore.callback(wakeup_reader.close)
+        restore.callback(wakeup_writer.close)
+        # After the first stop nothing drains the pair, so a full buffer is expected.
+        caller_wakeup_fd = signal.set_wakeup_fd(wakeup_writer.fileno(), warn_on_full_buffer=False)
+        restore.callback(signal.set_wakeup_fd, caller_wakeup_fd)
+        for signum, handler in previous_handlers.items():
+            # The console script keeps stop signals ignored through process shutdown; an
+            # in-process caller gets its own handlers back once anyio.run has fully returned.
+            restore.callback(
+                signal.signal, signum, signal.SIG_IGN if is_standalone_invocation() else handler
+            )
+            signal.signal(signum, _leave_stop_to_the_loop)
+            # As asyncio's own signal handling does: interrupted system calls restart.
+            signal.siginterrupt(signum, False)
+        anyio.run(serve_main)
+
+
+def _leave_stop_to_the_loop(_signum: int, _frame: FrameType | None) -> None:
+    """Do nothing: serve's event loop reads the stop signal from its wakeup fd."""
 
 
 def _run_oneshot_mode(

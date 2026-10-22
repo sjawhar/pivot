@@ -8,6 +8,9 @@ On Linux that name is ``/proc/self/fd/<fd>``, a descriptor of the directory that
 closes with the process, so nothing is written outside the socket's directory. Elsewhere it is
 a symlink in a private temporary directory, removed when the call returns; a process killed
 during the call leaves that directory behind. The non-Linux branch has not been run on macOS.
+
+pivot and pivot-tui each carry this module, byte for byte, so that a pivot-tui release runs
+beside a pivot release that has none. ``test_unix_socket.py`` checks that the copies match.
 """
 
 from __future__ import annotations

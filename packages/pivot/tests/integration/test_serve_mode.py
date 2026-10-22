@@ -674,6 +674,123 @@ def test_public_main_restores_stop_signals_for_children(
     assert "SIGTERM stopped it" in result.stdout, result.stdout
 
 
+# A library that installs a SIGTERM handler before Python starts, as a C application that
+# embeds Python can, and then drops itself from the environment children inherit.
+_HOST_HANDLER_C = r"""
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void host_handler(int sig) { (void)sig; }
+
+__attribute__((constructor)) static void install_host_handler(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = host_handler;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGTERM, &action, NULL);
+    unsetenv("LD_PRELOAD");
+}
+"""
+
+
+def _helper_host_handler_library(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Build the host-handler library. Without a C compiler, skip locally and fail in CI."""
+    compiler = shutil.which("cc")
+    if compiler is None:
+        message = "the host-handler library needs a C compiler, which is not installed"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+    source = tmp_path / "host_handler.c"
+    source.write_text(_HOST_HANDLER_C)
+    library = tmp_path / "host_handler.so"
+    subprocess.run([compiler, "-shared", "-fPIC", "-o", str(library), str(source)], check=True)
+    return library
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses LD_PRELOAD and /proc")
+@pytest.mark.parametrize("entry", ["main", "click"])
+def test_inprocess_serve_leaves_a_stop_handler_installed_outside_python(
+    tmp_path: pathlib.Path, entry: str
+) -> None:
+    """A host application can install SIGTERM's handler in C before Python starts. Python's
+    getsignal() then reports None and cannot put that handler back, so serve leaves SIGTERM
+    alone: it stops on Ctrl-C and returns as on main, and the host's handler and SIGINT's are
+    in place afterwards."""
+    library = _helper_host_handler_library(tmp_path)
+    project = tmp_path / "project"
+    _helper_project(project)
+    result = subprocess.run(
+        [sys.executable, str(_INPROC_SERVE), str(project), entry, "INT"],
+        capture_output=True,
+        text=True,
+        timeout=40,
+        env={**os.environ, "LD_PRELOAD": str(library)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "kernel before: SIGINT=caught SIGTERM=caught" in result.stdout, (
+        f"the host's SIGTERM handler is not installed:\n{result.stdout}"
+    )
+    assert "before: SIGINT=default_int_handler SIGTERM=None" in result.stdout, result.stdout
+    outcome = "serve raised SystemExit(0)" if entry == "main" else "serve returned"
+    assert outcome in result.stdout, f"{result.stdout}\n{result.stderr[-2000:]}"
+    assert "after: SIGINT=default_int_handler SIGTERM=None" in result.stdout, result.stdout
+    assert "kernel after: SIGINT=caught SIGTERM=caught" in result.stdout, result.stdout
+    assert "SIGTERM stopped it" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize("signame", ["TERM", "INT"])
+def test_inprocess_serve_keeps_the_callers_signal_wakeup_fd(
+    tmp_path: pathlib.Path, signame: str
+) -> None:
+    """An application that feeds signals to its own event loop sets a signal wakeup fd. Serve
+    in-process uses its own while it runs, and the caller's is set again once serve returns."""
+    project = tmp_path / "project"
+    _helper_project(project)
+    result = subprocess.run(
+        [sys.executable, str(_INPROC_SERVE), str(project), "main", signame, "wakeup"],
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stderr
+    fds = dict(
+        line.split(": ", 1) for line in result.stdout.splitlines() if line.startswith("wakeup fd")
+    )
+    assert "wakeup fd before" in fds, result.stdout
+    assert fds.get("wakeup fd after") == fds["wakeup fd before"], result.stdout
+
+
+# Serves as the console script does and resends SIGTERM at each disposition change after a stop.
+_STOP_WINDOW = pathlib.Path(__file__).with_name("serve_stop_window.py")
+
+
+def test_a_sigterm_during_serves_shutdown_changes_nothing(tmp_path: pathlib.Path) -> None:
+    """After the first stop, a later SIGTERM is a no-op: SIGTERM's disposition goes from serve's
+    handler straight to SIG_IGN and never passes through SIG_DFL, which would let that SIGTERM
+    kill the process on whichever thread the kernel picks."""
+    project = tmp_path / "project"
+    _helper_project(project)
+    # Short, because multiprocessing binds its manager's socket under TMPDIR.
+    private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
+    env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_STOP_WINDOW), str(project)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        resends = [line for line in result.stderr.splitlines() if line.startswith("probe:")]
+        assert result.returncode == 0, f"serve exited {result.returncode} after {resends}"
+        assert resends, f"the probe never sent SIGTERM again:\n{result.stderr[-2000:]}"
+        assert not (project / ".pivot" / "agent.sock").exists(), "serve left its socket"
+    finally:
+        shutil.rmtree(private_tmp)
+
+
 @pytest.mark.parametrize("entry", ["main", "click"])
 def test_serve_from_a_worker_thread_answers_and_leaves_signal_handlers_alone(
     tmp_path: pathlib.Path, entry: str

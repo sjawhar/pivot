@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import anyio
 
-from pivot import unix_socket
 from pivot.types import ArtifactIdentity, ChangeType, DepChange, OutputChange, StageExplanation
+from pivot_tui import unix_socket
 from pivot_tui.client import (
     CommitResult,
     EngineStatus,

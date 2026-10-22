@@ -15,6 +15,7 @@ from anyio.abc import SocketAttribute
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+import pivot_tui.unix_socket
 from pivot import unix_socket
 
 # The child sets one socket method to finish its call and then hang, so the test can kill it
@@ -213,3 +214,16 @@ def test_a_process_killed_inside_a_long_path_call_leaves_nothing_in_tmpdir(
     assert path.is_socket(), "the socket was bound at its own path"
     left = _helper_entries(private_tmp)
     assert not left, f"a process killed inside {method} left {left} in TMPDIR"
+
+
+def test_pivot_tui_carries_the_same_socket_module() -> None:
+    """pivot-tui carries its own copy, so that a pivot-tui release runs beside a pivot release
+    without this module; the two copies stay byte for byte the same."""
+    copies = {
+        module.__name__: pathlib.Path(module.__file__ or "").read_bytes()
+        for module in (unix_socket, pivot_tui.unix_socket)
+    }
+    assert copies["pivot.unix_socket"] == copies["pivot_tui.unix_socket"], (
+        "packages/pivot-tui/src/pivot_tui/unix_socket.py differs from "
+        + "packages/pivot/src/pivot/unix_socket.py"
+    )
