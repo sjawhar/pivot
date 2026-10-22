@@ -575,18 +575,20 @@ def _run_serve_mode(
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)
 
-    previous_handlers: dict[signal.Signals, Callable[[int, FrameType | None], object] | int] = {}
-    if threading.current_thread() is threading.main_thread():
+    stop_signals = list[signal.Signals]()
+    if is_standalone_invocation() and threading.current_thread() is threading.main_thread():
         for signum in (signal.SIGTERM, signal.SIGINT):
             handler = signal.getsignal(signum)
-            # getsignal() is None for a handler installed outside Python (a C host's), which
-            # Python cannot put back, so serve leaves that signal alone. Ctrl-C inherited as
-            # ignored stays ignored.
+            # None: what launched pivot (a C host that embeds Python, an LD_PRELOAD library)
+            # installed this handler before Python started, so that launcher owns the signal.
+            # Ctrl-C inherited as ignored (a background job of a non-interactive shell) stays so.
             if handler is not None and not (signum == signal.SIGINT and handler is signal.SIG_IGN):
-                previous_handlers[signum] = handler
-    if not previous_handlers:
-        # Python delivers signals only to the main thread, and only it may install handlers.
-        # Serve with no stop signal it may handle runs as it does on main; its caller stops it.
+                stop_signals.append(signum)
+    if not stop_signals:
+        # Only the `pivot` command owns its process, and only on the main thread may Python
+        # install handlers. Called in-process (`pivot.cli.main()` or the Click group), off the
+        # main thread, or with both stop signals owned by its launcher, serve changes no signal
+        # disposition, wakeup fd or mask, and its caller owns shutdown.
         with contextlib.suppress(KeyboardInterrupt):
             anyio.run(_serve)
         return
@@ -597,8 +599,8 @@ def _run_serve_mode(
     # which writes the signal's number to that fd, and the event loop reads it there. The first
     # stop cancels the serve task group, so the engine unwinds, removes the socket and shuts
     # down the worker pool; later ones are no-ops. No stop signal is reset to its default
-    # action while serve runs, which would let one kill the process mid-shutdown.
-    stop_numbers = {int(signum) for signum in previous_handlers}
+    # action, which would let one kill the process mid-shutdown.
+    stop_numbers = {int(signum) for signum in stop_signals}
     wakeup_reader, wakeup_writer = socket.socketpair()
     wakeup_reader.setblocking(False)
     wakeup_writer.setblocking(False)
@@ -618,24 +620,21 @@ def _run_serve_mode(
             await _serve()
             tg.cancel_scope.cancel()
 
-    with contextlib.ExitStack() as restore:
-        # Callbacks run last-registered first, each on its own, so one that fails leaves no
-        # other signal ignored. The caller's wakeup fd is set again before the pair closes.
-        restore.callback(wakeup_reader.close)
-        restore.callback(wakeup_writer.close)
+    with wakeup_reader, wakeup_writer:
         # After the first stop nothing drains the pair, so a full buffer is expected.
-        caller_wakeup_fd = signal.set_wakeup_fd(wakeup_writer.fileno(), warn_on_full_buffer=False)
-        restore.callback(signal.set_wakeup_fd, caller_wakeup_fd)
-        for signum, handler in previous_handlers.items():
-            # The console script keeps stop signals ignored through process shutdown; an
-            # in-process caller gets its own handlers back once anyio.run has fully returned.
-            restore.callback(
-                signal.signal, signum, signal.SIG_IGN if is_standalone_invocation() else handler
-            )
+        signal.set_wakeup_fd(wakeup_writer.fileno(), warn_on_full_buffer=False)
+        for signum in stop_signals:
             signal.signal(signum, _leave_stop_to_the_loop)
             # As asyncio's own signal handling does: interrupted system calls restart.
             signal.siginterrupt(signum, False)
-        anyio.run(serve_main)
+        try:
+            anyio.run(serve_main)
+        finally:
+            # Stop signals stay ignored through the rest of the process's shutdown.
+            for signum in stop_signals:
+                signal.signal(signum, signal.SIG_IGN)
+            # No signal may write to the pair's descriptor once it is closed and reused.
+            signal.set_wakeup_fd(-1)
 
 
 def _leave_stop_to_the_loop(_signum: int, _frame: FrameType | None) -> None:

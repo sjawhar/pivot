@@ -194,12 +194,14 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
 
 
 def main() -> None:
-    """Public CLI entry point for embedders."""
+    """Public CLI entry point for embedders. Serve mode changes no signal state here: the
+    caller's handlers decide what SIGTERM and Ctrl-C do, and the caller owns shutdown."""
     cli()
 
 
-def _console_main() -> None:  # pyright: ignore[reportUnusedFunction] - console-script entry point in pyproject.toml
-    """Run the console script, keeping stop signals ignored through process shutdown."""
+def _console_main() -> None:
+    """Run the `pivot` command, which owns its process: serve mode takes over SIGTERM and Ctrl-C
+    and keeps them ignored through process shutdown."""
     token = _standalone_invocation.set(True)
     try:
         cli()
@@ -208,4 +210,8 @@ def _console_main() -> None:  # pyright: ignore[reportUnusedFunction] - console-
 
 
 if __name__ == "__main__":
-    main()
+    # Run as a script, this file is a second copy of the module. Serve reads the flag of the
+    # package, pivot.cli, so the script runs that copy's console entry point.
+    import pivot.cli
+
+    pivot.cli._console_main()  # pyright: ignore[reportPrivateUsage] - the same module, imported as the package

@@ -14,14 +14,15 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import anyio
 import pytest
 
-from pivot import config
+from pivot import cli, config
 from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 from pivot.engine.engine import Engine
 from pivot.engine.sources import OneShotSource
@@ -635,73 +636,90 @@ def test_serve_mode_stopped_by_signals_exits_cleanly_and_leaves_nothing_behind(
         shutil.rmtree(private_tmp)
 
 
-@pytest.mark.parametrize("signame", ["TERM", "INT"])
-def test_inprocess_serve_restores_stop_signals_for_children(
-    tmp_path: pathlib.Path, signame: str
-) -> None:
-    """An application that invokes pivot's CLI in-process can still stop a child it starts
-    afterward. The standalone pivot command exits immediately, but CLI embedders do not."""
-    project = tmp_path / "project"
-    _helper_project(project)
-    result = subprocess.run(
-        [sys.executable, str(_INPROC_SERVE), str(project), "click", signame],
-        capture_output=True,
-        text=True,
-        timeout=40,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "serve returned" in result.stdout, result.stdout
-    assert "after: SIGINT=default_int_handler SIGTERM=0" in result.stdout, result.stdout
-    assert "SIGTERM stopped it" in result.stdout, result.stdout
-
-
-@pytest.mark.parametrize("signame", ["TERM", "INT"])
-def test_public_main_restores_stop_signals_for_children(
-    tmp_path: pathlib.Path, signame: str
-) -> None:
-    """The public `pivot.cli.main()` function is also an embedding API, not only the console
-    script's entry point. It restores its caller's stop handlers after serve returns."""
-    project = tmp_path / "project"
-    _helper_project(project)
-    result = subprocess.run(
-        [sys.executable, str(_INPROC_SERVE), str(project), "main", signame],
-        capture_output=True,
-        text=True,
-        timeout=40,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "after: SIGINT=default_int_handler SIGTERM=0" in result.stdout, result.stdout
-    assert "SIGTERM stopped it" in result.stdout, result.stdout
-
-
-# A library that installs a SIGTERM handler before Python starts, as a C application that
-# embeds Python can, and then drops itself from the environment children inherit.
+# Libraries that install a C SIGTERM handler: from an LD_PRELOAD constructor before Python
+# starts (as a C application that embeds Python can), or when Python calls them after start (as
+# a C extension can, unseen by signal.getsignal()). The handler reports each SIGTERM on stderr.
 _HOST_HANDLER_C = r"""
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-static void host_handler(int sig) { (void)sig; }
+static void host_handler(int sig) {
+    static const char message[] = "host-handler: SIGTERM\n";
+    (void)sig;
+    (void)!write(2, message, sizeof message - 1);
+}
 
-__attribute__((constructor)) static void install_host_handler(void) {
+int install_sigterm_handler(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = host_handler;
+    sigemptyset(&action.sa_mask);
+    return sigaction(SIGTERM, &action, NULL);
+}
+
+__attribute__((constructor)) static void install_when_preloaded(void) {
+    if (getenv("LD_PRELOAD") != NULL) {
+        install_sigterm_handler();
+        unsetenv("LD_PRELOAD");
+    }
+}
+"""
+
+# A C program that installs its own SIGTERM handler, then embeds Python and runs a script:
+# `host <python> <script> <args...>`.
+_EMBEDDING_HOST_C = r"""
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+
+static void host_handler(int sig) {
+    static const char message[] = "host-handler: SIGTERM\n";
+    (void)sig;
+    (void)!write(2, message, sizeof message - 1);
+}
+
+int main(int argc, char **argv) {
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = host_handler;
     sigemptyset(&action.sa_mask);
     sigaction(SIGTERM, &action, NULL);
-    unsetenv("LD_PRELOAD");
+
+    PyConfig config;
+    PyConfig_InitPythonConfig(&config);
+    PyConfig_SetBytesString(&config, &config.program_name, argv[1]);
+    PyConfig_SetBytesArgv(&config, argc - 1, argv + 1);
+    PyStatus status = Py_InitializeFromConfig(&config);
+    PyConfig_Clear(&config);
+    if (PyStatus_Exception(status)) {
+        Py_ExitStatusException(status);
+    }
+    return Py_RunMain();
 }
 """
 
 
-def _helper_host_handler_library(tmp_path: pathlib.Path) -> pathlib.Path:
-    """Build the host-handler library. Without a C compiler, skip locally and fail in CI."""
+def _helper_build_prerequisite_missing(message: str) -> NoReturn:
+    """Skip locally and fail in CI, where every C build these tests need must work."""
+    if os.environ.get("CI"):
+        pytest.fail(message)
+    pytest.skip(message)
+
+
+def _helper_c_compiler() -> str:
     compiler = shutil.which("cc")
     if compiler is None:
-        message = "the host-handler library needs a C compiler, which is not installed"
-        if os.environ.get("CI"):
-            pytest.fail(message)
-        pytest.skip(message)
+        _helper_build_prerequisite_missing("these tests need a C compiler, which is not installed")
+    return compiler
+
+
+def _helper_host_handler_library(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Build the host-handler library."""
+    compiler = _helper_c_compiler()
     source = tmp_path / "host_handler.c"
     source.write_text(_HOST_HANDLER_C)
     library = tmp_path / "host_handler.so"
@@ -709,57 +727,170 @@ def _helper_host_handler_library(tmp_path: pathlib.Path) -> pathlib.Path:
     return library
 
 
+def _helper_embedding_host(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Build the embedding host against the Python running the tests."""
+    compiler = _helper_c_compiler()
+    variables = sysconfig.get_config_vars()
+    include = pathlib.Path(variables["INCLUDEPY"])
+    libdir = pathlib.Path(variables["LIBDIR"])
+    if not variables["Py_ENABLE_SHARED"] or not (include / "Python.h").is_file():
+        _helper_build_prerequisite_missing(
+            f"the embedding host needs Python's headers and shared library (in {include} and {libdir})"
+        )
+    source = tmp_path / "host.c"
+    source.write_text(_EMBEDDING_HOST_C)
+    host = tmp_path / "host"
+    command = [compiler, str(source), "-o", str(host), f"-I{include}", f"-L{libdir}"]
+    command += [f"-Wl,-rpath,{libdir}", f"-lpython{variables['LDVERSION']}"]
+    subprocess.run([*command, *str(variables["LIBS"]).split(), "-lm"], check=True)
+    return host
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses LD_PRELOAD and /proc")
+@pytest.mark.parametrize("handler", ["default", "python", "c-before", "c-after"])
 @pytest.mark.parametrize("entry", ["main", "click"])
-def test_inprocess_serve_leaves_a_stop_handler_installed_outside_python(
-    tmp_path: pathlib.Path, entry: str
+def test_inprocess_serve_leaves_the_callers_signal_state_untouched(
+    tmp_path: pathlib.Path, entry: str, handler: str
 ) -> None:
-    """A host application can install SIGTERM's handler in C before Python starts. Python's
-    getsignal() then reports None and cannot put that handler back, so serve leaves SIGTERM
-    alone: it stops on Ctrl-C and returns as on main, and the host's handler and SIGINT's are
-    in place afterwards."""
+    """Only the `pivot` command owns its process. An application that runs serve in-process
+    keeps its own signal state, as on main: its SIGTERM and Ctrl-C handlers, as Python and the
+    kernel report them, its signal mask and its wakeup fd are the same before, during and after
+    serve. Its own SIGTERM handler decides what a SIGTERM during serve does."""
     library = _helper_host_handler_library(tmp_path)
     project = tmp_path / "project"
     _helper_project(project)
+    env = {**os.environ, "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    if handler == "c-before":
+        env["LD_PRELOAD"] = str(library)
     result = subprocess.run(
-        [sys.executable, str(_INPROC_SERVE), str(project), entry, "INT"],
+        [sys.executable, str(_INPROC_SERVE), str(project), entry, handler, str(library)],
         capture_output=True,
         text=True,
-        timeout=40,
-        env={**os.environ, "LD_PRELOAD": str(library)},
+        timeout=60,
+        env=env,
     )
-    assert result.returncode == 0, result.stderr
-    assert "kernel before: SIGINT=caught SIGTERM=caught" in result.stdout, (
-        f"the host's SIGTERM handler is not installed:\n{result.stdout}"
+    assert result.returncode == 0, result.stderr[-2000:]
+    report = json.loads(result.stdout.splitlines()[-1])
+    before, serving, after = report["before"], report["serving"], report["after"]
+    expect_caught = "no" if handler == "default" else "yes"
+    assert before["kernel"]["SIGTERM:SigCgt"] == expect_caught, report
+    assert before["wakeup_fd"] != -1, report
+    # While serve runs, asyncio's Runner holds Ctrl-C as on main; SIGTERM stays the caller's.
+    assert serving["kernel"] == before["kernel"], f"serve changed the kernel's state: {report}"
+    assert serving["handlers"]["SIGTERM"] == before["handlers"]["SIGTERM"], (
+        f"serve took SIGTERM: {report}"
     )
-    assert "before: SIGINT=default_int_handler SIGTERM=None" in result.stdout, result.stdout
-    outcome = "serve raised SystemExit(0)" if entry == "main" else "serve returned"
-    assert outcome in result.stdout, f"{result.stdout}\n{result.stderr[-2000:]}"
-    assert "after: SIGINT=default_int_handler SIGTERM=None" in result.stdout, result.stdout
-    assert "kernel after: SIGINT=caught SIGTERM=caught" in result.stdout, result.stdout
-    assert "SIGTERM stopped it" in result.stdout, result.stdout
+    assert after == before, f"serve left the caller's signal state changed: {report}"
+    outcome = "raised SystemExit(0)" if entry == "main" else "returned"
+    assert report["outcome"] == outcome, f"{report}\n{result.stderr[-2000:]}"
+    assert not report["socket_left"], report
+    # The caller's wakeup fd received Ctrl-C, and a SIGTERM its Python handler caught.
+    assert signal.SIGINT in report["wakeup_bytes"], report
+    assert (signal.SIGTERM in report["wakeup_bytes"]) == (handler == "python"), report
+    if handler != "default":
+        assert report["answers_after_sigterm"], f"a SIGTERM to the caller stopped serve: {report}"
+    assert report["python_handler_ran"] == ([signal.SIGTERM] if handler == "python" else [])
+    assert report["child_after_sigterm"] == -signal.SIGTERM, report
 
 
-@pytest.mark.parametrize("signame", ["TERM", "INT"])
-def test_inprocess_serve_keeps_the_callers_signal_wakeup_fd(
-    tmp_path: pathlib.Path, signame: str
+def test_cli_module_run_as_a_script_owns_stop_signals(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An application that feeds signals to its own event loop sets a signal wakeup fd. Serve
-    in-process uses its own while it runs, and the caller's is set again once serve returns."""
+    """Run as a script, pivot's CLI module owns its process as the `pivot` command does: a
+    SIGTERM stops serve, which removes its socket and exits 0."""
     project = tmp_path / "project"
     _helper_project(project)
-    result = subprocess.run(
-        [sys.executable, str(_INPROC_SERVE), str(project), "main", signame, "wakeup"],
-        capture_output=True,
-        text=True,
-        timeout=40,
-    )
-    assert result.returncode == 0, result.stderr
-    fds = dict(
-        line.split(": ", 1) for line in result.stdout.splitlines() if line.startswith("wakeup fd")
-    )
-    assert "wakeup fd before" in fds, result.stdout
-    assert fds.get("wakeup fd after") == fds["wakeup fd before"], result.stdout
+    script = pathlib.Path(cli.__file__ or "")
+    assert script.name == "__init__.py", script
+    # Short, because multiprocessing binds its manager's socket under TMPDIR.
+    private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
+    env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(script), "repro", "--watch", "--serve"],
+            cwd=project,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        monkeypatch.chdir(project)
+        try:
+            response = _helper_wait_for_status(
+                proc, pathlib.Path(".pivot", "agent.sock"), time.monotonic() + 30
+            )
+            assert response is not None, f"serve did not answer (exit {proc.poll()})"
+            proc.send_signal(signal.SIGTERM)
+            _, stderr = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        assert proc.returncode == 0, f"exit {proc.returncode}: {stderr.decode()[-2000:]}"
+        assert not (project / ".pivot" / "agent.sock").exists(), "serve left its socket"
+    finally:
+        shutil.rmtree(private_tmp)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses LD_PRELOAD and /proc")
+@pytest.mark.parametrize("launcher", ["embedding-host", "ld-preload"])
+def test_pivot_command_leaves_a_sigterm_handler_its_launcher_installed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, launcher: str
+) -> None:
+    """What launched the `pivot` command can install SIGTERM's handler in C before Python
+    starts: a C program that embeds Python and runs the script, or an LD_PRELOAD library. That
+    launcher owns SIGTERM, so serve leaves it alone, as on main: the launcher's handler runs on
+    SIGTERM, serve keeps answering, and Ctrl-C stops serve, which exits 0 and removes its
+    socket."""
+    project = tmp_path / "project"
+    _helper_project(project)
+    pivot_script = pathlib.Path(_PIVOT_BIN)
+    env = {**os.environ, "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    if launcher == "embedding-host":
+        argv = [str(_helper_embedding_host(tmp_path)), sys.executable, str(pivot_script)]
+    else:
+        env["LD_PRELOAD"] = str(_helper_host_handler_library(tmp_path))
+        argv = [str(pivot_script)]
+    # Short, because multiprocessing binds its manager's socket under TMPDIR.
+    private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
+    env["TMPDIR"] = str(private_tmp)
+    stderr_path = tmp_path / "serve.stderr"
+    socket_path = pathlib.Path(".pivot", "agent.sock")
+    try:
+        with stderr_path.open("wb") as stderr_file:
+            proc = subprocess.Popen(
+                [*argv, "repro", "--watch", "--serve"],
+                cwd=project,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+        monkeypatch.chdir(project)
+        try:
+            response = _helper_wait_for_status(proc, socket_path, time.monotonic() + 30)
+            assert response is not None, (
+                f"serve did not answer (exit {proc.poll()}):\n{stderr_path.read_text()[-2000:]}"
+            )
+            proc.send_signal(signal.SIGTERM)
+            time.sleep(2)
+            assert proc.poll() is None, (
+                f"SIGTERM stopped serve (exit {proc.returncode}):\n{stderr_path.read_text()[-2000:]}"
+            )
+            assert send_rpc(socket_path, "status") is not None, "serve stopped answering"
+            assert "host-handler: SIGTERM" in stderr_path.read_text(), (
+                f"the launcher's SIGTERM handler did not run:\n{stderr_path.read_text()[-2000:]}"
+            )
+            proc.send_signal(signal.SIGINT)
+            exit_code = proc.wait(timeout=20)
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        assert exit_code == 0, f"exit {exit_code} after Ctrl-C:\n{stderr_path.read_text()[-2000:]}"
+        assert not (project / socket_path).exists(), "serve left its socket"
+    finally:
+        shutil.rmtree(private_tmp)
 
 
 # Serves as the console script does and resends SIGTERM at each disposition change after a stop.
