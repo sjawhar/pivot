@@ -1370,3 +1370,61 @@ async def test_stage_completed_output_identity_reaches_tui_as_artifact_identity(
     summary = msg["output_summary"]
     assert summary is not None
     assert summary[0]["identity"] == identity
+
+
+@pytest.mark.anyio
+async def test_missing_input_that_arrives_with_its_directory_makes_the_pipeline_valid(
+    watch_project: pathlib.Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A missing input whose directory does not exist yet, then arrives with the file inside it.
+
+    Moving in a directory tree (mv, an unpacked archive, a download) shows the watcher the new
+    directory only; the file inside it never gets an event of its own. The arrival must still
+    count as the input's creation: the pipeline becomes valid and the stopped re-run runs.
+    """
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+
+            # Adds `late`, which reads newdir/sub/deep.txt; newdir does not exist yet
+            pipeline_py.write_text(
+                _helper_pipeline_source("-v1", third="late").replace(
+                    "    late(raw)\n",
+                    '    late(pipeline.input("deep.txt", path="newdir/sub/deep.txt"))\n',
+                )
+            )
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            invalid = recorder.events[invalid_index]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert "(path newdir/sub/deep.txt), which does not exist" in invalid["error"]
+            idle_index = await recorder.wait_for(_helper_is_idle, start=invalid_index)
+
+            # The input arrives with its directory, as `mv`, `cp -r` or `tar -x` deliver it
+            staging = tmp_path_factory.mktemp("staging")
+            (staging / "newdir" / "sub").mkdir(parents=True)
+            (staging / "newdir" / "sub" / "deep.txt").write_text("d")
+            os.rename(staging / "newdir", watch_project / "newdir")
+
+            valid_index = await recorder.wait_for(
+                lambda event: event["type"] == "pipeline_reloaded" and event["error"] is None,
+                start=idle_index,
+                timeout=30.0,
+            )
+            await recorder.wait_for(
+                _helper_completes("reload/late"), start=valid_index, timeout=30.0
+            )
+            assert recorder.completed("reload/late", start=valid_index) == StageStatus.RAN
+            assert eng.pipeline_error is None, "the input's arrival makes the pipeline valid"
+            tg.cancel_scope.cancel()

@@ -2512,6 +2512,12 @@ class Engine:
 
         affected = self._get_affected_stages_for_paths(filtered_paths)
         if not affected:
+            if self._missing_dependency_run is None:
+                return
+            # A missing input can arrive inside a new directory, which maps to no stage. The
+            # re-check only asks whether the missing inputs exist now, so any change triggers it.
+            _logger.info("Data changed while an input is missing - checking again")
+            await self._handle_run_requested(self._missing_dependency_run)
             return
 
         _logger.info(
