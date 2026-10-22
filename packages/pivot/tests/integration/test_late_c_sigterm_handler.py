@@ -1,20 +1,14 @@
-"""Red test: an in-process caller whose SIGTERM handler was installed in C after Python started
-gets that handler back from `repro --watch --serve`.
+"""An in-process caller retains a SIGTERM handler installed in C after Python starts.
 
 It belongs in `packages/pivot/tests/integration/` and runs the interpreter running pytest, so it
 also runs standalone against any tree: `<tree>/.venv/bin/python -m pytest <this file>`.
 
-A C extension or embedding runtime (a JVM bridge, an MPI runtime) can install a SIGTERM handler
-with sigaction after the interpreter has started; here a small library does it through ctypes.
-Python reads each signal's disposition only once, when its signal module initializes, so
-`signal.getsignal(SIGTERM)` still reports SIG_DFL afterwards. PR 493's B2 rule leaves a stop
-signal alone only when `getsignal()` is None, so serve keeps SIGTERM, installs its own handler
-over the C one, and on return "restores" SIG_DFL. The C handler is gone: the kernel reports
-SIGTERM at its default action, and the next SIGTERM kills the caller. At main (38238f8f) serve
-never touches SIGTERM, the kernel still reports it caught, and the C handler runs.
+A C extension or embedding runtime (a JVM bridge or an MPI runtime) can install a SIGTERM handler
+with sigaction after the interpreter starts; this test's small library does so through ctypes.
+Python's ``signal.getsignal(SIGTERM)`` can still report SIG_DFL after that direct C installation.
 
-The test stops serve with Ctrl-C (SIGINT), which every tree handles, then sends the process
-SIGTERM and requires the C handler to run and the process to survive.
+The test stops in-process serve with Ctrl-C, then verifies that the kernel still reports SIGTERM
+as caught, its handler runs, and the caller survives a SIGTERM after serve returns.
 """
 
 from __future__ import annotations
@@ -29,25 +23,10 @@ import textwrap
 
 import pytest
 
+from tests.integration import serve_test_support
+
 _PYTHON = pathlib.Path(sys.executable)
 
-_PIPELINE = """\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop() -> None:
-    pass
-
-
-with pipeline:
-    noop()
-"""
 
 _LIBRARY = r"""
 #include <signal.h>
@@ -135,7 +114,7 @@ _EMBEDDER = textwrap.dedent("""\
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc/self/status")
-def test_inprocess_serve_gives_back_a_sigterm_handler_installed_in_c_after_python_started() -> None:
+def test_inprocess_serve_leaves_a_sigterm_handler_installed_in_c_after_python_started() -> None:
     compiler = shutil.which("cc")
     if compiler is None:
         pytest.skip("needs a C compiler")
@@ -147,9 +126,7 @@ def test_inprocess_serve_gives_back_a_sigterm_handler_installed_in_c_after_pytho
             [compiler, "-shared", "-fPIC", "-o", str(library), str(root / "late.c")], check=True
         )
         project = root / "p"
-        (project / ".pivot").mkdir(parents=True)
-        (project / ".git").mkdir()
-        (project / "pipeline.py").write_text(_PIPELINE)
+        serve_test_support.create_noop_project(project)
         (root / "embedder.py").write_text(_EMBEDDER)
         private = root / "t"
         private.mkdir()

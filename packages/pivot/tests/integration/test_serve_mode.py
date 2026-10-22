@@ -29,6 +29,7 @@ from pivot.engine.sources import OneShotSource
 from pivot.engine.types import StageStarted
 from tests import helpers
 from tests.conftest import send_rpc
+from tests.integration import serve_test_support
 
 if TYPE_CHECKING:
     import types
@@ -337,34 +338,8 @@ async def test_sink_error_does_not_crash_engine(test_pipeline: Pipeline) -> None
 # =============================================================================
 # CLI Serve Mode E2E Tests
 # =============================================================================
-
-_NOOP_PIPELINE = """\
-import pathlib
-
-from pivot.compose import Pipeline, stage
-
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-
-@stage
-def noop() -> None:
-    pass
-
-
-with pipeline:
-    noop()
-"""
-
 # Runs serve in-process through pivot's embedding entry points; its docstring gives the modes.
 _INPROC_SERVE = pathlib.Path(__file__).with_name("inproc_serve.py")
-
-
-def _helper_project(project: pathlib.Path) -> None:
-    """Create a project at ``project`` whose pipeline has one stage that does nothing."""
-    (project / ".pivot").mkdir(parents=True)
-    (project / ".git").mkdir()
-    (project / "pipeline.py").write_text(_NOOP_PIPELINE)
 
 
 def _helper_wait_for_status(
@@ -479,7 +454,7 @@ def test_serve_mode_serves_a_project_whose_socket_path_exceeds_the_unix_socket_l
     An agent in the project connects to ``.pivot/agent.sock`` by its relative path.
     """
     project = tmp_path / ("deep-project-" * 10)
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     socket_path = project / ".pivot" / "agent.sock"
     assert len(os.fsencode(socket_path)) > 108, "the socket path must exceed every platform limit"
     stdout_path = tmp_path / "serve.stdout"
@@ -577,7 +552,7 @@ def test_serve_mode_stopped_by_signals_exits_cleanly_and_leaves_nothing_behind(
     shuts down as Ctrl-C does whatever arrives: exit 0, no task failing during shutdown, and
     neither its socket nor multiprocessing's manager directory left behind."""
     project = tmp_path / "project"
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     socket_path = project / ".pivot" / "agent.sock"
     # Short, because multiprocessing binds its manager's socket under TMPDIR.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
@@ -717,12 +692,13 @@ def _helper_c_compiler() -> str:
     return compiler
 
 
-def _helper_host_handler_library(tmp_path: pathlib.Path) -> pathlib.Path:
-    """Build the host-handler library."""
+@pytest.fixture(scope="module")
+def host_handler_library(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
+    """Build the host-handler library once for the signal-ownership tests."""
     compiler = _helper_c_compiler()
-    source = tmp_path / "host_handler.c"
+    source = tmp_path_factory.mktemp("host-handler") / "host_handler.c"
     source.write_text(_HOST_HANDLER_C)
-    library = tmp_path / "host_handler.so"
+    library = source.with_suffix(".so")
     subprocess.run([compiler, "-shared", "-fPIC", "-o", str(library), str(source)], check=True)
     return library
 
@@ -750,15 +726,15 @@ def _helper_embedding_host(tmp_path: pathlib.Path) -> pathlib.Path:
 @pytest.mark.parametrize("handler", ["default", "python", "c-before", "c-after"])
 @pytest.mark.parametrize("entry", ["main", "click"])
 def test_inprocess_serve_leaves_the_callers_signal_state_untouched(
-    tmp_path: pathlib.Path, entry: str, handler: str
+    tmp_path: pathlib.Path, entry: str, handler: str, host_handler_library: pathlib.Path
 ) -> None:
     """Only the `pivot` command owns its process. An application that runs serve in-process
     keeps its own signal state, as on main: its SIGTERM and Ctrl-C handlers, as Python and the
     kernel report them, its signal mask and its wakeup fd are the same before, during and after
     serve. Its own SIGTERM handler decides what a SIGTERM during serve does."""
-    library = _helper_host_handler_library(tmp_path)
+    library = host_handler_library
     project = tmp_path / "project"
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     env = {**os.environ, "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
     if handler == "c-before":
         env["LD_PRELOAD"] = str(library)
@@ -799,7 +775,7 @@ def test_cli_module_run_as_a_script_owns_stop_signals(
     """Run as a script, pivot's CLI module owns its process as the `pivot` command does: a
     SIGTERM stops serve, which removes its socket and exits 0."""
     project = tmp_path / "project"
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     script = pathlib.Path(cli.__file__ or "")
     assert script.name == "__init__.py", script
     # Short, because multiprocessing binds its manager's socket under TMPDIR.
@@ -851,7 +827,10 @@ if os.environ.pop("PIVOT_TEST_LAUNCHER_HANDLER", None):
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses LD_PRELOAD and /proc")
 @pytest.mark.parametrize("launcher", ["embedding-host", "ld-preload", "sitecustomize"])
 def test_pivot_command_leaves_a_sigterm_handler_its_launcher_installed(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, launcher: str
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launcher: str,
+    host_handler_library: pathlib.Path,
 ) -> None:
     """What launched the `pivot` command can give SIGTERM a handler before the script runs: in C
     before Python starts (a C program that embeds Python, an LD_PRELOAD library), or in Python
@@ -859,14 +838,14 @@ def test_pivot_command_leaves_a_sigterm_handler_its_launcher_installed(
     the launcher's handler runs on SIGTERM, serve keeps answering, and Ctrl-C stops serve, which
     exits 0 and removes its socket."""
     project = tmp_path / "project"
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     pivot_script = pathlib.Path(_PIVOT_BIN)
     env = {**os.environ, "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
     argv = [str(pivot_script)]
     if launcher == "embedding-host":
         argv = [str(_helper_embedding_host(tmp_path)), sys.executable, str(pivot_script)]
     elif launcher == "ld-preload":
-        env["LD_PRELOAD"] = str(_helper_host_handler_library(tmp_path))
+        env["LD_PRELOAD"] = str(host_handler_library)
     else:
         site_dir = tmp_path / "site"
         site_dir.mkdir()
@@ -916,21 +895,6 @@ def test_pivot_command_leaves_a_sigterm_handler_its_launcher_installed(
         shutil.rmtree(private_tmp)
 
 
-def _helper_disposition(pid: int, signum: int) -> str:
-    """Return whether the kernel reports ``signum`` ignored, caught or at its default action for
-    process ``pid`` (SigIgn and SigCgt in /proc/<pid>/status)."""
-    masks = {
-        key: int(value, 16)
-        for key, _, value in (
-            line.partition(":")
-            for line in pathlib.Path(f"/proc/{pid}/status").read_text().splitlines()
-        )
-        if key in ("SigIgn", "SigCgt")
-    }
-    bit = 1 << (signum - 1)
-    return "ignored" if masks["SigIgn"] & bit else "caught" if masks["SigCgt"] & bit else "default"
-
-
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc/<pid>/status")
 def test_pivot_command_leaves_sigint_ignored_when_its_launcher_ignores_it(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -940,7 +904,7 @@ def test_pivot_command_leaves_sigint_ignored_when_its_launcher_ignores_it(
     a SIGINT changes nothing and serve keeps answering. SIGTERM, still at its default, stops
     serve, which exits 0 and removes its socket."""
     project = tmp_path / "project"
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     # Short, because multiprocessing binds its manager's socket under TMPDIR.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
     env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
@@ -968,7 +932,7 @@ def test_pivot_command_leaves_sigint_ignored_when_its_launcher_ignores_it(
             assert response is not None, (
                 f"serve did not answer (exit {proc.poll()}):\n{stderr_path.read_text()[-2000:]}"
             )
-            serving = _helper_disposition(proc.pid, signal.SIGINT)
+            serving = serve_test_support.process_signal_disposition(proc.pid, signal.SIGINT)
             proc.send_signal(signal.SIGINT)
             time.sleep(2)
             assert proc.poll() is None, (
@@ -999,7 +963,7 @@ def test_a_sigterm_during_serves_shutdown_changes_nothing(tmp_path: pathlib.Path
     handler straight to SIG_IGN and never passes through SIG_DFL, which would let that SIGTERM
     kill the process on whichever thread the kernel picks."""
     project = tmp_path / "project"
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     # Short, because multiprocessing binds its manager's socket under TMPDIR.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
     env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
@@ -1027,7 +991,7 @@ def test_serve_from_a_worker_thread_answers_and_leaves_signal_handlers_alone(
     another thread gets it without stop-signal handling: it answers, and the process's SIGINT
     and SIGTERM handlers stay the embedder's. Stopping it is the embedder's job."""
     project = tmp_path / "project"
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     # Short, because multiprocessing binds its manager's socket under TMPDIR. The probe exits
     # while serve still runs, so the manager's directory stays there until this removes it.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
@@ -1118,7 +1082,7 @@ def test_stopping_first_live_serve_keeps_replacement_socket(
     """A newer serve takes the project's socket path as current startup behavior permits. When
     the older serve stops, it must leave the newer socket in place."""
     project = tmp_path / (("deep-project-" * 10) if long_path else "project")
-    _helper_project(project)
+    serve_test_support.create_noop_project(project)
     socket_path = project / ".pivot" / "agent.sock"
     if long_path:
         assert len(os.fsencode(socket_path)) > 108
