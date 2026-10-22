@@ -648,6 +648,14 @@ def _helper_calibration(wall_pct: str) -> str:
                 "base.jsonl": _helper_jsonl(_helper_rows([1e-310] * 6, [2.0] * 6)),
                 "head.jsonl": _helper_jsonl(_helper_rows([1e10] * 6, [2.0] * 6)),
             },
+            _COMPARE_ARGV,
+            id="change-between-medians-not-finite-compare",
+        ),
+        pytest.param(
+            {
+                "base.jsonl": _helper_jsonl(_helper_rows([1e-310] * 6, [2.0] * 6)),
+                "head.jsonl": _helper_jsonl(_helper_rows([1e10] * 6, [2.0] * 6)),
+            },
             ("--write-calibration", "calibration.json")
             + ("--sample", "1", "1", "1", "1", "base.jsonl", "head.jsonl"),
             id="change-between-medians-not-finite-write-calibration",

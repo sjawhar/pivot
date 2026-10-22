@@ -17,9 +17,9 @@ number, lies entirely above 1 (the change is not the job's own noise). It exits 
 regressed, 1 when something did, and 2 when the files cannot be compared: a file is missing or
 cannot be read, is not UTF-8, or cannot be parsed (JSON nested too deeply, or an integer too long
 to read, included), a field has the wrong JSON type, a timing is not a positive finite number or
-is too large for a float, a limit, an A/A change or the threshold derived from it is not a finite
-number, a command failed, a scenario is on one side only or lacks a limit, a side's reps are not
-0 to n-1 once each, or the two ran on machines with different core counts.
+is too large for a float, a limit, the change between medians or a threshold derived from it is
+not a finite number, a command failed, a scenario is on one side only or lacks a limit, a side's
+reps are not 0 to n-1 once each, or the two ran on machines with different core counts.
 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
 file: for each scenario and metric, three times the largest absolute change between the two
@@ -211,8 +211,13 @@ def _change_pct(base: float, head: float) -> float:
 
 
 def _changes(base_path: pathlib.Path, head_path: pathlib.Path) -> _Changes:
+    return _finite_changes(_paired(base_path, head_path))
+
+
+def _finite_changes(paired: dict[str, dict[_Metric, tuple[list[float], list[float]]]]) -> _Changes:
+    """Each scenario's change between medians; a change that is not finite cannot be compared."""
     changes = dict[str, dict[str, float]]()
-    for scenario, by_metric in _paired(base_path, head_path).items():
+    for scenario, by_metric in paired.items():
         changes[scenario] = {}
         for metric, key in _METRICS:
             base_values, head_values = by_metric[metric]
@@ -368,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(_derive_threshold(samples), indent=2, sort_keys=True))
             return 0
         paired = _paired(result_files[0], result_files[1])
+        _finite_changes(paired)
         limits = _read_limits(args.threshold_file, list(paired))
     except _CannotCompareError as error:
         # One line, whatever a path or a scenario name holds.

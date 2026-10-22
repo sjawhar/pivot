@@ -13,7 +13,12 @@ when it exits are counted in `leftover_procs` and killed; their CPU is not count
 
 Commands run with the environment a user has: the harness removes the BLAS thread variables
 (OPENBLAS_NUM_THREADS, OMP_NUM_THREADS, MKL_NUM_THREADS) rather than pinning them, because,
-once Task 1.10a is merged, pivot sets them for its workers and keeps any value it inherits.
+once Task 1.10a is merged, pivot sets them for its workers and keeps any value it inherits. It
+also removes PIVOT_CACHE_DIR, so each variant writes its own project's .pivot/cache.
+
+An interrupted run (Ctrl-C, or SIGTERM from `kill` or `timeout`) stops the command it is
+measuring: pivot gets SIGINT, its own Ctrl-C path, and up to 10 s to exit; then it, and anything
+left in its session, is killed.
 """
 
 from __future__ import annotations
@@ -36,7 +41,10 @@ from typing import TypedDict
 import gen
 
 KINDS = ("cold", "warm", "touch", "edit")
-_BLAS_VARS = frozenset({"OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"})
+_DROPPED_VARS = frozenset(
+    {"OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "PIVOT_CACHE_DIR"}
+)
+_INTERRUPT_GRACE_S = 10
 _SUMMARY = re.compile(r"Summary: (\d+) ran, (\d+) cached")
 _MARKER = re.compile(r"^    _edit_marker = .*\n", re.MULTILINE)
 _KEEP_IN_PIVOT_DIR = frozenset({".gitignore", "config.yaml"})
@@ -59,7 +67,8 @@ class Row(Measurement):
     cached: int | None
 
 
-def _session_members(sid: int) -> list[int]:
+def session_members(sid: int) -> list[int]:
+    """Return the live processes in session `sid`, the one `measure()` starts each command in."""
     members = list[int]()
     for stat in pathlib.Path("/proc").glob("[0-9]*/stat"):
         try:
@@ -74,7 +83,7 @@ def _session_members(sid: int) -> list[int]:
 
 def measure(argv: list[str], cwd: pathlib.Path) -> tuple[Measurement, str]:
     """Run one command to completion; return its measurement and combined output."""
-    env = {key: value for key, value in os.environ.items() if key not in _BLAS_VARS}
+    env = {key: value for key, value in os.environ.items() if key not in _DROPPED_VARS}
     load1 = os.getloadavg()[0]
     # Output goes to a file, not a pipe: a leftover process holding the pipe open would
     # otherwise keep the harness waiting after the command itself exits.
@@ -84,12 +93,16 @@ def measure(argv: list[str], cwd: pathlib.Path) -> tuple[Measurement, str]:
         proc = subprocess.Popen(
             argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
-        proc.wait()
+        try:
+            proc.wait()
+        except BaseException:
+            _stop(proc)
+            raise
         wall = time.perf_counter() - start
         after = resource.getrusage(resource.RUSAGE_CHILDREN)
         log.seek(0)
         output = log.read()
-    leftovers = _session_members(proc.pid)
+    leftovers = session_members(proc.pid)
     for pid in leftovers:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
@@ -103,6 +116,24 @@ def measure(argv: list[str], cwd: pathlib.Path) -> tuple[Measurement, str]:
         leftover_procs=len(leftovers),
     )
     return measurement, output
+
+
+def _stop(proc: subprocess.Popen[bytes]) -> None:
+    """Stop an interrupted command: SIGINT, a grace period, then SIGKILL its whole session.
+
+    SIGKILLing the session first would skip pivot's shutdown, which leaves loky's named
+    semaphores in /dev/shm.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=_INTERRUPT_GRACE_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    for pid in session_members(proc.pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def _reset(root: pathlib.Path) -> None:
@@ -165,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work", required=True, type=pathlib.Path)
     parser.add_argument("--out-dir", required=True, type=pathlib.Path)
     args = parser.parse_args(argv)
+    # SIGTERM raises SystemExit, so measure() stops the command it is running before run.py exits.
+    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
     variants: list[tuple[str, pathlib.Path]] = args.variant
     project: str = args.project
     reps: int = args.reps

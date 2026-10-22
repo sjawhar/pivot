@@ -1,19 +1,33 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
+import signal
+import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 import run
 
 if TYPE_CHECKING:
-    import pytest
+    from collections.abc import Iterator
 
 _PIVOT = pathlib.Path(sys.executable).parent / "pivot"
+_RUN_PY = pathlib.Path(run.__file__)
 _BLAS_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+# A stand-in for pivot: `init` makes the project, and `repro` runs a long child in its own
+# session and writes the session id, as a pivot repro that has started its workers does.
+_FAKE_PIVOT = """#!/bin/sh
+case "$1" in
+  init) mkdir -p .pivot ;;
+  repro) sleep 600 & ps -o sid= -p $$ > {sid_file}; wait ;;
+esac
+"""
 
 
 def _helper_python(code: str) -> list[str]:
@@ -31,6 +45,63 @@ def _helper_is_gone(pid: int) -> bool:
             return True
         time.sleep(0.05)
     return False
+
+
+def _helper_session_alive(sid: int) -> list[int]:
+    return [pid for pid in run.session_members(sid) if not _helper_is_gone(pid)]
+
+
+@pytest.fixture
+def fake_pivot(tmp_path: pathlib.Path) -> Iterator[tuple[pathlib.Path, pathlib.Path]]:
+    sid_file = tmp_path / "sid"
+    pivot = tmp_path / "fake-pivot"
+    pivot.write_text(_FAKE_PIVOT.format(sid_file=sid_file))
+    pivot.chmod(0o755)
+    yield pivot, sid_file
+    if sid_file.exists() and sid_file.read_text().strip():
+        # Never leave a measured session behind, whatever the test saw.
+        for pid in run.session_members(int(sid_file.read_text())):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
+def test_interrupted_run_stops_the_command_it_measures(
+    tmp_path: pathlib.Path, fake_pivot: tuple[pathlib.Path, pathlib.Path], signum: signal.Signals
+) -> None:
+    pivot, sid_file = fake_pivot
+    argv = [sys.executable, str(_RUN_PY), "--project", "chain-10", "--variant", f"a={pivot}"]
+    argv += ["--reps", "1", "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
+    harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 20
+    while not (sid_file.exists() and sid_file.read_text().strip()):
+        assert time.monotonic() < deadline, "the measured command never started"
+        time.sleep(0.05)
+    sid = int(sid_file.read_text())
+    assert run.session_members(sid), "the measured session should be running before the signal"
+
+    harness.send_signal(signum)
+
+    exit_code = harness.wait(timeout=30)
+    assert not _helper_session_alive(sid), "an interrupted run.py must stop what it measures"
+    # Killed by the signal (an uncaught KeyboardInterrupt), or exited 128 + signum.
+    assert exit_code in (-signum, 128 + signum), exit_code
+
+
+def test_variants_keep_separate_caches_when_the_caller_sets_one(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "shared-cache"
+    monkeypatch.setenv("PIVOT_CACHE_DIR", str(shared))
+    argv = ["--project", "chain-10", "--variant", f"a={_PIVOT}", "--variant", f"b={_PIVOT}"]
+    argv += ["--reps", "1", "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
+
+    assert run.main(argv) == 0
+
+    for name in ("a", "b"):
+        own = tmp_path / "work" / name / "chain-10" / ".pivot" / "cache"
+        assert own.is_dir() and any(own.rglob("*")), f"variant {name} did not use its own cache"
+    assert not shared.exists(), "no variant may write the caller's PIVOT_CACHE_DIR"
 
 
 def test_measure_counts_cpu_of_descendants_the_command_reaps(tmp_path: pathlib.Path) -> None:
