@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import enum
 import json
 import os
 import pathlib
@@ -40,7 +41,16 @@ from typing import TypedDict
 
 import gen
 
-KINDS = ("cold", "warm", "touch", "edit")
+
+class Kind(enum.StrEnum):
+    """What each measured command changes first; the value is the scenario name's last part."""
+
+    COLD = "cold"
+    WARM = "warm"
+    TOUCH = "touch"
+    EDIT = "edit"
+
+
 _DROPPED_VARS = frozenset(
     {"OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "PIVOT_CACHE_DIR"}
 )
@@ -122,18 +132,22 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
     """Stop an interrupted command: SIGINT, a grace period, then SIGKILL its whole session.
 
     SIGKILLing the session first would skip pivot's shutdown, which leaves loky's named
-    semaphores in /dev/shm.
+    semaphores in /dev/shm. The kill and the sweep run even if a second Ctrl-C or SIGTERM
+    arrives during the grace period.
     """
-    with contextlib.suppress(ProcessLookupError):
-        proc.send_signal(signal.SIGINT)
     try:
+        with contextlib.suppress(ProcessLookupError):
+            proc.send_signal(signal.SIGINT)
         proc.wait(timeout=_INTERRUPT_GRACE_S)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    for pid in session_members(proc.pid):
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
+        pass
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for pid in session_members(proc.pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 def _reset(root: pathlib.Path) -> None:
@@ -165,18 +179,16 @@ def _edit(path: pathlib.Path, function: str, stamp: str) -> None:
     path.write_text(source)
 
 
-def _prepare(kind: str, root: pathlib.Path, scope: gen.Scope, stamp: str) -> None:
+def _prepare(kind: Kind, root: pathlib.Path, scope: gen.Scope, stamp: str) -> None:
     match kind:
-        case "cold":
+        case Kind.COLD:
             _reset(root)
-        case "warm":
+        case Kind.WARM:
             pass
-        case "touch":
+        case Kind.TOUCH:
             (root / scope["touch"]).write_text(f"name: touched\nv: {stamp}\n")
-        case "edit":
+        case Kind.EDIT:
             _edit(root / scope["edit_file"], scope["edit_function"], stamp)
-        case _:
-            raise ValueError(f"unknown kind {kind!r}")
 
 
 def _parse_variant(text: str) -> tuple[str, pathlib.Path]:
@@ -196,8 +208,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work", required=True, type=pathlib.Path)
     parser.add_argument("--out-dir", required=True, type=pathlib.Path)
     args = parser.parse_args(argv)
-    # SIGTERM raises SystemExit, so measure() stops the command it is running before run.py exits.
-    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
     variants: list[tuple[str, pathlib.Path]] = args.variant
     project: str = args.project
     reps: int = args.reps
@@ -207,22 +217,22 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("variant names must be unique")
 
     roots = {name: work / name / project for name, _ in variants}
-    specs = {name: gen.write_project(project, roots[name], pivot) for name, pivot in variants}
+    # Every variant's project has the same scopes: a Scope holds paths relative to its root.
+    scopes = [gen.write_project(project, roots[name], pivot) for name, pivot in variants][0]
     out_dir.mkdir(parents=True, exist_ok=True)
     outs = {name: (out_dir / f"{name}.jsonl").open("w") for name, _ in variants}
     failed = 0
     try:
-        for scope_index, scope in enumerate(specs[variants[0][0]]["scopes"]):
-            for kind in KINDS:
+        for scope in scopes:
+            for kind in Kind:
                 scenario = f"{project}/{scope['name']}/{kind}"
                 for rep in range(reps):
                     order = variants if rep % 2 == 0 else variants[::-1]
                     for name, pivot in order:
                         root = roots[name]
-                        own_scope = specs[name]["scopes"][scope_index]
-                        _prepare(kind, root, own_scope, f"{scope['name']}-{rep}")
+                        _prepare(kind, root, scope, f"{scope['name']}-{rep}")
                         measurement, output = measure(
-                            [str(pivot), "repro", *own_scope["args"]], root / own_scope["cwd"]
+                            [str(pivot), "repro", *scope["args"]], root / scope["cwd"]
                         )
                         summary = _SUMMARY.search(output)
                         row = Row(
@@ -252,4 +262,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # SIGTERM raises SystemExit, so measure() stops the command it is running before run.py exits.
+    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
     sys.exit(main())

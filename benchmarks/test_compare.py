@@ -484,27 +484,26 @@ def _helper_rows_edited(
     return _helper_jsonl(rows)
 
 
-# JSON that json.dumps cannot write: an integer too large for a float, and one with more digits
-# than Python reads as an int (sys.get_int_max_str_digits() defaults to 4300).
-_BIG_INT = "1" + "0" * 400
+# An integer with more digits than Python reads (sys.get_int_max_str_digits() defaults to 4300),
+# which json.dumps cannot write, and one too large for a float, which it can.
 _LONG_INT = "1" + "0" * 5000
+_BIG_INT = 10**400
 _NESTED_ROW = "[" * 100_000 + "]" * 100_000 + "\n"
 
 
-def _helper_first_row_raw(field: str, raw: str) -> str:
-    """Six valid rows as JSONL, with row 0's `field` set to the JSON text `raw`."""
-    return _helper_rows_edited({field: "RAW"}).replace('"RAW"', raw)
+def _helper_first_row(field: str, value: object) -> str:
+    """Six valid rows as JSONL, with row 0's `field` set to `value`."""
+    return _helper_rows_edited({field: value})
 
 
-def _helper_limits(wall_pct: str) -> str:
-    """A threshold file whose wall_pct limit is the JSON text `wall_pct`."""
-    return json.dumps({_SCENARIO: {"wall_pct": "RAW", "cpu_pct": 10}}).replace('"RAW"', wall_pct)
+def _helper_limits(wall_pct: object) -> str:
+    """A threshold file whose wall_pct limit is `wall_pct`."""
+    return json.dumps({_SCENARIO: {"wall_pct": wall_pct, "cpu_pct": 10}})
 
 
-def _helper_calibration(wall_pct: str) -> str:
-    """A calibration file of one sample whose wall_pct change is the JSON text `wall_pct`."""
-    sample = {"changes": {_SCENARIO: {"wall_pct": "RAW", "cpu_pct": 1}}}
-    return json.dumps({"samples": [sample]}).replace('"RAW"', wall_pct)
+def _helper_calibration(wall_pct: object) -> str:
+    """A calibration file of one sample whose wall_pct change is `wall_pct`."""
+    return json.dumps({"samples": [{"changes": {_SCENARIO: {"wall_pct": wall_pct, "cpu_pct": 1}}}]})
 
 
 @pytest.mark.parametrize(
@@ -626,12 +625,12 @@ def _helper_calibration(wall_pct: str) -> str:
             id="zero-cpu-on-both-sides",
         ),
         pytest.param(
-            {"head.jsonl": _helper_first_row_raw("wall_s", _BIG_INT)},
+            {"head.jsonl": _helper_first_row("wall_s", _BIG_INT)},
             _COMPARE_ARGV,
             id="timing-too-large-for-a-float",
         ),
         pytest.param(
-            {"head.jsonl": _helper_first_row_raw("cpu_s", _BIG_INT)},
+            {"head.jsonl": _helper_first_row("cpu_s", _BIG_INT)},
             ("base.jsonl", "head.jsonl", "--derive-threshold"),
             id="timing-too-large-for-a-float-derive",
         ),
@@ -684,12 +683,12 @@ def _helper_calibration(wall_pct: str) -> str:
             id="threshold-not-a-mapping",
         ),
         pytest.param(
-            {"threshold.json": _helper_limits('"ten"')}, _COMPARE_ARGV, id="non-numeric-limit"
+            {"threshold.json": _helper_limits("ten")}, _COMPARE_ARGV, id="non-numeric-limit"
         ),
         pytest.param(
             {
                 "head.jsonl": _helper_jsonl(_helper_rows([2.0] * 6, [2.0] * 6)),
-                "threshold.json": _helper_limits("NaN"),
+                "threshold.json": _helper_limits(math.nan),
             },
             _COMPARE_ARGV,
             id="non-finite-limit",
@@ -703,12 +702,33 @@ def _helper_calibration(wall_pct: str) -> str:
             id="limit-too-large-for-a-float",
         ),
         pytest.param(
-            {"threshold.json": _helper_limits(_LONG_INT)},
+            # The one input json.dumps cannot write.
+            {
+                "threshold.json": _helper_limits(0).replace(
+                    '"wall_pct": 0', f'"wall_pct": {_LONG_INT}'
+                )
+            },
             _COMPARE_ARGV,
             id="limit-too-long-to-read",
         ),
         # Calibration files. A change must be a finite int or float, as a result row's timing is.
         pytest.param({"calibration.json": "{}"}, _DERIVE_ARGV, id="no-samples"),
+        # An empty or wrong-type `samples` derives no limits, so it is unreadable too.
+        pytest.param(
+            {"calibration.json": json.dumps({"samples": ""})},
+            _DERIVE_ARGV,
+            id="samples-empty-string",
+        ),
+        pytest.param(
+            {"calibration.json": json.dumps({"samples": {}})},
+            _DERIVE_ARGV,
+            id="samples-empty-object",
+        ),
+        pytest.param(
+            {"calibration.json": json.dumps({"samples": []})},
+            _DERIVE_ARGV,
+            id="samples-empty-list",
+        ),
         pytest.param(
             {"calibration.json": '{"samples": [{"sample": 1}]}'},
             _DERIVE_ARGV,
@@ -730,22 +750,22 @@ def _helper_calibration(wall_pct: str) -> str:
             id="calibration-changes-not-a-mapping",
         ),
         pytest.param(
-            {"calibration.json": _helper_calibration("NaN")},
+            {"calibration.json": _helper_calibration(math.nan)},
             _DERIVE_ARGV,
             id="calibration-change-nan",
         ),
         pytest.param(
-            {"calibration.json": _helper_calibration("Infinity")},
+            {"calibration.json": _helper_calibration(math.inf)},
             _DERIVE_ARGV,
             id="calibration-change-infinity",
         ),
         pytest.param(
-            {"calibration.json": _helper_calibration('"5"')},
+            {"calibration.json": _helper_calibration("5")},
             _DERIVE_ARGV,
             id="calibration-change-string",
         ),
         pytest.param(
-            {"calibration.json": _helper_calibration("true")},
+            {"calibration.json": _helper_calibration(True)},
             _DERIVE_ARGV,
             id="calibration-change-boolean",
         ),
@@ -755,7 +775,7 @@ def _helper_calibration(wall_pct: str) -> str:
             id="calibration-change-too-large-for-a-float",
         ),
         pytest.param(
-            {"calibration.json": _helper_calibration("1e308")},
+            {"calibration.json": _helper_calibration(1e308)},
             _DERIVE_ARGV,
             id="calibration-change-too-large-for-a-threshold",
         ),

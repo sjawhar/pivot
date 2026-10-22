@@ -24,7 +24,8 @@ reps are not 0 to n-1 once each, or the two ran on machines with different core 
 An A/A run measures the same build on both sides. With --derive-threshold, it prints a threshold
 file: for each scenario and metric, three times the largest absolute change between the two
 medians of any A/A run that measured it, rounded up to a whole percent and at least 2. The A/A
-runs are either result-file pairs or the samples of a calibration file.
+runs are either result-file pairs or the samples of a calibration file, whose `samples` must be
+a non-empty list (an empty one derives no limits, and exits 2).
 
 --write-calibration records each A/A run's per-scenario changes, with the GitHub Actions run,
 attempt and job that produced it, so the thresholds can be rebuilt after the artifacts expire.
@@ -39,7 +40,7 @@ import pathlib
 import random
 import statistics
 import sys
-from typing import Any, Literal, TypedDict, TypeGuard, cast
+from typing import Literal, TypedDict, TypeGuard, cast
 
 type _Metric = Literal["wall_s", "cpu_s"]
 type _LimitKey = Literal["wall_pct", "cpu_pct"]
@@ -60,6 +61,16 @@ class _Row(TypedDict):
     cpu_s: float
     cpu_count: int
     rep: int
+
+
+class _Sample(TypedDict):
+    """One A/A run's entry in calibration.json: the job that measured it, and its changes."""
+
+    sample: int
+    run: int
+    attempt: int
+    job: int
+    changes: _Changes
 
 
 class _CannotCompareError(Exception):
@@ -118,15 +129,18 @@ def _is_finite_number(value: object) -> TypeGuard[int | float]:
         return False
 
 
+def _json_object(value: object, what: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{what} must be a JSON object, got {value!r}")
+    return cast("dict[str, object]", value)
+
+
 def _load(path: pathlib.Path) -> dict[str, list[_Row]]:
     lines = _read_text(path).splitlines()
     by_scenario = dict[str, list[_Row]]()
     for number, line in enumerate(lines, start=1):
         try:
-            parsed = json.loads(line)
-            if not isinstance(parsed, dict):
-                raise TypeError(f"a result row must be a JSON object, got {parsed!r}")
-            raw = cast("dict[str, object]", parsed)
+            raw = _json_object(json.loads(line), "a result row")
             scenario = _field_str(raw, "scenario")
             exit_code = _field_int(raw, "exit_code")
             rep = _field_int(raw, "rep")
@@ -206,15 +220,7 @@ def ratio_interval(base: list[float], head: list[float]) -> tuple[float, float]:
     ]
 
 
-def _change_pct(base: float, head: float) -> float:
-    return (head - base) / base * 100
-
-
-def _changes(base_path: pathlib.Path, head_path: pathlib.Path) -> _Changes:
-    return _finite_changes(_paired(base_path, head_path))
-
-
-def _finite_changes(paired: dict[str, dict[_Metric, tuple[list[float], list[float]]]]) -> _Changes:
+def _changes(paired: dict[str, dict[_Metric, tuple[list[float], list[float]]]]) -> _Changes:
     """Each scenario's change between medians; a change that is not finite cannot be compared."""
     changes = dict[str, dict[str, float]]()
     for scenario, by_metric in paired.items():
@@ -222,7 +228,7 @@ def _finite_changes(paired: dict[str, dict[_Metric, tuple[list[float], list[floa
         for metric, key in _METRICS:
             base_values, head_values = by_metric[metric]
             base, head = statistics.median(base_values), statistics.median(head_values)
-            change = _change_pct(base, head)
+            change = (head - base) / base * 100
             if not math.isfinite(change):
                 raise _CannotCompareError(
                     f"{scenario} {metric}: the change from {base!r} to {head!r} is not finite"
@@ -259,19 +265,26 @@ def _calibration_change(by_key: dict[str, object], key: str) -> float:
 
 
 def _read_calibration(path: pathlib.Path) -> list[_Changes]:
-    # Building typed values checks the shape: any mismatch raises one of the caught errors.
-    calibration: Any = _read_json(path)
+    raw = _read_json(path)
     try:
-        samples: list[_Changes] = [
+        samples = _json_object(raw, "a calibration file")["samples"]
+        # An empty list derives no limits, so it is as unreadable as a missing one.
+        if not isinstance(samples, list) or not samples:
+            raise TypeError(f"samples must be a non-empty list, got {samples!r}")
+        return [
             {
-                str(scenario): {key: _calibration_change(by_key, key) for _, key in _METRICS}
-                for scenario, by_key in sample["changes"].items()
+                scenario: {
+                    key: _calibration_change(_json_object(by_key, scenario), key)
+                    for _, key in _METRICS
+                }
+                for scenario, by_key in _json_object(
+                    _json_object(sample, "a sample")["changes"], "changes"
+                ).items()
             }
-            for sample in calibration["samples"]
+            for sample in cast("list[object]", samples)
         ]
-    except (AttributeError, KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise _CannotCompareError(f"{path}: not a calibration file ({error!r})") from None
-    return samples
 
 
 def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str, float]]:
@@ -301,24 +314,19 @@ def _read_limits(path: pathlib.Path, scenarios: list[str]) -> dict[str, dict[str
     return limits
 
 
-def _calibration_samples(
-    parser: argparse.ArgumentParser, specs: list[list[str]]
-) -> list[dict[str, object]]:
-    samples = list[dict[str, object]]()
+def _calibration_samples(parser: argparse.ArgumentParser, specs: list[list[str]]) -> list[_Sample]:
+    samples = list[_Sample]()
     for sample, run, attempt, job, base, head in specs:
         try:
-            source = {
-                "sample": int(sample),
-                "run": int(run),
-                "attempt": int(attempt),
-                "job": int(job),
-            }
+            sample_id, run_id, attempt_id, job_id = (int(v) for v in (sample, run, attempt, job))
         except ValueError:
             parser.error(
                 f"--sample needs integer SAMPLE RUN ATTEMPT JOB, got {sample} {run} {attempt} {job}"
             )
-        changes = _changes(pathlib.Path(base), pathlib.Path(head))
-        samples.append({**source, "changes": changes})
+        changes = _changes(_paired(pathlib.Path(base), pathlib.Path(head)))
+        samples.append(
+            _Sample(sample=sample_id, run=run_id, attempt=attempt_id, job=job_id, changes=changes)
+        )
     return samples
 
 
@@ -367,13 +375,13 @@ def main(argv: list[str] | None = None) -> int:
                 samples = _read_calibration(calibration)
             else:
                 samples = [
-                    _changes(base, head)
+                    _changes(_paired(base, head))
                     for base, head in zip(result_files[::2], result_files[1::2], strict=True)
                 ]
             print(json.dumps(_derive_threshold(samples), indent=2, sort_keys=True))
             return 0
         paired = _paired(result_files[0], result_files[1])
-        _finite_changes(paired)
+        changes = _changes(paired)
         limits = _read_limits(args.threshold_file, list(paired))
     except _CannotCompareError as error:
         # One line, whatever a path or a scenario name holds.
@@ -385,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
         for metric, key in _METRICS:
             base_values, head_values = by_metric[metric]
             base, head = statistics.median(base_values), statistics.median(head_values)
-            limit = limits[scenario][key]
+            change, limit = changes[scenario][key], limits[scenario][key]
             low, high = ratio_interval(base_values, head_values)
             verdict = "ok"
             if head > base * (1 + limit / 100) and low > 1:
@@ -393,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
                 regressed = True
             print(
                 f"{verdict:10} {scenario} {metric}: base {base:.3f} head {head:.3f} "
-                + f"({_change_pct(base, head):+.1f}%, limit +{limit}%; "
+                + f"({change:+.1f}%, limit +{limit}%; "
                 + f"95% CI {(low - 1) * 100:+.1f}% to {(high - 1) * 100:+.1f}%)"
             )
     return 1 if regressed else 0

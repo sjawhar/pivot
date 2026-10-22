@@ -42,11 +42,6 @@ class Scope(TypedDict):
     edit_function: str
 
 
-class ProjectSpec(TypedDict):
-    name: str
-    scopes: list[Scope]
-
-
 # (function name, parameter name -> annotation, call arguments)
 type _Stage = tuple[str, dict[str, str], list[str]]
 
@@ -187,15 +182,13 @@ def _write_multi(root: pathlib.Path) -> list[Scope]:
     ]
 
 
-def write_project(name: str, root: pathlib.Path, pivot: pathlib.Path) -> ProjectSpec:
+def write_project(name: str, root: pathlib.Path, pivot: pathlib.Path) -> list[Scope]:
     """Create project `name` at `root` (which must not exist), initialised with `pivot init`."""
     if name not in PROJECTS:
         raise ValueError(f"unknown project {name!r}; choose from {', '.join(PROJECTS)}")
     root.mkdir(parents=True)
     subprocess.run([str(pivot), "init"], cwd=root, check=True, stdout=subprocess.DEVNULL)
     if name == "multi":
-        scopes = _write_multi(root)
-    else:
-        shape, n = name.rsplit("-", 1)
-        scopes = _write_shape(shape, int(n), root)
-    return ProjectSpec(name=name, scopes=scopes)
+        return _write_multi(root)
+    shape, n = name.rsplit("-", 1)
+    return _write_shape(shape, int(n), root)

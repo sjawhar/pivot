@@ -20,12 +20,29 @@ if TYPE_CHECKING:
 _PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _RUN_PY = pathlib.Path(run.__file__)
 _BLAS_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
-# A stand-in for pivot: `init` makes the project, and `repro` runs a long child in its own
-# session and writes the session id, as a pivot repro that has started its workers does.
-_FAKE_PIVOT = """#!/bin/sh
+# Stand-ins for pivot. `init` makes the project. `repro` starts a long child in its own session,
+# as a pivot repro that has started its workers does, and writes the session id. On SIGINT,
+# pivot's own Ctrl-C path, it writes the SIGINT file: _INTERRUPTIBLE then exits, and _DEAF keeps
+# waiting, as a pivot whose shutdown outlasts the grace period would.
+_SID_FILE = "sid"
+_SIGINT_FILE = "got-sigint"
+_INTERRUPTIBLE = """#!/bin/sh
 case "$1" in
   init) mkdir -p .pivot ;;
-  repro) sleep 600 & ps -o sid= -p $$ > {sid_file}; wait ;;
+  repro) trap 'echo int > {sigint_file}; exit 130' INT
+         sleep 600 & ps -o sid= -p $$ > {sid_file}; wait ;;
+esac
+"""
+_DEAF = """#!/bin/sh
+case "$1" in
+  init) mkdir -p .pivot ;;
+  repro) trap 'echo int > {sigint_file}' INT
+         sleep 600 & ps -o sid= -p $$ > {sid_file}; while :; do wait; done ;;
+esac
+"""
+_QUICK = """#!/bin/sh
+case "$1" in
+  init) mkdir -p .pivot ;;
 esac
 """
 
@@ -51,41 +68,87 @@ def _helper_session_alive(sid: int) -> list[int]:
     return [pid for pid in run.session_members(sid) if not _helper_is_gone(pid)]
 
 
-@pytest.fixture
-def fake_pivot(tmp_path: pathlib.Path) -> Iterator[tuple[pathlib.Path, pathlib.Path]]:
-    sid_file = tmp_path / "sid"
-    pivot = tmp_path / "fake-pivot"
-    pivot.write_text(_FAKE_PIVOT.format(sid_file=sid_file))
+def _helper_stand_in(tmp_path: pathlib.Path, script: str) -> pathlib.Path:
+    pivot = tmp_path / "stand-in-pivot"
+    sid_file, sigint_file = tmp_path / _SID_FILE, tmp_path / _SIGINT_FILE
+    pivot.write_text(script.format(sid_file=sid_file, sigint_file=sigint_file))
     pivot.chmod(0o755)
-    yield pivot, sid_file
+    return pivot
+
+
+def _helper_run_argv(tmp_path: pathlib.Path, pivot: pathlib.Path) -> list[str]:
+    argv = ["--project", "chain-10", "--variant", f"a={pivot}", "--reps", "1"]
+    return [*argv, "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
+
+
+def _helper_read_when_written(path: pathlib.Path) -> str:
+    deadline = time.monotonic() + 20
+    while not (path.exists() and path.read_text().strip()):
+        assert time.monotonic() < deadline, f"{path.name} was never written"
+        time.sleep(0.05)
+    return path.read_text()
+
+
+@pytest.fixture
+def stand_in_session(tmp_path: pathlib.Path) -> Iterator[None]:
+    """Kill whatever is left of the stand-in's session, whatever the test saw."""
+    yield
+    sid_file = tmp_path / _SID_FILE
     if sid_file.exists() and sid_file.read_text().strip():
-        # Never leave a measured session behind, whatever the test saw.
         for pid in run.session_members(int(sid_file.read_text())):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.usefixtures("stand_in_session")
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
 def test_interrupted_run_stops_the_command_it_measures(
-    tmp_path: pathlib.Path, fake_pivot: tuple[pathlib.Path, pathlib.Path], signum: signal.Signals
+    tmp_path: pathlib.Path, signum: signal.Signals
 ) -> None:
-    pivot, sid_file = fake_pivot
-    argv = [sys.executable, str(_RUN_PY), "--project", "chain-10", "--variant", f"a={pivot}"]
-    argv += ["--reps", "1", "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
+    pivot = _helper_stand_in(tmp_path, _INTERRUPTIBLE)
+    argv = [sys.executable, str(_RUN_PY), *_helper_run_argv(tmp_path, pivot)]
     harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + 20
-    while not (sid_file.exists() and sid_file.read_text().strip()):
-        assert time.monotonic() < deadline, "the measured command never started"
-        time.sleep(0.05)
-    sid = int(sid_file.read_text())
+    sid = int(_helper_read_when_written(tmp_path / _SID_FILE))
     assert run.session_members(sid), "the measured session should be running before the signal"
 
     harness.send_signal(signum)
 
     exit_code = harness.wait(timeout=30)
     assert not _helper_session_alive(sid), "an interrupted run.py must stop what it measures"
+    # A SIGKILLed stand-in writes nothing, so this fails if anything kills it before its SIGINT.
+    assert (tmp_path / _SIGINT_FILE).exists(), "pivot must get SIGINT, its Ctrl-C path, first"
     # Killed by the signal (an uncaught KeyboardInterrupt), or exited 128 + signum.
     assert exit_code in (-signum, 128 + signum), exit_code
+
+
+@pytest.mark.usefixtures("stand_in_session")
+@pytest.mark.parametrize("second", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
+def test_second_signal_during_the_grace_period_still_stops_the_command(
+    tmp_path: pathlib.Path, second: signal.Signals
+) -> None:
+    pivot = _helper_stand_in(tmp_path, _DEAF)
+    argv = [sys.executable, str(_RUN_PY), *_helper_run_argv(tmp_path, pivot)]
+    harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sid = int(_helper_read_when_written(tmp_path / _SID_FILE))
+    harness.send_signal(signal.SIGINT)
+    # The stand-in has its SIGINT, so run.py is waiting out the grace period.
+    _helper_read_when_written(tmp_path / _SIGINT_FILE)
+
+    harness.send_signal(second)
+
+    exit_code = harness.wait(timeout=30)
+    assert not _helper_session_alive(sid), "a second signal must not orphan the measured session"
+    assert exit_code in (-second, 128 + second), exit_code
+
+
+def test_main_leaves_the_callers_sigterm_handler_in_place(tmp_path: pathlib.Path) -> None:
+    pivot = _helper_stand_in(tmp_path, _QUICK)
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        assert run.main(_helper_run_argv(tmp_path, pivot)) == 0
+        assert signal.getsignal(signal.SIGTERM) is before, "run.main() replaced the SIGTERM handler"
+    finally:
+        signal.signal(signal.SIGTERM, before)
 
 
 def test_variants_keep_separate_caches_when_the_caller_sets_one(
