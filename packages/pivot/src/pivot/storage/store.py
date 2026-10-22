@@ -72,13 +72,13 @@ class CacheStore:
             else:
                 ref_hash, _ = cache.hash_file(ref_path, db)
 
-        cache_path = cache.get_cache_path(self._cache_dir, ref_hash)
+        cache_path = cache.resolve_cache_object_path(self._cache_dir, ref_hash)
         if not cache_path.exists():
             raise FileNotFoundError(cache_path)
         return cache_path
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path:
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        project.make_dirs(self._cache_dir)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             return pathlib.Path(tempfile.mkdtemp(prefix="pivot_cache_out_", dir=self._cache_dir))
 
@@ -287,10 +287,10 @@ class WorkspaceStore:
             return False
         if types.is_dir_hash(output_hash):
             return all(
-                cache.get_cache_path(self._cache_dir, entry["hash"]).exists()
+                cache.resolve_cache_object_path(self._cache_dir, entry["hash"]).exists()
                 for entry in output_hash["manifest"]
             )
-        return cache.get_cache_path(self._cache_dir, output_hash["hash"]).exists()
+        return cache.resolve_cache_object_path(self._cache_dir, output_hash["hash"]).exists()
 
     def resolve_display_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         """Resolve the workspace path for an artifact, for display/CLI use.

@@ -13,6 +13,7 @@ import yaml
 
 from pivot import config, git, project, types, yaml_config
 from pivot.show import common
+from pivot.storage import cache
 from pivot.types import ChangeType, MetricData, MetricValue, OutputFormat
 
 if TYPE_CHECKING:
@@ -327,9 +328,9 @@ def collect_metrics_from_head(
     for rel_path in paths:
         file_hash = head_hashes.get(rel_path)
 
-        # Try cache first if we have a hash
-        if file_hash is not None:
-            cached_path = cache_dir / file_hash[:2] / file_hash[2:]
+        # Try cache first if we have a hash; a malformed hash is never turned into a path
+        if file_hash is not None and cache.is_valid_hash(file_hash):
+            cached_path = cache.resolve_cache_object_path(cache_dir, file_hash)
             if cached_path.exists():
                 try:
                     content = cached_path.read_bytes()

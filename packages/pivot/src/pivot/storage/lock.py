@@ -53,6 +53,21 @@ def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
     return state_dir / "stages"
 
 
+def resolve_stage_lock_path(stages_dir: pathlib.Path, stage_name: str) -> pathlib.Path:
+    """Return an existing stage lock, falling back to the matching 0.5.2 lock once."""
+    primary_path = stages_dir / f"{stage_name}.lock"
+    if primary_path.exists():
+        return primary_path
+    legacy_stages_dir = project.legacy_stages_dir_for(stages_dir)
+    if legacy_stages_dir is None:
+        return primary_path
+    legacy_path = legacy_stages_dir / f"{stage_name}.lock"
+    if legacy_path.exists():
+        project.report_legacy_state_dir(stages_dir.parent)
+        return legacy_path
+    return primary_path
+
+
 def stage_name_error(name: str) -> str | None:
     """Return why ``name`` cannot name a lock file, or None if it can.
 
@@ -341,16 +356,8 @@ class StageLock:
             return True, None
 
     def read(self) -> LockData | None:
-        """Read the configured lock, falling back to a matching 0.5.2 lock when absent."""
-        exists, data = self._read_path(self.path)
-        if exists:
-            return data
-        legacy_stages_dir = project.legacy_stages_dir_for(self.stages_dir)
-        if legacy_stages_dir is None:
-            return None
-        exists, data = self._read_path(legacy_stages_dir / f"{self.stage_name}.lock")
-        if exists:
-            project.report_legacy_state_dir(self.stages_dir.parent)
+        """Read the configured lock, using its legacy location only on a primary miss."""
+        _, data = self._read_path(resolve_stage_lock_path(self.stages_dir, self.stage_name))
         return data
 
     def write(self, data: LockData) -> None:

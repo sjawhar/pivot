@@ -158,7 +158,7 @@ def render_plots_html(
     output_path: pathlib.Path,
 ) -> pathlib.Path:
     """Generate simple HTML image gallery."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    project.make_dirs(output_path.parent)
     proj_root = project.get_project_root()
 
     plot_divs = list[str]()

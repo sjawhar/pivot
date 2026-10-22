@@ -47,7 +47,9 @@ All commands support:
 
 **`PIVOT_CACHE_DIR`** takes precedence over the `cache.dir` config setting. Relative paths are
 resolved against the project root. Empty or whitespace-only values are treated as unset, falling
-back to the config file or `<state dir>/cache`.
+back to the config file or `<state dir>/cache`. A cache directory that Pivot creates inside a
+configured state directory, other than `<state dir>/cache`, gets its own `.gitignore` that
+ignores everything in it.
 
 ---
 

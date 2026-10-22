@@ -11,6 +11,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, TypedDict, final
 
 import pivot.types as types
+from pivot import project
 
 if TYPE_CHECKING:
     import pathlib
@@ -109,7 +110,7 @@ class LocalFlockLockService:
     __slots__ = ("_lock_dir",)
 
     def __init__(self, lock_dir: pathlib.Path) -> None:
-        lock_dir.mkdir(parents=True, exist_ok=True)
+        project.make_dirs(lock_dir)
         self._lock_dir = lock_dir
 
     def acquire_many(

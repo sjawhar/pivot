@@ -54,7 +54,7 @@ def restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathli
 def _get_lock_path_from_token(token: str, state_dir: pathlib.Path) -> pathlib.Path:
     """Get a restore lock path from a previously resolved target token."""
     lock_dir = state_dir / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    project.make_dirs(lock_dir)
     return lock_dir / f"{_RESTORE_LOCK_PREFIX}{token}"
 
 
@@ -108,7 +108,7 @@ def atomic_write_file(
         mode: File permissions (default 0o644).
         staging_path: Optional deterministic temporary path beside ``dest``.
     """
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    project.make_dirs(dest.parent)
     if staging_path is None:
         fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
         tmp = pathlib.Path(tmp_path)
@@ -361,21 +361,25 @@ def is_valid_hash(value: object) -> bool:
 
 
 def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
-    """Get the read path for a hash, checking a matching 0.5.2 cache on a primary miss."""
+    """Return the configured cache path for a hash, for writers and primary-cache reads."""
     if len(file_hash) != XXHASH64_HEX_LENGTH:
         raise exceptions.SecurityValidationError(
             f"Hash must be exactly {XXHASH64_HEX_LENGTH} characters, got {len(file_hash)}"
         )
-    # Prevents path traversal via malicious hashes
     if not is_valid_hash(file_hash):
         raise exceptions.SecurityValidationError(f"Hash contains invalid characters: {file_hash!r}")
-    cache_path = cache_dir / file_hash[:2] / file_hash[2:]
+    return cache_dir / file_hash[:2] / file_hash[2:]
+
+
+def resolve_cache_object_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
+    """Return an existing cache object, falling back to the matching 0.5.2 cache once."""
+    cache_path = get_cache_path(cache_dir, file_hash)
     if cache_path.exists():
         return cache_path
     legacy_files_dir = project.legacy_cache_files_dir_for(cache_dir)
     if legacy_files_dir is None:
         return cache_path
-    legacy_path = legacy_files_dir / file_hash[:2] / file_hash[2:]
+    legacy_path = get_cache_path(legacy_files_dir, file_hash)
     if legacy_path.exists():
         project.report_legacy_state_dir(cache_dir.parent.parent)
         return legacy_path
@@ -653,7 +657,7 @@ def staged_cache_file(cache_path: pathlib.Path) -> Generator[pathlib.Path]:
     """An empty temporary file beside cache object ``cache_path`` to publish it from
     (``publish_cache_object``), removed on exit. A killed process's is swept (``_staging_in``).
     """
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    project.make_dirs(cache_path.parent)
     with _staging_in(cache_path.parent):
         fd, name = tempfile.mkstemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_path.parent)
         os.close(fd)
@@ -936,7 +940,7 @@ def _repair_tree_dir_files(
         wrong.append((entry, target))
     if not wrong:
         return True
-    objects = [get_cache_path(cache_dir, entry["hash"]) for entry, _ in wrong]
+    objects = [resolve_cache_object_path(cache_dir, entry["hash"]) for entry, _ in wrong]
     if not all(obj.is_file() for obj in objects):
         return False
     modes = dict[pathlib.Path, int]()
@@ -1109,13 +1113,17 @@ def missing_cache_objects(
 ) -> list[str]:
     """Return hashes required to restore an output that are absent from the cache."""
     if is_dir_hash(output_hash):
-        tree_path = get_cache_path(cache_dir, output_hash["hash"])
+        tree_path = resolve_cache_object_path(cache_dir, output_hash["hash"])
         if checkout_modes[0] == CheckoutMode.SYMLINK and tree_path.exists():
             return []
         hashes = [entry["hash"] for entry in output_hash["manifest"]]
     else:
         hashes = [output_hash["hash"]]
-    return [file_hash for file_hash in hashes if not get_cache_path(cache_dir, file_hash).exists()]
+    return [
+        file_hash
+        for file_hash in hashes
+        if not resolve_cache_object_path(cache_dir, file_hash).exists()
+    ]
 
 
 def save_to_cache(
@@ -1209,7 +1217,7 @@ def _save_directory_to_cache(
         and checkout_modes[0] == CheckoutMode.SYMLINK
         and path.is_symlink()
         and _get_symlink_cache_hash(path, cache_dir) == output_hash["hash"]
-        and get_cache_path(cache_dir, output_hash["hash"]).exists()
+        and resolve_cache_object_path(cache_dir, output_hash["hash"]).exists()
     ):
         return output_hash
 
@@ -1256,7 +1264,7 @@ def _publish_tree(
             and _cache_object_key(link, cache_dir) is None
         ]
 
-    cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
+    project.make_dirs(cache_dir_path.parent)
     with _staging_in(cache_dir_path.parent):
         staged = pathlib.Path(
             tempfile.mkdtemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_dir_path.parent)
@@ -1424,7 +1432,7 @@ def _restore_file_from_cache(
     With a state_dir, holds path's restore lock and stages the file under one name
     tagged with path's token, so the next restore removes what a killed one left.
     """
-    cache_path = get_cache_path(cache_dir, output_hash["hash"])
+    cache_path = resolve_cache_object_path(cache_dir, output_hash["hash"])
     if not cache_path.exists():
         return False
 
@@ -1460,11 +1468,11 @@ def _restore_directory_from_cache(
     lock_token: str | None = None,
 ) -> bool:
     """Restore a directory atomically."""
-    cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
+    cache_dir_path = resolve_cache_object_path(cache_dir, output_hash["hash"])
     symlink_fast_path = checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists()
     if not symlink_fast_path:
         for entry in output_hash["manifest"]:
-            if not get_cache_path(cache_dir, entry["hash"]).exists():
+            if not resolve_cache_object_path(cache_dir, entry["hash"]).exists():
                 return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1497,7 +1505,7 @@ def _restore_directory_from_cache(
         )
         symlink_fast_path = False
         for entry in output_hash["manifest"]:
-            if not get_cache_path(cache_dir, entry["hash"]).exists():
+            if not resolve_cache_object_path(cache_dir, entry["hash"]).exists():
                 return False
 
     if symlink_fast_path:
@@ -1512,7 +1520,7 @@ def _restore_directory_from_cache(
             if temp_symlink.is_symlink():
                 temp_symlink.unlink()
             for entry in output_hash["manifest"]:
-                if not get_cache_path(cache_dir, entry["hash"]).exists():
+                if not resolve_cache_object_path(cache_dir, entry["hash"]).exists():
                     return False
 
     temp_path = pathlib.Path(tempfile.mkdtemp(prefix=restore_prefix, dir=path.parent))
@@ -1522,7 +1530,7 @@ def _restore_directory_from_cache(
     try:
         resolved_temp = temp_path.resolve()
         for file_count, entry in enumerate(output_hash["manifest"], start=1):
-            file_cache_path = get_cache_path(cache_dir, entry["hash"])
+            file_cache_path = resolve_cache_object_path(cache_dir, entry["hash"])
             file_path = temp_path / entry["relpath"]
             if not file_path.resolve().is_relative_to(resolved_temp):
                 raise exceptions.SecurityValidationError(
@@ -1607,7 +1615,7 @@ def _is_cached(cache_dir: pathlib.Path, content_hash: str | None) -> bool:
     return (
         content_hash is not None
         and is_valid_hash(content_hash)
-        and get_cache_path(cache_dir, content_hash).exists()
+        and resolve_cache_object_path(cache_dir, content_hash).exists()
     )
 
 
@@ -1680,7 +1688,7 @@ def restore_missing_in_directory(
                 f"Manifest contains path traversal: {relpath!r}"
             )
 
-        file_cache_path = get_cache_path(cache_dir, entry["hash"])
+        file_cache_path = resolve_cache_object_path(cache_dir, entry["hash"])
         if file_path.is_symlink():
             if not file_path.parent.resolve().is_relative_to(resolved_base):
                 raise exceptions.SecurityValidationError(

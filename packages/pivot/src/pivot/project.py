@@ -107,8 +107,6 @@ def _resolve_configured_state_dir(
 ) -> pathlib.Path:
     from pivot import exceptions
 
-    warn_if_global_state_dir_ignored(root, shadowed=present)
-
     if configured is None:
         state_dir = root / ".pivot"
     elif is_valid_state_dir_value(configured):
@@ -116,6 +114,7 @@ def _resolve_configured_state_dir(
     else:
         raise exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
 
+    warn_if_global_state_dir_ignored(root, shadowed=present)
     _state_dir_cache[root] = state_dir
     return state_dir
 
@@ -349,6 +348,44 @@ def make_state_dir(state_dir: pathlib.Path) -> pathlib.Path:
         return state_dir
     create_gitignore_if_absent(state_dir / ".gitignore")
     return state_dir
+
+
+def make_dirs(path: pathlib.Path) -> None:
+    """``path.mkdir(parents=True, exist_ok=True)`` for every directory Pivot creates for state.
+
+    When ``path`` lies inside the current project's configured state directory, that directory
+    is first created through ``ensure_state_dir``, so it gets its ``.gitignore`` before anything
+    is written inside it. Outside a project, or outside its state directory, this only creates
+    ``path``.
+    """
+    from pivot import exceptions
+
+    if not path.is_dir():
+        try:
+            root = get_project_root()
+            state_dir = state_dir_or_default(root)
+        except (exceptions.ProjectNotInitializedError, OSError):
+            pass
+        else:
+            if state_dir != root / ".pivot" and path.absolute().is_relative_to(state_dir):
+                ensure_state_dir(root)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def make_nested_cache_dir(cache_dir: pathlib.Path) -> None:
+    """Create a custom cache directory inside the state directory, ignoring all of it.
+
+    The state directory's template ignores only ``/cache/``, so a cache at another path inside
+    it gets its own ``*`` ignore file when this call creates the directory. An existing
+    directory is left as it is.
+    """
+    try:
+        cache_dir.mkdir(parents=True)
+    except FileExistsError:
+        return
+    descriptor = os.open(cache_dir / ".gitignore", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    with os.fdopen(descriptor, "w") as gitignore:
+        gitignore.write("# Pivot cache; never commit it\n*\n")
 
 
 def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:

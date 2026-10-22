@@ -495,15 +495,18 @@ def locate_cache_dir() -> pathlib.Path:
 
 
 def get_cache_dir() -> pathlib.Path:
-    """Get the cache directory, creating a configured default state directory when needed.
+    """Get the cache directory, initializing project state before a nested cache writer runs.
 
-    The default cache belongs to the configured state directory. Call ``locate_cache_dir`` for a
-    display-only lookup that must not create it.
+    Call ``locate_cache_dir`` for a display-only lookup that must not create state.
     """
     root = project.get_project_root()
     cache_dir = locate_cache_dir()
-    if cache_dir == project.state_dir_or_default(root) / "cache":
+    state_dir = project.state_dir_or_default(root)
+    resolved_cache_dir = pathlib.Path(os.path.realpath(cache_dir))
+    if state_dir != root / ".pivot" and resolved_cache_dir.is_relative_to(state_dir):
         project.ensure_state_dir(root)
+        if resolved_cache_dir != state_dir / "cache":
+            project.make_nested_cache_dir(resolved_cache_dir)
     return cache_dir
 
 

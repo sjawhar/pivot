@@ -283,7 +283,7 @@ def restore_file(
         should_try_cache = True
         if "manifest" not in output_hash:
             file_hash = output_hash["hash"]
-            cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
+            cached_path = cache.resolve_cache_object_path(cache_dir / "files", file_hash)
             should_try_cache = cached_path.exists()
 
         if should_try_cache:

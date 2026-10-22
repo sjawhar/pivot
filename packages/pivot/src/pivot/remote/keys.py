@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import xxhash
 
-from pivot import exceptions
+from pivot import exceptions, project
 from pivot.storage import cache
 
 if TYPE_CHECKING:
@@ -123,7 +123,7 @@ async def atomic_download(
     """
     with contextlib.ExitStack() as stack:
         if overwrite:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
+            project.make_dirs(local_path.parent)
             fd, name = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
             os.close(fd)
             tmp_path = local_path.with_name(os.path.basename(name))

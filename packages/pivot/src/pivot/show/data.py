@@ -622,7 +622,7 @@ def restore_data_from_cache(
         return None
 
     cache_dir = config.locate_cache_dir() / "files"
-    cached_path = cache_dir / file_hash[:2] / file_hash[2:]
+    cached_path = cache.resolve_cache_object_path(cache_dir, file_hash)
 
     # Prevent symlink escape attacks
     if cached_path.is_symlink():
