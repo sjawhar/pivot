@@ -624,8 +624,7 @@ def restore_data_from_cache(
     cache_dir = config.locate_cache_dir() / "files"
     cached_path = cache.resolve_cache_object_path(cache_dir, file_hash)
 
-    # `resolve_cache_object_path` rejects a symlinked object before it reaches this reader.
-    if not cached_path.exists():
+    if cached_path is None:
         return None
 
     # Create temp file with same extension

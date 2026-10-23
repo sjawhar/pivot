@@ -122,7 +122,10 @@ def push(
 
     if not local_hashes:
         if not quiet:
-            click.echo("No files to push")
+            if dry_run:
+                click.echo(f"Would push 0 file(s) to '{resolved_name}'")
+            else:
+                click.echo("No files to push")
         return
 
     if dry_run:

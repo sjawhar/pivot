@@ -41,12 +41,14 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
                     continue
                 with os.scandir(prefix_entry.path) as hash_entries:
                     for hash_entry in hash_entries:
-                        if hash_entry.is_file():
-                            full_hash = prefix_entry.name + hash_entry.name
-                            if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
-                                hashes.add(full_hash)
-                                if is_legacy:
-                                    project.report_legacy_state_dir(cache_dir.parent)
+                        full_hash = prefix_entry.name + hash_entry.name
+                        object_path = pathlib.Path(hash_entry.path)
+                        if cache.is_valid_hash(full_hash) and cache.is_cache_object_path(
+                            object_path
+                        ):
+                            hashes.add(full_hash)
+                            if is_legacy:
+                                project.report_legacy_state_dir(cache_dir.parent)
 
     metrics.end("sync.get_local_cache_hashes", _t)
     return hashes
@@ -414,7 +416,7 @@ async def _push_async(
     skipped_non_file = 0
     for hash_ in status["local_only"]:
         cache_path = cache.resolve_cache_object_path(files_dir, hash_)
-        if cache_path.is_file():
+        if cache_path is not None and cache_path.is_file():
             items.append((cache_path, hash_))
         else:
             skipped_non_file += 1

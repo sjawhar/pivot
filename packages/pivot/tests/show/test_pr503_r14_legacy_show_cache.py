@@ -95,5 +95,23 @@ def test_cache_object_resolver_rejects_a_primary_symlink(
         set_project_root / "altstate" / "cache" / "files", _HASH
     )
 
-    assert not resolved.exists()
-    assert not resolved.is_symlink()
+    assert resolved is None
+
+
+def test_cache_object_resolver_rejects_a_legacy_symlink_even_when_a_sentinel_exists(
+    set_project_root: pathlib.Path,
+) -> None:
+    _configure_state_dir(set_project_root)
+    primary_files = set_project_root / "altstate" / "cache" / "files"
+    legacy = set_project_root / ".pivot" / "cache" / "files" / _HASH[:2] / _HASH[2:]
+    legacy.parent.mkdir(parents=True)
+    secret = set_project_root / "secret"
+    secret.write_text("untrusted\n")
+    legacy.symlink_to(secret)
+    sentinel = primary_files / _HASH[:2] / f".pivot-missing-cache-object-{_HASH[2:]}"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("must not be returned\n")
+
+    resolved = cache.resolve_cache_object_path(primary_files, _HASH)
+
+    assert resolved is None

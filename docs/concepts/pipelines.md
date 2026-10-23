@@ -157,16 +157,18 @@ A state directory belongs to one project. Set `core.state_dir` in the project's 
 projects at the same directory, including with an absolute path. They would share lock files
 and overwrite each other's records of what ran, so each would see the other's stages as stale.
 
-`config get` and `config list` show the stored configuration value. They do not resolve the state
-directory, create anything, or warn when a stored `core.state_dir` is unusable. A command that
-reads or writes state does resolve it. If `.pivot/config.yaml` cannot be read, or its
-`core.state_dir` cannot be used or created as a writable, searchable directory (including a
-read-only directory), that command prints one warning naming the file and the problem. Pivot
-creates a configured state directory on its first write. Every state-using command that Pivot
-0.5.2 ran keeps its exit code and uses the default `.pivot`; a state-using command that 0.5.2
-failed still fails in one error line. The exception is a hand-edited empty value: `show` returns
-0 because it reads the retained `.pivot` run history, and `history` reports that same history.
-`--quiet` silences the warning.
+`config get core.state_dir` shows the stored configuration value. It does not resolve the state
+directory, create anything, or warn when that stored value is unusable. `config list` likewise
+does not resolve state; it displays a validated merged configuration. As in Pivot 0.5.2, a
+non-string `core.state_dir` makes `config list` fail in one line that names the key and its
+expected string type. A command that reads or writes state does resolve it. If
+`.pivot/config.yaml` cannot be read, or its `core.state_dir` cannot be used or created as a
+writable, searchable directory (including a read-only directory), that command prints one
+warning naming the file and the problem. Pivot creates a configured state directory on its first
+write. Every state-using command that Pivot 0.5.2 ran keeps its exit code and uses the default
+`.pivot`; a state-using command that 0.5.2 failed still fails in one error line. The exception
+is a hand-edited empty value: `show` returns 0 because it reads the retained `.pivot` run
+history, and `history` reports that same history. `--quiet` silences the warning.
 
 When a project created by Pivot 0.5.2 sets `core.state_dir`, Pivot reads a stage lock missing
 from the configured directory, and its cached objects, from `.pivot` until the state is moved.

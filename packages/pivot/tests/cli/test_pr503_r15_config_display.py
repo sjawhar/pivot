@@ -50,3 +50,36 @@ def test_config_display_never_warns_about_a_stored_unusable_state_dir(
     result = _run(root, home, _PIVOT, *command)
 
     assert "Pivot uses the default .pivot." not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("config", "stored_value"),
+    [
+        ("core:\n  state_dir: 5\n", "5"),
+        ("core:\n  state_dir: [a, b]\n", "a, b"),
+        ("core:\n  state_dir: {a: 1}\n", "{'a': 1}"),
+    ],
+    ids=["integer", "list", "mapping"],
+)
+def test_non_string_state_dir_matches_release_display_contract(
+    tmp_path: pathlib.Path, config: str, stored_value: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "project"
+    root.mkdir()
+    assert _run(root, home, "git", "init", "-q").returncode == 0
+    assert _run(root, home, _PIVOT, "init").returncode == 0
+    (root / ".pivot" / "config.yaml").write_text(config)
+
+    listed = _run(root, home, _PIVOT, "config", "list")
+    shown = _run(root, home, _PIVOT, "config", "get", "core.state_dir")
+
+    assert listed.returncode == 1, listed.stdout + listed.stderr
+    errors = [line for line in listed.stderr.splitlines() if line.startswith("Error:")]
+    assert len(errors) == 1, listed.stderr
+    assert "core.state_dir" in errors[0]
+    assert "string" in errors[0].lower()
+    assert shown.returncode == 0, shown.stdout + shown.stderr
+    assert shown.stdout == f"core.state_dir = {stored_value} (local)\n"
+    assert "Pivot uses the default .pivot." not in shown.stderr

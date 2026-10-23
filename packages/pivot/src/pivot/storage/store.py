@@ -73,8 +73,8 @@ class CacheStore:
                 ref_hash, _ = cache.hash_file(ref_path, db)
 
         cache_path = cache.resolve_cache_object_path(self._cache_dir, ref_hash)
-        if not cache_path.exists():
-            raise FileNotFoundError(cache_path)
+        if cache_path is None:
+            raise FileNotFoundError(ref_hash)
         return cache_path
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path:
@@ -287,10 +287,10 @@ class WorkspaceStore:
             return False
         if types.is_dir_hash(output_hash):
             return all(
-                cache.resolve_cache_object_path(self._cache_dir, entry["hash"]).exists()
+                cache.resolve_cache_object_path(self._cache_dir, entry["hash"]) is not None
                 for entry in output_hash["manifest"]
             )
-        return cache.resolve_cache_object_path(self._cache_dir, output_hash["hash"]).exists()
+        return cache.resolve_cache_object_path(self._cache_dir, output_hash["hash"]) is not None
 
     def resolve_display_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         """Resolve the workspace path for an artifact, for display/CLI use.

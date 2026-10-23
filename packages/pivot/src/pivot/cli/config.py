@@ -32,6 +32,13 @@ def _flatten_config(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return result
 
 
+def _raise_for_non_string_state_dir(data: dict[str, Any]) -> None:
+    """Keep config-list's release failure concise when its stored state value has the wrong type."""
+    value = _get_nested_value(data, "core.state_dir")
+    if value is not None and not isinstance(value, str):
+        raise click.ClickException("core.state_dir must be a string")
+
+
 @click.group()
 def config_cmd() -> None:
     """View and modify Pivot configuration."""
@@ -47,9 +54,12 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     data: dict[str, Any]
     if use_global:
         data = config.load_config_file(config.get_global_config_path())
+        _raise_for_non_string_state_dir(data)
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
+        _raise_for_non_string_state_dir(data)
     else:
+        _raise_for_non_string_state_dir(config.load_config_file(config.get_local_config_path()))
         merged = config.get_merged_config()
         data = merged.model_dump()
 

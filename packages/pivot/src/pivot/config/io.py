@@ -481,46 +481,44 @@ def get_run_history_retention() -> int:
     return merged.core.run_history_retention
 
 
-def locate_cache_dir() -> pathlib.Path:
-    """Return the configured cache location without creating project state."""
+def _effective_cache_dir() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Resolve the effective cache without creating state or cache directories."""
+    root = project.get_project_root()
     env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
-    cache_dir = pathlib.Path(env_cache or get_merged_config().cache.dir)
-    if not cache_dir.is_absolute():
-        cache_dir = project.get_project_root() / cache_dir
+    configured = pathlib.Path(env_cache or get_merged_config().cache.dir)
+    cache_dir = configured if configured.is_absolute() else root / configured
+    cache_dir = pathlib.Path(os.path.realpath(cache_dir))
+    state_dir = project.state_dir_or_default(root)
+    stages_dir = state_dir / "stages"
+    fallback_cache_dir = state_dir / "cache"
+    if (
+        cache_dir == stages_dir
+        or cache_dir.is_relative_to(stages_dir)
+        or stages_dir.is_relative_to(cache_dir)
+    ):
+        project.report_cache_stage_overlap(cache_dir, stages_dir, fallback_cache_dir)
+        cache_dir = fallback_cache_dir
+    return root, state_dir, cache_dir
+
+
+def locate_cache_dir() -> pathlib.Path:
+    """Return the effective cache location without creating project state."""
+    _, _, cache_dir = _effective_cache_dir()
     return cache_dir
 
 
 def get_cache_dir() -> pathlib.Path:
-    """Return a writer-facing cache directory without overlapping durable stage locks."""
-    root = project.get_project_root()
-    cache_dir = locate_cache_dir()
-    state_dir = project.state_dir_or_default(root)
-    resolved_cache_dir = pathlib.Path(os.path.realpath(cache_dir))
-    stages_dir = state_dir / "stages"
-    fallback_cache_dir = state_dir / "cache"
-    if (
-        resolved_cache_dir == stages_dir
-        or resolved_cache_dir.is_relative_to(stages_dir)
-        or stages_dir.is_relative_to(resolved_cache_dir)
-    ):
-        project.report_cache_stage_overlap(resolved_cache_dir, stages_dir, fallback_cache_dir)
-        cache_dir = fallback_cache_dir
-        resolved_cache_dir = fallback_cache_dir
-    if state_dir != root / ".pivot" and resolved_cache_dir.is_relative_to(state_dir):
+    """Return the effective writer-facing cache location, creating state only when required."""
+    root, state_dir, cache_dir = _effective_cache_dir()
+    if state_dir != root / ".pivot" and cache_dir.is_relative_to(state_dir):
         project.ensure_state_dir(root)
-        if resolved_cache_dir != fallback_cache_dir:
-            project.make_nested_cache_dir(resolved_cache_dir)
+        if cache_dir != state_dir / "cache":
+            project.make_nested_cache_dir(cache_dir)
     return cache_dir
 
 
 def get_state_dir() -> pathlib.Path:
-    """Get the current project's configured state directory, created when absent.
-
-    The merged config is loaded first, as 0.5.2 did here, so a config file that cannot be read
-    fails this call with its own message. A directory created here gets its ``.gitignore``, and
-    one that cannot be created is returned for the caller to fail on
-    (``project.ensure_state_dir``). An empty hand-edited path uses the default ``.pivot``.
-    """
+    """Get the current project's configured state directory, created when absent."""
     get_merged_config()
     root = project.get_project_root()
     try:
