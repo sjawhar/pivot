@@ -1139,8 +1139,10 @@ def save_to_cache(
         path: File or directory to save
         cache_dir: Cache directory
         state_db: Optional state database for hash caching
-        checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
-        checkout_modes: Ordered list of link modes to try with fallback on failure.
+        checkout_mode: Single link mode, with no fallback except that a hard link refused with
+            EMLINK is copied. Takes precedence over checkout_modes.
+        checkout_modes: Ordered list of link modes to try with fallback on failure; a hard link
+            refused with EMLINK is copied whatever the order is.
         state_dir: State directory for the workspace target's restore lock.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
@@ -1394,8 +1396,10 @@ def restore_from_cache(
         path: Target path to restore to
         output_hash: Hash info for the cached output
         cache_dir: Cache directory
-        checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
-        checkout_modes: Ordered list of link modes to try with fallback on failure.
+        checkout_mode: Single link mode, with no fallback except that a hard link refused with
+            EMLINK is copied. Takes precedence over checkout_modes.
+        checkout_modes: Ordered list of link modes to try with fallback on failure; a hard link
+            refused with EMLINK is copied whatever the order is.
         state_dir: State directory for restore locks and crash cleanup.
         lock_token: Target token yielded by an already-held restore_lock for path.
     """

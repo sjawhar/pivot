@@ -2681,6 +2681,7 @@ def _helper_restore_with_one_link_refused(
     [
         pytest.param(None, id="default-order"),
         pytest.param([cache.CheckoutMode.HARDLINK], id="hardlink-only"),
+        pytest.param([cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY], id="hardlink-copy"),
     ],
 )
 @pytest.mark.parametrize("kind", ["file", "directory"])
@@ -2692,8 +2693,8 @@ def test_restore_copies_a_cache_object_at_the_hard_link_limit(
 ) -> None:
     """A hard link refused with EMLINK means that one object already has as many links as the
     filesystem allows (65,000 on ext4). That entry is checked out as a copy: a regular file
-    with the object's bytes and its mode, never a symlink into the cache, even with symlink
-    next in the order or no copy in it."""
+    with the object's bytes and its mode, never a symlink into the cache, whether symlink,
+    copy or nothing comes next in the order."""
     full, full_object = _helper_restore_with_one_link_refused(
         tmp_path, monkeypatch, kind, errno.EMLINK, modes
     )
@@ -2718,6 +2719,53 @@ def test_restore_symlinks_when_a_hard_link_crosses_devices(
 
     assert full.is_symlink()
     assert full.resolve() == full_object.resolve()
+
+
+@pytest.mark.parametrize("operation", ["restore", "save"])
+def test_copy_at_the_hard_link_limit_is_staged_under_the_targets_restore_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """The copy made at the link limit is built under the target's deterministic restore name,
+    which the next restore or save of the target clears if this one is killed mid-copy, and
+    then renamed over the target."""
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("content\n")
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    if operation == "restore":
+        target.unlink()
+    _helper_refuse_links_to(
+        monkeypatch, cache.get_cache_path(cache_dir, output_hash["hash"]), errno.EMLINK
+    )
+    copied = list[pathlib.Path]()
+    renamed = list[tuple[pathlib.Path, pathlib.Path]]()
+    real_copy2 = shutil.copy2
+    real_replace = pathlib.Path.replace
+
+    def _copy2(source: str, dest: str, **kwargs: Any) -> object:
+        copied.append(pathlib.Path(dest))
+        return real_copy2(source, dest, **kwargs)
+
+    def _replace(self: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
+        renamed.append((self, pathlib.Path(dest)))
+        return real_replace(self, dest)
+
+    monkeypatch.setattr(shutil, "copy2", _copy2)
+    monkeypatch.setattr(pathlib.Path, "replace", _replace)
+
+    if operation == "restore":
+        assert cache.restore_from_cache(target, output_hash, cache_dir, state_dir=state_dir)
+    else:
+        cache.save_to_cache(target, cache_dir, state_dir=state_dir)
+
+    staging = cache.restore_staging_path(target)
+    assert [p for p in copied if p.parent == target.parent] == [staging]
+    assert renamed == [(staging, target)]
+    assert stat.S_ISREG(os.lstat(target).st_mode)
+    assert target.read_text() == "content\n"
+    assert not staging.exists()
 
 
 def test_commit_keeps_a_written_output_whose_cache_object_is_at_the_hard_link_limit(

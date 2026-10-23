@@ -869,7 +869,7 @@ pivot config unset default_remote
 | Key | Description | Default |
 |-----|-------------|---------|
 | `cache.dir` | Cache directory | `.pivot/cache` |
-| `cache.checkout_mode` | Checkout mode order; a cache object at the filesystem's hard-link limit is copied | `hardlink,symlink,copy` |
+| `cache.checkout_mode` | Checkout mode order; a hard link refused because the cache object is at the filesystem's link limit makes a copy instead | `hardlink,symlink,copy` |
 | `core.max_workers` | Most parallel workers (-1 = all CPUs); a run starts fewer when fewer of its stages can run at once | `-2` |
 | `core.run_history_retention` | Keep last N runs | `100` |
 | `core.state_dir` | State directory | `.pivot` |
