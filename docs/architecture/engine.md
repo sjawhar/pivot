@@ -170,7 +170,7 @@ async with Engine(pipeline=pipeline) as engine:
 | `StageStarted` | Stage begins | Stage name, index |
 | `StageCompleted` | Stage finishes | Status, reason, duration |
 | `LogLine` | Stage output | Line, is_stderr |
-| `PipelineReloaded` | Registry reload | Stages list, added/removed/modified |
+| `PipelineReloaded` | Registry reload, or the pipeline becomes invalid or valid again | Stages list, added/removed/modified, error |
 | `StageStateChanged` | State transition | Stage, old/new state |
 | `SinkStateChanged` | Sink disabled/enabled | Backoff state |
 | `EngineDiagnostic` | Non-fatal anomaly | Message, detail |

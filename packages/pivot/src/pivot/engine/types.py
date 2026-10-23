@@ -143,7 +143,7 @@ class EngineStateChanged(TypedDict):
 
 
 class PipelineReloaded(TypedDict):
-    """Registry was reloaded, DAG structure may have changed."""
+    """The pipeline was reloaded, or became invalid or valid again; ``error`` says why it is invalid."""
 
     type: Literal["pipeline_reloaded"]
     seq: NotRequired[int]
