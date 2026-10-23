@@ -156,7 +156,9 @@ and a thread native code starts outside `_thread`:
   once as Code changed after the upgrade. That accepted one-time rerun writes
   the current manifest; later runs reuse it until code or inputs change. Run
   `pivot repro --force <stage>` once to re-check a stage you know imports
-  dynamically.
+  dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns
+  once as Code changed, because each output's tag (`out:<key>:tag`) joined the
+  manifest; that run is checked, so it marks a stage that imports dynamically.
 
 
 ### Transitive Tracking
