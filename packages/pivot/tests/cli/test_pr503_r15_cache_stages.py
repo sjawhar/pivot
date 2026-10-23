@@ -1,4 +1,4 @@
-"""Round 15 C2: a cache may not overlap the directory containing committed stage locks."""
+"""A cache may not overlap the directory containing committed stage locks."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Round 14 B1: a custom cache below core.state_dir retains its state ignore template."""
+"""A custom cache below core.state_dir retains its state ignore template."""
 
 from __future__ import annotations
 

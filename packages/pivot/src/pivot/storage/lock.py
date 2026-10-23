@@ -340,25 +340,21 @@ class StageLock:
         self.stages_dir = stages_dir
         self.path = stages_dir / f"{stage_name}.lock"
 
-    def _read_path(self, path: pathlib.Path) -> tuple[bool, LockData | None]:
-        """Read one lock path, returning whether the path existed."""
+    def read(self) -> LockData | None:
+        """Read the configured lock, using its legacy location only on a primary miss."""
+        path = resolve_stage_lock_path(self.stages_dir, self.stage_name)
         try:
             with open(path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not is_lock_data(data):
                 logger.debug("Lock file %s failed validation; treating it as missing", path)
-                return True, None
-            return True, _convert_from_storage_format(data, stage_name=self.stage_name)
+                return None
+            return _convert_from_storage_format(data, stage_name=self.stage_name)
         except FileNotFoundError:
-            return False, None
+            return None  # Normal case - lock doesn't exist yet
         except (UnicodeDecodeError, yaml.YAMLError) as e:
             logger.warning("Failed to parse lock file %s: %s", path, e)
-            return True, None
-
-    def read(self) -> LockData | None:
-        """Read the configured lock, using its legacy location only on a primary miss."""
-        _, data = self._read_path(resolve_stage_lock_path(self.stages_dir, self.stage_name))
-        return data
+            return None
 
     def write(self, data: LockData) -> None:
         """Write lock file atomically, converting to storage format."""

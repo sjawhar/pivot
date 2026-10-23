@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import pytest
+import yaml
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -440,3 +441,40 @@ def test_state_commands_fail_on_an_invalid_local_config_as_on_052(
     errors = [line for line in result.stderr.splitlines() if line.startswith("Error")]
     assert errors and errors[0].startswith(f"Error: {invalid_yaml}"), result.stderr
     assert not (root / ".pivot" / "state.lmdb").exists()
+
+
+@pytest.mark.parametrize("layout", ["configured", "legacy"])
+@pytest.mark.parametrize("object_kind", ["symlink", "directory"])
+def test_push_dry_run_ignores_a_cache_object_that_is_not_a_regular_file(
+    tmp_path: pathlib.Path, layout: str, object_kind: str
+) -> None:
+    """A symlink or directory at a cache object path is absent, in the configured and 0.5.2 caches."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _project(home, tmp_path / "project", "input\n")
+    if layout == "configured":
+        _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "altstate"))
+    _ok(_run_with_home(root, home, _PIVOT, "repro"))
+    if layout == "legacy":
+        _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "altstate"))
+    _ok(_run_with_home(root, home, _PIVOT, "config", "set", "remotes.origin", "s3://cache-objects"))
+
+    state = root / "altstate" if layout == "configured" else root / ".pivot"
+    lock = yaml.safe_load((state / "stages" / "test" / "process.lock").read_text())
+    file_hash = lock["outs"][0]["hash"]
+    cache_object = state / "cache" / "files" / file_hash[:2] / file_hash[2:]
+    cache_object.unlink()
+    marker = "CACHE-OBJECT-TARGET"
+    if object_kind == "symlink":
+        target = root / "outside-cache-object"
+        target.write_text(f"{marker}\n")
+        cache_object.symlink_to(target)
+    else:
+        cache_object.mkdir()
+
+    result = _run_with_home(root, home, _PIVOT, "push", "--dry-run", "--remote", "origin")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert marker not in output, output
+    assert "Would push 0 file(s)" in result.stdout, output

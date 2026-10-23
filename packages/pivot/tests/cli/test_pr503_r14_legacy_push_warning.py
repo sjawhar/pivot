@@ -1,4 +1,4 @@
-"""Round 14 B3: push dry-run reports a legacy cache scan once."""
+"""Push dry-run reports a legacy cache scan once."""
 
 from __future__ import annotations
 

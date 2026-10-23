@@ -1,5 +1,5 @@
-"""R5 defect 4: with a global core.state_dir, commands that never load the merged config print
-no warning, so `history`/`show` silently read an empty .pivot/state.lmdb after an upgrade."""
+"""Every command that uses the state directory warns once that a global `core.state_dir` is
+ignored; commands that never use it stay silent."""
 
 from __future__ import annotations
 
@@ -63,19 +63,18 @@ def _case_id(value: object) -> str | None:
 @pytest.mark.parametrize(
     ("args", "uses_state"),
     [
-        # Control, warns at 392187f8: status loads the merged config.
+        # Commands that use the state directory.
         (("status",), True),
         # Read the state database whose location changed for global-value users.
         (("history",), True),
         (("show",), True),
         (("fingerprint", "reset"), True),
-        # Other project commands that print nothing about the ignored value.
+        # Commands that resolve the state directory while loading the pipeline.
         (("init", "--force"), True),
         (("list",), True),
         (("dag",), True),
         (("plots", "show"), True),
-        # PR503_ROUND10 L2 ruling: only commands that use the state directory warn. These
-        # read remotes, imports or another key, never state, so they stay quiet.
+        # These read remotes, imports or another key, never state, so they stay quiet.
         (("remote", "list"), False),
         (("update", "--dry-run"), False),
         (("config", "set", "core.max_workers", "2"), False),

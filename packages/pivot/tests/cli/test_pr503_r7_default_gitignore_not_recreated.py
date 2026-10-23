@@ -1,13 +1,8 @@
-"""R7 defect G4: in the default layout, read commands recreate a deleted `.pivot/.gitignore`.
+"""In the default layout, only `init` writes `.pivot/.gitignore`, as on 0.5.2.
 
-Without `core.state_dir`, 0.5.2 writes `.pivot/.gitignore` only in `init` (and when it first creates
-`secret.key`). At ce74ad41, `project.ensure_state_dir` runs `create_gitignore_if_absent` on every
-state lookup, so `list`, `dag` and `status` recreate the file after a user deletes it, and in a
-`.pivot` the user cannot write (mode 0555) they now exit 1 with `PermissionError` where 0.5.2
-exits 0. The 17:20Z closed rule says the default `.pivot` behaves exactly as on main; the C1 rule
-writes an ignore file only when Pivot creates the state directory, and here `.pivot` already exists.
-
-The `present` case is the control: with the file in place the read-only `.pivot` works on both.
+A state directory gets its ignore file only when Pivot creates it, and `.pivot` already exists.
+So `list`, `dag` and `status` leave a deleted `.pivot/.gitignore` deleted, and run in a `.pivot`
+the user cannot write (mode 0555), with or without the file.
 """
 
 from __future__ import annotations

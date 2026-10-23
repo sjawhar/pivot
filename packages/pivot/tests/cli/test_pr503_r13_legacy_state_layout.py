@@ -1,4 +1,4 @@
-"""Round 13: a project built by Pivot 0.5.2 remains readable after core.state_dir is set."""
+"""A project built by Pivot 0.5.2 remains readable after core.state_dir is set."""
 
 from __future__ import annotations
 

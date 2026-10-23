@@ -81,7 +81,7 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo("Created:")
         click.echo("  .pivot/")
         click.echo(f"  {_display_path(stages_dir, cwd)}/")
-        for gitignore_path in dict.fromkeys(created_gitignores):
+        for gitignore_path in created_gitignores:
             click.echo(f"  {_display_path(gitignore_path, cwd)}")
         if created_pivotignore:
             click.echo("  .pivotignore")

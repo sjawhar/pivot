@@ -75,7 +75,6 @@ def commit_stages(
 
     def _get_state_db(stage_state_dir: pathlib.Path) -> state_mod.StateDB:
         if stage_state_dir not in state_dbs:
-            project.make_state_dir(stage_state_dir)
             state_dbs[stage_state_dir] = state_mod.StateDB(stage_state_dir)
         return state_dbs[stage_state_dir]
 

@@ -1,4 +1,4 @@
-"""Round 14 B2: diff reads the legacy cache after core.state_dir changes."""
+"""`diff` reads the legacy cache after core.state_dir changes."""
 
 from __future__ import annotations
 

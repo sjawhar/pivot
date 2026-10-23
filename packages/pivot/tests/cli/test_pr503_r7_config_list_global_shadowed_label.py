@@ -1,15 +1,7 @@
-"""R7 defect G5: `config list --global` labels a shadowed global `core.state_dir` as `(local)`.
+"""`config list --global` labels a global `core.state_dir` `(global, ignored)`.
 
-The J1 ruling (21:15Z) says a global `core.state_dir` is ignored and `config get` and `config list`
-mark it as ignored. With a global `core.state_dir: globalstate` and a project that sets its own
-`core.state_dir: localstate`, `config get --global core.state_dir` prints
-`core.state_dir = globalstate (global, ignored)`, but `config list --global` prints
-`core.state_dir = globalstate (local)`: the global file's value under the local label.
-`cli/config.py:72` takes the label from `get_config_value`, which answers for the merged config
-(local wins), while the value comes from the global file. 0.5.2 prints `(local)` here too, so this
-is not a regression; it is a case inside J1's contract that misbehaves.
-
-The unshadowed project is the control: `config list --global` prints `(global, ignored)` there.
+A global `core.state_dir` is ignored, so the label holds whether or not the project sets its own
+value. 0.5.2 printed `(local)` when the project set one.
 """
 
 from __future__ import annotations

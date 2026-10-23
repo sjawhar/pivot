@@ -1,7 +1,6 @@
-"""R6 defect 1: `config get --global core.state_dir` outside a project exits 1 with a traceback.
+"""`config get --global core.state_dir` and `config unset --global` work outside a project.
 
-Pivot 0.5.2 (and 392187f8) print the global value and exit 0. Round 10's N4 change calls
-`project.report_ignored_global_state_dir()`, which needs a project root.
+Outside a project nothing ignores the global value, so it is labeled `(global)` as on 0.5.2.
 """
 
 from __future__ import annotations
@@ -84,7 +83,7 @@ def test_config_get_global_state_dir_ignores_an_invalid_local_config(
 
 
 def test_config_unset_global_state_dir_works_outside_a_project(tmp_path: pathlib.Path) -> None:
-    """Control, passes at 3c3cceb8: the fix the warning names works outside a project."""
+    """The fix the ignored-value warning names works outside a project."""
     home, cwd = _outside_any_project(tmp_path)
 
     result = _run(cwd, home, _PIVOT, "config", "unset", "--global", "core.state_dir")

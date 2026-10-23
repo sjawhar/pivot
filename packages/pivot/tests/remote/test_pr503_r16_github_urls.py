@@ -1,4 +1,4 @@
-"""Round 16 G1 red tests for GitHub Contents URL encoding.
+"""GitHub Contents URL encoding.
 
 A source config controls a GitHub Contents path. The reader must request exactly its owner/repo
 contents prefix, segment-encode every path component, and send the imported revision as the sole

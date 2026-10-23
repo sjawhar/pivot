@@ -1,4 +1,4 @@
-"""Round 14 B8: the deep audit's `impdrv.py`, case for case, as a test.
+"""`pivot import` reads a source's locks where Pivot 0.5.2 read them.
 
 `pivot import --no-download` from a local git source whose `.pivot/config.yaml` has a problem,
 or that 0.5.2 configured with a valid `core.state_dir` while its locks stayed in `.pivot/stages`.
@@ -6,9 +6,9 @@ Pivot 0.5.2 read every one of these sources' locks from `.pivot/stages` at the r
 exited 0. The head does the same and prints one warning naming the source, except for the
 control, which has no state-directory problem and prints none.
 
-`impdrv.py` traced `open` calls to show that no decoy and no source worktree file is read. This
-test shows the same by behaviour: every decoy lock, and the source worktree's own lock after the
-commit, records `_DECOY_HASH`, so a read of any of them puts that hash in the `.pvt` file.
+No decoy and no source worktree file is read: every decoy lock, and the source worktree's own
+lock after the commit, records `_DECOY_HASH`, so a read of any of them puts that hash in the
+`.pvt` file.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ _DECOY_LOCK = {**_LOCK, "outs": [{"key": None, "tag": "data", "hash": _DECOY_HAS
 _REMOTES = "remotes:\n  origin: s3://source-cache\n"
 _WARNING = "Ignoring core.state_dir"
 
-# impdrv.py CASES: name -> (config text, symlink to create in the source or None).
+# name -> (config text, symlink to create in the source or None).
 # {E} is the decoy directory beside the source.
 _CASES: dict[str, tuple[str, tuple[str, str] | None]] = {
     "dup-key": ("core:\n  max_workers: 1\n  max_workers: 2\n" + _REMOTES, None),

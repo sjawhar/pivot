@@ -1,16 +1,9 @@
-"""R7 defect G2: a readable local config whose `core.state_dir` is not a path stops listing.
+"""A readable local config whose `core.state_dir` is not a path keeps 0.5.2's listing behaviour.
 
 With a hand-edited `core.state_dir` of `''`, `5`, `[a, b]` or `{x: 1}`, the file itself is valid YAML.
 0.5.2 runs `list`, `list --json`, `dag`, `plots show` and `init --force` (exit 0) and lists the stage
-in shell completion, because none of them read `core.state_dir`. At ce74ad41 each exits 1 with
-`core.state_dir in <file> must be a path`, and TAB completion returns nothing:
-`project.state_dir_if_readable` (the 06:42Z warn-first path) catches only a config that cannot be
-parsed; `_resolve_configured_state_dir` raises for an unusable value and nothing catches it in
-`compose._stage_state_dir`, `discovery.glob_all_pipelines` or `cli/init.py`.
-
-The rollout rule the 06:42Z ruling applied to an unreadable file (warn, keep listing, exit 0) fits
-this case the same way: listing never needs the state directory. `status` is the control: it fails
-with one `Error:` line on the head, as `repro` and `status` fail on 0.5.2 for the non-string values.
+in shell completion, because none of them read `core.state_dir`. Pivot does the same with one
+warning, since listing never needs the state directory. `status` keeps 0.5.2's exit code.
 """
 
 from __future__ import annotations

@@ -1,13 +1,8 @@
-"""R7 defect G1: with an unreadable local config, `init --force` and `plots show` now refuse.
+"""With an unreadable local config, `init --force` and `plots show` run as on 0.5.2.
 
 With `.pivot/config.yaml` that is invalid YAML or unreadable (mode 000), 0.5.2 runs `init --force`
 (exit 0, config left byte-identical) and `plots show` on a pipeline with no plots (exit 0, "No plots
-found."): neither reads the config there. At ce74ad41 both exit 1 with the config's error, because
-`cli/init.py` calls `project.state_dir_is_configured` and `cli/plots.py:43` resolves the default
-output under the state directory before it knows there is anything to render. The 06:42Z ruling
-and the census name only `list` and `dag`; these two refusals are new and not in the census.
-
-`status` is the control: it fails on 0.5.2 and on the head with the same `Error:` line.
+found."): neither reads the config there. `status` still fails with the same `Error:` line.
 """
 
 from __future__ import annotations
@@ -109,7 +104,7 @@ def test_plots_show_with_no_plots_runs_with_an_unreadable_local_config(
 def test_status_still_fails_with_the_config_error(
     broken_local: tuple[str, pathlib.Path, pathlib.Path, pathlib.Path],
 ) -> None:
-    """Control, passes on 0.5.2 and at ce74ad41: a state command fails with one `Error:` line."""
+    """A state command fails with one `Error:` line, as on 0.5.2."""
     kind, home, root, config = broken_local
 
     result = _run(root, home, _PIVOT, "status")

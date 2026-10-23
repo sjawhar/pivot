@@ -1,4 +1,4 @@
-"""R5 defect 2: a directory that is writable but not searchable passes the preflight."""
+"""`config set core.state_dir` refuses a directory that is not writable and searchable."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def _run(cwd: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
 @pytest.mark.parametrize(
     ("mode", "value"),
     [
-        # Control, refused at 392187f8: read-only parent (J5).
+        # Read-only parent.
         (0o555, "dir/state"),
         # Writable but not searchable (no x bit): nothing can be created or opened inside.
         (0o600, "dir"),

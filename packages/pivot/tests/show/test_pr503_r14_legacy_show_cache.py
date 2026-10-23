@@ -1,4 +1,4 @@
-"""Round 14 B2: show readers resolve release cache objects in an upgraded layout."""
+"""Show readers resolve release cache objects in an upgraded layout."""
 
 from __future__ import annotations
 

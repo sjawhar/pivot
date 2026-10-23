@@ -1,15 +1,10 @@
-"""R7 defect G3: a local config that is not UTF-8 stops listing, outside the 06:42Z warn-first path.
+"""A local config that is not UTF-8 keeps 0.5.2's listing behaviour.
 
-`.pivot/config.yaml` holding one non-UTF-8 byte (here a Latin-1 `é` in a comment) cannot be read by
-the config loader: ruamel raises `UnicodeDecodeError`, which is not a `ConfigError`. 0.5.2 runs
-`list`, `list --json`, `list --all`, `dag`, `plots show` and `init --force` (exit 0) and lists the
-stage in shell completion, because none of them read the config. At ce74ad41 they exit 1 with
-`Failed to load pipeline.py: 'utf-8' codec can't decode byte 0xe9 ...` (TAB completion returns
-nothing): `project.state_dir_if_readable` catches only `ConfigError`. The global-config path
-(`warn_if_global_state_dir_ignored`) already catches `UnicodeDecodeError`, and with a non-UTF-8
-global file every command matches 0.5.2.
-
-The 06:42Z ruling covers an unreadable local config: `list` and `dag` warn once on stderr and exit 0.
+`.pivot/config.yaml` holding one non-UTF-8 byte (here a Latin-1 `é` in a comment) cannot be read.
+0.5.2 runs `list`, `list --json`, `list --all`, `dag`, `plots show` and `init --force` (exit 0) and
+lists the stage in shell completion, because none of them read the config. Pivot does the same and
+`list` and `dag` print one warning on stderr naming the unknown state directory. `history`, which
+uses state, still fails in one `Error:` line.
 """
 
 from __future__ import annotations
@@ -86,7 +81,7 @@ def test_commands_that_never_read_state_still_run(
 
 @pytest.mark.parametrize("args", [("list",), ("dag",)], ids=lambda args: "-".join(args))
 def test_list_and_dag_warn_once_on_stderr(tmp_path: pathlib.Path, args: tuple[str, ...]) -> None:
-    """The 06:42Z warn-first rule: one warning on stderr naming the unknown state directory."""
+    """One warning on stderr naming the unknown state directory."""
     home, root = _project(tmp_path)
 
     result = _run(root, home, _PIVOT, *args)
@@ -121,7 +116,7 @@ def test_tab_completion_still_lists_stages(tmp_path: pathlib.Path) -> None:
 
 
 def test_history_still_fails(tmp_path: pathlib.Path) -> None:
-    """Control, passes on 0.5.2 and at ce74ad41: a state command exits 1 with one `Error:` line."""
+    """A state command exits 1 with one `Error:` line, as on 0.5.2."""
     home, root = _project(tmp_path)
 
     result = _run(root, home, _PIVOT, "history")

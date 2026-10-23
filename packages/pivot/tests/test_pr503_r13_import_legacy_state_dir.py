@@ -1,4 +1,4 @@
-"""Round 13: imports retain Pivot 0.5.2 source layouts with a configured state directory."""
+"""Imports retain Pivot 0.5.2 source layouts with a configured state directory."""
 
 from __future__ import annotations
 

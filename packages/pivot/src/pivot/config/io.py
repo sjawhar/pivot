@@ -251,7 +251,7 @@ def get_merged_config() -> models.PivotConfig:
 
     defaults = models.PivotConfig.get_default().model_dump()
 
-    global_data = copy.deepcopy(load_config_file(get_global_config_path()))
+    global_data = load_config_file(get_global_config_path())
     unset_nested(global_data, ["core", "state_dir"])
     merged = deep_merge(defaults, global_data)
 

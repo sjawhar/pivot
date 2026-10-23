@@ -97,18 +97,11 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     if (cached := _state_dir_cache.get(root)) is not None:
         return cached
 
+    from pivot import exceptions
     from pivot.config import io as config_io
 
     config_path = root / ".pivot" / "config.yaml"
     present, configured = config_io.read_config_file_value(config_path, "core.state_dir")
-    return _resolve_configured_state_dir(root, config_path, present, configured)
-
-
-def _resolve_configured_state_dir(
-    root: pathlib.Path, config_path: pathlib.Path, present: bool, configured: object
-) -> pathlib.Path:
-    from pivot import exceptions
-
     if configured is None:
         state_dir = root / ".pivot"
     elif is_valid_state_dir_value(configured):
@@ -411,7 +404,8 @@ def make_nested_cache_dir(cache_dir: pathlib.Path) -> None:
 def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
     """Return an initialized project's state directory, creating it when absent.
 
-    An empty hand-edited ``core.state_dir`` uses the default state directory as 0.5.2 did.
+    An empty hand-edited ``core.state_dir`` falls back to ``<root>/.pivot`` through
+    ``state_dir_or_default``.
     Other invalid config values still raise ``ConfigError``. A directory this call creates gets
     the default ``.gitignore``. One that already exists is left as it is, so a deleted
     ``.pivot/.gitignore`` stays deleted until ``init`` writes it. A directory that cannot be

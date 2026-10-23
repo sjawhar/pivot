@@ -1,10 +1,9 @@
-"""R8: the docs and the warning state a different rule than the differential rule (12:12Z).
+"""The warning and the docs state the rule for an unusable local `core.state_dir`.
 
 The rule: every command 0.5.2 ran keeps 0.5.2's exit code and uses the default `.pivot`; every
 command 0.5.2 failed still fails, in one line. Under `core.state_dir: afile` (a regular file),
-`pivot track` writes state, exits 0 as on 0.5.2, and writes its cache under `.pivot`. The warning
-it prints says that only "commands that do not need it use the default .pivot", and
-`docs/concepts/pipelines.md` says commands that read or write state "fail with a one-line error".
+`pivot track` writes state, exits 0 as on 0.5.2, and writes its cache under `.pivot`, so neither
+the warning nor `docs/concepts/pipelines.md` may say that commands which use state fail.
 Run from `packages/pivot/tests/cli/` of a source tree; the docs check reads that tree's docs.
 """
 

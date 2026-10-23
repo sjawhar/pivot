@@ -1,4 +1,4 @@
-"""Round 14 B4: an unusable local state directory owns the one warning."""
+"""An unusable local state directory owns the one warning."""
 
 from __future__ import annotations
 

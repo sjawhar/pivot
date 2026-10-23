@@ -1,10 +1,8 @@
-"""R6 defect 3: the resolver reads `.pivot/config.yaml` as YAML 1.1, everything else as YAML 1.2.
+"""A `core.state_dir` value that YAML 1.1 reads as a bool or a number names a directory.
 
 `config set` writes with ruamel (YAML 1.2), where `on`, `off`, `yes`, `no` and `1:20` are plain
-strings, so it stores `state_dir: on` unquoted, exactly as 0.5.2 does. `project._read_core_state_dir`
-reads the same file with PyYAML (YAML 1.1), where `on` is True and `1:20` is the integer 80. So the
-value is written, `config set` exits 1 with a traceback, and every later command refuses the
-config. `config get core.state_dir` still prints the string. 0.5.2 uses the directory `on/`.
+strings, so it stores `state_dir: on` unquoted, exactly as 0.5.2 does. The resolver reads the file
+with the same YAML 1.2 loader, so the value names the directory `on/`, as on 0.5.2.
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ def test_a_state_dir_named_like_a_yaml_1_1_scalar_is_a_directory(
 ) -> None:
     """As in 0.5.2, the value names the directory `<root>/<value>` and the pipeline runs there.
 
-    `y` is the control: it is a string in both YAML versions and passes at 3c3cceb8.
+    `y` is a string in both YAML versions.
     """
     root = _project(tmp_path)
     config_path = root / ".pivot" / "config.yaml"

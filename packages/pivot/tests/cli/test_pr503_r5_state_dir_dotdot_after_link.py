@@ -1,4 +1,4 @@
-"""R5 defect 1: `..` after a link is normalized lexically, so an unusable target is written."""
+"""A `core.state_dir` reached through a link and `..` is checked where the kernel resolves it."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _run(cwd: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
 @pytest.mark.parametrize(
     "case",
     [
-        # Control, refused at 392187f8: `nested` is missing, so `nested/..` is the root.
+        # `nested` is missing, so `nested/..` is the root.
         "control-missing-component",
         # `nested` -> outside/dir, so the kernel reads `nested/../state` as outside/state, a file.
         "symlink-then-parent-segment",

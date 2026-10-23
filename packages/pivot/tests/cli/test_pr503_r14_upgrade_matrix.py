@@ -1,13 +1,13 @@
-"""Round 14 B8: the deep audit's `upgdrv.py`, case for case, as a test.
+"""Commands on a project that Pivot 0.5.2 laid out, after core.state_dir is set.
 
-`upgdrv.py` built each project with Pivot 0.5.2 (`init`, `config set core.state_dir`, `repro`,
-then `git add -A` and a commit). This test writes the layout 0.5.2 left, as the driver recorded
-it on pivot-slices: locks, cache and run history in `.pivot`; in the configured state directory
-only `locks/` and `state.lmdb`, with no `.gitignore`, so a relative one is committed with
-`.pivot/config.yaml`. The default `.pivot` layout is byte-identical to 0.5.2's, so the head builds
-it. Each case (none, a relative `altstate`, an absolute directory outside the project) then runs
-one command per copy. Every command keeps 0.5.2's exit code (0). Configured layouts read the
-legacy locks and cache and print the migration warning once; the unconfigured layout prints none.
+Pivot 0.5.2 (`init`, `config set core.state_dir`, `repro`, then `git add -A` and a commit) left
+locks, cache and run history in `.pivot`; in the configured state directory only `locks/` and
+`state.lmdb`, with no `.gitignore`, so a relative one is committed with `.pivot/config.yaml`.
+This test writes that layout. The default `.pivot` layout is byte-identical to 0.5.2's, so the
+head builds it. Each case (none, a relative `altstate`, an absolute directory outside the
+project) then runs one command per copy. Every command keeps 0.5.2's exit code (0). Configured
+layouts read the legacy locks and cache and print the migration warning once; the unconfigured
+layout prints none.
 """
 
 from __future__ import annotations
@@ -35,14 +35,14 @@ with Pipeline("test") as pipeline:
 """
 _WARNING = "Pivot 0.5.2 stored locks and cache"
 
-# upgdrv.py CASES: name -> core.state_dir value ({outside} is a directory beside the project).
+# name -> core.state_dir value ({outside} is a directory beside the project).
 _CASES: dict[str, str | None] = {
     "none": None,
     "altstate": "altstate",
     "abs-outside": "{outside}/st",
 }
 
-# upgdrv.py COMMANDS, with whether the command reads stage locks or cache objects.
+# Commands, with whether each reads stage locks or cache objects.
 _COMMANDS: dict[str, tuple[tuple[str, ...], bool]] = {
     "status": (("status",), True),
     "verify": (("verify",), True),

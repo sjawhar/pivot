@@ -1,4 +1,4 @@
-"""Round 15 B1: configuration displays do not resolve an unusable state directory."""
+"""Configuration displays do not resolve an unusable state directory."""
 
 from __future__ import annotations
 

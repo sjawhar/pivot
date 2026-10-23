@@ -1,10 +1,9 @@
-"""R6 defect 2: a project without core.state_dir fails when ~/.config/pivot/config.yaml is broken.
+"""A broken `~/.config/pivot/config.yaml` keeps 0.5.2's behaviour in a project without one.
 
-Round 10's resolver reads the global config on every state lookup to decide whether to warn
-(`project.warn_if_global_state_dir_ignored` -> `_read_core_state_dir`), and lets a YAML error or a
-PermissionError escape. With an invalid or unreadable global file, `init`, `list`, `dag`,
-`plots show` and `init --force` now exit 1, where 0.5.2 and 392187f8 exit 0, and `status` and
-`history` lose 0.5.2's error message.
+Pivot reads the global file only to decide whether to warn about an ignored global
+`core.state_dir`, and stays silent when it cannot. With an invalid or unreadable global file,
+`init`, `list`, `dag`, `plots show` and `init --force` exit 0 as on 0.5.2, and `status` and
+`history` keep 0.5.2's one-line error naming the file.
 """
 
 from __future__ import annotations
@@ -127,7 +126,7 @@ def test_second_init_after_a_broken_global_config_behaves_like_052(
 def test_commands_that_read_global_config_keep_the_052_message(
     broken: tuple[str, pathlib.Path, pathlib.Path, pathlib.Path], args: tuple[str, ...]
 ) -> None:
-    """0.5.2 exits 1 here with one `Error:` line naming the file (392187f8's history exited 0)."""
+    """0.5.2 exits 1 here with one `Error:` line naming the file."""
     kind, home, root, global_config = broken
 
     result = _run(root, home, _PIVOT, *args)

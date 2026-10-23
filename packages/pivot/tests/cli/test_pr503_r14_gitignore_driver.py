@@ -1,10 +1,8 @@
-"""Round 14 B8: the deep audit's `gitignore.sh`, case for case, as a test.
+"""`.gitignore` creation, bytes and mode, and config locking, for each state layout.
 
-Under umask 0002 and 0022, each case checks `.gitignore` creation, bytes and mode, and config
-locking, as the driver printed them (`out/gi_head.out`). Every command exits 0, as on 0.5.2
-(`out/gi_rel.out`). The one intended difference from 0.5.2: a configured state directory that
-Pivot creates gets the default template (0.5.2 wrote none there, because it kept its state in
-`.pivot`).
+Under umask 0002 and 0022, every command exits 0, as on 0.5.2. The one intended difference from
+0.5.2: a configured state directory that Pivot creates gets the default template (0.5.2 wrote
+none there, because it kept its state in `.pivot`).
 """
 
 from __future__ import annotations

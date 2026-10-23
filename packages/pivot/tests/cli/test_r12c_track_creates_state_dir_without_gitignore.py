@@ -1,16 +1,8 @@
-"""R12 completeness B1: `track` creates a configured state directory without its `.gitignore`.
+"""`track` keeps what it writes under a new configured state directory out of git.
 
 `core.state_dir: fresh` is set in `.pivot/config.yaml` while `fresh/` does not exist yet (a hand
-edit, or a state directory the user deleted). `pivot track` writes its cache under
-`fresh/cache/` through `config.get_cache_dir()`, which never calls `project.ensure_state_dir`, so
-`fresh/` is made by the cache write with no `.gitignore`. Every later command sees an existing
-directory and returns from `ensure_state_dir` before writing one, so the cache and the state
-database stay visible to git for good.
-
-The C1 ruling says Pivot writes the state directory's `.gitignore` whenever it creates the
-directory. At ce74ad41 the pipeline load created it through `ensure_state_dir` first, so the
-`pipeline` case passed; 0.5.2 kept the cache in `.pivot/cache`, so nothing `track` wrote was
-visible to git.
+edit, or a state directory the user deleted). `pivot track` writes its cache under `fresh/cache/`,
+and Pivot creates `fresh/` with its `.gitignore` before writing there, with or without a pipeline.
 """
 
 from __future__ import annotations
@@ -89,6 +81,6 @@ def test_track_keeps_what_it_writes_out_of_git(tmp_path: pathlib.Path, with_pipe
         )
     assert _exposed_state_files(root, home) == []
 
-    # A later state command does not repair it either.
+    # A later state command keeps the runtime files ignored too.
     assert _run(root, home, _PIVOT, "status").returncode in {0, 1}
     assert _exposed_state_files(root, home) == []

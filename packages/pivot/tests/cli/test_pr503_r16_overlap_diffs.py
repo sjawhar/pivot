@@ -1,9 +1,8 @@
-"""Round 16 R15-C2: readers use the non-overlapping effective cache directory.
+"""Readers use the non-overlapping effective cache directory.
 
 Each fixture keeps its old output out of Git and places it in `<state>/cache`, then makes the
-configured or environment-selected cache overlap `<state>/stages`. Before the effective-cache
-resolver, diff looks only below the overlapping path and reports the output as added. The fixed
-reader warns once and uses `<state>/cache`, reporting the old/new modification instead.
+configured or environment-selected cache overlap `<state>/stages`. The reader warns once and
+uses `<state>/cache`, reporting the old/new modification.
 """
 
 from __future__ import annotations

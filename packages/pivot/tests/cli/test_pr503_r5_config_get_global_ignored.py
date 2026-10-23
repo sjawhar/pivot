@@ -1,5 +1,4 @@
-"""R5 defect 5: `config get --global core.state_dir` presents the ignored value as in effect,
-while `config list --global` in the same project marks it `(global, ignored)`."""
+"""`config get --global` and `config list --global` label a global `core.state_dir` ignored."""
 
 from __future__ import annotations
 
@@ -33,7 +32,6 @@ def test_config_get_global_marks_the_state_dir_ignored(tmp_path: pathlib.Path) -
     listed = _run(root, home, _PIVOT, "config", "list", "--global")
     got = _run(root, home, _PIVOT, "config", "get", "--global", "core.state_dir")
 
-    # Control, passes at 392187f8.
     assert "core.state_dir = globalstate (global, ignored)" in listed.stdout, listed.stdout
     assert got.returncode == 0, got.stdout + got.stderr
     assert got.stdout == "core.state_dir = globalstate (global, ignored)\n", got.stdout

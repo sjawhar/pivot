@@ -1,5 +1,5 @@
-"""R5 defect 3: set/unset over a hand-edited state_dir that is not a usable directory exits 1
-with a traceback after writing the config. Pivot 0.5.2 exits 0 with one line."""
+"""`config set` and `config unset` replace a hand-edited `core.state_dir` that names no usable
+directory, and exit 0 as on 0.5.2."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _run(cwd: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
 def test_config_set_and_unset_replace_an_unusable_hand_edited_state_dir(
     tmp_path: pathlib.Path, old: str, action: str
 ) -> None:
-    """Like 0.5.2, the command succeeds in one line and the config holds the new value."""
+    """Like 0.5.2, the command succeeds with its confirmation and the config holds the new value."""
     if old == "unreadable-directory" and os.geteuid() == 0:
         pytest.skip("root ignores directory permission bits")
     root = tmp_path / "project"
