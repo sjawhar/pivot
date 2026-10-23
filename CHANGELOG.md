@@ -2,6 +2,60 @@
 
 <!-- version list -->
 
+## v0.5.8 (2026-10-23)
+
+### Bug Fixes
+
+- **cli**: An absolute path typed through a symlink to the project root names the file it points to
+  in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch`, `pull` and `track`, instead of matching
+  nothing or being refused as outside the project
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **compose**: After upgrading, stages with outputs rerun once because output tags are part of their
+  fingerprint; stages with no outputs remain cached
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **compose**: Harden directory output handling ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: A stage whose output path changes with its loader, such as `loaders.CSV()` to
+  `loaders.DataFrameJSONL()`, no longer exits 1 with `ValueError('Invalid JSON …')`
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: An entry whose git HEAD content is not in the local cache is reported with unknown
+  counts and a `pivot fetch` warning instead of aborting the diff, and `--json` entries carry
+  `change_type` ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: Key git HEAD and the workspace by path, so an output that moves is removed at its HEAD
+  path and added at its new one, and a path whose kind changed is named with both kinds and not
+  compared ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: One selection decides, for git HEAD and the workspace, which stage outputs and directory
+  members each target names, and a target that names no CSV, JSON or JSONL file is named in a
+  warning ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **rpc**: `diff_output` answers a modified file whose two sides are cached instead of dropping the
+  connection on numpy or datetime values, and refuses a request naming neither hash
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **storage**: A lock records and reads back every directory member name it can hold, including
+  spaces and format characters such as a macOS screenshot's; a control character is recorded with a
+  warning that a later release refuses it, and a backslash fails the stage naming the file
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff` resolves
+  them into workspace files ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+
 ## v0.5.7 (2026-10-23)
 
 ### Bug Fixes
