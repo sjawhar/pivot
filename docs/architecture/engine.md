@@ -158,7 +158,7 @@ async with Engine(pipeline=pipeline) as engine:
 | Event | Trigger | Action |
 |-------|---------|--------|
 | `DataArtifactChanged` | File modified | Run affected stages |
-| `CodeOrConfigChanged` | Python/config modified | Reload registry, run all |
+| `CodeOrConfigChanged` | Python/config modified, with the same watch batch's data files | Reload registry, run all |
 | `RunRequested` | CLI/RPC command | Run specified stages |
 | `CancelRequested` | User interrupt | Stop starting new stages |
 
@@ -170,7 +170,7 @@ async with Engine(pipeline=pipeline) as engine:
 | `StageStarted` | Stage begins | Stage name, index |
 | `StageCompleted` | Stage finishes | Status, reason, duration |
 | `LogLine` | Stage output | Line, is_stderr |
-| `PipelineReloaded` | Registry reload | Stages list, added/removed/modified |
+| `PipelineReloaded` | Registry reload, or the pipeline becomes invalid or valid again | Stages list, added/removed/modified, error |
 | `StageStateChanged` | State transition | Stage, old/new state |
 | `SinkStateChanged` | Sink disabled/enabled | Backoff state |
 | `EngineDiagnostic` | Non-fatal anomaly | Message, detail |

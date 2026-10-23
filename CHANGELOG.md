@@ -2,6 +2,193 @@
 
 <!-- version list -->
 
+## v0.5.6 (2026-10-23)
+
+### Bug Fixes
+
+- **fingerprint**: A result marked as not reusable is never restored from the run cache, and pivot
+  commit keeps the mark ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage reruns when a method of a user class it uses changes, including dataclass
+  methods ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage reruns when a user module imported inside the stage body changes, whether
+  the import is absolute, relative or inside a function
+  ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage whose run imports a user module its fingerprint does not cover warns
+  once, naming the module, and is not reused ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: After upgrading, each stage whose fingerprint now covers more code, such as one
+  that uses a user class or imports a user module in its body, reruns once; later runs reuse results
+  as before ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Imports made by a covered import, on any thread it starts, count as covered;
+  threads that pivot starts never do ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Refuse at definition a stage whose body imports a user module that is not loaded,
+  with the import to add ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Track user-class methods and in-body imports, refuse dynamic imports, keep unsafe
+  results out of the run cache ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+### Continuous Integration
+
+- Benchmark wall time and CPU against main on every pull request
+  ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: An interrupted run.py stops the measured pivot run, sweeps its session and restores the
+  caller's signal mask ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Derive thresholds from recorded A/A runs with a 2% floor, and exit 2 on any input the
+  comparator cannot read ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Measure each pull request's merge commit against its first parent, for wall time and
+  CPU at pipeline and task scope ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Report a regression only when the median change is over the calibrated threshold and a
+  paired bootstrap interval lies wholly above 1 ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+
+## v0.5.5 (2026-10-22)
+
+### Bug Fixes
+
+- **watch**: A reload that adds a stage whose input is missing reports the pipeline invalid and
+  keeps watching, instead of ending the session ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+- **watch**: Creating the missing input, including inside a new directory or through a symlink in
+  the project, runs the stopped stages once ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+- **watch**: Keep watching when a reload adds a stage whose input is missing
+  ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+- **watch**: While an input is missing, only a change at that input or a directory above it
+  re-checks the pipeline; other changes are handled as before
+  ([#509](https://github.com/sjawhar/pivot/pull/509),
+  [`e0f8f6e`](https://github.com/sjawhar/pivot/commit/e0f8f6e7590f5ea559816687c9d2102cb28e4ce7))
+
+
+## v0.5.4 (2026-10-22)
+
+### Bug Fixes
+
+- Serve and TUI at any project path; run the suite without uv on PATH
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **rpc**: A stopping serve removes only the socket it bound, and a cancelled bind still cleans up
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **serve**: A worker stopped by the same group stop is not reported as a failed stage
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **serve**: The pivot command takes over a stop signal only when it is at its default, and leaves a
+  launcher's disposition alone ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **serve**: The pivot command's serve mode stops cleanly on SIGTERM, repeated SIGTERM or a
+  process-group SIGTERM, and removes its socket ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **socket**: Serve and the TUI work when the project's agent socket path is longer than a Unix
+  socket address ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- **tui**: Pivot-tui carries its own long-path socket code, so its wheel works beside any pivot
+  release ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+### Testing
+
+- Replace the help timing test with a check that help imports no heavy modules
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+- Run the test suite without uv on PATH, and check it in CI
+  ([#493](https://github.com/sjawhar/pivot/pull/493),
+  [`a17c062`](https://github.com/sjawhar/pivot/commit/a17c0626ce8c695717dfbb7cbf0249c3ab5b7998))
+
+
+## v0.5.3 (2026-10-22)
+
+### Bug Fixes
+
+- **engine**: Say a deferred reload covers a data change only if it succeeds
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+- **watch**: Hand a batch's data to the data handler when its reload starts no re-run
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+- **watch**: Run each stage once when one watch batch edits code and data
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+### Chores
+
+- Exclude .worktrees/ from basedpyright ([#506](https://github.com/sjawhar/pivot/pull/506),
+  [`38238f8`](https://github.com/sjawhar/pivot/commit/38238f8f0e7baffdf4b663861cf14b657defee93))
+
+- Ignore agent worktrees under .worktrees/ ([#506](https://github.com/sjawhar/pivot/pull/506),
+  [`38238f8`](https://github.com/sjawhar/pivot/commit/38238f8f0e7baffdf4b663861cf14b657defee93))
+
+### Continuous Integration
+
+- Hold releases while main carries a known regression
+  ([#505](https://github.com/sjawhar/pivot/pull/505),
+  [`cf66ba9`](https://github.com/sjawhar/pivot/commit/cf66ba99c6234037f6e64a1fec79a1ecf1e5d26a))
+
+- Run known-regressions on pushes to main only, as intended
+  ([#505](https://github.com/sjawhar/pivot/pull/505),
+  [`cf66ba9`](https://github.com/sjawhar/pivot/commit/cf66ba99c6234037f6e64a1fec79a1ecf1e5d26a))
+
+- The known-regressions header asks for the fix's PR only once one is open
+  ([#505](https://github.com/sjawhar/pivot/pull/505),
+  [`cf66ba9`](https://github.com/sjawhar/pivot/commit/cf66ba99c6234037f6e64a1fec79a1ecf1e5d26a))
+
+### Documentation
+
+- **engine**: Define CodeOrConfigChanged.data_paths without the handler policy
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+- **watch**: Describe the no-stages branch of a batch's data paths
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+### Refactoring
+
+- **engine**: State the reloads that start no re-run in one docstring
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+### Testing
+
+- **engine**: Cover a code change's batch data while a run is in progress
+  ([#508](https://github.com/sjawhar/pivot/pull/508),
+  [`2da40c2`](https://github.com/sjawhar/pivot/commit/2da40c2e2d5ca95e966b839fb6745ca0a16333aa))
+
+
 ## v0.5.2 (2026-10-20)
 
 ### Bug Fixes

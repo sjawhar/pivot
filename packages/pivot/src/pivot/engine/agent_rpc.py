@@ -12,7 +12,7 @@ import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import BaseModel, ValidationError, field_validator
 
-from pivot import exceptions, parameters, project, types
+from pivot import exceptions, parameters, project, types, unix_socket
 from pivot import explain as explain_mod
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
@@ -23,7 +23,7 @@ from pivot.types import DataDiffResult, OnError, StageExplanation
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from anyio.abc import SocketStream
+    from anyio.abc import SocketListener, SocketStream
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import InputEvent
@@ -488,21 +488,36 @@ class AgentRpcSource:
             if self._socket_path.exists():
                 self._socket_path.unlink()
 
-        listener = await anyio.create_unix_listener(self._socket_path)
+        listener = await self._listen()
+        async with listener:
+            bound = self._socket_path.lstat()
+            try:
+                self._socket_path.chmod(0o600)  # Owner-only access
+                if self._ready is not None:
+                    self._ready.set()
+                async with anyio.create_task_group() as tg:
+                    while True:
+                        conn = await listener.accept()
+                        tg.start_soon(self._handle_connection, conn, send)
+            finally:
+                # A newer serve can take this pathname while this source still accepts clients.
+                # Unlink only the socket this source bound; lstat avoids following a replacement
+                # link. The check runs while the listener is open: the bound socket keeps its
+                # inode, so a replacement cannot be given the same inode number.
+                with contextlib.suppress(FileNotFoundError):
+                    current = self._socket_path.lstat()
+                    if (current.st_dev, current.st_ino) == (bound.st_dev, bound.st_ino):
+                        self._socket_path.unlink()
 
-        try:
-            self._socket_path.chmod(0o600)  # Owner-only access
-            if self._ready is not None:
-                self._ready.set()
-            async with listener, anyio.create_task_group() as tg:
-                while True:
-                    conn = await listener.accept()
-                    tg.start_soon(self._handle_connection, conn, send)
-        finally:
-            # Clean up socket file on exit (suppress errors to avoid masking original exception)
-            with contextlib.suppress(OSError):
-                if self._socket_path.exists():
-                    self._socket_path.unlink()
+    async def _listen(self) -> SocketListener:  # pyright: ignore[reportReturnType] - CancelScope.__exit__ is typed -> bool but never swallows an exception it did not raise
+        """Bind the listener; a cancellation waits until the bind has finished.
+
+        anyio binds in a worker thread that it abandons on cancellation, so a cancel landing
+        mid-bind would return before the socket exists while the thread goes on to create it,
+        and the caller's cleanup would run too early to remove it.
+        """
+        with anyio.CancelScope(shield=True):
+            return await unix_socket.create_unix_listener(self._socket_path)
 
     async def _handle_connection(
         self,

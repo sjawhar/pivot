@@ -71,7 +71,7 @@ Key fields:
 - **TuiStatusMessage**: `type`, `stage`, `index`, `total`, `status`, `reason`, `elapsed` (seconds, or `None` if still running), `run_id`
 - **TuiLogMessage**: `type`, `stage`, `line`, `is_stderr`, `timestamp`
 - **TuiWatchMessage**: `type`, `status` (WatchStatus enum), `message`
-- **TuiReloadMessage**: `type`, `stages` (current stage names), `stages_added`, `stages_removed`, `stages_modified`, `error`. When `error` is set (a syntax error, a missing `pipeline` variable, a stage that fails to fingerprint, or a `params.yaml` that fails its checks), the app keeps its stage list, titles itself `Pipeline invalid - waiting for fix`, and shows the error on a line under the header until a reload with `error` unset clears it.
+- **TuiReloadMessage**: `type`, `stages` (current stage names), `stages_added`, `stages_removed`, `stages_modified`, `error`. When `error` is set (a syntax error, a missing `pipeline` variable, a stage that fails to fingerprint, a `params.yaml` that fails its checks, or a run that found a stage over its resource capacity or an input missing), the app keeps its stage list, titles itself `Pipeline invalid - waiting for fix`, and shows the error on a line under the header until a message with `error` unset clears it: a good reload, or the data change that finds the missing input.
 
 ## Execution History
 

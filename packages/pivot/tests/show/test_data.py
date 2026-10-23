@@ -1429,6 +1429,7 @@ def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactR
         no_fingerprint=False,
         code_deps=[],
         input_paths={},
+        unsafe_fingerprint=False,
     )
 
 

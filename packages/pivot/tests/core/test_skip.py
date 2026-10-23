@@ -435,3 +435,33 @@ def test_explain_unchanged_stage_has_empty_reason() -> None:
     )
     assert result["changed"] is False
     assert result["reason"] == ""
+
+
+# =============================================================================
+# Uncovered-import marker carried by pivot commit
+# =============================================================================
+
+_MARKER = f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}helpers, helpers.lib"
+
+
+def test_carry_uncovered_import_keeps_marker_when_static_fingerprint_is_unchanged() -> None:
+    fingerprint = {"self:count": "aa", "module:helpers": ""}
+
+    carried = skip.carry_uncovered_import({**fingerprint, _MARKER: ""}, fingerprint)
+
+    assert carried == {**fingerprint, _MARKER: ""}
+    assert skip.uncovered_import_reason(carried) is not None
+
+
+def test_carry_uncovered_import_drops_marker_after_a_code_edit() -> None:
+    previous = {"self:count": "aa", _MARKER: ""}
+    fingerprint = {"self:count": "bb"}
+
+    assert skip.carry_uncovered_import(previous, fingerprint) == fingerprint
+
+
+def test_carry_uncovered_import_without_a_marked_lock_returns_the_fingerprint() -> None:
+    fingerprint = {"self:count": "aa"}
+
+    assert skip.carry_uncovered_import(None, fingerprint) == fingerprint
+    assert skip.carry_uncovered_import(dict(fingerprint), fingerprint) == fingerprint

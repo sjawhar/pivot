@@ -4,9 +4,11 @@ Workers execute in separate processes via `loky.get_reusable_executor()`. An Eng
 workers and manager alive across its runs; each run receives a fresh manager queue for output,
 and a manager that cannot be reached when a run starts is replaced then.
 The loky initializer (`core._init_worker`, which runs `worker.unwind_when_stopped`) and the manager's initializer
-(`core._exit_when_parent_dies`) start the parent-death watcher, so a worker or manager exits
+(`core._init_manager`, which runs `core._exit_when_parent_dies`) start the parent-death watcher, so a worker or manager exits
 when its Pivot process dies; a worker first unwinds its running stage so its `finally` blocks
-run, within `worker.TERMINATION_GRACE_S`. Keep `timeout=None` and
+run, within `worker.TERMINATION_GRACE_S`. The manager also ignores SIGTERM (multiprocessing
+already makes it ignore SIGINT), so a stop signalled to the whole process group leaves it to
+its owner's shutdown, which removes its `pymp-*` directory. Keep `timeout=None` and
 `reuse=False if kill_workers else "auto"` in the shared executor policy.
 While a discovery's import session lasts, the worker initializer (`core._init_worker`) also
 has each worker import user code through discovery's checked loader
@@ -24,8 +26,11 @@ differ.
 | `deps` | Input dependency paths |
 | `outs` | Output artifact references |
 | `incremental_inputs` | Parameter-to-own-output identities for prior incremental values |
+| `unsafe_fingerprint` | The fingerprint downgraded a refusal to a warning; the run cache is neither read nor written |
+| `no_fingerprint` | The stage is `@no_fingerprint`: its declared files are its code, so the worker does not check the user modules it imports |
 | `project_root` | Absolute path to project root |
 | `state_dir` | Absolute path to `.pivot/` directory |
+
 ## Path Derivation
 
 Workers derive all paths from `project_root` and `state_dir` in `WorkerStageInfo`:

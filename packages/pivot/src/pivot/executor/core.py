@@ -7,6 +7,7 @@ import logging
 import multiprocessing as mp
 import os
 import pathlib
+import signal
 import threading
 from multiprocessing import managers
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
@@ -48,7 +49,21 @@ def _exit_when_parent_dies(parent_pid: int) -> None:
             poll.wait(1)
         os._exit(0)
 
-    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
+    worker._start_pivot_thread(  # pyright: ignore[reportPrivateUsage] - worker owns coverage bypass
+        threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch")
+    )
+
+
+def _init_manager(parent_pid: int) -> None:
+    """Initialize the output-queue manager process.
+
+    A service manager's stop (systemd, GNU ``timeout``) signals the whole process group. The
+    manager ignores SIGTERM, as multiprocessing already makes it ignore SIGINT, so it stays up
+    until its owner shuts it down and its finalizer removes its ``pymp-*`` directory. If the
+    owner dies instead, the parent-death watcher exits it.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _exit_when_parent_dies(parent_pid)
 
 
 def configured_worker_count(override: int | None = None) -> int:
@@ -100,9 +115,11 @@ def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.Proce
 
 def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
     """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
-    (``worker.unwind_when_stopped``), and import user code through discovery's checked loader
+    (``worker.unwind_when_stopped``), record the user modules each stage imports
+    (``worker.install_import_hooks``), and import user code through discovery's checked loader
     when a discovery's import session for ``user_code_root`` lasts."""
     worker.unwind_when_stopped(parent_pid)
+    worker.install_import_hooks()
     if user_code_root is not None:
         discovery.install_user_code_loader(user_code_root)
 
@@ -110,7 +127,7 @@ def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
 def create_manager() -> managers.SyncManager:
     """Start a spawn-context manager that exits when this process dies."""
     manager = managers.SyncManager(ctx=mp.get_context("spawn"))
-    manager.start(initializer=_exit_when_parent_dies, initargs=(os.getpid(),))
+    manager.start(initializer=_init_manager, initargs=(os.getpid(),))
     return manager
 
 
@@ -368,9 +385,11 @@ def prepare_worker_info(
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
 
+    # The fingerprint is computed first: it sets `unsafe_fingerprint`.
+    fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
     return worker.WorkerStageInfo(
         func=stage_info["func"],
-        fingerprint=pipeline.ensure_fingerprint(stage_info["name"]),
+        fingerprint=fingerprint,
         deps=stage_info["deps"],
         outs=stage_info["outs"],
         store_spec=store_spec,
@@ -387,6 +406,8 @@ def prepare_worker_info(
         state_dir=state_dir,
         project_state_dir=default_state_dir,
         collection_params=stage_info["collection_params"],
+        unsafe_fingerprint=stage_info["unsafe_fingerprint"],
+        no_fingerprint=stage_info["no_fingerprint"],
     )
 
 

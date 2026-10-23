@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import signal
 import socket
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -22,8 +24,9 @@ import pytest
 from tests.conftest import send_rpc
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Generator
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 @pytest.fixture
@@ -63,7 +66,7 @@ with pipeline:
 
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
+            [_PIVOT_BIN, "repro", "--watch", "--serve", "--force"],
             cwd=tmp_path,
             env=env,
             stdout=stdout_file,

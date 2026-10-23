@@ -501,6 +501,7 @@ def _emit_stage_info(
         no_fingerprint=node.no_fingerprint,
         code_deps=list(node.code_deps),
         input_paths=input_paths,
+        unsafe_fingerprint=False,
     )
 
 

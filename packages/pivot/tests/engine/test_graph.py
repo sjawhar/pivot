@@ -51,6 +51,7 @@ def _create_stage(
         no_fingerprint=False,
         code_deps=[],
         input_paths={},
+        unsafe_fingerprint=False,
     )
 
 
@@ -447,6 +448,7 @@ def test_validate_dependency_sources_reports_missing_pipeline_input_path(
         "Stage 'demo/combine' depends on input 'extra.csv' "
         "(path missing/extra.csv), which does not exist"
     )
+    assert errors[0].input_path == set_project_root / "missing" / "extra.csv"
 
 
 @pytest.mark.parametrize(

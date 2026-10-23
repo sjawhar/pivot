@@ -106,4 +106,4 @@ By default, such captures raise `StageDefinitionError` with a message that names
 - Config: `core.unsafe_fingerprinting: true` in `.pivot/config.yaml` (`pivot config set core.unsafe_fingerprinting true`)
 - Environment: `PIVOT_UNSAFE_FINGERPRINTING=1`
 
-When enabled, these captures produce a warning instead of an error. This is unsafe because it can lead to silent wrong outputs: the captured value may change without triggering re-execution.
+When enabled, these captures produce a warning instead of an error. This is unsafe because it can lead to silent wrong outputs: the captured value may change without triggering re-execution. A stage whose fingerprint needed the downgrade (`RegistryStageInfo.unsafe_fingerprint`, copied to `WorkerStageInfo`) is kept out of the run cache: the worker neither looks it up nor files the result, and `pivot commit` does not file it either.

@@ -34,15 +34,130 @@ For each stage function, Pivot:
    and nonlocals the function references
 3. **Recurses transitively** — every user-code callable found in step 2
    gets the same treatment, and *its* dependencies are merged into the
-   manifest
-4. **Inspects type hints** — user-defined classes in annotations
+   manifest. A user class the stage reaches has its callable members walked:
+   methods, descriptors such as properties, partial members, and nested user
+   classes. A module value or helper read only inside a method
+   (`ScopeWalk().step(...)` reading a module-level regex) is tracked
+4. **Follows imports in the function body** — a user module discovery already
+   loaded is walked like a module-level dependency, together with its packages
+   and a submodule a `from` import names (`import pkg.sub`, `from pkg import
+   sub`). A body import of a user module discovery did not load is refused
+   when the pipeline is defined, without running it: Pivot would have to
+   execute the module to fingerprint it. The error names the module; import
+   it at module level (or in `pipeline.py`) so discovery loads it, or move the
+   value into the stage's `StageParams`
+5. **Inspects type hints** — user-defined classes in annotations
    (including Pydantic models) are fingerprinted
-5. **Hashes Pydantic schemas** — `model_json_schema()` captures field
+6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
    types, defaults, and validators
 
 The manifest is stored in the per-stage lock file. On the next run, the
 worker recomputes the manifest and compares it key-by-key against the
 locked version. Any difference triggers re-execution.
+
+While a stage runs, its worker records the user modules it imports through
+Python's `__import__` and `importlib.import_module` entry points, including a
+module a warm worker already holds, and compares the `sys.modules` keys before
+and after the stage to catch a newly registered user module loaded from a
+source file. What a covered module's first import starts belongs to that
+import, as it would for a module-level import: every import on the thread
+running it, every hooked import on a thread it started (and on threads those
+start) for the rest of the stage, already resident or not, and every module
+any thread registers without the hooks while such an import or thread runs.
+Every thread Python starts counts: each start function `_thread` exposes
+(`start_new_thread`, `start_new`, `start_joinable_thread`), which
+`threading.Thread`, `threading.Timer` and `ThreadPoolExecutor` start through.
+A thread native code starts outside `_thread` is not covered.
+A hooked import on any other thread is counted, already resident or not, and
+so is a module registered without the hooks at any other time, even when a
+covered import later imports it. A stage that imported a user module its
+fingerprint does not cover still succeeds, with one warning naming the module,
+but its result is never reused:
+Pivot files no run-cache entry, removes any entry an earlier run filed for the
+same inputs, never restores one for that stage, and writes a lock the next run
+cannot match; `pivot status --explain` and `pivot repro --dry-run --explain`
+show the stage as stale with that reason, and `pivot verify` reports it as
+failed with that reason until it reruns without an uncovered import.
+`pivot commit` keeps that mark when it
+records the same outputs, so the stage still reruns. A user class reached only
+through a loaded input (an object in a `loaders.Pickle()` input whose class the
+stage never names) counts as a module the stage imported; name the class in the
+parameter's annotation (`Annotated[Box, loaders.Pickle()]`) to cover it. To
+clear the warning, import the module statically and read it by name in the
+stage's own code (`import pkg.mod`, then `pkg.mod.NAME`, or pass `pkg.mod`
+itself to the call that needs it), so the walk covers it, or move the value
+into `StageParams`. An import in `pipeline.py` alone does not cover a module
+for a stage that never reads it, and a body import that only silences the
+warning while the stage still reads values through the object a dynamic import
+returned leaves those values untracked. A `@no_fingerprint` stage is not
+checked: its declared `code_deps` are its code.
+
+That check does not see every way a stage can reach code. In most of these
+cases Pivot reuses a result whose fingerprint missed the code, as it would
+without the check. In three it reruns a stage it could have reused: a thread
+that existed before a covered import, a thread left from an earlier stage (a
+covered thread of that stage included) that imports while a later stage runs,
+and a thread native code starts outside `_thread`:
+
+- a read of a module already in `sys.modules` without an import, or
+  `importlib.reload`: import the module where the stage reads it;
+- a warm `EntryPoint.load()` or `importlib.__import__` of a user module another
+  stage already made resident: it creates no new `sys.modules` key, and the
+  loader may hold an importer before the hook, so it is not fingerprinted, as
+  on main; import the module statically;
+- private import machinery, or a loader that replaces a module already in
+  `sys.modules` or never registers one, such as `runpy.run_path("helpers/lib.py")`
+  or `runpy.run_module("toplib")` for a top-level module: import it statically,
+  or move the value into `StageParams`;
+- an import in a child process: declare the code the child runs as an input,
+  or list it in `@no_fingerprint(code_deps=[...])`;
+- an import from a thread that outlives its stage: the import is charged to
+  whichever stage is running when it happens, which then warns and reruns, or
+  to none; a covered thread still running in a later stage is not covered for
+  it; join the thread before the stage returns;
+- a covered module that hands work at import time to a thread that existed
+  before its import, such as a pool an earlier import created: that thread is
+  not covered, so its imports are counted and the stage reruns. When an earlier
+  stage in the same worker started the thread, whether the stage warns depends
+  on which stage ran first there: where the covered import itself starts the
+  thread, the thread is covered and the stage caches. Start the thread or pool
+  inside the module, or import the module statically;
+- a thread native code starts outside `_thread`, such as one a C extension
+  starts or `pthread_create` called through `ctypes`: no start hook sees it, so
+  its imports are counted and the stage warns and reruns; import the module
+  statically;
+- a user module a covered thread imports that has nothing to do with the
+  covered module: it is excused and not fingerprinted, as on main, so an edit
+  to it is seen only through values the stage reads from the covered module,
+  or when the covered module changes; import user modules statically;
+- a user module another thread registers without the hooks while a covered
+  import or covered thread runs: it is excused with that import's own, so an
+  edit to it is seen only through values the stage reads from the covered
+  module, or when the covered module changes; import user modules statically,
+  or before starting threads;
+- a user module a covered module loads at import time through `importlib.util`
+  and `exec_module`, `EntryPoint.load()` or `importlib.__import__`: it is
+  excused, as on main, and not fingerprinted itself, so an edit to it is seen
+  only through values the stage reads from the covered module, or when the
+  covered module changes; import it statically;
+- a package resource read through `importlib.resources` (for example
+  `files(helpers).joinpath("table.txt")`): it is data, not code; declare it
+  with `pipeline.input`;
+- a module created without a source file (CPython's `pyexpat.errors`,
+  Cython's `_cython_3_3_0`): it has no source to fingerprint;
+- `pivot repro --no-commit` followed by `pivot commit`: no lock exists to carry
+  the mark, so `pivot commit` records the outputs on disk against the static
+  fingerprint, as it records any output; run `pivot repro` without
+  `--no-commit` for a stage that imports dynamically;
+- a result cached by an earlier Pivot version: if its static fingerprint is
+  unchanged, it may be reused because `_CACHE_SCHEMA_VERSION` keys only the
+  state.lmdb caches, not the lock. A stage whose static walk reaches a user
+  class method or a user module gains entries in its manifest, so it reruns
+  once as Code changed after the upgrade. That accepted one-time rerun writes
+  the current manifest; later runs reuse it until code or inputs change. Run
+  `pivot repro --force <stage>` once to re-check a stage you know imports
+  dynamically.
+
 
 ### Transitive Tracking
 
@@ -75,16 +190,21 @@ raises `StageDefinitionError`; use [StageParams](parameters.md) instead.
 
 ### Lambdas
 
-Lambdas created dynamically (via `eval`, `exec`, or an interactive session)
-have no source to hash, so their fingerprint changes every run. Use named,
-module-level functions for stages and the helpers they call:
+A lambda in a source file is hashed by its AST like any function. One created
+dynamically (via `eval`, `exec`, or an interactive session) has no source, so
+Pivot hashes its code object (`__code__`: bytecode and constants, without the
+source path). Its fingerprint is the same from run to run, and editing the
+expression re-runs the stage. Only a callable with neither source nor a code
+object falls back to `id()`, which changes every run; Pivot warns when it does.
+Prefer named, module-level functions, whose AST hash ignores comments and
+formatting:
 
 ```python
-# Bad - no stable source
+# Works, hashed by its code object
 normalize = eval("lambda df: df / df.max()")
 
 
-# Good - stable fingerprint
+# Better - AST fingerprint
 def normalize(df):
     return df / df.max()
 ```
@@ -121,10 +241,12 @@ Fix: move a mutable or nested value into the stage's [StageParams](parameters.md
 Configuration in module-level mutable collections is not supported.
 
 To suppress the check (at your own risk), set
-`core.unsafe_fingerprinting = true` in your Pivot config or
-`PIVOT_UNSAFE_FINGERPRINTING=1` in the environment.
-
-### Dynamic Name Access
+`core.unsafe_fingerprinting = true` in your Pivot config
+(`pivot config set core.unsafe_fingerprinting true`) or
+`PIVOT_UNSAFE_FINGERPRINTING=1` in the environment. A stage whose fingerprint
+needed that downgrade still runs, but its result is never filed in the run
+cache or restored from it: the captured value may differ next time while the
+fingerprint stays the same.
 
 Pivot rejects patterns that bypass static analysis:
 
@@ -133,7 +255,10 @@ Pivot rejects patterns that bypass static analysis:
 - `importlib.import_module()` — dynamic imports
 
 All of these silently introduce dependencies that fingerprinting can't
-track. Use direct attribute access and static imports instead.
+track. Use direct attribute access and static imports instead. Other dynamic
+import spellings (`__import__`, an alias of `import_module`, `exec`) are not
+refused: a user module one of them loads while the stage runs makes its result
+not reusable, as described above, and a library module costs nothing.
 
 ## @pivot.no_fingerprint()
 

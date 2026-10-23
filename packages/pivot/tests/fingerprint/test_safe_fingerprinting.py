@@ -5,7 +5,10 @@ import importlib.machinery
 import json
 import logging
 import math
+import os
+import pathlib
 import re
+import subprocess
 import sys
 import types
 import typing
@@ -17,9 +20,11 @@ import numpy as np
 import pandas as pd
 import pydantic
 import pytest
+from tests.conftest import init_git_repo
 
-from pivot import exceptions, fingerprint
+from pivot import exceptions, fingerprint, run_history
 from pivot.config import models
+from pivot.storage import state
 
 
 @dataclasses.dataclass
@@ -765,3 +770,127 @@ def test_cached_helper_globals_and_defaults_are_checked() -> None:
     message = str(exc.value)
     assert "as the default of parameter 'cols'" in message
     assert "captures non-scalar variable 'DEFAULT_COLUMNS' (type: list)" in message
+
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
+
+_UNSAFE_LIST_PIPELINE = """\
+from pivot import Pipeline, stage
+
+SUFFIXES = ["!"]
+
+
+@stage
+def shout(text: str) -> str:
+    return text.strip().upper() + SUFFIXES[0]
+
+
+with Pipeline("u") as pipeline:
+    shout(pipeline.input("input.txt", t=str))
+"""
+
+_PARAMS_LIST_PIPELINE = """\
+from pivot import Pipeline, StageParams, stage
+
+
+class ShoutParams(StageParams):
+    suffixes: list[str] = ["!"]
+
+
+@stage
+def shout(text: str, params: ShoutParams) -> str:
+    return text.strip().upper() + params.suffixes[0]
+
+
+with Pipeline("u") as pipeline:
+    shout(pipeline.input("input.txt", t=str), params=ShoutParams())
+"""
+
+
+def _helper_pivot_ok(
+    cwd: pathlib.Path, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    full_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
+    }
+    full_env.update(env or {})
+    proc = subprocess.run(
+        [_PIVOT_BIN, *args],
+        cwd=cwd,
+        env=full_env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0, f"pivot {' '.join(args)} failed:\n{proc.stdout}{proc.stderr}"
+    return proc
+
+
+def _helper_shout_project(root: pathlib.Path, pipeline_source: str) -> pathlib.Path:
+    init_git_repo(root)
+    _helper_pivot_ok(root, "init")
+    (root / "pipeline.py").write_text(pipeline_source)
+    (root / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    (root / "data" / "raw" / "input.txt").write_text("hello\n")
+    return root
+
+
+def _helper_run_cache_entries(
+    root: pathlib.Path, stage_name: str
+) -> list[run_history.RunCacheEntry]:
+    """Every run-cache entry filed for ``stage_name``, under any input hash."""
+    prefix = f"runcache:{stage_name}:".encode()
+    with state.StateDB(root / ".pivot", readonly=True) as db:
+        raw_entries = db.iter_prefix(prefix)
+    return [run_history.deserialize_run_cache_entry(value) for _key, value in raw_entries]
+
+
+@pytest.mark.parametrize(
+    ("command", "switch"),
+    [
+        pytest.param("repro", "config", id="repro-config"),
+        pytest.param("repro", "env", id="repro-env"),
+        pytest.param("commit", "config", id="commit-config"),
+    ],
+)
+def test_unsafe_result_is_kept_out_of_the_run_cache(
+    tmp_path: pathlib.Path, command: str, switch: str
+) -> None:
+    """A result fingerprinted with a refusal downgraded to a warning is never filed in the run
+    cache, by a worker (`pivot repro`) or by `pivot commit`: the run cache would hand it to the
+    next run whose fingerprint matches, though the captured list may hold other values."""
+    root = _helper_shout_project(tmp_path, _UNSAFE_LIST_PIPELINE)
+    env = dict[str, str]()
+    if switch == "config":
+        (root / ".pivot" / "config.yaml").write_text("core:\n  unsafe_fingerprinting: true\n")
+    else:
+        env["PIVOT_UNSAFE_FINGERPRINTING"] = "1"
+    if command == "commit":
+        _helper_pivot_ok(root, "repro", "--no-commit", env=env)
+    _helper_pivot_ok(root, command, env=env)
+
+    output = root / "data" / "u" / "shout.txt"
+    assert output.read_text() == "HELLO!", "the unsafe stage still runs and writes its output"
+    entries = _helper_run_cache_entries(root, "u/shout")
+    assert entries == [], f"an unsafe result reached the run cache: {entries}"
+
+
+def test_safe_result_is_filed_in_the_run_cache(tmp_path: pathlib.Path) -> None:
+    """Control: the same stage with its list in StageParams, the flag off, files one entry."""
+    root = _helper_shout_project(tmp_path, _PARAMS_LIST_PIPELINE)
+    _helper_pivot_ok(root, "repro")
+
+    assert (root / "data" / "u" / "shout.txt").read_text() == "HELLO!", "the stage ran"
+    entries = _helper_run_cache_entries(root, "u/shout")
+    assert len(entries) == 1, f"a safe result is filed once in the run cache: {entries}"
+
+
+def test_config_set_accepts_unsafe_fingerprinting(tmp_path: pathlib.Path) -> None:
+    """The documented switch for unsafe fingerprinting can be set from the CLI."""
+    root = _helper_shout_project(tmp_path, _UNSAFE_LIST_PIPELINE)
+    _helper_pivot_ok(root, "config", "set", "core.unsafe_fingerprinting", "true")
+    got = _helper_pivot_ok(root, "config", "get", "core.unsafe_fingerprinting", "--json")
+    assert json.loads(got.stdout)["value"] is True, got.stdout

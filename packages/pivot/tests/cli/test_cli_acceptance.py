@@ -1942,9 +1942,10 @@ from pivot import Pipeline, stage
 
 @stage
 def build(raw: str) -> str:
-    import lazy_helper
+    scope = {}
+    exec("import lazy_helper as loaded", scope)
 
-    return raw.strip() + "-" + lazy_helper.VALUE
+    return raw.strip() + "-" + scope["loaded"].VALUE
 
 
 with Pipeline("w") as pipeline:
@@ -1983,11 +1984,12 @@ def test_worker_runs_the_edited_code_of_a_module_a_stage_body_imports(
     helper: str,
     pythonpath: list[str],
 ) -> None:
-    """A module only a stage body imports is imported by the worker alone: one outside the root
-    on ``PYTHONPATH``, or a project package named ``pivot_tui``, which the worker imports from the
-    project root on its ``sys.path``, not pivot-tui's. The worker treats it as user code and
-    caches bytecode for it checked by content, so an edit that keeps the file's size, made in the
-    second the previous version was written and cached, is run when the stage next runs."""
+    """A module a stage loads only at run time is imported by the worker alone: one outside the
+    root on ``PYTHONPATH``, or a project package named ``pivot_tui``, which the worker imports
+    from the project root on its ``sys.path``, not pivot-tui's. The worker treats it as user code
+    (the stage warns that its fingerprint does not cover it) and caches bytecode for it checked by
+    content, so an edit that keeps the file's size, made in the second the previous version was
+    written and cached, is run when the stage next runs."""
     root = tmp_path / "project"
     root.mkdir()
     _project(root, {"pipeline.py": pipeline, "data/raw/in.txt": "x"})
@@ -1996,8 +1998,9 @@ def test_worker_runs_the_edited_code_of_a_module_a_stage_body_imports(
         (tmp_path / rel).write_text(text)
     env = _helper_env_with_path(*(tmp_path / entry for entry in pythonpath))
     output = root / "data" / "w" / "build.txt"
-    _ok(_pivot(root, "repro", env=env))
+    first = _ok(_pivot(root, "repro", env=env))
     assert output.read_text() == "x-alpha"
+    assert "its fingerprint does not cover" in " ".join(first.split()), first
     before = (tmp_path / helper).stat()
     (tmp_path / helper).write_text('VALUE = "bravo"\n')
     os.utime(tmp_path / helper, ns=(before.st_atime_ns, before.st_mtime_ns))
@@ -2006,6 +2009,54 @@ def test_worker_runs_the_edited_code_of_a_module_a_stage_body_imports(
     out = _ok(_pivot(root, "repro", env=env))
 
     assert output.read_text() == "y-bravo", out
+
+
+@pytest.mark.parametrize(
+    ("module", "files", "pythonpath"),
+    [
+        pytest.param(
+            "lazy_helper",
+            {"outside/lazy_helper.py": 'VALUE = "alpha"\n'},
+            ["outside"],
+            id="module-outside-the-root",
+        ),
+        pytest.param(
+            "pivot_tui.helpers",
+            {
+                "project/pivot_tui/__init__.py": "",
+                "project/pivot_tui/helpers.py": 'VALUE = "alpha"\n',
+            },
+            [],
+            id="project-package-named-pivot_tui",
+        ),
+    ],
+)
+def test_static_body_import_of_a_user_module_discovery_did_not_load_is_refused(
+    tmp_path: pathlib.Path, module: str, files: dict[str, str], pythonpath: list[str]
+) -> None:
+    """The same modules imported by a static statement in the stage body are user code that
+    discovery never loaded, so the stage is refused at definition and names the module."""
+    root = tmp_path / "project"
+    root.mkdir()
+    pipeline = (
+        "from pivot import Pipeline, stage\n\n\n"
+        "@stage\ndef build(raw: str) -> str:\n"
+        f"    import {module}\n\n"
+        f"    return raw.strip() + '-' + {module}.VALUE\n\n\n"
+        'with Pipeline("w") as pipeline:\n    build(pipeline.input("in.txt"))\n'
+    )
+    _project(root, {"pipeline.py": pipeline, "data/raw/in.txt": "x"})
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(text)
+    env = _helper_env_with_path(*(tmp_path / entry for entry in pythonpath))
+
+    proc = _pivot(root, "repro", env=env)
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert f"imports user module '{module}'" in out, out
+    assert not (root / "data" / "w" / "build.txt").exists()
 
 
 _STAGE_BODY_PIPELINE = """\

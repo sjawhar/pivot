@@ -180,15 +180,19 @@ def validate_dependency_sources(
             if store.exists(dep):
                 continue
             try:
-                input_path = project.to_relative_path(store.checkout(dep))
+                input_path = store.checkout(dep)
             except FileNotFoundError:
                 input_path = None
+                input_path_display = None
+            else:
+                input_path_display = project.to_relative_path(input_path)
             errors.append(
                 exceptions.DependencyNotFoundError(
                     stage=stage_name,
                     dep=pivot_types.identity_key(dep_identity),
                     available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
                     input_path=input_path,
+                    input_path_display=input_path_display,
                 )
             )
 
