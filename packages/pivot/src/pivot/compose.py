@@ -14,7 +14,16 @@ import os
 import pathlib
 import types as _stdlib_types
 import typing
-from typing import TYPE_CHECKING, Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Never,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 from typing_extensions import is_typeddict
 
@@ -145,23 +154,25 @@ def _handle_to_artifact_ref(handle: ArtifactHandle, consumer_name: str) -> types
         )
 
     identity = types.ArtifactIdentity(producer=qualified_name, key=output_key)
+    directory: types.ArtifactIdentity | None = None
     member = handle._member  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
     if member is not None:
-        identity, member = _directory_file_identity(identity, member, consumer_name)
+        directory = identity
+        identity = _directory_file_identity(directory, member, consumer_name)
     types.validate_artifact_identity(identity)
     return types.ArtifactRef(
         identity=identity,
         format=output_spec.format,
         python_type=handle._python_type,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
         tag=_artifact_tag(output_spec.tag),
-        member=member,
+        directory=directory,
     )
 
 
 def _directory_file_identity(
     directory: types.ArtifactIdentity, key: str, consumer_name: str
-) -> tuple[types.ArtifactIdentity, str]:
-    """Name one file of a directory output: its identity and its normalized path inside it.
+) -> types.ArtifactIdentity:
+    """Name one file of a directory output by its normalized path inside it.
 
     The key is checked by the rules for a directory output's keys, so a consumer can only name
     a file the producer could write.
@@ -173,7 +184,7 @@ def _directory_file_identity(
             f"Stage '{consumer_name}' depends on file {key!r} of stage '{directory.producer}': "
             + f"{error}"
         ) from None
-    return types.directory_file_identity(directory, member), member
+    return types.directory_file_identity(directory, member)
 
 
 def _iter_stage_handles(node: _StageNode) -> list[ArtifactHandle]:
@@ -832,7 +843,6 @@ class Pipeline:
         self,
         original_func: Callable[..., object],
         stage_wrapper: Callable[..., object],
-        get_output_specs: Callable[[str], list[_OutputSpec]],
         resources: dict[str, int | str],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -853,7 +863,7 @@ class Pipeline:
         reason = lock.stage_name_error(qualified_name)
         if reason is not None:
             raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
-        output_specs = get_output_specs(qualified_name)
+        output_specs = _analyze_return_type(original_func, qualified_name)
 
         sig = inspect.signature(original_func)
         try:
@@ -1241,7 +1251,7 @@ def _parse_output_type(hint: Any, key: str, stage_name: str) -> list[_OutputSpec
     fmt: loaders_mod.Writer[object] | None = None
     label = _output_label(key)
     for metadata in args[1:]:
-        if isinstance(metadata, (_MetricTag, _PlotTag, _IncrementalTag, _DirectoryTag)):
+        if isinstance(metadata, _OutputTag):
             if tag is not None:
                 raise exceptions.StageDefinitionError(
                     f"Stage '{stage_name}': {label} cannot combine "
@@ -1408,13 +1418,6 @@ def stage[**P, R](
 def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None) -> Callable[P, R]:
     """Build a stage wrapper for a validated resource declaration."""
     normalized_resources = _normalize_stage_resources(resources)
-    _cached_specs: list[_OutputSpec] | None = None
-
-    def _get_output_specs(stage_name: str) -> list[_OutputSpec]:
-        nonlocal _cached_specs
-        if _cached_specs is None:
-            _cached_specs = _analyze_return_type(func, stage_name)
-        return _cached_specs
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -1422,7 +1425,7 @@ def _stage[**P, R](func: Callable[P, R], resources: dict[str, int | str] | None)
         if pipeline is None:
             return func(*args, **kwargs)
         return pipeline._record_stage(  # pyright: ignore[reportPrivateUsage] - the @stage wrapper is Pipeline's recording entry point
-            func, wrapper, _get_output_specs, normalized_resources, args, kwargs
+            func, wrapper, normalized_resources, args, kwargs
         )
 
     return wrapper
@@ -1469,6 +1472,12 @@ class _InputNode:
     inherited: bool = False
 
 
+_HANDLE_NOT_ITERABLE = (
+    "An artifact handle is not iterable: pipeline.py runs before any stage writes its files. "
+    + "Name one file of a directory output, e.g. parts['train.csv'], or pass the handle itself."
+)
+
+
 class ArtifactHandle:
     _pipeline: Pipeline
     _source: _StageNode | _InputNode
@@ -1511,11 +1520,8 @@ class ArtifactHandle:
             raise KeyError(self._member_has_no_parts_message())
         directory_spec = self._selected_directory()
         if directory_spec is not None:
-            file_type = _directory_file_type(
-                directory_spec.python_type,
-                _output_label(directory_spec.key),
-                self._qualified_source_name(),
-            )
+            # _parse_output_type checked that a directory output's type is dict[str, T]
+            file_type = get_args(directory_spec.python_type)[1]
             return ArtifactHandle(
                 self._pipeline, self._source, self._output_key, file_type, member=key
             )
@@ -1524,15 +1530,26 @@ class ArtifactHandle:
             raise KeyError(_no_such_output_message(self._source, key))
         return ArtifactHandle(self._pipeline, self._source, key, spec.python_type)
 
-    def _qualified_source_name(self) -> str:
-        assert isinstance(self._source, _StageNode)
-        return f"{self._pipeline.name}/{self._source.name}"
+    def __iter__(self) -> Never:
+        """Refuse ``for``: a handle names outputs that no stage has written yet.
+
+        Without this method Python iterates by calling ``handle[0]``, ``handle[1]``, ..., and a
+        directory handle accepts every key, so the loop would never end.
+        """
+        raise TypeError(_HANDLE_NOT_ITERABLE)
+
+    def __contains__(self, item: object) -> Never:
+        """Refuse ``in``. Without this method ``in`` calls ``__iter__``, and Python replaces the
+        TypeError it raises with a generic "not iterable" one that does not say what to write.
+        """
+        raise TypeError(_HANDLE_NOT_ITERABLE)
 
     def _member_has_no_parts_message(self) -> str:
+        assert isinstance(self._source, _StageNode)
         return (
             f"{self._member!r} is one file of a directory output of stage "
-            + f"'{self._qualified_source_name()}'; it has no outputs or files of its own. "
-            + "Pass the handle itself."
+            + f"'{self._pipeline.name}/{self._source.name}'; it has no outputs or files of its "
+            + "own. Pass the handle itself."
         )
 
     def _selected_directory(self) -> _OutputSpec | None:
@@ -1542,11 +1559,8 @@ class ArtifactHandle:
         a TypedDict field is selected by name before its files are.
         """
         assert isinstance(self._source, _StageNode)
-        specs = self._source.output_specs
-        if self._output_key is not None:
-            spec = _select_output(specs, self._output_key)
-        else:
-            spec = _select_output(specs, SINGLE_OUTPUT_KEY)
+        key = SINGLE_OUTPUT_KEY if self._output_key is None else self._output_key
+        spec = _select_output(self._source.output_specs, key)
         return spec if spec is not None and isinstance(spec.tag, _DirectoryTag) else None
 
 

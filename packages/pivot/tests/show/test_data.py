@@ -11,6 +11,7 @@ import pytest
 from pivot import loaders
 from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import data
+from pivot.show import selection as selection_module
 from pivot.types import (
     ArtifactIdentity,
     ArtifactRef,
@@ -532,7 +533,7 @@ def test_diff_data_files_new_file(tmp_path: Path) -> None:
     new_file = tmp_path / "data.csv"
     new_file.write_text("id,name\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(None, new_file, "data.csv")
+    result = data.diff_data_files(None, new_file, "data.csv", change_type=ChangeType.ADDED)
 
     assert result["old_rows"] is None
     assert result["new_rows"] == 2
@@ -547,11 +548,42 @@ def test_diff_data_files_deleted_file(tmp_path: Path) -> None:
     old_file = tmp_path / "data.csv"
     old_file.write_text("id,name\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(old_file, None, "data.csv")
+    result = data.diff_data_files(old_file, None, "data.csv", change_type=ChangeType.REMOVED)
 
     assert result["old_rows"] == 2
     assert result["new_rows"] is None
     assert result["summary_only"] is True
+
+
+@pytest.mark.parametrize(
+    ("new_text", "change_type", "new_rows", "new_cols"),
+    [
+        pytest.param("id\n1\n2\n3\n", ChangeType.MODIFIED, 3, ["id"], id="modified"),
+        pytest.param(None, ChangeType.REMOVED, None, None, id="removed"),
+    ],
+)
+def test_diff_data_files_reports_an_unreadable_old_side_as_unknown(
+    tmp_path: Path,
+    new_text: str | None,
+    change_type: ChangeType,
+    new_rows: int | None,
+    new_cols: list[str] | None,
+) -> None:
+    """An old side that exists but could not be read keeps its change type, with unknown
+    counts and no schema changes, and its text summary says the HEAD rows are unknown."""
+    new_file = None
+    if new_text is not None:
+        new_file = tmp_path / "data.csv"
+        new_file.write_text(new_text)
+
+    result = data.diff_data_files(None, new_file, "data.csv", change_type=change_type)
+
+    assert result["change_type"] == change_type
+    assert (result["old_rows"], result["new_rows"]) == (None, new_rows)
+    assert (result["old_cols"], result["new_cols"]) == (None, new_cols)
+    assert result["schema_changes"] == []
+    rows_line = "  Rows: unknown -> 3" if new_rows else "  Rows: unknown (removed)"
+    assert data.format_diff_summary(result) == f"data.csv:\n{rows_line}"
 
 
 def test_diff_data_files_reorder_only(tmp_path: Path) -> None:
@@ -561,7 +593,7 @@ def test_diff_data_files_reorder_only(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n3,charlie\n")
     new_file.write_text("id,name\n3,charlie\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv")
+    result = data.diff_data_files(old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED)
 
     assert result["reorder_only"] is True
     assert result["row_changes"] == []
@@ -574,7 +606,9 @@ def test_diff_data_files_with_key(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n")
     new_file.write_text("id,name\n1,alice\n2,bobby\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=["id"])
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["id"]
+    )
 
     assert result["reorder_only"] is False
     assert len(result["row_changes"]) == 1
@@ -589,7 +623,9 @@ def test_diff_data_files_missing_key_column_old(tmp_path: Path) -> None:
     new_file.write_text("id,name,extra\n1,alice,x\n")
 
     with pytest.raises(data.DataError, match="Key column.*not in old file"):
-        data.diff_data_files(old_file, new_file, "data.csv", key_columns=["extra"])
+        data.diff_data_files(
+            old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["extra"]
+        )
 
 
 def test_diff_data_files_missing_key_column_new(tmp_path: Path) -> None:
@@ -600,7 +636,9 @@ def test_diff_data_files_missing_key_column_new(tmp_path: Path) -> None:
     new_file.write_text("id,name\n1,alice\n")
 
     with pytest.raises(data.DataError, match="Key column.*not in new file"):
-        data.diff_data_files(old_file, new_file, "data.csv", key_columns=["extra"])
+        data.diff_data_files(
+            old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["extra"]
+        )
 
 
 def test_diff_data_files_large_file_summary_only(
@@ -615,7 +653,9 @@ def test_diff_data_files_large_file_summary_only(
     # Monkeypatch the size threshold to trigger large file path
     monkeypatch.setattr(data, "_MAX_IN_MEMORY_SIZE", 1)
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None)
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=None
+    )
 
     assert result["summary_only"] is True
     assert result["row_changes"] == []
@@ -635,7 +675,9 @@ def test_diff_data_files_positional_diff(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n")
     new_file.write_text("id,name\n1,alice\n2,bobby\n3,carol\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None)
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=None
+    )
 
     assert result["reorder_only"] is False
     assert result["summary_only"] is False
@@ -654,7 +696,14 @@ def test_diff_data_files_positional_truncation(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,a\n2,b\n3,c\n4,d\n5,e\n")
     new_file.write_text("id,name\n1,x\n2,y\n3,z\n4,w\n5,v\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None, max_rows=2)
+    result = data.diff_data_files(
+        old_file,
+        new_file,
+        "data.csv",
+        change_type=ChangeType.MODIFIED,
+        key_columns=None,
+        max_rows=2,
+    )
 
     assert result["truncated"] is True
     # Should only have 2 changes due to max_rows
@@ -709,34 +758,81 @@ def test_diff_data_hashes_change(
 
 
 # =============================================================================
-# Workspace Hash Tests
+# Workspace Selection Tests
 # =============================================================================
 
 
-def test_get_data_hashes_from_workspace(
-    tmp_path: Path,
-    set_project_root: Path,
+def _select(targets: list[str]) -> selection_module.DataSelection:
+    selection = selection_module.select_data_files(targets)
+    assert selection is not None
+    return selection
+
+
+def test_select_data_files_hashes_a_workspace_output(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Get hashes from workspace files."""
-    data_file = tmp_path / "data.csv"
-    data_file.write_text("id,name\n1,alice\n")
+    """A registered data output present in the workspace is hashed and its file recorded."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
+    output = mock_discovery.root / "data" / "process_data.csv"
+    output.parent.mkdir(parents=True)
+    output.write_text("id,name\n1,alice\n")
 
-    result = data.get_data_hashes_from_workspace(["data.csv"])
+    selection = _select(["process_data"])
 
-    assert "data.csv" in result
-    assert result["data.csv"] is not None
-    assert len(result["data.csv"]) == 16  # xxhash64 produces 16 hex chars
+    assert len(selection["workspace_hashes"]["data/process_data.csv"]) == 16  # xxhash64 hex
+    assert selection["workspace_paths"] == {"data/process_data.csv": output}
 
 
-def test_get_data_hashes_from_workspace_missing_file(
-    tmp_path: Path,
-    set_project_root: Path,
+def test_select_data_files_leaves_a_missing_workspace_output_absent(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Missing file returns None hash."""
-    result = data.get_data_hashes_from_workspace(["nonexistent.csv"])
+    """A registered output missing from the workspace has no workspace hash and no path."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
 
-    assert "nonexistent.csv" in result
-    assert result["nonexistent.csv"] is None
+    selection = _select(["data/process_data.csv"])
+
+    assert selection["head_hashes"] == {"data/process_data.csv": None}
+    assert selection["workspace_hashes"] == {}
+    assert selection["workspace_paths"] == {}
+
+
+def test_select_data_files_expands_a_path_directory_output(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory output contributes a hash for each data file, not one for the directory."""
+    _register_stage(
+        mock_discovery,
+        "results",
+        [_ref("results", None, ArtifactTag.DATA, loaders.PathOnly())],
+    )
+    _mock_head_lock(monkeypatch, None)
+    directory = mock_discovery.root / "data" / "results.dat"
+    directory.mkdir(parents=True)
+    (directory / "one.csv").write_text("id\n1\n")
+    (directory / "notes.yaml").write_text("n: 1\n")
+
+    selection = _select(["."])
+
+    assert list(selection["workspace_hashes"]) == ["data/results.dat/one.csv"]
+
+
+def test_select_data_files_warns_about_a_target_that_names_no_output(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A path that is no stage output is named in a warning and not compared."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
+    (mock_discovery.root / "loose.csv").write_text("id\n1\n")
+
+    selection = _select(["loose.csv"])
+
+    assert selection["head_hashes"] == {}
+    assert selection["workspace_hashes"] == {}
+    assert "No CSV, JSON or JSONL stage output matches 'loose.csv'" in caplog.text
 
 
 # =============================================================================
@@ -748,6 +844,7 @@ def test_format_diff_summary_basic(tmp_path: Path) -> None:
     """Format basic diff summary."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=110,
         old_cols=["id", "name"],
@@ -776,6 +873,7 @@ def test_format_diff_summary_reorder_only() -> None:
     """Format reorder-only summary."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=100,
         old_cols=["id", "name"],
@@ -798,6 +896,7 @@ def test_format_diff_table_json() -> None:
     diffs = [
         DataDiffResult(
             path="data.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=10,
             new_rows=10,
             old_cols=["id"],
@@ -828,6 +927,7 @@ def test_format_diff_table_plain_output() -> None:
     diffs = [
         DataDiffResult(
             path="data.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=100,
             new_rows=150,
             old_cols=["id", "name"],
@@ -840,6 +940,7 @@ def test_format_diff_table_plain_output() -> None:
         ),
         DataDiffResult(
             path="train.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=50,
             new_rows=50,
             old_cols=["x", "y"],
@@ -956,67 +1057,67 @@ def test_restore_data_from_cache_symlink_blocked(
 
 
 # =============================================================================
-# Numpy Encoder Tests
+# JSON encoding of diff values
 # =============================================================================
 
 
-def test_numpy_encoder_integer() -> None:
+def test_json_default_integer() -> None:
     """Encode numpy integer types."""
     import numpy
 
-    result = json.dumps({"value": numpy.int64(42)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.int64(42)}, default=data.json_default)
     assert json.loads(result) == {"value": 42}
 
 
-def test_numpy_encoder_floating() -> None:
-    """Encode numpy floating types (float32 needs custom encoder, float64 is native)."""
+def test_json_default_floating() -> None:
+    """Encode numpy floating types (float32 needs the default, float64 is native)."""
     import numpy
 
-    # numpy.float32 needs custom encoder (numpy.float64 serializes natively)
-    result = json.dumps({"value": numpy.float32(3.14)}, cls=data._NumpyEncoder)
+    # numpy.float32 needs the default (numpy.float64 serializes natively)
+    result = json.dumps({"value": numpy.float32(3.14)}, default=data.json_default)
     parsed = json.loads(result)
     assert abs(parsed["value"] - 3.14) < 0.001
 
 
-def test_numpy_encoder_bool() -> None:
+def test_json_default_bool() -> None:
     """Encode numpy boolean types."""
     import numpy
 
-    result = json.dumps({"value": numpy.bool_(True)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.bool_(True)}, default=data.json_default)
     assert json.loads(result) == {"value": True}
 
 
-def test_numpy_encoder_array() -> None:
+def test_json_default_array() -> None:
     """Encode numpy arrays."""
     import numpy
 
-    result = json.dumps({"value": numpy.array([1, 2, 3])}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.array([1, 2, 3])}, default=data.json_default)
     assert json.loads(result) == {"value": [1, 2, 3]}
 
 
-def test_numpy_encoder_timestamp() -> None:
+def test_json_default_timestamp() -> None:
     """Encode pandas Timestamp."""
-    result = json.dumps({"value": pandas.Timestamp("2024-01-01")}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.Timestamp("2024-01-01")}, default=data.json_default)
     parsed = json.loads(result)
     assert "2024-01-01" in parsed["value"]
 
 
-def test_numpy_encoder_timedelta() -> None:
+def test_json_default_timedelta() -> None:
     """Encode pandas Timedelta."""
-    result = json.dumps({"value": pandas.Timedelta(days=1)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.Timedelta(days=1)}, default=data.json_default)
     parsed = json.loads(result)
     assert "1 day" in parsed["value"]
 
 
-def test_numpy_encoder_pandas_na() -> None:
+def test_json_default_pandas_na() -> None:
     """Encode pandas.NA as None."""
-    result = json.dumps({"value": pandas.NA}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.NA}, default=data.json_default)
     assert json.loads(result) == {"value": None}
 
 
-def test_numpy_encoder_nat() -> None:
+def test_json_default_nat() -> None:
     """Encode NaT as None."""
-    result = json.dumps({"value": pandas.NaT}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.NaT}, default=data.json_default)
     assert json.loads(result) == {"value": None}
 
 
@@ -1101,6 +1202,7 @@ def test_format_diff_summary_removed_file() -> None:
     """Format summary for removed file."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.REMOVED,
         old_rows=50,
         new_rows=None,
         old_cols=["id", "name"],
@@ -1122,6 +1224,7 @@ def test_format_diff_summary_added_file() -> None:
     """Format summary for added file."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.ADDED,
         old_rows=None,
         new_rows=100,
         old_cols=None,
@@ -1143,6 +1246,7 @@ def test_format_diff_summary_with_schema_changes() -> None:
     """Format summary with various schema changes."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=100,
         old_cols=["id", "old_col", "modified_col"],
@@ -1181,6 +1285,7 @@ def test_format_diff_summary_with_row_changes() -> None:
     """Format summary with row changes."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=105,
         old_cols=["id", "name"],
@@ -1298,7 +1403,7 @@ def test_get_schema_unsupported(tmp_path: Path) -> None:
 
 
 # =============================================================================
-# get_data_hashes_from_head Tests (registered stages, mocked git HEAD)
+# select_data_files HEAD-side Tests (registered stages, mocked git HEAD)
 # =============================================================================
 
 
@@ -1356,7 +1461,7 @@ def _mock_head_lock(monkeypatch: pytest.MonkeyPatch, content: bytes | None) -> N
     monkeypatch.setattr(git, "read_files_from_head", _read_files_from_head)
 
 
-def test_get_data_hashes_from_head_only_includes_data_outputs(
+def test_select_data_files_only_includes_data_outputs_at_head(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1373,12 +1478,12 @@ def test_get_data_hashes_from_head_only_includes_data_outputs(
     )
     _mock_head_lock(monkeypatch, None)
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head(
+def test_select_data_files_reads_head_hash(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1396,12 +1501,12 @@ outs:
 """
     _mock_head_lock(monkeypatch, lock_content)
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": "deadbeef00000000"}
 
 
-def test_get_data_hashes_from_head_no_lock_file(
+def test_select_data_files_head_no_lock_file(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1409,12 +1514,12 @@ def test_get_data_hashes_from_head_no_lock_file(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, None)
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_invalid_yaml(
+def test_select_data_files_head_invalid_yaml(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1422,12 +1527,12 @@ def test_get_data_hashes_from_head_invalid_yaml(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"invalid: yaml: content: [")
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_missing_outs_key(
+def test_select_data_files_head_missing_outs_key(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1435,12 +1540,12 @@ def test_get_data_hashes_from_head_missing_outs_key(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"fingerprint: abc123\n")
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_outs_not_list(
+def test_select_data_files_head_outs_not_list(
     mock_discovery: PipelineLike,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1448,6 +1553,6 @@ def test_get_data_hashes_from_head_outs_not_list(
     _register_csv_stage(mock_discovery)
     _mock_head_lock(monkeypatch, b"outs: not_a_list\n")
 
-    result = data.get_data_hashes_from_head()
+    result = _select(["."])["head_hashes"]
 
     assert result == {"data/process_data.csv": None}

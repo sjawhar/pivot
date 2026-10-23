@@ -21,7 +21,7 @@ logical keys to hashes:
 | `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); library code is not hashed |
 | `schema:<module>.<qualname>` | Pydantic model JSON schemas |
 | `wire:<parameter>` | Call-site artifact wiring: a direct identity, or a collection's kind and ordered identities; input path bindings use `wire:<parameter>:path` or `:paths` |
-| `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…` | Reader/Writer method ASTs and config for each input and output |
+| `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…`, `out:…:tag` | Reader/Writer method ASTs and config for each input and output, plus each output's placement and write semantics |
 
 ### How It Works
 
@@ -156,7 +156,9 @@ and a thread native code starts outside `_thread`:
   once as Code changed after the upgrade. That accepted one-time rerun writes
   the current manifest; later runs reuse it until code or inputs change. Run
   `pivot repro --force <stage>` once to re-check a stage you know imports
-  dynamically.
+  dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns
+  once as Code changed, because each output's tag (`out:<key>:tag`) joined the
+  manifest; that run is checked, so it marks a stage that imports dynamically.
 
 
 ### Transitive Tracking

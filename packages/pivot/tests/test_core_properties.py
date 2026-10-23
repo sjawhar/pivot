@@ -88,6 +88,38 @@ def test_lock_write_then_read_returns_the_written_data(case: tuple[str, LockData
         assert stage_lock.read() == data
 
 
+_member_names = st.lists(st.text(max_size=6), min_size=1, max_size=3).map("/".join)
+
+
+@_SETTINGS
+@hypothesis.given(_member_names, st.one_of(st.none(), _member_names))
+def test_lock_write_never_produces_a_lock_read_refuses(relpath: str, empty_dir: str | None) -> None:
+    """Write and read apply one rule to recorded names: whatever a directory output records,
+    the write either refuses it or writes a lock that reads back as written."""
+    identity = ArtifactIdentity("p/stage", "o")
+    output = DirHash(
+        hash="0123456789abcdef",
+        manifest=[DirManifestEntry(relpath=relpath, hash="00112233445566ff", size=1, isexec=False)],
+    )
+    if empty_dir is not None:
+        output["empty_dirs"] = [empty_dir]
+    data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={identity: output},
+        output_paths={identity: "data/p/stage/o"},
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_lock = lock.StageLock("p/stage", pathlib.Path(tmp))
+        try:
+            stage_lock.write(data)
+        except exceptions.InvalidPathError:
+            assert not stage_lock.path.exists()
+            return
+        assert stage_lock.read() == data
+
+
 @_SETTINGS
 @hypothesis.given(st.binary(max_size=200))
 def test_lock_read_treats_arbitrary_bytes_as_missing_or_valid(content: bytes) -> None:

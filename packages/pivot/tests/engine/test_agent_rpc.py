@@ -28,7 +28,7 @@ from pivot.engine.agent_rpc import (
 )
 from pivot.engine.engine import Engine
 from pivot.engine.types import EventSource, InputEvent, OutputEvent, StageStarted
-from pivot.types import DataDiffResult
+from pivot.types import ChangeType, DataDiffResult
 from tests import helpers
 
 
@@ -1933,6 +1933,7 @@ def _make_diff_result(path: str = "output.csv") -> DataDiffResult:
     """Create a minimal DataDiffResult for testing."""
     return DataDiffResult(
         path=path,
+        change_type=ChangeType.MODIFIED,
         old_rows=10,
         new_rows=12,
         old_cols=["a", "b"],
@@ -2022,16 +2023,15 @@ async def test_handler_diff_output_invalid_new_hash_type() -> None:
 
 
 @pytest.mark.anyio
-async def test_handler_diff_output_null_hashes(
+async def test_handler_diff_output_null_old_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """diff_output works with null hashes (file added/removed cases)."""
+    """diff_output restores only the side whose hash the request names (an added file)."""
     mock_engine = MagicMock()
     handler = AgentRpcHandler(engine=mock_engine)
 
     expected = _make_diff_result("new_file.csv")
 
-    # restore_data_from_cache should NOT be called for null hashes
     restore_calls = list[str]()
 
     def _mock_restore(rel_path: str, file_hash: str) -> Path | None:
@@ -2043,6 +2043,7 @@ async def test_handler_diff_output_null_hashes(
         "pivot.show.data.diff_data_files",
         _helper_diff_data_files,
     )
+    monkeypatch.setattr("pathlib.Path.unlink", _helper_path_unlink)
 
     _diff_expected = expected
     try:
@@ -2050,14 +2051,25 @@ async def test_handler_diff_output_null_hashes(
             "DataDiffResult",
             await handler.handle_query(
                 "diff_output",
-                {"path": "new_file.csv", "old_hash": None, "new_hash": None},
+                {"path": "new_file.csv", "old_hash": None, "new_hash": "def4560000000000"},
             ),
         )
     finally:
         _diff_expected = None
 
     assert result["path"] == "new_file.csv", "Should return correct path"
-    assert restore_calls == [], "Should not call restore for null hashes"
+    assert restore_calls == ["def4560000000000"], "Should restore only the named side"
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_refuses_a_request_naming_neither_hash() -> None:
+    """A request naming neither hash names no file to compare, so it is refused."""
+    handler = AgentRpcHandler(engine=MagicMock())
+
+    with pytest.raises(ValueError, match="old_hash or new_hash must be given"):
+        await handler.handle_query(
+            "diff_output", {"path": "out.csv", "old_hash": None, "new_hash": None}
+        )
 
 
 @pytest.mark.anyio
@@ -2081,7 +2093,7 @@ async def test_handler_diff_output_max_rows_default(
 
     await handler.handle_query(
         "diff_output",
-        {"path": "out.csv", "old_hash": None, "new_hash": None},
+        {"path": "out.csv", "old_hash": None, "new_hash": "def4560000000000"},
     )
 
     assert captured_kwargs.get("max_rows") == 50, "Default max_rows should be 50"
@@ -2108,7 +2120,117 @@ async def test_handler_diff_output_custom_max_rows(
 
     await handler.handle_query(
         "diff_output",
-        {"path": "out.csv", "old_hash": None, "new_hash": None, "max_rows": 100},
+        {"path": "out.csv", "old_hash": None, "new_hash": "def4560000000000", "max_rows": 100},
     )
 
     assert captured_kwargs.get("max_rows") == 100, "Should use custom max_rows"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("old_hash", "new_hash", "change_type"),
+    [
+        pytest.param(None, "def4560000000000", ChangeType.ADDED, id="added"),
+        pytest.param("abc1230000000000", None, ChangeType.REMOVED, id="removed"),
+        pytest.param("abc1230000000000", "def4560000000000", ChangeType.MODIFIED, id="modified"),
+    ],
+)
+async def test_handler_diff_output_passes_the_change_type_its_hashes_name(
+    monkeypatch: pytest.MonkeyPatch,
+    old_hash: str | None,
+    new_hash: str | None,
+    change_type: ChangeType,
+) -> None:
+    """A request naming only a new hash is an added file, only an old hash a removed file, and
+    both a modified file, whether or not either object is in the cache."""
+    handler = AgentRpcHandler(engine=MagicMock())
+    captured_kwargs = dict[str, object]()
+
+    def _mock_diff(
+        old_path: object, new_path: object, path_display: str, **kwargs: object
+    ) -> DataDiffResult:
+        captured_kwargs.update(kwargs)
+        return _make_diff_result(path_display)
+
+    monkeypatch.setattr("pivot.show.data.restore_data_from_cache", _helper_restore_data_none)
+    monkeypatch.setattr("pivot.show.data.diff_data_files", _mock_diff)
+
+    await handler.handle_query(
+        "diff_output", {"path": "out.csv", "old_hash": old_hash, "new_hash": new_hash}
+    )
+
+    assert captured_kwargs.get("change_type") == change_type, captured_kwargs
+
+
+def test_encode_wire_writes_numpy_scalars_as_python_values() -> None:
+    """A diff result's row values can be numpy integers, floats and bools; the RPC writes them
+    as plain JSON numbers and booleans instead of dropping the connection."""
+    import numpy
+
+    from pivot.engine import agent_rpc
+
+    message = {
+        "old_values": {"n": numpy.int64(2), "x": numpy.float64(0.5), "ok": numpy.bool_(True)}
+    }
+
+    wire = json.loads(agent_rpc._encode_wire(message))
+
+    assert wire == {"old_values": {"n": 2, "x": 0.5, "ok": True}}
+    assert [type(value) for value in wire["old_values"].values()] == [int, float, bool]
+
+
+@pytest.mark.anyio
+async def test_rpc_diff_output_answers_a_modified_file_with_a_datetime_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A modified file's rows can hold timestamps; the reply writes them as text, as
+    `pivot diff --json` does, instead of dropping the connection."""
+    import shutil
+
+    import pandas
+
+    from pivot import config, loaders
+    from pivot.storage import cache
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(config, "locate_cache_dir", lambda: cache_dir)
+    hashes = list[str]()
+    for rows in (2, 3):
+        frame = pandas.DataFrame({"v": range(1, rows + 1)})
+        frame["when"] = pandas.Timestamp("2024-01-01") + pandas.to_timedelta(frame["v"], unit="D")
+        source = tmp_path / f"stamp{rows}.jsonl"
+        loaders.DataFrameJSONL().save(frame, source)
+        file_hash, _ = cache.hash_file(source)
+        cached = cache.get_cache_path(cache_dir / "files", file_hash)
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, cached)
+        hashes.append(file_hash)
+    socket_path = tmp_path / "agent.sock"
+    request = {
+        "jsonrpc": "2.0",
+        "method": "diff_output",
+        "params": {"path": "data/d/stamp.jsonl", "old_hash": hashes[0], "new_hash": hashes[1]},
+        "id": 1,
+    }
+
+    reply = b""
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
+        source = AgentRpcSource(socket_path=socket_path, handler=AgentRpcHandler(engine=engine))
+        send, _ = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await helpers.wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                await conn.send(json.dumps(request).encode() + b"\n")
+                while not reply.endswith(b"\n"):
+                    reply += await conn.receive(65536)
+
+            tg.cancel_scope.cancel()
+
+    result = json.loads(reply)["result"]
+    assert (result["change_type"], result["old_rows"], result["new_rows"]) == ("modified", 2, 3)
+    assert [change["new_values"] for change in result["row_changes"]] == [
+        {"v": 3, "when": "2024-01-04 00:00:00"}
+    ]

@@ -45,10 +45,12 @@ _MAX_VERSION = 2**63 - 1
 
 
 def _json_default(obj: object) -> object:
-    """Custom JSON encoder for enums and other non-serializable types."""
+    """Encode enums by value, and a diff result's numpy and pandas values as `--json` does."""
     if isinstance(obj, enum.Enum):
         return obj.value
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    from pivot.show import data as data_mod
+
+    return data_mod.json_default(obj)
 
 
 def _identity_json(ref: types.ArtifactRef) -> types.ArtifactIdentityJson:
@@ -406,6 +408,8 @@ class AgentRpcHandler:
                     raise ValueError("old_hash must be string or null")
                 if new_hash is not None and not isinstance(new_hash, str):
                     raise ValueError("new_hash must be string or null")
+                if not old_hash and not new_hash:
+                    raise ValueError("old_hash or new_hash must be given")
 
                 max_rows = params.get("max_rows", 50)
                 if not isinstance(max_rows, int) or isinstance(max_rows, bool):
@@ -427,8 +431,18 @@ class AgentRpcHandler:
                             old_path_file = data_mod.restore_data_from_cache(_path, _old_hash)
                         if _new_hash:
                             new_path_file = data_mod.restore_data_from_cache(_path, _new_hash)
+                        if not _old_hash:
+                            change_type = types.ChangeType.ADDED
+                        elif not _new_hash:
+                            change_type = types.ChangeType.REMOVED
+                        else:
+                            change_type = types.ChangeType.MODIFIED
                         return data_mod.diff_data_files(
-                            old_path_file, new_path_file, _path, max_rows=_max_rows
+                            old_path_file,
+                            new_path_file,
+                            _path,
+                            change_type=change_type,
+                            max_rows=_max_rows,
                         )
                     finally:
                         if old_path_file:

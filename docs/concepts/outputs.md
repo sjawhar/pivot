@@ -172,6 +172,15 @@ symlink-mode checkout links each file to an object in the configured cache
 (`cache.dir`), and that link counts as the file it points to. A link to a
 hash-named file anywhere else is a user symlink.
 
+A lock records each file of a directory artifact by its path inside the
+directory, and Pivot reads back every path it writes. Any character a file name
+holds is recorded, spaces and format characters included (a macOS screenshot's
+narrow no-break space, `Screenshot … 10.00.00 AM.png`). A name with a
+backslash cannot be recorded: the stage, or `pivot commit`, fails and names the
+file, and the previous lock is kept. A name with a control character (a TAB,
+an escape, DEL) is recorded with a warning naming it; a later release refuses
+these names, so rename such files.
+
 ## Directory outputs
 
 Tag a `dict[str, T]` return value with `directory` when a stage writes a
@@ -179,6 +188,9 @@ variable set of files. Each key is a file's path inside the directory and each
 value is written by `T`'s default writer, or by the loader given beside the
 tag. The loader never comes from a key's extension, so give keys the extension
 of the files the loader writes:
+
+A directory handle is not a collection while `pipeline.py` is loading. Do not iterate it or test
+membership; name one member (`parts["train.csv"]`) or pass the handle itself.
 
 ```python
 from typing import Annotated

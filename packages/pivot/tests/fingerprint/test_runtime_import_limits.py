@@ -106,15 +106,14 @@ outs:
 """
 
 
-def test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it(
+def test_result_cached_by_0_5_2_reruns_once_and_its_run_marks_the_stage(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A stage whose 0.5.2 lock matches its unchanged static fingerprint is served from that lock
-    without running, so the stage-import check has nothing to see. A static walk that gains a
-    user class method or a user module reruns once as Code changed; after that it reuses normally.
-    `pivot repro --force <stage>` runs a dynamically importing stage once under this version: the
-    check marks it, and the next edit to the module it imports reruns it. Both docs list the
-    boundary."""
+    """Each output's tag joined the manifest after 0.5.6 (`out:<key>:tag`), so a 0.5.2 lock no
+    longer matches: the first `pivot repro` after the upgrade reruns the stage once as Code
+    changed, and the stage-import check sees that run and marks the lock. A marked result is
+    never reused, so the next `pivot repro` reruns it with the uncovered-import reason, and an
+    edit to the module it imports is picked up. Both docs state the upgrade rerun."""
     project = _project(tmp_path, {**_LIB, "pipeline.py": _RUNTIME_IMPORT}, lines=_LINES_0_5_2)
     flagged = _run(project, "repro")
     assert flagged.returncode == 0, flagged.stdout + flagged.stderr
@@ -129,8 +128,54 @@ def test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it(
     upgraded = _run(project, "repro", "--json")
 
     assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
-    assert '"stage": "t/count", "status": "cached"' in upgraded.stdout, upgraded.stdout
-    assert _UNCOVERED not in _flat(upgraded)
+    assert '"stage": "t/count", "status": "ran", "reason": "Code changed"' in upgraded.stdout, (
+        upgraded.stdout
+    )
+    manifest = yaml.safe_load(lock.read_text())["code_manifest"]
+    assert any(key.startswith("uncovered-import:") for key in manifest), manifest
+    again = _run(project, "repro", "--json")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert (
+        '"stage": "t/count", "status": "ran", "reason": "Previous run imported modules its '
+        + 'fingerprint does not cover: helpers, helpers.lib"'
+    ) in again.stdout, again.stdout
+    (project / "helpers" / "lib.py").write_text("VALUE = 100\n")
+    edited = _run(project, "repro")
+    assert edited.returncode == 0, edited.stdout + edited.stderr
+    assert _value(project) == 103
+    for doc in ("concepts", "architecture"):
+        text = " ".join((_REPO / "docs" / doc / "fingerprinting.md").read_text().split())
+        assert "Upgrading from 0.5.6 or earlier" in text, f"{doc}: the upgrade rerun is not stated"
+        assert "every stage with outputs reruns once" in text, (
+            f"{doc}: the upgrade rerun is missing"
+        )
+
+
+def test_result_cached_with_the_same_static_fingerprint_is_reused_until_a_forced_run_marks_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An earlier Pivot's lock whose static fingerprint matches this version's (this version's own
+    lock without its `uncovered-import:` key) is served from that lock without running, so the
+    stage-import check has nothing to see, and plain `pivot repro` keeps reusing it.
+    `pivot repro --force <stage>` runs a dynamically importing stage once under this version: the
+    check marks it, and the next edit to the module it imports reruns it. Both docs list the
+    boundary."""
+    project = _project(tmp_path, {**_LIB, "pipeline.py": _RUNTIME_IMPORT}, lines=_LINES_0_5_2)
+    first = _run(project, "repro")
+    assert first.returncode == 0, first.stdout + first.stderr
+    lock = project / ".pivot" / "stages" / "t" / "count.lock"
+    earlier = yaml.safe_load(lock.read_text())
+    marks = [key for key in earlier["code_manifest"] if key.startswith("uncovered-import:")]
+    assert marks, earlier["code_manifest"]
+    for key in marks:
+        del earlier["code_manifest"][key]
+    lock.write_text(yaml.safe_dump(earlier, sort_keys=False))
+
+    for _ in range(2):
+        reused = _run(project, "repro", "--json")
+        assert reused.returncode == 0, reused.stdout + reused.stderr
+        assert '"stage": "t/count", "status": "cached"' in reused.stdout, reused.stdout
+        assert _UNCOVERED not in _flat(reused)
     forced = _run(project, "repro", "--force", "t/count")
     assert forced.returncode == 0, forced.stdout + forced.stderr
     assert _flat(forced).count(_UNCOVERED) == 1, _flat(forced)

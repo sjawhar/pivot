@@ -197,7 +197,12 @@ def commit_stages(
                 output_hashes=dict(sorted(output_hashes_by_identity.items())),
                 output_paths=output_paths_by_identity,
             )
-            production_lock.write(new_lock_data)
+            try:
+                production_lock.write(new_lock_data)
+            except exceptions.InvalidPathError as exc:
+                logger.error("%s — skipping", exc)
+                failed.append(stage_name)
+                continue
 
             # 8. Update StateDB: dep generations, output generations, run cache entry
             run_id = run_history.generate_run_id()

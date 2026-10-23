@@ -2,6 +2,142 @@
 
 <!-- version list -->
 
+## v0.5.8 (2026-10-23)
+
+### Bug Fixes
+
+- **cli**: An absolute path typed through a symlink to the project root names the file it points to
+  in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch`, `pull` and `track`, instead of matching
+  nothing or being refused as outside the project
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **compose**: After upgrading, stages with outputs rerun once because output tags are part of their
+  fingerprint; stages with no outputs remain cached
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **compose**: Harden directory output handling ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: A stage whose output path changes with its loader, such as `loaders.CSV()` to
+  `loaders.DataFrameJSONL()`, no longer exits 1 with `ValueError('Invalid JSON …')`
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: An entry whose git HEAD content is not in the local cache is reported with unknown
+  counts and a `pivot fetch` warning instead of aborting the diff, and `--json` entries carry
+  `change_type` ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: Key git HEAD and the workspace by path, so an output that moves is removed at its HEAD
+  path and added at its new one, and a path whose kind changed is named with both kinds and not
+  compared ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **diff**: One selection decides, for git HEAD and the workspace, which stage outputs and directory
+  members each target names, and a target that names no CSV, JSON or JSONL file is named in a
+  warning ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **rpc**: `diff_output` answers a modified file whose two sides are cached instead of dropping the
+  connection on numpy or datetime values, and refuses a request naming neither hash
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **storage**: A lock records and reads back every directory member name it can hold, including
+  spaces and format characters such as a macOS screenshot's; a control character is recorded with a
+  warning that a later release refuses it, and a backslash fails the stage naming the file
+  ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+- **storage**: Refuse committed directory manifests with unsafe paths before `pivot diff` resolves
+  them into workspace files ([#500](https://github.com/sjawhar/pivot/pull/500),
+  [`b24d007`](https://github.com/sjawhar/pivot/commit/b24d007a68f774e12c61e2534a50f2da8eb68835))
+
+
+## v0.5.7 (2026-10-23)
+
+### Bug Fixes
+
+- **cache**: `--checkout-mode hardlink`, and a `cache.checkout_mode` order without copy, now copy a
+  file whose cache object is at the filesystem's hard-link limit in checkout, pull and repro,
+  instead of failing with `[Errno 31] Too many links`
+  ([#510](https://github.com/sjawhar/pivot/pull/510),
+  [`7faf1e7`](https://github.com/sjawhar/pivot/commit/7faf1e7920dad13f50516ceac9d845a1a53cbc75))
+
+- **cache**: Checkout, get, pull, repro's restore and a stage's own outputs copy a file whose cache
+  object already has as many hard links as the filesystem allows (65,000 on ext4), instead of
+  symlinking it into the cache; other files still hardlink, and a cache on another device still gets
+  symlinks as before ([#510](https://github.com/sjawhar/pivot/pull/510),
+  [`7faf1e7`](https://github.com/sjawhar/pivot/commit/7faf1e7920dad13f50516ceac9d845a1a53cbc75))
+
+- **cache**: Copy a cache object that has reached the filesystem's hard-link limit instead of
+  linking it ([#510](https://github.com/sjawhar/pivot/pull/510),
+  [`7faf1e7`](https://github.com/sjawhar/pivot/commit/7faf1e7920dad13f50516ceac9d845a1a53cbc75))
+
+
+## v0.5.6 (2026-10-23)
+
+### Bug Fixes
+
+- **fingerprint**: A result marked as not reusable is never restored from the run cache, and pivot
+  commit keeps the mark ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage reruns when a method of a user class it uses changes, including dataclass
+  methods ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage reruns when a user module imported inside the stage body changes, whether
+  the import is absolute, relative or inside a function
+  ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage whose run imports a user module its fingerprint does not cover warns
+  once, naming the module, and is not reused ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: After upgrading, each stage whose fingerprint now covers more code, such as one
+  that uses a user class or imports a user module in its body, reruns once; later runs reuse results
+  as before ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Imports made by a covered import, on any thread it starts, count as covered;
+  threads that pivot starts never do ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Refuse at definition a stage whose body imports a user module that is not loaded,
+  with the import to add ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Track user-class methods and in-body imports, refuse dynamic imports, keep unsafe
+  results out of the run cache ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+### Continuous Integration
+
+- Benchmark wall time and CPU against main on every pull request
+  ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: An interrupted run.py stops the measured pivot run, sweeps its session and restores the
+  caller's signal mask ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Derive thresholds from recorded A/A runs with a 2% floor, and exit 2 on any input the
+  comparator cannot read ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Measure each pull request's merge commit against its first parent, for wall time and
+  CPU at pipeline and task scope ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Report a regression only when the median change is over the calibrated threshold and a
+  paired bootstrap interval lies wholly above 1 ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+
 ## v0.5.5 (2026-10-22)
 
 ### Bug Fixes

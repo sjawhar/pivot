@@ -42,6 +42,10 @@ def _parse_lock_contents(
             continue
 
         if not lock.is_lock_data(data):
+            error = lock.lock_data_error(data)
+            assert error is not None
+            if isinstance(error, lock.UnsafeLockPath):
+                raise exceptions.SecurityValidationError(f"Refusing lock file {lock_path}: {error}")
             result[stage_name] = None
             continue
 

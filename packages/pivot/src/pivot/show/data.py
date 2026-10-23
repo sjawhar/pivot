@@ -7,14 +7,13 @@ import logging
 import os
 import pathlib
 import re
-from typing import TYPE_CHECKING, Any, TypedDict, cast, override
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy
 import pandas
 import tabulate
 
-from pivot import config, loaders, project, types
-from pivot.show import common
+from pivot import config, loaders
 from pivot.storage import cache
 from pivot.types import (
     ChangeType,
@@ -26,9 +25,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-
-    from pivot.storage import store as store_mod
+    from collections.abc import Mapping
 
 # Status symbols for diff display (plain text)
 STATUS_SYMBOLS: dict[ChangeType, str] = {
@@ -53,29 +50,33 @@ _MAX_IN_MEMORY_SIZE = 100 * 1024 * 1024
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
-class _NumpyEncoder(json.JSONEncoder):
-    """JSON encoder that handles numpy types by converting to Python equivalents."""
+def json_default(o: object) -> object:
+    """Encode the numpy and pandas values a diff result holds as plain JSON values.
 
-    @override
-    def default(self, o: object) -> object:
-        if isinstance(o, numpy.integer):
-            return int(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.integer stub is generic
-        if isinstance(o, numpy.floating):
-            return float(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.floating stub is generic
-        if isinstance(o, numpy.bool_):
-            return bool(o)
-        if isinstance(o, numpy.ndarray):
-            return o.tolist()
-        if isinstance(o, (pandas.Timestamp, pandas.Timedelta)):
-            return str(o)
-        # Handle NaN/NaT values (float, numpy.floating, pandas.NaT, etc.)
-        # Cast to Any for pandas.isna() which accepts dynamic types from JSON
-        try:
-            if pandas.isna(cast("Any", o)):
-                return None
-        except (TypeError, ValueError):  # pragma: no cover
-            pass
-        return super().default(o)  # pragma: no cover
+    ``pivot diff --json`` and the ``diff_output`` RPC both encode through this, so a row value
+    reads the same in each: a numpy scalar as its Python value, a timestamp or timedelta as its
+    text, and NaN, NaT or NA as null.
+    """
+    if isinstance(o, numpy.integer):
+        return int(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.integer stub is generic
+    if isinstance(o, numpy.floating):
+        return float(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.floating stub is generic
+    if isinstance(o, numpy.bool_):
+        return bool(o)
+    if isinstance(o, numpy.ndarray):
+        return o.tolist()
+    if isinstance(o, (pandas.Timestamp, pandas.Timedelta)):
+        return str(o)
+    # Handle NaN/NaT values (float, numpy.floating, pandas.NaT, etc.)
+    # Cast to Any for pandas.isna() which accepts dynamic types from JSON
+    try:
+        if pandas.isna(cast("Any", o)):
+            return None
+    except (TypeError, ValueError):  # pragma: no cover
+        pass
+    raise TypeError(  # pragma: no cover
+        f"Object of type {type(o).__name__} is not JSON serializable"
+    )
 
 
 class DataDiffEntry(TypedDict):
@@ -95,30 +96,6 @@ def detect_format(path: pathlib.Path) -> DataFileFormat:
     """Detect data file format from extension."""
     suffix = path.suffix.lower()
     return _DATA_EXTENSIONS.get(suffix, DataFileFormat.UNKNOWN)
-
-
-def _format_from_loader(
-    loader: loaders.Reader[object] | loaders.Writer[object] | loaders.Loader[object, object],
-) -> DataFileFormat | None:
-    if isinstance(loader, loaders.CSV):
-        return DataFileFormat.CSV
-    if isinstance(loader, loaders.JSON):
-        return DataFileFormat.JSON
-    if isinstance(loader, loaders.JSONL):
-        return DataFileFormat.JSONL
-    return None
-
-
-def _is_data_output(
-    out: types.ArtifactRef, store: store_mod.WorkspaceStore, project_root: pathlib.Path
-) -> bool:
-    """True for a stage output that `pivot diff` can compare (CSV, JSON or JSONL data)."""
-    if out.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
-        return False
-    if _format_from_loader(out.format) is not None:
-        return True
-    rel_path = project.to_relative_path(store.resolve_display_path(out), project_root)
-    return detect_format(pathlib.Path(rel_path)) != DataFileFormat.UNKNOWN
 
 
 def load_dataframe(path: pathlib.Path) -> pandas.DataFrame:
@@ -395,63 +372,56 @@ def diff_data_files(
     old_path: pathlib.Path | None,
     new_path: pathlib.Path | None,
     path_display: str,
+    *,
+    change_type: ChangeType,
     key_columns: list[str] | None = None,
     max_rows: int = 10000,
 ) -> DataDiffResult:
-    """Compare two data files and return detailed diff result."""
-    # Handle file added/removed cases
-    if old_path is None and new_path is not None:
-        new_df = load_dataframe(new_path)
-        new_cols = list(new_df.columns)
-        new_dtypes = {col: str(dtype) for col, dtype in new_df.dtypes.items()}
-        return DataDiffResult(
-            path=path_display,
-            old_rows=None,
-            new_rows=len(new_df),
-            old_cols=None,
-            new_cols=new_cols,
-            schema_changes=[
+    """Compare two data files and return detailed diff result.
+
+    A None path is a side that does not exist, or one that ``change_type`` says exists but
+    could not be read, such as a git HEAD object missing from the local cache; that side's
+    rows and columns are None.
+    """
+    if old_path is None or new_path is None:
+        old_df = None if old_path is None else load_dataframe(old_path)
+        new_df = None if new_path is None else load_dataframe(new_path)
+        schema_changes = list[SchemaChange]()
+        if change_type == ChangeType.ADDED and new_df is not None:
+            new_dtypes = {col: str(dtype) for col, dtype in new_df.dtypes.items()}
+            schema_changes = [
                 SchemaChange(
                     column=col,
                     old_dtype=None,
                     new_dtype=new_dtypes[col],
                     change_type=ChangeType.ADDED,
                 )
-                for col in new_cols
-            ],
-            row_changes=[],
-            reorder_only=False,
-            truncated=False,
-            summary_only=True,
-        )
-
-    if old_path is not None and new_path is None:
-        old_df = load_dataframe(old_path)
-        old_cols = list(old_df.columns)
-        old_dtypes = {col: str(dtype) for col, dtype in old_df.dtypes.items()}
-        return DataDiffResult(
-            path=path_display,
-            old_rows=len(old_df),
-            new_rows=None,
-            old_cols=old_cols,
-            new_cols=None,
-            schema_changes=[
+                for col in new_df.columns
+            ]
+        elif change_type == ChangeType.REMOVED and old_df is not None:
+            old_dtypes = {col: str(dtype) for col, dtype in old_df.dtypes.items()}
+            schema_changes = [
                 SchemaChange(
                     column=col,
                     old_dtype=old_dtypes[col],
                     new_dtype=None,
                     change_type=ChangeType.REMOVED,
                 )
-                for col in old_cols
-            ],
+                for col in old_df.columns
+            ]
+        return DataDiffResult(
+            path=path_display,
+            change_type=change_type,
+            old_rows=None if old_df is None else len(old_df),
+            new_rows=None if new_df is None else len(new_df),
+            old_cols=None if old_df is None else list(old_df.columns),
+            new_cols=None if new_df is None else list(new_df.columns),
+            schema_changes=schema_changes,
             row_changes=[],
             reorder_only=False,
             truncated=False,
             summary_only=True,
         )
-
-    if old_path is None or new_path is None:  # pragma: no cover
-        raise DataError("Both old and new paths are None")
 
     # Check file sizes for large file handling - BEFORE loading
     old_size = old_path.stat().st_size
@@ -467,6 +437,7 @@ def diff_data_files(
         schema_changes = _diff_schema(old_cols, new_cols, old_dtypes, new_dtypes)
         return DataDiffResult(
             path=path_display,
+            change_type=change_type,
             old_rows=get_row_count(old_path),
             new_rows=get_row_count(new_path),
             old_cols=old_cols,
@@ -504,6 +475,7 @@ def diff_data_files(
     if reorder_only:
         return DataDiffResult(
             path=path_display,
+            change_type=change_type,
             old_rows=len(old_df),
             new_rows=len(new_df),
             old_cols=old_cols,
@@ -527,6 +499,7 @@ def diff_data_files(
 
     return DataDiffResult(
         path=path_display,
+        change_type=change_type,
         old_rows=len(old_df),
         new_rows=len(new_df),
         old_cols=old_cols,
@@ -537,40 +510,6 @@ def diff_data_files(
         truncated=truncated,
         summary_only=False,
     )
-
-
-def get_data_hashes_from_head() -> dict[str, str | None]:
-    """Map each data output's workspace path to its hash in the lock files at git HEAD."""
-    from pivot.cli import helpers as cli_helpers
-
-    store = cli_helpers.require_workspace_store()
-    proj_root = project.get_project_root()
-    outs_by_stage = dict[str, list[types.ArtifactRef]]()
-    for stage_name in cli_helpers.list_stages():
-        data_outs = [
-            out
-            for out in cli_helpers.get_stage(stage_name)["outs"]
-            if _is_data_output(out, store, proj_root)
-        ]
-        if data_outs:
-            outs_by_stage[stage_name] = data_outs
-    return common.output_hashes_from_head(outs_by_stage, store)
-
-
-def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None]:
-    """Compute hashes for data files in workspace."""
-    result = dict[str, str | None]()
-    proj_root = project.get_project_root()
-
-    for rel_path in paths:
-        abs_path = proj_root / rel_path
-        if abs_path.exists():
-            file_hash, _ = cache.hash_file(abs_path)
-            result[rel_path] = file_hash
-        else:
-            result[rel_path] = None
-
-    return result
 
 
 def diff_data_hashes(
@@ -664,8 +603,12 @@ def format_diff_summary(result: DataDiffResult) -> str:
         lines.append(f"  Rows: {old_rows:,} -> {new_rows:,} ({diff_str})")
     elif old_rows is not None:
         lines.append(f"  Rows: {old_rows:,} (removed)")
-    elif new_rows is not None:
+    elif new_rows is not None and result["change_type"] == ChangeType.ADDED:
         lines.append(f"  Rows: {new_rows:,} (added)")
+    elif new_rows is not None:
+        lines.append(f"  Rows: unknown -> {new_rows:,}")
+    else:
+        lines.append("  Rows: unknown (removed)")
 
     # Column counts
     old_cols = result["old_cols"]
@@ -716,7 +659,7 @@ def format_diff_table(
 ) -> str:
     """Format diff results for display."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(diffs, indent=2, cls=_NumpyEncoder)
+        return json.dumps(diffs, indent=2, default=json_default)
 
     if not diffs:
         return "No data file changes."
@@ -736,7 +679,7 @@ def format_row_changes_table(
 ) -> str:
     """Format row changes as a table."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(row_changes, indent=2, cls=_NumpyEncoder)
+        return json.dumps(row_changes, indent=2, default=json_default)
 
     if not row_changes:
         return "No row changes."
