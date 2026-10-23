@@ -234,6 +234,7 @@ def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
         logging.getLogger(name).handlers.clear()
     yield
     project._project_root_cache = None
+    project.clear_state_dir_cache()
 
 
 @pytest.fixture

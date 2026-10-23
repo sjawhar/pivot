@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import subprocess
 import sys
 
 import pytest
+import yaml
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 _CASES = {
@@ -83,3 +85,35 @@ def test_non_string_state_dir_matches_release_display_contract(
     assert shown.returncode == 0, shown.stdout + shown.stderr
     assert shown.stdout == f"core.state_dir = {stored_value} (local)\n"
     assert "Pivot uses the default .pivot." not in shown.stderr
+
+
+@pytest.mark.parametrize(
+    ("value", "stored_value"), [("5", "5"), ("[a, b]", "a, b")], ids=["integer", "list"]
+)
+@pytest.mark.parametrize(
+    "scope",
+    [("--local",), ("--local", "--json"), ("--global",)],
+    ids=["local", "local-json", "global"],
+)
+def test_scoped_config_list_shows_a_non_string_state_dir_as_052_does(
+    tmp_path: pathlib.Path, value: str, stored_value: str, scope: tuple[str, ...]
+) -> None:
+    """0.5.2 exits 0 and shows the stored value for scoped `config list`; plain `config list` still exits 1."""
+    home = tmp_path / "home"
+    (home / ".config" / "pivot").mkdir(parents=True)
+    root = tmp_path / "project"
+    root.mkdir()
+    assert _run(root, home, "git", "init", "-q").returncode == 0
+    (root / ".pivot").mkdir()
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {value}\n")
+    if scope[0] == "--global":
+        (home / ".config" / "pivot" / "config.yaml").write_text(f"core:\n  state_dir: {value}\n")
+
+    listed = _run(root, home, _PIVOT, "config", "list", *scope)
+
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    if "--json" in scope:
+        assert json.loads(listed.stdout)["core"]["state_dir"] == yaml.safe_load(value)
+    else:
+        assert f"core.state_dir = {stored_value}" in listed.stdout, listed.stdout
+    assert _run(root, home, _PIVOT, "config", "list").returncode == 1

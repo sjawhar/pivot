@@ -371,12 +371,20 @@ def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     return cache_dir / file_hash[:2] / file_hash[2:]
 
 
+# The errnos for which `Path.exists()` reports a path as missing: CPython 3.13
+# `pathlib/_abc.py:30` (`_IGNORED_ERRNOS`). A prefix that is a regular file (ENOTDIR) or a symlink
+# loop (ELOOP) makes the object missing, as it did on 0.5.2; any other error, such as EACCES, raises.
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
 def is_cache_object_path(path: pathlib.Path, *, directory: bool = False) -> bool:
     """Whether a resolver or scan may treat a final cache file or tree root as present."""
     try:
         mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return False
+    except OSError as e:
+        if e.errno in _ABSENT_ERRNOS:
+            return False
+        raise
     expected = stat.S_ISDIR if directory else stat.S_ISREG
     if not expected(mode):
         kind = "directory tree" if directory else "regular file"

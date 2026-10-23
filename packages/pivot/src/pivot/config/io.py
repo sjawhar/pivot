@@ -269,7 +269,7 @@ def clear_config_cache() -> None:
     """Clear cached configuration and its project state directory."""
     global _merged_config_cache
     _merged_config_cache = None
-    project._state_dir_cache.clear()  # pyright: ignore[reportPrivateUsage] - shared resolver cache
+    project.clear_state_dir_cache()
 
 
 def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:

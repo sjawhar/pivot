@@ -1,3 +1,4 @@
+import contextvars
 import logging
 import os
 import pathlib
@@ -8,16 +9,25 @@ logger = logging.getLogger(__name__)
 _project_root_cache: pathlib.Path | None = None
 _state_dir_cache = dict[pathlib.Path, pathlib.Path]()
 
-# The CLI turns these warnings on; loky workers and shell completion never do, so they stay silent.
-_state_dir_warnings_enabled = False
-# Global config files whose ignored core.state_dir was already reported in this process.
-_reported_ignored_global_state_dirs = set[pathlib.Path]()
-# Project config files whose unusable state directory was already reported in this process.
-_reported_unusable_state_dirs = set[pathlib.Path]()
-# Configured state directories whose 0.5.2 lock layout was already reported in this process.
-_reported_legacy_state_dirs = set[pathlib.Path]()
-# Effective cache directories that overlap the stage-lock directory already reported this process.
-_reported_cache_stage_overlaps = set[tuple[pathlib.Path, pathlib.Path]]()
+
+class StateDirWarnings(typing.TypedDict):
+    """What one CLI invocation has already reported about the state directory."""
+
+    # Global config files whose ignored core.state_dir was reported.
+    ignored_global: set[pathlib.Path]
+    # Project config files whose unusable state directory was reported.
+    unusable: set[pathlib.Path]
+    # Configured state directories whose 0.5.2 lock layout was reported.
+    legacy: set[pathlib.Path]
+    # Effective cache directories reported as overlapping the stage-lock directory.
+    cache_stage_overlap: set[tuple[pathlib.Path, pathlib.Path]]
+
+
+# Set by the CLI callback for one invocation without --quiet. None (loky workers, shell
+# completion, library callers, -q) means these warnings stay silent.
+_state_dir_warnings = contextvars.ContextVar[StateDirWarnings | None](
+    "state_dir_warnings", default=None
+)
 
 
 STATE_GITIGNORE_CONTENT = """\
@@ -141,8 +151,9 @@ def state_dir_or_default(root: pathlib.Path, *, warn: bool = True) -> pathlib.Pa
             return state_dir
         problem = f"{target_problem} (core.state_dir in {config_path})"
         reason = "The state directory cannot be used"
-    if warn and _state_dir_warnings_enabled and config_path not in _reported_unusable_state_dirs:
-        _reported_unusable_state_dirs.add(config_path)
+    reported = _state_dir_warnings.get()
+    if warn and reported is not None and config_path not in reported["unusable"]:
+        reported["unusable"].add(config_path)
         logger.warning(f"{problem}. {reason}; Pivot uses the default .pivot.")
     return root / ".pivot"
 
@@ -235,13 +246,14 @@ def legacy_cache_files_dir_for(cache_files_dir: pathlib.Path) -> pathlib.Path | 
 
 
 def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
-    """Warn once that reads fall back to the 0.5.2 state layout for ``state_dir``."""
-    if not _state_dir_warnings_enabled or state_dir in _reported_legacy_state_dirs:
+    """Warn once per invocation that reads fall back to the 0.5.2 state layout for ``state_dir``."""
+    reported = _state_dir_warnings.get()
+    if reported is None or state_dir in reported["legacy"]:
         return
     legacy = legacy_state_dir_for(state_dir)
     if legacy is None:
         return
-    _reported_legacy_state_dirs.add(state_dir)
+    reported["legacy"].add(state_dir)
     root = get_project_root()
     try:
         target = (state_dir / "stages").relative_to(root)
@@ -260,13 +272,14 @@ def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
 def report_cache_stage_overlap(
     cache_dir: pathlib.Path, stages_dir: pathlib.Path, fallback_cache_dir: pathlib.Path
 ) -> None:
-    """Warn once that an effective cache directory overlaps durable stage locks."""
-    if not _state_dir_warnings_enabled:
+    """Warn once per invocation that an effective cache directory overlaps durable stage locks."""
+    reported = _state_dir_warnings.get()
+    if reported is None:
         return
     key = (cache_dir, stages_dir)
-    if key in _reported_cache_stage_overlaps:
+    if key in reported["cache_stage_overlap"]:
         return
-    _reported_cache_stage_overlaps.add(key)
+    reported["cache_stage_overlap"].add(key)
     logger.warning(
         "cache directory %s overlaps the stage-lock directory %s; Pivot uses %s.",
         cache_dir,
@@ -275,10 +288,26 @@ def report_cache_stage_overlap(
     )
 
 
-def enable_state_dir_warnings() -> None:
-    """Report an ignored global ``core.state_dir`` and an unusable project one from now on."""
-    global _state_dir_warnings_enabled
-    _state_dir_warnings_enabled = True
+def begin_state_dir_warnings() -> contextvars.Token[StateDirWarnings | None]:
+    """Report state-directory problems, each once, until the returned token is reset."""
+    return _state_dir_warnings.set(
+        StateDirWarnings(
+            ignored_global=set[pathlib.Path](),
+            unusable=set[pathlib.Path](),
+            legacy=set[pathlib.Path](),
+            cache_stage_overlap=set[tuple[pathlib.Path, pathlib.Path]](),
+        )
+    )
+
+
+def end_state_dir_warnings(token: contextvars.Token[StateDirWarnings | None]) -> None:
+    """Stop reporting, restoring whatever reporting state ``begin_state_dir_warnings`` replaced."""
+    _state_dir_warnings.reset(token)
+
+
+def clear_state_dir_cache() -> None:
+    """Forget every resolved state directory, so the next lookup reads the config again."""
+    _state_dir_cache.clear()
 
 
 def ignored_global_state_dir_message(
@@ -294,19 +323,20 @@ def ignored_global_state_dir_message(
 
 
 def warn_if_global_state_dir_ignored(root: pathlib.Path, *, shadowed: bool) -> None:
-    """Log, once per process, that the global config's ``core.state_dir`` is ignored.
+    """Log, once per invocation, that the global config's ``core.state_dir`` is ignored.
 
-    Silent until ``enable_state_dir_warnings`` runs. ``shadowed`` says the project
+    Silent outside ``begin_state_dir_warnings``. ``shadowed`` says the project
     sets its own value. The global file is read only to decide whether to warn: when it cannot
     be read, this says nothing, and reporting that stays with the normal config load.
     """
-    if not _state_dir_warnings_enabled:
+    reported = _state_dir_warnings.get()
+    if reported is None:
         return
     from pivot import exceptions
     from pivot.config import io as config_io
 
     global_path = config_io.get_global_config_path()
-    if global_path in _reported_ignored_global_state_dirs:
+    if global_path in reported["ignored_global"]:
         return
     try:
         present, _ = config_io.read_config_file_value(global_path, "core.state_dir")
@@ -314,7 +344,7 @@ def warn_if_global_state_dir_ignored(root: pathlib.Path, *, shadowed: bool) -> N
         return
     if not present:
         return
-    _reported_ignored_global_state_dirs.add(global_path)
+    reported["ignored_global"].add(global_path)
     logger.warning(ignored_global_state_dir_message(global_path, root, shadowed=shadowed))
 
 

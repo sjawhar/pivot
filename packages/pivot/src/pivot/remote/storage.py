@@ -6,7 +6,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Protocol, TypedDict
 
-from pivot import config, exceptions, project
+from pivot import config, exceptions
 from pivot.remote import batch, keys
 from pivot.remote import config as remote_config
 
@@ -174,12 +174,7 @@ async def _download_verified(
     finally:
         with contextlib.suppress(OSError):
             os.close(fd)
-    keys.check_digest(
-        expected_hash,
-        actual_hash,
-        f"{bucket}/{key}",
-        state_dir=project.get_state_dir(),
-    )
+    keys.check_digest(expected_hash, actual_hash, f"{bucket}/{key}")
 
 
 async def _stream_upload(

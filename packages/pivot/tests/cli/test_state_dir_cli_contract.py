@@ -477,4 +477,173 @@ def test_push_dry_run_ignores_a_cache_object_that_is_not_a_regular_file(
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert marker not in output, output
-    assert "Would push 0 file(s)" in result.stdout, output
+    assert "No files to push" in result.stdout, output
+
+
+_METRIC_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, metric, stage
+
+
+@stage
+def process(value: str) -> Annotated[dict, metric]:
+    return {"score": int(value.strip())}
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt", t=str))
+"""
+
+
+def _break_cache_prefix(prefix: pathlib.Path, prefix_kind: str) -> None:
+    """Replace a cache prefix directory with a regular file or a symlink loop."""
+    import shutil
+
+    if prefix.is_dir() and not prefix.is_symlink():
+        shutil.rmtree(prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    if prefix_kind == "file":
+        prefix.write_text("not a cache prefix directory\n")
+    else:
+        prefix.symlink_to(prefix.name)
+
+
+@pytest.mark.parametrize("prefix_kind", ["file", "symlink-loop"])
+def test_metrics_diff_treats_an_unusable_cache_prefix_as_missing(
+    tmp_path: pathlib.Path, prefix_kind: str
+) -> None:
+    """0.5.2 and main exit 0 and read the committed metric from git when the prefix is not a directory."""
+    home = tmp_path / "home"
+    root = _project(home, tmp_path / "project", "1\n")
+    (root / "pipeline.py").write_text(_METRIC_PIPELINE)
+    for args in (
+        ("git", "config", "user.email", "t@example.com"),
+        ("git", "config", "user.name", "t"),
+        (_PIVOT, "repro"),
+        ("git", "add", "-A"),
+        ("git", "commit", "-qm", "base"),
+    ):
+        _ok(_run_with_home(root, home, *args))
+    lock = yaml.safe_load((root / ".pivot" / "stages" / "test" / "process.lock").read_text())
+    _break_cache_prefix(
+        root / ".pivot" / "cache" / "files" / lock["outs"][0]["hash"][:2], prefix_kind
+    )
+    (root / "metrics" / "test" / "process.yaml").write_text("score: 2\n")
+
+    result = _run_with_home(root, home, _PIVOT, "metrics", "diff", "metrics/test/process.yaml")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "modified" in result.stdout, output
+    assert "Error" not in output, output
+
+
+@pytest.mark.parametrize("prefix_kind", ["file", "symlink-loop"])
+def test_checkout_reports_a_missing_object_when_the_cache_prefix_is_unusable(
+    tmp_path: pathlib.Path, prefix_kind: str
+) -> None:
+    """0.5.2 and main say the object is missing and name `pivot pull`, not a raw errno."""
+    home = tmp_path / "home"
+    root = _project(home, tmp_path / "project", "input\n")
+    _ok(_run_with_home(root, home, _PIVOT, "repro"))
+    lock = yaml.safe_load((root / ".pivot" / "stages" / "test" / "process.lock").read_text())
+    _break_cache_prefix(
+        root / ".pivot" / "cache" / "files" / lock["outs"][0]["hash"][:2], prefix_kind
+    )
+    (root / "data" / "test" / "process.txt").unlink()
+
+    result = _run_with_home(root, home, _PIVOT, "checkout", "data/test/process.txt")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "Missing 1 file(s)" in output, output
+    assert "pivot pull" in output, output
+    assert "Errno" not in output, output
+    assert "Traceback" not in output, output
+
+
+def test_metrics_diff_treats_a_cache_dir_that_is_a_file_as_missing(tmp_path: pathlib.Path) -> None:
+    """Main exits 0 when PIVOT_CACHE_DIR names a regular file; the committed metric is read from git."""
+    import os
+
+    home = tmp_path / "home"
+    root = _project(home, tmp_path / "project", "1\n")
+    (root / "pipeline.py").write_text(_METRIC_PIPELINE)
+    for args in (
+        ("git", "config", "user.email", "t@example.com"),
+        ("git", "config", "user.name", "t"),
+        (_PIVOT, "repro"),
+        ("git", "add", "-A"),
+        ("git", "commit", "-qm", "base"),
+    ):
+        _ok(_run_with_home(root, home, *args))
+    cache_file = tmp_path / "cache-is-a-file"
+    cache_file.write_text("not a directory\n")
+    (root / "metrics" / "test" / "process.yaml").write_text("score: 2\n")
+
+    result = subprocess.run(
+        [_PIVOT, "metrics", "diff", "metrics/test/process.yaml"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "HOME": str(home), "PIVOT_CACHE_DIR": str(cache_file)},
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "modified" in result.stdout, output
+
+
+@pytest.mark.parametrize("command", ["fetch", "pull"])
+def test_fetch_and_pull_download_under_an_empty_state_dir(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], command: str
+) -> None:
+    """0.5.2 exits 0 with `1 transferred` under a hand-edited `core.state_dir: ''`; so does the head."""
+    import os
+
+    import boto3
+    import xxhash
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=moto_services["s3"],
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    )
+    bucket = f"empty-state-dir-{command}"
+    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+    content = b"remote object\n"
+    digest = xxhash.xxh64(content).hexdigest()
+    s3.put_object(  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+        Bucket=bucket, Key=f"cache/files/{digest[:2]}/{digest[2:]}", Body=content
+    )
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "project"
+    root.mkdir()
+    _ok(_run_with_home(root, home, "git", "init", "-q"))
+    _ok(_run_with_home(root, home, _PIVOT, "init"))
+    (root / ".pivot" / "config.yaml").write_text(
+        f"core:\n  state_dir: ''\nremotes:\n  origin: s3://{bucket}/cache\ndefault_remote: origin\n"
+    )
+    (root / "pipeline.py").write_text("from pivot import Pipeline\n\npipeline = Pipeline('test')\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PIVOT", "AWS"))}
+    env.update(
+        HOME=str(home),
+        AWS_ENDPOINT_URL=moto_services["s3"],
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+
+    result = subprocess.run(
+        [_PIVOT, command], cwd=root, capture_output=True, text=True, check=False, env=env
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "1 transferred" in output, output

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from pivot import project
 from pivot.remote import sync
 from pivot.show import data, metrics
@@ -11,8 +13,7 @@ from pivot.storage import cache
 
 if TYPE_CHECKING:
     import pathlib
-
-    import pytest
+    from collections.abc import Generator
 
 _HASH = "abc1234567890def"
 
@@ -26,7 +27,14 @@ def _legacy_cache_file(root: pathlib.Path, text: str) -> pathlib.Path:
 
 def _configure_state_dir(root: pathlib.Path) -> None:
     (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
-    project.enable_state_dir_warnings()
+
+
+@pytest.fixture(autouse=True)
+def _report_state_dir_warnings() -> Generator[None]:
+    """Report state-directory warnings for this test only, as one CLI invocation does."""
+    token = project.begin_state_dir_warnings()
+    yield
+    project.end_state_dir_warnings(token)
 
 
 def test_data_cache_reader_uses_legacy_cache_object(
@@ -137,6 +145,28 @@ def test_cache_object_resolver_rejects_a_legacy_directory(
     _configure_state_dir(set_project_root)
     legacy = set_project_root / ".pivot" / "cache" / "files" / _HASH[:2] / _HASH[2:]
     legacy.mkdir(parents=True)
+
+    resolved = cache.resolve_cache_object_path(
+        set_project_root / "altstate" / "cache" / "files", _HASH
+    )
+
+    assert resolved is None
+
+
+@pytest.mark.parametrize("prefix_kind", ["file", "symlink-loop"])
+@pytest.mark.parametrize("layout", ["configured", "legacy"])
+def test_cache_object_resolver_reports_absent_when_the_prefix_is_not_a_directory(
+    set_project_root: pathlib.Path, layout: str, prefix_kind: str
+) -> None:
+    """Path.exists() called this absent (ENOTDIR, ELOOP), as did 0.5.2; the resolver agrees."""
+    _configure_state_dir(set_project_root)
+    state = set_project_root / ("altstate" if layout == "configured" else ".pivot")
+    prefix = state / "cache" / "files" / _HASH[:2]
+    prefix.parent.mkdir(parents=True)
+    if prefix_kind == "file":
+        prefix.write_text("not a cache prefix directory\n")
+    else:
+        prefix.symlink_to(prefix.name)
 
     resolved = cache.resolve_cache_object_path(
         set_project_root / "altstate" / "cache" / "files", _HASH

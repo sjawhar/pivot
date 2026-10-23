@@ -69,7 +69,7 @@ def test_pull_rejects_downloaded_bytes_that_do_not_match_cache_hash(
         f"Delete {key} from the remote, then run `pivot push`" in error
         and "has not run `pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote`"
         in error
-        and f"delete `{state_dir}/state.lmdb/`" in error
+        and "delete `.pivot/state.lmdb/`" in error
         for error in result["errors"]
     ), result["errors"]
     assert not cache.get_cache_path(cache_dir / "files", expected_hash).exists()

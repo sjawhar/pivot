@@ -120,14 +120,14 @@ def push(
     else:
         local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
-    if dry_run:
-        if not quiet:
-            click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
-        return
-
     if not local_hashes:
         if not quiet:
             click.echo("No files to push")
+        return
+
+    if dry_run:
+        if not quiet:
+            click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
         return
 
     # Remote hash tracking is project-level (not per-stage), so use the

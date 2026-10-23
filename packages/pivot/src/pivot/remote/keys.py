@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import pathlib
 import re
 import tempfile
 from typing import TYPE_CHECKING
@@ -80,16 +79,13 @@ async def stream_to_fd(read_chunk: Callable[[], Awaitable[bytes]], fd: int) -> s
     return hasher.hexdigest()
 
 
-def check_digest(
-    expected_hash: str,
-    actual_hash: str,
-    location: str,
-    *,
-    state_dir: pathlib.Path | None = None,
-) -> None:
+def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
     """Raise RemoteError if the downloaded object at ``location`` is not ``expected_hash``."""
     if actual_hash != expected_hash:
-        state_db_path = (state_dir or pathlib.Path(".pivot")) / "state.lmdb"
+        root = project.get_project_root()
+        state_db_path = project.state_dir_or_default(root, warn=False) / "state.lmdb"
+        if state_db_path.is_relative_to(root):
+            state_db_path = state_db_path.relative_to(root)
         raise exceptions.RemoteError(
             f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
             + f"for {location}. Delete {location} from the remote, then run "

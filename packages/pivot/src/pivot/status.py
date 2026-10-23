@@ -43,6 +43,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import enum
 import logging
 import pathlib
@@ -132,7 +133,9 @@ def _get_explanations_in_parallel(
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+            # Workers run in this context, so a warning they report counts as this command's.
             future = pool.submit(
+                contextvars.copy_context().run,
                 explain.get_stage_explanation,
                 stage_name,
                 fingerprint,

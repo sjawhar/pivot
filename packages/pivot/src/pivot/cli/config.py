@@ -54,10 +54,8 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     data: dict[str, Any]
     if use_global:
         data = config.load_config_file(config.get_global_config_path())
-        _raise_for_non_string_state_dir(data)
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
-        _raise_for_non_string_state_dir(data)
     else:
         _raise_for_non_string_state_dir(config.load_config_file(config.get_local_config_path()))
         merged = config.get_merged_config()

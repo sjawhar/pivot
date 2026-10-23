@@ -191,11 +191,13 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         raise click.UsageError("--verbose and --quiet are mutually exclusive")
     ctx.obj = CliContext(verbose=verbose, quiet=quiet)
     _setup_logging(verbose, quiet)
-    # Like the CLI's other warnings about project files, these give way to --quiet.
+    # Like the CLI's other warnings about project files, these give way to --quiet. Each
+    # invocation reports each problem once; an embedder's next invocation starts afresh.
     if not ctx.resilient_parsing and not quiet:
         from pivot import project
 
-        project.enable_state_dir_warnings()
+        token = project.begin_state_dir_warnings()
+        ctx.call_on_close(lambda: project.end_state_dir_warnings(token))
 
 
 def main() -> None:

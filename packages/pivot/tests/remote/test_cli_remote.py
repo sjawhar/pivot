@@ -80,6 +80,33 @@ def test_push_dry_run(
         assert "Would push 2 file(s) to 'my-remote'" in result.output
 
 
+def test_push_dry_run_with_no_files_prints_the_release_line(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """With nothing to push, `--dry-run` prints 0.5.2's and main's line, as plain push does."""
+
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(
+            transfer,
+            "create_remote_from_name",
+            return_value=(mocker.MagicMock(), "my-remote"),
+        )
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
+
+        result = runner.invoke(cli.cli, ["push", "--dry-run"])
+
+        assert result.exit_code == 0
+        assert result.output == "No files to push\n"
+
+
 def test_push_success(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
