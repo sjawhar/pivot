@@ -263,6 +263,9 @@ class Engine:
     _worker_pool: worker_pool_mod.WorkerPool | None
     _effective_max_workers: int
     _worker_idle_timeout_s: float | None
+    # Workers the run's first submission starts: the run's resource width
+    # (Scheduler.resource_width). Zero once that submission is made.
+    _first_submission_workers: int
 
     # Run state machine (Task 10/11)
     _run_state: _RunState
@@ -334,6 +337,7 @@ class Engine:
         self._worker_pool = None
         self._effective_max_workers = 1
         self._worker_idle_timeout_s = None
+        self._first_submission_workers = 0
 
         # Run state machine (Task 10/11)
         self._run_state = _RunState.IDLE
@@ -1657,6 +1661,7 @@ class Engine:
             resource_capacity=resource_capacity,
         )
         self._effective_max_workers = max_workers
+        self._first_submission_workers = self._scheduler.resource_width(limit=max_workers)
 
         # Emit initial state events for all stages
         for stage_name, initial_state in self._scheduler.stage_states.items():
@@ -1794,7 +1799,10 @@ class Engine:
                     stage_name,
                     limit=prestart_limit,
                 )
-                prestart_target = active_after_parent + direct_consumers
+                prestart_target = max(
+                    active_after_parent + direct_consumers, self._first_submission_workers
+                )
+                self._first_submission_workers = 0
                 future = pool.submit(
                     worker.execute_stage,
                     stage_name,

@@ -113,16 +113,20 @@ when a run starts (it died, or its socket was removed) is replaced then.
 
 ### Pool Size
 
-`get_width()` still gives the Engine an upper bound from the run's stage graph, capped by
-`core.max_workers`. It limits admission; it does not pre-create that many workers.
+`get_width()` gives the Engine an upper bound from the run's stage graph, capped by
+`core.max_workers`. It limits admission and the workers that the run's first submission starts.
 
-The worker pool starts a process only when an admitted stage needs capacity. For a parent that
-runs past half the one-shot idle timeout, it pings idle workers pre-started for that parent’s
-scheduler-admissible direct consumer wave. The ping restarts the worker’s idle clock without
-blocking it on the parent; when the parent resolves, pings stop and those workers become
-ordinary idle workers. Consequently, live workers stay bounded by actual scheduler capacity. A
-`local_grade: 2` limit therefore starts at most two workers for an otherwise-wide grade wave.
-Cached and skipped stages do not start workers.
+The worker pool starts processes when the run submits work. The run's first submission starts
+the run's resource width: the most of its stages that one replayed schedule runs at once,
+within resource capacities (`Scheduler.resource_width`). The width counts every stage of the
+run, including stages that are cached or skipped later. A `local_grade: 2` limit therefore
+starts at most two workers for an otherwise-wide grade wave, and a chain starts one. After the
+first submission, a dispatch starts a worker when an admitted stage finds every live worker
+busy, or for the scheduler-admissible direct consumer wave of the parent it dispatches. For a
+parent that runs past half the one-shot idle timeout, the pool pings idle workers pre-started
+for that wave. The ping restarts the worker’s idle clock without blocking it on the parent;
+when the parent resolves, pings stop and those workers become ordinary idle workers. A run
+whose stages all skip in the coordinator starts no workers.
 
 For a one-shot Engine, an idle worker exits after the 10-second idle timeout, or occasionally
 after a second one, when loky's worker loses its process-lock race. The timeout is 126 times the

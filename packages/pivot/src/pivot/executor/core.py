@@ -219,7 +219,8 @@ def submit[T](
 ) -> concurrent.futures.Future[T]:
     """Submit work, growing only when every live worker already has work.
 
-    ``prestart_target`` covers direct consumers that the scheduler predicts will become
+    ``prestart_target`` is the worker count to start now: the run's resource width at its first
+    submission, and later the direct consumers that the scheduler predicts will become
     resource-admissible when this stage completes. ``keepalive_pings`` counts submitted
     keep-alive pings that have not finished: they last milliseconds, so they are not work.
     """

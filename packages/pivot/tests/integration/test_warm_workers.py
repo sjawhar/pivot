@@ -35,6 +35,7 @@ from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
+    import concurrent.futures
     from collections.abc import Callable
     from multiprocessing.process import BaseProcess
 
@@ -1141,6 +1142,67 @@ def test_resource_capacity_bounds_workers_started(
     _helper_pivot(root, env, "repro")
 
     assert _helper_started_workers(worker_log) == 2
+
+
+# `prep` feeds `middle`, which feeds two tasks: the run is two stages wide only once `middle`
+# finishes.
+_LATE_FAN_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def prep() -> str:
+    return "prep"
+
+
+@stage
+def middle(value: str) -> str:
+    return value
+
+
+@stage
+def task(value: str) -> str:
+    return value
+
+
+with Pipeline("late_fan") as pipeline:
+    shared = middle(prep())
+    for index in range(2):
+        with pipeline.variant(str(index)):
+            task(shared)
+"""
+
+
+@pytest.mark.anyio
+async def test_first_submission_starts_the_runs_resource_width(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run's first submission asks for the run's resource width of workers, not only for
+    its first stage's direct consumers, so a wave two stages later does not wait for a worker
+    to start."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _LATE_FAN_PIPELINE)
+    targets = list[int]()
+    submit = WorkerPool.submit
+
+    def recording_submit(
+        self: WorkerPool,
+        fn: Callable[..., Any],
+        /,
+        *args: object,
+        prestart_target: int = 0,
+        **kwargs: object,
+    ) -> concurrent.futures.Future[Any]:
+        targets.append(prestart_target)
+        return submit(self, fn, *args, prestart_target=prestart_target, **kwargs)
+
+    monkeypatch.setattr(WorkerPool, "submit", recording_submit)
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_source(sources.OneShotSource(stages=None, force=True, reason="test", max_workers=8))
+        await eng.run(exit_on_completion=True)
+
+    assert len(targets) == 4, f"the run submitted {len(targets)} of its 4 stages"
+    assert targets[0] == 2, f"the first submission asked for {targets[0]} workers, not 2"
 
 
 @pytest.mark.slow

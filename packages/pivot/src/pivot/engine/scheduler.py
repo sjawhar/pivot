@@ -183,6 +183,46 @@ class Scheduler:
                 break
         return count
 
+    def resource_width(self, *, limit: int) -> int:
+        """Return the widest point of one replayed schedule of this run, at most ``limit``.
+
+        The replay starts stages in stage order once their upstream stages have finished and
+        their resources are free. Running stages finish one at a time, in the order they
+        started, each only when nothing else can start. Resource capacities bound the result:
+        four grades that share a two-slot resource count as two, and a chain counts as one. A
+        schedule whose stages finish in another order can run more stages at once.
+        """
+        waiting = {stage: set(upstream) for stage, upstream in self._upstream_unfinished.items()}
+        counts = collections.defaultdict[str, int](int)
+        running = list[str]()
+        pending = list(self._stage_states)
+        widest = 0
+        while pending or running:
+            for stage in list(pending):
+                if waiting[stage]:
+                    continue
+                request = self._stage_resources[stage]
+                if any(
+                    counts[resource] + amount > self._resource_capacity[resource]
+                    for resource, amount in request.items()
+                ):
+                    continue
+                for resource, amount in request.items():
+                    counts[resource] += amount
+                running.append(stage)
+                pending.remove(stage)
+            widest = max(widest, len(running))
+            if widest >= limit:
+                return limit
+            if not running:
+                return widest
+            stage = running.pop(0)
+            for resource, amount in self._stage_resources[stage].items():
+                counts[resource] -= amount
+            for consumer in self._downstream[stage]:
+                waiting[consumer].discard(stage)
+        return widest
+
     def acquire_resources(self, stage: str) -> None:
         """Reserve a stage's resources immediately before it is admitted."""
         for resource, request in self._stage_resources[stage].items():

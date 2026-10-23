@@ -184,6 +184,56 @@ def test_preview_direct_consumers_keeps_chain_at_one_worker() -> None:
     assert scheduler.preview_direct_consumers("source", limit=8) == 1
 
 
+def test_resource_width_respects_resource_capacity() -> None:
+    """A source feeding four grades that share a two-slot resource never runs more than two
+    stages at once, though four grades are mutually independent."""
+    scheduler = _helper_init_scheduler(
+        execution_order=["source", "grade_a", "grade_b", "grade_c", "grade_d"],
+        edges=[
+            ("source", "grade_a"),
+            ("source", "grade_b"),
+            ("source", "grade_c"),
+            ("source", "grade_d"),
+        ],
+        stage_resources={
+            "source": {"cpu": 1},
+            "grade_a": {"cpu": 1, "local_grade": 1},
+            "grade_b": {"cpu": 1, "local_grade": 1},
+            "grade_c": {"cpu": 1, "local_grade": 1},
+            "grade_d": {"cpu": 1, "local_grade": 1},
+        },
+        resource_capacity={"cpu": 8, "local_grade": 2},
+    )
+
+    assert scheduler.resource_width(limit=8) == 2
+
+
+def test_resource_width_keeps_chain_at_one() -> None:
+    scheduler = _helper_init_scheduler(
+        execution_order=["a", "b", "c"],
+        edges=[("a", "b"), ("b", "c")],
+    )
+
+    assert scheduler.resource_width(limit=8) == 1
+
+
+def test_resource_width_counts_a_fan_up_to_the_limit() -> None:
+    scheduler = _helper_init_scheduler(
+        execution_order=["source", "f0", "f1", "f2", "sink"],
+        edges=[
+            ("source", "f0"),
+            ("source", "f1"),
+            ("source", "f2"),
+            ("f0", "sink"),
+            ("f1", "sink"),
+            ("f2", "sink"),
+        ],
+    )
+
+    assert scheduler.resource_width(limit=8) == 3
+    assert scheduler.resource_width(limit=2) == 2
+
+
 def test_fan_in_waits_for_all_upstream() -> None:
     scheduler = _helper_init_scheduler(
         execution_order=["A", "B", "C"],

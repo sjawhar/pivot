@@ -41,13 +41,14 @@ def create_executor(
 
 The key behaviors:
 
-1. **First dispatch** - `core.submit()` sets loky's private `_max_workers` to the number of
-   submitted, unfinished stages, capped by the Engine's limit. The Engine records each direct
-   consumer wave's half-timeout deadline, and its existing 100 ms execution loop services those
-   deadlines, so a parent costs no thread. Once a deadline passes, the loop sends a
-   barrier-coordinated ping to each idle pre-started worker. Pings stop and queued ping futures
-   are cancelled when the parent resolves, fails, or the run ends; those workers then follow
-   the normal timeout.
+1. **First dispatch** - The run's first submission starts the run's resource width
+   (`Scheduler.resource_width`), capped by the Engine's limit. After it, `core.submit()` sets
+   loky's private `_max_workers` to the number of submitted, unfinished stages, or to a
+   parent's direct consumer wave. The Engine records each direct consumer wave's half-timeout
+   deadline, and its existing 100 ms execution loop services those deadlines, so a parent
+   costs no thread. Once a deadline passes, the loop sends a barrier-coordinated ping to each
+   idle pre-started worker. Pings stop and queued ping futures are cancelled when the parent
+   resolves, fails, or the run ends; those workers then follow the normal timeout.
 2. **Later dispatches** - An existing idle worker takes the stage. A new worker starts only when
    every live worker already has work.
 3. **Idle cleanup** - One-shot Engines give idle workers a 10-second timeout. An idle worker
