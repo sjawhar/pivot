@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from pivot import project
+from pivot import state_dir as state_dir_mod
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 _PIPELINE = """\
@@ -87,7 +87,7 @@ def test_a_default_init_writes_the_template(tmp_path: pathlib.Path, umask: int) 
     proj = _Project(tmp_path, umask)
 
     gitignore = proj.root / ".pivot" / ".gitignore"
-    assert gitignore.read_text() == project.STATE_GITIGNORE_CONTENT
+    assert gitignore.read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
     assert _mode(gitignore) == proj.file_mode()
 
 
@@ -101,7 +101,7 @@ def test_b_repro_creates_a_configured_state_dir_with_the_template(
     proj.pivot("repro")
 
     gitignore = proj.root / "altstate" / ".gitignore"
-    assert gitignore.read_text() == project.STATE_GITIGNORE_CONTENT
+    assert gitignore.read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
     assert _mode(gitignore) == proj.file_mode()
 
 
@@ -114,7 +114,7 @@ def test_c_config_set_creates_the_state_dir_with_only_the_template(
     proj.pivot("config", "set", "core.state_dir", "st2")
 
     assert sorted(os.listdir(proj.root / "st2")) == [".gitignore"]
-    assert (proj.root / "st2" / ".gitignore").read_text() == project.STATE_GITIGNORE_CONTENT
+    assert (proj.root / "st2" / ".gitignore").read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
     assert _mode(proj.root / "st2" / ".gitignore") == proj.file_mode()
     assert sorted(os.listdir(proj.root / ".pivot")) == [
         ".gitignore",
@@ -139,7 +139,7 @@ def test_d_a_pre_existing_state_dir_gets_a_template_only_from_init_force(
 
     result = proj.pivot("init", "--force")
 
-    assert gitignore.read_text() == project.STATE_GITIGNORE_CONTENT
+    assert gitignore.read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
     assert _mode(gitignore) == proj.file_mode()
     assert "  pre/.gitignore" in result.stdout.splitlines(), result.stdout
 
@@ -173,7 +173,7 @@ def test_f_a_deleted_default_gitignore_returns_only_with_init_force(
 
     proj.pivot("init", "--force")
 
-    assert gitignore.read_text() == project.STATE_GITIGNORE_CONTENT
+    assert gitignore.read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
     assert _mode(gitignore) == proj.file_mode()
 
 

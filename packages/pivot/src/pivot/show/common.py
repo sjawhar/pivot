@@ -8,6 +8,7 @@ import tabulate
 import yaml
 
 from pivot import exceptions, git, project, types, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.storage import lock
 from pivot.types import ChangeType, OutputFormat, StorageLockData
 
@@ -56,7 +57,7 @@ def read_lock_files_from_head(
     if not stage_names:
         return {}
     root = project.get_project_root()
-    state_dir = project.state_dir_or_default(root)
+    state_dir = state_dir_mod.state_dir_or_default(root)
     try:
         stages_dir = lock.stages_rel_path(state_dir, root)
     except ValueError:
@@ -77,7 +78,7 @@ def read_lock_files_from_head(
             missing, git.read_files_from_head(lock_paths), legacy_stages_dir
         )
         if any(data is not None for data in legacy.values()):
-            project.report_legacy_state_dir(state_dir)
+            state_dir_mod.report_legacy_state_dir(state_dir)
         result.update({name: data for name, data in legacy.items() if data is not None})
     if stages_dir is None and not any(data is not None for data in result.values()):
         raise exceptions.ConfigError(

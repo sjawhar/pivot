@@ -5,6 +5,7 @@ import pathlib
 import click
 
 from pivot import path_policy, project
+from pivot import state_dir as state_dir_mod
 from pivot.cli import _run_common
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import targets as cli_targets
@@ -63,7 +64,7 @@ def plots_show(targets: tuple[str, ...], output: pathlib.Path | None, open_brows
         return
 
     if output is None:
-        output_path = project.ensure_state_dir_or_default(proj_root) / "plots" / "index.html"
+        output_path = state_dir_mod.ensure_state_dir_or_default(proj_root) / "plots" / "index.html"
     else:
         output_path = proj_root / output
     output_path = plots_mod.render_plots_html(plot_list, output_path)

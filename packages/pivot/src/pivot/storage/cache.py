@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, TypedDict
 
 import xxhash
 
-from pivot import exceptions, metrics, project
+from pivot import exceptions, metrics
+from pivot import state_dir as state_dir_mod
 from pivot.config import CheckoutMode as CheckoutMode
 from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_hash
 
@@ -54,7 +55,7 @@ def restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathli
 def _get_lock_path_from_token(token: str, state_dir: pathlib.Path) -> pathlib.Path:
     """Get a restore lock path from a previously resolved target token."""
     lock_dir = state_dir / "locks"
-    project.make_dirs(lock_dir)
+    state_dir_mod.make_dirs(lock_dir)
     return lock_dir / f"{_RESTORE_LOCK_PREFIX}{token}"
 
 
@@ -108,7 +109,7 @@ def atomic_write_file(
         mode: File permissions (default 0o644).
         staging_path: Optional deterministic temporary path beside ``dest``.
     """
-    project.make_dirs(dest.parent)
+    state_dir_mod.make_dirs(dest.parent)
     if staging_path is None:
         fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
         tmp = pathlib.Path(tmp_path)
@@ -400,11 +401,11 @@ def resolve_cache_object_path(
     cache_path = get_cache_path(cache_dir, file_hash)
     if is_cache_object_path(cache_path, directory=directory):
         return cache_path
-    legacy_files_dir = project.legacy_cache_files_dir_for(cache_dir)
+    legacy_files_dir = state_dir_mod.legacy_cache_files_dir_for(cache_dir)
     if legacy_files_dir is not None:
         legacy_path = get_cache_path(legacy_files_dir, file_hash)
         if is_cache_object_path(legacy_path, directory=directory):
-            project.report_legacy_state_dir(cache_dir.parent.parent)
+            state_dir_mod.report_legacy_state_dir(cache_dir.parent.parent)
             return legacy_path
     return None
 
@@ -680,7 +681,7 @@ def staged_cache_file(cache_path: pathlib.Path) -> Generator[pathlib.Path]:
     """An empty temporary file beside cache object ``cache_path`` to publish it from
     (``publish_cache_object``), removed on exit. A killed process's is swept (``_staging_in``).
     """
-    project.make_dirs(cache_path.parent)
+    state_dir_mod.make_dirs(cache_path.parent)
     with _staging_in(cache_path.parent):
         fd, name = tempfile.mkstemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_path.parent)
         os.close(fd)
@@ -1296,7 +1297,7 @@ def _publish_tree(
             and _cache_object_key(link, cache_dir) is None
         ]
 
-    project.make_dirs(cache_dir_path.parent)
+    state_dir_mod.make_dirs(cache_dir_path.parent)
     with _staging_in(cache_dir_path.parent):
         staged = pathlib.Path(
             tempfile.mkdtemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_dir_path.parent)

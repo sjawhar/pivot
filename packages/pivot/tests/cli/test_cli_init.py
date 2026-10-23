@@ -6,6 +6,7 @@ import click.testing
 import pytest
 
 from pivot import cli, ignore, project
+from pivot import state_dir as state_dir_mod
 
 # --- basic initialization tests ---
 
@@ -520,7 +521,7 @@ def test_init_force_no_warning_for_identical_gitignore(
         project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         # Write the exact same content that init would write
-        pathlib.Path(".pivot/.gitignore").write_text(project.STATE_GITIGNORE_CONTENT)
+        pathlib.Path(".pivot/.gitignore").write_text(state_dir_mod.STATE_GITIGNORE_CONTENT)
 
         result = runner.invoke(cli.cli, ["init", "--force"])
 

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import xxhash
 
 from pivot import exceptions, project
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache
 
 if TYPE_CHECKING:
@@ -83,7 +84,7 @@ def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
     """Raise RemoteError if the downloaded object at ``location`` is not ``expected_hash``."""
     if actual_hash != expected_hash:
         root = project.get_project_root()
-        state_db_path = project.state_dir_or_default(root, warn=False) / "state.lmdb"
+        state_db_path = state_dir_mod.state_dir_or_default(root, warn=False) / "state.lmdb"
         if state_db_path.is_relative_to(root):
             state_db_path = state_db_path.relative_to(root)
         raise exceptions.RemoteError(
@@ -119,7 +120,7 @@ async def atomic_download(
     """
     with contextlib.ExitStack() as stack:
         if overwrite:
-            project.make_dirs(local_path.parent)
+            state_dir_mod.make_dirs(local_path.parent)
             fd, name = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
             os.close(fd)
             tmp_path = local_path.with_name(os.path.basename(name))

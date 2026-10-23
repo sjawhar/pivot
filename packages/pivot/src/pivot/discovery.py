@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Final, override
 import cloudpickle
 
 from pivot import exceptions, fingerprint, metrics, project, types
+from pivot import state_dir as state_dir_mod
 from pivot.registry import PipelineLike
 
 if TYPE_CHECKING:
@@ -387,7 +388,7 @@ def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -
     files and half its StateDB, so a ``root=`` other than the project root splits one stage's
     state across two directories. Stages from another pipeline carry that pipeline's root.
     While the project config cannot be read or its state directory cannot be used, stages keep
-    0.5.2's ``.pivot`` (``project.state_dir_or_default``), and that is what is checked.
+    0.5.2's ``.pivot`` (``state_dir.state_dir_or_default``), and that is what is checked.
     """
     advice = (
         "but a pipeline always uses the project's .pivot and data/ (with state in its configured "
@@ -397,7 +398,7 @@ def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -
         raise exceptions.PipelineConfigError(
             f"Pipeline '{pipeline.name}' sets root={pipeline.root}, {advice}"
         )
-    expected_state_dir = project.state_dir_or_default(project_root).resolve()
+    expected_state_dir = state_dir_mod.state_dir_or_default(project_root).resolve()
     for stage_name in pipeline.list_stages():
         state_dir = pipeline.get_stage(stage_name)["state_dir"]
         if state_dir is not None and state_dir.resolve() != expected_state_dir:
@@ -688,7 +689,7 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
         List of paths to pipeline config files.
     """
     resolved_project_root = project_root.resolve()
-    state_dir = project.state_dir_or_default(project_root)
+    state_dir = state_dir_mod.state_dir_or_default(project_root)
     # A state directory at or above the root would exclude the whole project.
     excluded_state_dir: pathlib.Path | None = None
     if not resolved_project_root.is_relative_to(state_dir.resolve()):

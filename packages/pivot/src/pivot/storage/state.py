@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Self
 
 import lmdb
 
-from pivot import exceptions, project, run_history
+from pivot import exceptions, run_history
+from pivot import state_dir as state_dir_mod
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +347,7 @@ class StateDB:
         readonly: bool = False,
         write_timeout: float = 30.0,
     ) -> None:
-        project.make_state_dir(state_dir)
+        state_dir_mod.make_state_dir(state_dir)
         lmdb_path = (state_dir / "state.lmdb").resolve()
 
         with _fork_gate.transaction():

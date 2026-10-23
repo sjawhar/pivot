@@ -24,6 +24,7 @@ import anyio
 import click
 
 from pivot import config, project, registry
+from pivot import state_dir as state_dir_mod
 from pivot.cli import _run_common, completion, is_standalone_invocation
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -398,7 +399,7 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
         from pivot import project
         from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 
-        state_dir = project.ensure_state_dir(project.get_project_root())
+        state_dir = state_dir_mod.ensure_state_dir(project.get_project_root())
         socket_path = state_dir / "agent.sock"
 
         app = tui_run.PivotApp(
@@ -515,7 +516,7 @@ def _run_serve_mode(
     from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 
     # Get project paths
-    state_dir = project.ensure_state_dir(project.get_project_root())
+    state_dir = state_dir_mod.ensure_state_dir(project.get_project_root())
     socket_path = state_dir / "agent.sock"
 
     # Get pipeline for Engine

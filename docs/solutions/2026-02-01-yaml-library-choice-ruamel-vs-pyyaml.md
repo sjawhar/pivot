@@ -41,7 +41,7 @@ PyYAML (`yaml.safe_load()`) parses YAML into plain Python dicts, discarding comm
 
 ## Solution
 
-Use **ruamel.yaml** for config files, through `config/io.py`, for every read and every write. Use **PyYAML** for every other YAML file (lock files, `.pvt` files, data files, params, metrics):
+Use **ruamel.yaml** for config files, through `config/files.py` (reads) and `config/io.py` (writes), for every read and every write. Use **PyYAML** for every other YAML file (lock files, `.pvt` files, data files, params, metrics):
 
 ```python
 # EDITABLE CONFIG - preserve comments and formatting
@@ -83,7 +83,7 @@ except AttributeError:
 
 ### One reader for config files
 
-Every read of a file that `config set` writes (`.pivot/config.yaml`, `~/.config/pivot/config.yaml`) goes through `config/io.py`'s ruamel loader (`load_config_file`, `read_config_file_value`, `parse_config_yaml`), never PyYAML. That includes a read-only lookup of one key, such as `core.state_dir` in `project.state_dir_for`.
+Every read of a file that `config set` writes (`.pivot/config.yaml`, `~/.config/pivot/config.yaml`) goes through the ruamel loader in `config/files.py` (`read_config_file_value`, and `config/io.py`'s `load_config_file` and `parse_config_yaml` on top of it), never PyYAML. That includes a read-only lookup of one key, such as `core.state_dir` in `state_dir.state_dir_for`.
 
 ruamel writes and reads YAML 1.2; PyYAML reads YAML 1.1. Plain scalars that YAML 1.2 keeps as strings come back from PyYAML as other types, so a value written by `config set` changes meaning when PyYAML reads it:
 
@@ -98,7 +98,7 @@ ruamel writes and reads YAML 1.2; PyYAML reads YAML 1.1. Plain scalars that YAML
 
 (Probe: `ruamel.yaml.YAML(typ="rt").load(text)` against `yaml.safe_load(text)` for `core:\n  state_dir: <value>\n`; the round-trip tests are `packages/pivot/tests/cli/test_pr503_r6_state_dir_yaml_1_1_value.py`.)
 
-The two libraries also fail differently: `config/io.py` reports `Invalid YAML in <file>` and `Permission denied reading <file>`, so one reader also means one error message.
+The two libraries also fail differently: `config/files.py` reports `Invalid YAML in <file>` and `Permission denied reading <file>`, so one reader also means one error message.
 
 Exceptions, each kept to match release 0.5.2:
 
@@ -109,9 +109,9 @@ Exceptions, each kept to match release 0.5.2:
 
 | Library | Module | Purpose |
 |---------|--------|---------|
-| ruamel.yaml | `config/io.py` | Every config-file read and write, including `project.state_dir_for` and import's source `core.state_dir` |
+| ruamel.yaml | `config/files.py`, `config/io.py` | Every config-file read and write, including `state_dir.state_dir_for` and import's source `core.state_dir` |
 | PyYAML | `import_artifact.py` | Source repository `remotes` and `default_remote` (0.5.2 parse, kept deliberately) |
-| PyYAML | `remote/config.py`, `cli/completion.py` | Remote names and URLs from config files (0.5.2 readers, not yet on `config/io.py`) |
+| PyYAML | `remote/config.py`, `cli/completion.py` | Remote names and URLs from config files (0.5.2 readers, not yet on `config/files.py`) |
 | PyYAML | `storage/lock.py` | Lock file parsing |
 | PyYAML | `storage/track.py` | `.pvt` files |
 | PyYAML | `loaders.py` | YAML data loader |
@@ -137,7 +137,7 @@ yaml.default_flow_style = False  # Explicit for new keys
 
 The choice between YAML libraries depends on the file:
 
-- **Config files (`config set` writes them, users edit them)**: Use ruamel.yaml, through `config/io.py`, for reads as well as writes. Preserving comments respects the user's documentation, and reading with the writer's YAML version keeps every value meaning what it meant when written.
+- **Config files (`config set` writes them, users edit them)**: Use ruamel.yaml, through `config/files.py` and `config/io.py`, for reads as well as writes. Preserving comments respects the user's documentation, and reading with the writer's YAML version keeps every value meaning what it meant when written.
 - **Every other YAML file**: Use PyYAML. Simpler API, faster parsing (with C extension), no need for round-trip overhead.
 
 The performance difference is negligible for typical config file sizes. The user experience difference is significant: losing comments feels like data loss, even though the semantic content is preserved.

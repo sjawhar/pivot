@@ -10,6 +10,7 @@ import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
 from pivot.types import HashInfo
@@ -118,7 +119,7 @@ def get_lock_data_from_revision(
                 "core.state_dir is outside the project, so lock files are not in git"
             ) from None
         return None
-    project.report_legacy_state_dir(state_dir)
+    state_dir_mod.report_legacy_state_dir(state_dir)
     return _parse_lock_data_from_bytes(content)
 
 

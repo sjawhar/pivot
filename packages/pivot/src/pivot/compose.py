@@ -29,6 +29,7 @@ from . import (
     types,
 )
 from . import loaders as loaders_mod
+from . import state_dir as state_dir_mod
 from .storage import lock
 
 logger = logging.getLogger(__name__)
@@ -543,16 +544,16 @@ class Pipeline:
 
     @property
     def state_dir(self) -> pathlib.Path:
-        return project.ensure_state_dir(self._root)
+        return state_dir_mod.ensure_state_dir(self._root)
 
     def _stage_state_dir(self) -> pathlib.Path:
         """The state directory recorded on this pipeline's stages; loading never creates it.
 
         While the project config cannot be read or its ``core.state_dir`` cannot be used, the
-        stages keep 0.5.2's ``.pivot`` (``project.state_dir_or_default``), so listing them runs
+        stages keep 0.5.2's ``.pivot`` (``state_dir.state_dir_or_default``), so listing them runs
         as it did there; commands that use the configured directory fail on it themselves.
         """
-        return project.state_dir_or_default(self._root)
+        return state_dir_mod.state_dir_or_default(self._root)
 
     @property
     def input_bindings(self) -> dict[str, str]:

@@ -28,8 +28,6 @@ import tempfile
 
 import pytest
 
-from pivot import project
-
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 _PIPELINE = """\
@@ -411,6 +409,8 @@ def test_every_created_configured_state_directory_has_the_template(
     base_project: pathlib.Path, tmp_path: pathlib.Path, command: str
 ) -> None:
     """A command that creates a configured state directory preserves its state files from git."""
+    from pivot import state_dir as state_dir_mod
+
     copy = tmp_path / "copy"
     shutil.copytree(base_project, copy, symlinks=True)
     home = copy / "home"
@@ -421,7 +421,7 @@ def test_every_created_configured_state_directory_has_the_template(
 
     fresh = root / "fresh"
     if fresh.exists():
-        assert (fresh / ".gitignore").read_text() == project.STATE_GITIGNORE_CONTENT
+        assert (fresh / ".gitignore").read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
 
 
 def test_the_table_covers_every_help_command() -> None:

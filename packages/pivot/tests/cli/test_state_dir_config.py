@@ -18,6 +18,7 @@ import yaml
 
 from conftest import GitRepo, init_git_repo
 from pivot import cli, compose, exceptions, import_artifact, parameters, project, stage_def
+from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
 from pivot.config import io as config_io
 from pivot.show import common as show_common
@@ -99,7 +100,7 @@ def test_configuring_state_dir_after_init_keeps_marker_gitignore(
     assert configured.returncode == 0, configured.stdout + configured.stderr
     assert repro.returncode == 0, repro.stdout + repro.stderr
     assert _pivot_entries(root) == [".gitignore", "config.yaml", "config.yaml.lock", "stages"]
-    assert (root / ".pivot" / ".gitignore").read_text() == project.STATE_GITIGNORE_CONTENT
+    assert (root / ".pivot" / ".gitignore").read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
     assert (root / "altstate" / ".gitignore").is_file()
     assert "no longer used" in configured.stdout + configured.stderr
 
@@ -283,7 +284,7 @@ def test_init_force_overwrites_default_state_ignore(
         result = runner.invoke(cli.cli, ["init", "--force"])
 
         assert result.exit_code == 0, result.output
-        assert ignore_path.read_text() == project.STATE_GITIGNORE_CONTENT
+        assert ignore_path.read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
 
 
 def test_init_writes_gitignore_to_the_configured_state_dir(
@@ -438,7 +439,7 @@ def test_revision_lock_read_normalizes_configured_state_dir(
     lock_data = restore.get_lock_data_from_revision(
         "test/writes_state",
         "HEAD",
-        project.get_state_dir(),
+        state_dir_mod.get_state_dir(),
     )
 
     assert lock_data is not None

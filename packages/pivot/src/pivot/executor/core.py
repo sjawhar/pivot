@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 import loky
 
 from pivot import config, discovery, exceptions, parameters, project, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
@@ -384,7 +385,7 @@ def prepare_worker_info(
 
     # Create the state directory through the common path so a newly configured directory has
     # its state ignore file before a worker writes under it.
-    project.make_state_dir(state_dir)
+    state_dir_mod.make_state_dir(state_dir)
 
     # The fingerprint is computed first: it sets `unsafe_fingerprint`.
     fingerprint = pipeline.ensure_fingerprint(stage_info["name"])

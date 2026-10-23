@@ -7,7 +7,7 @@ import pathlib
 import subprocess
 import sys
 
-from pivot import project
+from pivot import state_dir as state_dir_mod
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -46,7 +46,7 @@ def test_track_ignores_a_custom_cache_inside_a_new_state_directory(tmp_path: pat
     tracked = _run(root, home, _PIVOT, "track", "data/item.txt")
 
     assert tracked.returncode == 0, tracked.stdout + tracked.stderr
-    assert (root / "fresh" / ".gitignore").read_text() == project.STATE_GITIGNORE_CONTENT
+    assert (root / "fresh" / ".gitignore").read_text() == state_dir_mod.STATE_GITIGNORE_CONTENT
     status = _run(root, home, "git", "status", "--porcelain", "-uall")
     assert status.returncode == 0, status.stderr
     assert not any(

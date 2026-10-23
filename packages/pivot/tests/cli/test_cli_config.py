@@ -5,7 +5,8 @@ import click.testing
 import pytest
 
 from conftest import isolated_pivot_dir
-from pivot import cli, project
+from pivot import cli
+from pivot import state_dir as state_dir_mod
 
 # --- config list tests ---
 
@@ -194,9 +195,9 @@ def test_config_set_global_flag(
 ) -> None:
     global_config = tmp_path / ".config" / "pivot" / "config.yaml"
 
-    from pivot.config import io
+    from pivot.config import files as config_files
 
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "--global", "display.precision", "3"])
@@ -211,9 +212,9 @@ def test_config_set_global_rejects_project_state_dir(
     """core.state_dir is local because it identifies one project's own state."""
     global_config = tmp_path / ".config" / "pivot" / "config.yaml"
 
-    from pivot.config import io
+    from pivot.config import files as config_files
 
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "--global", "core.state_dir", "shared"])
@@ -229,12 +230,12 @@ def test_config_set_state_dir_updates_the_current_process(
     """The state resolver drops its old value after config set."""
     with isolated_pivot_dir(runner, tmp_path):
         root = pathlib.Path.cwd()
-        assert project.get_state_dir() == root / ".pivot"
+        assert state_dir_mod.get_state_dir() == root / ".pivot"
 
         result = runner.invoke(cli.cli, ["config", "set", "core.state_dir", "alternate-state"])
 
         assert result.exit_code == 0, result.output
-        assert project.get_state_dir() == root / "alternate-state"
+        assert state_dir_mod.get_state_dir() == root / "alternate-state"
         assert sorted(path.name for path in (root / ".pivot").iterdir()) == [
             "config.yaml",
             "config.yaml.lock",
@@ -352,9 +353,9 @@ def test_config_unset_global_flag(
     global_config.parent.mkdir(parents=True)
     global_config.write_text("display:\n  precision: 3\n")
 
-    from pivot.config import io
+    from pivot.config import files as config_files
 
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "unset", "--global", "display.precision"])
@@ -409,10 +410,10 @@ def test_config_get_global_flag(
     global_config.write_text("display:\n  precision: 7\n")
 
     from pivot import config
-    from pivot.config import io
+    from pivot.config import files as config_files
 
     # Patch both locations since CLI uses `config.get_global_config_path`
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
     monkeypatch.setattr(config, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):

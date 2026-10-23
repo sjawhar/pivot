@@ -194,10 +194,10 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     # Like the CLI's other warnings about project files, these give way to --quiet. Each
     # invocation reports each problem once; an embedder's next invocation starts afresh.
     if not ctx.resilient_parsing and not quiet:
-        from pivot import project
+        from pivot import state_dir as state_dir_mod
 
-        token = project.begin_state_dir_warnings()
-        ctx.call_on_close(lambda: project.end_state_dir_warnings(token))
+        token = state_dir_mod.begin_state_dir_warnings()
+        ctx.call_on_close(lambda: state_dir_mod.end_state_dir_warnings(token))
 
 
 def main() -> None:

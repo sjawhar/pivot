@@ -5,7 +5,8 @@ import pathlib
 
 import click
 
-from pivot import exceptions, ignore, project
+from pivot import exceptions, ignore
+from pivot import state_dir as state_dir_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
@@ -41,17 +42,17 @@ def init(ctx: click.Context, force: bool) -> None:
     created_gitignores = list[pathlib.Path]()
     # A config that cannot be read, or a core.state_dir that cannot be used, leaves 0.5.2's
     # default layout after one warning: 0.5.2's init never read the config.
-    state_dir = project.state_dir_or_default(cwd)
+    state_dir = state_dir_mod.state_dir_or_default(cwd)
     if state_dir != pivot_dir:
         # .pivot keeps the config and its lock, so it keeps an ignore file; init is its only
         # writer. Neither ignore file is ever overwritten in a configured layout.
-        if project.create_gitignore_if_absent(marker_gitignore):
+        if state_dir_mod.create_gitignore_if_absent(marker_gitignore):
             created_gitignores.append(marker_gitignore)
         state_gitignore = state_dir / ".gitignore"
         state_gitignore_existed = os.path.lexists(state_gitignore)
-        project.ensure_state_dir(cwd)
+        state_dir_mod.ensure_state_dir(cwd)
         if not state_gitignore_existed:
-            project.create_gitignore_if_absent(state_gitignore)
+            state_dir_mod.create_gitignore_if_absent(state_gitignore)
             created_gitignores.append(state_gitignore)
         elif force and not quiet:
             click.echo(f"Leaving {state_gitignore}; Pivot does not own it.")
@@ -59,9 +60,9 @@ def init(ctx: click.Context, force: bool) -> None:
         # Warn if overwriting existing .gitignore with custom content
         if force and marker_gitignore.exists():
             existing_content = marker_gitignore.read_text()
-            if existing_content != project.STATE_GITIGNORE_CONTENT and not quiet:
+            if existing_content != state_dir_mod.STATE_GITIGNORE_CONTENT and not quiet:
                 click.echo("Warning: Overwriting existing .pivot/.gitignore", err=True)
-        marker_gitignore.write_text(project.STATE_GITIGNORE_CONTENT)
+        marker_gitignore.write_text(state_dir_mod.STATE_GITIGNORE_CONTENT)
         created_gitignores.append(marker_gitignore)
 
     stages_dir = state_dir / "stages"

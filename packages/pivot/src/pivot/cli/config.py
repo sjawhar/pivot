@@ -4,7 +4,8 @@ from typing import Any, cast
 import click
 import pydantic
 
-from pivot import config, exceptions, project
+from pivot import config, exceptions
+from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 
@@ -85,14 +86,14 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
             if use_global:
                 # Every row comes from the global file, so every label does too.
                 source = config.ConfigSource.GLOBAL
-                if key == "core.state_dir" and project.report_ignored_global_state_dir():
+                if key == "core.state_dir" and state_dir_mod.report_ignored_global_state_dir():
                     source = config.ConfigSource.GLOBAL_IGNORED
             else:
                 configured_value, source = config.get_config_value(key)
                 if source == config.ConfigSource.GLOBAL_IGNORED:
                     value = configured_value
             row = f"{key} = {_format_value(value)} ({source})"
-            if key == "core.state_dir" and not project.is_valid_state_dir_value(value):
+            if key == "core.state_dir" and not state_dir_mod.is_valid_state_dir_value(value):
                 row += " invalid: core.state_dir must be a path"
             click.echo(row)
 
@@ -135,7 +136,7 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         # Outside a project nothing ignores the value. An unreadable local config only drops
         # the warning: labeling a global value never needs the local file.
         global_state_dir = key == "core.state_dir" and value is not None
-        if global_state_dir and project.report_ignored_global_state_dir():
+        if global_state_dir and state_dir_mod.report_ignored_global_state_dir():
             source = config.ConfigSource.GLOBAL_IGNORED
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())

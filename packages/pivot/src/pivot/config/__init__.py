@@ -1,3 +1,4 @@
+from pivot.config.files import get_global_config_path as get_global_config_path
 from pivot.config.io import DEFAULT_CHECKOUT_MODE_ORDER as DEFAULT_CHECKOUT_MODE_ORDER
 from pivot.config.io import edit_config as edit_config
 from pivot.config.io import get_cache_dir as get_cache_dir
@@ -6,7 +7,6 @@ from pivot.config.io import get_config_path as get_config_path
 from pivot.config.io import get_config_value as get_config_value
 from pivot.config.io import get_diff_max_rows as get_diff_max_rows
 from pivot.config.io import get_display_precision as get_display_precision
-from pivot.config.io import get_global_config_path as get_global_config_path
 from pivot.config.io import get_local_config_path as get_local_config_path
 from pivot.config.io import get_max_workers as get_max_workers
 from pivot.config.io import get_merged_config as get_merged_config

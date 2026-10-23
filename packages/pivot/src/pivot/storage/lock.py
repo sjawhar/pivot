@@ -17,7 +17,8 @@ from typing import TypeGuard, cast
 
 import yaml
 
-from pivot import project, yaml_config
+from pivot import state_dir as state_dir_mod
+from pivot import yaml_config
 from pivot.storage import cache
 from pivot.types import (
     ArtifactIdentity,
@@ -58,12 +59,12 @@ def resolve_stage_lock_path(stages_dir: pathlib.Path, stage_name: str) -> pathli
     primary_path = stages_dir / f"{stage_name}.lock"
     if primary_path.exists():
         return primary_path
-    legacy_stages_dir = project.legacy_stages_dir_for(stages_dir)
+    legacy_stages_dir = state_dir_mod.legacy_stages_dir_for(stages_dir)
     if legacy_stages_dir is None:
         return primary_path
     legacy_path = legacy_stages_dir / f"{stage_name}.lock"
     if legacy_path.exists():
-        project.report_legacy_state_dir(stages_dir.parent)
+        state_dir_mod.report_legacy_state_dir(stages_dir.parent)
         return legacy_path
     return primary_path
 

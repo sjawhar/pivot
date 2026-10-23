@@ -4,6 +4,7 @@ import pydantic
 import pytest
 
 from pivot import config, project
+from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
 from pivot.exceptions import ConfigError
 
@@ -27,7 +28,7 @@ def _write_config(project_root: pathlib.Path, content: str) -> None:
 
 def test_ensure_state_dir_does_not_create_a_project_marker(tmp_path: pathlib.Path) -> None:
     """A pipeline constructed outside a project must not turn its parent into a project."""
-    result = project.ensure_state_dir(tmp_path)
+    result = state_dir_mod.ensure_state_dir(tmp_path)
 
     assert result == tmp_path / ".pivot"
     assert not result.exists()
@@ -177,7 +178,7 @@ def test_state_dir_for_reads_the_project_configuration(project_root: pathlib.Pat
     """The project resolver is the source of truth for state location."""
     _write_config(project_root, "core:\n  state_dir: custom-state\n")
 
-    assert project.state_dir_for(project_root) == project_root / "custom-state"
+    assert state_dir_mod.state_dir_for(project_root) == project_root / "custom-state"
 
 
 # --- Error handling tests ---

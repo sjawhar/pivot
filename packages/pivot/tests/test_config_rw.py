@@ -4,25 +4,26 @@ from typing import Any
 import pytest
 
 from pivot import project
+from pivot.config import files as config_files
 from pivot.config import io
 
 # --- parse_dotted_key tests ---
 
 
 def test_parse_dotted_key_simple() -> None:
-    assert io.parse_dotted_key("cache.dir") == ["cache", "dir"]
+    assert config_files.parse_dotted_key("cache.dir") == ["cache", "dir"]
 
 
 def test_parse_dotted_key_nested() -> None:
-    assert io.parse_dotted_key("cache.checkout_mode") == ["cache", "checkout_mode"]
+    assert config_files.parse_dotted_key("cache.checkout_mode") == ["cache", "checkout_mode"]
 
 
 def test_parse_dotted_key_top_level() -> None:
-    assert io.parse_dotted_key("default_remote") == ["default_remote"]
+    assert config_files.parse_dotted_key("default_remote") == ["default_remote"]
 
 
 def test_parse_dotted_key_remotes() -> None:
-    assert io.parse_dotted_key("remotes.origin") == ["remotes", "origin"]
+    assert config_files.parse_dotted_key("remotes.origin") == ["remotes", "origin"]
 
 
 # --- get_nested / set_nested / unset_nested tests ---
@@ -30,25 +31,25 @@ def test_parse_dotted_key_remotes() -> None:
 
 def test_get_nested_returns_value() -> None:
     data = {"cache": {"dir": "/tmp/cache"}}
-    result = io.get_nested(data, ["cache", "dir"])
+    result = config_files.get_nested(data, ["cache", "dir"])
     assert result == "/tmp/cache"
 
 
 def test_get_nested_returns_sentinel_for_missing_key() -> None:
     data = {"cache": {"dir": "/tmp/cache"}}
-    result = io.get_nested(data, ["cache", "nonexistent"])
-    assert result is io._NOT_FOUND
+    result = config_files.get_nested(data, ["cache", "nonexistent"])
+    assert result is config_files.NOT_FOUND
 
 
 def test_get_nested_returns_sentinel_for_missing_parent() -> None:
     data = {"cache": {"dir": "/tmp/cache"}}
-    result = io.get_nested(data, ["nonexistent", "key"])
-    assert result is io._NOT_FOUND
+    result = config_files.get_nested(data, ["nonexistent", "key"])
+    assert result is config_files.NOT_FOUND
 
 
 def test_get_nested_top_level() -> None:
     data = {"default_remote": "origin"}
-    result = io.get_nested(data, ["default_remote"])
+    result = config_files.get_nested(data, ["default_remote"])
     assert result == "origin"
 
 
@@ -192,7 +193,7 @@ def test_get_merged_config_returns_defaults_when_no_files(
 ) -> None:
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     result = io.get_merged_config()
 
@@ -208,7 +209,7 @@ def test_get_merged_config_local_overrides_global(
 
     global_file = tmp_path / "global.yaml"
     global_file.write_text("core:\n  max_workers: 4\n")
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_file)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_file)
 
     local_file = tmp_path / ".pivot" / "config.yaml"
     local_file.write_text("core:\n  max_workers: 8\n")
@@ -226,7 +227,7 @@ def test_get_merged_config_global_overrides_defaults(
 
     global_file = tmp_path / "global.yaml"
     global_file.write_text("display:\n  precision: 3\n")
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_file)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_file)
 
     result = io.get_merged_config()
 
@@ -241,7 +242,7 @@ def test_get_merged_config_merges_sections(
 
     global_file = tmp_path / "global.yaml"
     global_file.write_text("cache:\n  dir: /global/cache\n")
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_file)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_file)
 
     local_file = tmp_path / ".pivot" / "config.yaml"
     local_file.write_text("core:\n  max_workers: 4\n")
@@ -262,7 +263,7 @@ def test_get_config_value_returns_local_value(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     local_file = tmp_path / ".pivot" / "config.yaml"
     local_file.write_text("cache:\n  dir: /local/cache\n")
@@ -283,7 +284,7 @@ def test_get_config_value_returns_global_value(
 
     global_file = tmp_path / "global.yaml"
     global_file.write_text("display:\n  precision: 3\n")
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_file)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_file)
 
     value, source = io.get_config_value("display.precision")
 
@@ -298,7 +299,7 @@ def test_get_config_value_returns_default_value(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     value, source = io.get_config_value("core.max_workers")
 
@@ -313,7 +314,7 @@ def test_get_config_value_returns_none_for_unknown(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     value, source = io.get_config_value("unknown.key")
 
@@ -331,7 +332,7 @@ def test_set_config_value_creates_local_file(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     io.set_config_value("cache.dir", "/custom/cache", scope=models.ConfigScope.LOCAL)
 
@@ -350,7 +351,7 @@ def test_set_config_value_creates_global_file(
     (tmp_path / ".pivot").mkdir()
 
     global_file = tmp_path / ".config" / "pivot" / "config.yaml"
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_file)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_file)
 
     io.set_config_value("display.precision", 3, scope=models.ConfigScope.GLOBAL)
 
@@ -364,7 +365,7 @@ def test_set_config_value_updates_existing(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     local_file = tmp_path / ".pivot" / "config.yaml"
     local_file.write_text("cache:\n  dir: /old\n")
@@ -383,7 +384,7 @@ def test_set_config_value_sets_remotes(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     io.set_config_value("remotes.origin", "s3://my-bucket/cache", scope=models.ConfigScope.LOCAL)
 
@@ -403,7 +404,7 @@ def test_unset_config_value_removes_key(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     local_file = tmp_path / ".pivot" / "config.yaml"
     local_file.write_text("cache:\n  dir: /custom\n")
@@ -423,7 +424,7 @@ def test_unset_config_value_returns_false_for_missing(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     removed, notices = io.unset_config_value("cache.dir", scope=models.ConfigScope.LOCAL)
 
@@ -438,7 +439,7 @@ def test_unset_config_value_cleans_empty_sections(
 
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     (tmp_path / ".pivot").mkdir()
-    monkeypatch.setattr(io, "get_global_config_path", lambda: tmp_path / "global.yaml")
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: tmp_path / "global.yaml")
 
     local_file = tmp_path / ".pivot" / "config.yaml"
     local_file.write_text("cache:\n  dir: /custom\nother: value\n")
