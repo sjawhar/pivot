@@ -6,11 +6,16 @@ Must be module-level and picklable.
 
 from __future__ import annotations
 
+import _thread
+import builtins
 import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
 import dataclasses
+import importlib
+import importlib._bootstrap as importlib_bootstrap
+import importlib.util
 import logging
 import os
 import pathlib
@@ -67,13 +72,397 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Mapping, Sequence
     from inspect import Signature
     from multiprocessing import Queue
-    from types import TracebackType
+    from types import ModuleType, TracebackType
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(slots=True)
+class _StageImports:
+    """The user modules one stage call imported, under the covered thread rule.
+
+    A covered thread is one inside a covered module's first import, or a thread a covered thread
+    started during this stage (`_on_covered_thread`). What a covered thread imports belongs to
+    the covered import, as a module-level import of it would have before the stage ran.
+    """
+
+    # The user modules the stage's manifest covers (`fingerprint.covered_user_modules`).
+    covered: frozenset[str]
+    # User modules the stage requested through `__import__` or `importlib.import_module` on a
+    # thread that is not a covered thread, already resident or not. The same request on a covered
+    # thread is not recorded, already resident or not, so a warm worker and a cold one agree.
+    imported: set[str] = dataclasses.field(default_factory=set[str])
+    # `sys.modules` keys added while the window below was open, however they were registered
+    # (`exec_module`, `EntryPoint.load()`, `importlib.__import__`). The snapshot cannot tell
+    # which thread registered a key, so this part of the rule is by time.
+    added_in_window: set[str] = dataclasses.field(default_factory=set[str])
+    # User source modules that became resident during the stage outside the window, by any
+    # route: the `sys.modules` snapshot's count, set when the stage returns. A covered import
+    # that requests such a module later does not remove it.
+    new_outside_window: set[str] = dataclasses.field(default_factory=set[str])
+    # The window is open while any thread is inside a covered module's first import or any
+    # covered thread of this stage is running: `window_depth` counts those holds, and
+    # `window_resident_before` holds the `sys.modules` keys at the moment it opened. Guarded by
+    # `_stage_imports_lock`.
+    window_depth: int = 0
+    window_resident_before: frozenset[str] = frozenset()
+
+    def uncovered(self) -> set[str]:
+        """The user modules the stage imported that its manifest does not cover."""
+        return (self.imported | self.new_outside_window) - self.covered
+
+
+class _CoveredImportState(threading.local):
+    """This thread's part in the covered thread rule: how deep it is inside a covered module's
+    first import and for which stage, and the stage it is a covered thread of when a covered
+    thread started it (`_run_as_covered_thread`)."""
+
+    depth: int = 0
+    importing_for: _StageImports | None = None
+    covered_for: _StageImports | None = None
+    # A Pivot-owned thread start is not user code and must not inherit the starting user's
+    # coverage. `_start_pivot_thread` sets this only around its `thread.start()` call.
+    starting_pivot_thread: bool = False
+
+
+_stage_imports: _StageImports | None = None
+_stage_imports_lock = threading.Lock()
+_covered_import_state = _CoveredImportState()
+_original_import = builtins.__import__
+_original_import_module = importlib.import_module
+_original_start_new_thread = _thread.start_new_thread
+_original_start_joinable_thread = _thread.start_joinable_thread
+_replaced_thread_starts: dict[tuple[ModuleType, str], object] = {}
+_hooks_installed = False
+
+
+def _on_covered_thread(tracked: _StageImports) -> bool:
+    """Whether this thread is a covered thread of the stage `tracked` records: inside a covered
+    module's first import for that stage, or a thread a covered thread started during it."""
+    state = _covered_import_state
+    return (state.depth > 0 and state.importing_for is tracked) or state.covered_for is tracked
+
+
+def _open_window(tracked: _StageImports) -> None:
+    """Hold the stage's window for unhooked registrations open (`_StageImports.window_depth`)."""
+    with _stage_imports_lock:
+        if tracked.window_depth == 0 and _stage_imports is tracked:
+            tracked.window_resident_before = frozenset(sys.modules)
+        tracked.window_depth += 1
+
+
+def _close_window(tracked: _StageImports) -> None:
+    """Release one hold on the window. When the last is released, every `sys.modules` key added
+    while it was open is recorded (`_StageImports.added_in_window`)."""
+    with _stage_imports_lock:
+        tracked.window_depth -= 1
+        if tracked.window_depth == 0:
+            if _stage_imports is tracked:
+                tracked.added_in_window.update(set(sys.modules) - tracked.window_resident_before)
+            tracked.window_resident_before = frozenset()
+
+
+def _is_user_source_module(module: object) -> bool:
+    """Whether `module` is user code loaded from a source file.
+
+    A module created without a file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) has
+    no source to fingerprint, so the stage-import check ignores it.
+    """
+    if not isinstance(module, type(sys)):
+        return False
+    return isinstance(vars(module).get("__file__"), str) and fingerprint.is_user_code(module)
+
+
+def _package_chain(name: str) -> list[str]:
+    """`name` and its packages: `a.b.c` gives `a`, `a.b`, `a.b.c`."""
+    parts = name.split(".")
+    return [".".join(parts[:index]) for index in range(1, len(parts) + 1)]
+
+
+def _record_stage_import(names: Sequence[str]) -> None:
+    """Record each of `names` that is resident user source for the running stage, whether or not
+    it was resident before. On a covered thread of that stage nothing is recorded."""
+    tracked = _stage_imports
+    if tracked is None or _on_covered_thread(tracked):
+        return
+    found = [name for name in names if _is_user_source_module(sys.modules.get(name))]
+    if not found:
+        return
+    with _stage_imports_lock:
+        if _stage_imports is tracked:
+            tracked.imported.update(found)
+
+
+def _imports_only_covered(tracked: _StageImports, name: str, fromlist: Sequence[str]) -> bool:
+    """Whether importing `name` (with `fromlist`, for a `from` import) first-imports at least
+    one module, and every module it first-imports by name is one the stage's manifest covers.
+
+    When `name` is resident, a `from` name its module does not hold yet is a submodule the
+    import will load. When it is not, the `from` names cannot be told from attributes before the
+    import runs; a submodule among them is recorded after the import (`_tracked_import`).
+    """
+    pending = [prefix for prefix in _package_chain(name) if prefix not in sys.modules]
+    parent = sys.modules.get(name)
+    if parent is not None:
+        namespace: dict[str, object] = getattr(parent, "__dict__", {})
+        pending.extend(
+            f"{name}.{item}"
+            for item in fromlist
+            if f"{name}.{item}" not in sys.modules and item not in namespace
+        )
+    return bool(pending) and all(module in tracked.covered for module in pending)
+
+
+@contextlib.contextmanager
+def _covered_import(
+    tracked: _StageImports, name: str | None, fromlist: Sequence[str]
+) -> Generator[None]:
+    """Make this thread a covered thread while it first-imports a covered module, and hold the
+    stage's window for unhooked registrations open meanwhile (`_open_window`)."""
+    state = _covered_import_state
+    if state.depth == 0 and (name is None or not _imports_only_covered(tracked, name, fromlist)):
+        yield
+        return
+    if state.depth == 0:
+        state.importing_for = tracked
+        _open_window(tracked)
+    state.depth += 1
+    try:
+        yield
+    finally:
+        state.depth -= 1
+        if state.depth == 0:
+            state.importing_for = None
+            _close_window(tracked)
+
+
+def _run_as_covered_thread(tracked: _StageImports, function: Callable[[], object]) -> None:
+    """Run a thread's body as a covered thread of the stage `tracked` records, then release the
+    hold on that stage's window its start took."""
+    _covered_import_state.covered_for = tracked
+    try:
+        function()
+    finally:
+        _covered_import_state.covered_for = None
+        _close_window(tracked)
+
+
+def _tracked_start_new_thread(
+    function: Callable[..., object],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any] | None = None,
+    /,
+) -> int:
+    """`_thread.start_new_thread` and its synonym `start_new`. A thread a covered thread of the
+    running stage starts is a covered thread of that stage until its function returns, and holds
+    the stage's window open until then."""
+    call_kwargs = {} if kwargs is None else kwargs
+    tracked = _stage_imports
+    if (
+        tracked is None
+        or _covered_import_state.starting_pivot_thread
+        or not callable(function)
+        or not _on_covered_thread(tracked)
+    ):
+        return _original_start_new_thread(function, args, call_kwargs)
+
+    def covered_function(*call_args: object, **named: object) -> None:
+        _run_as_covered_thread(tracked, lambda: function(*call_args, **named))
+
+    _open_window(tracked)
+    try:
+        return _original_start_new_thread(covered_function, args, call_kwargs)
+    except BaseException:
+        _close_window(tracked)
+        raise
+
+
+def _tracked_start_joinable_thread(
+    function: Callable[[], object],
+    handle: _thread._ThreadHandle | None = None,  # pyright: ignore[reportPrivateUsage] - `start_joinable_thread`'s own signature
+    daemon: bool = True,
+) -> _thread._ThreadHandle:  # pyright: ignore[reportPrivateUsage] - `start_joinable_thread`'s own signature
+    """`_thread.start_joinable_thread`, under the rule `_tracked_start_new_thread` applies.
+
+    `threading.Thread.start` starts every `threading.Thread` through it, so `threading.Timer`
+    and `concurrent.futures.ThreadPoolExecutor` workers follow the rule too.
+    """
+    tracked = _stage_imports
+    if (
+        tracked is None
+        or _covered_import_state.starting_pivot_thread
+        or not callable(function)
+        or not _on_covered_thread(tracked)
+    ):
+        return _original_start_joinable_thread(function, handle=handle, daemon=daemon)
+    _open_window(tracked)
+    try:
+        return _original_start_joinable_thread(
+            lambda: _run_as_covered_thread(tracked, function), handle=handle, daemon=daemon
+        )
+    except BaseException:
+        _close_window(tracked)
+        raise
+
+
+# The thread starts each map to their replacement while hooks are installed: every `_thread`
+# start function, plus `threading`'s `start_joinable_thread` binding that `Thread.start` calls.
+_THREAD_START_HOOKS: dict[tuple[ModuleType, str], Callable[..., object]] = {
+    (_thread, "start_new_thread"): _tracked_start_new_thread,
+    (_thread, "start_new"): _tracked_start_new_thread,
+    (_thread, "start_joinable_thread"): _tracked_start_joinable_thread,
+    (threading, "_start_joinable_thread"): _tracked_start_joinable_thread,
+}
+
+
+def _import_package(globals: Mapping[str, object] | None) -> str | None:
+    """The package CPython will use for a relative ``__import__``.
+
+    CPython 3.13's ``importlib._bootstrap._calc___package__`` first reads ``__package__``, then
+    ``__spec__.parent``, then falls back to ``__name__`` and ``__path__`` (CPython
+    ``Lib/importlib/_bootstrap.py:1442-1459``). The hook must resolve the same module as the
+    original import before it can record it.
+    """
+    if globals is None:
+        return None
+    calc_package = cast(
+        "Callable[[Mapping[str, object]], str]",
+        vars(importlib_bootstrap)["_calc___package__"],
+    )
+    return calc_package(globals)
+
+
+def _tracked_import(
+    name: str,
+    globals: Mapping[str, object] | None = None,  # noqa: A002 - CPython's `__import__` signature
+    locals: Mapping[str, object] | None = None,  # noqa: A002 - CPython's `__import__` signature
+    fromlist: Sequence[str] | None = (),
+    level: int = 0,
+) -> object:
+    tracked = _stage_imports
+    if tracked is None:
+        return _original_import(name, globals, locals, fromlist or (), level)
+    package = _import_package(globals) if level else None
+    absolute: str | None = name
+    if level:
+        try:
+            absolute = importlib.util.resolve_name(
+                "." * level + name, package if isinstance(package, str) else None
+            )
+        except (ImportError, ValueError):
+            absolute = None
+    items = [item for item in fromlist or () if item != "*"]
+    with _covered_import(tracked, absolute, items):
+        result = _original_import(name, globals, locals, fromlist or (), level)
+    if absolute is not None:
+        _record_stage_import(_package_chain(absolute) + [f"{absolute}.{item}" for item in items])
+    return result
+
+
+def _tracked_import_module(name: str, package: str | None = None) -> object:
+    tracked = _stage_imports
+    if tracked is None:
+        return _original_import_module(name, package)
+    try:
+        absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
+    except (ImportError, ValueError):
+        absolute = None
+    with _covered_import(tracked, absolute, []):
+        result = _original_import_module(name, package)
+    if absolute is not None:
+        _record_stage_import(_package_chain(absolute))
+    return result
+
+
+def install_import_hooks() -> None:
+    """Route `builtins.__import__` and `importlib.import_module` through the stage-import check,
+    and every thread start in `_THREAD_START_HOOKS` through the covered thread rule.
+    The worker initializer (`executor.core._init_worker`) calls this; nothing else in Pivot's
+    own process installs it. The hooks record nothing while no stage is running.
+    """
+    global _original_import, _original_import_module, _hooks_installed
+    global _original_start_new_thread, _original_start_joinable_thread
+    if _hooks_installed:
+        return
+    _original_import = builtins.__import__
+    _original_import_module = importlib.import_module
+    _original_start_new_thread = _thread.start_new_thread
+    _original_start_joinable_thread = _thread.start_joinable_thread
+    builtins.__import__ = _tracked_import
+    importlib.import_module = _tracked_import_module
+    for (module, name), hook in _THREAD_START_HOOKS.items():
+        _replaced_thread_starts[module, name] = vars(module)[name]
+        vars(module)[name] = hook
+    _hooks_installed = True
+
+
+def _uninstall_import_hooks() -> None:
+    global _hooks_installed
+    builtins.__import__ = _original_import
+    importlib.import_module = _original_import_module
+    for (module, name), original in _replaced_thread_starts.items():
+        vars(module)[name] = original
+    _replaced_thread_starts.clear()
+    _hooks_installed = False
+
+
+def _start_pivot_thread(thread: threading.Thread) -> None:
+    """Start a thread Pivot owns without letting it inherit user-code coverage.
+
+    A Pivot thread can start while a covered import is running (the pipe reader is the critical
+    case). It remains outside the covered thread rule, so later user loads still count. All
+    Pivot-owned starts in a worker route through this helper.
+    """
+    covered_state = _covered_import_state
+    was_starting_pivot_thread = covered_state.starting_pivot_thread
+    covered_state.starting_pivot_thread = True
+    try:
+        thread.start()
+    finally:
+        covered_state.starting_pivot_thread = was_starting_pivot_thread
+
+
+@contextlib.contextmanager
+def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
+    """Record the user modules one stage call imports.
+
+    A stage executed in a process without the worker initializer (`execute_stage` called
+    directly) gets the hooks for this call only. When the stage returns, every user source module
+    that became resident during it outside the window is recorded
+    (`_StageImports.new_outside_window`). A covered thread still running then holds the window
+    open, so the keys added since it opened count as added in it; that thread is not a covered
+    thread of a later stage.
+    """
+    global _stage_imports
+    installed_here = not _hooks_installed
+    if installed_here:
+        install_import_hooks()
+    tracked = _StageImports(covered=covered)
+    with _stage_imports_lock:
+        assert _stage_imports is None, "Worker cannot execute two stages concurrently"
+        resident_before = frozenset(sys.modules)
+        _stage_imports = tracked
+    try:
+        yield tracked
+    finally:
+        with _stage_imports_lock:
+            resident_after = set(sys.modules)
+            if tracked.window_depth:
+                tracked.added_in_window.update(resident_after - tracked.window_resident_before)
+            tracked.window_resident_before = frozenset()
+            _stage_imports = None
+        tracked.new_outside_window.update(
+            name
+            for name in resident_after - resident_before - tracked.added_in_window
+            if _is_user_source_module(sys.modules.get(name))
+        )
+        if installed_here:
+            _uninstall_import_hooks()
+
 
 # How long a stopped worker's running stage may take to unwind before the worker exits.
 TERMINATION_GRACE_S = 10.0
@@ -140,7 +529,9 @@ def _start_exit_timer() -> None:
         if _stop.exit_timer_started:
             return
         _stop.exit_timer_started = True
-    threading.Thread(target=_exit_after_grace, daemon=True, name="pivot-stop-grace").start()
+    _start_pivot_thread(
+        threading.Thread(target=_exit_after_grace, daemon=True, name="pivot-stop-grace")
+    )
 
 
 def _interrupt_stage(_signum: int, _frame: object) -> None:
@@ -206,7 +597,9 @@ def unwind_when_stopped(parent_pid: int) -> None:
         _start_exit_timer()
         signal.pthread_kill(main_thread, signal.SIGTERM)
 
-    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
+    _start_pivot_thread(
+        threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch")
+    )
 
 
 class _QueueLoggingHandler(logging.Handler):
@@ -305,6 +698,10 @@ class WorkerStageInfo(TypedDict):
     project_state_dir: pathlib.Path
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
+    # The fingerprint downgraded a refusal to a warning: the run cache is neither read nor written.
+    unsafe_fingerprint: bool
+    # The stage is `@no_fingerprint`: its declared files are its code, so imports are not checked.
+    no_fingerprint: bool
 
 
 def _make_result(
@@ -544,23 +941,50 @@ def _execute_stage(
                                 deferred_writes=deferred,
                             )
 
-                output_paths = _run_stage_function_with_store(
-                    stage_info["func"],
-                    stage_name,
-                    output_queue,
-                    ring_buffer,
-                    params_instance,
-                    stage_info["deps"],
-                    stage_outs,
-                    store,
-                    stage_info["params_arg_name"],
-                    stage_info["collection_params"],
-                    stage_info["incremental_inputs"],
-                    lock_data,
-                    state_dir,
-                    project_state_dir,
-                    project_root,
+                covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
+                with _track_stage_imports(covered_modules) as stage_imports:
+                    output_paths = _run_stage_function_with_store(
+                        stage_info["func"],
+                        stage_name,
+                        output_queue,
+                        ring_buffer,
+                        params_instance,
+                        stage_info["deps"],
+                        stage_outs,
+                        store,
+                        stage_info["params_arg_name"],
+                        stage_info["collection_params"],
+                        stage_info["incremental_inputs"],
+                        lock_data,
+                        state_dir,
+                        project_state_dir,
+                        project_root,
+                    )
+                # A @no_fingerprint stage declares its code as files (`code_deps`); that
+                # declaration is its contract, so its imports are not checked.
+                uncovered = (
+                    set[str]() if stage_info["no_fingerprint"] else stage_imports.uncovered()
                 )
+                lock_manifest = current_fingerprint
+                if uncovered:
+                    modules = ", ".join(sorted(uncovered))
+                    commit_note = (
+                        " `pivot commit` will record these outputs as current." if no_commit else ""
+                    )
+                    logger.warning(
+                        "Stage '%s' imported user modules its fingerprint does not cover: %s. "
+                        + "Its result will not be reused; the next run reruns it.%s Fix: import "
+                        + "them statically and read them by name in the stage's own code "
+                        + "(`import pkg.mod`, then `pkg.mod.NAME`, or pass `pkg.mod` itself), or "
+                        + "move the values into StageParams.",
+                        stage_name,
+                        modules,
+                        commit_note,
+                    )
+                    lock_manifest = {
+                        **current_fingerprint,
+                        f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}{modules}": "",
+                    }
                 if no_commit:
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=_store_cache_dir(store)
@@ -587,7 +1011,7 @@ def _execute_stage(
 
                 # Build lock data
                 new_lock_data = LockData(
-                    code_manifest=current_fingerprint,
+                    code_manifest=lock_manifest,
                     params=current_params,
                     dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
                     output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
@@ -604,6 +1028,7 @@ def _execute_stage(
                         output_hashes,
                         production_lock,
                         state_db,
+                        reusable=not uncovered,
                         file_hash_entries=file_hash_entries,
                     )
                     return StageResult(
@@ -879,7 +1304,8 @@ def _check_skip_or_run(
         params=current_params,
         dep_hashes=dep_hashes_by_identity,
         out_paths=out_identities,
-        run_cache_allowed=not bool(stage_info["incremental_inputs"]),
+        run_cache_allowed=not stage_info["incremental_inputs"]
+        and not stage_info["unsafe_fingerprint"],
     )
     if decision["changed"]:
         return None, decision["reason"], input_hash, decision["run_cache_allowed"]
@@ -1459,7 +1885,7 @@ class _QueueWriter:
         self._reader_thread = threading.Thread(
             target=self._pipe_reader, daemon=True, name=f"pipe-reader-{self._stage_name}"
         )
-        self._reader_thread.start()
+        _start_pivot_thread(self._reader_thread)
 
     def __enter__(self) -> _QueueWriter:
         self._redirect.__enter__()
@@ -1676,6 +2102,7 @@ def _commit_lock_and_build_deferred(
     production_lock: lock.StageLock,
     state_db: state.StateDB,
     *,
+    reusable: bool = True,
     file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
@@ -1690,6 +2117,7 @@ def _commit_lock_and_build_deferred(
         input_hash,
         output_hashes,
         state_db,
+        reusable=reusable,
         file_hash_entries=file_hash_entries,
         increment_outputs=increment_outputs,
     )
@@ -1701,10 +2129,17 @@ def _build_deferred_writes(
     output_hashes: dict[str, HashInfo],
     state_db: state.StateDB,
     *,
+    reusable: bool = True,
     file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
-    """Build deferred writes for coordinator to apply."""
+    """Build deferred writes for coordinator to apply.
+
+    A result that is not ``reusable`` (its run imported user modules its fingerprint does not
+    cover) files no run-cache entry and deletes any entry at its input hash; its lock carries a
+    key no fingerprint has and `skip.check_stage` never consults the run cache for it, so no tier
+    skips it.
+    """
     result: DeferredWrites = {}
 
     if increment_outputs:
@@ -1716,27 +2151,33 @@ def _build_deferred_writes(
         result["dep_generations"] = gen_record
 
     # Incremental outputs continue from the latest lock state and never use the run cache.
-    outs = stage_info["outs"]
-    cached_paths = (
-        set[str]()
-        if any(out.tag is types.ArtifactTag.INCREMENTAL for out in outs)
-        else {
-            types.identity_key(out.identity)
-            for out in outs
-            if out.tag is not types.ArtifactTag.METRIC
-        }
-    )
-    output_entries = [
-        run_history.output_hash_to_entry(path, oh)
-        for path, oh in output_hashes.items()
-        if path in cached_paths
-    ]
-    if output_entries:
-        result["run_cache_input_hash"] = input_hash
-        result["run_cache_entry"] = run_history.RunCacheEntry(
-            run_id=stage_info["run_id"],
-            output_hashes=output_entries,
+    # An unsafe fingerprint may match a run whose captured values differed; a non-reusable
+    # result imported code its fingerprint does not cover. Never file either. A non-reusable run
+    # also removes any entry an earlier run filed at its key, which the check never saw.
+    if reusable and not stage_info["unsafe_fingerprint"]:
+        outs = stage_info["outs"]
+        cached_paths = (
+            set[str]()
+            if any(out.tag is types.ArtifactTag.INCREMENTAL for out in outs)
+            else {
+                types.identity_key(out.identity)
+                for out in outs
+                if out.tag is not types.ArtifactTag.METRIC
+            }
         )
+        output_entries = [
+            run_history.output_hash_to_entry(path, oh)
+            for path, oh in output_hashes.items()
+            if path in cached_paths
+        ]
+        if output_entries:
+            result["run_cache_input_hash"] = input_hash
+            result["run_cache_entry"] = run_history.RunCacheEntry(
+                run_id=stage_info["run_id"],
+                output_hashes=output_entries,
+            )
+    if not reusable:
+        result["run_cache_delete_input_hash"] = input_hash
 
     if file_hash_entries:
         result["file_hash_entries"] = file_hash_entries

@@ -94,6 +94,7 @@ def _helper_info(
         code_deps=[],
         input_paths={},
         incremental_inputs={},
+        unsafe_fingerprint=False,
     )
 
 

@@ -129,20 +129,25 @@ def commit_stages(
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
             out_paths = [types.identity_key(out.identity) for out in stage_outs]
             production_lock = lock.StageLock(stage_name, stages_dir)
+            previous_lock = production_lock.read()
+            # A run that imported code the fingerprint misses marked its lock; committing the
+            # same outputs keeps that mark, so the stage is still not reusable.
+            code_manifest = skip.carry_uncovered_import(
+                previous_lock["code_manifest"] if previous_lock is not None else None, fingerprint
+            )
+            reusable = skip.uncovered_import_reason(code_manifest) is None
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
-            if not force and stage_names is None:
-                lock_data = production_lock.read()
-                if lock_data is not None:
-                    decision = skip.check_stage(
-                        lock_data=lock_data,
-                        fingerprint=fingerprint,
-                        params=current_params,
-                        dep_hashes=dep_hashes_by_identity,
-                        out_paths=[out.identity for out in stage_outs],
-                    )
-                    if not decision["changed"]:
-                        continue
+            if not force and stage_names is None and previous_lock is not None:
+                decision = skip.check_stage(
+                    lock_data=previous_lock,
+                    fingerprint=fingerprint,
+                    params=current_params,
+                    dep_hashes=dep_hashes_by_identity,
+                    out_paths=[out.identity for out in stage_outs],
+                )
+                if not decision["changed"]:
+                    continue
 
             # 6. Hash and cache outputs
             output_hashes_by_key = dict[str, HashInfo]()
@@ -187,7 +192,7 @@ def commit_stages(
 
             # 7. Write production lock
             new_lock_data = LockData(
-                code_manifest=fingerprint,
+                code_manifest=code_manifest,
                 params=current_params,
                 dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
                 output_hashes=dict(sorted(output_hashes_by_identity.items())),
@@ -200,30 +205,31 @@ def commit_stages(
 
             dep_gen_map = worker.compute_dep_generation_map(stage_info["deps"], stage_db)
 
-            # Only cached outputs belong in run cache
-            cached_paths = {
-                types.identity_key(out.identity)
-                for out in stage_outs
-                if out.tag is not ArtifactTag.METRIC
-            }
-            cached_output_hashes = {
-                path: oh for path, oh in output_hashes_by_key.items() if path in cached_paths
-            }
-
-            output_entries = [
-                run_history.output_hash_to_entry(path, oh)
-                for path, oh in cached_output_hashes.items()
-            ]
-
+            # An unsafe fingerprint may match a run whose captured values differed, and a carried
+            # uncovered-import mark means the outputs came from code the fingerprint misses: never
+            # file either. A carried mark also removes any entry an earlier run filed at this key.
             deferred = DeferredWrites()
             if dep_gen_map:
                 deferred["dep_generations"] = dep_gen_map
-            if output_entries:
-                deferred["run_cache_input_hash"] = input_hash
-                deferred["run_cache_entry"] = run_history.RunCacheEntry(
-                    run_id=run_id,
-                    output_hashes=output_entries,
-                )
+            if reusable and not stage_info["unsafe_fingerprint"]:
+                cached_paths = {
+                    types.identity_key(out.identity)
+                    for out in stage_outs
+                    if out.tag is not ArtifactTag.METRIC
+                }
+                output_entries = [
+                    run_history.output_hash_to_entry(path, oh)
+                    for path, oh in output_hashes_by_key.items()
+                    if path in cached_paths
+                ]
+                if output_entries:
+                    deferred["run_cache_input_hash"] = input_hash
+                    deferred["run_cache_entry"] = run_history.RunCacheEntry(
+                        run_id=run_id,
+                        output_hashes=output_entries,
+                    )
+            if not reusable:
+                deferred["run_cache_delete_input_hash"] = input_hash
             if file_hash_entries:
                 deferred["file_hash_entries"] = file_hash_entries
 

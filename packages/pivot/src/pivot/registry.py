@@ -41,6 +41,8 @@ class RegistryStageInfo(TypedDict):
         no_fingerprint: Use file-level hashing instead of AST fingerprinting.
         code_deps: Extra project-relative files hashed into a no_fingerprint stage's fingerprint.
         input_paths: Project-relative paths by input artifact identity, for the wiring manifest.
+        unsafe_fingerprint: The fingerprint was computed with a refusal downgraded to a
+            warning (unsafe fingerprinting), so the run cache neither files nor reuses results.
     """
 
     func: Callable[..., Any]
@@ -59,6 +61,7 @@ class RegistryStageInfo(TypedDict):
     no_fingerprint: bool
     code_deps: list[str]
     input_paths: dict[str, str]
+    unsafe_fingerprint: bool
 
 
 class StageRegistry:
@@ -149,7 +152,7 @@ class StageRegistry:
         """Ensure a stage fingerprint is computed and cached."""
         info = self._stages[stage_name]
         if info["fingerprint"] is None:
-            info["fingerprint"] = _compute_fingerprint(stage_name, info)
+            info["fingerprint"], info["unsafe_fingerprint"] = _compute_fingerprint(stage_name, info)
         return info["fingerprint"]
 
     def build_dag(self) -> DiGraph[str]:
@@ -256,10 +259,10 @@ def _check_output_path_free(
         )
 
 
-def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, str]:
-    """Compute and return a stage fingerprint, wrapping errors."""
+def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict[str, str], bool]:
+    """Compute a stage fingerprint and whether a refusal in it was downgraded; wrap errors."""
     try:
-        with fingerprint.stage_fingerprint_scope(stage_name):
+        with fingerprint.stage_fingerprint_scope(stage_name) as scope:
             no_fp = info["no_fingerprint"]
             if no_fp:
                 result = _compute_file_fingerprint(info["func"], info["code_deps"])
@@ -273,7 +276,7 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> dict[str, 
                 out_key = types.identity_key(out.identity)
                 for key, value in fingerprint.get_loader_fingerprint(out.format).items():
                     result[f"out:{out_key}:{key}"] = value
-        return result
+        return result, scope["unsafe"]
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
 

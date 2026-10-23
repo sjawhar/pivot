@@ -75,6 +75,8 @@ def _make_worker_stage_info(
         project_state_dir=state_dir,
         collection_params={},
         incremental_inputs={},
+        unsafe_fingerprint=False,
+        no_fingerprint=False,
     )
 
 
