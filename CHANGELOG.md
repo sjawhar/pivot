@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v0.5.7 (2026-10-23)
+
+### Bug Fixes
+
+- **cache**: `--checkout-mode hardlink`, and a `cache.checkout_mode` order without copy, now copy a
+  file whose cache object is at the filesystem's hard-link limit in checkout, pull and repro,
+  instead of failing with `[Errno 31] Too many links`
+  ([#510](https://github.com/sjawhar/pivot/pull/510),
+  [`7faf1e7`](https://github.com/sjawhar/pivot/commit/7faf1e7920dad13f50516ceac9d845a1a53cbc75))
+
+- **cache**: Checkout, get, pull, repro's restore and a stage's own outputs copy a file whose cache
+  object already has as many hard links as the filesystem allows (65,000 on ext4), instead of
+  symlinking it into the cache; other files still hardlink, and a cache on another device still gets
+  symlinks as before ([#510](https://github.com/sjawhar/pivot/pull/510),
+  [`7faf1e7`](https://github.com/sjawhar/pivot/commit/7faf1e7920dad13f50516ceac9d845a1a53cbc75))
+
+- **cache**: Copy a cache object that has reached the filesystem's hard-link limit instead of
+  linking it ([#510](https://github.com/sjawhar/pivot/pull/510),
+  [`7faf1e7`](https://github.com/sjawhar/pivot/commit/7faf1e7920dad13f50516ceac9d845a1a53cbc75))
+
+
 ## v0.5.6 (2026-10-23)
 
 ### Bug Fixes
