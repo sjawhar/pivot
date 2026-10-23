@@ -67,12 +67,15 @@ class CacheStore:
             raise FileNotFoundError(ref_path)
 
         with self._state_db() as db:
-            if ref_path.is_dir():
+            is_directory = ref_path.is_dir()
+            if is_directory:
                 ref_hash = cache.hash_directory(ref_path, db)["hash"]
             else:
                 ref_hash, _ = cache.hash_file(ref_path, db)
 
-        cache_path = cache.resolve_cache_object_path(self._cache_dir, ref_hash)
+        cache_path = cache.resolve_cache_object_path(
+            self._cache_dir, ref_hash, directory=is_directory
+        )
         if cache_path is None:
             raise FileNotFoundError(ref_hash)
         return cache_path

@@ -115,3 +115,31 @@ def test_cache_object_resolver_rejects_a_legacy_symlink_even_when_a_sentinel_exi
     resolved = cache.resolve_cache_object_path(primary_files, _HASH)
 
     assert resolved is None
+
+
+def test_cache_object_resolver_rejects_a_primary_directory(
+    set_project_root: pathlib.Path,
+) -> None:
+    _configure_state_dir(set_project_root)
+    primary = set_project_root / "altstate" / "cache" / "files" / _HASH[:2] / _HASH[2:]
+    primary.mkdir(parents=True)
+
+    resolved = cache.resolve_cache_object_path(
+        set_project_root / "altstate" / "cache" / "files", _HASH
+    )
+
+    assert resolved is None
+
+
+def test_cache_object_resolver_rejects_a_legacy_directory(
+    set_project_root: pathlib.Path,
+) -> None:
+    _configure_state_dir(set_project_root)
+    legacy = set_project_root / ".pivot" / "cache" / "files" / _HASH[:2] / _HASH[2:]
+    legacy.mkdir(parents=True)
+
+    resolved = cache.resolve_cache_object_path(
+        set_project_root / "altstate" / "cache" / "files", _HASH
+    )
+
+    assert resolved is None

@@ -371,23 +371,31 @@ def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
     return cache_dir / file_hash[:2] / file_hash[2:]
 
 
-def is_cache_object_path(path: pathlib.Path) -> bool:
-    """Whether a resolver or cache scan may treat this final path as a present object."""
-    if path.is_symlink():
-        logger.debug("Ignoring symlinked cache object %s", path)
+def is_cache_object_path(path: pathlib.Path, *, directory: bool = False) -> bool:
+    """Whether a resolver or scan may treat a final cache file or tree root as present."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
         return False
-    return path.exists()
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(mode):
+        kind = "directory tree" if directory else "regular file"
+        logger.debug("Ignoring cache object %s: expected %s", path, kind)
+        return False
+    return True
 
 
-def resolve_cache_object_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path | None:
-    """Return an existing regular cache object, or ``None`` when neither location has one."""
+def resolve_cache_object_path(
+    cache_dir: pathlib.Path, file_hash: str, *, directory: bool = False
+) -> pathlib.Path | None:
+    """Return an existing regular object or requested tree root, or ``None`` when absent."""
     cache_path = get_cache_path(cache_dir, file_hash)
-    if is_cache_object_path(cache_path):
+    if is_cache_object_path(cache_path, directory=directory):
         return cache_path
     legacy_files_dir = project.legacy_cache_files_dir_for(cache_dir)
     if legacy_files_dir is not None:
         legacy_path = get_cache_path(legacy_files_dir, file_hash)
-        if is_cache_object_path(legacy_path):
+        if is_cache_object_path(legacy_path, directory=directory):
             project.report_legacy_state_dir(cache_dir.parent.parent)
             return legacy_path
     return None
@@ -1121,7 +1129,7 @@ def missing_cache_objects(
 ) -> list[str]:
     """Return hashes required to restore an output that are absent from the cache."""
     if is_dir_hash(output_hash):
-        tree_path = resolve_cache_object_path(cache_dir, output_hash["hash"])
+        tree_path = resolve_cache_object_path(cache_dir, output_hash["hash"], directory=True)
         if (
             checkout_modes[0] == CheckoutMode.SYMLINK
             and tree_path is not None
@@ -1229,7 +1237,10 @@ def _save_directory_to_cache(
         and checkout_modes[0] == CheckoutMode.SYMLINK
         and path.is_symlink()
         and _get_symlink_cache_hash(path, cache_dir) == output_hash["hash"]
-        and (cache_path := resolve_cache_object_path(cache_dir, output_hash["hash"])) is not None
+        and (
+            cache_path := resolve_cache_object_path(cache_dir, output_hash["hash"], directory=True)
+        )
+        is not None
         and cache_path.exists()
     ):
         return output_hash
@@ -1481,7 +1492,7 @@ def _restore_directory_from_cache(
     lock_token: str | None = None,
 ) -> bool:
     """Restore a directory atomically."""
-    cache_dir_path = resolve_cache_object_path(cache_dir, output_hash["hash"])
+    cache_dir_path = resolve_cache_object_path(cache_dir, output_hash["hash"], directory=True)
     symlink_fast_path = (
         checkout_modes[0] == CheckoutMode.SYMLINK
         and cache_dir_path is not None
