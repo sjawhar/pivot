@@ -1028,8 +1028,9 @@ def _checkout_with_fallback(
     """Try each link mode in order until one succeeds.
 
     With ``keep_existing_copy``, reaching COPY while ``path`` still exists leaves it in place:
-    the caller guarantees it already holds the cached bytes. A failed link attempt clears
-    ``path`` first, so COPY then copies from the cache as usual.
+    the caller guarantees it already holds the cached bytes. A failed link attempt leaves
+    ``path`` as it was, since each mode builds its entry under a staging name and renames it
+    over ``path`` only once it is made.
 
     A hard link refused with EMLINK means ``cache_path`` alone already has as many links as the
     filesystem allows (65,000 on ext4); other objects still link. That entry is copied, as if
