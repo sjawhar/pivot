@@ -8,7 +8,6 @@ import pathlib
 import signal
 import socket
 import subprocess
-import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -23,6 +22,7 @@ from pivot.cli import completion
 from pivot.config import io as config_io
 from pivot.show import common as show_common
 from pivot.storage import restore
+from tests import helpers
 
 if TYPE_CHECKING:
     import click.testing
@@ -54,19 +54,6 @@ def _lock_text() -> str:
     return yaml.safe_dump({"code_manifest": {}, "params": {}, "deps": [], "outs": []})
 
 
-_PIVOT = str(pathlib.Path(sys.executable).with_name("pivot"))
-
-
-def _run_pivot(root: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [_PIVOT, *args],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
 def _write_acceptance_pipeline(root: pathlib.Path) -> None:
     (root / "data" / "raw").mkdir(parents=True)
     (root / "data" / "raw" / "input.txt").write_text("data")
@@ -88,13 +75,14 @@ def test_configuring_state_dir_after_init_keeps_marker_gitignore(
     tmp_path: pathlib.Path,
 ) -> None:
     """The documented init/config/repro sequence relocates future state without moving old state."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
 
-    initialized = _run_pivot(root, "init")
-    configured = _run_pivot(root, "config", "set", "core.state_dir", "altstate")
+    initialized = helpers.run_pivot(root, home, "init")
+    configured = helpers.run_pivot(root, home, "config", "set", "core.state_dir", "altstate")
     _write_acceptance_pipeline(root)
-    repro = _run_pivot(root, "repro")
+    repro = helpers.run_pivot(root, home, "repro")
 
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
     assert configured.returncode == 0, configured.stdout + configured.stderr
@@ -107,13 +95,14 @@ def test_configuring_state_dir_after_init_keeps_marker_gitignore(
 
 def test_repro_after_hand_editing_state_dir_creates_its_gitignore(tmp_path: pathlib.Path) -> None:
     """A hand-edited state setting creates the configured directory's ignore file on repro."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
 
-    initialized = _run_pivot(root, "init")
+    initialized = helpers.run_pivot(root, home, "init")
     (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
     _write_acceptance_pipeline(root)
-    repro = _run_pivot(root, "repro")
+    repro = helpers.run_pivot(root, home, "repro")
 
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
     assert repro.returncode == 0, repro.stdout + repro.stderr
@@ -585,6 +574,7 @@ def test_import_ignores_a_source_state_dir_that_is_not_a_repo_path(
 
 def test_import_reads_a_source_config_with_a_duplicate_key(tmp_path: pathlib.Path) -> None:
     """PyYAML, which 0.5.2 used, keeps the last duplicate; the import still writes its `.pvt`."""
+    home = tmp_path / "home"
     source = tmp_path / "source"
     source.mkdir()
     init_git_repo(source)
@@ -618,10 +608,17 @@ def test_import_reads_a_source_config_with_a_duplicate_key(tmp_path: pathlib.Pat
     consumer = tmp_path / "consumer"
     consumer.mkdir()
     init_git_repo(consumer)
-    assert _run_pivot(consumer, "init").returncode == 0
+    assert helpers.run_pivot(consumer, home, "init").returncode == 0
 
-    result = _run_pivot(
-        consumer, "import", str(source), "test/writes_state", "--out", "got.txt", "--no-download"
+    result = helpers.run_pivot(
+        consumer,
+        home,
+        "import",
+        str(source),
+        "test/writes_state",
+        "--out",
+        "got.txt",
+        "--no-download",
     )
 
     output = result.stdout + result.stderr
@@ -721,7 +718,7 @@ with pipeline:
 """)
     socket_path = tmp_path / "altstate" / "agent.sock"
     proc = subprocess.Popen(
-        [_PIVOT, "repro", "--watch", "--serve"],
+        [helpers.PIVOT, "repro", "--watch", "--serve"],
         cwd=tmp_path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

@@ -23,13 +23,13 @@ import pytest
 from conftest import isolated_pivot_dir, send_rpc
 from pivot import cli, compose, executor, loaders
 from pivot.storage import cache, track
+from tests import helpers
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     import click.testing
 
-_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 # =============================================================================
 # Module-level stage functions (required for pickling)
@@ -745,7 +745,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     # The child logs every RPC disconnect. Files avoid a PIPE filling and blocking it.
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            [_PIVOT_BIN, "repro", "--watch", "--serve"],
+            [helpers.PIVOT, "repro", "--watch", "--serve"],
             cwd=tmp_path,
             env=env,
             stdout=stdout_file,
@@ -814,7 +814,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
 
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            [_PIVOT_BIN, "repro", "--watch", "--serve"],
+            [helpers.PIVOT, "repro", "--watch", "--serve"],
             cwd=project,
             env=env,
             stdout=stdout_file,
@@ -1623,27 +1623,12 @@ def test_repro_included_pipeline_file_target_runs(
     assert summary in result.output, result.output
 
 
-def _pivot_with_hash_seed(
-    cwd: pathlib.Path, hash_seed: int, *args: str
-) -> subprocess.CompletedProcess[str]:
-    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
-    env["PYTHONHASHSEED"] = str(hash_seed)
-    return subprocess.run(
-        [_PIVOT_BIN, *args],
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
-
-
 @pytest.mark.parametrize("hash_seed", [0, 1, 2, 3])
 def test_params_holding_sets_and_nan_stay_one_stage_in_every_process(
     tmp_path: pathlib.Path, hash_seed: int
 ) -> None:
     """include() deep-copies a set, which may reorder it, and a re-import makes a new NaN."""
+    home = tmp_path / "home"
     _write_prep_report_project(
         tmp_path,
         _prep_pipeline(
@@ -1655,8 +1640,9 @@ def test_params_holding_sets_and_nan_stay_one_stage_in_every_process(
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / ".pivot").mkdir()
 
-    listed = _pivot_with_hash_seed(tmp_path, hash_seed, "list")
-    ran = _pivot_with_hash_seed(tmp_path, hash_seed, "repro", "prep/pipeline.py")
+    seed = {"PYTHONHASHSEED": str(hash_seed)}
+    listed = helpers.run_pivot(tmp_path, home, "list", extra_env=seed)
+    ran = helpers.run_pivot(tmp_path, home, "repro", "prep/pipeline.py", extra_env=seed)
 
     assert listed.returncode == 0, listed.stdout + listed.stderr
     assert "prep/drop_low" in listed.stdout, listed.stdout
@@ -1798,7 +1784,7 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(
-            [_PIVOT_BIN, "repro", "--watch", "--debounce", "100"],
+            [helpers.PIVOT, "repro", "--watch", "--debounce", "100"],
             cwd=project,
             env=env,
             stdout=log,
@@ -1881,7 +1867,7 @@ def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(
-            [_PIVOT_BIN, "repro", "--watch", "--debounce", "100"],
+            [helpers.PIVOT, "repro", "--watch", "--debounce", "100"],
             cwd=project,
             env=env,
             stdout=log,
@@ -1949,7 +1935,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
 
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            [_PIVOT_BIN, "repro", "--watch"],
+            [helpers.PIVOT, "repro", "--watch"],
             cwd=project,
             env=env,
             stdout=stdout_file,
@@ -2022,7 +2008,7 @@ def _start_watch_jsonl(
     project: pathlib.Path,
 ) -> tuple[subprocess.Popen[str], queue.Queue[str]]:
     process = subprocess.Popen(
-        [_PIVOT_BIN, "repro", "--watch", "--jsonl", "--debounce", "50"],
+        [helpers.PIVOT, "repro", "--watch", "--jsonl", "--debounce", "50"],
         cwd=project,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

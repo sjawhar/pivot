@@ -2,18 +2,16 @@
 
 """CLI regressions for fingerprint gaps found during PR #496 acceptance testing."""
 
-import os
 import pathlib
 import subprocess
-import sys
 
 import pytest
 import yaml
+from tests import helpers
 
 from pivot import run_history
 from pivot.storage import state
 
-_PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _LINES = "Local Set Default Proof Using\nSet Default Proof Using\nLemma a\n"
 _HEADER = """\
 import functools
@@ -41,22 +39,8 @@ def _pipeline(imports: str, body: str) -> str:
     return _HEADER + imports + _NORMALIZE + "\n" + body + _FOOTER
 
 
-def _run(
-    project: pathlib.Path, *args: str, pythonpath: pathlib.Path | None = None
-) -> subprocess.CompletedProcess[str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
-    }
-    if pythonpath is not None:
-        env["PYTHONPATH"] = str(pythonpath)
-    return subprocess.run(
-        [str(_PIVOT), *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
-    )
-
-
 def _project(tmp_path: pathlib.Path, files: dict[str, str]) -> pathlib.Path:
+    home = tmp_path / "home"
     project = tmp_path / "project"
     for rel, text in files.items():
         (project / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -64,7 +48,7 @@ def _project(tmp_path: pathlib.Path, files: dict[str, str]) -> pathlib.Path:
     (project / "data" / "raw").mkdir(parents=True)
     (project / "data" / "raw" / "lines.txt").write_text(_LINES)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    init = _run(project, "init")
+    init = helpers.run_pivot(project, home, "init")
     assert init.returncode == 0, init.stdout + init.stderr
     return project
 
@@ -82,13 +66,15 @@ def _run_cache_entries(project: pathlib.Path) -> list[run_history.RunCacheEntry]
     return [run_history.deserialize_run_cache_entry(value) for _key, value in entries]
 
 
-def _assert_not_reusable(project: pathlib.Path, result: subprocess.CompletedProcess[str]) -> None:
+def _assert_not_reusable(
+    project: pathlib.Path, home: pathlib.Path, result: subprocess.CompletedProcess[str]
+) -> None:
     """Check a successful run's warning, empty run cache, and reported uncovered-import reason."""
     message = " ".join((result.stdout + result.stderr).split())
     assert result.returncode == 0, message
     assert message.count("imported user modules its fingerprint does not cover") == 1, message
     assert _run_cache_entries(project) == []
-    status = _run(project, "status", "--json")
+    status = helpers.run_pivot(project, home, "status", "--json")
     assert status.returncode == 0, status.stdout + status.stderr
     assert "Previous run imported modules its fingerprint does not cover" in status.stdout
 
@@ -237,6 +223,7 @@ def test_runtime_dynamic_import_makes_result_not_reusable(
 ) -> None:
     """A user module loaded only at run time is outside the fingerprint: the stage still runs,
     warns, files no run-cache entry and reruns next time, so an edit to the module is seen."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -248,12 +235,12 @@ def test_runtime_dynamic_import_makes_result_not_reusable(
         },
     )
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
-    _assert_not_reusable(project, first)
+    _assert_not_reusable(project, home, first)
     assert _count(project) == 4
     _edit(project, *_EDIT_LIB_VALUE)
-    second = _run(project, "repro")
+    second = helpers.run_pivot(project, home, "repro")
     assert second.returncode == 0, second.stdout + second.stderr
     assert _count(project) == 103
 
@@ -317,6 +304,7 @@ def test_relative_builtins_import_uses_cpythons_package_fallback(
     """A relative `builtins.__import__` records the same user module CPython imports when the
     package comes from `__name__`, `__spec__.parent` or a `ModuleType` fallback, cold or after an
     upstream stage made the module resident. The explicit `__package__` spelling is the control."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -326,15 +314,15 @@ def test_relative_builtins_import_uses_cpythons_package_fallback(
             ),
         },
     )
-    _run(project, "config", "set", "core.max_workers", "1")
+    helpers.run_pivot(project, home, "config", "set", "core.max_workers", "1")
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
-    _assert_not_reusable(project, first)
+    _assert_not_reusable(project, home, first)
     assert "helpers" in first.stdout + first.stderr
     assert _count(project) == 4
     _edit(project, *_EDIT_LIB_VALUE)
-    second = _run(project, "repro")
+    second = helpers.run_pivot(project, home, "repro")
     assert second.returncode == 0, second.stdout + second.stderr
     assert _count(project) == 103
 
@@ -378,6 +366,7 @@ def test_pivot_thread_started_inside_a_covered_import_does_not_excuse_a_later_ma
     """A pipe reader, parent watcher or stop-grace thread Pivot starts is not user work. Starting
     the reader through `fileno()` or `faulthandler.enable()` inside a covered import must not
     excuse a later manual or `EntryPoint.load()` load of `late`."""
+    home = tmp_path / "home"
     lib, body = _PIVOT_THREAD_LOADS[surface]
     project = _project(
         tmp_path,
@@ -392,13 +381,13 @@ def test_pivot_thread_started_inside_a_covered_import_does_not_excuse_a_later_ma
         },
     )
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
-    _assert_not_reusable(project, first)
+    _assert_not_reusable(project, home, first)
     assert "late" in first.stdout + first.stderr
     assert _count(project) == 4
     _edit(project, "late.py", "VALUE = 1\n", "VALUE = 100\n")
-    second = _run(project, "repro")
+    second = helpers.run_pivot(project, home, "repro")
     assert second.returncode == 0, second.stdout + second.stderr
     assert _count(project) == 103
 
@@ -408,6 +397,7 @@ def test_pivot_reader_started_before_a_covered_import_does_not_excuse_a_later_ma
 ) -> None:
     """A later manual load stays counted when Pivot starts a pipe reader before or during a covered
     import, because Pivot-owned threads do not inherit user-code coverage."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -431,7 +421,7 @@ def test_pivot_reader_started_before_a_covered_import_does_not_excuse_a_later_ma
         },
     )
 
-    _assert_not_reusable(project, _run(project, "repro"))
+    _assert_not_reusable(project, home, helpers.run_pivot(project, home, "repro"))
 
 
 def test_pivot_thread_started_inside_a_covered_import_does_not_hide_a_hooked_load(
@@ -439,6 +429,7 @@ def test_pivot_thread_started_inside_a_covered_import_does_not_hide_a_hooked_loa
 ) -> None:
     """A later hooked `__import__` stays counted while a reader Pivot starts in a covered import
     remains alive."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -455,7 +446,7 @@ def test_pivot_thread_started_inside_a_covered_import_does_not_hide_a_hooked_loa
         },
     )
 
-    _assert_not_reusable(project, _run(project, "repro"))
+    _assert_not_reusable(project, home, helpers.run_pivot(project, home, "repro"))
 
 
 def test_runtime_dynamic_import_under_no_commit_warns_that_commit_records_outputs(
@@ -463,6 +454,7 @@ def test_runtime_dynamic_import_under_no_commit_warns_that_commit_records_output
 ) -> None:
     """`pivot commit` records outputs on disk against the static fingerprint, so under
     `--no-commit` the warning says so."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -476,13 +468,13 @@ def test_runtime_dynamic_import_under_no_commit_warns_that_commit_records_output
         },
     )
 
-    result = _run(project, "repro", "--no-commit")
+    result = helpers.run_pivot(project, home, "repro", "--no-commit")
 
     message = " ".join((result.stdout + result.stderr).split())
     assert result.returncode == 0, message
     assert message.count("imported user modules its fingerprint does not cover") == 1, message
     assert "`pivot commit` will record these outputs as current" in message, message
-    committed = _run(project, "repro")
+    committed = helpers.run_pivot(project, home, "repro")
     assert "`pivot commit`" not in " ".join((committed.stdout + committed.stderr).split())
 
 
@@ -491,6 +483,7 @@ def test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage(
 ) -> None:
     """A thread one stage leaves running can import while a later stage runs in the same
     worker. That later stage still succeeds; it only loses reuse and reruns next time."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -515,15 +508,15 @@ def test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage(
             ),
         },
     )
-    configured = _run(project, "config", "set", "core.max_workers", "1")
+    configured = helpers.run_pivot(project, home, "config", "set", "core.max_workers", "1")
     assert configured.returncode == 0, configured.stdout + configured.stderr
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
-    _assert_not_reusable(project, first)
+    _assert_not_reusable(project, home, first)
     assert "late" in first.stdout + first.stderr
     assert _count(project) == 3
-    second = _run(project, "repro", "t/count")
+    second = helpers.run_pivot(project, home, "repro", "t/count")
     assert second.returncode == 0, second.stdout + second.stderr
     assert "t/count" in second.stdout
     assert "cached" not in second.stdout.split("t/count", 1)[1].splitlines()[0]
@@ -535,15 +528,16 @@ def test_dynamic_import_spelling_of_a_user_module_makes_result_not_reusable(
 ) -> None:
     """Spellings main does not refuse at definition run; the user module they load at run time
     makes the result not reusable, and an edit to it is seen without `--force`."""
+    home = tmp_path / "home"
     files, edit_spec = _DYNAMIC_IMPORT_SHAPES[shape]
     project = _project(tmp_path, files)
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
-    _assert_not_reusable(project, first)
+    _assert_not_reusable(project, home, first)
     assert _count(project) == 4
     _edit(project, *edit_spec)
-    second = _run(project, "repro")
+    second = helpers.run_pivot(project, home, "repro")
     assert second.returncode == 0, second.stdout + second.stderr
     assert _count(project) == 103
 
@@ -563,6 +557,7 @@ _LIBRARY_DYNAMIC_IMPORTS = {
 @pytest.mark.parametrize("shape", sorted(_LIBRARY_DYNAMIC_IMPORTS))
 def test_dynamic_import_of_a_library_runs_and_caches(tmp_path: pathlib.Path, shape: str) -> None:
     """As on main: a dynamic import of a library module runs, warns nothing, and caches."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -575,8 +570,8 @@ def test_dynamic_import_of_a_library_runs_and_caches(tmp_path: pathlib.Path, sha
         },
     )
 
-    first = _run(project, "repro")
-    again = _run(project, "repro", "--json")
+    first = helpers.run_pivot(project, home, "repro")
+    again = helpers.run_pivot(project, home, "repro", "--json")
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
@@ -628,6 +623,7 @@ def test_unloaded_user_body_import_is_refused_at_definition(
 ) -> None:
     """A body import of a user module discovery did not load is refused: Pivot would have to
     run the module to fingerprint it. The message names the module and the fix."""
+    home = tmp_path / "home"
     files, statement, module = _UNLOADED_BODY_IMPORTS[shape]
     project = _project(
         tmp_path,
@@ -642,7 +638,7 @@ def test_unloaded_user_body_import_is_refused_at_definition(
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     message = result.stdout + result.stderr
     assert result.returncode != 0, message
@@ -653,6 +649,7 @@ def test_unloaded_user_body_import_is_refused_at_definition(
 
 
 def test_body_import_of_a_library_module_is_not_refused(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -666,12 +663,13 @@ def test_body_import_of_a_library_module_is_not_refused(tmp_path: pathlib.Path) 
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_resolved_helper_accepts_import_module_argument_name(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -687,13 +685,14 @@ def test_resolved_helper_accepts_import_module_argument_name(tmp_path: pathlib.P
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == "safe:import_module"
 
 
 def test_decorated_method_wrapper_edit_reruns_stage(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -710,16 +709,17 @@ def test_decorated_method_wrapper_edit_reruns_stage(tmp_path: pathlib.Path) -> N
             ),
         },
     )
-    assert _run(project, "repro").returncode == 0
+    assert helpers.run_pivot(project, home, "repro").returncode == 0
     _edit(project, "helpers/model.py", "fn(self, x) * 2\n", "fn(self, x) * 200\n")
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == 800
 
 
 def test_decorator_wrapper_global_edit_reruns_stage(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -736,16 +736,17 @@ def test_decorator_wrapper_global_edit_reruns_stage(tmp_path: pathlib.Path) -> N
             ),
         },
     )
-    assert _run(project, "repro").returncode == 0
+    assert helpers.run_pivot(project, home, "repro").returncode == 0
     _edit(project, "helpers/model.py", "SCALE = 2", "SCALE = 30")
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == 120
 
 
 def test_wrapped_helper_body_import_edit_reruns_stage(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -765,10 +766,10 @@ def test_wrapped_helper_body_import_edit_reruns_stage(tmp_path: pathlib.Path) ->
             ),
         },
     )
-    assert _run(project, "repro").returncode == 0
+    assert helpers.run_pivot(project, home, "repro").returncode == 0
     _edit(project, "impl.py", "LIMIT = 1", "LIMIT = 100")
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == 103
@@ -850,18 +851,20 @@ _TRACKED_CLASS_MEMBER_SHAPES = {
 
 @pytest.mark.parametrize("shape", sorted(_TRACKED_CLASS_MEMBER_SHAPES))
 def test_class_member_edit_reruns_stage(tmp_path: pathlib.Path, shape: str) -> None:
+    home = tmp_path / "home"
     files, edit, expected = _TRACKED_CLASS_MEMBER_SHAPES[shape]
     project = _project(tmp_path, files)
-    assert _run(project, "repro").returncode == 0
+    assert helpers.run_pivot(project, home, "repro").returncode == 0
     _edit(project, *edit)
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == expected
 
 
 def test_dataclass_callable_member_is_refused(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -880,7 +883,7 @@ def test_dataclass_callable_member_is_refused(tmp_path: pathlib.Path) -> None:
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode != 0, result.stdout + result.stderr
     assert "captures non-scalar variable" in result.stdout + result.stderr
@@ -892,6 +895,7 @@ def test_guarded_unloaded_body_import_is_refused_without_running_it(
 ) -> None:
     """A guarded body import of a module discovery did not load is refused at definition, and
     the module is never run: one that raises on import does not break discovery."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -906,7 +910,7 @@ def test_guarded_unloaded_body_import_is_refused_without_running_it(
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     message = result.stdout + result.stderr
     assert result.returncode != 0, message
@@ -918,6 +922,7 @@ def test_guarded_unloaded_body_import_is_refused_without_running_it(
 def test_body_import_package_attribute_submodule_change_reruns_stage(
     tmp_path: pathlib.Path,
 ) -> None:
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -931,11 +936,11 @@ def test_body_import_package_attribute_submodule_change_reruns_stage(
             ),
         },
     )
-    assert _run(project, "repro").returncode == 0
+    assert helpers.run_pivot(project, home, "repro").returncode == 0
     assert _count(project) == 4
     _edit(project, "helpers/lib.py", "VALUE = 1", "VALUE = 100")
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == 103
@@ -946,6 +951,7 @@ def test_body_import_of_unloaded_submodule_through_loaded_package_is_refused(
 ) -> None:
     """`import pkg.sub` where discovery loaded `pkg` but not `pkg.sub` names an unloaded user
     module, so it is refused like any other unloaded user body import."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -960,7 +966,7 @@ def test_body_import_of_unloaded_submodule_through_loaded_package_is_refused(
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     message = result.stdout + result.stderr
     assert result.returncode != 0, message
@@ -972,6 +978,7 @@ def test_preloaded_package_attribute_of_unloaded_package_is_refused(
 ) -> None:
     """A stage that loads `helpers.lib` in its body so a later stage can read `helpers.lib`
     through `import helpers` is refused when discovery loaded neither module."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -990,7 +997,7 @@ def test_preloaded_package_attribute_of_unloaded_package_is_refused(
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     message = result.stdout + result.stderr
     assert result.returncode != 0, message
@@ -1034,6 +1041,7 @@ def test_static_body_import_of_loaded_submodule_is_reused(
     """A static body import of a user submodule discovery loaded is covered by the fingerprint,
     with its package: the stages run without a warning, stay cached on the next `repro`, and
     `count` shows an edit to the module it reads."""
+    home = tmp_path / "home"
     body, first_stage, after_edit = _LOADED_SUBMODULE_BODIES[shape]
     wiring = (
         'count(preload(pipeline.input("lines.txt", t=str)))'
@@ -1051,20 +1059,20 @@ def test_static_body_import_of_loaded_submodule_is_reused(
             ),
         },
     )
-    configured = _run(project, "config", "set", "core.max_workers", "1")
+    configured = helpers.run_pivot(project, home, "config", "set", "core.max_workers", "1")
     assert configured.returncode == 0, configured.stdout + configured.stderr
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
     assert first.returncode == 0, first.stdout + first.stderr
     assert "does not cover" not in first.stdout + first.stderr
     assert _run_cache_entries(project) != []
-    again = _run(project, "repro", "--json")
+    again = helpers.run_pivot(project, home, "repro", "--json")
     assert again.returncode == 0, again.stdout + again.stderr
     for stage_name in {first_stage, "t/count"}:
         assert f'"stage": "{stage_name}", "status": "cached"' in again.stdout, again.stdout
     _edit(project, *_EDIT_LIB_VALUE)
 
-    edited = _run(project, "repro")
+    edited = helpers.run_pivot(project, home, "repro")
 
     assert edited.returncode == 0, edited.stdout + edited.stderr
     assert "does not cover" not in edited.stdout + edited.stderr
@@ -1074,18 +1082,19 @@ def test_static_body_import_of_loaded_submodule_is_reused(
 def test_eval_lambda_is_hashed_by_its_code_object(tmp_path: pathlib.Path) -> None:
     """A lambda built by `eval` has no source; its code object is hashed, so its fingerprint is
     stable across runs and an edit to it reruns the stage."""
+    home = tmp_path / "home"
     pipeline = _pipeline(
         '\nhelper = eval("lambda x: x + 1")\n',
         '@stage\ndef count(text: str) -> dict:\n    return {"v": helper(len(text.splitlines()))}\n',
     )
     project = _project(tmp_path, {"pipeline.py": pipeline})
-    assert _run(project, "repro").returncode == 0
+    assert helpers.run_pivot(project, home, "repro").returncode == 0
 
-    again = _run(project, "repro", "--json")
+    again = helpers.run_pivot(project, home, "repro", "--json")
 
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
     _edit(project, "pipeline.py", "x + 1", "x + 100")
-    edited = _run(project, "repro", "--json")
+    edited = helpers.run_pivot(project, home, "repro", "--json")
     assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
     assert _count(project) == 103
 
@@ -1113,6 +1122,7 @@ def test_following_the_uncovered_import_warning_fix_clears_it(
 ) -> None:
     """The warning's fix (import the module and read it by name in the stage's own code) clears
     it: a module-level import alone does not, and after the fix the stage is cached again."""
+    home = tmp_path / "home"
     imports, as_written, fixed = _WARNING_FIXES[shape]
 
     def stage_body(body: str) -> str:
@@ -1126,7 +1136,7 @@ def test_following_the_uncovered_import_warning_fix_clears_it(
             "pipeline.py": _pipeline(imports, stage_body(as_written)),
         },
     )
-    flagged = _run(project, "repro")
+    flagged = helpers.run_pivot(project, home, "repro")
     message = " ".join((flagged.stdout + flagged.stderr).split())
     assert flagged.returncode == 0, message
     assert message.count("imported user modules its fingerprint does not cover") == 1, message
@@ -1134,15 +1144,15 @@ def test_following_the_uncovered_import_warning_fix_clears_it(
     assert "pipeline.py)" not in message, message
     (project / "pipeline.py").write_text(_pipeline(imports, stage_body(fixed)))
 
-    first = _run(project, "repro")
-    again = _run(project, "repro", "--json")
+    first = helpers.run_pivot(project, home, "repro")
+    again = helpers.run_pivot(project, home, "repro", "--json")
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
     if shape == "import-module-through-dict":
         _edit(project, *_EDIT_LIB_VALUE)
-        assert _run(project, "repro").returncode == 0
+        assert helpers.run_pivot(project, home, "repro").returncode == 0
         assert _count(project) == 103
 
 
@@ -1162,6 +1172,7 @@ _FILELESS_LIBRARY_BODIES = {
 def test_library_that_creates_fileless_modules_caches(tmp_path: pathlib.Path, shape: str) -> None:
     """A library that creates modules without a source file (`pyexpat.errors`) is not user
     code to the stage-import check: the stage caches and `pivot verify` passes, as on main."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -1174,9 +1185,9 @@ def test_library_that_creates_fileless_modules_caches(tmp_path: pathlib.Path, sh
         },
     )
 
-    first = _run(project, "repro")
-    again = _run(project, "repro", "--json")
-    verify = _run(project, "verify")
+    first = helpers.run_pivot(project, home, "repro")
+    again = helpers.run_pivot(project, home, "repro", "--json")
+    verify = helpers.run_pivot(project, home, "verify")
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
@@ -1221,19 +1232,20 @@ def test_body_import_of_loaded_module_that_imports_user_modules_is_reused(
 ) -> None:
     """A body import of a loaded module is walked like a module-level import even when that
     module imports other user modules: no warning, cached, and an edit reruns the stage."""
+    home = tmp_path / "home"
     files, body_import, read = _TRANSITIVE_LAYOUTS[shape]
     project = _project(tmp_path, {**files, "pipeline.py": _transitive_pipeline(body_import, read)})
-    configured = _run(project, "config", "set", "core.max_workers", "1")
+    configured = helpers.run_pivot(project, home, "config", "set", "core.max_workers", "1")
     assert configured.returncode == 0, configured.stdout + configured.stderr
 
-    first = _run(project, "repro")
-    again = _run(project, "repro", "--json")
+    first = helpers.run_pivot(project, home, "repro")
+    again = helpers.run_pivot(project, home, "repro", "--json")
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
     _edit(project, *_EDIT_LIB_VALUE)
-    edited = _run(project, "repro")
+    edited = helpers.run_pivot(project, home, "repro")
     assert edited.returncode == 0, edited.stdout + edited.stderr
     assert _count(project) == 103
 
@@ -1243,6 +1255,7 @@ def test_uncovered_dynamic_import_after_a_covered_import_still_warns(
 ) -> None:
     """The covered module's own import of a sibling is excused; a later runtime import of a
     third, uncovered user module in the same stage still makes the result not reusable."""
+    home = tmp_path / "home"
     files, body_import, read = _TRANSITIVE_LAYOUTS["lib-imports-sibling"]
     project = _project(
         tmp_path,
@@ -1253,9 +1266,9 @@ def test_uncovered_dynamic_import_after_a_covered_import_still_warns(
         },
     )
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
-    _assert_not_reusable(project, first)
+    _assert_not_reusable(project, home, first)
     message = " ".join((first.stdout + first.stderr).split())
     assert "does not cover: late." in message, message
     assert "helpers.util" not in message, message
@@ -1289,6 +1302,7 @@ def test_body_import_of_module_that_registers_a_module_without_the_hooks_is_reus
     module that becomes resident during the stage's covered import of it is excused, as a
     module-level import would leave it. The stage warns nothing, caches, and reruns on an edit to
     `helpers/lib.py`."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -1299,14 +1313,14 @@ def test_body_import_of_module_that_registers_a_module_without_the_hooks_is_reus
         },
     )
 
-    first = _run(project, "repro")
-    again = _run(project, "repro", "--json")
+    first = helpers.run_pivot(project, home, "repro")
+    again = helpers.run_pivot(project, home, "repro", "--json")
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
     _edit(project, *_EDIT_LIB_VALUE)
-    edited = _run(project, "repro")
+    edited = helpers.run_pivot(project, home, "repro")
     assert edited.returncode == 0, edited.stdout + edited.stderr
     assert _count(project) == 103
 
@@ -1324,6 +1338,7 @@ def test_thread_import_after_the_covered_import_returned_still_warns(
     """A second thread the stage itself starts after its covered import returned is not a
     covered thread: its import of an uncovered user module still makes the result not reusable,
     whether or not the import goes through the hooks."""
+    home = tmp_path / "home"
     files, body_import, read = _TRANSITIVE_LAYOUTS["lib-imports-sibling"]
     thread = (
         "    import threading\n\n"
@@ -1340,9 +1355,9 @@ def test_thread_import_after_the_covered_import_returned_still_warns(
         },
     )
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
-    _assert_not_reusable(project, first)
+    _assert_not_reusable(project, home, first)
     message = " ".join((first.stdout + first.stderr).split())
     assert "does not cover: late." in message, message
     assert "helpers.util" not in message, message
@@ -1372,6 +1387,7 @@ def test_body_import_of_module_whose_import_thread_imports_a_user_module_is_reus
     `__import__` or `importlib.import_module` and joins it: that thread is a covered thread, so
     its import belongs to the covered import, as a module-level import would leave it. The stage
     warns nothing, caches, and reruns on an edit to `helpers/lib.py`."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -1382,14 +1398,14 @@ def test_body_import_of_module_whose_import_thread_imports_a_user_module_is_reus
         },
     )
 
-    first = _run(project, "repro")
-    again = _run(project, "repro", "--json")
+    first = helpers.run_pivot(project, home, "repro")
+    again = helpers.run_pivot(project, home, "repro", "--json")
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert "does not cover" not in " ".join((first.stdout + first.stderr).split())
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
     _edit(project, *_EDIT_LIB_VALUE)
-    edited = _run(project, "repro")
+    edited = helpers.run_pivot(project, home, "repro")
     assert edited.returncode == 0, edited.stdout + edited.stderr
     assert _count(project) == 103
 
@@ -1426,6 +1442,7 @@ def test_covered_import_of_a_dependency_an_earlier_stage_loaded_is_reused_warm_o
     imports `helpers.util`, in the same worker. That import belongs to the covered `helpers.lib`
     whether `helpers.util` is already resident (warm worker, first run) or not (a fresh worker
     when only `count` reruns): `count` warns nothing and caches either way."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -1435,14 +1452,14 @@ def test_covered_import_of_a_dependency_an_earlier_stage_loaded_is_reused_warm_o
             "pipeline.py": _WARM_DEPENDENCY_PIPELINE,
         },
     )
-    configured = _run(project, "config", "set", "core.max_workers", "1")
+    configured = helpers.run_pivot(project, home, "config", "set", "core.max_workers", "1")
     assert configured.returncode == 0, configured.stdout + configured.stderr
 
-    warm = _run(project, "repro")
-    warm_again = _run(project, "repro", "--json")
+    warm = helpers.run_pivot(project, home, "repro")
+    warm_again = helpers.run_pivot(project, home, "repro", "--json")
     _edit(project, *_EDIT_LIB_VALUE)
-    cold = _run(project, "repro", "--json")
-    cold_again = _run(project, "repro", "--json")
+    cold = helpers.run_pivot(project, home, "repro", "--json")
+    cold_again = helpers.run_pivot(project, home, "repro", "--json")
 
     for result in (warm, warm_again, cold, cold_again):
         assert result.returncode == 0, result.stdout + result.stderr
@@ -1490,6 +1507,7 @@ def test_body_import_a_raising_meta_path_finder_rejects_runs_and_caches(
     """A `sys.meta_path` finder that raises something other than ImportError for a name it is
     asked about does not refuse the stage: the definition-time lookup treats it as not found,
     and the stage runs and caches, as on main."""
+    home = tmp_path / "home"
     site = tmp_path / "site"
     site.mkdir()
     (site / "sitecustomize.py").write_text(_RAISING_FINDER)
@@ -1498,8 +1516,8 @@ def test_body_import_a_raising_meta_path_finder_rejects_runs_and_caches(
         tmp_path, {"pipeline.py": _pipeline("", "@stage\ndef count(text: str) -> dict:\n" + body)}
     )
 
-    first = _run(project, "repro", pythonpath=site)
-    again = _run(project, "repro", "--json", pythonpath=site)
+    first = helpers.run_pivot(project, home, "repro", extra_env={"PYTHONPATH": str(site)})
+    again = helpers.run_pivot(project, home, "repro", "--json", extra_env={"PYTHONPATH": str(site)})
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
@@ -1508,6 +1526,7 @@ def test_body_import_a_raising_meta_path_finder_rejects_runs_and_caches(
 
 def test_dunder_import_with_cpython_keywords_runs_in_a_stage(tmp_path: pathlib.Path) -> None:
     """The worker's `__import__` takes CPython's keyword names (`globals=`, `locals=`)."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -1521,7 +1540,7 @@ def test_dunder_import_with_cpython_keywords_runs_in_a_stage(tmp_path: pathlib.P
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _count(project) == 6
@@ -1530,6 +1549,7 @@ def test_dunder_import_with_cpython_keywords_runs_in_a_stage(tmp_path: pathlib.P
 def test_unloaded_package_found_by_a_meta_path_finder_is_refused(tmp_path: pathlib.Path) -> None:
     """A package only a `sys.meta_path` finder locates (a setuptools PEP 660 editable install)
     is an unloaded user module like any other: its body import is refused at definition."""
+    home = tmp_path / "home"
     package = tmp_path / "ext" / "src" / "extpkg"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("VALUE = 1\n")
@@ -1560,7 +1580,7 @@ def test_unloaded_package_found_by_a_meta_path_finder_is_refused(tmp_path: pathl
         },
     )
 
-    result = _run(project, "repro", pythonpath=site)
+    result = helpers.run_pivot(project, home, "repro", extra_env={"PYTHONPATH": str(site)})
 
     message = result.stdout + result.stderr
     assert result.returncode != 0, message
@@ -1608,6 +1628,7 @@ def test_user_class_reached_only_through_a_loaded_input(
     """A user class a stage reaches only through a pickled input counts as a module the stage
     imported: the stage warns and reruns, so an edit to the class is seen. Naming the class in
     the parameter's annotation covers it: the stage caches, and an edit still reruns it."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -1618,8 +1639,8 @@ def test_user_class_reached_only_through_a_loaded_input(
     )
     src = project / "src"
 
-    first = _run(project, "repro", pythonpath=src)
-    again = _run(project, "repro", "--json", pythonpath=src)
+    first = helpers.run_pivot(project, home, "repro", extra_env={"PYTHONPATH": str(src)})
+    again = helpers.run_pivot(project, home, "repro", "--json", extra_env={"PYTHONPATH": str(src)})
 
     message = " ".join((first.stdout + first.stderr).split())
     assert first.returncode == 0, message
@@ -1627,7 +1648,7 @@ def test_user_class_reached_only_through_a_loaded_input(
     count_status = "ran" if warns else "cached"
     assert f'"stage": "t/count", "status": "{count_status}"' in again.stdout, again.stdout
     _edit(project, "src/mypkg/models.py", "self.value * 2", "self.value * 200")
-    edited = _run(project, "repro", "--json", pythonpath=src)
+    edited = helpers.run_pivot(project, home, "repro", "--json", extra_env={"PYTHONPATH": str(src)})
     assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
     assert _count(project) == 600
 
@@ -1686,10 +1707,11 @@ def test_dynamic_name_refusals_read_the_wrapped_function_source(
     """As on main, the definition-time refusals for a functools.wraps stage read
     `inspect.getsource` of the stage, which follows `__wrapped__`: a computed `getattr`,
     `import_module` or `globals()` in the wrapper's own body runs and caches."""
+    home = tmp_path / "home"
     project = _project(tmp_path, _WRAPPER_BODIES_MAIN_RUNS[shape])
 
-    first = _run(project, "repro")
-    again = _run(project, "repro", "--json")
+    first = helpers.run_pivot(project, home, "repro")
+    again = helpers.run_pivot(project, home, "repro", "--json")
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
@@ -1702,6 +1724,7 @@ def test_dynamic_name_refusal_reads_a_function_reached_only_through_wrapped(
     """A wrapper that calls `wrapper.__wrapped__` never reaches its function through the walk;
     the refusal still reads the wrapped source, so a computed `getattr` there is refused at
     definition, as on main."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path,
         {
@@ -1721,7 +1744,7 @@ def test_dynamic_name_refusal_reads_a_function_reached_only_through_wrapped(
         },
     )
 
-    result = _run(project, "repro")
+    result = helpers.run_pivot(project, home, "repro")
 
     message = result.stdout + result.stderr
     assert result.returncode != 0, message

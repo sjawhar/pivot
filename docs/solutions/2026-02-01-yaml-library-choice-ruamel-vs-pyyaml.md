@@ -96,7 +96,7 @@ ruamel writes and reads YAML 1.2; PyYAML reads YAML 1.1. Plain scalars that YAML
 | `1:20` | `'1:20'` | `80` |
 | `y` | `'y'` | `'y'` |
 
-(Probe: `ruamel.yaml.YAML(typ="rt").load(text)` against `yaml.safe_load(text)` for `core:\n  state_dir: <value>\n`; the round-trip tests are `packages/pivot/tests/cli/test_pr503_r6_state_dir_yaml_1_1_value.py`.)
+(Probe: `ruamel.yaml.YAML(typ="rt").load(text)` against `yaml.safe_load(text)` for `core:\n  state_dir: <value>\n`; the round-trip tests are `test_a_state_dir_named_like_a_yaml_1_1_scalar_is_a_directory` in `packages/pivot/tests/cli/test_state_dir_value_resolution.py`.)
 
 The two libraries also fail differently: `config/files.py` reports `Invalid YAML in <file>` and `Permission denied reading <file>`, so one reader also means one error message.
 

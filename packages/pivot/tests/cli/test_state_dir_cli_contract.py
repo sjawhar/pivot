@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import pathlib
 import subprocess
 import sys
+from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
-_PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+from tests import helpers
+
+if TYPE_CHECKING:
+    import pathlib
 
 _PIPELINE = """\
 from pivot import Pipeline, stage
@@ -25,10 +28,6 @@ with Pipeline("test") as pipeline:
 """
 
 
-def _run(cwd: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
-
-
 def _ok(proc: subprocess.CompletedProcess[str]) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -38,23 +37,28 @@ def test_configured_state_dir_keeps_config_lock_git_ignored(
     tmp_path: pathlib.Path, layout: str
 ) -> None:
     """The restored config.yaml.lock keeps 0.5.2's contract: it exists and git ignores it."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    _ok(_run(root, "git", "init", "-q"))
+    _ok(helpers.run_cli(root, home, "git", "init", "-q"))
     if layout == "preconfigured":
         (root / ".pivot").mkdir()
         (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: state\n")
-        _ok(_run(root, _PIVOT, "init", "--force"))
+        _ok(helpers.run_pivot(root, home, "init", "--force"))
     else:
-        _ok(_run(root, _PIVOT, "init"))
+        _ok(helpers.run_pivot(root, home, "init"))
         value = "state" if layout == "transition-relative" else str(tmp_path / "external-state")
-        _ok(_run(root, _PIVOT, "config", "set", "core.state_dir", value))
-    _ok(_run(root, _PIVOT, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+        _ok(helpers.run_pivot(root, home, "config", "set", "core.state_dir", value))
+    _ok(
+        helpers.run_pivot(root, home, "config", "set", "remotes.origin", "s3://unused-bucket/cache")
+    )
 
     assert (root / ".pivot" / "config.yaml.lock").is_file()
-    ignored = _run(root, "git", "check-ignore", "-q", ".pivot/config.yaml.lock")
+    ignored = helpers.run_cli(root, home, "git", "check-ignore", "-q", ".pivot/config.yaml.lock")
     assert ignored.returncode == 0, ".pivot/config.yaml.lock is not ignored by git"
-    status = _run(root, "git", "status", "--porcelain", "--untracked-files=all", ".pivot")
+    status = helpers.run_cli(
+        root, home, "git", "status", "--porcelain", "--untracked-files=all", ".pivot"
+    )
     untracked = sorted(line[3:] for line in status.stdout.splitlines())
     assert ".pivot/config.yaml.lock" not in untracked, untracked
 
@@ -64,11 +68,12 @@ def test_config_set_state_dir_refusal_is_a_single_error_line(
     tmp_path: pathlib.Path, target_kind: str
 ) -> None:
     """The installed CLI refuses with one `Error:` line, exit 1, and no traceback."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    assert _run(root, "git", "init", "-q").returncode == 0
-    assert _run(root, _PIVOT, "init").returncode == 0
-    assert _run(root, _PIVOT, "config", "set", "core.max_workers", "2").returncode == 0
+    assert helpers.run_cli(root, home, "git", "init", "-q").returncode == 0
+    assert helpers.run_pivot(root, home, "init").returncode == 0
+    assert helpers.run_pivot(root, home, "config", "set", "core.max_workers", "2").returncode == 0
     config_path = root / ".pivot" / "config.yaml"
     before = config_path.read_bytes()
     if target_kind == "existing-file":
@@ -81,7 +86,7 @@ def test_config_set_state_dir_refusal_is_a_single_error_line(
         (root / "parent").write_text("not a directory\n")
         value = "parent/state"
 
-    result = _run(root, _PIVOT, "config", "set", "core.state_dir", value)
+    result = helpers.run_pivot(root, home, "config", "set", "core.state_dir", value)
 
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
@@ -93,11 +98,12 @@ def test_config_set_state_dir_refusal_is_a_single_error_line(
 
 def test_config_set_refuses_state_dir_under_dangling_symlink(tmp_path: pathlib.Path) -> None:
     """A parent that is a dangling symlink is a parent that is not a directory: refuse before writing."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    assert _run(root, "git", "init", "-q").returncode == 0
-    assert _run(root, _PIVOT, "init").returncode == 0
-    assert _run(root, _PIVOT, "config", "set", "core.max_workers", "2").returncode == 0
+    assert helpers.run_cli(root, home, "git", "init", "-q").returncode == 0
+    assert helpers.run_pivot(root, home, "init").returncode == 0
+    assert helpers.run_pivot(root, home, "config", "set", "core.max_workers", "2").returncode == 0
     (root / "data" / "raw").mkdir(parents=True)
     (root / "data" / "raw" / "input.txt").write_text("input\n")
     (root / "pipeline.py").write_text(_PIPELINE)
@@ -105,8 +111,8 @@ def test_config_set_refuses_state_dir_under_dangling_symlink(tmp_path: pathlib.P
     before = config_path.read_bytes()
     (root / "link").symlink_to(root / "missing-parent")
 
-    result = _run(root, _PIVOT, "config", "set", "core.state_dir", "link/state")
-    status = _run(root, _PIVOT, "status")
+    result = helpers.run_pivot(root, home, "config", "set", "core.state_dir", "link/state")
+    status = helpers.run_pivot(root, home, "status")
 
     output = result.stdout + result.stderr
     assert config_path.read_bytes() == before, config_path.read_text()
@@ -119,19 +125,20 @@ def test_list_and_status_all_keep_project_pipelines_under_ancestor_state_dir(
     tmp_path: pathlib.Path, spelling: str
 ) -> None:
     """Like 0.5.2, the pre-round-6 tree, and plain `pivot list`, --all finds the root pipeline."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    assert _run(root, "git", "init", "-q").returncode == 0
-    assert _run(root, _PIVOT, "init").returncode == 0
+    assert helpers.run_cli(root, home, "git", "init", "-q").returncode == 0
+    assert helpers.run_pivot(root, home, "init").returncode == 0
     (root / "data" / "raw").mkdir(parents=True)
     (root / "data" / "raw" / "input.txt").write_text("input\n")
     (root / "pipeline.py").write_text(_PIPELINE)
     value = ".." if spelling == "relative" else str(tmp_path)
     (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {value}\n")
 
-    plain = _run(root, _PIVOT, "list")
-    listed = _run(root, _PIVOT, "list", "--all")
-    status = _run(root, _PIVOT, "status", "--all")
+    plain = helpers.run_pivot(root, home, "list")
+    listed = helpers.run_pivot(root, home, "list", "--all")
+    status = helpers.run_pivot(root, home, "status", "--all")
 
     assert plain.returncode == 0 and "test/process" in plain.stdout, plain.stdout + plain.stderr
     assert listed.returncode == 0, listed.stdout + listed.stderr
@@ -142,24 +149,26 @@ def test_list_and_status_all_keep_project_pipelines_under_ancestor_state_dir(
 
 def test_default_init_force_warns_like_pivot_052(tmp_path: pathlib.Path) -> None:
     """Without core.state_dir, overwriting a custom ignore file prints 0.5.2's exact warning."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    assert _run(root, "git", "init", "-q").returncode == 0
-    assert _run(root, _PIVOT, "init").returncode == 0
+    assert helpers.run_cli(root, home, "git", "init", "-q").returncode == 0
+    assert helpers.run_pivot(root, home, "init").returncode == 0
     (root / ".pivot" / ".gitignore").write_text("custom\n")
 
-    result = _run(root, _PIVOT, "init", "--force")
+    result = helpers.run_pivot(root, home, "init", "--force")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stderr == "Warning: Overwriting existing .pivot/.gitignore\n", result.stderr
 
 
 def _init_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, bytes]:
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    _ok(_run(root, "git", "init", "-q"))
-    _ok(_run(root, _PIVOT, "init"))
-    _ok(_run(root, _PIVOT, "config", "set", "core.max_workers", "2"))
+    _ok(helpers.run_cli(root, home, "git", "init", "-q"))
+    _ok(helpers.run_pivot(root, home, "init"))
+    _ok(helpers.run_pivot(root, home, "config", "set", "core.max_workers", "2"))
     config_path = root / ".pivot" / "config.yaml"
     return root, config_path, config_path.read_bytes()
 
@@ -169,13 +178,14 @@ def test_config_set_normalizes_parent_segments_before_the_preflight(
     tmp_path: pathlib.Path, target_kind: str
 ) -> None:
     """`missing/../state` names `state`, so an unusable `state` is refused before writing."""
+    home = tmp_path / "home"
     root, config_path, before = _init_project(tmp_path)
     if target_kind == "regular-file":
         (root / "state").write_text("not a directory\n")
     else:
         (root / "state").symlink_to(root / "missing-target")
 
-    result = _run(root, _PIVOT, "config", "set", "core.state_dir", "missing/../state")
+    result = helpers.run_pivot(root, home, "config", "set", "core.state_dir", "missing/../state")
 
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
@@ -185,14 +195,15 @@ def test_config_set_normalizes_parent_segments_before_the_preflight(
 
 def test_config_set_repairs_a_hand_edited_invalid_state_dir(tmp_path: pathlib.Path) -> None:
     """Like 0.5.2, `config set` overwrites an unusable value written by hand."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    _ok(_run(root, "git", "init", "-q"))
-    _ok(_run(root, _PIVOT, "init"))
+    _ok(helpers.run_cli(root, home, "git", "init", "-q"))
+    _ok(helpers.run_pivot(root, home, "init"))
     config_path = root / ".pivot" / "config.yaml"
     config_path.write_text("core:\n  state_dir: ''\n")
 
-    result = _run(root, _PIVOT, "config", "set", "core.state_dir", "altstate")
+    result = helpers.run_pivot(root, home, "config", "set", "core.state_dir", "altstate")
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
@@ -203,14 +214,15 @@ def test_config_set_repairs_a_hand_edited_invalid_state_dir(tmp_path: pathlib.Pa
 
 def test_config_unset_state_dir_reports_the_transition_like_set(tmp_path: pathlib.Path) -> None:
     """Unsetting core.state_dir transitions back to `.pivot` with the same notice as set."""
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    _ok(_run(root, "git", "init", "-q"))
-    _ok(_run(root, _PIVOT, "init"))
-    _ok(_run(root, _PIVOT, "config", "set", "core.state_dir", "altstate"))
+    _ok(helpers.run_cli(root, home, "git", "init", "-q"))
+    _ok(helpers.run_pivot(root, home, "init"))
+    _ok(helpers.run_pivot(root, home, "config", "set", "core.state_dir", "altstate"))
     (root / "altstate" / "state.lmdb").mkdir()
 
-    result = _run(root, _PIVOT, "config", "unset", "core.state_dir")
+    result = helpers.run_pivot(root, home, "config", "unset", "core.state_dir")
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
@@ -221,6 +233,7 @@ def test_config_unset_state_dir_reports_the_transition_like_set(tmp_path: pathli
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 def test_config_set_refuses_a_state_dir_under_a_read_only_parent(tmp_path: pathlib.Path) -> None:
     """A target whose nearest existing ancestor is not writable is refused before writing."""
+    home = tmp_path / "home"
     import os
 
     if os.geteuid() == 0:
@@ -230,7 +243,7 @@ def test_config_set_refuses_a_state_dir_under_a_read_only_parent(tmp_path: pathl
     read_only.mkdir()
     read_only.chmod(0o555)
     try:
-        result = _run(root, _PIVOT, "config", "set", "core.state_dir", "read-only/state")
+        result = helpers.run_pivot(root, home, "config", "set", "core.state_dir", "read-only/state")
     finally:
         read_only.chmod(0o755)
 
@@ -238,15 +251,6 @@ def test_config_set_refuses_a_state_dir_under_a_read_only_parent(tmp_path: pathl
     assert result.returncode == 1, output
     assert config_path.read_bytes() == before
     assert output.strip().startswith("Error: core.state_dir"), output
-
-
-def _run_with_home(
-    cwd: pathlib.Path, home: pathlib.Path, *args: str
-) -> subprocess.CompletedProcess[str]:
-    import os
-
-    env = {**os.environ, "HOME": str(home)}
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False, env=env)
 
 
 def _write_global_state_dir(home: pathlib.Path, value: str) -> pathlib.Path:
@@ -258,8 +262,8 @@ def _write_global_state_dir(home: pathlib.Path, value: str) -> pathlib.Path:
 
 def _project(home: pathlib.Path, root: pathlib.Path, input_text: str) -> pathlib.Path:
     root.mkdir()
-    _ok(_run_with_home(root, home, "git", "init", "-q"))
-    _ok(_run_with_home(root, home, _PIVOT, "init"))
+    _ok(helpers.run_cli(root, home, "git", "init", "-q"))
+    _ok(helpers.run_pivot(root, home, "init"))
     (root / "data" / "raw").mkdir(parents=True)
     (root / "data" / "raw" / "input.txt").write_text(input_text)
     (root / "pipeline.py").write_text(_PIPELINE)
@@ -273,7 +277,7 @@ def _ignored_warning(global_config: pathlib.Path, root: pathlib.Path) -> str:
 
 
 def _stage_states(home: pathlib.Path, root: pathlib.Path) -> str:
-    status = _run_with_home(root, home, _PIVOT, "status")
+    status = helpers.run_pivot(root, home, "status")
     assert status.returncode == 0, status.stdout + status.stderr
     return status.stdout
 
@@ -288,7 +292,7 @@ def test_projects_sharing_a_global_state_dir_keep_correct_skip_decisions(
     b = _project(home, tmp_path / "b", "input-b\n")
 
     for root in (a, b):
-        repro = _run_with_home(root, home, _PIVOT, "repro")
+        repro = helpers.run_pivot(root, home, "repro")
         assert repro.returncode == 0, repro.stdout + repro.stderr
         assert _ignored_warning(global_config, root) in repro.stderr, repro.stderr
 
@@ -296,7 +300,7 @@ def test_projects_sharing_a_global_state_dir_keep_correct_skip_decisions(
     assert "1 cached, 0 stale" in _stage_states(home, b)
 
     (b / "data" / "raw" / "input.txt").write_text("input-b-changed\n")
-    _ok(_run_with_home(b, home, _PIVOT, "repro"))
+    _ok(helpers.run_pivot(b, home, "repro"))
 
     assert "1 cached, 0 stale" in _stage_states(home, a)
     assert "1 cached, 0 stale" in _stage_states(home, b)
@@ -311,8 +315,8 @@ def test_config_get_and_list_show_a_global_state_dir_as_ignored(tmp_path: pathli
     global_config = _write_global_state_dir(home, "globalstate")
     root = _project(home, tmp_path / "project", "input\n")
 
-    got = _run_with_home(root, home, _PIVOT, "config", "get", "core.state_dir")
-    listed = _run_with_home(root, home, _PIVOT, "config", "list")
+    got = helpers.run_pivot(root, home, "config", "get", "core.state_dir")
+    listed = helpers.run_pivot(root, home, "config", "list")
 
     assert got.returncode == 0, got.stdout + got.stderr
     assert got.stdout.strip() == "core.state_dir = globalstate (global, ignored)", got.stdout
@@ -327,9 +331,7 @@ def test_config_set_global_state_dir_is_refused(tmp_path: pathlib.Path) -> None:
     root = _project(home, tmp_path / "project", "input\n")
     global_config = home / ".config" / "pivot" / "config.yaml"
 
-    result = _run_with_home(
-        root, home, _PIVOT, "config", "set", "--global", "core.state_dir", "shared"
-    )
+    result = helpers.run_pivot(root, home, "config", "set", "--global", "core.state_dir", "shared")
 
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
@@ -342,13 +344,14 @@ def test_config_list_marks_a_hand_edited_empty_state_dir(tmp_path: pathlib.Path)
 
     A non-string value (e.g. a list) already fails 0.5.2's schema validation, so it is not here.
     """
+    home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
-    _ok(_run(root, "git", "init", "-q"))
-    _ok(_run(root, _PIVOT, "init"))
+    _ok(helpers.run_cli(root, home, "git", "init", "-q"))
+    _ok(helpers.run_pivot(root, home, "init"))
     (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: ''\n")
 
-    listed = _run(root, _PIVOT, "config", "list")
+    listed = helpers.run_pivot(root, home, "config", "list")
 
     output = listed.stdout + listed.stderr
     assert listed.returncode == 0, output
@@ -364,9 +367,9 @@ def test_warning_names_a_shadowed_global_state_dir(tmp_path: pathlib.Path) -> No
     home = tmp_path / "home"
     global_config = _write_global_state_dir(home, "globalstate")
     root = _project(home, tmp_path / "project", "input\n")
-    _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "localstate"))
+    _ok(helpers.run_pivot(root, home, "config", "set", "core.state_dir", "localstate"))
 
-    status = _run_with_home(root, home, _PIVOT, "status")
+    status = helpers.run_pivot(root, home, "status")
 
     expected = (
         f"core.state_dir in {global_config} is shadowed by "
@@ -406,7 +409,7 @@ def test_list_and_dag_warn_on_an_invalid_local_config(
     """Like 0.5.2, listing never needs the config; the unknown state directory is warned once."""
     root, invalid_yaml = _project_with_invalid_local_config(tmp_path)
 
-    result = _run_with_home(root, tmp_path / "home", _PIVOT, *args)
+    result = helpers.run_pivot(root, tmp_path / "home", *args)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "test/process" in result.stdout, result.stdout
@@ -421,7 +424,7 @@ def test_list_json_stays_parseable_with_an_invalid_local_config(tmp_path: pathli
 
     root, invalid_yaml = _project_with_invalid_local_config(tmp_path)
 
-    result = _run_with_home(root, tmp_path / "home", _PIVOT, "list", "--json")
+    result = helpers.run_pivot(root, tmp_path / "home", "list", "--json")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert [stage["name"] for stage in json.loads(result.stdout)["stages"]] == ["test/process"]
@@ -435,7 +438,7 @@ def test_state_commands_fail_on_an_invalid_local_config_as_on_052(
     """Every command that uses state still exits 1 with 0.5.2's one `Error:` line."""
     root, invalid_yaml = _project_with_invalid_local_config(tmp_path)
 
-    result = _run_with_home(root, tmp_path / "home", _PIVOT, command)
+    result = helpers.run_pivot(root, tmp_path / "home", command)
 
     assert result.returncode == 1, result.stdout + result.stderr
     errors = [line for line in result.stderr.splitlines() if line.startswith("Error")]
@@ -453,11 +456,11 @@ def test_push_dry_run_ignores_a_cache_object_that_is_not_a_regular_file(
     home.mkdir()
     root = _project(home, tmp_path / "project", "input\n")
     if layout == "configured":
-        _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "altstate"))
-    _ok(_run_with_home(root, home, _PIVOT, "repro"))
+        _ok(helpers.run_pivot(root, home, "config", "set", "core.state_dir", "altstate"))
+    _ok(helpers.run_pivot(root, home, "repro"))
     if layout == "legacy":
-        _ok(_run_with_home(root, home, _PIVOT, "config", "set", "core.state_dir", "altstate"))
-    _ok(_run_with_home(root, home, _PIVOT, "config", "set", "remotes.origin", "s3://cache-objects"))
+        _ok(helpers.run_pivot(root, home, "config", "set", "core.state_dir", "altstate"))
+    _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", "s3://cache-objects"))
 
     state = root / "altstate" if layout == "configured" else root / ".pivot"
     lock = yaml.safe_load((state / "stages" / "test" / "process.lock").read_text())
@@ -472,7 +475,7 @@ def test_push_dry_run_ignores_a_cache_object_that_is_not_a_regular_file(
     else:
         cache_object.mkdir()
 
-    result = _run_with_home(root, home, _PIVOT, "push", "--dry-run", "--remote", "origin")
+    result = helpers.run_pivot(root, home, "push", "--dry-run", "--remote", "origin")
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
@@ -520,18 +523,18 @@ def test_metrics_diff_treats_an_unusable_cache_prefix_as_missing(
     for args in (
         ("git", "config", "user.email", "t@example.com"),
         ("git", "config", "user.name", "t"),
-        (_PIVOT, "repro"),
+        (helpers.PIVOT, "repro"),
         ("git", "add", "-A"),
         ("git", "commit", "-qm", "base"),
     ):
-        _ok(_run_with_home(root, home, *args))
+        _ok(helpers.run_cli(root, home, *args))
     lock = yaml.safe_load((root / ".pivot" / "stages" / "test" / "process.lock").read_text())
     _break_cache_prefix(
         root / ".pivot" / "cache" / "files" / lock["outs"][0]["hash"][:2], prefix_kind
     )
     (root / "metrics" / "test" / "process.yaml").write_text("score: 2\n")
 
-    result = _run_with_home(root, home, _PIVOT, "metrics", "diff", "metrics/test/process.yaml")
+    result = helpers.run_pivot(root, home, "metrics", "diff", "metrics/test/process.yaml")
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
@@ -546,14 +549,14 @@ def test_checkout_reports_a_missing_object_when_the_cache_prefix_is_unusable(
     """0.5.2 and main say the object is missing and name `pivot pull`, not a raw errno."""
     home = tmp_path / "home"
     root = _project(home, tmp_path / "project", "input\n")
-    _ok(_run_with_home(root, home, _PIVOT, "repro"))
+    _ok(helpers.run_pivot(root, home, "repro"))
     lock = yaml.safe_load((root / ".pivot" / "stages" / "test" / "process.lock").read_text())
     _break_cache_prefix(
         root / ".pivot" / "cache" / "files" / lock["outs"][0]["hash"][:2], prefix_kind
     )
     (root / "data" / "test" / "process.txt").unlink()
 
-    result = _run_with_home(root, home, _PIVOT, "checkout", "data/test/process.txt")
+    result = helpers.run_pivot(root, home, "checkout", "data/test/process.txt")
 
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
@@ -565,30 +568,28 @@ def test_checkout_reports_a_missing_object_when_the_cache_prefix_is_unusable(
 
 def test_metrics_diff_treats_a_cache_dir_that_is_a_file_as_missing(tmp_path: pathlib.Path) -> None:
     """Main exits 0 when PIVOT_CACHE_DIR names a regular file; the committed metric is read from git."""
-    import os
-
     home = tmp_path / "home"
     root = _project(home, tmp_path / "project", "1\n")
     (root / "pipeline.py").write_text(_METRIC_PIPELINE)
     for args in (
         ("git", "config", "user.email", "t@example.com"),
         ("git", "config", "user.name", "t"),
-        (_PIVOT, "repro"),
+        (helpers.PIVOT, "repro"),
         ("git", "add", "-A"),
         ("git", "commit", "-qm", "base"),
     ):
-        _ok(_run_with_home(root, home, *args))
+        _ok(helpers.run_cli(root, home, *args))
     cache_file = tmp_path / "cache-is-a-file"
     cache_file.write_text("not a directory\n")
     (root / "metrics" / "test" / "process.yaml").write_text("score: 2\n")
 
-    result = subprocess.run(
-        [_PIVOT, "metrics", "diff", "metrics/test/process.yaml"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, "HOME": str(home), "PIVOT_CACHE_DIR": str(cache_file)},
+    result = helpers.run_pivot(
+        root,
+        home,
+        "metrics",
+        "diff",
+        "metrics/test/process.yaml",
+        extra_env={"PIVOT_CACHE_DIR": str(cache_file)},
     )
 
     output = result.stdout + result.stderr
@@ -601,8 +602,6 @@ def test_fetch_and_pull_download_under_an_empty_state_dir(
     tmp_path: pathlib.Path, moto_services: dict[str, str], command: str
 ) -> None:
     """0.5.2 exits 0 with `1 transferred` under a hand-edited `core.state_dir: ''`; so does the head."""
-    import os
-
     import boto3
     import xxhash
 
@@ -625,15 +624,14 @@ def test_fetch_and_pull_download_under_an_empty_state_dir(
     home.mkdir()
     root = tmp_path / "project"
     root.mkdir()
-    _ok(_run_with_home(root, home, "git", "init", "-q"))
-    _ok(_run_with_home(root, home, _PIVOT, "init"))
+    _ok(helpers.run_cli(root, home, "git", "init", "-q"))
+    _ok(helpers.run_pivot(root, home, "init"))
     (root / ".pivot" / "config.yaml").write_text(
         f"core:\n  state_dir: ''\nremotes:\n  origin: s3://{bucket}/cache\ndefault_remote: origin\n"
     )
     (root / "pipeline.py").write_text("from pivot import Pipeline\n\npipeline = Pipeline('test')\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("PIVOT", "AWS"))}
+    env = {k: v for k, v in helpers.cli_env(home).items() if not k.startswith("AWS")}
     env.update(
-        HOME=str(home),
         AWS_ENDPOINT_URL=moto_services["s3"],
         AWS_ACCESS_KEY_ID="x",
         AWS_SECRET_ACCESS_KEY="x",
@@ -641,7 +639,7 @@ def test_fetch_and_pull_download_under_an_empty_state_dir(
     )
 
     result = subprocess.run(
-        [_PIVOT, command], cwd=root, capture_output=True, text=True, check=False, env=env
+        [helpers.PIVOT, command], cwd=root, capture_output=True, text=True, check=False, env=env
     )
 
     output = result.stdout + result.stderr
