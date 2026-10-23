@@ -370,7 +370,9 @@ async def test_watched_startup_fingerprints_each_stage_once(
     calls = list[str]()
     compute = registry._compute_fingerprint
 
-    def _counting_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+    def _counting_compute(
+        stage_name: str, info: registry.RegistryStageInfo
+    ) -> tuple[dict[str, str], bool]:
         calls.append(stage_name)
         return compute(stage_name, info)
 
@@ -413,7 +415,9 @@ async def test_watched_startup_serves_rpc_while_fingerprinting(
     calls = list[str]()
     finished = list[str]()
 
-    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+    def _slow_compute(
+        stage_name: str, info: registry.RegistryStageInfo
+    ) -> tuple[dict[str, str], bool]:
         calls.append(stage_name)
         time.sleep(1.0)
         result = compute(stage_name, info)
@@ -501,7 +505,9 @@ async def test_reload_fingerprints_off_the_event_loop(
             reload_started = threading.Event()
             finished = list[str]()
 
-            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+            def _slow_compute(
+                stage_name: str, info: registry.RegistryStageInfo
+            ) -> tuple[dict[str, str], bool]:
                 reload_started.set()
                 time.sleep(1.0)
                 finished.append(stage_name)
@@ -785,7 +791,9 @@ async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
             compute = registry._compute_fingerprint
             reload_started = threading.Event()
 
-            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+            def _slow_compute(
+                stage_name: str, info: registry.RegistryStageInfo
+            ) -> tuple[dict[str, str], bool]:
                 reload_started.set()
                 time.sleep(1.0)
                 return compute(stage_name, info)
@@ -970,7 +978,9 @@ async def test_run_requested_during_startup_snapshot_is_refused_at_once(
     compute = registry._compute_fingerprint
     finished = list[str]()
 
-    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+    def _slow_compute(
+        stage_name: str, info: registry.RegistryStageInfo
+    ) -> tuple[dict[str, str], bool]:
         time.sleep(1.0)
         finished.append(stage_name)
         return compute(stage_name, info)

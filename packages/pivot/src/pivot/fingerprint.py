@@ -5,7 +5,10 @@ import contextvars
 import dataclasses
 import enum
 import functools
+import importlib
+import importlib.machinery
 import importlib.metadata
+import importlib.util
 import inspect
 import json
 import linecache
@@ -73,7 +76,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 29 decides a namespace package by its site-packages, dist-packages and pivot-package
 # directories, not by the interpreter's prefix, so a manifest that left out the user's part of a
 # namespace shared with a checkout under the prefix is not reused.
-_CACHE_SCHEMA_VERSION = 29
+# Version 30 follows every callable user class member, dataclass defaults, and body imports of
+# user modules discovery loaded, and records the user modules each manifest covers.
+_CACHE_SCHEMA_VERSION = 30
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -212,6 +217,11 @@ _capture_errors: contextvars.ContextVar[list[str] | None] = contextvars.ContextV
 # persistent manifest cache.
 _unsafe_capture_warning: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_unsafe_capture_warning", default=False
+)
+
+# The stage `stage_fingerprint_scope` is fingerprinting, told when a refusal is downgraded.
+_stage_scope: contextvars.ContextVar["StageFingerprintScope | None"] = contextvars.ContextVar(
+    "_stage_scope", default=None
 )
 
 # Live values read while computing a cacheable manifest: (path, token) per read. A path is the
@@ -667,8 +677,8 @@ def _immutable_value_text(value: Any) -> str | None:
 
 def _value_kind(value: Any) -> _ValueKind:
     """Classify a value a walked function reads; the walk and a cache hit share this."""
-    # functools.partial fails is_user_code() (module is functools/stdlib).
-    if isinstance(value, functools.partial):
+    # functools.partial and partialmethod fail is_user_code() (module is functools/stdlib).
+    if isinstance(value, (functools.partial, functools.partialmethod)):
         return _ValueKind.PARTIAL
     if _is_callable_instance(value) or _is_user_class_instance(value) or _carries_instance(value):
         return _ValueKind.REFUSED
@@ -720,10 +730,11 @@ def _default_token(value: Any) -> str:
 # A walk step names one move from a visited object to a value it reads: `g:NAME` a global
 # (also recorded when absent), `c:NAME` a closure cell, `d:PARAM` a default, `a:ATTR` a module
 # attribute, `ca:ATTR` a class attribute (`Config.SCALE`), `n:NAME` and `np:DOTTED` names in a
-# class's module, `u` the function behind a
-# C-level wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and
-# `s:INDEX` container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a
-# model's field annotations. `hints` and `schema` read the visited object itself.
+# class's module, `m:NAME` a callable user class member, `fd:NAME` a dataclass field default,
+# `bi:MODULE` a loaded module a function body imports, `u` the function behind a C-level
+# wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and `s:INDEX`
+# container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a model's field
+# annotations. `hints` and `schema` read the visited object itself.
 _UNREAD = object()
 
 
@@ -745,6 +756,13 @@ def _read_step(owner: Any, step: str) -> Any:
             case "np":
                 namespace = vars(sys.modules[owner.__module__])
                 return _resolve_dotted_path(tuple(arg.split(".")), namespace)
+            case "m":
+                return dict(_user_methods(owner)).get(arg, _UNREAD)
+            case "fd":
+                return _dataclass_field_value(owner, arg)
+            case "bi":
+                module = _body_import_module(arg)
+                return _UNREAD if module is None else module
             case "u":
                 return inspect.unwrap(owner)
             case "pf":
@@ -760,12 +778,20 @@ def _read_step(owner: Any, step: str) -> Any:
             case "s":
                 return sorted(owner, key=_serialize_value_for_hash)[int(arg)]
             case "hc":
-                return _hint_classes(owner)[int(arg)][0]
+                return _hint_classes(owner)[int(arg)]
             case "fc":
                 return _model_field_classes(owner)[int(arg)]
             case _:
                 return _UNREAD
-    except (AttributeError, KeyError, IndexError, ValueError, TypeError, StopIteration):
+    except (
+        AttributeError,
+        KeyError,
+        IndexError,
+        ValueError,
+        TypeError,
+        StopIteration,
+        ImportError,
+    ):
         return _UNREAD
 
 
@@ -776,12 +802,14 @@ def _read_token(owner: Any, step: str) -> str:
     the value itself.
     """
     if step == "hints":
-        return "|".join(f"{_value_token(cls)}:{whole}" for cls, whole in _hint_classes(owner))
+        return "|".join(_value_token(cls) for cls in _hint_classes(owner))
     if step == "schema":
         if not hasattr(owner, "model_json_schema"):
             return "absent"
         field_classes = "|".join(_value_token(cls) for cls in _model_field_classes(owner))
         return f"{_schema_hash(owner)}|{field_classes}"
+    if step.startswith("fd:"):
+        return _dataclass_field_token(owner, step.partition(":")[2])
     value = _read_step(owner, step)
     if value is _UNREAD:
         return "absent"
@@ -1012,18 +1040,28 @@ def _collected_capture_errors() -> Iterator[None]:
         raise exceptions.StageDefinitionError("\n\n".join(dict.fromkeys(errors)))
 
 
+class StageFingerprintScope(TypedDict):
+    """What `stage_fingerprint_scope` learned about one stage's fingerprint."""
+
+    unsafe: bool  # a refusal in it was downgraded to a warning by unsafe fingerprinting
+
+
 @contextlib.contextmanager
-def stage_fingerprint_scope(stage_name: str) -> Iterator[None]:
-    """Name the stage being fingerprinted and raise all of its unsafe-capture errors together.
+def stage_fingerprint_scope(stage_name: str) -> Iterator[StageFingerprintScope]:
+    """Name the stage being fingerprinted, raise all of its unsafe-capture errors together, and
+    report whether unsafe fingerprinting downgraded any of them to a warning (`unsafe`).
 
     Wraps a stage's manifest and its input and output loader fingerprints, so a refusal found
     in loader config is reported with the stage's own refusals.
     """
+    scope = StageFingerprintScope(unsafe=False)
     token = _current_stage_name.set(stage_name)
+    scope_token = _stage_scope.set(scope)
     try:
         with _collected_capture_errors():
-            yield
+            yield scope
     finally:
+        _stage_scope.reset(scope_token)
         _current_stage_name.reset(token)
 
 
@@ -1107,13 +1145,33 @@ def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
     return nested_globals
 
 
-def _check_dynamic_name_access(func: Callable[..., Any]) -> None:
+def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
+    """Parse `func`'s own source, without following a functools.wraps chain."""
+    code = getattr(func, "__code__", None)
+    target: object = (
+        code if hasattr(func, "__wrapped__") and isinstance(code, types.CodeType) else func
+    )
     try:
-        source = inspect.getsource(func)
-        tree = ast.parse(textwrap.dedent(source))
+        return ast.parse(textwrap.dedent(inspect.getsource(target)))
     except (OSError, TypeError, SyntaxError):
-        return
+        return None
 
+
+def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
+    """Parse the source `inspect.getsource(func)` returns: for a functools.wraps wrapper, the
+    function at the end of its `__wrapped__` chain."""
+    try:
+        return ast.parse(textwrap.dedent(inspect.getsource(func)))
+    except (OSError, TypeError, SyntaxError):
+        return None
+
+
+def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
+    """Refuse `getattr` with a computed name, `globals()`/`locals()`, and `x.import_module(...)`.
+
+    Other dynamic imports are left to the worker's stage-import check, which makes a stage that
+    loads uncovered user code at run time not reusable.
+    """
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1151,8 +1209,15 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     func_name = getattr(func, "__name__", "<lambda>")
     manifest[f"self:{func_name}"] = hash_function_ast(func)
 
+    tree: ast.Module | None = None
     if is_user_code(func):
-        _check_dynamic_name_access(func)
+        tree = _source_tree(func)
+        # The refusals read the source `inspect.getsource` returns, which follows a
+        # functools.wraps chain to the wrapped function, as on main; the body-import walk below
+        # reads the wrapper's own source.
+        check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
+        if check_tree is not None:
+            _check_dynamic_name_access(func, check_tree)
 
     _t_closure = metrics.start()
     try:
@@ -1164,6 +1229,7 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         metrics.end("fingerprint.getclosurevars", _t_closure)
         if isinstance(func, type):
             _process_class_body_dependencies(func, manifest, visited)
+            _process_user_methods(func, manifest, visited)
             return manifest
         # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
         # getclosurevars rejects it. The function it wraps reads the module values, so walk
@@ -1205,8 +1271,400 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
 
     _process_default_values(func, manifest, visited)
     _process_type_hint_dependencies(func, manifest, visited)
+    if tree is not None:
+        _process_body_imports(func, tree, manifest, visited)
 
     return manifest
+
+
+def _process_user_methods(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
+    """Walk each callable user class member as a stage helper or refuse opaque state."""
+    class_ref = _definition_ref(cls)
+    stage_name = _current_stage_name.get() or cls.__qualname__
+    for label, member in _user_methods(cls):
+        step = f"m:{label}"
+        _record_read(cls, step)
+        with _walking(step):
+            binding_ref = f"{class_ref}.{label}"
+            _process_captured_value(
+                binding_ref,
+                binding_ref,
+                member,
+                cls,
+                manifest,
+                visited,
+                stage_name,
+                chain=None,
+            )
+            if isinstance(member, type) and hasattr(member, "model_fields"):
+                _hash_pydantic_schema(
+                    cast("type[_PydanticModelProtocol]", member), manifest, visited
+                )
+    _process_dataclass_defaults(cls, manifest, visited)
+
+
+def _dataclass_field_value(cls: type, name: str) -> Any:
+    """Return one dataclass field's default or factory, or `_UNREAD` when absent."""
+    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
+    field = fields.get(name)
+    if field is None:
+        return _UNREAD
+    if field.default is not dataclasses.MISSING:
+        return field.default
+    if field.default_factory is not dataclasses.MISSING:
+        return field.default_factory
+    return _UNREAD
+
+
+def _dataclass_field_token(cls: type, name: str) -> str:
+    """Return a stable token for a dataclass field's live default or factory."""
+    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
+    field = fields.get(name)
+    if field is None:
+        return "absent"
+    if field.default_factory is not dataclasses.MISSING:
+        return _value_token(field.default_factory)
+    if field.default is dataclasses.MISSING:
+        return "absent"
+    serialized = _serialize_value_for_hash(field.default)
+    return f"field:{xxhash.xxh64(serialized.encode()).hexdigest()}"
+
+
+def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
+    """Track each own dataclass field's live default or factory."""
+    if not dataclasses.is_dataclass(cls):
+        return
+    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
+    annotations = cast("Mapping[str, Any]", vars(cls).get("__annotations__", {}))
+    class_ref = _definition_ref(cls)
+    stage_name = _current_stage_name.get() or cls.__qualname__
+    for name in annotations:
+        field = fields.get(name)
+        if field is None:
+            continue
+        step = f"fd:{name}"
+        _record_read(cls, step)
+        binding_ref = f"{class_ref}.{name}"
+        if field.default is not dataclasses.MISSING:
+            serialized = _serialize_value_for_hash(field.default)
+            manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
+            continue
+        if field.default_factory is dataclasses.MISSING:
+            continue
+        with _walking(step):
+            _process_captured_value(
+                binding_ref,
+                binding_ref,
+                field.default_factory,
+                cls,
+                manifest,
+                visited,
+                stage_name,
+                chain=None,
+            )
+
+
+def _class_member_parts(name: str, raw: Any) -> list[tuple[str, Any]]:
+    """Return the concrete callable values one class-dict member can execute."""
+    if isinstance(raw, property):
+        return [(name, raw.fget), (f"{name}.fset", raw.fset), (f"{name}.fdel", raw.fdel)]
+    if isinstance(raw, functools.cached_property):
+        return [(name, cast("functools.cached_property[Any]", raw).func)]
+    if isinstance(raw, (classmethod, staticmethod)):
+        return [(name, cast("Any", raw.__func__))]
+    if isinstance(raw, functools.partialmethod):
+        return [
+            (
+                name,
+                functools.partial(
+                    cast("Callable[..., Any]", raw.func), *raw.args, **(raw.keywords or {})
+                ),
+            )
+        ]
+    if isinstance(raw, functools.singledispatchmethod):
+        dispatcher = cast("Any", raw.dispatcher)
+        members = [(name, raw.func)]
+        for registered_type, function in cast("Mapping[type, Any]", dispatcher.registry).items():
+            if registered_type is object:
+                continue
+            label = f"{name}.register:{registered_type.__module__}.{registered_type.__qualname__}"
+            members.append((label, function))
+        return members
+    return [(name, raw)]
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_user_source_file(filename: str) -> bool:
+    """Whether a code object's filename is a real source file outside library directories."""
+    try:
+        path = pathlib.Path(filename).resolve()
+    except OSError:
+        return False
+    return path.is_file() and not is_library_path(path)
+
+
+def _written_in_user_source(function: types.FunctionType) -> bool:
+    """Whether a function's own code object was compiled from a user source file."""
+    return _is_user_source_file(function.__code__.co_filename)
+
+
+def _user_member_value(value: Any) -> Any:
+    """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it."""
+    if isinstance(value, functools.partial):
+        return cast("Any", value)
+    if inspect.isfunction(value):
+        if _written_in_user_source(value):
+            return value
+        unwrapped = inspect.unwrap(value)
+        if unwrapped is not value and inspect.isfunction(unwrapped):
+            return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
+        return _UNREAD
+    if isinstance(value, type):
+        return value if is_user_code(value) else _UNREAD
+    if _is_callable_instance(value) or _carries_instance(value):
+        return value
+    if callable(value):
+        unwrapped = inspect.unwrap(value)
+        if unwrapped is not value and inspect.isfunction(unwrapped):
+            return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
+    if hasattr(value, "__get__") and _is_user_class_instance(value):
+        return value
+    return _UNREAD
+
+
+def _user_methods(cls: type) -> list[tuple[str, Any]]:
+    """Trackable or refused callable members user classes expose, labelled for cache replay."""
+
+    def collect() -> list[tuple[str, Any]]:
+        found = list[tuple[str, Any]]()
+        mro = cls.__mro__
+        user = [is_user_code(klass) for klass in mro]
+        end = max((index + 1 for index, is_user in enumerate(user) if is_user), default=0)
+        seen = set[str]()
+        for klass, is_user in zip(mro[:end], user[:end], strict=True):
+            if not is_user:
+                continue
+            for name, raw in vars(klass).items():
+                if name in seen:
+                    continue
+                seen.add(name)
+                for label, member in _class_member_parts(name, raw):
+                    if member is None:
+                        continue
+                    value = _user_member_value(member)
+                    if value is not _UNREAD:
+                        found.append((label, value))
+        return found
+
+    return _memoized("members", cls, collect)
+
+
+class _BodyImport(typing.NamedTuple):
+    """One name an import statement in a function body binds."""
+
+    bound: str  # the name the statement binds in the body
+    module: str  # the absolute name of the module the statement imports
+    target: str  # the module `bound` names (`import`), or `module.attribute` (`from`)
+    attribute: str | None  # the attribute of `module` a `from` import binds; None for `import`
+
+
+def _body_imports(func: Callable[..., Any], tree: ast.Module) -> list[_BodyImport]:
+    """Return imports in `func`'s own body, resolving relative names without executing them."""
+    globals_dict = getattr(func, "__globals__", {})
+    package = globals_dict.get("__package__")
+    found = list[_BodyImport]()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname is not None:
+                    found.append(_BodyImport(alias.asname, alias.name, alias.name, None))
+                else:
+                    top = alias.name.partition(".")[0]
+                    found.append(_BodyImport(top, alias.name, top, None))
+        elif isinstance(node, ast.ImportFrom):
+            try:
+                module = importlib.util.resolve_name(
+                    "." * node.level + (node.module or ""), package
+                )
+            except (ImportError, ValueError):
+                continue
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                found.append(_BodyImport(bound, module, f"{module}.{alias.name}", alias.name))
+    return found
+
+
+def _body_import_module(name: str) -> types.ModuleType | None:
+    """Return an already-loaded user module without executing an import."""
+    module = sys.modules.get(name)
+    return module if isinstance(module, types.ModuleType) and is_user_code(module) else None
+
+
+def _module_spec_without_import(name: str) -> importlib.machinery.ModuleSpec | None:
+    """Resolve `name` through finders without running package initializers.
+
+    A top-level name the filesystem finder does not locate is asked of every `sys.meta_path`
+    finder (`importlib.util.find_spec`): an editable install's finder (setuptools' PEP 660)
+    locates its package this way. `find_spec` runs no package initializer for a top-level name,
+    but a finder may import modules of its own (setuptools' distutils shim imports
+    `setuptools._distutils`). A finder that raises is treated as not finding the name, so the
+    lookup never refuses a stage over an error in a finder.
+    """
+    path: Sequence[str] | None = None
+    spec: importlib.machinery.ModuleSpec | None = None
+    parts = name.split(".")
+    for index, part in enumerate(parts):
+        current = ".".join(parts[: index + 1])
+        loaded = sys.modules.get(current)
+        if isinstance(loaded, types.ModuleType):
+            spec = getattr(loaded, "__spec__", None)
+            if not isinstance(spec, importlib.machinery.ModuleSpec):
+                return None
+        else:
+            try:
+                spec = importlib.machinery.PathFinder.find_spec(part, path)
+                if spec is None and index == 0:
+                    spec = importlib.util.find_spec(part)
+            except Exception:  # noqa: BLE001 - any finder error means "not found"
+                spec = None
+            if spec is None:
+                return None
+        path = spec.submodule_search_locations
+        if index + 1 < len(parts) and path is None:
+            return None
+    return spec
+
+
+def _mark_module_covered(module_name: str, manifest: dict[str, str]) -> None:
+    """Record that this manifest covers user module `module_name` and its user packages.
+
+    The worker compares the user modules a stage imports with these entries.
+    """
+    parts = module_name.split(".")
+    for index in range(1, len(parts) + 1):
+        name = ".".join(parts[:index])
+        module = sys.modules.get(name)
+        if isinstance(module, types.ModuleType) and is_user_code(module):
+            manifest.setdefault(f"module:{name}", "")
+
+
+# Loader manifests are merged into a stage's manifest under these prefixes (`dep:<parameter>:`,
+# `out:<output>:`), so a module a user loader covers appears as `dep:n:module:helpers.lib`.
+_LOADER_KEY_PREFIXES = ("dep:", "out:")
+
+
+def covered_user_modules(manifest: dict[str, str]) -> set[str]:
+    """Names of the user modules a stage manifest covers, from every key form that marks one:
+    `module:NAME`, and `dep:…:module:NAME` / `out:…:module:NAME` for a loader's walk."""
+    covered = set[str]()
+    for key in manifest:
+        if key.startswith("module:"):
+            name = key.removeprefix("module:")
+        elif key.startswith(_LOADER_KEY_PREFIXES) and ":module:" in key:
+            name = key.rpartition(":module:")[2]
+        else:
+            continue
+        if name and ":" not in name:
+            covered.add(name)
+    return covered
+
+
+def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
+    """Whether a top-level module's spec locates library code (`is_library_path`), or no file."""
+    if spec.has_location and spec.origin is not None:
+        return is_library_path(pathlib.Path(spec.origin).resolve())
+    locations = list(spec.submodule_search_locations or ())
+    if not locations:
+        return True
+    return all(is_library_path(pathlib.Path(location).resolve()) for location in locations)
+
+
+def _unloaded_body_import_error(
+    func: Callable[..., Any], module_name: str
+) -> exceptions.StageDefinitionError:
+    qualname = getattr(func, "__qualname__", "?")
+    return exceptions.StageDefinitionError(
+        f"'{qualname}' imports user module '{module_name}' in its body, but pipeline discovery "
+        + "did not load it, so Pivot cannot fingerprint it without running it. "
+        + "Fix: import it at module level (or in pipeline.py) so discovery loads it, "
+        + "or move the value into the stage's StageParams."
+    )
+
+
+def _is_user_module_name(name: str) -> bool:
+    """Whether `name` locates a user module, found without importing it or its packages."""
+    spec = _module_spec_without_import(name)
+    return spec is not None and not _is_library_spec(spec)
+
+
+def _process_body_imports(
+    func: Callable[..., Any], tree: ast.Module, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Walk body imports of user modules discovery loaded; refuse unloaded user modules.
+
+    Pivot never imports a module to fingerprint it: importing a module discovery did not load
+    can run any code, so reading its source cannot decide its fingerprint.
+    """
+    imports = _body_imports(func, tree)
+    if not imports:
+        return
+    stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
+    owner = _walk_owner(func)
+    for body_import in imports:
+        module = _body_import_module(body_import.module)
+        if module is None:
+            if _is_user_module_name(body_import.module):
+                raise _unloaded_body_import_error(func, body_import.module)
+            continue
+        _mark_module_covered(body_import.module, manifest)
+        imported = f"bi:{body_import.module}"
+        _record_read(func, imported)
+        attribute = body_import.attribute
+        if attribute is not None and not _names_submodule(module, attribute):
+            with _walking(imported):
+                step = f"a:{attribute}"
+                _record_read(module, step)
+                with _walking(step):
+                    binding_ref = f"{module.__name__}.{attribute}"
+                    _process_captured_value(
+                        body_import.bound,
+                        binding_ref,
+                        getattr(module, attribute),
+                        func,
+                        manifest,
+                        visited,
+                        stage_name,
+                        chain=body_import.bound,
+                    )
+            continue
+        target = _body_import_module(body_import.target)
+        if target is None:
+            if _is_user_module_name(body_import.target):
+                raise _unloaded_body_import_error(func, body_import.target)
+            continue
+        step = f"bi:{body_import.target}"
+        if step != imported:
+            _record_read(func, step)
+        with _walking(step):
+            _process_captured_value(
+                body_import.bound,
+                f"{owner}.{body_import.bound}",
+                target,
+                func,
+                manifest,
+                visited,
+                stage_name,
+                chain=body_import.bound,
+            )
+
+
+def _names_submodule(module: types.ModuleType, attribute: str) -> bool:
+    """Whether `from module import attribute` binds a submodule: `module` lacks the attribute,
+    so the import loads `module.attribute`, or the attribute is that submodule."""
+    value = vars(module).get(attribute, _UNREAD)
+    return value is _UNREAD or (
+        isinstance(value, types.ModuleType) and value.__name__ == f"{module.__name__}.{attribute}"
+    )
 
 
 def _process_class_body_dependencies(
@@ -1217,8 +1675,7 @@ def _process_class_body_dependencies(
         tree = ast.parse(textwrap.dedent(source))
     except (OSError, TypeError, SyntaxError):
         return
-
-    class_def = next((node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)), None)
+    class_def = next((node for node in tree.body if isinstance(node, ast.ClassDef)), None)
     if class_def is None:
         return
 
@@ -1445,29 +1902,14 @@ def _check_non_scalar_capture(
     )
     if _is_unsafe_fingerprinting_enabled():
         _unsafe_capture_warning.set(True)
+        if (scope := _stage_scope.get()) is not None:
+            scope["unsafe"] = True
         _logger.warning(message)
         return
     errors = _capture_errors.get()
     if errors is None:
         raise exceptions.StageDefinitionError(message)
     errors.append(message)
-
-
-def _check_data_class_methods(cls: type) -> None:
-    allowed = frozenset({"model_post_init", "model_validate", "model_rebuild"})
-    user_methods = [
-        name
-        for name, val in vars(cls).items()
-        if callable(val)
-        and not (name.startswith("__") and name.endswith("__"))
-        and name not in allowed
-    ]
-    if user_methods:
-        message = (
-            f"Data class '{cls.__qualname__}' has methods {user_methods}. "
-            + "Move these to standalone functions for reliable change detection."
-        )
-        raise exceptions.StageDefinitionError(message)
 
 
 def _is_user_class_instance(value: Any) -> bool:
@@ -1639,9 +2081,7 @@ def _process_captured_value(
     """
     match _value_kind(value):
         case _ValueKind.PARTIAL:
-            _process_partial_dependency(
-                binding_ref, cast("functools.partial[Any]", value), manifest, visited
-            )
+            _process_partial_dependency(binding_ref, value, manifest, visited)
         case _ValueKind.USER:
             _process_callable_dependency(binding_ref, value, manifest, visited)
             if isinstance(value, type) and chain is not None:
@@ -1887,7 +2327,7 @@ def _process_callable_dependency(
 
 def _process_partial_dependency(
     binding_ref: str,
-    partial_obj: functools.partial[Any],
+    partial_obj: Any,
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
@@ -1920,7 +2360,7 @@ def _process_partial_dependency(
 
 def _process_partial_arguments(
     binding_ref: str,
-    partial_obj: functools.partial[Any],
+    partial_obj: Any,
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
@@ -2052,15 +2492,14 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
     return hints
 
 
-def _hint_classes(func: Callable[..., Any]) -> list[tuple[type, bool]]:
-    """Return each user class in `func`'s type hints, with whether it is a whole hint.
-
-    A class that is not a whole hint is the origin of a generic (`MyContainer[int]`). Within
-    one `fingerprint_pass()` each function's hints are collected once.
+def _hint_classes(func: Callable[..., Any]) -> list[type]:
+    """Return each user class in `func`'s type hints, including the origin of a generic
+    (`MyContainer[int]`). Within one `fingerprint_pass()` each function's hints are collected
+    once.
     """
 
-    def collect() -> list[tuple[type, bool]]:
-        found = list[tuple[type, bool]]()
+    def collect() -> list[type]:
+        found = list[type]()
         for hint in _resolved_type_hints(func).values():
             _collect_hint_classes(hint, found)
         return found
@@ -2068,7 +2507,7 @@ def _hint_classes(func: Callable[..., Any]) -> list[tuple[type, bool]]:
     return _memoized("hints", func, collect)
 
 
-def _collect_hint_classes(hint: Any, found: list[tuple[type, bool]]) -> None:
+def _collect_hint_classes(hint: Any, found: list[type]) -> None:
     """Add the user classes in one type hint to `found`, recursing into generics."""
     if hint is type(None):
         return
@@ -2076,12 +2515,12 @@ def _collect_hint_classes(hint: Any, found: list[tuple[type, bool]]) -> None:
     if origin is not None:
         # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
         if isinstance(origin, type) and is_user_code(origin):
-            found.append((cast("type[Any]", origin), False))
+            found.append(cast("type[Any]", origin))
         for arg in typing.get_args(hint):
             _collect_hint_classes(arg, found)
         return
     if isinstance(hint, type) and is_user_code(hint):
-        found.append((cast("type[Any]", hint), True))
+        found.append(cast("type[Any]", hint))
 
 
 def _process_type_hint_dependencies(
@@ -2089,10 +2528,8 @@ def _process_type_hint_dependencies(
 ) -> None:
     """Process user-defined classes in type hints, including Pydantic model defaults."""
     _record_read(func, "hints")
-    for index, (hint_class, whole_hint) in enumerate(_hint_classes(func)):
+    for index, hint_class in enumerate(_hint_classes(func)):
         with _walking(f"hc:{index}"):
-            if whole_hint and dataclasses.is_dataclass(cast("object", hint_class)):
-                _check_data_class_methods(hint_class)
             key = f"class:{_definition_ref(hint_class)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, hint_class, manifest, visited)
@@ -2266,14 +2703,14 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         return ["function", _function_identity(value, active)]
     if _is_library_callable(value):
         return ["external", _library_name(value)]
-    if isinstance(value, functools.partial):
-        partial_obj = cast("functools.partial[Any]", value)
-        inner = (*active, id(partial_obj))
+    if isinstance(value, (functools.partial, functools.partialmethod)):
+        partial_value = cast("Any", value)
+        inner = (*active, id(partial_value))
         return [
             "partial",
-            _canonicalize_value_for_hash(partial_obj.func, inner),
-            _canonicalize_value_for_hash(partial_obj.args, inner),
-            _canonicalize_value_for_hash(partial_obj.keywords, inner),
+            _canonicalize_value_for_hash(partial_value.func, inner),
+            _canonicalize_value_for_hash(partial_value.args, inner),
+            _canonicalize_value_for_hash(partial_value.keywords, inner),
         ]
     if isinstance(value, dict):
         mapping = cast("dict[Any, Any]", value)
@@ -2314,6 +2751,9 @@ def _add_callable_to_manifest(
 
     Its closure cells and defaults are keyed under the reference in `key`.
     """
+    module_name = getattr(func, "__module__", None)
+    if isinstance(module_name, str):
+        _mark_module_covered(module_name, manifest)
     manifest[key] = hash_function_ast(func)
     token = _owner_ref.set(key.partition(":")[2])
     try:
@@ -2344,6 +2784,7 @@ def _process_module_dependency(
     """
     if not is_user_code(module):
         return
+    _mark_module_covered(module.__name__, manifest)
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
     for attribute in _attributes_read(func, chain):
         step = f"a:{attribute}"
@@ -2402,17 +2843,20 @@ def _definition_ref(obj: Any) -> str:
 
 def _binding_ref(func: Callable[..., Any], name: str) -> str:
     """Return a module-qualified reference for a value reached through `func`."""
-    module = getattr(func, "__module__", None) or "<unknown>"
+    globals_dict = getattr(func, "__globals__", {})
+    module = globals_dict.get("__name__") or getattr(func, "__module__", None) or "<unknown>"
     return f"{module}.{name}"
 
 
 def _callable_ref(func: Callable[..., Any], binding_ref: str) -> str:
     """Use callable's definition, or the binding path where one definition makes many.
 
-    A lambda is keyed by its binding, and so is a function defined inside another one that
-    holds closure cells or defaults: two closures from one factory (`h2 = make(2)`,
-    `h5 = make(5)`) share a definition, and their values must not share keys.
+    A functools.wraps wrapper gets a separate owner from the function it wraps: update_wrapper
+    copies the wrapped function's module and qualname, so without the marker the child's hash
+    overwrites the wrapper's bytecode hash in the manifest.
     """
+    if inspect.isfunction(func) and hasattr(func, "__wrapped__"):
+        return f"{binding_ref}.<wrapper>"
     qualname = getattr(func, "__qualname__", "") or ""
     if "<lambda>" in qualname:
         return binding_ref

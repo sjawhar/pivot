@@ -48,6 +48,7 @@ def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageI
         no_fingerprint=False,
         code_deps=[],
         input_paths={},
+        unsafe_fingerprint=False,
     )
 
 
@@ -233,6 +234,7 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             no_fingerprint=False,
             code_deps=[],
             input_paths={},
+            unsafe_fingerprint=False,
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
@@ -251,6 +253,7 @@ def test_missing_dependency_raises_error(tmp_path: Path) -> None:
             no_fingerprint=False,
             code_deps=[],
             input_paths={},
+            unsafe_fingerprint=False,
         ),
     }
 
@@ -294,6 +297,7 @@ def test_validate_dependency_sources_uses_store() -> None:
             no_fingerprint=False,
             code_deps=[],
             input_paths={},
+            unsafe_fingerprint=False,
         ),
     }
 
@@ -327,6 +331,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             no_fingerprint=False,
             code_deps=[],
             input_paths={},
+            unsafe_fingerprint=False,
         ),
     }
 
@@ -350,6 +355,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             no_fingerprint=False,
             code_deps=[],
             input_paths={},
+            unsafe_fingerprint=False,
         ),
         "consumer": RegistryStageInfo(
             func=lambda: None,
@@ -368,6 +374,7 @@ def test_validate_dependency_sources_no_store_skips_external() -> None:
             no_fingerprint=False,
             code_deps=[],
             input_paths={},
+            unsafe_fingerprint=False,
         ),
     }
 

@@ -8,10 +8,14 @@ parallelism, and the value plumbing between the store and the stage function.
 from __future__ import annotations
 
 import array
+import ast
 import contextlib
 import dataclasses
 import fcntl
+import importlib
+import importlib.util
 import io
+import json
 import logging
 import os
 import pathlib
@@ -49,6 +53,7 @@ from pivot.types import (
 if TYPE_CHECKING:
     import multiprocessing as mp
     from collections.abc import Callable
+    from types import ModuleType
 
 _STAGE = "skip/consume"
 
@@ -81,6 +86,7 @@ def _stage_info(
     bindings: dict[str, str] | None = None,
     no_commit: bool = True,
     force: bool = False,
+    unsafe_fingerprint: bool = False,
 ) -> worker.WorkerStageInfo:
     return worker.WorkerStageInfo(
         func=func,
@@ -114,6 +120,8 @@ def _stage_info(
         project_state_dir=project / ".pivot",
         collection_params={},
         incremental_inputs={},
+        unsafe_fingerprint=unsafe_fingerprint,
+        no_fingerprint=False,
     )
 
 
@@ -421,6 +429,446 @@ def test_run_cache_restores_an_earlier_input_version(
         "unchanged (run cache)",
     )
     assert _output_path(project).read_text() == "V2"
+
+
+def test_unsafe_stage_never_restores_an_existing_run_cache_entry(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """An unsafe fingerprint must run even when a safe run filed this input's cache entry."""
+    raw = project / "raw.txt"
+    committed = _stage_info(_upper, project, worker_env, no_commit=False)
+    for content in ("v1", "v2"):
+        raw.write_text(content)
+        assert _run_and_apply(committed, worker_env, output_queue)["status"] == StageStatus.RAN
+
+    raw.write_text("v1")
+    unsafe = _stage_info(_upper, project, worker_env, no_commit=False, unsafe_fingerprint=True)
+    result = _run_and_apply(unsafe, worker_env, output_queue)
+
+    assert (result["status"], result["reason"]) == (
+        StageStatus.RAN,
+        "Input dependencies changed",
+    )
+
+
+def test_stage_import_tracking_records_cached_module_per_stage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "warm_worker_dynamic_module"
+    (tmp_path / f"{module_name}.py").write_text("VALUE = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    with worker._track_stage_imports(frozenset()) as first:
+        importlib.import_module(module_name)
+    with worker._track_stage_imports(frozenset()) as second:
+        importlib.import_module(module_name)
+
+    assert module_name in first.imported
+    assert module_name in second.imported
+
+
+def _user_modules(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str]
+) -> ModuleType:
+    """Write each of `files` as a top-level module under `tmp_path`, none of them resident, and
+    return `cov_sync`: a module without a source file whose `go`, `done` and `stop` events the
+    modules can wait on."""
+    sync = type(sys)("cov_sync")
+    sync.go = threading.Event()
+    sync.done = threading.Event()
+    sync.stop = threading.Event()
+    monkeypatch.setitem(sys.modules, "cov_sync", sync)
+    for name, text in files.items():
+        (tmp_path / f"{name}.py").write_text(text)
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    return sync
+
+
+def _register_without_the_hooks(name: str, path: pathlib.Path) -> None:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+
+
+def test_covered_module_first_import_excuses_only_its_own_imports(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What a covered module's first import loads is excused; a later import of another user
+    module is counted."""
+    _user_modules(
+        tmp_path,
+        monkeypatch,
+        {"cov_lib": "import cov_dep\n\nVALUE = 1\n", "cov_dep": "VALUE = 2\n", "cov_other": ""},
+    )
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        importlib.import_module("cov_lib")
+        importlib.import_module("cov_other")
+
+    assert {"cov_lib", "cov_dep"} <= tracked.added_in_window
+    assert tracked.imported == {"cov_lib", "cov_other"}
+    assert tracked.uncovered() == {"cov_other"}
+
+
+def test_covered_import_of_an_already_resident_dependency_is_excused_on_its_own_thread(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A warm worker already holds `cov_dep`; the covered `cov_lib` importing it on its own
+    thread is part of that import, as in a cold worker, so it is not counted."""
+    _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": "import cov_dep\n\nVALUE = 1\n", "cov_dep": ""}
+    )
+    importlib.import_module("cov_dep")
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        importlib.import_module("cov_lib")
+
+    assert tracked.imported == {"cov_lib"}
+    assert tracked.uncovered() == set()
+
+
+# `cov_lib`'s top level starts a loader and returns; the loader waits for `cov_sync.go`, loads
+# `cov_other`, and sets `cov_sync.done`. Each spelling starts the loader a different way: every
+# `_thread` start function, `threading.Thread` and a subclass of it, `threading.Timer`, a pool, and
+# a thread a covered thread starts.
+_LOADER_STARTS = {
+    "thread": "threading.Thread(target=_load).start()\n",
+    "thread-subclass": (
+        "class _Loader(threading.Thread):\n"
+        "    def run(self):\n"
+        "        _load()\n\n\n"
+        "_Loader().start()\n"
+    ),
+    "timer": "threading.Timer(0, _load).start()\n",
+    "pool": (
+        "_pool = concurrent.futures.ThreadPoolExecutor(1)\n"
+        "_pool.submit(_load)\n"
+        "_pool.shutdown(wait=False)\n"
+    ),
+    "start-new-thread": "_thread.start_new_thread(_load, ())\n",
+    "start-new": "_thread.start_new(_load, ())\n",
+    "start-joinable-thread": "_thread.start_joinable_thread(_load)\n",
+    "nested-thread": (
+        "threading.Thread(target=lambda: threading.Thread(target=_load).start()).start()\n"
+    ),
+}
+_LOADER_ROUTES = {
+    "hooked": "    importlib.import_module('cov_other')\n",
+    "unhooked": (
+        "    spec = importlib.util.spec_from_file_location(\n"
+        "        'cov_other', pathlib.Path(__file__).with_name('cov_other.py')\n"
+        "    )\n"
+        "    module = importlib.util.module_from_spec(spec)\n"
+        "    sys.modules['cov_other'] = module\n"
+        "    spec.loader.exec_module(module)\n"
+    ),
+}
+
+
+def _loader_lib(start: str, route: str) -> str:
+    return (
+        "import _thread\nimport concurrent.futures\nimport importlib\nimport importlib.util\n"
+        "import pathlib\nimport sys\nimport threading\n\nimport cov_sync\n\n\n"
+        "def _load():\n"
+        "    assert cov_sync.go.wait(10)\n"
+        f"{_LOADER_ROUTES[route]}"
+        "    cov_sync.done.set()\n\n\n"
+        f"{_LOADER_STARTS[start]}\nVALUE = 1\n"
+    )
+
+
+@pytest.mark.parametrize("resident", [False, True], ids=["new", "resident"])
+@pytest.mark.parametrize("route", sorted(_LOADER_ROUTES))
+@pytest.mark.parametrize("start", sorted(_LOADER_STARTS))
+def test_thread_a_covered_import_starts_is_covered_after_the_import_returns(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str,
+    route: str,
+    resident: bool,
+) -> None:
+    """A thread a covered module's first import starts (through any `_thread` start function,
+    as a `threading.Thread` or subclass, a `threading.Timer` or a `ThreadPoolExecutor` worker, or
+    from a thread it started) is a covered thread for the rest of the stage: what it loads after
+    that import returned is not counted, by either route, whether or not the module was already
+    resident."""
+    sync = _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": _loader_lib(start, route), "cov_other": ""}
+    )
+    if resident:
+        importlib.import_module("cov_other")
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        importlib.import_module("cov_lib")
+        sync.go.set()
+        assert sync.done.wait(10)
+
+    assert tracked.imported == {"cov_lib"}
+    assert tracked.uncovered() == set()
+
+
+def test_module_the_stage_registers_after_every_covered_thread_ended_is_counted(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A covered thread's end releases its hold on the window: once every covered thread has
+    ended, a module the stage itself registers without the hooks is counted."""
+    sync = _user_modules(
+        tmp_path,
+        monkeypatch,
+        {
+            "cov_lib": (
+                "import threading\n\nimport cov_sync\n\n"
+                "LOADER = threading.Thread(target=cov_sync.go.wait, args=(10,))\n"
+                "LOADER.start()\n"
+            ),
+            "cov_late": "",
+        },
+    )
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        loader = importlib.import_module("cov_lib").LOADER
+        sync.go.set()
+        loader.join(10)
+        assert not loader.is_alive()
+        _register_without_the_hooks("cov_late", tmp_path / "cov_late.py")
+
+    assert tracked.window_depth == 0
+    assert tracked.uncovered() == {"cov_late"}
+
+
+@pytest.mark.parametrize("route", sorted(_LOADER_ROUTES))
+def test_what_a_covered_thread_loads_is_excused_when_the_thread_outlives_the_stage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """A covered thread still running when the stage returns holds the window open then: what it
+    loaded during the stage, by either route, is excused, not counted by the snapshot."""
+    sync = _user_modules(
+        tmp_path,
+        monkeypatch,
+        {
+            "cov_lib": (
+                "import importlib\nimport importlib.util\nimport pathlib\nimport sys\n"
+                "import threading\n\nimport cov_sync\n\n\n"
+                "def _load():\n"
+                "    assert cov_sync.go.wait(10)\n"
+                f"{_LOADER_ROUTES[route]}"
+                "    cov_sync.done.set()\n"
+                "    assert cov_sync.stop.wait(10)\n\n\n"
+                "LOADER = threading.Thread(target=_load, daemon=True)\n"
+                "LOADER.start()\n"
+            ),
+            "cov_other": "",
+        },
+    )
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        loader = importlib.import_module("cov_lib").LOADER
+        sync.go.set()
+        assert sync.done.wait(10)
+    assert tracked.window_resident_before == frozenset()
+    sync.stop.set()
+    loader.join(10)
+
+    assert not loader.is_alive()
+    assert "cov_other" in tracked.added_in_window
+    assert tracked.uncovered() == set()
+
+
+def _thread_blocking_in_cov_lib(sync: ModuleType, target: Callable[[], object]) -> None:
+    """Run `target` on a thread the stage starts, while the stage's own thread is inside the
+    covered `cov_lib`'s first import (which waits for `cov_sync.done`)."""
+
+    def other_thread() -> None:
+        assert sync.go.wait(10)
+        target()
+        sync.done.set()
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    importlib.import_module("cov_lib")
+    thread.join(10)
+    assert not thread.is_alive()
+
+
+_BLOCKING_COV_LIB = "import cov_sync\n\ncov_sync.go.set()\nassert cov_sync.done.wait(10)\n"
+
+
+@pytest.mark.parametrize("resident", [False, True], ids=["new", "resident"])
+def test_hooked_import_on_a_thread_no_covered_thread_started_is_counted(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, resident: bool
+) -> None:
+    """A thread the stage started before its covered import is not a covered thread: its hooked
+    import while the covered import is open is counted, whether or not the module was already
+    resident."""
+    sync = _user_modules(tmp_path, monkeypatch, {"cov_lib": _BLOCKING_COV_LIB, "cov_other": ""})
+    if resident:
+        importlib.import_module("cov_other")
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        _thread_blocking_in_cov_lib(sync, lambda: importlib.import_module("cov_other"))
+
+    assert tracked.uncovered() == {"cov_other"}
+
+
+def test_unhooked_registration_on_another_thread_while_a_covered_thread_runs_is_excused(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `sys.modules` snapshot cannot tell threads apart: a module any thread registers
+    without the hooks while a covered thread runs is excused (a stated limit)."""
+    sync = _user_modules(tmp_path, monkeypatch, {"cov_lib": _BLOCKING_COV_LIB, "cov_other": ""})
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        _thread_blocking_in_cov_lib(
+            sync, lambda: _register_without_the_hooks("cov_other", tmp_path / "cov_other.py")
+        )
+
+    assert "cov_other" in tracked.added_in_window
+    assert tracked.uncovered() == set()
+
+
+@pytest.mark.parametrize("registration", ["exec_module", "importlib.__import__", "__import__"])
+def test_module_the_stage_loads_outside_every_window_stays_counted_when_a_covered_import_uses_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, registration: str
+) -> None:
+    """The stage's own thread loads `cov_late` while no covered thread runs; the covered
+    `cov_lib` then imports it. The earlier load is still counted, by any route."""
+    _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": "import cov_late\n\nVALUE = 1\n", "cov_late": ""}
+    )
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as tracked:
+        if registration == "exec_module":
+            _register_without_the_hooks("cov_late", tmp_path / "cov_late.py")
+        elif registration == "importlib.__import__":
+            importlib.__import__("cov_late")
+        else:
+            __import__("cov_late")
+        importlib.import_module("cov_lib")
+
+    assert tracked.uncovered() == {"cov_late"}
+
+
+@pytest.mark.parametrize("resident", [False, True], ids=["new", "resident"])
+def test_covered_thread_of_an_earlier_stage_is_not_covered_in_a_later_stage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, resident: bool
+) -> None:
+    """A covered thread is covered only for the stage whose covered import started it: its
+    import while a later stage runs in the same worker is counted for that stage. With the
+    module already resident, the `sys.modules` snapshot cannot count it; only the stage scoping
+    of coverage does."""
+    sync = _user_modules(
+        tmp_path, monkeypatch, {"cov_lib": _loader_lib("thread", "hooked"), "cov_other": ""}
+    )
+    if resident:
+        importlib.import_module("cov_other")
+
+    with worker._track_stage_imports(frozenset({"cov_lib"})) as first:
+        importlib.import_module("cov_lib")
+    with worker._track_stage_imports(frozenset()) as second:
+        sync.go.set()
+        assert sync.done.wait(10)
+
+    assert first.uncovered() == set()
+    assert second.uncovered() == {"cov_other"}
+
+
+def test_import_hooks_keep_cpythons_signature_and_are_not_installed_on_import() -> None:
+    """`import pivot.executor.worker` leaves the interpreter's `__import__` alone, and a hooked
+    `__import__` accepts CPython's keyword names."""
+    script = "\n".join(
+        [
+            "import builtins",
+            "original = builtins.__import__",
+            "import pivot.executor.worker as worker",
+            "assert builtins.__import__ is original",
+            "worker.install_import_hooks()",
+            "assert builtins.__import__ is not original",
+            "json = builtins.__import__('json', globals=None, locals=None, fromlist=(), level=0)",
+            "print(json.__name__)",
+        ]
+    )
+    probe = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.strip() == "json"
+
+
+def test_every_thread_start_function_is_hooked() -> None:
+    """Every start function `_thread` exposes, and `threading`'s binding that
+    `threading.Thread.start` calls, is replaced while the hooks are installed and restored after;
+    importing `pivot.executor.worker` replaces none. A start function a new Python adds fails
+    this test until it is hooked."""
+    script = "\n".join(
+        [
+            "import _thread",
+            "import json",
+            "import threading",
+            "starts = sorted(",
+            "    name for name in dir(_thread)",
+            "    if 'start' in name.lower() and callable(getattr(_thread, name))",
+            ")",
+            "targets = [(_thread, name) for name in starts] + [(threading, '_start_joinable_thread')]",
+            "originals = [vars(module)[name] for module, name in targets]",
+            "import pivot.executor.worker as worker",
+            "untouched = [vars(module)[name] for module, name in targets] == originals",
+            "worker.install_import_hooks()",
+            "unhooked = [",
+            "    f'{module.__name__}.{name}'",
+            "    for (module, name), original in zip(targets, originals)",
+            "    if vars(module)[name] is original",
+            "]",
+            "worker._uninstall_import_hooks()",
+            "restored = [vars(module)[name] for module, name in targets] == originals",
+            "print(json.dumps({'starts': starts, 'untouched': untouched,",
+            "                  'unhooked': unhooked, 'restored': restored}))",
+        ]
+    )
+    probe = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    result = json.loads(probe.stdout)
+    assert result["starts"], "_thread exposes no start function"
+    assert result["untouched"], "importing pivot.executor.worker replaced a thread start"
+    assert result["unhooked"] == [], f"thread starts not hooked: {result['unhooked']}"
+    assert result["restored"], "a thread start was not restored"
+
+
+def test_pivot_owned_worker_threads_start_through_the_bypass_helper() -> None:
+    """Every direct `threading.Thread` start that can run in a worker goes through
+    `_start_pivot_thread`, so an internal pipe reader, parent watcher or stop-grace timer cannot
+    inherit user-code coverage. Adding another direct constructor fails this test until it uses
+    the helper or is explicitly kept outside a worker."""
+    expected = {
+        pathlib.Path(worker.__file__).resolve(): {
+            "_start_exit_timer",
+            "unwind_when_stopped",
+            "_ensure_pipe",
+        },
+        pathlib.Path(worker.__file__).resolve().with_name("core.py"): {
+            "_exit_when_parent_dies",
+        },
+    }
+    for path, expected_functions in expected.items():
+        source = path.read_text()
+        tree = ast.parse(source)
+        found = {
+            function.name: ast.get_source_segment(source, function)
+            for function in ast.walk(tree)
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and "threading.Thread(" in (ast.get_source_segment(source, function) or "")
+        }
+        assert found.keys() == expected_functions, path
+        for name, body in found.items():
+            assert body is not None
+            assert "_start_pivot_thread(" in body, f"{path}:{name} bypasses the helper"
 
 
 @pytest.mark.parametrize(

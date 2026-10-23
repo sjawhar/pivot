@@ -49,7 +49,9 @@ def _exit_when_parent_dies(parent_pid: int) -> None:
             poll.wait(1)
         os._exit(0)
 
-    threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch").start()
+    worker._start_pivot_thread(  # pyright: ignore[reportPrivateUsage] - worker owns coverage bypass
+        threading.Thread(target=_watch_parent, daemon=True, name="pivot-parent-watch")
+    )
 
 
 def _init_manager(parent_pid: int) -> None:
@@ -113,9 +115,11 @@ def _get_executor(max_workers: int, *, kill_workers: bool = False) -> loky.Proce
 
 def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
     """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
-    (``worker.unwind_when_stopped``), and import user code through discovery's checked loader
+    (``worker.unwind_when_stopped``), record the user modules each stage imports
+    (``worker.install_import_hooks``), and import user code through discovery's checked loader
     when a discovery's import session for ``user_code_root`` lasts."""
     worker.unwind_when_stopped(parent_pid)
+    worker.install_import_hooks()
     if user_code_root is not None:
         discovery.install_user_code_loader(user_code_root)
 
@@ -381,9 +385,11 @@ def prepare_worker_info(
     # Ensure state directory exists (workers open StateDB in readonly mode)
     state_dir.mkdir(parents=True, exist_ok=True)
 
+    # The fingerprint is computed first: it sets `unsafe_fingerprint`.
+    fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
     return worker.WorkerStageInfo(
         func=stage_info["func"],
-        fingerprint=pipeline.ensure_fingerprint(stage_info["name"]),
+        fingerprint=fingerprint,
         deps=stage_info["deps"],
         outs=stage_info["outs"],
         store_spec=store_spec,
@@ -400,6 +406,8 @@ def prepare_worker_info(
         state_dir=state_dir,
         project_state_dir=default_state_dir,
         collection_params=stage_info["collection_params"],
+        unsafe_fingerprint=stage_info["unsafe_fingerprint"],
+        no_fingerprint=stage_info["no_fingerprint"],
     )
 
 

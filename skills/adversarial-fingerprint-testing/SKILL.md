@@ -32,7 +32,6 @@ The change MUST satisfy ALL three:
 - **Module-level type annotations as documentation** — `_CONFIG: MyTypedDict = {...}` where only dict values matter (tracked via params hash)
 - **Docstring/comment/whitespace changes** — intentionally ignored
 - **Decorator changes on stage functions** — known limitation, documented
-- **Lazy imports inside function bodies** — known limitation, documented
 
 ## Pre-Attempt Checklist
 
