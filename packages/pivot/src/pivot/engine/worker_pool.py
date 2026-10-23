@@ -106,13 +106,13 @@ class WorkerPool:
             or self._has_stale_user_code()
             or not executor_core.is_executor_usable(executor, self._max_workers)
         ):
-            executor = self._replace_executor(idle_timeout_s, warm=False)
+            executor = self._replace_executor(idle_timeout_s)
         else:
             fresh_workers = False
         # An argument change can make loky replace a live reusable executor during first use.
         # Recheck every acquisition so this pool never keeps its narrowed call queue.
         if not executor_core.is_executor_usable(executor, self._max_workers):
-            executor = self._replace_executor(idle_timeout_s, warm=False)
+            executor = self._replace_executor(idle_timeout_s)
         if fresh_workers:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
@@ -126,15 +126,16 @@ class WorkerPool:
     def restart(self, *, max_workers: int) -> None:
         """Replace every worker before a reload starts its next run.
 
-        If starting the fresh worker fails, the pool holds no executor and the next
-        ``start()`` creates one, as on first use.
+        ``max_workers`` is the reloaded run's width; that many fresh workers start together.
+        If starting them fails, the pool holds no executor and the next ``start()`` creates
+        one, as on first use.
         """
         self._max_workers = max(self._max_workers, max_workers)
-        self._executor = self._replace_executor(self._idle_timeout_s, warm=True)
+        self._executor = self._replace_executor(self._idle_timeout_s, warm_workers=max_workers)
         self._restamp_user_code_files()
 
     def _replace_executor(
-        self, idle_timeout_s: float | None, *, warm: bool
+        self, idle_timeout_s: float | None, *, warm_workers: int = 0
     ) -> loky.ProcessPoolExecutor:
         """Stop this pool's workers, then return a fresh executor.
 
@@ -142,18 +143,20 @@ class WorkerPool:
         executor: loky 3.7 keeps one per thread, and a watch reload restarts from an anyio
         worker thread, so the executor this pool holds need not be the one loky finds on the
         calling thread. The pool forgets the old executor as soon as it is shut down, so a
-        failure starting the fresh worker never leaves it holding one that rejects work.
+        failure starting the fresh workers never leaves it holding one that rejects work.
 
-        A reload may warm one worker before its next run. A replacement that ``start()`` makes
-        belongs to that run's critical path, so it returns an unwarmed executor and lets its
-        submitted stages start every worker they need in parallel.
+        A reload warms ``warm_workers`` workers, all started together, before its next run. A
+        replacement that ``start()`` makes belongs to that run's critical path, so it warms
+        none and lets its submitted stages start every worker they need in parallel.
         """
         if self._executor is not None:
             executor = self._executor
             self._executor = None
             executor.shutdown(wait=True, kill_workers=True)
-        if warm:
-            executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
+        if warm_workers:
+            executor_core.restart_workers(
+                self._max_workers, warm_workers=warm_workers, idle_timeout_s=idle_timeout_s
+            )
             return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
         return executor_core.create_fresh_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 

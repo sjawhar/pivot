@@ -260,16 +260,21 @@ def create_manager() -> managers.SyncManager:
     return manager
 
 
-def restart_workers(max_workers: int, *, idle_timeout_s: float | None) -> None:
-    """Replace stale workers and leave one fresh worker ready for the next dispatch.
+def restart_workers(
+    max_workers: int, *, warm_workers: int = 1, idle_timeout_s: float | None
+) -> None:
+    """Replace stale workers and start ``warm_workers`` fresh ones together for the next run.
 
-    If the fresh worker's warm-up fails, the executor this call created is shut down, its
-    workers killed, before the error propagates. Loky 3.7 keeps it in the calling thread's
-    slot, which no ``WorkerPool`` holds, so nothing else would stop its worker.
+    Every warm worker starts at once, and the call returns when one of them has run a no-op;
+    the rest finish starting in parallel, so the next run waits at most one worker start-up.
+
+    If the warm-up fails, the executor this call created is shut down, its workers killed,
+    before the error propagates. Loky 3.7 keeps it in the calling thread's slot, which no
+    ``WorkerPool`` holds, so nothing else would stop its workers.
     """
     pool = create_fresh_executor(max_workers, idle_timeout_s=idle_timeout_s)
     try:
-        submit(pool, max_workers, _noop).result()
+        submit(pool, max_workers, _noop, prestart_target=warm_workers).result()
     except BaseException:
         pool.shutdown(wait=True, kill_workers=True)
         raise

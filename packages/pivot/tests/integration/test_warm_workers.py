@@ -1699,10 +1699,10 @@ def _helper_pool_worker_pids(pool: WorkerPool | None) -> set[int]:
 
 
 @pytest.mark.anyio
-async def test_watch_reload_restarts_one_warm_worker(
+async def test_watch_reload_restarts_its_runs_width_of_warm_workers(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A reload replaces one worker before its narrowed run begins."""
+    """A reload replaces its workers with the narrowed run's width before that run begins."""
     root = tmp_path.resolve() / "project"
     pipeline = _helper_project(root, monkeypatch, _THREE_PID_PIPELINE)
     recorder = _Recorder()
@@ -1731,7 +1731,7 @@ async def test_watch_reload_restarts_one_warm_worker(
             after_run = _helper_pool_worker_pids(eng._worker_pool)
             tg.cancel_scope.cancel()
 
-    assert [len(pids) for pids in restarted] == [1], "the reload starts one warm worker"
+    assert [len(pids) for pids in restarted] == [1], "a chain's reload starts one warm worker"
     assert after_run == restarted[0], "the narrowed run should reuse the restarted worker"
 
 

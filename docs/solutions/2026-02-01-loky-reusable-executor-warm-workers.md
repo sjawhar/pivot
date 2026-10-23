@@ -90,21 +90,23 @@ Pivot's normal worker output queue continues to capture stage logs.
 ### Killing Workers for Code Reload
 
 In watch mode, code changes require fresh workers with updated imports. `WorkerPool.restart()`
-first shuts down the executor the pool holds with `kill_workers=True`, then starts one fresh warm
-worker; additional workers start on demand. A replacement that `start()` makes for its own run
-does not wait for that warm-up, so the run submits every stage at once and loky starts them in
-parallel:
+first shuts down the executor the pool holds with `kill_workers=True`, then starts the reloaded
+run's width of fresh workers together and waits for one of them to run a no-op. A replacement
+that `start()` makes for its own run warms none, so the run submits every stage at once and loky
+starts them in parallel:
 
 ```python
 def _replace_executor(
-    self, idle_timeout_s: float | None, *, warm: bool
+    self, idle_timeout_s: float | None, *, warm_workers: int = 0
 ) -> loky.ProcessPoolExecutor:
     if self._executor is not None:
         executor = self._executor
         self._executor = None
         executor.shutdown(wait=True, kill_workers=True)
-    if warm:
-        executor_core.restart_workers(self._max_workers, idle_timeout_s=idle_timeout_s)
+    if warm_workers:
+        executor_core.restart_workers(
+            self._max_workers, warm_workers=warm_workers, idle_timeout_s=idle_timeout_s
+        )
         return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
     return executor_core.create_fresh_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 ```

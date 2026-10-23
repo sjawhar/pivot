@@ -222,5 +222,5 @@ class WatchCoordinator:
         return engine_graph.get_producer(self._graph, identity)
 
     def should_restart_workers(self, *, parallel: bool) -> bool:
-        """Decide whether a parallel reload replaces its one warm worker."""
+        """Decide whether a parallel reload replaces its workers before its re-run."""
         return parallel

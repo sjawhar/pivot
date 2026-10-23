@@ -2703,8 +2703,9 @@ class Engine:
             stages = list(runnable or all_stages)
 
         if stages:
-            # Restart the worker pool with one fresh worker so the next run picks up reloaded
-            # code. Run in thread to avoid blocking the event loop during process kill/spawn.
+            # Restart the worker pool with the re-run's width of fresh workers so the next run
+            # picks up reloaded code and starts its stages together. Run in thread to avoid
+            # blocking the event loop during process kill/spawn.
             # A failed restart leaves the pool without an executor, so the re-run's start()
             # creates new workers; the failure is logged rather than ending the session.
             coordinator = self._get_watch_coordinator()

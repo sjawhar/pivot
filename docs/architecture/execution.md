@@ -140,8 +140,8 @@ need one. Workers can start after the TUI begins and use the already-running tra
 
 Workers stay alive across runs in one long-lived Engine, so imports from earlier stages remain
 available. Before a later run reuses workers, Pivot replaces them if a user-code module they
-imported changed. A watch-mode code reload starts one fresh worker; additional workers start
-only when the reloaded run admits stages that need them.
+imported changed. A watch-mode code reload starts the reloaded run's width of fresh workers
+together, so that run starts its stages at once.
 
 ## Stage resources
 

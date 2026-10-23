@@ -422,6 +422,41 @@ def test_wider_run_after_a_narrow_one_starts_its_stages_together(
         pool.shutdown()
 
 
+def test_run_after_a_reload_restart_starts_its_stages_together(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watch reload restarts workers before its re-run, as main does. That re-run must start
+    every stage together, as on main: a restart that warmed fewer workers than the re-run can
+    start at once leaves the rest a whole worker start-up behind the first stage."""
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_SLOW_STARTUP_HOOK)
+    width = 4
+    pool = WorkerPool()
+    reload_thread = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        pool.start(max_workers=width)
+        assert pool.submit(_helper_identity, 1).result(timeout=60) == 1
+        pool.end_run()
+
+        with monkeypatch.context() as patched:
+            patched.setenv(
+                "PYTHONPATH",
+                os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])),
+            )
+            reload_thread.submit(lambda: pool.restart(max_workers=width)).result(timeout=120)
+            pool.start(max_workers=width)
+            futures = [pool.submit(_helper_started_at, _STAGE_S) for _ in range(width)]
+            starts = sorted(future.result(timeout=120) for future in futures)
+        pool.end_run()
+        offsets = [round(start - starts[0], 2) for start in starts]
+        late = [offset for offset in offsets if offset > _STAGE_S / 2]
+        assert not late, f"{len(late)} of {width} stages started late: offsets {offsets}"
+    finally:
+        pool.shutdown()
+        reload_thread.shutdown(wait=True)
+
+
 def _helper_narrow_run(pool: WorkerPool) -> None:
     pool.start(max_workers=1, idle_timeout_s=None)
     assert pool.submit(_helper_identity, 1).result(timeout=60) == 1

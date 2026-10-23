@@ -125,10 +125,10 @@ Note: JsonlSink renames the engine's `stage_started` and `stage_completed` to th
 
 ### Code Change Handling
 
-When Python files change, `WorkerPool.restart()` replaces the workers with one fresh warm worker.
-Additional workers start only when the reloaded run admits stages that need them (see
-[Pool Size](execution.md#pool-size)). Across all pipelines with `--keep-going`, the reload
-re-runs only the stages a missing dependency leaves runnable:
+When Python files change, `WorkerPool.restart()` replaces the workers, starting the reloaded
+run's width of fresh workers together (see [Pool Size](execution.md#pool-size)). Across all
+pipelines with `--keep-going`, the reload re-runs only the stages a missing dependency leaves
+runnable:
 
 **Why restart instead of hot reload?**
 
