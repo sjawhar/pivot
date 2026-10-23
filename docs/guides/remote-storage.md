@@ -214,7 +214,7 @@ pivot push
 # Iterate on a feature branch
 pivot repro
 pivot push
-git add <state-dir>/stages
+git add "<state dir>/stages"
 git commit -m "Update pipeline outputs"
 git push
 ```
@@ -253,7 +253,7 @@ A GCS permission error names the object and the missing permission, for example 
 Lock files may be out of sync. Ensure the lock files under `<state dir>/stages/` are committed:
 
 ```bash
-git add <state-dir>/stages
+git add "<state dir>/stages"
 git commit -m "Sync lock files"
 ```
 

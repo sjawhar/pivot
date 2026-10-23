@@ -40,7 +40,7 @@ Lock files are YAML and human-readable. The default state directory is `.pivot`;
 with your `core.state_dir` value when configured:
 
 ```bash
-cat <state-dir>/stages/demo/train.lock
+cat "<state dir>/stages/demo/train.lock"
 ```
 
 Contains: code fingerprint manifest, parameter values, input hashes, output hashes.
@@ -63,7 +63,7 @@ See: [Fingerprinting](../concepts/fingerprinting.md) and [Caching](../concepts/c
 
 ### Cache Not Shared in CI
 
-1. Ensure lock files are committed: `git add <state-dir>/stages`
+1. Ensure lock files are committed: `git add "<state dir>/stages"`
 2. Ensure remote is configured: `pivot config list`
 3. Run `pivot pull` before `pivot repro` in CI
 

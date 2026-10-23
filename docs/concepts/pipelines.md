@@ -173,13 +173,13 @@ history, and `history` reports that same history. `--quiet` silences the warning
 When a project created by Pivot 0.5.2 sets `core.state_dir`, Pivot reads a stage lock missing
 from the configured directory, and its cached objects, from `.pivot` until the state is moved.
 Pivot warns once per command and directs new writes to the configured state directory; move the
-tracked locks with `git mv .pivot/stages <state_dir>/stages`.
+tracked locks with `git mv .pivot/stages "<state dir>/stages"`.
 
 ```
 <project_root>/
   .pivot/
     config.yaml
-  <state_dir>/
+  <state dir>/
     cache/files/       # Content-addressable cache (shared across pipelines)
     stages/<pipeline>/ # Per-stage lock files (commit these)
     state.lmdb/        # LMDB database (hashes, generations, run cache)

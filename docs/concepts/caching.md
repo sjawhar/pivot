@@ -13,7 +13,7 @@ two hex characters as a prefix). The per-stage lock file records each output's c
 `<state dir>` is `core.state_dir`, which defaults to `.pivot`.
 
 ```
-<state_dir>/
+<state dir>/
   cache/
     files/
       a1/

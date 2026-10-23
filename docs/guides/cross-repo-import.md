@@ -152,7 +152,7 @@ If the file isn't in your local cache, run `pivot update` to re-download it from
 # Train and push outputs
 pivot repro
 pivot push
-git add <state-dir>/stages && git commit -m "Update model"
+git add "<state dir>/stages" && git commit -m "Update model"
 git push
 ```
 

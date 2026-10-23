@@ -165,7 +165,7 @@ Lock files use relative paths for portability across machines.
 .pivot/
 └── config.yaml          # Project configuration
 
-<state_dir>/             # .pivot by default
+<state dir>/             # .pivot by default
 ├── cache/
 │   └── files/           # Content-addressable storage
 │       ├── ab/
