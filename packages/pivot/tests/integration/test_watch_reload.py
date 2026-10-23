@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import anyio
 import pytest
+import watchfiles
 
 from pivot import discovery, project
 from pivot.engine import agent_rpc, sources
@@ -28,7 +29,9 @@ from pivot_tui import event_poller, rpc_client_impl
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
+
+    from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
     from pivot.registry import PipelineLike
 
@@ -105,6 +108,33 @@ class _Recorder:
             if event["type"] == "stage_completed" and event["stage"] == stage:
                 return event["status"]
         raise AssertionError(f"{stage} did not complete in events[{start}:{end}]")
+
+
+type _Batch = set[tuple[watchfiles.Change, str]]
+
+
+class _ScriptedWatch:
+    """Stands in for ``watchfiles.awatch`` and yields exactly the batches a test reports.
+
+    With real watching, the OS and the debounce decide which changes share a batch; here the
+    test does. The watched paths do not matter, so a watch-path update does not restart it.
+    """
+
+    _send: MemoryObjectSendStream[_Batch]
+    _recv: MemoryObjectReceiveStream[_Batch]
+
+    def __init__(self) -> None:
+        self._send, self._recv = anyio.create_memory_object_stream[_Batch](8)
+
+    async def report(self, *paths: pathlib.Path) -> None:
+        """Report ``paths`` as modified, all in one batch."""
+        await self._send.send({(watchfiles.Change.modified, str(path)) for path in paths})
+
+    async def awatch(
+        self, *_paths: object, debounce: int, stop_event: anyio.Event
+    ) -> AsyncGenerator[_Batch]:
+        async for batch in self._recv:
+            yield batch
 
 
 def _helper_is_idle(event: OutputEvent) -> bool:
@@ -340,7 +370,9 @@ async def test_watched_startup_fingerprints_each_stage_once(
     calls = list[str]()
     compute = registry._compute_fingerprint
 
-    def _counting_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+    def _counting_compute(
+        stage_name: str, info: registry.RegistryStageInfo
+    ) -> tuple[dict[str, str], bool]:
         calls.append(stage_name)
         return compute(stage_name, info)
 
@@ -383,7 +415,9 @@ async def test_watched_startup_serves_rpc_while_fingerprinting(
     calls = list[str]()
     finished = list[str]()
 
-    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+    def _slow_compute(
+        stage_name: str, info: registry.RegistryStageInfo
+    ) -> tuple[dict[str, str], bool]:
         calls.append(stage_name)
         time.sleep(1.0)
         result = compute(stage_name, info)
@@ -471,7 +505,9 @@ async def test_reload_fingerprints_off_the_event_loop(
             reload_started = threading.Event()
             finished = list[str]()
 
-            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+            def _slow_compute(
+                stage_name: str, info: registry.RegistryStageInfo
+            ) -> tuple[dict[str, str], bool]:
                 reload_started.set()
                 time.sleep(1.0)
                 finished.append(stage_name)
@@ -755,7 +791,9 @@ async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
             compute = registry._compute_fingerprint
             reload_started = threading.Event()
 
-            def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+            def _slow_compute(
+                stage_name: str, info: registry.RegistryStageInfo
+            ) -> tuple[dict[str, str], bool]:
                 reload_started.set()
                 time.sleep(1.0)
                 return compute(stage_name, info)
@@ -821,6 +859,106 @@ async def test_data_edit_while_a_run_is_cancelling_waits_for_it(
 
 
 @pytest.mark.anyio
+async def test_pipeline_and_data_edits_in_one_batch_run_each_stage_once(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pipeline.py edit the watcher reports in one batch with a data edit runs each stage once.
+
+    The data edit was made before the reload the batch starts, so the reload's re-run covers
+    it, and the re-run is not cancelled and restarted for it. An editor that saves every buffer
+    at once, or a checkout that changes both files, makes such a batch.
+    """
+    watch = _ScriptedWatch()
+    monkeypatch.setattr(watchfiles, "awatch", watch.awatch)
+    pipeline_py = watch_project / "pipeline.py"
+    input_txt = watch_project / "data" / "raw" / "input.txt"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
+    pipeline = _helper_discover(watch_project)
+    keep_output = _helper_output_path(watch_project, pipeline, "reload/keep")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await _helper_wait_until_watching(eng)
+
+            pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
+            input_txt.write_text("y")
+            await watch.report(pipeline_py, input_txt)
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            await recorder.wait_for(_helper_is_idle, start=reload_index)
+
+            completions = sorted(
+                (event["stage"], event["status"])
+                for event in recorder.events[reload_index:]
+                if event["type"] == "stage_completed"
+            )
+            assert completions == [
+                ("reload/added", StageStatus.RAN),
+                ("reload/change", StageStatus.RAN),
+                ("reload/keep", StageStatus.RAN),
+            ], "each stage runs once: the batch's data edit does not cancel the reload's re-run"
+            assert keep_output.read_text() == "y-keep", "the re-run reads the data edit"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_still_broken_pipeline_and_data_edit_in_one_batch_run_nothing_until_fixed(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A batch with a still-broken pipeline.py and a data edit handles the data edit as an
+    invalid pipeline does: it is dropped, and the edit that fixes the pipeline reruns it.
+
+    The reload this batch starts leaves the pipeline invalid and starts no re-run, so nothing
+    covers the data edit but the data-change handler.
+    """
+    caplog.set_level(logging.DEBUG, logger="pivot.engine.engine")
+    watch = _ScriptedWatch()
+    monkeypatch.setattr(watchfiles, "awatch", watch.awatch)
+    pipeline_py = watch_project / "pipeline.py"
+    input_txt = watch_project / "data" / "raw" / "input.txt"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="removed"))
+    pipeline = _helper_discover(watch_project)
+    keep_output = _helper_output_path(watch_project, pipeline, "reload/keep")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await _helper_wait_until_watching(eng)
+
+            pipeline_py.write_text("def broken(:\n")
+            await watch.report(pipeline_py)
+            first_invalid = await recorder.wait_for(_helper_is_invalid_pipeline)
+
+            input_txt.write_text("y")
+            await watch.report(pipeline_py, input_txt)
+            await recorder.wait_for(_helper_is_invalid_pipeline, start=first_invalid + 1)
+            with anyio.fail_after(10):
+                while "ignoring run request" not in caplog.text:
+                    await anyio.sleep(0.05)
+            assert "re-run covers the change" not in caplog.text, "no re-run started to cover it"
+
+            pipeline_py.write_text(_helper_pipeline_source("-v1", third="added"))
+            await watch.report(pipeline_py)
+            reload_index = await recorder.wait_for(_helper_is_reload)
+            await recorder.wait_for(_helper_is_idle, start=reload_index)
+
+            assert not any(
+                event["type"] == "stage_completed" for event in recorder.events[:reload_index]
+            ), "nothing ran while the pipeline was invalid"
+            assert keep_output.read_text() == "y-keep", "the fixed pipeline's run reads the edit"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("refused", [False, True], ids=["valid", "refused"])
 async def test_run_requested_during_startup_snapshot_is_refused_at_once(
     watch_project: pathlib.Path,
@@ -840,7 +978,9 @@ async def test_run_requested_during_startup_snapshot_is_refused_at_once(
     compute = registry._compute_fingerprint
     finished = list[str]()
 
-    def _slow_compute(stage_name: str, info: registry.RegistryStageInfo) -> dict[str, str]:
+    def _slow_compute(
+        stage_name: str, info: registry.RegistryStageInfo
+    ) -> tuple[dict[str, str], bool]:
         time.sleep(1.0)
         finished.append(stage_name)
         return compute(stage_name, info)
@@ -1240,6 +1380,115 @@ async def test_run_that_finds_params_yaml_broken_marks_the_pipeline_invalid(
 
 
 @pytest.mark.anyio
+async def test_reload_adding_a_stage_with_a_missing_input_waits_for_the_file(
+    watch_project: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reload whose re-run finds an input missing leaves watch up with the pipeline invalid.
+
+    No stage runs while the input is absent. A write to another existing input is ignored; the
+    missing input itself, or a directory that could contain it, re-checks and resumes the run.
+    """
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    change_output = _helper_output_path(watch_project, pipeline, "reload/change")
+    recorder = _Recorder()
+    caplog.set_level(logging.DEBUG, logger="pivot.engine.engine")
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        rpc_source = agent_rpc.AgentRpcSource(
+            socket_path=watch_project / "unused.sock",
+            handler=agent_rpc.AgentRpcHandler(engine=eng),
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert change_output.read_text() == "x-v1"
+
+            # Edits `change` and adds `late`, which reads an input that does not exist yet
+            pipeline_py.write_text(
+                _helper_pipeline_source("-v2", third="late").replace(
+                    "    late(raw)\n", '    late(pipeline.input("missing.txt"))\n'
+                )
+            )
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            invalid = recorder.events[invalid_index]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert (
+                "Stage 'reload/late' depends on input 'missing.txt' (path data/raw/missing.txt), "
+                + "which does not exist"
+            ) in invalid["error"]
+            assert eng.pipeline_error == invalid["error"]
+            assert (
+                "Pipeline invalid: Stage 'reload/late' depends on input 'missing.txt'"
+                in caplog.text
+            )
+            assert "Pipeline invalid - waiting for fix" in caplog.text
+            await recorder.wait_for(_helper_is_idle, start=invalid_index)
+
+            run_send, run_recv = anyio.create_memory_object_stream[InputEvent](1)
+            response = await rpc_source._handle_request(
+                {"jsonrpc": "2.0", "method": "run", "id": 1}, run_send
+            )
+            assert response is not None
+            assert "error" in response, "RPC run is refused while the input is missing"
+            assert response["error"]["code"] == -32003
+            with pytest.raises(anyio.WouldBlock):
+                run_recv.receive_nowait()
+
+            event_start = len(recorder.events)
+            log_start = len(caplog.records)
+            (watch_project / "data" / "raw" / "input.txt").write_text("y")
+            with anyio.fail_after(5):
+                while not any(
+                    "ignoring run request" in record.getMessage()
+                    for record in caplog.records[log_start:]
+                ) and not any(
+                    event["type"] == "pipeline_reloaded" for event in recorder.events[event_start:]
+                ):
+                    await anyio.sleep(0.05)
+            assert any(
+                "ignoring run request" in record.getMessage()
+                for record in caplog.records[log_start:]
+            )
+            assert not any(
+                event["type"] == "pipeline_reloaded" for event in recorder.events[event_start:]
+            ), "an existing input does not re-check a missing input"
+            assert eng.pipeline_error == invalid["error"], "the input is still missing"
+
+            (watch_project / "data" / "raw" / "missing.txt").write_text("m")
+            valid_index = await recorder.wait_for(
+                _helper_is_reload,
+                start=invalid_index + 1,
+            )
+            late_done = await recorder.wait_for(_helper_completes("reload/late"), start=valid_index)
+            await recorder.wait_for(_helper_is_idle, start=late_done)
+
+            assert eng.pipeline_error is None, "the input's arrival makes the pipeline valid"
+            assert not any(
+                event["type"] == "stage_completed"
+                for event in recorder.events[first_idle:valid_index]
+            ), "nothing ran while the input was missing"
+            completed = [
+                event["stage"] for event in recorder.events if event["type"] == "stage_completed"
+            ]
+            assert completed.count("reload/late") == 1, "the new stage runs once"
+            assert recorder.completed("reload/late", start=valid_index) == StageStatus.RAN
+            assert recorder.completed("reload/change", start=valid_index) == StageStatus.RAN, (
+                "the stopped re-run runs the stage the reload edited"
+            )
+            assert change_output.read_text() == "y-v2", "on the input edited while waiting"
+            assert change_output.with_stem("late").read_text() == "m-late"
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
 async def test_stage_completed_output_identity_reaches_tui_as_artifact_identity(
     watch_project: pathlib.Path,
 ) -> None:
@@ -1275,3 +1524,132 @@ async def test_stage_completed_output_identity_reaches_tui_as_artifact_identity(
     summary = msg["output_summary"]
     assert summary is not None
     assert summary[0]["identity"] == identity
+
+
+@pytest.mark.anyio
+async def test_missing_input_that_arrives_with_its_directory_makes_the_pipeline_valid(
+    watch_project: pathlib.Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A missing input whose directory does not exist yet, then arrives with the file inside it.
+
+    Moving in a directory tree (mv, an unpacked archive, a download) shows the watcher the new
+    directory only; the file inside it never gets an event of its own. The arrival must still
+    count as the input's creation: the pipeline becomes valid and the stopped re-run runs.
+    """
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+
+            # Adds `late`, which reads newdir/sub/deep.txt; newdir does not exist yet
+            pipeline_py.write_text(
+                _helper_pipeline_source("-v1", third="late").replace(
+                    "    late(raw)\n",
+                    '    late(pipeline.input("deep.txt", path="newdir/sub/deep.txt"))\n',
+                )
+            )
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            invalid = recorder.events[invalid_index]
+            assert invalid["type"] == "pipeline_reloaded"
+            assert invalid["error"] is not None
+            assert "(path newdir/sub/deep.txt), which does not exist" in invalid["error"]
+            idle_index = await recorder.wait_for(_helper_is_idle, start=invalid_index)
+
+            # The input arrives with its directory, as `mv`, `cp -r` or `tar -x` deliver it
+            staging = tmp_path_factory.mktemp("staging")
+            (staging / "newdir" / "sub").mkdir(parents=True)
+            (staging / "newdir" / "sub" / "deep.txt").write_text("d")
+            os.rename(staging / "newdir", watch_project / "newdir")
+
+            valid_index = await recorder.wait_for(
+                _helper_is_reload,
+                start=idle_index,
+                timeout=30.0,
+            )
+            await recorder.wait_for(
+                _helper_completes("reload/late"), start=valid_index, timeout=30.0
+            )
+            assert recorder.completed("reload/late", start=valid_index) == StageStatus.RAN
+            assert eng.pipeline_error is None, "the input's arrival makes the pipeline valid"
+            tg.cancel_scope.cancel()
+
+
+class _FileSink:
+    """Sink that appends each event's type to a file, as ``--jsonl > <file>`` writes it."""
+
+    _path: pathlib.Path
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self._path = path
+
+    async def handle(self, event: OutputEvent) -> None:
+        with self._path.open("a") as handle:
+            handle.write(f"{event['type']}\n")
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.anyio
+async def test_output_written_inside_the_project_does_not_recheck_a_missing_input(
+    watch_project: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """While an input is missing, the session's own output inside the project re-checks nothing.
+
+    A session whose output lands in the watched root (``--jsonl > events.jsonl``, a log file)
+    writes on every re-check. Only a change at a missing input's path, or at a directory that
+    would contain it, checks the inputs again.
+    """
+    caplog.set_level(logging.INFO, logger="pivot.engine.engine")
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_helper_pipeline_source("-v1", third="other"))
+    pipeline = _helper_discover(watch_project)
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_sink(_FileSink(watch_project / "events.jsonl"))
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+
+            pipeline_py.write_text(
+                _helper_pipeline_source("-v1", third="late").replace(
+                    "    late(raw)\n", '    late(pipeline.input("missing.txt"))\n'
+                )
+            )
+            invalid_index = await recorder.wait_for(_helper_is_invalid_pipeline, start=first_idle)
+            idle_index = await recorder.wait_for(_helper_is_idle, start=invalid_index)
+            log_offset = len(caplog.text)
+
+            await anyio.sleep(10)
+            rechecks = [
+                event
+                for event in recorder.events[idle_index:]
+                if event["type"] == "pipeline_reloaded"
+            ]
+            assert not rechecks, f"{len(rechecks)} re-checks fed by the session's own output"
+            assert "checking again" not in caplog.text[log_offset:]
+
+            (watch_project / "data" / "raw" / "missing.txt").write_text("m")
+            valid_index = await recorder.wait_for(
+                _helper_is_reload,
+                start=idle_index,
+            )
+            await recorder.wait_for(_helper_completes("reload/late"), start=valid_index)
+            assert recorder.completed("reload/late", start=valid_index) == StageStatus.RAN
+            tg.cancel_scope.cancel()

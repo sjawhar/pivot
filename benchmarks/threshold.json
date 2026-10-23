@@ -1,0 +1,178 @@
+{
+  "chain-10/pipeline/cold": {
+    "cpu_pct": 3,
+    "wall_pct": 2
+  },
+  "chain-10/pipeline/edit": {
+    "cpu_pct": 4,
+    "wall_pct": 4
+  },
+  "chain-10/pipeline/touch": {
+    "cpu_pct": 4,
+    "wall_pct": 5
+  },
+  "chain-10/pipeline/warm": {
+    "cpu_pct": 3,
+    "wall_pct": 4
+  },
+  "chain-100/pipeline/cold": {
+    "cpu_pct": 2,
+    "wall_pct": 15
+  },
+  "chain-100/pipeline/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 5
+  },
+  "chain-100/pipeline/touch": {
+    "cpu_pct": 2,
+    "wall_pct": 8
+  },
+  "chain-100/pipeline/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "chain-1000/pipeline/cold": {
+    "cpu_pct": 2,
+    "wall_pct": 4
+  },
+  "chain-1000/pipeline/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "chain-1000/pipeline/touch": {
+    "cpu_pct": 4,
+    "wall_pct": 18
+  },
+  "chain-1000/pipeline/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "diamond-10/pipeline/cold": {
+    "cpu_pct": 5,
+    "wall_pct": 5
+  },
+  "diamond-10/pipeline/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 5
+  },
+  "diamond-10/pipeline/touch": {
+    "cpu_pct": 8,
+    "wall_pct": 10
+  },
+  "diamond-10/pipeline/warm": {
+    "cpu_pct": 5,
+    "wall_pct": 6
+  },
+  "diamond-100/pipeline/cold": {
+    "cpu_pct": 2,
+    "wall_pct": 3
+  },
+  "diamond-100/pipeline/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "diamond-100/pipeline/touch": {
+    "cpu_pct": 3,
+    "wall_pct": 2
+  },
+  "diamond-100/pipeline/warm": {
+    "cpu_pct": 3,
+    "wall_pct": 4
+  },
+  "diamond-1000/pipeline/cold": {
+    "cpu_pct": 2,
+    "wall_pct": 15
+  },
+  "diamond-1000/pipeline/edit": {
+    "cpu_pct": 3,
+    "wall_pct": 3
+  },
+  "diamond-1000/pipeline/touch": {
+    "cpu_pct": 2,
+    "wall_pct": 3
+  },
+  "diamond-1000/pipeline/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "fan-10/pipeline/cold": {
+    "cpu_pct": 4,
+    "wall_pct": 4
+  },
+  "fan-10/pipeline/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "fan-10/pipeline/touch": {
+    "cpu_pct": 2,
+    "wall_pct": 3
+  },
+  "fan-10/pipeline/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 3
+  },
+  "fan-100/pipeline/cold": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "fan-100/pipeline/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "fan-100/pipeline/touch": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "fan-100/pipeline/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "fan-1000/pipeline/cold": {
+    "cpu_pct": 3,
+    "wall_pct": 2
+  },
+  "fan-1000/pipeline/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "fan-1000/pipeline/touch": {
+    "cpu_pct": 2,
+    "wall_pct": 3
+  },
+  "fan-1000/pipeline/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "multi/pipeline/cold": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "multi/pipeline/edit": {
+    "cpu_pct": 3,
+    "wall_pct": 5
+  },
+  "multi/pipeline/touch": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "multi/pipeline/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "multi/task/cold": {
+    "cpu_pct": 2,
+    "wall_pct": 4
+  },
+  "multi/task/edit": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  },
+  "multi/task/touch": {
+    "cpu_pct": 2,
+    "wall_pct": 3
+  },
+  "multi/task/warm": {
+    "cpu_pct": 2,
+    "wall_pct": 2
+  }
+}

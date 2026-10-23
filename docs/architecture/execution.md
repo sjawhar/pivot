@@ -380,7 +380,7 @@ In watch mode, the Agent RPC `cancel` command sends a `CancelRequested` event, a
 
 ### Stopping mid-stage
 
-`Ctrl+C` at a terminal (outside the TUI), and the death of the Pivot process (`SIGKILL`, or `SIGTERM`, which Pivot does not handle), stop running stages mid-stage. Each running stage gets `pivot.executor.worker.WorkerTerminated`, a `KeyboardInterrupt`, raised where it is, so its `except KeyboardInterrupt` cleanup, `finally` blocks and context managers run, as they would for `Ctrl+C` in a plain Python program. Then:
+`Ctrl+C` at a terminal (outside the TUI), and the death of the Pivot process (`SIGKILL`, or `SIGTERM`, which Pivot does not handle outside the `pivot` command's `repro --watch --serve`; that serve mode handles SIGTERM as `Ctrl+C`), stop running stages mid-stage. Each running stage gets `pivot.executor.worker.WorkerTerminated`, a `KeyboardInterrupt`, raised where it is, so its `except KeyboardInterrupt` cleanup, `finally` blocks and context managers run, as they would for `Ctrl+C` in a plain Python program. Then:
 
 - The stage fails and nothing it produced is committed: no output enters the cache and no lock is written, even if the stage caught the exception and returned a value.
 - The worker exits once the stage has unwound, and no later than `worker.TERMINATION_GRACE_S` (10 s) after it was told to stop, whatever the stage does. Before exiting, it kills every process still descended from it. A process that detached (double-forked, a daemon, or orphaned when its parent exited) is not reached; the stage's cleanup must stop it, as it must stop a container, which the Docker daemon runs.

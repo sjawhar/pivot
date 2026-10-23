@@ -12,6 +12,8 @@ import datetime
 import json
 import logging
 import pathlib
+import signal
+import socket
 import threading
 import time
 import uuid
@@ -22,7 +24,7 @@ import anyio
 import click
 
 from pivot import config, project, registry
-from pivot.cli import _run_common, completion
+from pivot.cli import _run_common, completion, is_standalone_invocation
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -40,6 +42,8 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     import networkx as nx
 
     from pivot.cli import console as tui_console
@@ -509,7 +513,7 @@ def _run_serve_mode(
     pipeline = cli_decorators.get_pipeline_from_context()
     use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
-    async def serve_main() -> None:
+    async def _serve() -> None:
         # Build watch paths
         all_stages = cli_helpers.get_all_stages()
         engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
@@ -557,9 +561,74 @@ def _run_serve_mode(
             # Run until interrupted (watch mode never exits on its own)
             await eng.run(exit_on_completion=False)
 
-    # Run the async event loop
-    with contextlib.suppress(KeyboardInterrupt):
-        anyio.run(serve_main)
+    stop_signals = list[signal.Signals]()
+    if is_standalone_invocation() and threading.current_thread() is threading.main_thread():
+        # Serve takes a stop signal only at its default, as Python sets it at start when nothing
+        # else did. Any other disposition was set by whatever launched pivot, which owns that
+        # signal: SIG_IGN (`env --ignore-signal`, `trap ''`, a background job of a
+        # non-interactive shell), a C handler installed before Python started (getsignal() is
+        # None), or a Python handler.
+        for signum, default in (
+            (signal.SIGTERM, signal.SIG_DFL),
+            (signal.SIGINT, signal.default_int_handler),
+        ):
+            if signal.getsignal(signum) is default:
+                stop_signals.append(signum)
+    if not stop_signals:
+        # Only the `pivot` command owns its process, and only on the main thread may Python
+        # install handlers. Called in-process (`pivot.cli.main()` or the Click group), off the
+        # main thread, or with both stop signals owned by its launcher, serve changes no signal
+        # disposition, wakeup fd or mask, and its caller owns shutdown.
+        with contextlib.suppress(KeyboardInterrupt):
+            anyio.run(_serve)
+        return
+
+    # A service manager stops a server with SIGTERM, often more than once (GNU timeout signals
+    # the process and then its group). Serve installs its own handler for each stop signal and
+    # its own signal wakeup fd: whichever thread the kernel picks runs Python's C-level handler,
+    # which writes the signal's number to that fd, and the event loop reads it there. The first
+    # stop cancels the serve task group, so the engine unwinds, removes the socket and shuts
+    # down the worker pool; later ones are no-ops. No stop signal is reset to its default
+    # action, which would let one kill the process mid-shutdown.
+    stop_numbers = {int(signum) for signum in stop_signals}
+    wakeup_reader, wakeup_writer = socket.socketpair()
+    wakeup_reader.setblocking(False)
+    wakeup_writer.setblocking(False)
+
+    async def serve_main() -> None:
+        async with anyio.create_task_group() as tg:
+
+            async def _cancel_on_stop() -> None:
+                while True:
+                    await anyio.wait_readable(wakeup_reader)
+                    with contextlib.suppress(BlockingIOError):
+                        if stop_numbers.intersection(wakeup_reader.recv(4096)):
+                            tg.cancel_scope.cancel()
+                            return
+
+            tg.start_soon(_cancel_on_stop)
+            await _serve()
+            tg.cancel_scope.cancel()
+
+    with wakeup_reader, wakeup_writer:
+        # After the first stop nothing drains the pair, so a full buffer is expected.
+        signal.set_wakeup_fd(wakeup_writer.fileno(), warn_on_full_buffer=False)
+        for signum in stop_signals:
+            signal.signal(signum, _leave_stop_to_the_loop)
+            # As asyncio's own signal handling does: interrupted system calls restart.
+            signal.siginterrupt(signum, False)
+        try:
+            anyio.run(serve_main)
+        finally:
+            # Stop signals stay ignored through the rest of the process's shutdown.
+            for signum in stop_signals:
+                signal.signal(signum, signal.SIG_IGN)
+            # No signal may write to the pair's descriptor once it is closed and reused.
+            signal.set_wakeup_fd(-1)
+
+
+def _leave_stop_to_the_loop(_signum: int, _frame: FrameType | None) -> None:
+    """Do nothing: serve's event loop reads the stop signal from its wakeup fd."""
 
 
 def _run_oneshot_mode(

@@ -134,8 +134,11 @@ The Engine shuts its workers and manager down when it exits. An atexit fallback 
 when code creates a reusable executor outside an Engine context.
 
 Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler).
-The output-queue manager therefore starts with `_exit_when_parent_dies`, a thread that exits it
-once its parent pid changes. Every worker starts with `core._init_worker`, which runs
+The output-queue manager therefore starts with `_init_manager`, which runs
+`_exit_when_parent_dies`, a thread that exits it once its parent pid changes. It also makes the
+manager ignore SIGTERM, as multiprocessing makes it ignore SIGINT: a stop sent to the whole
+process group (systemd, GNU `timeout`) would otherwise kill it before its finalizer removes its
+`pymp-*` directory. Every worker starts with `core._init_worker`, which runs
 `worker.unwind_when_stopped` (and, while a discovery's import session lasts, installs
 discovery's checked loader):
 

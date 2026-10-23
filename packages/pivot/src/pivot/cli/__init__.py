@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import importlib
 import logging
 import sys
@@ -77,6 +78,14 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "Update imported artifacts from source repos.",
     ),
 }
+
+
+_standalone_invocation = contextvars.ContextVar("standalone_invocation", default=False)
+
+
+def is_standalone_invocation() -> bool:
+    """Return whether the console-script entry point invoked the current command."""
+    return _standalone_invocation.get()
 
 
 class CliContext(TypedDict):
@@ -185,9 +194,24 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
 
 
 def main() -> None:
-    """Main CLI entry point."""
+    """Public CLI entry point for embedders. Serve mode changes no signal state here: the
+    caller's handlers decide what SIGTERM and Ctrl-C do, and the caller owns shutdown."""
     cli()
 
 
+def _console_main() -> None:
+    """Run the `pivot` command, which owns its process: serve mode takes over SIGTERM and Ctrl-C
+    and keeps them ignored through process shutdown."""
+    token = _standalone_invocation.set(True)
+    try:
+        cli()
+    finally:
+        _standalone_invocation.reset(token)
+
+
 if __name__ == "__main__":
-    main()
+    # Run as a script, this file is a second copy of the module. Serve reads the flag of the
+    # package, pivot.cli, so the script runs that copy's console entry point.
+    import pivot.cli
+
+    pivot.cli._console_main()  # pyright: ignore[reportPrivateUsage] - the same module, imported as the package

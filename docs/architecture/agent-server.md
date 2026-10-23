@@ -8,7 +8,7 @@ When running in watch mode with the TUI, Pivot starts an Agent Server that expos
 
 ## Protocol
 
-**Transport:** Unix domain socket (path provided by the TUI when starting the server)
+**Transport:** Unix domain socket. `pivot repro --watch --serve` and `pivot repro --watch --tui` listen on `.pivot/agent.sock` in the project root; the one-shot `pivot repro --tui` and `pivot run --tui` listen on `agent.sock` in the state directory (`core.state_dir`, `.pivot` by default). A socket address holds at most 108 bytes on Linux and 104 on macOS; Pivot serves a project at any depth, and a client of a deeper project connects by the relative path `.pivot/agent.sock` from the project root, as in the example below. The `pivot` command's serve mode stops on SIGTERM as it does on Ctrl-C, including a stop sent more than once or to its whole process group (GNU `timeout`, `systemctl stop`): it removes the socket and its worker pool's temporary directory and exits 0. A SIGKILL leaves the socket, which the next start removes. Serve takes a stop signal only if it is at its default when `pivot` starts. A signal that whatever launched `pivot` ignored (`env --ignore-signal`, `trap ''`) or gave a handler (a C program that embeds Python, an `LD_PRELOAD` library, Python startup code) belongs to that launcher, and serve leaves it alone. Serve run in-process (`pivot.cli.main()` or the Click group) changes no signal state: the caller's own handlers decide what SIGTERM does, and the caller owns shutdown.
 
 **Protocol:** JSON-RPC 2.0
 
@@ -191,7 +191,7 @@ The Engine uses locks to protect atomic state transitions. When a `run` request 
 | `-32603` | Internal error | Server-side exception; a query that raises a Pivot error (for example a stage that fails to fingerprint) gets this code with the error's message |
 | `-32001` | Execution in progress | A run is already executing |
 | `-32002` | Stage not found | Requested stage doesn't exist (includes suggestions for typos) |
-| `-32003` | Pipeline invalid | `run` or `commit` refused because the watched pipeline is invalid (it fails to load, a stage fails to fingerprint, or `params.yaml` fails its checks, at startup or after an edit); the message carries the error. Refused until an edit reloads a good pipeline, so a commit never records outputs the current code did not produce |
+| `-32003` | Pipeline invalid | `run` or `commit` refused because the watched pipeline is invalid (it fails to load, a stage fails to fingerprint, or `params.yaml` fails its checks, at startup or after an edit; or a run found a stage over its resource capacity, or an input missing that left it no stage to run); the message carries the error. Refused until an edit reloads a good pipeline, or a data change finds the missing input, so a commit never records outputs the current code did not produce |
 | `-32004` | Engine starting | `run` or `commit` refused because a watched engine is fingerprinting stages: its startup snapshot ("Engine is starting") or a code reload ("Engine is reloading"). The reply is immediate; retry once the engine is ready |
 
 ## Client Example

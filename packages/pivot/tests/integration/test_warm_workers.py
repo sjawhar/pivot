@@ -787,7 +787,8 @@ with Pipeline("warm") as pipeline:
 async def test_forced_run_restarts_workers_after_in_function_helper_changes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A helper first imported inside a stage is reported by the worker and invalidates it."""
+    """A helper first imported inside a stage at run time is reported by the worker and
+    invalidates it. (A static body import of a module discovery did not load is refused.)"""
     module_name = f"warm_in_function_{uuid.uuid4().hex}"
     root = tmp_path.resolve() / "project"
     root.mkdir()
@@ -802,8 +803,9 @@ from pivot.compose import Pipeline, stage
 
 @stage
 def value() -> str:
-    import {module_name}
-    return {module_name}.value()
+    scope = {{}}
+    exec("import {module_name} as helper", scope)
+    return scope["helper"].value()
 
 
 with Pipeline("warm") as pipeline:
@@ -1221,8 +1223,7 @@ def test_command_starts_no_more_workers_than_stages_that_can_run(
     worker_limit: int,
 ) -> None:
     """A command starts no workers beyond the stages its scheduler admits."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _WIDTH_PIPELINE)
     _helper_configure_workers(root, max_workers)
     env, worker_log = _helper_logging_env(tmp_path)
@@ -1253,8 +1254,7 @@ def test_tui_restores_tracked_input_when_missing(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
     """The engine restores a missing tracked input before the stage that consumes it runs."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     _helper_configure_workers(root, 8)
     env, _ = _helper_logging_env(tmp_path)
@@ -1292,8 +1292,7 @@ def test_tui_warns_once_about_a_changed_tracked_file_whenever_the_engine_checks_
 ) -> None:
     """A tracked file edited since `pivot track` is reported once, outside the TUI's screen,
     whether the engine checks it before the TUI starts or while the TUI runs."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env, worker_log = _helper_logging_env(tmp_path)
     tracked = root / "data" / "raw" / "x.txt"
@@ -1364,8 +1363,7 @@ def test_watch_tui_warns_once_about_a_changed_tracked_file_across_its_runs(
     """`pivot repro --watch --tui` checks the tracked files on every run. A tracked file edited
     since `pivot track`, and edited again while the session runs, is reported once, outside the
     TUI's screen, whether the startup run checks it before the TUI starts or while it runs."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env, _ = _helper_logging_env(tmp_path)
     hook = tmp_path / "hook" / "sitecustomize.py"
@@ -1422,8 +1420,7 @@ def test_watch_tui_prints_the_pipeline_error_it_shows_at_exit_after_a_second_bre
     """A watch session whose pipeline breaks one way, then another, and is still broken when
     the user quits prints the error the TUI shows, in full, once: `Pipeline invalid: <error>`
     and `Pipeline invalid - waiting for fix`, as plain `pivot repro --watch` prints them."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
@@ -1524,8 +1521,7 @@ def test_watch_tui_prints_a_pipeline_error_by_the_engines_state_not_the_tuis(
     """After a watch session the terminal reports the pipeline error the engine still has when
     the user quits, even when the TUI has not yet shown the latest reload: a pipeline still
     broken prints its error, and one already repaired prints nothing stale."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env, _ = _helper_logging_env(tmp_path)
     hook = tmp_path / "hook" / "sitecustomize.py"
@@ -1654,8 +1650,7 @@ def test_repro_tui_runs_stages_available_with_keep_going(
     tmp_path: pathlib.Path,
 ) -> None:
     """Across all pipelines with keep-going, the run leaves out stages with a missing input."""
-    # A short directory name keeps the TUI's .pivot/agent.sock within AF_UNIX's 107-byte limit.
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
         (root / name).mkdir(parents=True)
         (root / name / "pipeline.py").write_text(source)
@@ -1746,7 +1741,7 @@ async def test_watch_reload_keeps_going_past_a_pipeline_with_a_missing_input(
 ) -> None:
     """Across all pipelines with keep-going, a reload re-runs the stages the first run could
     run and leaves out the ones a missing input breaks."""
-    root = tmp_path.resolve() / "p"
+    root = tmp_path.resolve() / "project"
     for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
         (root / name).mkdir(parents=True)
         (root / name / "pipeline.py").write_text(source)

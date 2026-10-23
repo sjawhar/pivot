@@ -1,7 +1,6 @@
 # pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportImplicitOverride=false
 
 import ast
-import dataclasses
 import enum
 import importlib
 import importlib.util
@@ -233,41 +232,6 @@ class _HelperAnnotatedClass(_HelperBase):
         self.model = _HelperPydanticModel()
 
 
-@dataclasses.dataclass
-class _HelperDataClassNoMethods:
-    value: int
-
-
-@dataclasses.dataclass
-class _HelperDataClassWithMethod:
-    value: int
-
-    def custom(self) -> int:
-        return self.value
-
-
-@dataclasses.dataclass
-class _HelperDataClassWithDunder:
-    value: int
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-
-class _HelperPydanticModelWithAllowedMethod(BaseModel):
-    value: int
-
-    def model_post_init(self, __context: typing.Any) -> None:
-        return None
-
-
-class _HelperPydanticModelWithUserMethod(BaseModel):
-    value: int
-
-    def compute(self) -> int:
-        return self.value + 1
-
-
 def _helper_parse_annotation(expr: str) -> ast.AST:
     """Parse an annotation expression into an AST node."""
     tree = ast.parse(f"x: {expr}")
@@ -343,7 +307,10 @@ def test_helper_function_captured():
 
     assert "self:main" in fp
     assert _definition_key("func", helper) in fp
-    assert len(fp) == 2
+    modules = {key for key in fp if key.startswith("module:")}
+    assert f"module:{helper.__module__}" in modules
+    assert all(f"{helper.__module__}.".startswith(f"{key[7:]}.") for key in modules), modules
+    assert len(fp) == 2 + len(modules)
 
 
 def test_constant_captured():
@@ -1177,43 +1144,33 @@ def test_hash_function_no_code_object():
     assert len(h) == 16  # xxhash64 hexdigest
 
 
-def test_check_data_class_methods_allows_dunders_and_pydantic_hooks():
-    """Dunder methods and allowed Pydantic hooks should be allowed."""
-    fingerprint._check_data_class_methods(_HelperDataClassNoMethods)
-    fingerprint._check_data_class_methods(_HelperDataClassWithDunder)
-    fingerprint._check_data_class_methods(_HelperPydanticModelWithAllowedMethod)
-
-
-def test_check_data_class_methods_rejects_user_methods():
-    """User-defined methods on data classes should raise errors."""
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperDataClassWithMethod)
-
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperPydanticModelWithUserMethod)
+def _helper_check_dynamic(func: typing.Callable[..., object]) -> None:
+    tree = fingerprint._source_tree(func)
+    assert tree is not None, "the helper must have source"
+    fingerprint._check_dynamic_name_access(func, tree)
 
 
 def test_check_dynamic_name_access_allows_literal_getattr():
     """Literal getattr usage should be allowed."""
-    fingerprint._check_dynamic_name_access(_helper_static_getattr)
+    _helper_check_dynamic(_helper_static_getattr)
 
 
 def test_check_dynamic_name_access_rejects_dynamic_getattr():
     """Dynamic getattr usage should be rejected."""
     with pytest.raises(exceptions.StageDefinitionError, match="getattr"):
-        fingerprint._check_dynamic_name_access(_helper_dynamic_getattr)
+        _helper_check_dynamic(_helper_dynamic_getattr)
 
 
 def test_check_dynamic_name_access_rejects_globals():
     """globals() usage should be rejected."""
     with pytest.raises(exceptions.StageDefinitionError, match="globals"):
-        fingerprint._check_dynamic_name_access(_helper_uses_globals)
+        _helper_check_dynamic(_helper_uses_globals)
 
 
 def test_check_dynamic_name_access_rejects_import_module():
     """import_module usage should be rejected."""
     with pytest.raises(exceptions.StageDefinitionError, match="dynamic imports"):
-        fingerprint._check_dynamic_name_access(_helper_uses_import_module)
+        _helper_check_dynamic(_helper_uses_import_module)
 
 
 def test_compute_function_hash_warns_when_source_unavailable_for_user_code(
@@ -1467,6 +1424,22 @@ def test_get_loader_fingerprint_returns_manifest():
 
     assert isinstance(fp, dict)
     assert len(fp) > 0
+
+
+def test_covered_user_modules_reads_every_module_key_form():
+    """Bare `module:` keys and the `dep:`/`out:`-prefixed keys a loader's walk adds both count;
+    other keys that mention a module do not."""
+    manifest = {
+        "self:count": "a",
+        "module:helpers": "",
+        "dep:n:module:helpers.lib": "",
+        "out:t/count:out:module:other.mod": "",
+        "func:helpers.lib.value": "b",
+        "const:module.NAME": "1",
+        "dep:n:loader:helpers.myloader.Scaled:load": "c",
+    }
+
+    assert fingerprint.covered_user_modules(manifest) == {"helpers", "helpers.lib", "other.mod"}
 
 
 def test_loader_fingerprint_includes_load_method():
@@ -2580,6 +2553,78 @@ def test_recorded_reads_detect_each_changed_live_value(
         sys.modules.pop("reads_settings", None)
 
 
+_REPLAY_LIB = """\
+import replay_settings
+
+LIMIT = replay_settings.SOURCE["method"]
+
+
+class Walker:
+    def step(self, x):
+        return x + LIMIT
+"""
+
+_REPLAY_BODY = """\
+import replay_settings
+
+BODY = replay_settings.SOURCE["body"]
+"""
+
+_REPLAY_STAGE = """\
+from replay_lib import Walker
+
+
+def stage(x):
+    import replay_body
+
+    return Walker().step(x) + replay_body.BODY
+"""
+
+
+@pytest.mark.parametrize("changed", ["method", "body"])
+def test_recorded_reads_replay_method_and_body_import_reads(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """A cache hit re-reads what a user class's method read (`m:NAME`) and what a module the
+    body imports holds (`bi:MODULE`), each computed at import from a module that is not
+    edited."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "replay_settings.py").write_text("SOURCE = {'method': 1, 'body': 2}\n")
+    (tmp_path / "replay_lib.py").write_text(_REPLAY_LIB)
+    (tmp_path / "replay_body.py").write_text(_REPLAY_BODY)
+    (tmp_path / "replay_stage.py").write_text(_REPLAY_STAGE)
+    writes = list[tuple[bytes, bytes]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
+    names = ("replay_stage", "replay_lib", "replay_body")
+    try:
+        settings = importlib.import_module("replay_settings")
+        importlib.import_module("replay_body")
+        module = importlib.import_module("replay_stage")
+        manifest = fingerprint.get_stage_fingerprint_cached("r/stage", module.stage)
+        assert manifest["const:replay_lib.LIMIT"] == "1", manifest
+        assert manifest["const:replay_body.BODY"] == "2", manifest
+        ((_key, raw),) = writes
+        reads = json.loads(raw)["r"]
+        for name in names:
+            del sys.modules[name]
+        importlib.import_module("replay_body")
+        module = importlib.import_module("replay_stage")
+        assert fingerprint._recorded_reads_hold(module.stage, reads), "re-import alone must hit"
+
+        vars(settings)["SOURCE"][changed] += 100
+        for name in names:
+            del sys.modules[name]
+        importlib.import_module("replay_body")
+        module = importlib.import_module("replay_stage")
+
+        assert fingerprint._recorded_reads_hold(module.stage, reads) is False
+    finally:
+        for name in (*names, "replay_settings"):
+            sys.modules.pop(name, None)
+
+
 def _helper_make_scaler(factor: int) -> typing.Callable[[int], int]:
     def scaler(x: int) -> int:
         return x * factor
@@ -2633,14 +2678,15 @@ def _helper_reads_class_attributes() -> int:
 
 def test_class_attributes_a_stage_reads_are_tracked_one_by_one() -> None:
     """A scalar is `const:<class>.<NAME>`, an Enum member is name and value, a plain function
-    is walked; a staticmethod is left to the class AST hash."""
+    is walked; a staticmethod is walked as one of the class's methods, not read as a value."""
     manifest = fingerprint.get_stage_fingerprint(_helper_reads_class_attributes)
     config = f"{__name__}._ClassReadConfig"
 
     assert manifest[f"const:{config}.SCALE"] == "3", manifest
     assert manifest[f"const:{config}.MODE"] == '_ClassReadMode.FAST="fast"', manifest
     assert f"func:{__name__}._helper_class_callback" in manifest, manifest
-    assert not any(key.endswith(f"{config}.static") for key in manifest), manifest
+    assert f"func:{config}.static" in manifest, manifest
+    assert not any(key.startswith(f"const:{config}.static") for key in manifest), manifest
     assert f"class:{config}" in manifest, manifest
     assert not any(key.startswith(f"const:{config}.__") for key in manifest), manifest
 

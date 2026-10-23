@@ -215,6 +215,7 @@ def _stage(name: str, deps: list[str], out: str) -> RegistryStageInfo:
         no_fingerprint=False,
         code_deps=[],
         input_paths={},
+        unsafe_fingerprint=False,
     )
 
 

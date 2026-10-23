@@ -626,6 +626,8 @@ def _stage_info(
         project_state_dir=project / ".pivot",
         collection_params={},
         incremental_inputs={},
+        unsafe_fingerprint=False,
+        no_fingerprint=False,
     )
 
 

@@ -7,10 +7,13 @@ import json
 import logging
 import os
 import pathlib
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
+import typing
 from typing import TYPE_CHECKING, Annotated
 
 import numpy as np
@@ -25,6 +28,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     import click.testing
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 # =============================================================================
 # Module-level stage functions (required for pickling)
@@ -740,7 +745,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     # The child logs every RPC disconnect. Files avoid a PIPE filling and blocking it.
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+            [_PIVOT_BIN, "repro", "--watch", "--serve"],
             cwd=tmp_path,
             env=env,
             stdout=stdout_file,
@@ -809,7 +814,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
 
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
-            ["uv", "run", "pivot", "repro", "--watch", "--serve"],
+            [_PIVOT_BIN, "repro", "--watch", "--serve"],
             cwd=project,
             env=env,
             stdout=stdout_file,
@@ -1618,9 +1623,6 @@ def test_repro_included_pipeline_file_target_runs(
     assert summary in result.output, result.output
 
 
-_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
-
-
 def _pivot_with_hash_seed(
     cwd: pathlib.Path, hash_seed: int, *args: str
 ) -> subprocess.CompletedProcess[str]:
@@ -1989,3 +1991,130 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def _watch_missing_input_pipeline(*, missing: bool) -> str:
+    late = (
+        """\
+
+@stage
+def late(text: str) -> str:
+    return text + "-late"
+"""
+        if missing
+        else ""
+    )
+    wire_late = '    late(pipeline.input("missing.txt", t=str))\n' if missing else ""
+    return f"""\
+from pivot import Pipeline, stage
+
+
+@stage
+def keep(text: str) -> str:
+    return text + "-keep"
+{late}
+with Pipeline("reload") as pipeline:
+    keep(pipeline.input("input.txt", t=str))
+{wire_late}"""
+
+
+def _start_watch_jsonl(
+    project: pathlib.Path,
+) -> tuple[subprocess.Popen[str], queue.Queue[str]]:
+    process = subprocess.Popen(
+        [_PIVOT_BIN, "repro", "--watch", "--jsonl", "--debounce", "50"],
+        cwd=project,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    messages = queue.Queue[str]()
+
+    def read(stream: typing.TextIO) -> None:
+        for line in stream:
+            messages.put(line)
+
+    assert process.stdout is not None and process.stderr is not None
+    threading.Thread(target=read, args=(process.stdout,), daemon=True).start()
+    threading.Thread(target=read, args=(process.stderr,), daemon=True).start()
+    return process, messages
+
+
+def _wait_for_watch_event(
+    process: subprocess.Popen[str],
+    messages: queue.Queue[str],
+    predicate: Callable[[dict[str, typing.Any]], bool],
+) -> dict[str, typing.Any]:
+    deadline = time.monotonic() + 30
+    seen = list[str]()
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            pytest.fail(f"watch exited {process.returncode}: {''.join(seen)}")
+        try:
+            line = messages.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        seen.append(line)
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        typed_event = typing.cast("dict[str, typing.Any]", event)
+        if predicate(typed_event):
+            return typed_event
+    pytest.fail(f"timed out waiting for event: {''.join(seen)}")
+
+
+def test_repro_watch_reload_with_missing_input_stays_alive_and_recovers(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A real watch CLI keeps running until a newly added stage's input appears."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    (project / ".pivot").mkdir()
+    (project / "data/raw").mkdir(parents=True)
+    (project / "data/raw/input.txt").write_text("x\n")
+    pipeline_path = project / "pipeline.py"
+    pipeline_path.write_text(_watch_missing_input_pipeline(missing=False))
+    process, messages = _start_watch_jsonl(project)
+    try:
+        _wait_for_watch_event(
+            process,
+            messages,
+            lambda event: event.get("type") == "stage_complete"
+            and event.get("stage") == "reload/keep",
+        )
+        pipeline_path.write_text(_watch_missing_input_pipeline(missing=True))
+        invalid = _wait_for_watch_event(
+            process,
+            messages,
+            lambda event: event.get("type") == "pipeline_reloaded"
+            and event.get("error") is not None,
+        )
+        assert process.poll() is None, invalid
+
+        (project / "data/raw/missing.txt").write_text("m\n")
+        recovered = _wait_for_watch_event(
+            process,
+            messages,
+            lambda event: event.get("type") == "pipeline_reloaded" and event.get("error") is None,
+        )
+        assert recovered["error"] is None
+        late = _wait_for_watch_event(
+            process,
+            messages,
+            lambda event: event.get("type") == "stage_complete"
+            and event.get("stage") == "reload/late",
+        )
+        assert late["status"] == "ran"
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()

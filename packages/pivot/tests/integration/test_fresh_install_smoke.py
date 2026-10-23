@@ -3,14 +3,14 @@
 The rest of the suite imports pivot from the workspace venv, where every dev dependency is
 present. This test catches what only a user's clean install sees: undeclared runtime
 dependencies, files missing from the wheel, and a broken console script. It needs uv and
-registry access, so it runs only in CI.
+registry access, so it runs only in CI, which runs the suite without uv on PATH and names uv's
+executable in ``PIVOT_TEST_UV``.
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
-import shutil
 import signal
 import subprocess
 import time
@@ -184,8 +184,9 @@ def _run(
 
 def _install_wheel(tmp_path: pathlib.Path, *requirements: str) -> str:
     """Build pivot's wheel, install it and ``requirements`` into a new venv, return ``pivot``."""
-    uv = shutil.which("uv")
-    assert uv is not None, "CI installs uv before running tests"
+    uv = os.environ.get("PIVOT_TEST_UV", "")
+    if not (pathlib.Path(uv).is_file() and os.access(uv, os.X_OK)):
+        pytest.fail(f"PIVOT_TEST_UV must name the uv executable; it is {uv!r}", pytrace=False)
     dist = tmp_path / "dist"
     build = _run([uv, "build", "--package", "pivot", "--wheel", "--out-dir", str(dist)], _REPO_ROOT)
     assert build.returncode == 0, build.stderr
