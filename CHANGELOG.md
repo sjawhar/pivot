@@ -2,6 +2,67 @@
 
 <!-- version list -->
 
+## v0.5.6 (2026-10-23)
+
+### Bug Fixes
+
+- **fingerprint**: A result marked as not reusable is never restored from the run cache, and pivot
+  commit keeps the mark ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage reruns when a method of a user class it uses changes, including dataclass
+  methods ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage reruns when a user module imported inside the stage body changes, whether
+  the import is absolute, relative or inside a function
+  ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: A stage whose run imports a user module its fingerprint does not cover warns
+  once, naming the module, and is not reused ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: After upgrading, each stage whose fingerprint now covers more code, such as one
+  that uses a user class or imports a user module in its body, reruns once; later runs reuse results
+  as before ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Imports made by a covered import, on any thread it starts, count as covered;
+  threads that pivot starts never do ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Refuse at definition a stage whose body imports a user module that is not loaded,
+  with the import to add ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+- **fingerprint**: Track user-class methods and in-body imports, refuse dynamic imports, keep unsafe
+  results out of the run cache ([#496](https://github.com/sjawhar/pivot/pull/496),
+  [`23a7d5e`](https://github.com/sjawhar/pivot/commit/23a7d5ee1d2faa368ebf63184214c6e900e25696))
+
+### Continuous Integration
+
+- Benchmark wall time and CPU against main on every pull request
+  ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: An interrupted run.py stops the measured pivot run, sweeps its session and restores the
+  caller's signal mask ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Derive thresholds from recorded A/A runs with a 2% floor, and exit 2 on any input the
+  comparator cannot read ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Measure each pull request's merge commit against its first parent, for wall time and
+  CPU at pipeline and task scope ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+- **bench**: Report a regression only when the median change is over the calibrated threshold and a
+  paired bootstrap interval lies wholly above 1 ([#501](https://github.com/sjawhar/pivot/pull/501),
+  [`600ad58`](https://github.com/sjawhar/pivot/commit/600ad58cd27abd30b39106ec39d459d7839cc5b6))
+
+
 ## v0.5.5 (2026-10-22)
 
 ### Bug Fixes
