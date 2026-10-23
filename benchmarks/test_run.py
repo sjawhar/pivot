@@ -99,15 +99,22 @@ def test_interrupted_run_stops_the_command_it_measures(
 
 
 @pytest.mark.usefixtures("stand_in_session")
-@pytest.mark.parametrize("second", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param(signal.SIGINT, signal.SIGINT, id="sigint-then-sigint"),
+        pytest.param(signal.SIGINT, signal.SIGTERM, id="sigint-then-sigterm"),
+        pytest.param(signal.SIGTERM, signal.SIGINT, id="sigterm-then-sigint"),
+    ],
+)
 def test_second_signal_during_the_grace_period_still_stops_the_command(
-    tmp_path: pathlib.Path, second: signal.Signals
+    tmp_path: pathlib.Path, first: signal.Signals, second: signal.Signals
 ) -> None:
     pivot = run_test_helpers.make_stand_in(tmp_path, run_test_helpers.DEAF_STAND_IN)
     argv = [sys.executable, str(_RUN_PY), *run_test_helpers.run_argv(tmp_path, pivot)]
     harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     sid = int(_helper_read_when_written(tmp_path / _SID_FILE))
-    harness.send_signal(signal.SIGINT)
+    harness.send_signal(first)
     # The stand-in has its SIGINT, so run.py is waiting out the grace period.
     _helper_read_when_written(tmp_path / _SIGINT_FILE)
 
@@ -119,7 +126,20 @@ def test_second_signal_during_the_grace_period_still_stops_the_command(
     exit_code = harness.wait(timeout=30)
     assert not _helper_session_alive(sid), "a second signal must not orphan the measured session"
     # The first signal decides run.py's status; later signals only wait for its stop to finish.
-    assert exit_code in (-signal.SIGINT, 128 + signal.SIGINT), exit_code
+    assert exit_code in (-first, 128 + first), exit_code
+
+
+def test_wakeup_pipe_sigterm_before_sigint_decides_the_stop_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    monkeypatch.setattr(run, "_stop_signal_read_fd", read_fd)
+    try:
+        os.write(write_fd, bytes((signal.SIGTERM, signal.SIGINT)))
+        assert run._first_queued_stop_signal(signal.SIGINT) == signal.SIGTERM  # pyright: ignore[reportPrivateUsage] - controlled pipe test
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 def test_main_leaves_the_callers_sigterm_handler_in_place(tmp_path: pathlib.Path) -> None:
