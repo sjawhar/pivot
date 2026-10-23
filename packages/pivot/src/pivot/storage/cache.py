@@ -675,9 +675,10 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
         _ = publish_cache_object(staged, cache_path)
 
 
-# A link the filesystem cannot make (across devices, refused, unsupported, or past the
-# filesystem's link limit) falls through to the next checkout mode.
-FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES, errno.EMLINK}
+# A link the filesystem cannot make (across devices, refused, or unsupported) falls through to
+# the next checkout mode. EMLINK is not here: it is one object's limit, not the filesystem's
+# (see _checkout_with_fallback).
+FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES}
 
 
 def _stage_checkout(
@@ -1027,8 +1028,14 @@ def _checkout_with_fallback(
     """Try each link mode in order until one succeeds.
 
     With ``keep_existing_copy``, reaching COPY while ``path`` still exists leaves it in place:
-    the caller guarantees it already holds the cached bytes. A failed link attempt clears
-    ``path`` first, so COPY then copies from the cache as usual.
+    the caller guarantees it already holds the cached bytes. A failed link attempt leaves
+    ``path`` as it was, since each mode builds its entry under a staging name and renames it
+    over ``path`` only once it is made.
+
+    A hard link refused with EMLINK means ``cache_path`` alone already has as many links as the
+    filesystem allows (65,000 on ext4); other objects still link. That entry is copied, as if
+    COPY came next, whatever the order holds: a copy is always correct, where a symlink into the
+    cache dangles once the workspace is moved or packed without it.
 
     ``executable`` is None for a single-file output: ``FileHash`` has no isexec field, so a
     single file's mode is never part of any hash and there is no wrong permission to guard
@@ -1072,6 +1079,17 @@ def _checkout_with_fallback(
             )
             return
         except OSError as e:
+            if mode == CheckoutMode.HARDLINK and e.errno == errno.EMLINK:
+                logger.debug(f"Cache object {cache_path} is at the hard-link limit; copying it")
+                if not (keep_existing_copy and path.exists()):
+                    _checkout_from_cache(
+                        path,
+                        cache_path,
+                        CheckoutMode.COPY,
+                        executable=executable,
+                        staging_path=staging_path,
+                    )
+                return
             if e.errno not in FALLBACK_ERRNO or is_last:
                 raise
             logger.debug(f"Checkout mode {mode.value} failed ({e}), trying next mode")
@@ -1122,8 +1140,10 @@ def save_to_cache(
         path: File or directory to save
         cache_dir: Cache directory
         state_db: Optional state database for hash caching
-        checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
-        checkout_modes: Ordered list of link modes to try with fallback on failure.
+        checkout_mode: Single link mode, with no fallback except that a hard link refused with
+            EMLINK is copied. Takes precedence over checkout_modes.
+        checkout_modes: Ordered list of link modes to try with fallback on failure; a hard link
+            refused with EMLINK is copied whatever the order is.
         state_dir: State directory for the workspace target's restore lock.
     """
     effective_modes = _resolve_checkout_modes(checkout_mode, checkout_modes)
@@ -1377,8 +1397,10 @@ def restore_from_cache(
         path: Target path to restore to
         output_hash: Hash info for the cached output
         cache_dir: Cache directory
-        checkout_mode: Single link mode (no fallback). Takes precedence over checkout_modes.
-        checkout_modes: Ordered list of link modes to try with fallback on failure.
+        checkout_mode: Single link mode, with no fallback except that a hard link refused with
+            EMLINK is copied. Takes precedence over checkout_modes.
+        checkout_modes: Ordered list of link modes to try with fallback on failure; a hard link
+            refused with EMLINK is copied whatever the order is.
         state_dir: State directory for restore locks and crash cleanup.
         lock_token: Target token yielded by an already-held restore_lock for path.
     """
