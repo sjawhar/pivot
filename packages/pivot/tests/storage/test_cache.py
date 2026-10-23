@@ -2595,12 +2595,12 @@ def test_copy_to_cache_raises_a_failed_link(
     assert _helper_entries(cache_path.parent) == [], "nothing published, no temp file left"
 
 
-@pytest.mark.parametrize("link_errno", [errno.ENOSYS, errno.ENOTSUP, errno.EMLINK])
+@pytest.mark.parametrize("link_errno", [errno.ENOSYS, errno.ENOTSUP])
 def test_hardlink_checkout_falls_through_a_link_the_filesystem_cannot_make(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, link_errno: int
 ) -> None:
-    """A filesystem without hard-link support (ENOSYS, ENOTSUP), or an object at the
-    filesystem's link limit (EMLINK), moves checkout on to the next mode, as EXDEV does."""
+    """A filesystem without hard-link support (ENOSYS, ENOTSUP) moves checkout on to the next
+    mode, as EXDEV does."""
     cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_text("content")
@@ -2617,6 +2617,176 @@ def test_hardlink_checkout_falls_through_a_link_the_filesystem_cannot_make(
 
     assert target.read_text() == "content"
     assert target.stat().st_ino != cache_path.stat().st_ino
+
+
+def _helper_refuse_links_to(
+    monkeypatch: pytest.MonkeyPatch, cache_path: pathlib.Path, link_errno: int
+) -> None:
+    """Make os.link refuse, with link_errno, every new link to the cache object at cache_path."""
+    real_link = os.link
+
+    def _link(source: str, dest: str, **kwargs: Any) -> None:
+        if pathlib.Path(source) == cache_path:
+            raise OSError(link_errno, os.strerror(link_errno))
+        real_link(source, dest, **kwargs)
+
+    monkeypatch.setattr(os, "link", _link)
+
+
+_FULL_OBJECT_CONTENT = "#!/bin/sh\necho full\n"
+
+
+def _helper_restore_with_one_link_refused(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    link_errno: int,
+    modes: list[cache.CheckoutMode] | None,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Cache a file output, or a directory output holding an executable full.sh and other.txt,
+    remove it, then restore it with every link to full.sh's object refused with link_errno.
+
+    Returns the restored full.sh entry and its cache object.
+    """
+    cache_dir = tmp_path / "cache"
+    if kind == "file":
+        output = full = tmp_path / "full.sh"
+        full.write_text(_FULL_OBJECT_CONTENT)
+    else:
+        output = tmp_path / "out"
+        output.mkdir()
+        full = output / "full.sh"
+        full.write_text(_FULL_OBJECT_CONTENT)
+        full.chmod(0o755)
+        (output / "other.txt").write_text("other\n")
+    full_hash, _ = cache.hash_file(full)
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    cache.remove_output(output)
+    full_object = cache.get_cache_path(cache_dir, full_hash)
+    _helper_refuse_links_to(monkeypatch, full_object, link_errno)
+
+    assert cache.restore_from_cache(
+        output, output_hash, cache_dir, checkout_modes=modes, state_dir=tmp_path / ".pivot"
+    )
+
+    if kind == "directory":
+        other = output / "other.txt"
+        other_object = cache.get_cache_path(cache_dir, cache.hash_file(other)[0])
+        assert other.stat().st_ino == other_object.stat().st_ino, "other entries still hardlink"
+    return full, full_object
+
+
+@pytest.mark.parametrize(
+    "modes",
+    [
+        pytest.param(None, id="default-order"),
+        pytest.param([cache.CheckoutMode.HARDLINK], id="hardlink-only"),
+        pytest.param([cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY], id="hardlink-copy"),
+    ],
+)
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_restore_copies_a_cache_object_at_the_hard_link_limit(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    modes: list[cache.CheckoutMode] | None,
+) -> None:
+    """A hard link refused with EMLINK means that one object already has as many links as the
+    filesystem allows (65,000 on ext4). That entry is checked out as a copy: a regular file
+    with the object's bytes and its mode, never a symlink into the cache, whether symlink,
+    copy or nothing comes next in the order."""
+    full, full_object = _helper_restore_with_one_link_refused(
+        tmp_path, monkeypatch, kind, errno.EMLINK, modes
+    )
+
+    entry = os.lstat(full)
+    assert stat.S_ISREG(entry.st_mode), "an object at the link limit is copied, not symlinked"
+    assert entry.st_ino != full_object.stat().st_ino
+    assert full.read_text() == _FULL_OBJECT_CONTENT
+    # A directory entry keeps its recorded executable bit; a single file's mode is not hashed.
+    assert stat.S_IMODE(entry.st_mode) == (0o755 if kind == "directory" else 0o644)
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_restore_symlinks_when_a_hard_link_crosses_devices(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """EXDEV says the workspace cannot hardlink into the cache at all, so the default order
+    still moves on to symlink."""
+    full, full_object = _helper_restore_with_one_link_refused(
+        tmp_path, monkeypatch, kind, errno.EXDEV, None
+    )
+
+    assert full.is_symlink()
+    assert full.resolve() == full_object.resolve()
+
+
+@pytest.mark.parametrize("operation", ["restore", "save"])
+def test_copy_at_the_hard_link_limit_is_staged_under_the_targets_restore_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """The copy made at the link limit is built under the target's deterministic restore name,
+    which the next restore or save of the target clears if this one is killed mid-copy, and
+    then renamed over the target."""
+    cache_dir = tmp_path / "cache"
+    state_dir = tmp_path / ".pivot"
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("content\n")
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    if operation == "restore":
+        target.unlink()
+    _helper_refuse_links_to(
+        monkeypatch, cache.get_cache_path(cache_dir, output_hash["hash"]), errno.EMLINK
+    )
+    copied = list[pathlib.Path]()
+    renamed = list[tuple[pathlib.Path, pathlib.Path]]()
+    real_copy2 = shutil.copy2
+    real_replace = pathlib.Path.replace
+
+    def _copy2(source: str, dest: str, **kwargs: Any) -> object:
+        copied.append(pathlib.Path(dest))
+        return real_copy2(source, dest, **kwargs)
+
+    def _replace(self: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
+        renamed.append((self, pathlib.Path(dest)))
+        return real_replace(self, dest)
+
+    monkeypatch.setattr(shutil, "copy2", _copy2)
+    monkeypatch.setattr(pathlib.Path, "replace", _replace)
+
+    if operation == "restore":
+        assert cache.restore_from_cache(target, output_hash, cache_dir, state_dir=state_dir)
+    else:
+        cache.save_to_cache(target, cache_dir, state_dir=state_dir)
+
+    staging = cache.restore_staging_path(target)
+    assert [p for p in copied if p.parent == target.parent] == [staging]
+    assert renamed == [(staging, target)]
+    assert stat.S_ISREG(os.lstat(target).st_mode)
+    assert target.read_text() == "content\n"
+    assert not staging.exists()
+
+
+def test_commit_keeps_a_written_output_whose_cache_object_is_at_the_hard_link_limit(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage output whose cache object is at the hard-link limit stays the regular file the
+    stage wrote, with the default order, instead of becoming a symlink into the cache."""
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "out.txt"
+    output.write_text("")
+    output_hash, written = cache.hash_file(output)
+    _helper_refuse_links_to(monkeypatch, cache.get_cache_path(cache_dir, output_hash), errno.EMLINK)
+
+    cache.store_hashed_output(
+        output, FileHash(hash=output_hash), cache_dir, state_dir=tmp_path / ".pivot"
+    )
+
+    kept = os.lstat(output)
+    assert stat.S_ISREG(kept.st_mode)
+    assert kept.st_ino == written.st_ino, "the file the stage wrote is kept, not replaced"
+    assert output.read_text() == ""
 
 
 def test_symlinked_entry_keeps_its_mode_when_the_same_bytes_are_cached_executable(

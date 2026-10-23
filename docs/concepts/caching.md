@@ -167,8 +167,10 @@ its cache entry after the stage runs, and when a skipped stage restores it:
 | `symlink` | Symbolic link to cache file | Zero copy, visibly a link |
 | `copy` | Full file copy | Safe but uses disk space |
 
-The default order is `hardlink → symlink → copy`. Configure it in
-`.pivot/config.yaml`:
+The default order is `hardlink → symlink → copy`. A hard link refused because
+the cache object already has as many links as the filesystem allows (65,000 on
+ext4) makes that file a copy, even when `symlink` comes next or `copy` is not
+in the order. Configure the order in `.pivot/config.yaml`:
 
 ```yaml
 cache:

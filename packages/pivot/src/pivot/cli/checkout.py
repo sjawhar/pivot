@@ -497,7 +497,8 @@ def checkout(
     project_root = project.get_project_root()
     cache_dir = config.get_cache_dir() / "files"
 
-    # Determine checkout modes - CLI flag overrides config (single mode, no fallback)
+    # Determine checkout modes - CLI flag overrides config (single mode, no fallback, except
+    # that a hard link refused with EMLINK is copied whatever the order is)
     checkout_modes = (
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
     )

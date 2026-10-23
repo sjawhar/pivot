@@ -6,11 +6,13 @@ the way a user does, so it covers discovery, config and the real command wiring.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pathlib
 import py_compile
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -1514,6 +1516,80 @@ def test_outputs_symlinked_to_one_cache_object_feed_one_stage(tmp_path: pathlib.
 
     assert "1 ran" in out, out
     assert (root / "data" / "sym" / "both.yaml").read_text() == "total: 4\n"
+
+
+_LINK_LIMIT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def left() -> str:
+    return ""
+
+
+@stage
+def right() -> str:
+    return ""
+
+
+with Pipeline("lim") as pipeline:
+    left()
+    right()
+"""
+
+# Above ext4's limit of 65,000 hard links per file.
+_LINK_LIMIT_PROBE = 70_000
+
+
+def _helper_fill_hard_links(target: pathlib.Path, scratch: pathlib.Path) -> None:
+    """Hard-link ``target`` from ``scratch`` until the filesystem refuses another link with
+    EMLINK; skip the test on a filesystem that allows more than _LINK_LIMIT_PROBE links."""
+    scratch.mkdir()
+    for i in range(_LINK_LIMIT_PROBE):
+        try:
+            os.link(target, scratch / str(i))
+        except OSError as e:
+            if e.errno != errno.EMLINK:
+                raise
+            return
+    pytest.skip(f"{target}'s filesystem allows more than {_LINK_LIMIT_PROBE} hard links")
+
+
+def test_outputs_whose_cache_object_is_at_the_hard_link_limit_are_copied(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two empty outputs share one cache object, which already has as many hard links as the
+    filesystem allows. Checkout, a repro that restores them and a repro that rewrites them each
+    leave both as regular files, never symlinks into the cache, and both stages stay cached."""
+    (tmp_path / "project").mkdir()
+    root = _project(tmp_path / "project", {"pipeline.py": _LINK_LIMIT_PIPELINE})
+    _ok(_pivot(root, "repro"))
+    outputs = [root / "data" / "lim" / "left.txt", root / "data" / "lim" / "right.txt"]
+    empty_object = cache.get_cache_path(
+        root / ".pivot" / "cache" / "files", xxhash.xxh64(b"").hexdigest()
+    )
+    assert {o.stat().st_ino for o in outputs} == {empty_object.stat().st_ino}
+    for output in outputs:
+        output.unlink()
+    _helper_fill_hard_links(empty_object, tmp_path / "links")
+
+    restored = _ok(_pivot(root, "checkout"))
+    assert "Restored 2 file(s)" in restored, restored
+    assert [stat.S_ISREG(os.lstat(o).st_mode) for o in outputs] == [True, True], "checkout"
+
+    for output in outputs:
+        output.unlink()
+    out = _ok(_pivot(root, "repro"))
+    assert "0 ran, 2 cached" in out, out
+    assert [stat.S_ISREG(os.lstat(o).st_mode) for o in outputs] == [True, True], "restore"
+
+    out = _ok(_pivot(root, "repro", "--force"))
+    assert "2 ran" in out, out
+    assert [stat.S_ISREG(os.lstat(o).st_mode) for o in outputs] == [True, True], "rewrite"
+    assert [o.read_text() for o in outputs] == ["", ""]
+
+    assert "2 cached" in _ok(_pivot(root, "status"))
+    _ok(_pivot(root, "verify"))
 
 
 _CPU_PIPELINE = """\
