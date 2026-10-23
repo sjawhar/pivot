@@ -6,7 +6,7 @@ import pathlib
 
 import click
 
-from pivot import config, discovery, exceptions, project, registry, types
+from pivot import config, discovery, exceptions, project, registry
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -52,6 +52,7 @@ def diff(
     deletions, and modifications. Detects reorder-only changes.
     """
     from pivot.show import data as data_module
+    from pivot.show import selection as selection_module
 
     max_rows = max_rows if max_rows is not None else config.get_diff_max_rows()
 
@@ -66,35 +67,16 @@ def diff(
     if key_columns and positional:
         raise click.ClickException("Cannot use both --key and --positional")
 
-    # Get HEAD hashes from lock files
-    head_hashes = data_module.get_data_hashes_from_head()
-    if not head_hashes:
+    # One selection decides, for HEAD and the workspace, the data files the targets name
+    selection = selection_module.select_data_files(targets)
+    if selection is None:
         click.echo("No data files found in registered stages.")
         return
 
-    # Filter to targets: stage identities resolve through the Store, anything else is a path
-    proj_root = project.get_project_root()
-    store = cli_helpers.require_workspace_store()
-    all_stages = cli_helpers.get_all_stages()
-    target_set = set[str]()
-
-    for target in targets:
-        resolved = cli_targets.resolve_cli_target(target, all_stages)
-        if resolved is None:
-            target_set.add(project.to_relative_path(project.normalize_path(target), proj_root))
-            continue
-        for ref in resolved["refs"]:
-            if ref.tag in {types.ArtifactTag.METRIC, types.ArtifactTag.PLOT}:
-                continue
-            target_set.add(project.to_relative_path(store.resolve_display_path(ref), proj_root))
-
-    filtered_head_hashes = {k: v for k, v in head_hashes.items() if k in target_set}
-
-    # Get workspace hashes
-    workspace_hashes = data_module.get_data_hashes_from_workspace(list(target_set))
-
     # Quick hash comparison to find changed files
-    hash_diffs = data_module.diff_data_hashes(filtered_head_hashes, workspace_hashes)
+    hash_diffs = data_module.diff_data_hashes(
+        selection["head_hashes"], selection["workspace_hashes"]
+    )
 
     if not hash_diffs:
         if output_format == OutputFormat.JSON:
@@ -103,84 +85,54 @@ def diff(
             click.echo("No data file changes detected.")
         return
 
-    if no_tui or summary:
-        # Non-interactive output
-        diff_results = list[DataDiffResult]()
-        temp_files = list[pathlib.Path]()
-        try:
-            for diff_entry in hash_diffs:
-                rel_path = diff_entry["path"]
-                abs_path = proj_root / rel_path
-                old_hash = diff_entry["old_hash"]
-
-                # Restore old file from cache if needed
-                old_path: pathlib.Path | None = None
-                if old_hash is not None:
-                    old_path = data_module.restore_data_from_cache(rel_path, old_hash)
-                    if old_path is not None:
-                        temp_files.append(old_path)
-                new_path = abs_path if abs_path.exists() else None
-
-                # When --positional is set, don't use key columns
-                effective_keys = None if positional else key_columns
-                result = data_module.diff_data_files(
-                    old_path=old_path,
-                    new_path=new_path,
-                    path_display=rel_path,
-                    key_columns=effective_keys,
-                    max_rows=max_rows,
-                )
-                diff_results.append(result)
-
-            # Format output
-            output = data_module.format_diff_table(
-                diff_results,
-                output_format,
-            )
-            click.echo(output)
-        finally:
-            for temp_file in temp_files:
-                with contextlib.suppress(OSError):
-                    temp_file.unlink(missing_ok=True)
-    else:
-        # Launch TUI — compute diffs first, then pass to TUI
+    run_app = None
+    if not (no_tui or summary):
         try:
             from pivot_tui import diff as data_tui
         except ImportError as err:
             raise click.UsageError(
                 "The TUI requires the 'pivot-tui' package. Install it with: pip install 'pivot[tui]' or: uv pip install pivot-tui"
             ) from err
+        run_app = data_tui.run_diff_app
 
-        diff_results = list[DataDiffResult]()
-        temp_files = list[pathlib.Path]()
-        try:
-            for diff_entry in hash_diffs:
-                rel_path = diff_entry["path"]
-                abs_path = proj_root / rel_path
-                old_hash = diff_entry["old_hash"]
+    # When --positional is set, don't use key columns
+    effective_keys = None if positional else key_columns
+    diff_results = list[DataDiffResult]()
+    temp_files = list[pathlib.Path]()
+    try:
+        for diff_entry in hash_diffs:
+            rel_path = diff_entry["path"]
+            old_hash = diff_entry["old_hash"]
 
-                tui_old_path: pathlib.Path | None = None
-                if old_hash is not None:
-                    tui_old_path = data_module.restore_data_from_cache(rel_path, old_hash)
-                    if tui_old_path is not None:
-                        temp_files.append(tui_old_path)
-                new_path = abs_path if abs_path.exists() else None
+            # Restore old file from cache if needed
+            old_path: pathlib.Path | None = None
+            if old_hash is not None:
+                old_path = data_module.restore_data_from_cache(rel_path, old_hash)
+                if old_path is None:
+                    logger.warning(
+                        "%s: its git HEAD content is not in the local cache; run pivot fetch to compare it",
+                        rel_path,
+                    )
+                else:
+                    temp_files.append(old_path)
+            result = data_module.diff_data_files(
+                old_path=old_path,
+                new_path=selection["workspace_paths"].get(rel_path),
+                path_display=rel_path,
+                change_type=diff_entry["change_type"],
+                key_columns=effective_keys,
+                max_rows=max_rows,
+            )
+            diff_results.append(result)
 
-                effective_keys = None if positional else key_columns
-                result = data_module.diff_data_files(
-                    old_path=tui_old_path,
-                    new_path=new_path,
-                    path_display=rel_path,
-                    key_columns=effective_keys,
-                    max_rows=max_rows,
-                )
-                diff_results.append(result)
-
-            data_tui.run_diff_app(diff_results)
-        finally:
-            for temp_file in temp_files:
-                with contextlib.suppress(OSError):
-                    temp_file.unlink(missing_ok=True)
+        if run_app is None:
+            click.echo(data_module.format_diff_table(diff_results, output_format))
+        else:
+            run_app(diff_results)
+    finally:
+        for temp_file in temp_files:
+            with contextlib.suppress(OSError):
+                temp_file.unlink(missing_ok=True)
 
 
 @cli_decorators.pivot_command(auto_discover=False)

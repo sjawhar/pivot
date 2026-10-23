@@ -186,7 +186,21 @@ def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str
     return key
 
 
-def _scandir_recursive(
+def _is_artifact_file_member(path: pathlib.Path, cache_dir: pathlib.Path | None) -> bool:
+    """Whether ``path`` is a regular artifact member or a checkout symlink to its cache object."""
+    return path.is_file() and (
+        not path.is_symlink() or _cache_object_key(path, cache_dir) is not None
+    )
+
+
+def is_artifact_member_content(
+    path: pathlib.Path, file_hash: str, cache_dir: pathlib.Path | None
+) -> bool:
+    """Whether a candidate member has the content its cache-object symlink names."""
+    return not path.is_symlink() or file_hash == _cache_object_key(path, cache_dir)
+
+
+def scandir_artifact_members(
     path: pathlib.Path,
     cache_dir: pathlib.Path | None,
     left_out: list[pathlib.Path],
@@ -211,7 +225,7 @@ def _scandir_recursive(
     with os.scandir(path) as entries:
         for entry in entries:
             if entry.is_symlink():
-                if _cache_object_key(pathlib.Path(entry.path), cache_dir) is not None:
+                if _is_artifact_file_member(pathlib.Path(entry.path), cache_dir):
                     yield entry
                 else:
                     left_out.append(pathlib.Path(entry.path))
@@ -219,7 +233,9 @@ def _scandir_recursive(
                 yield entry
             elif entry.is_dir():
                 dirs.append(pathlib.Path(entry.path))
-                yield from _scandir_recursive(pathlib.Path(entry.path), cache_dir, left_out, dirs)
+                yield from scandir_artifact_members(
+                    pathlib.Path(entry.path), cache_dir, left_out, dirs
+                )
 
 
 def _parent_dirs(relpaths: Iterable[str]) -> set[str]:
@@ -252,7 +268,7 @@ def _empty_dir_path(root: pathlib.Path, relpath: str) -> pathlib.Path:
     return target
 
 
-def _warn_left_out_symlinks(path: pathlib.Path, left_out: list[pathlib.Path]) -> None:
+def log_left_out_symlinks(path: pathlib.Path, left_out: list[pathlib.Path]) -> None:
     """Log one warning naming every symlink a directory artifact does not store."""
     absolute = path.absolute()
     cwd = pathlib.Path.cwd()
@@ -306,7 +322,9 @@ def hash_directory(
     dirs = list[pathlib.Path]()
     resolved_base = path.resolve()
 
-    for entry in sorted(_scandir_recursive(path, cache_dir, left_out, dirs), key=lambda e: e.path):
+    for entry in sorted(
+        scandir_artifact_members(path, cache_dir, left_out, dirs), key=lambda e: e.path
+    ):
         file_path = pathlib.Path(entry.path)
         # Verify a regular file is still within the directory (paranoid check). A cache-object
         # link resolves into the cache by design.
@@ -316,7 +334,7 @@ def hash_directory(
             rel = file_path.relative_to(path)
             file_stat = entry.stat(follow_symlinks=True)
             file_hash, _ = hash_file(file_path, state_db)
-            if entry.is_symlink() and file_hash != _cache_object_key(file_path, cache_dir):
+            if not is_artifact_member_content(file_path, file_hash, cache_dir):
                 left_out.append(file_path)
                 continue
             manifest_entry: DirManifestEntry = {
@@ -330,7 +348,7 @@ def hash_directory(
             continue  # File deleted between scan and hash
 
     if left_out and warn_left_out_symlinks:
-        _warn_left_out_symlinks(path, left_out)
+        log_left_out_symlinks(path, left_out)
 
     # A deepest empty directory holds no stored file and no other directory.
     found_dirs = {str(directory.relative_to(path)) for directory in dirs}
@@ -1258,7 +1276,7 @@ def _publish_tree(
     manifest = output_hash["manifest"]
 
     def _user_symlinks(directory: str, names: list[str]) -> list[str]:
-        # Not stored (see _scandir_recursive); copytree would copy each target.
+        # Not stored (see scandir_artifact_members); copytree would copy each target.
         return [
             name
             for name in names
@@ -1609,8 +1627,7 @@ class MissingRestore(TypedDict):
     """Outcome of restore_missing_in_directory."""
 
     restored: int  # missing files restored in place
-    restored_dirs: int  # missing empty directories restored in place
-    unavailable: int  # missing files whose blob is not in the cache
+    missing: int  # missing files left missing: a blob is not in the cache, so nothing is written
     local_changes: list[str]  # changed or extra files whose content the cache lacks
     replace: bool  # directory holds only cached content but not the target: replace it whole
 
@@ -1748,22 +1765,11 @@ def restore_missing_in_directory(
             rel for rel, content_hash in changed.items() if not _is_cached(cache_dir, content_hash)
         )
         if local_changes:
-            return MissingRestore(
-                restored=0,
-                restored_dirs=0,
-                unavailable=0,
-                local_changes=local_changes,
-                replace=False,
-            )
-        return MissingRestore(
-            restored=0, restored_dirs=0, unavailable=0, local_changes=[], replace=True
-        )
+            return MissingRestore(restored=0, missing=0, local_changes=local_changes, replace=False)
+        return MissingRestore(restored=0, missing=0, local_changes=[], replace=True)
 
-    unavailable = sum(1 for _, _, file_cache_path in missing if not file_cache_path.exists())
-    if unavailable:
-        return MissingRestore(
-            restored=0, restored_dirs=0, unavailable=unavailable, local_changes=[], replace=False
-        )
+    if any(not file_cache_path.exists() for _, _, file_cache_path in missing):
+        return MissingRestore(restored=0, missing=len(missing), local_changes=[], replace=False)
 
     for entry, file_path, file_cache_path in missing:
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1773,13 +1779,7 @@ def restore_missing_in_directory(
     for dir_path in missing_dirs:
         dir_path.mkdir(parents=True, exist_ok=True)
 
-    return MissingRestore(
-        restored=len(missing),
-        restored_dirs=len(missing_dirs),
-        unavailable=0,
-        local_changes=[],
-        replace=False,
-    )
+    return MissingRestore(restored=len(missing), missing=0, local_changes=[], replace=False)
 
 
 def protect(path: pathlib.Path) -> None:

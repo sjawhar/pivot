@@ -3,18 +3,17 @@ from __future__ import annotations
 
 import inspect
 import pathlib
-from typing import TYPE_CHECKING
 
-from pivot import git, loaders, project, types
+import pytest
+
+from pivot import exceptions, git, loaders, project, types
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import RegistryStageInfo
 from pivot.show import common as show_common
 from pivot.show import data as data_module
+from pivot.show import selection as selection_module
 from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
-
-if TYPE_CHECKING:
-    import pytest
 
 
 def _make_artifact_ref(
@@ -68,12 +67,7 @@ def _use_store(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _register(monkeypatch: pytest.MonkeyPatch, ref: types.ArtifactRef) -> None:
     stage_info = {"train": _make_stage_info("train", [ref])}
-
-    def _get_stage(name: str) -> RegistryStageInfo:
-        return stage_info[name]
-
-    monkeypatch.setattr(cli_helpers, "list_stages", lambda: ["train"])
-    monkeypatch.setattr(cli_helpers, "get_stage", _get_stage)
+    monkeypatch.setattr(cli_helpers, "get_all_stages", lambda: stage_info)
 
 
 def _mock_head_files(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
@@ -83,7 +77,13 @@ def _mock_head_files(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -
     monkeypatch.setattr(git, "read_files_from_head", _read_files_from_head)
 
 
-def test_get_data_hashes_from_head_detects_format_from_ref_loader(
+def _head_hashes() -> dict[str, str | None]:
+    selection = selection_module.select_data_files(["."])
+    assert selection is not None
+    return selection["head_hashes"]
+
+
+def test_select_data_files_detects_format_from_ref_loader(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A data output is diffable by its loader's format, independent of its identity string."""
@@ -95,7 +95,7 @@ def test_get_data_hashes_from_head_detects_format_from_ref_loader(
 
     assert data_module.detect_format(pathlib.Path("train")) == DataFileFormat.UNKNOWN
 
-    result = data_module.get_data_hashes_from_head()
+    result = _head_hashes()
 
     assert result == {"data/train.json": None}
 
@@ -116,12 +116,15 @@ def test_extract_output_hashes_from_lock_uses_identity_keys() -> None:
     assert result == {"train": "deadbeef", "train:model": "beadfeed"}
 
 
-def test_get_data_hashes_from_head_uses_identity_keys_and_store_paths(
+def test_select_data_files_expands_directory_manifest(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A directory output records one head hash per comparable file in its manifest."""
     _use_store(tmp_path, monkeypatch)
-    _register(monkeypatch, _make_artifact_ref("train", None, types.ArtifactTag.DATA, loaders.CSV()))
-
+    _register(
+        monkeypatch,
+        _make_artifact_ref("train", None, types.ArtifactTag.DIRECTORY, loaders.CSV()),
+    )
     lock_content = b"""
 code_manifest: {}
 params: {}
@@ -129,11 +132,99 @@ deps: []
 outs:
   - key: null
     hash: deadbeef00000000
-    tag: data
+    manifest:
+      - relpath: first.csv
+        hash: abcd123400000000
+        size: 4
+        isexec: false
+      - relpath: notes.yaml
+        hash: beadfeed00000000
+        size: 5
+        isexec: false
 """
-
     _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
 
-    result = data_module.get_data_hashes_from_head()
+    result = _head_hashes()
 
-    assert result == {"data/train.csv": "deadbeef00000000"}
+    assert result == {"data/train/first.csv": "abcd123400000000"}
+
+
+def test_select_data_files_refuses_a_manifest_path_outside_its_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed lock whose directory manifest leaves the directory is refused, naming the lock
+    and the path, before any file is read through it."""
+    _use_store(tmp_path, monkeypatch)
+    _register(
+        monkeypatch,
+        _make_artifact_ref("train", None, types.ArtifactTag.DIRECTORY, loaders.CSV()),
+    )
+    lock_content = b"""
+code_manifest: {}
+params: {}
+deps: []
+outs:
+  - key: null
+    hash: deadbeef00000000
+    manifest:
+      - relpath: ../../secret.csv
+        hash: abcd123400000000
+        size: 4
+        isexec: false
+"""
+    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
+
+    with pytest.raises(exceptions.SecurityValidationError) as excinfo:
+        _head_hashes()
+
+    assert ".pivot/stages/train.lock" in str(excinfo.value)
+    assert "outs[0].manifest[0].relpath: '../../secret.csv'" in str(excinfo.value)
+
+
+def test_select_data_files_expands_an_unlocked_path_directory_from_the_workspace(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path output that is a directory on disk, with no HEAD lock, compares its data files."""
+    _use_store(tmp_path, monkeypatch)
+    _register(
+        monkeypatch, _make_artifact_ref("train", None, types.ArtifactTag.DATA, loaders.PathOnly())
+    )
+    directory = tmp_path / "data" / "train.dat"
+    directory.mkdir(parents=True)
+    (directory / "rows.csv").write_text("id\n1\n")
+    _mock_head_files(monkeypatch, {})
+
+    selection = selection_module.select_data_files(["data/train.dat/rows.csv"])
+    assert selection is not None
+    assert selection["head_hashes"] == {}
+    assert list(selection["workspace_paths"]) == ["data/train.dat/rows.csv"]
+
+
+def test_select_data_files_reads_a_path_directory_output_as_a_directory_from_its_lock(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DATA-tagged output whose HEAD lock records a manifest is a directory output, even
+    when the workspace no longer holds it."""
+    _use_store(tmp_path, monkeypatch)
+    _register(
+        monkeypatch, _make_artifact_ref("train", None, types.ArtifactTag.DATA, loaders.PathOnly())
+    )
+    lock_content = b"""
+code_manifest: {}
+params: {}
+deps: []
+outs:
+  - key: null
+    hash: deadbeef00000000
+    manifest:
+      - relpath: rows.csv
+        hash: abcd123400000000
+        size: 4
+        isexec: false
+"""
+    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
+
+    selection = selection_module.select_data_files(["data/train.dat/rows.csv"])
+    assert selection is not None
+    assert selection["head_hashes"] == {"data/train.dat/rows.csv": "abcd123400000000"}
+    assert selection["workspace_paths"] == {}

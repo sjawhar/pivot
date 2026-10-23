@@ -251,11 +251,6 @@ async def read_remote_lock_file(
     return data
 
 
-def _entry_identity(stage: str, entry: OutEntry) -> types.ArtifactIdentity:
-    """Identity of a lock output entry: ``stage`` or ``stage:key``."""
-    return types.ArtifactIdentity(stage, entry["key"])
-
-
 def _entry_size(entry: OutEntry, identity: str) -> int:
     if "size" in entry:
         return int(entry["size"])
@@ -347,7 +342,7 @@ async def _resolve_remote_path_with_session(
         if lock_data is None:
             continue
         for entry in lock_data["outs"]:
-            entry_identity = _entry_identity(stage, entry)
+            entry_identity = types.ArtifactIdentity(stage, entry["key"])
             identity = types.identity_key(entry_identity)
             manifest_paths = _iter_manifest_paths(entry_identity, entry)
             available.add(identity)

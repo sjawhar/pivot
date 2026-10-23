@@ -305,8 +305,8 @@ class ArtifactTag(enum.StrEnum):
 class ArtifactRef:
     """One output a stage writes, or one artifact a stage reads.
 
-    ``member`` is set on a dependency that reads one file of a directory output: the file's
-    path inside the directory. Its identity is the directory's identity with the file's path
+    ``directory`` is set on a dependency that reads one file of a directory output: the
+    directory output's identity. The ref's own identity is that identity with the file's path
     appended to the key (``stage:file.json``, or ``stage:output/file.json`` for a keyed
     output), so a lock records the hash of that file alone.
     """
@@ -317,7 +317,7 @@ class ArtifactRef:
     )
     python_type: type
     tag: ArtifactTag
-    member: str | None = None
+    directory: ArtifactIdentity | None = None
 
 
 def source_identity(ref: ArtifactRef) -> ArtifactIdentity:
@@ -326,11 +326,7 @@ def source_identity(ref: ArtifactRef) -> ArtifactIdentity:
     Every other ref is its own source. The DAG, artifact locks and watch mode treat a file of
     a directory as part of the directory its producer writes.
     """
-    if ref.member is None:
-        return ref.identity
-    assert ref.identity.key is not None, "a directory file's key ends with its path"
-    output_key = ref.identity.key.removesuffix(ref.member).removesuffix("/")
-    return ArtifactIdentity(ref.identity.producer, output_key or None)
+    return ref.identity if ref.directory is None else ref.directory
 
 
 def directory_file_identity(directory: ArtifactIdentity, path: str) -> ArtifactIdentity:
@@ -695,6 +691,7 @@ class DataDiffResult(TypedDict):
     """Result of comparing two data files."""
 
     path: str
+    change_type: ChangeType
     old_rows: int | None
     new_rows: int | None
     old_cols: list[str] | None

@@ -69,12 +69,13 @@ def _normalize_cli_targets(
         if target_path.suffix == ".pvt":
             target = str(track.get_data_path(target_path))
 
-        normalized_path = project.normalize_path(target, base=pathlib.Path.cwd())
-
-        if not normalized_path.is_relative_to(project_root):
+        relative = project.relative_within(
+            project.normalize_path(target, base=pathlib.Path.cwd()), project_root
+        )
+        if relative is None:
             raise click.ClickException(f"Target '{original}' resolves outside project root")
 
-        normalized.append(str(normalized_path))
+        normalized.append(str(project_root / relative))
 
     return tuple(normalized)
 

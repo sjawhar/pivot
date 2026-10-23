@@ -6,6 +6,8 @@ output's handle by a file name makes a dependency on that one file.
 """
 
 import pathlib
+import typing
+from collections.abc import Callable
 from typing import Annotated, TypedDict
 
 import matplotlib.figure
@@ -379,3 +381,90 @@ def test_output_named_like_a_file_of_a_directory_output_is_refused_at_build(
     assert "Stage 'p/_helper_file_named_field'" in message, message
     assert "output 'parts/a.json'" in message, message
     assert "directory output 'parts'" in message, message
+
+
+def _helper_as_handle(value: object) -> compose.ArtifactHandle:
+    return typing.cast("compose.ArtifactHandle", value)
+
+
+def _helper_as_dataframe(value: object) -> pd.DataFrame:
+    return typing.cast("pd.DataFrame", value)
+
+
+def _helper_raw(pipeline: compose.Pipeline) -> compose.ArtifactHandle:
+    return _helper_as_handle(pipeline.input("raw.csv", t=pd.DataFrame))
+
+
+def _helper_directory_handle(pipeline: compose.Pipeline) -> compose.ArtifactHandle:
+    return _helper_as_handle(_helper_split(_helper_as_dataframe(_helper_raw(pipeline))))
+
+
+def _helper_directory_field(_pipeline: compose.Pipeline) -> compose.ArtifactHandle:
+    return _helper_as_handle(_helper_parts()["parts"])
+
+
+def _helper_directory_file(_pipeline: compose.Pipeline) -> compose.ArtifactHandle:
+    return _helper_as_handle(_helper_parts()["parts"]["a.json"])
+
+
+def _helper_typed_dict_handle(_pipeline: compose.Pipeline) -> compose.ArtifactHandle:
+    return _helper_as_handle(_helper_parts())
+
+
+def _helper_file_handle(pipeline: compose.Pipeline) -> compose.ArtifactHandle:
+    split = _helper_split(_helper_as_dataframe(_helper_raw(pipeline)))
+    return _helper_as_handle(_helper_count_one(split["a.jsonl"]))
+
+
+def _helper_contains(handle: compose.ArtifactHandle) -> object:
+    return "train.jsonl" in handle
+
+
+def _helper_iterates(handle: compose.ArtifactHandle) -> object:
+    dynamic_handle = typing.cast("typing.Any", handle)
+    return next(name for name in dynamic_handle)
+
+
+def _helper_lists(handle: compose.ArtifactHandle) -> object:
+    dynamic_handle = typing.cast("typing.Any", handle)
+    return list(dynamic_handle)
+
+
+@pytest.mark.parametrize(
+    "use",
+    [
+        pytest.param(_helper_contains, id="in"),
+        pytest.param(_helper_iterates, id="for"),
+        pytest.param(_helper_lists, id="list"),
+    ],
+)
+@pytest.mark.parametrize(
+    "select",
+    [
+        pytest.param(_helper_directory_handle, id="directory"),
+        pytest.param(_helper_directory_field, id="directory-field"),
+        pytest.param(_helper_directory_file, id="one-file"),
+        pytest.param(_helper_typed_dict_handle, id="typed-dict"),
+        pytest.param(_helper_file_handle, id="file"),
+        pytest.param(_helper_raw, id="input"),
+    ],
+)
+def test_a_handle_refuses_iteration_and_membership_naming_one_file(
+    tmp_path: pathlib.Path,
+    select: Callable[[compose.Pipeline], compose.ArtifactHandle],
+    use: Callable[[compose.ArtifactHandle], object],
+) -> None:
+    """A handle stands for outputs that do not exist yet, so it has no members to list or test.
+
+    Python falls back to ``handle[0]``, ``handle[1]``, ... for ``in`` and ``for`` when a class
+    has ``__getitem__`` and no ``__iter__``, and a directory handle accepts any key.
+    """
+    with (
+        pytest.raises(TypeError) as exc_info,
+        compose.Pipeline("p", root=tmp_path) as pipeline,
+    ):
+        use(select(pipeline))
+
+    message = str(exc_info.value)
+    assert "not iterable" in message, message
+    assert "parts['train.csv']" in message, message
