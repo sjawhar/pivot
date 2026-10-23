@@ -134,10 +134,8 @@ def _leave_0_5_2_state(project: pathlib.Path) -> None:
 def test_d1_forced_run_after_an_edit_is_not_undone_by_a_0_5_2_run_cache_entry(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Criterion (a): main 19fd78cb gives 103 here. A project last run by 0.5.2; the module the
-    stage imports at run time is edited; the docs' remedy, `pivot repro --force <stage>`, gives
-    103. The next `repro` must keep 103. At 5faa7b85 it restores 0.5.2's run-cache entry
-    (`cached`, "unchanged (run cache)"), rewrites the output to 4 and drops the lock's mark."""
+    """After a forced recheck marks a dynamically importing stage, a later `repro` must not
+    restore the same-input run-cache entry that a prior Pivot version filed."""
     project = _project(tmp_path)
     _leave_0_5_2_state(project)
     _edit_lib(project)
@@ -150,10 +148,8 @@ def test_d1_forced_run_after_an_edit_is_not_undone_by_a_0_5_2_run_cache_entry(
 
 
 def test_d1_stage_a_forced_run_marked_reruns_on_the_next_edit(tmp_path: pathlib.Path) -> None:
-    """Criteria (b) and (c): the docs say `pivot repro --force <stage>` re-checks a stage a
-    0.5.2 run left cached, and the round-11 ruling says that after it "the stage carries the
-    marker and reruns on the next edit". With 0.5.2's real state (its lock and its run-cache
-    entry), the edit after the forced run is served from the run cache: v stays 4."""
+    """A forced recheck marks the dynamically importing stage, so a later module edit reruns it
+    instead of restoring an older run-cache entry."""
     project = _project(tmp_path)
     _leave_0_5_2_state(project)
 
@@ -167,10 +163,8 @@ def test_d1_stage_a_forced_run_marked_reruns_on_the_next_edit(tmp_path: pathlib.
 
 
 def test_d1_forced_run_after_no_commit_and_commit_is_not_undone(tmp_path: pathlib.Path) -> None:
-    """Criterion (a): main 19fd78cb gives 103 here. `repro --no-commit` then `pivot commit` (the
-    stated limit, which files a run-cache entry for the outputs on disk), then an edit, then
-    `pivot repro --force t/count`, which gives 103 and marks the lock. The next `repro` must keep
-    103; at 5faa7b85 it restores the committed entry and the output goes back to 4."""
+    """A forced flagged run after `repro --no-commit` and `pivot commit` must not be undone by the
+    run-cache entry that commit filed."""
     project = _project(tmp_path)
     _ok(_run(project, "repro", "--no-commit"))
     _ok(_run(project, "commit"))
@@ -189,8 +183,7 @@ def test_d1_forced_run_after_no_commit_and_commit_is_not_undone(tmp_path: pathli
 def test_d1_control_without_a_prior_entry_the_flagged_stage_reruns(
     tmp_path: pathlib.Path, repeat: int
 ) -> None:
-    """Control (passes at 5faa7b85): with no earlier run-cache entry, a flagged stage reruns on
-    every `repro` and an edit gives 103."""
+    """Without an older run-cache entry, a flagged stage reruns on every `repro` after an edit."""
     project = _project(tmp_path)
     _ok(_run(project, "repro"))
     _edit_lib(project)

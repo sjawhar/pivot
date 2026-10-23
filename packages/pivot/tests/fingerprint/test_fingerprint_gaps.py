@@ -83,7 +83,7 @@ def _run_cache_entries(project: pathlib.Path) -> list[run_history.RunCacheEntry]
 
 
 def _assert_not_reusable(project: pathlib.Path, result: subprocess.CompletedProcess[str]) -> None:
-    """The stage ran, warned once, filed no run-cache entry, and its next repro reruns it."""
+    """Check a successful run's warning, empty run cache, and reported uncovered-import reason."""
     message = " ".join((result.stdout + result.stderr).split())
     assert result.returncode == 0, message
     assert message.count("imported user modules its fingerprint does not cover") == 1, message
@@ -406,9 +406,8 @@ def test_pivot_thread_started_inside_a_covered_import_does_not_excuse_a_later_ma
 def test_pivot_reader_started_before_a_covered_import_does_not_excuse_a_later_manual_load(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The audit control: when the stage starts the pipe reader before importing the covered
-    module, the later manual load is already counted. The F2 fix makes the inside-import cases
-    behave the same way."""
+    """A later manual load stays counted when Pivot starts a pipe reader before or during a covered
+    import, because Pivot-owned threads do not inherit user-code coverage."""
     project = _project(
         tmp_path,
         {
@@ -438,8 +437,8 @@ def test_pivot_reader_started_before_a_covered_import_does_not_excuse_a_later_ma
 def test_pivot_thread_started_inside_a_covered_import_does_not_hide_a_hooked_load(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The P6 control: a later hooked `__import__` stays counted even while a reader Pivot
-    started in the covered import is still alive."""
+    """A later hooked `__import__` stays counted while a reader Pivot starts in a covered import
+    remains alive."""
     project = _project(
         tmp_path,
         {

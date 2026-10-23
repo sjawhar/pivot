@@ -205,33 +205,29 @@ def commit_stages(
 
             dep_gen_map = worker.compute_dep_generation_map(stage_info["deps"], stage_db)
 
-            # Only cached outputs belong in run cache
-            cached_paths = {
-                types.identity_key(out.identity)
-                for out in stage_outs
-                if out.tag is not ArtifactTag.METRIC
-            }
-            cached_output_hashes = {
-                path: oh for path, oh in output_hashes_by_key.items() if path in cached_paths
-            }
-
-            output_entries = [
-                run_history.output_hash_to_entry(path, oh)
-                for path, oh in cached_output_hashes.items()
-            ]
-
-            deferred = DeferredWrites()
-            if dep_gen_map:
-                deferred["dep_generations"] = dep_gen_map
             # An unsafe fingerprint may match a run whose captured values differed, and a carried
             # uncovered-import mark means the outputs came from code the fingerprint misses: never
             # file either. A carried mark also removes any entry an earlier run filed at this key.
-            if output_entries and reusable and not stage_info["unsafe_fingerprint"]:
-                deferred["run_cache_input_hash"] = input_hash
-                deferred["run_cache_entry"] = run_history.RunCacheEntry(
-                    run_id=run_id,
-                    output_hashes=output_entries,
-                )
+            deferred = DeferredWrites()
+            if dep_gen_map:
+                deferred["dep_generations"] = dep_gen_map
+            if reusable and not stage_info["unsafe_fingerprint"]:
+                cached_paths = {
+                    types.identity_key(out.identity)
+                    for out in stage_outs
+                    if out.tag is not ArtifactTag.METRIC
+                }
+                output_entries = [
+                    run_history.output_hash_to_entry(path, oh)
+                    for path, oh in output_hashes_by_key.items()
+                    if path in cached_paths
+                ]
+                if output_entries:
+                    deferred["run_cache_input_hash"] = input_hash
+                    deferred["run_cache_entry"] = run_history.RunCacheEntry(
+                        run_id=run_id,
+                        output_hashes=output_entries,
+                    )
             if not reusable:
                 deferred["run_cache_delete_input_hash"] = input_hash
             if file_hash_entries:

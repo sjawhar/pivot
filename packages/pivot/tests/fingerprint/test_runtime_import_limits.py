@@ -180,12 +180,8 @@ with Pipeline("t") as pipeline:
 def test_d2_runpy_load_of_a_user_file_is_caught_or_listed_as_a_limit(
     tmp_path: pathlib.Path, call: str, edited_file: str
 ) -> None:
-    """docs/architecture/fingerprinting.md lists `runpy` among the spellings whose user-module
-    loads are "caught by the worker's check below". `runpy.run_path` and `runpy.run_module`
-    (default `alter_sys=False`, no parent package) execute the file without `__import__`,
-    `import_module` or a lasting `sys.modules` entry, so the head warns nothing, caches, and
-    serves the stale result after an edit, as main does. Either the check catches it, or the
-    architecture doc's limits table names `runpy` (and the sentence stops calling it caught)."""
+    """A `runpy` load without a lasting module registration must either be detected or remain
+    documented as a fingerprinting limitation."""
     project = _project(tmp_path, {**_LIB, "pipeline.py": _RUNPY.format(call=call)})
     first = _run(project, "repro")
     assert first.returncode == 0, first.stdout + first.stderr

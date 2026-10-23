@@ -669,6 +669,7 @@ def test_what_a_covered_thread_loads_is_excused_when_the_thread_outlives_the_sta
         loader = importlib.import_module("cov_lib").LOADER
         sync.go.set()
         assert sync.done.wait(10)
+    assert tracked.window_resident_before == frozenset()
     sync.stop.set()
     loader.join(10)
 

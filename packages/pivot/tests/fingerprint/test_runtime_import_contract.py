@@ -1,10 +1,6 @@
 # pyright: reportImplicitStringConcatenation=false
 
-"""Red tests from the PR #496 round-seven acceptance recheck (ACCEPTANCE_R7.md D1-D5).
-
-Place in ``packages/pivot/tests/fingerprint/``. Each test drives the installed ``pivot`` CLI in a
-fresh project, or reads the shipped docs, and fails at PR head 51d44ec1.
-"""
+"""Runtime-import contracts exercised through the installed ``pivot`` CLI and shipped docs."""
 
 import os
 import pathlib
@@ -82,9 +78,8 @@ with Pipeline("t") as pipeline:
 def test_d1_no_fingerprint_stage_with_body_import_is_reused(
     tmp_path: pathlib.Path, module_import: str
 ) -> None:
-    """`@no_fingerprint(code_deps=[...])` hashes files, not the AST, so its manifest has no
-    `module:` keys. Main caches this stage and reruns it when `helpers/lib.py` changes. At
-    51d44ec1 it warns and reruns on every `repro`, and `pivot verify` fails."""
+    """A `@no_fingerprint(code_deps=[...])` stage tracks its declared files, not its imports.
+    It reuses unchanged outputs and reruns after a declared file changes."""
     project = _project(
         tmp_path, {**_LIB, "pipeline.py": _NO_FINGERPRINT.format(module_import=module_import)}
     )
@@ -177,10 +172,8 @@ with Pipeline("t") as pipeline:
 def test_d2_user_loader_body_import_of_loaded_module_is_covered(
     tmp_path: pathlib.Path, loader: str, pipeline: str, after_edit: str
 ) -> None:
-    """A user loader's `load`/`save` body-imports a module discovery loaded. The static walk
-    covers it (the lock holds `dep:<name>:module:helpers.lib` / `out:<key>:module:...`), so the
-    runtime check must not call it uncovered: no warning, cached on the next run, rerun on edit.
-    At 51d44ec1 every run warns, files no run-cache entry, and reruns, and `verify` fails."""
+    """A user loader's loaded body import is covered by the loader manifest, so it emits no
+    uncovered-import warning, reuses unchanged output, and reruns when its module changes."""
     project = _project(tmp_path, {**_LIB, "helpers/myloader.py": loader, "pipeline.py": pipeline})
 
     first = _run(project, "repro")
@@ -217,11 +210,8 @@ with Pipeline("t") as pipeline:
 
 
 def test_d3_commit_after_a_flagged_committing_repro_is_described(tmp_path: pathlib.Path) -> None:
-    """The docs scope the commit boundary to `repro --no-commit` and give "run `pivot repro`
-    without `--no-commit`" as the remedy. A routine `pivot commit` after that remedy records the
-    flagged stage as current all the same (the stage is always stale, and `commit` with no
-    arguments commits every stale stage), and the edit is then missed. Either `commit` must
-    leave the flagged stage stale, or the docs must stop presenting that remedy as sufficient."""
+    """A `pivot commit` after a flagged `repro` preserves the mark, so an edit to the dynamically
+    imported module reruns the stage instead of restoring a stale result."""
     project = _project(tmp_path, {**_LIB, "pipeline.py": _RUNTIME_IMPORT})
     flagged = _run(project, "repro")
     assert flagged.returncode == 0, flagged.stdout + flagged.stderr
@@ -263,10 +253,8 @@ with Pipeline("t") as pipeline:
 
 
 def test_d4_uncovered_import_warning_names_a_fix_that_applies(tmp_path: pathlib.Path) -> None:
-    """The warning says "Fix: import them at module level (or in pipeline.py)". Here pipeline.py
-    already imports `helpers.lib` at module level, and the warning still fires: the named fix is
-    already applied and cannot clear it. A fix that does is a static import the stage's own code
-    makes (walked under contract item 2), or StageParams."""
+    """The warning's static-import remedy requires reading the module by name in the stage's own
+    code, or moving the value into `StageParams`; a `pipeline.py` import alone does not cover it."""
     project = _project(tmp_path, {**_LIB, "pipeline.py": _ALREADY_IMPORTED})
 
     first = _run(project, "repro")
@@ -288,8 +276,7 @@ def test_d4_uncovered_import_warning_names_a_fix_that_applies(tmp_path: pathlib.
 
 
 def test_d5_concepts_doc_names_a_command_that_exists(tmp_path: pathlib.Path) -> None:
-    """The concepts doc says `pivot status` and `pivot explain` show the reason; there is no
-    `pivot explain` command (`pivot status --explain` and `pivot repro --explain` show it)."""
+    """The concepts documentation names only commands that can explain a marked stage."""
     explain = _run(tmp_path, "explain", "--help")
     if explain.returncode == 0:
         return

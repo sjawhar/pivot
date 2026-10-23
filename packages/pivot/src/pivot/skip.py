@@ -83,7 +83,10 @@ def check_stage(
     - Tier 1 (generation check via can_skip_via_generation) before calling this
     - Tier 3 (run cache) after this returns changed=True, when run_cache_allowed
     """
-    if lock_data is not None and uncovered_import_reason(lock_data["code_manifest"]) is not None:
+    uncovered_reason = (
+        uncovered_import_reason(lock_data["code_manifest"]) if lock_data is not None else None
+    )
+    if uncovered_reason is not None:
         run_cache_allowed = False
 
     if force and not explain:
@@ -97,7 +100,7 @@ def check_stage(
     # Fast path: cheap dict equality, no detailed diffs or path conversion.
     if not explain:
         if lock_data["code_manifest"] != fingerprint:
-            reason = uncovered_import_reason(lock_data["code_manifest"]) or "Code changed"
+            reason = uncovered_reason or "Code changed"
             return ChangeDecision(changed=True, reason=reason, run_cache_allowed=run_cache_allowed)
         if not params_equal(lock_data["params"], params):
             return ChangeDecision(
@@ -126,7 +129,7 @@ def check_stage(
     out_changed = sorted(out_paths) != locked_out_paths
 
     changed = force or bool(code_changes or param_changes or dep_changes or out_changed)
-    reason = uncovered_import_reason(lock_data["code_manifest"]) or _first_reason(
+    reason = uncovered_reason or _first_reason(
         code_changes, param_changes, dep_changes, out_changed, force
     )
 

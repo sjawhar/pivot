@@ -136,15 +136,6 @@ _original_import = builtins.__import__
 _original_import_module = importlib.import_module
 _original_start_new_thread = _thread.start_new_thread
 _original_start_joinable_thread = _thread.start_joinable_thread
-# The attributes each thread start is replaced at while the hooks are installed, and the value
-# each held before: every start function `_thread` exposes, and `threading`'s own binding of
-# `start_joinable_thread`, which `threading.Thread.start` calls.
-_THREAD_START_ATTRIBUTES: tuple[tuple[ModuleType, str], ...] = (
-    (_thread, "start_new_thread"),
-    (_thread, "start_new"),
-    (_thread, "start_joinable_thread"),
-    (threading, "_start_joinable_thread"),
-)
 _replaced_thread_starts: dict[tuple[ModuleType, str], object] = {}
 _hooks_installed = False
 
@@ -159,7 +150,7 @@ def _on_covered_thread(tracked: _StageImports) -> bool:
 def _open_window(tracked: _StageImports) -> None:
     """Hold the stage's window for unhooked registrations open (`_StageImports.window_depth`)."""
     with _stage_imports_lock:
-        if tracked.window_depth == 0:
+        if tracked.window_depth == 0 and _stage_imports is tracked:
             tracked.window_resident_before = frozenset(sys.modules)
         tracked.window_depth += 1
 
@@ -318,12 +309,13 @@ def _tracked_start_joinable_thread(
         raise
 
 
-# The hook each of `_THREAD_START_ATTRIBUTES` is replaced by.
-_THREAD_START_HOOKS: dict[str, Callable[..., object]] = {
-    "start_new_thread": _tracked_start_new_thread,
-    "start_new": _tracked_start_new_thread,
-    "start_joinable_thread": _tracked_start_joinable_thread,
-    "_start_joinable_thread": _tracked_start_joinable_thread,
+# The thread starts each map to their replacement while hooks are installed: every `_thread`
+# start function, plus `threading`'s `start_joinable_thread` binding that `Thread.start` calls.
+_THREAD_START_HOOKS: dict[tuple[ModuleType, str], Callable[..., object]] = {
+    (_thread, "start_new_thread"): _tracked_start_new_thread,
+    (_thread, "start_new"): _tracked_start_new_thread,
+    (_thread, "start_joinable_thread"): _tracked_start_joinable_thread,
+    (threading, "_start_joinable_thread"): _tracked_start_joinable_thread,
 }
 
 
@@ -388,8 +380,7 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
 
 def install_import_hooks() -> None:
     """Route `builtins.__import__` and `importlib.import_module` through the stage-import check,
-    and every thread start (`_THREAD_START_ATTRIBUTES`) through the covered thread rule.
-
+    and every thread start in `_THREAD_START_HOOKS` through the covered thread rule.
     The worker initializer (`executor.core._init_worker`) calls this; nothing else in Pivot's
     own process installs it. The hooks record nothing while no stage is running.
     """
@@ -403,9 +394,9 @@ def install_import_hooks() -> None:
     _original_start_joinable_thread = _thread.start_joinable_thread
     builtins.__import__ = _tracked_import
     importlib.import_module = _tracked_import_module
-    for module, name in _THREAD_START_ATTRIBUTES:
+    for (module, name), hook in _THREAD_START_HOOKS.items():
         _replaced_thread_starts[module, name] = vars(module)[name]
-        vars(module)[name] = _THREAD_START_HOOKS[name]
+        vars(module)[name] = hook
     _hooks_installed = True
 
 
@@ -462,6 +453,7 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
             resident_after = set(sys.modules)
             if tracked.window_depth:
                 tracked.added_in_window.update(resident_after - tracked.window_resident_before)
+            tracked.window_resident_before = frozenset()
             _stage_imports = None
         tracked.new_outside_window.update(
             name
@@ -2159,30 +2151,31 @@ def _build_deferred_writes(
         result["dep_generations"] = gen_record
 
     # Incremental outputs continue from the latest lock state and never use the run cache.
-    outs = stage_info["outs"]
-    cached_paths = (
-        set[str]()
-        if any(out.tag is types.ArtifactTag.INCREMENTAL for out in outs)
-        else {
-            types.identity_key(out.identity)
-            for out in outs
-            if out.tag is not types.ArtifactTag.METRIC
-        }
-    )
-    output_entries = [
-        run_history.output_hash_to_entry(path, oh)
-        for path, oh in output_hashes.items()
-        if path in cached_paths
-    ]
     # An unsafe fingerprint may match a run whose captured values differed; a non-reusable
     # result imported code its fingerprint does not cover. Never file either. A non-reusable run
     # also removes any entry an earlier run filed at its key, which the check never saw.
-    if output_entries and reusable and not stage_info["unsafe_fingerprint"]:
-        result["run_cache_input_hash"] = input_hash
-        result["run_cache_entry"] = run_history.RunCacheEntry(
-            run_id=stage_info["run_id"],
-            output_hashes=output_entries,
+    if reusable and not stage_info["unsafe_fingerprint"]:
+        outs = stage_info["outs"]
+        cached_paths = (
+            set[str]()
+            if any(out.tag is types.ArtifactTag.INCREMENTAL for out in outs)
+            else {
+                types.identity_key(out.identity)
+                for out in outs
+                if out.tag is not types.ArtifactTag.METRIC
+            }
         )
+        output_entries = [
+            run_history.output_hash_to_entry(path, oh)
+            for path, oh in output_hashes.items()
+            if path in cached_paths
+        ]
+        if output_entries:
+            result["run_cache_input_hash"] = input_hash
+            result["run_cache_entry"] = run_history.RunCacheEntry(
+                run_id=stage_info["run_id"],
+                output_hashes=output_entries,
+            )
     if not reusable:
         result["run_cache_delete_input_hash"] = input_hash
 

@@ -86,8 +86,7 @@ with Pipeline("t") as pipeline:
     count(pipeline.input("lines.txt", t=str))
 """
 
-# Control (round 13's AC1 item 2, which a fix must keep): the stage itself starts the thread after
-# its covered import of helpers.lib returned. That import is counted, at the head as before.
+# A thread the stage starts after a covered import returns is not covered, so its import is counted.
 _STAGE_THREAD_PIPELINE = """\
 import threading
 
@@ -151,9 +150,8 @@ def _value(project: pathlib.Path) -> object:
 def test_d1_body_import_of_module_whose_loader_thread_imports_after_it_returns_is_reused(
     tmp_path: pathlib.Path, shape: str
 ) -> None:
-    """Criterion (a): main 19fd78cb runs this stage once and caches it on the second `repro`, with no
-    warning. At 2f820946 every run warns `does not cover: plugin` and the second `repro` reruns it
-    (`Previous run imported modules its fingerprint does not cover: plugin`)."""
+    """A loader thread a covered module starts may import after that module's import returns.
+    Its import belongs to the covered import, so the stage emits no warning and reuses its result."""
     project = _project(tmp_path, _LOADER_LIBS[shape], _BODY_IMPORT_PIPELINE)
 
     first = _ok(_run(project, "repro"))
@@ -166,8 +164,8 @@ def test_d1_body_import_of_module_whose_loader_thread_imports_after_it_returns_i
 
 @pytest.mark.parametrize("shape", sorted(_LOADER_LIBS))
 def test_d1_loader_thread_stage_reruns_on_a_lib_edit(tmp_path: pathlib.Path, shape: str) -> None:
-    """Contract item 2 for the same layout: once it caches, an edit to helpers/lib.py reruns it
-    (v 103) with no warning. Main 19fd78cb fails this one (it serves v 4); a fix must keep both."""
+    """Once the stage reuses a loader thread's covered import, editing the covered module reruns
+    the stage without an uncovered-import warning."""
     project = _project(tmp_path, _LOADER_LIBS[shape], _BODY_IMPORT_PIPELINE)
     _ok(_run(project, "repro"))
     _ok(_run(project, "repro"))
@@ -184,8 +182,8 @@ def test_d1_loader_thread_stage_reruns_on_a_lib_edit(tmp_path: pathlib.Path, sha
 def test_d1_control_a_thread_the_stage_starts_after_the_covered_import_still_warns(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Control (passes at 2f820946; AC1 item 2): the stage, not the covered module, starts the thread
-    after its covered import returned. The import is counted and the stage reruns."""
+    """A thread the stage, rather than a covered module, starts after a covered import returns is
+    not covered: its import is counted and the stage reruns."""
     project = _project(tmp_path, "VALUE = 1\n", _STAGE_THREAD_PIPELINE)
 
     first = _ok(_run(project, "repro"))
@@ -196,8 +194,8 @@ def test_d1_control_a_thread_the_stage_starts_after_the_covered_import_still_war
     assert '"stage": "t/count", "status": "ran"' in again.stdout, again.stdout
 
 
-# D2: round 13's AC1 layouts (`test_fingerprint_gaps.py::_IMPORT_THREAD_LIBS`), where the module
-# joins the thread inside its own import, so the thread's import lands inside the covered window.
+# A covered module starts and joins its loader during import, so the loader remains covered
+# whether `plugin` was already resident.
 _JOINED_THREAD_LIBS = {
     "thread-dunder-import": (
         "import threading\n\n"
@@ -254,9 +252,8 @@ def _refresh_input(project: pathlib.Path, index: int) -> None:
 def test_d2_covered_import_whose_joined_thread_imports_a_module_an_upstream_stage_loaded_caches(
     tmp_path: pathlib.Path, shape: str
 ) -> None:
-    """Criterion (a), with (b) and (c): main 19fd78cb runs both stages once with no warning, then
-    caches `count` on every data refresh. At 2f820946 every run warns `does not cover: plugin`
-    for `t/count`, its lock is marked, and `count` reruns on every refresh that reruns `a`."""
+    """A covered module's joined loader imports a module an upstream stage already loaded.
+    The loader remains covered, so `count` emits no warning and reuses across data refreshes."""
     project = _warm_project(tmp_path, shape, _A_IMPORTS_PLUGIN)
 
     first = _ok(_run(project, "repro"))
@@ -273,8 +270,8 @@ def test_d2_covered_import_whose_joined_thread_imports_a_module_an_upstream_stag
 def test_d2_control_without_the_upstream_import_the_same_layout_caches(
     tmp_path: pathlib.Path, shape: str
 ) -> None:
-    """Control (passes at 2f820946 and at main): `a` does not import `plugin`, so `plugin` is not
-    resident when `count`'s covered import starts the thread, and `count` caches."""
+    """Without the upstream import, `plugin` is not resident when `count`'s covered module starts
+    its loader; `count` still reuses across data refreshes."""
     project = _warm_project(tmp_path, shape, _A_DOES_NOT_IMPORT_PLUGIN)
 
     first = _ok(_run(project, "repro"))
