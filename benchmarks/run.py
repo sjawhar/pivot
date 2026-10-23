@@ -188,7 +188,7 @@ def _first_queued_stop_signal(fallback: int) -> int:
     run.py's status is the first stop signal it observes. Two stop signals that are pending together
     have no observable order, and run.py reports the one the wakeup pipe lists first. CPython writes
     the byte in `trip_signal` at
-    https://github.com/python/cpython/blob/v3.13.16/Modules/signalmodule.c#L323; Linux documents
+    https://github.com/python/cpython/blob/v3.13.16/Modules/signalmodule.c#L304-L328; Linux documents
     pending-standard-signal delivery order as unspecified at
     https://man7.org/linux/man-pages/man7/signal.7.html.
     """
@@ -210,7 +210,7 @@ def _stop_on_signal(signum: int, _frame: object) -> None:
     run.py's status is the first stop signal it observes. Two stop signals that are pending together
     have no observable order, and run.py reports the one the wakeup pipe lists first. CPython writes
     the byte in `trip_signal` at
-    https://github.com/python/cpython/blob/v3.13.16/Modules/signalmodule.c#L323; Linux documents
+    https://github.com/python/cpython/blob/v3.13.16/Modules/signalmodule.c#L304-L328; Linux documents
     pending-standard-signal delivery order as unspecified at
     https://man7.org/linux/man-pages/man7/signal.7.html.
     """
