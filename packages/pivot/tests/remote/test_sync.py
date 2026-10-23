@@ -300,6 +300,33 @@ def test_get_target_hashes_identity_target_with_lock_files_no_pipeline(
     assert result == {"aabbccdd11223344"}, "Should resolve hash from lock file without pipeline"
 
 
+def test_get_target_hashes_no_pipeline_reads_each_stage_from_its_own_lock_location(
+    set_project_root: pathlib.Path,
+) -> None:
+    """In a partly migrated project, each stage's lock is found where it is, as StageLock finds it.
+
+    Stage `a` was re-run after `core.state_dir` was set, so `altstate/stages` holds only its lock;
+    stage `b` still has only its 0.5.2 lock in `.pivot/stages`.
+    """
+    (set_project_root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
+    for stages_dir, stage, digest in (
+        (set_project_root / "altstate" / "stages", "a", "aaaaaaaaaaaaaaaa"),
+        (set_project_root / ".pivot" / "stages", "b", "bbbbbbbbbbbbbbbb"),
+    ):
+        lock.StageLock(stage, stages_dir).write(
+            LockData(
+                code_manifest={},
+                params={},
+                dep_hashes={},
+                output_hashes={types.ArtifactIdentity(stage, "output"): FileHash(hash=digest)},
+            )
+        )
+    state_dir = set_project_root / "altstate"
+
+    assert sync.get_target_hashes(["a:output"], state_dir, all_stages=None) == {"aaaaaaaaaaaaaaaa"}
+    assert sync.get_target_hashes(["b:output"], state_dir, all_stages=None) == {"bbbbbbbbbbbbbbbb"}
+
+
 def test_get_target_hashes_pvt_file_target_without_pipeline(
     set_project_root: pathlib.Path,
 ) -> None:

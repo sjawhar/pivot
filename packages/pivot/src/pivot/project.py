@@ -116,6 +116,8 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
         state_dir = root / ".pivot"
     elif is_valid_state_dir_value(configured):
         state_dir = resolve_state_dir_value(root, typing.cast("str", configured))
+    elif configured == "":
+        raise exceptions.EmptyStateDirError(f"core.state_dir in {config_path} must be a path")
     else:
         raise exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
 
@@ -204,16 +206,6 @@ def state_dir_is_configured(root: pathlib.Path) -> bool:
 def get_state_dir() -> pathlib.Path:
     """Return the configured state directory of the current project."""
     return state_dir_for(get_project_root())
-
-
-def _configured_state_dir_is_empty(root: pathlib.Path) -> bool:
-    """Whether the local config's sole invalid state-dir value is an empty string."""
-    from pivot.config import io as config_io
-
-    present, configured = config_io.read_config_file_value(
-        root / ".pivot" / "config.yaml", "core.state_dir"
-    )
-    return present and configured == ""
 
 
 def legacy_state_dir_for(state_dir: pathlib.Path) -> pathlib.Path | None:
@@ -446,10 +438,8 @@ def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
 
     try:
         state_dir = state_dir_for(root)
-    except exceptions.ConfigError:
-        if _configured_state_dir_is_empty(root):
-            return state_dir_or_default(root)
-        raise
+    except exceptions.EmptyStateDirError:
+        return state_dir_or_default(root)
     if (
         os.path.isdir(state_dir)
         or not (root / ".pivot").is_dir()

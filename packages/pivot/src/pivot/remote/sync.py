@@ -139,16 +139,18 @@ def _get_file_hash_from_stages(
 
     from pivot.cli import helpers as cli_helpers
 
+    # Stage names come from the configured stages directory and its 0.5.2 counterpart; each lock
+    # is read through StageLock, which finds a stage's lock where it is, one stage at a time.
     stages_dir = lock.get_stages_dir(state_dir)
-    if not stages_dir.exists():
-        legacy_stages_dir = project.legacy_stages_dir_for(stages_dir)
-        if legacy_stages_dir is None or not legacy_stages_dir.exists():
-            return None
-        project.report_legacy_state_dir(state_dir)
-        stages_dir = legacy_stages_dir
+    stage_names = set[str]()
+    for scanned_dir in (stages_dir, project.legacy_stages_dir_for(stages_dir)):
+        if scanned_dir is not None and scanned_dir.is_dir():
+            stage_names.update(
+                lock_file.relative_to(scanned_dir).with_suffix("").as_posix()
+                for lock_file in scanned_dir.rglob("*.lock")
+            )
 
-    for lock_file in stages_dir.rglob("*.lock"):
-        stage_name = lock_file.relative_to(stages_dir).with_suffix("").as_posix()
+    for stage_name in sorted(stage_names):
         try:
             stage_info = cli_helpers.get_stage(stage_name)
             non_cached_paths = {

@@ -520,11 +520,7 @@ def get_cache_dir() -> pathlib.Path:
 def get_state_dir() -> pathlib.Path:
     """Get the current project's configured state directory, created when absent."""
     get_merged_config()
-    root = project.get_project_root()
-    try:
-        return project.ensure_state_dir(root)
-    except exceptions.ConfigError:
-        return project.ensure_state_dir_or_default(root)
+    return project.ensure_state_dir(project.get_project_root())
 
 
 def get_max_workers() -> int:
