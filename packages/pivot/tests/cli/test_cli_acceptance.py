@@ -19,6 +19,7 @@ import sysconfig
 import time
 import urllib.request
 import uuid
+from typing import TYPE_CHECKING
 
 import boto3
 import pytest
@@ -27,6 +28,9 @@ import yaml
 
 from pivot import loaders
 from pivot.storage import cache
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -2310,6 +2314,1697 @@ def test_checkout_counts_the_files_it_restores(tmp_path: pathlib.Path) -> None:
 
     assert "Restored 4 file(s)" in restored, restored
     assert "Skipped 4 file(s) (already exist)" in skipped, skipped
+
+
+def _helper_drop_cached_file(root: pathlib.Path, lock_path: str, relpath: str) -> None:
+    """Delete the cache blob of one file of a directory output."""
+    lock_data = yaml.safe_load((root / ".pivot" / "stages" / lock_path).read_text())
+    (entry,) = [e for e in lock_data["outs"][0]["manifest"] if e["relpath"] == relpath]
+    (root / ".pivot" / "cache" / "files" / entry["hash"][:2] / entry["hash"][2:]).unlink()
+
+
+def test_checkout_counts_the_files_of_a_missing_directory_output(tmp_path: pathlib.Path) -> None:
+    """Missing, like restored and skipped, counts files: a three-file directory is three."""
+    root = _project(tmp_path, {"pipeline.py": _THREE_FILES_PIPELINE, "notes.txt": "n"})
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "track", "notes.txt"))
+    shutil.rmtree(root / "data" / "n" / "split")
+    for relpath in ("a.txt", "b.txt", "sub/c.txt"):
+        _helper_drop_cached_file(root, "n/split.lock", relpath)
+
+    proc = _pivot(root, "checkout")
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "Skipped 1 file(s) (already exist)" in out, out
+    assert "Missing 3 file(s) from:\n  split\n" in out, out
+
+
+def test_checkout_only_missing_counts_present_files_when_a_blob_is_gone(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An in-place restore that cannot get one file's blob still counts the files on disk."""
+    root = _project(tmp_path, {"pipeline.py": _THREE_FILES_PIPELINE})
+    _ok(_pivot(root, "repro"))
+    (root / "data" / "n" / "split" / "a.txt").unlink()
+    _helper_drop_cached_file(root, "n/split.lock", "a.txt")
+
+    proc = _pivot(root, "checkout", "--only-missing")
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "Skipped 2 file(s) (already exist)" in out, out
+    assert "Missing 1 file(s) from:\n  split\n" in out, out
+
+
+_ALIAS_PIPELINE = """\
+from pivot import Pipeline, stage
+
+from shapes import Shape
+
+
+@stage
+def make(seed: str) -> Shape:
+    return {"a.yaml": {"v": 1}}
+
+
+@stage
+def use(payload: Shape) -> dict[str, int]:
+    return {"n": len(payload)}
+
+
+with Pipeline("t") as pipeline:
+    use(make(pipeline.input("seed.txt")))
+"""
+
+_FILE_SHAPE = "Shape = dict[str, dict[str, int]]\n"
+
+_DIRECTORY_SHAPE = """\
+from typing import Annotated
+
+from pivot import directory, loaders
+
+Shape = Annotated[dict[str, dict[str, int]], directory, loaders.YAML()]
+"""
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "placed", "kind"),
+    [
+        pytest.param(_FILE_SHAPE, _DIRECTORY_SHAPE, "data/t/make", "dir", id="file-to-directory"),
+        pytest.param(
+            _DIRECTORY_SHAPE, _FILE_SHAPE, "data/t/make.yaml", "file", id="directory-to-file"
+        ),
+    ],
+)
+def test_switching_directory_through_a_type_alias_reruns_the_producer(
+    tmp_path: pathlib.Path, before: str, after: str, placed: str, kind: str
+) -> None:
+    """The stage's source is unchanged, but its output moves and changes kind."""
+    root = _project(
+        tmp_path,
+        {"pipeline.py": _ALIAS_PIPELINE, "shapes.py": before, "data/raw/seed.txt": "x\n"},
+    )
+    _ok(_pivot(root, "repro"))
+    (root / "shapes.py").write_text(after)
+
+    status = _ok(_pivot(root, "status"))
+    rerun = _ok(_pivot(root, "repro"))
+
+    assert "0 stale" not in status, status
+    assert "2 ran" in rerun, rerun
+    output = root / placed
+    assert output.is_dir() if kind == "dir" else output.is_file(), sorted(
+        str(p.relative_to(root)) for p in (root / "data" / "t").rglob("*")
+    )
+    _ok(_pivot(root, "verify"))
+
+
+def test_verify_fails_when_a_file_sits_at_a_directory_outputs_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot commit` records whatever is at the path; verify checks the kind matches the stage."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _ALIAS_PIPELINE,
+            "shapes.py": _DIRECTORY_SHAPE,
+            "data/raw/seed.txt": "x\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    shutil.rmtree(root / "data" / "t" / "make")
+    (root / "data" / "t" / "make").write_text("v: 1\n")
+    _ok(_pivot(root, "commit", "t/make"))
+
+    verify = _pivot(root, "verify", "t/make")
+
+    out = verify.stdout + verify.stderr
+    assert verify.returncode == 1, out
+    assert "data/t/make" in out, out
+    assert "directory" in out, out
+
+
+_MEMBERSHIP_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory]:
+    return {"train.jsonl": raw}
+
+
+@stage
+def fit(train: pd.DataFrame) -> dict:
+    return {"rows": int(len(train))}
+
+
+with Pipeline("m") as pipeline:
+    parts = split(pipeline.input("t.csv"))
+    if "train.jsonl" in parts:
+        fit(parts["train.jsonl"])
+"""
+
+
+def test_membership_test_on_a_directory_handle_fails_the_load_at_once(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`in` on a handle must fail pipeline.py's load, not spin: every command loads it first."""
+    root = _project(tmp_path, {"pipeline.py": _MEMBERSHIP_PIPELINE, "data/raw/t.csv": "a\n1\n"})
+
+    try:
+        proc = subprocess.run(
+            [_PIVOT, "list"],
+            cwd=root,
+            env=_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("pivot list was still loading pipeline.py after 30 s")
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "is not iterable" in out, out
+    assert "parts['train.csv']" in out, out
+
+
+_DIFF_PIPELINE = """\
+import pathlib
+import tempfile
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("part")}
+
+
+@stage
+def bundle(raw: pd.DataFrame) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "bundle"
+    out.mkdir()
+    raw.to_csv(out / "all.csv", index=False)
+    return out
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    split(rows)
+    bundle(rows)
+"""
+
+
+def test_diff_on_a_directory_output_compares_each_of_its_files(tmp_path: pathlib.Path) -> None:
+    """A directory output diffs file by file: a changed, a new and a removed file, by stage
+    name or by path, and an unchanged file is not listed."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\nkeep,5\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\nval,4\nkeep,5\n")
+    _ok(_pivot(root, "repro"))
+
+    by_stage = _ok(_pivot(root, "diff", "--no-tui", "d/split"))
+    by_path = _ok(_pivot(root, "diff", "--no-tui", "data/d/split"))
+    path_output = _ok(_pivot(root, "diff", "--no-tui", "d/bundle"))
+
+    assert "data/d/split/train.csv:\n  Rows: 1 -> 2 (+1)" in by_stage, by_stage
+    assert "data/d/split/val.csv:\n  Rows: 1 (added)" in by_stage, by_stage
+    assert "data/d/split/test.csv:\n  Rows: 1 (removed)" in by_stage, by_stage
+    assert "keep.csv" not in by_stage, by_stage
+    assert by_path == by_stage
+    assert "data/d/bundle.dat/all.csv:\n  Rows: 3 -> 4 (+1)" in path_output, path_output
+
+
+def test_diff_json_names_each_entry_change_type(tmp_path: pathlib.Path) -> None:
+    """Every `--json` entry carries `change_type`, one of `added`, `removed` and `modified`,
+    beside its row counts, and no cache-miss warning is logged."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\nkeep,5\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\nval,4\nkeep,5\n")
+    _ok(_pivot(root, "repro"))
+
+    result = _pivot(root, "diff", "--json", "d/split")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    kinds = {
+        e["path"]: (e["change_type"], e["old_rows"], e["new_rows"])
+        for e in json.loads(result.stdout)
+    }
+    assert kinds == {
+        "data/d/split/test.csv": ("removed", 1, None),
+        "data/d/split/train.csv": ("modified", 1, 2),
+        "data/d/split/val.csv": ("added", None, 1),
+    }, kinds
+    assert "local cache" not in result.stderr, result.stderr
+
+
+def _fresh_clone(tmp_path: pathlib.Path, pipeline_py: str) -> pathlib.Path:
+    """A project committed with its outputs, then cloned: the clone has no `.pivot/cache`."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _project(source, {"pipeline.py": pipeline_py, "data/raw/rows.csv": "v\n1\n2\n"})
+    _ok(_pivot(source, "repro"))
+    _commit(source, "first run")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(source), str(clone)], check=True)
+    assert not (clone / ".pivot" / "cache").exists()
+    return clone
+
+
+@pytest.mark.parametrize(
+    ("moved", "expected", "text"),
+    [
+        pytest.param(
+            False,
+            {"data/d/make.csv": ("modified", None, 3)},
+            ["data/d/make.csv:\n  Rows: unknown -> 3"],
+            id="modified",
+        ),
+        pytest.param(
+            True,
+            {
+                "data/d/make/all.csv": ("removed", None, None),
+                "data/d/make.csv": ("added", None, 3),
+            },
+            [
+                "data/d/make/all.csv:\n  Rows: unknown (removed)",
+                "data/d/make.csv:\n  Rows: 3 (added)",
+            ],
+            id="moved",
+        ),
+    ],
+)
+def test_diff_in_a_fresh_clone_reports_a_head_side_missing_from_the_cache(
+    tmp_path: pathlib.Path,
+    moved: bool,
+    expected: dict[str, tuple[str, int | None, int | None]],
+    text: list[str],
+) -> None:
+    """A clone that never pulled has no cache object for git HEAD's side. Each such entry is
+    listed at its path with its change type and unknown HEAD counts, stderr names it once with
+    the fix, and every other entry is compared, in `--json`, `--no-tui` and the TUI."""
+    clone = _fresh_clone(tmp_path, _MAKE_DIRECTORY_PIPELINE if moved else _MAKE_FILE_PIPELINE)
+    if moved:
+        (clone / "pipeline.py").write_text(_MAKE_FILE_PIPELINE)
+    (clone / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    tui_capture = _write_tui_capture_module(clone)
+    _ok(_pivot(clone, "repro"))
+    (missing,) = [path for path, (kind, _, _) in expected.items() if kind != "added"]
+    line = (
+        f"{missing}: its git HEAD content is not in the local cache; run pivot fetch to compare it"
+    )
+
+    for target in ("d/make", "."):
+        result = _pivot(clone, "diff", "--json", target)
+        assert result.returncode == 0, (target, result.stdout + result.stderr)
+        entries = json.loads(result.stdout)
+        kinds = {e["path"]: (e["change_type"], e["old_rows"], e["new_rows"]) for e in entries}
+        assert kinds == expected, (target, kinds)
+        assert result.stderr.count(line) == 1, (target, result.stderr)
+
+    text_result = _pivot(clone, "diff", "--no-tui", "d/make")
+    assert text_result.returncode == 0, text_result.stdout + text_result.stderr
+    for block in text:
+        assert block in text_result.stdout, text_result.stdout
+    assert text_result.stderr.count(line) == 1, text_result.stderr
+
+    tui_result = _pivot(clone, "diff", "d/make")
+    assert tui_result.returncode == 0, tui_result.stdout + tui_result.stderr
+    tui_kinds = {
+        e["path"]: (e["change_type"], e["old_rows"], e["new_rows"])
+        for e in json.loads(tui_capture.read_text())
+    }
+    assert tui_kinds == expected, tui_kinds
+    assert tui_result.stderr.count(line) == 1, tui_result.stderr
+
+
+_FETCH_FIX_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def mod(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("part")}
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    mod(rows)
+    split(rows)
+"""
+
+
+@pytest.mark.parametrize(
+    ("change", "target", "before_fix", "after_fix"),
+    [
+        pytest.param(
+            "modified",
+            "data/d/mod.csv",
+            ("modified", None, 3),
+            ("modified", 2, 3),
+            id="modified-output",
+        ),
+        pytest.param(
+            "deleted",
+            "data/d/mod.csv",
+            ("removed", None, None),
+            ("removed", 2, None),
+            id="deleted-output",
+        ),
+        pytest.param(
+            "deleted",
+            "data/d/split/train.csv",
+            ("removed", None, None),
+            ("removed", 1, None),
+            id="deleted-directory-member",
+        ),
+    ],
+)
+def test_diff_names_a_fix_that_compares_the_entry_without_touching_the_workspace(
+    tmp_path: pathlib.Path,
+    moto_services: dict[str, str],
+    change: str,
+    target: str,
+    before_fix: tuple[str, int | None, int | None],
+    after_fix: tuple[str, int | None, int | None],
+) -> None:
+    """In a fresh clone whose cache lacks git HEAD's objects, the warning names a command.
+    Running it makes the same diff compare the entry with git HEAD's counts known, and leaves
+    the workspace side as it was: a deleted output stays deleted, a changed one stays changed."""
+    env = _env(
+        AWS_ENDPOINT_URL=moto_services["s3"],
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"fetch-fix-{uuid.uuid4().hex[:8]}"
+    boto3.client(
+        "s3",
+        endpoint_url=moto_services["s3"],
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    ).create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _project(
+        source,
+        {"pipeline.py": _FETCH_FIX_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"},
+    )
+    _ok(_pivot(source, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(source, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(source, "repro", env=env))
+    _ok(_pivot(source, "push", env=env))
+    _commit(source, "first run")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(source), str(clone)], check=True)
+    assert not (clone / ".pivot" / "cache").exists()
+    if change == "modified":
+        (clone / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntest,2\ntrain,3\n")
+        _ok(_pivot(clone, "repro", env=env))
+    else:
+        (clone / target).unlink()
+    workspace_before = (clone / target).read_bytes() if (clone / target).exists() else None
+
+    def _entry(
+        result: subprocess.CompletedProcess[str],
+    ) -> dict[str, tuple[str, int | None, int | None]]:
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            e["path"]: (e["change_type"], e["old_rows"], e["new_rows"])
+            for e in json.loads(result.stdout)
+        }
+
+    first = _pivot(clone, "diff", "--json", target, env=env)
+    assert _entry(first) == {target: before_fix}, first.stdout
+    line = (
+        f"{target}: its git HEAD content is not in the local cache; run pivot fetch to compare it"
+    )
+    assert first.stderr.count(line) == 1, first.stderr
+
+    _ok(_pivot(clone, "fetch", env=env))
+
+    after = _pivot(clone, "diff", "--json", target, env=env)
+    assert _entry(after) == {target: after_fix}, after.stdout
+    assert "local cache" not in after.stderr, after.stderr
+    workspace_after = (clone / target).read_bytes() if (clone / target).exists() else None
+    assert workspace_after == workspace_before
+
+
+def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` refuses a committed directory manifest path outside its project."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("TOP_SECRET_VALUE\n1\n")
+    malicious_relpath = f"../../../../{secret.name}"
+    try:
+        lock_path = root / ".pivot" / "stages" / "d" / "split.lock"
+        lock_data = yaml.safe_load(lock_path.read_text())
+        lock_data["outs"][0]["manifest"] = [
+            {
+                "relpath": malicious_relpath,
+                "hash": "a" * 16,
+                "size": secret.stat().st_size,
+                "isexec": False,
+            }
+        ]
+        lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
+        _commit(root, "malicious lock")
+
+        result = _pivot(root, "diff", "--json", "d/split")
+    finally:
+        secret.unlink()
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert ".pivot/stages/d/split.lock" in output
+    assert malicious_relpath in output
+    assert "TOP_SECRET_VALUE" not in output
+
+
+def test_diff_refuses_a_manifest_path_with_a_null_byte(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` names and refuses a committed manifest path containing a null byte."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    lock_path = root / ".pivot" / "stages" / "d" / "split.lock"
+    lock_data = yaml.safe_load(lock_path.read_text())
+    lock_data["outs"][0]["manifest"] = [
+        {"relpath": "nul\0.csv", "hash": "a" * 16, "size": 20, "isexec": False}
+    ]
+    lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
+    _commit(root, "malicious lock")
+
+    result = _pivot(root, "diff", "--json", "d/split")
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert ".pivot/stages/d/split.lock" in output
+    assert "not a project-relative POSIX path" in output
+
+
+_RECORDED_NAME_DIRECTORY_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {{"plain.csv": raw, {name!r}: raw}}
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+# A `pathlib.Path` directory output writes its files itself, so any name the filesystem takes
+# reaches the lock: a CSV through pandas, any other name as raw bytes.
+_RECORDED_NAME_PATH_PIPELINE = """\
+import pathlib
+import tempfile
+
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "make"
+    out.mkdir()
+    raw.to_csv(out / "plain.csv", index=False)
+    name = {name!r}
+    if name.endswith(".csv"):
+        raw.to_csv(out / name, index=False)
+    else:
+        (out / name).write_bytes(b"image-bytes")
+    return out
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+
+def _run_recorded_name_project(
+    tmp_path: pathlib.Path, pipeline_py: str, output: str, name: str
+) -> tuple[pathlib.Path, str]:
+    """Run a stage whose directory output holds ``plain.csv`` and ``name``, commit, grow the
+    input by one row and run again. Returns the root and both runs' output."""
+    root = _project(
+        tmp_path,
+        {"pipeline.py": pipeline_py.format(name=name), "data/raw/rows.csv": "v\n1\n2\n"},
+    )
+    first = _ok(_pivot(root, "repro"))
+    lock_data = yaml.safe_load((root / ".pivot" / "stages" / "d" / "make.lock").read_text())
+    assert lock_data["outs"][0]["path"] == output
+    assert sorted(entry["relpath"] for entry in lock_data["outs"][0]["manifest"]) == sorted(
+        ["plain.csv", name]
+    )
+    status = _ok(_pivot(root, "status"))
+    assert "1 stages: 1 cached, 0 stale" in status, status
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    second = _ok(_pivot(root, "repro"))
+    return root, first + second
+
+
+def _assert_recorded_name_is_read(root: pathlib.Path, output: str, name: str) -> None:
+    """status, verify, diff --json, params diff and checkout all read the recorded name."""
+    status = _ok(_pivot(root, "status"))
+    assert "1 stages: 1 cached, 0 stale" in status, status
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+    changed = {"plain.csv", name} if name.endswith(".csv") else {"plain.csv"}
+    assert {
+        (entry["path"], entry["change_type"], entry["old_rows"], entry["new_rows"])
+        for entry in _json_diff(root, "d/make")
+    } == {(f"{output}/{member}", "modified", 2, 3) for member in changed}
+    params = _pivot(root, "params", "diff")
+    assert params.returncode == 0, params.stdout + params.stderr
+    shutil.rmtree(root / output)
+    assert "Restored 2 file(s)" in _ok(_pivot(root, "checkout"))
+    assert sorted(path.name for path in (root / output).iterdir()) == sorted(["plain.csv", name])
+
+
+@pytest.mark.parametrize(
+    ("pipeline_py", "output", "name"),
+    [
+        pytest.param(
+            _RECORDED_NAME_DIRECTORY_PIPELINE,
+            "data/d/make",
+            "Screenshot 2024-01-01 at 10.00.00\u202fAM.csv",
+            id="directory-narrow-no-break-space",
+        ),
+        pytest.param(
+            _RECORDED_NAME_DIRECTORY_PIPELINE,
+            "data/d/make",
+            "caf\u00e9\u00a0menu.csv",
+            id="directory-no-break-space",
+        ),
+        pytest.param(
+            _RECORDED_NAME_DIRECTORY_PIPELINE,
+            "data/d/make",
+            "team\u200dlead.csv",
+            id="directory-zero-width-joiner",
+        ),
+        pytest.param(
+            _RECORDED_NAME_PATH_PIPELINE,
+            "data/d/make.dat",
+            "Screenshot 2024-01-01 at 10.00.00\u202fAM.csv",
+            id="path-narrow-no-break-space",
+        ),
+        pytest.param(
+            _RECORDED_NAME_PATH_PIPELINE,
+            "data/d/make.dat",
+            "Screenshot 2024-01-01 at 10.00.00\u202fAM.png",
+            id="path-macos-screenshot-png",
+        ),
+        pytest.param(
+            _RECORDED_NAME_PATH_PIPELINE,
+            "data/d/make.dat",
+            "\u8cc7\u6599\u3000\u4e00\u89a7.png",
+            id="path-ideographic-space-png",
+        ),
+    ],
+)
+def test_a_member_name_with_a_space_or_format_character_is_recorded_and_read(
+    tmp_path: pathlib.Path, pipeline_py: str, output: str, name: str
+) -> None:
+    """A name with a no-break, narrow or ideographic space or a zero-width joiner, as in a
+    macOS screenshot, is recorded without a warning, and every command reads the lock."""
+    root, runs = _run_recorded_name_project(tmp_path, pipeline_py, output, name)
+
+    assert "WARNING" not in runs, runs
+    _assert_recorded_name_is_read(root, output, name)
+
+
+def test_a_member_name_with_a_control_character_is_recorded_with_a_warning(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A TAB in a member name is recorded and read back, as on 0.5.2; each run that records it
+    warns once, naming the file, that a later release will refuse it."""
+    name = "a\tb.csv"
+    root, runs = _run_recorded_name_project(
+        tmp_path, _RECORDED_NAME_DIRECTORY_PIPELINE, "data/d/make", name
+    )
+
+    warning = (
+        "Stage 'd/make' records 'data/d/make/a\\tb.csv', whose name holds a control character; "
+        + "a later release will refuse such names, so rename it"
+    )
+    assert " ".join(runs.split()).count(warning) == 2, runs
+    _assert_recorded_name_is_read(root, "data/d/make", name)
+
+
+def test_a_member_name_with_a_backslash_fails_the_stage_and_records_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A lock never records a name its read refuses: a backslash fails the run and `pivot
+    commit`, naming the file, and writes no lock."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _RECORDED_NAME_PATH_PIPELINE.format(name="b\\s.csv"),
+            "data/raw/rows.csv": "v\n1\n2\n",
+        },
+    )
+    lock_path = root / ".pivot" / "stages" / "d" / "make.lock"
+    refusal = (
+        "Stage 'd/make' cannot record 'data/d/make.dat/b\\\\s.csv': it contains a backslash; "
+        + "rename it"
+    )
+
+    run = _pivot(root, "repro")
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert refusal in " ".join((run.stdout + run.stderr).split()), run.stdout + run.stderr
+    assert not lock_path.exists()
+
+    _ok(_pivot(root, "repro", "--no-commit"))
+    commit = _pivot(root, "commit", "d/make")
+    assert commit.returncode == 1, commit.stdout + commit.stderr
+    assert f"{refusal} — skipping" in " ".join(commit.stderr.split()), commit.stderr
+    assert not lock_path.exists()
+
+
+_EXTERNAL_CACHE_DIFF_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def double(numbers: pd.DataFrame) -> pd.DataFrame:
+    return numbers * 2
+
+
+with Pipeline("p") as pipeline:
+    double(pipeline.input("numbers.csv"))
+"""
+
+
+def _configure_external_symlink_cache(root: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_dir)))
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+
+
+def test_diff_supports_external_cache_symlink_checkout_for_a_single_file_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` reads a single-file output checked out from an external cache."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _EXTERNAL_CACHE_DIFF_PIPELINE,
+            "data/raw/numbers.csv": "a\n1\n",
+        },
+    )
+    _configure_external_symlink_cache(root, tmp_path / "cache")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "numbers.csv").write_text("a\n1\n2\n")
+    _ok(_pivot(root, "repro"))
+
+    json_output = _ok(_pivot(root, "diff", "--json", "data/p/double.jsonl"))
+    text_output = _ok(_pivot(root, "diff", "--no-tui", "data/p/double.jsonl"))
+
+    assert '"path": "data/p/double.jsonl"' in json_output
+    assert "Rows: 1 -> 2 (+1)" in text_output
+
+
+def test_diff_supports_external_cache_symlink_checkout_for_a_directory_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` reads a directory output checked out from an external cache."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    _configure_external_symlink_cache(root, tmp_path / "cache")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,2\n")
+    _ok(_pivot(root, "repro"))
+
+    json_output = _ok(_pivot(root, "diff", "--json", "d/split"))
+    text_output = _ok(_pivot(root, "diff", "--no-tui", "d/split"))
+
+    assert '"path": "data/d/split/train.csv"' in json_output
+    assert "Rows: 1 -> 2 (+1)" in text_output
+
+
+_NESTED_DIFF_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {"nested/train.csv": raw}
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+_TUI_CAPTURE_MODULE = """\
+import json
+import pathlib
+
+
+def run_diff_app(results):
+    pathlib.Path("tui-results.json").write_text(json.dumps(results, default=str))
+"""
+
+
+def _write_tui_capture_module(root: pathlib.Path) -> pathlib.Path:
+    package = root / "pivot_tui"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    capture = package / "diff.py"
+    capture.write_text(_TUI_CAPTURE_MODULE)
+    return root / "tui-results.json"
+
+
+def _replace_nested_with_outside_directory(
+    root: pathlib.Path, tmp_path: pathlib.Path
+) -> pathlib.Path:
+    """Replace the recorded `data/d/make/nested` with a symlink to an outside secret directory."""
+    nested = root / "data" / "d" / "make" / "nested"
+    (nested / "train.csv").unlink()
+    nested.rmdir()
+    external = tmp_path.parent / f"{tmp_path.name}-external"
+    external.mkdir()
+    (external / "train.csv").write_text("TOP_SECRET_VALUE\n42\n")
+    nested.symlink_to(external, target_is_directory=True)
+    return external
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("d/make", id="directory-target"),
+        pytest.param("data/d/make/nested/train.csv", id="direct-member-target"),
+    ],
+)
+def test_diff_member_map_excludes_descendants_of_a_left_out_directory_symlink(
+    tmp_path: pathlib.Path, target: str
+) -> None:
+    """`pivot diff` never reads a recorded file below a left-out directory symlink."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _NESTED_DIFF_PIPELINE,
+            "data/raw/rows.csv": "value\n1\n",
+        },
+    )
+    tui_capture = _write_tui_capture_module(root)
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    external = _replace_nested_with_outside_directory(root, tmp_path)
+    try:
+        json_output = _ok(_pivot(root, "diff", "--json", target))
+        text_output = _ok(_pivot(root, "diff", "--no-tui", target))
+        tui_output = _ok(_pivot(root, "diff", target))
+        tui_results = tui_capture.read_text()
+    finally:
+        (external / "train.csv").unlink()
+        external.rmdir()
+
+    for output in (json_output, text_output, tui_output):
+        assert "Directory artifact data/d/make leaves out symlink nested" in output, output
+        assert "TOP_SECRET_VALUE" not in output, output
+    assert "data/d/make/nested/train.csv" in tui_results
+    assert "TOP_SECRET_VALUE" not in tui_results
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("d/split", id="directory-target"),
+        pytest.param("data/d/split/train.csv", id="direct-member-target"),
+    ],
+)
+def test_diff_tui_excludes_an_outside_file_symlink(tmp_path: pathlib.Path, target: str) -> None:
+    """The TUI receives no data from a left-out file symlink."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    tui_capture = _write_tui_capture_module(root)
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("TOP_SECRET_VALUE\n1\n")
+    member = root / "data" / "d" / "split" / "train.csv"
+    member.unlink()
+    member.symlink_to(secret)
+    try:
+        output = _ok(_pivot(root, "diff", target))
+        tui_results = tui_capture.read_text()
+    finally:
+        secret.unlink()
+
+    assert "Directory artifact data/d/split leaves out symlink train.csv" in output
+    assert "TOP_SECRET_VALUE" not in output
+    assert "data/d/split/train.csv" in tui_results
+    assert "TOP_SECRET_VALUE" not in tui_results
+
+
+def test_diff_excludes_a_cache_shaped_symlink_with_wrong_contents(tmp_path: pathlib.Path) -> None:
+    """A symlink to a misnamed cache object is left out like record-time hashing leaves it out."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_dir)))
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    member = root / "data" / "d" / "split" / "train.csv"
+    fake_hash = "0123456789abcdef"
+    fake_cache_object = cache_dir / "files" / fake_hash[:2] / fake_hash[2:]
+    fake_cache_object.parent.mkdir(parents=True)
+    fake_cache_object.write_text("TOP_SECRET_VALUE\n42\n")
+    member.unlink()
+    member.symlink_to(fake_cache_object)
+
+    output = _ok(_pivot(root, "diff", "--json", "d/split"))
+
+    assert "Directory artifact data/d/split leaves out symlink train.csv" in output
+    assert "TOP_SECRET_VALUE" not in output
+
+
+def _row_counts(root: pathlib.Path, target: str) -> dict[str, tuple[object, object]]:
+    result = _pivot(root, "diff", "--json", target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return {
+        entry["path"]: (entry["old_rows"], entry["new_rows"]) for entry in json.loads(result.stdout)
+    }
+
+
+def test_diff_compares_a_cache_object_symlink_member(tmp_path: pathlib.Path) -> None:
+    """A directory member that is a checkout link to its cache object diffs as that object."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(
+        project_dir,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    _ok(_pivot(root, "config", "set", "cache.dir", str(cache_dir)))
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,2\n")
+    _ok(_pivot(root, "repro"))
+
+    member = root / "data" / "d" / "split" / "train.csv"
+    member_hash, _ = cache.hash_file(member)
+    cache_object = cache.get_cache_path(cache_dir / "files", member_hash)
+    assert cache_object.is_file()
+    member.unlink()
+    member.symlink_to(cache_object)
+
+    direct = _row_counts(root, "data/d/split/train.csv")
+    whole = _row_counts(root, "d/split")
+
+    assert direct == {"data/d/split/train.csv": (1, 2)}
+    assert whole["data/d/split/train.csv"] == (1, 2)
+
+
+def _output_root_symlinked_to_an_in_project_copy(root: pathlib.Path) -> None:
+    output = root / "data" / "d" / "split"
+    replacement = root / "data" / "d" / "replacement"
+    shutil.copytree(output, replacement)
+    shutil.rmtree(output)
+    output.symlink_to(replacement, target_is_directory=True)
+
+
+@pytest.mark.parametrize(
+    "layout", ["external-cache-symlink-checkout", "output-root-symlink", "data-symlinked-outside"]
+)
+def test_diff_gives_a_member_one_answer_whatever_the_target(
+    tmp_path: pathlib.Path, layout: str
+) -> None:
+    """A directory member diffs the same whether the target names it, its output, or a
+    directory above the output, including the project root, in each supported symlinked layout."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    root = _project(project_dir, {"pipeline.py": _DIFF_PIPELINE})
+    rows = root / "data" / "raw" / "rows.csv"
+    if layout == "data-symlinked-outside":
+        external_data = tmp_path / "data"
+        external_data.mkdir()
+        (root / "data").symlink_to(external_data, target_is_directory=True)
+    if layout == "external-cache-symlink-checkout":
+        _configure_external_symlink_cache(root, tmp_path / "cache")
+    rows.parent.mkdir(parents=True, exist_ok=True)
+    rows.write_text("part,v\ntrain,1\n")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    rows.write_text("part,v\ntrain,1\ntrain,2\n")
+    _ok(_pivot(root, "repro"))
+    if layout == "output-root-symlink":
+        _output_root_symlinked_to_an_in_project_copy(root)
+    if layout != "data-symlinked-outside":
+        assert (root / "data" / "d" / "split").is_symlink()
+
+    answers = {
+        target: _row_counts(root, target).get("data/d/split/train.csv")
+        for target in (".", "data", "data/d", "data/d/split", "data/d/split/train.csv", "d/split")
+    }
+
+    assert answers == dict.fromkeys(answers, (1, 2))
+
+
+def test_diff_path_directory_member_never_reads_an_outside_symlink(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A direct member of a `pathlib.Path` directory output uses that output's member map."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\n",
+        },
+    )
+    tui_capture = _write_tui_capture_module(root)
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("part,v\nTOP_SECRET_VALUE,42\n")
+    member = root / "data" / "d" / "bundle.dat" / "all.csv"
+    member.unlink()
+    member.symlink_to(secret)
+    target = "data/d/bundle.dat/all.csv"
+    try:
+        json_output = _ok(_pivot(root, "diff", "--json", target))
+        text_output = _ok(_pivot(root, "diff", "--no-tui", target))
+        tui_output = _ok(_pivot(root, "diff", target))
+        tui_results = tui_capture.read_text()
+    finally:
+        secret.unlink()
+
+    for output in (json_output, text_output, tui_output):
+        assert "Directory artifact data/d/bundle.dat leaves out symlink all.csv" in output, output
+        assert "TOP_SECRET_VALUE" not in output, output
+    assert target in tui_results
+    assert "TOP_SECRET_VALUE" not in tui_results
+
+
+def _json_diff(root: pathlib.Path, target: str) -> list[dict[str, object]]:
+    result = _pivot(root, "diff", "--json", target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout)
+
+
+def test_diff_of_the_project_root_equals_the_data_directory(tmp_path: pathlib.Path) -> None:
+    """`pivot diff .` and the absolute project root select the same outputs as `data`."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    targets = (".", str(root), "data")
+
+    unchanged = {target: _json_diff(root, target) for target in targets}
+
+    assert unchanged == {target: [] for target in targets}
+
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\ntest,2\n")
+    _ok(_pivot(root, "repro"))
+    changed = {target: _json_diff(root, target) for target in targets}
+
+    assert changed["."] == changed[str(root)] == changed["data"]
+    assert {entry["path"] for entry in changed["data"]} == {
+        "data/d/bundle.dat/all.csv",
+        "data/d/split/train.csv",
+    }
+
+
+def test_diff_warns_only_about_symlinks_inside_the_selected_targets(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A left-out sibling of a direct target is not named; the whole output names it."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+
+    secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
+    secret.write_text("part,v\nTOP_SECRET_VALUE,42\n")
+    sibling = root / "data" / "d" / "split" / "test.csv"
+    sibling.unlink()
+    sibling.symlink_to(secret)
+    try:
+        direct = _ok(_pivot(root, "diff", "--json", "data/d/split/train.csv"))
+        whole = _ok(_pivot(root, "diff", "--json", "d/split"))
+    finally:
+        secret.unlink()
+
+    assert "leaves out" not in direct, direct
+    assert "Directory artifact data/d/split leaves out symlink test.csv" in whole, whole
+    assert "TOP_SECRET_VALUE" not in direct + whole
+
+
+def _symlinked_project(
+    tmp_path: pathlib.Path, files: dict[str, str]
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """A project at ``<tmp>/project``, a symlink ``<tmp>/link`` to it, and a CSV outside it."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _project(root, files)
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+    outside = tmp_path / "outside.csv"
+    outside.write_text("part,v\nx,1\n")
+    return root, link, outside
+
+
+def test_diff_takes_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """From a cwd reached through a symlink to the project, an absolute target under that
+    symlink names the output the relative target names; a path outside stays unmatched."""
+    root, link, outside = _symlinked_project(
+        tmp_path, {"pipeline.py": _DIFF_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\ntest,2\n")
+    _ok(_pivot(root, "repro"))
+
+    relative = _pivot(link, "diff", "--json", "data/d/split/train.csv")
+    absolute = _pivot(link, "diff", "--json", str(link / "data" / "d" / "split" / "train.csv"))
+    refused = _pivot(link, "diff", "--json", str(outside))
+
+    assert relative.returncode == 0, relative.stdout + relative.stderr
+    assert absolute.returncode == 0, absolute.stdout + absolute.stderr
+    entries = json.loads(absolute.stdout)
+    assert entries == json.loads(relative.stdout)
+    assert [(e["path"], e["old_rows"], e["new_rows"]) for e in entries] == [
+        ("data/d/split/train.csv", 1, 2)
+    ]
+    assert "outside base" not in absolute.stderr, absolute.stderr
+    assert refused.returncode == 0, refused.stdout + refused.stderr
+    assert json.loads(refused.stdout) == []
+    assert (
+        f"No CSV, JSON or JSONL stage output matches {str(outside)!r}, so it is not compared"
+        in " ".join(refused.stderr.split())
+    ), refused.stderr
+
+
+def test_checkout_takes_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An absolute target under a symlink to the project restores what the relative target
+    restores; a path outside the project is refused as before."""
+    root, link, outside = _symlinked_project(
+        tmp_path, {"pipeline.py": _DIFF_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    output = root / "data" / "d" / "split"
+
+    for target in ("data/d/split", str(link / "data" / "d" / "split")):
+        shutil.rmtree(output)
+        assert "Restored 2 file(s)" in _ok(_pivot(link, "checkout", target)), target
+        assert sorted(path.name for path in output.iterdir()) == ["test.csv", "train.csv"]
+    refused = _pivot(link, "checkout", str(outside))
+
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert f"Target '{outside}' resolves outside project root" in refused.stderr, refused.stderr
+
+
+@pytest.mark.parametrize(
+    ("command", "line"),
+    [
+        ("push", "Would push 2 file(s) to 'origin'"),
+        ("fetch", "Would fetch 2 file(s) from 'origin'"),
+        ("pull", "Would pull 2 file(s) from 'origin'"),
+    ],
+)
+def test_remote_commands_take_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path, command: str, line: str
+) -> None:
+    """push, fetch and pull read an absolute target under a symlink to the project as the
+    relative target; a path outside the project is refused as before."""
+    root, link, outside = _symlinked_project(
+        tmp_path, {"pipeline.py": _DIFF_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    _ok(_pivot(root, "config", "set", "default_remote", "origin"))
+    # With the local cache gone, fetch and pull have both of the output's files to name.
+    shutil.rmtree(root / ".pivot" / "cache" / "files")
+    env = _env(AWS_ENDPOINT_URL="http://127.0.0.1:9", AWS_DEFAULT_REGION="us-east-1")
+
+    relative = _ok(_pivot(link, command, "--dry-run", "data/d/split", env=env))
+    absolute = _ok(_pivot(link, command, "--dry-run", str(link / "data" / "d" / "split"), env=env))
+    refused = _pivot(link, command, "--dry-run", str(outside), env=env)
+
+    assert line in relative, relative
+    assert line in absolute, absolute
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert f"Target '{outside}' resolves outside project root" in refused.stderr, refused.stderr
+
+
+def test_track_takes_an_absolute_path_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An absolute path under a symlink to the project is tracked as the relative path is;
+    a path outside the project is refused as before."""
+    root, link, outside = _symlinked_project(tmp_path, {"notes.txt": "notes\n"})
+    pvt = root / "notes.txt.pvt"
+    recorded = dict[str, str]()
+
+    for path in ("notes.txt", str(link / "notes.txt")):
+        pvt.unlink(missing_ok=True)
+        assert f"Tracked: {path}" in _ok(_pivot(link, "track", path)), path
+        recorded[path] = pvt.read_text()
+    refused = _pivot(link, "track", str(outside))
+
+    assert recorded["notes.txt"] == recorded[str(link / "notes.txt")]
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert f"Path '{outside}' resolves outside project root" in refused.stderr, refused.stderr
+
+
+_KIND_DIFF_PIPELINE = """\
+import pathlib
+import tempfile
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("part")}
+
+
+@stage
+def bundle(raw: pd.DataFrame) -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "bundle"
+    out.mkdir()
+    raw.to_csv(out / "all.csv", index=False)
+    (out / "notes.txt").write_text(f"rows={len(raw)}\\n")
+    return out
+
+
+@stage
+def double(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    split(rows)
+    bundle(rows)
+    double(rows)
+"""
+
+
+def _kind_project(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A committed project with a directory, a `pathlib.Path` directory and a file output,
+    whose workspace then gains one row."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _KIND_DIFF_PIPELINE,
+            "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "data" / "raw" / "rows.csv").write_text("part,v\ntrain,1\ntrain,3\ntest,2\n")
+    _ok(_pivot(root, "repro"))
+    return root
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("data/d/bundle.dat/notes.txt", id="non-data-member"),
+        pytest.param("data/d/split/absent.csv", id="absent-member"),
+        pytest.param("data/d/split/sub", id="missing-subdirectory"),
+    ],
+)
+def test_diff_warns_about_a_target_inside_an_output_that_selects_no_data_file(
+    tmp_path: pathlib.Path, target: str
+) -> None:
+    """A target inside a directory output that selects no data file on either side is named
+    in the unmatched-target warning, while a data member beside it is compared silently."""
+    root = _kind_project(tmp_path)
+    warning = f"No CSV, JSON or JSONL stage output matches {target!r}"
+
+    json_result = _pivot(root, "diff", "--json", target)
+    text_output = _ok(_pivot(root, "diff", "--no-tui", target))
+    control = _ok(_pivot(root, "diff", "--json", "data/d/bundle.dat/all.csv"))
+
+    assert json_result.returncode == 0, json_result.stdout + json_result.stderr
+    assert json.loads(json_result.stdout) == []
+    assert warning in json_result.stderr, json_result.stderr
+    assert warning in text_output, text_output
+    assert "No CSV, JSON or JSONL" not in control, control
+    assert '"path": "data/d/bundle.dat/all.csv"' in control, control
+
+
+def _file_output_replaced_by_a_directory(root: pathlib.Path) -> tuple[str, str, str]:
+    output = root / "data" / "d" / "double.csv"
+    output.unlink()
+    output.mkdir()
+    (output / "a.csv").write_text("part,v\ntrain,1\n")
+    return "data/d/double.csv", "a file", "a directory"
+
+
+def _directory_output_replaced_by_a_file(root: pathlib.Path) -> tuple[str, str, str]:
+    output = root / "data" / "d" / "split"
+    shutil.rmtree(output)
+    output.write_text("part,v\ntrain,1\n")
+    return "data/d/split", "a directory", "a file"
+
+
+@pytest.mark.parametrize(
+    "replace",
+    [
+        pytest.param(_file_output_replaced_by_a_directory, id="file-replaced-by-directory"),
+        pytest.param(_directory_output_replaced_by_a_file, id="directory-replaced-by-file"),
+    ],
+)
+def test_diff_names_an_output_whose_kind_changed_and_compares_nothing_for_it(
+    tmp_path: pathlib.Path, replace: Callable[[pathlib.Path], tuple[str, str, str]]
+) -> None:
+    """An output recorded at git HEAD as one kind and found in the workspace as the other is
+    named in one line with both kinds, and none of its files is compared."""
+    root = _kind_project(tmp_path)
+    output, head_kind, workspace_kind = replace(root)
+    line = f"Output {output} is {head_kind} at git HEAD and {workspace_kind} in the workspace"
+
+    json_result = _pivot(root, "diff", "--json", output)
+    text_output = _ok(_pivot(root, "diff", "--no-tui", output))
+    every_output = _pivot(root, "diff", "--json", ".")
+
+    assert json_result.returncode == 0, json_result.stdout + json_result.stderr
+    assert json.loads(json_result.stdout) == []
+    assert json_result.stderr.count(line) == 1, json_result.stderr
+    assert text_output.count(line) == 1, text_output
+    assert "No data file changes detected." in text_output, text_output
+    assert every_output.stderr.count(line) == 1, every_output.stderr
+    compared = {entry["path"] for entry in json.loads(every_output.stdout)}
+    assert not any(path == output or path.startswith(f"{output}/") for path in compared)
+    assert "data/d/bundle.dat/all.csv" in compared
+
+
+_MAKE_DIRECTORY_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {"all.csv": raw}
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+_MAKE_FILE_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+with Pipeline("d") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+_MAKE_JSONL_PIPELINE = _MAKE_FILE_PIPELINE.replace("loaders.CSV()", "loaders.DataFrameJSONL()")
+
+
+@pytest.mark.parametrize("keep_old_output", [True, False], ids=["old-output-kept", "old-removed"])
+@pytest.mark.parametrize(
+    ("before", "after", "old_output", "new_output", "removed", "added"),
+    [
+        pytest.param(
+            _MAKE_DIRECTORY_PIPELINE,
+            _MAKE_FILE_PIPELINE,
+            "data/d/make",
+            "data/d/make.csv",
+            "data/d/make/all.csv",
+            "data/d/make.csv",
+            id="directory-to-file",
+        ),
+        pytest.param(
+            _MAKE_FILE_PIPELINE,
+            _MAKE_DIRECTORY_PIPELINE,
+            "data/d/make.csv",
+            "data/d/make",
+            "data/d/make.csv",
+            "data/d/make/all.csv",
+            id="file-to-directory",
+        ),
+        pytest.param(
+            _MAKE_FILE_PIPELINE,
+            _MAKE_JSONL_PIPELINE,
+            "data/d/make.csv",
+            "data/d/make.jsonl",
+            "data/d/make.csv",
+            "data/d/make.jsonl",
+            id="csv-to-dataframe-jsonl",
+        ),
+    ],
+)
+def test_diff_compares_a_moved_output_by_path(
+    tmp_path: pathlib.Path,
+    before: str,
+    after: str,
+    old_output: str,
+    new_output: str,
+    removed: str,
+    added: str,
+    keep_old_output: bool,
+) -> None:
+    """A stage whose output moved to a new path, by a kind or loader switch, lists HEAD's file
+    as removed at the path HEAD recorded, and the workspace file as added at the new one, with
+    no warning."""
+    root = _project(tmp_path, {"pipeline.py": before, "data/raw/rows.csv": "v\n1\n2\n"})
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "pipeline.py").write_text(after)
+    (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    _ok(_pivot(root, "repro"))
+    old_output_on_disk = root / old_output
+    assert old_output_on_disk.exists()
+    if not keep_old_output:
+        if old_output_on_disk.is_dir():
+            shutil.rmtree(old_output_on_disk)
+        else:
+            old_output_on_disk.unlink()
+
+    expected = {removed: (2, None), added: (None, 3)}
+    selections = {
+        "d/make": expected,
+        ".": expected,
+        new_output: {added: (None, 3)},
+        old_output: {removed: (2, None)},
+    }
+
+    for target, answer in selections.items():
+        result = _pivot(root, "diff", "--json", target)
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = {e["path"]: (e["old_rows"], e["new_rows"]) for e in json.loads(result.stdout)}
+        assert rows == answer, (target, rows)
+        assert "at git HEAD and" not in result.stderr, (target, result.stderr)
+        assert "No CSV, JSON or JSONL" not in result.stderr, (target, result.stderr)
+
+    text_output = _ok(_pivot(root, "diff", "--no-tui", "d/make"))
+    assert "Rows: 2 (removed)" in text_output, text_output
+    assert "Rows: 3 (added)" in text_output, text_output
+
+
+_ALIAS_SHAPE_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+from shapes import Shape, make_value
+
+
+@stage
+def make(raw: pd.DataFrame) -> Shape:
+    return make_value(raw)
+
+
+with Pipeline("k") as pipeline:
+    make(pipeline.input("rows.csv"))
+"""
+
+_DATAFRAME_FILE_SHAPE = """\
+import pandas as pd
+
+Shape = pd.DataFrame
+
+
+def make_value(raw):
+    return raw
+"""
+
+_DATAFRAME_DIRECTORY_SHAPE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import directory, loaders
+
+Shape = Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]
+
+
+def make_value(raw):
+    return {"part.csv": raw}
+"""
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "removed", "added"),
+    [
+        pytest.param(
+            _DATAFRAME_DIRECTORY_SHAPE,
+            _DATAFRAME_FILE_SHAPE,
+            "data/k/make/part.csv",
+            "data/k/make.jsonl",
+            id="directory-to-file",
+        ),
+        pytest.param(
+            _DATAFRAME_FILE_SHAPE,
+            _DATAFRAME_DIRECTORY_SHAPE,
+            "data/k/make.jsonl",
+            "data/k/make/part.csv",
+            id="file-to-directory",
+        ),
+    ],
+)
+def test_diff_compares_an_output_moved_by_a_type_alias_switch(
+    tmp_path: pathlib.Path, first: str, second: str, removed: str, added: str
+) -> None:
+    """A type-alias switch that moves an output between `data/k/make` and `data/k/make.jsonl`
+    is a move: HEAD's file is removed at the HEAD path and the new file added, with no
+    kind-change line naming either path."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _ALIAS_SHAPE_PIPELINE,
+            "shapes.py": first,
+            "data/raw/rows.csv": "v\n1\n2\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _commit(root, "first run")
+    (root / "shapes.py").write_text(second)
+    _ok(_pivot(root, "repro"))
+
+    result = _pivot(root, "diff", "--json", "k/make")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    rows = {e["path"]: (e["old_rows"], e["new_rows"]) for e in json.loads(result.stdout)}
+    assert rows == {removed: (2, None), added: (None, 2)}, rows
+    assert "git HEAD" not in result.stderr, result.stderr
+
+
+_MAKE_AND_OTHER_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, loaders, stage
+
+
+@stage
+def make(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw
+
+
+@stage
+def other(raw: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return raw.head(1)
+
+
+with Pipeline("d") as pipeline:
+    rows = pipeline.input("rows.csv")
+    make(rows)
+    other(rows)
+"""
+
+
+@pytest.mark.parametrize(
+    ("head_paths", "expected"),
+    [
+        pytest.param(
+            {"other": "data/d/make.csv"},
+            {
+                "d/make": {"data/d/make.csv": (2, 3)},
+                "data/d/make.csv": {"data/d/make.csv": (2, 3)},
+                "d/other": {"data/d/other.csv": (None, 1)},
+                ".": {"data/d/make.csv": (2, 3), "data/d/other.csv": (None, 1)},
+            },
+            id="moved-onto-a-current-output",
+        ),
+        pytest.param(
+            {"make": "data/d/old.csv", "other": "data/d/old.csv"},
+            {
+                "d/make": {"data/d/old.csv": (2, None), "data/d/make.csv": (None, 3)},
+                "data/d/old.csv": {"data/d/old.csv": (2, None)},
+                "d/other": {"data/d/other.csv": (None, 1)},
+                ".": {
+                    "data/d/old.csv": (2, None),
+                    "data/d/make.csv": (None, 3),
+                    "data/d/other.csv": (None, 1),
+                },
+            },
+            id="two-moved-to-one-path",
+        ),
+        pytest.param(
+            {"other": "data/d/make.csv", "make": None},
+            {
+                "d/other": {"data/d/make.csv": (1, 3), "data/d/other.csv": (None, 1)},
+                "d/make": {"data/d/make.csv": (1, 3)},
+                "data/d/make.csv": {"data/d/make.csv": (1, 3)},
+                ".": {"data/d/make.csv": (1, 3), "data/d/other.csv": (None, 1)},
+            },
+            id="moved-onto-an-output-with-no-lock",
+        ),
+    ],
+)
+def test_diff_keeps_one_head_entry_for_a_path_two_locks_record(
+    tmp_path: pathlib.Path,
+    head_paths: dict[str, str | None],
+    expected: dict[str, dict[str, tuple[int | None, int | None]]],
+) -> None:
+    """When two committed HEAD locks record one path, which takes a hand-edited lock, the path
+    keeps the HEAD entry of the output that lives there, or else the first registered output's;
+    the other entry is dropped. A moved entry placed at a current output with no HEAD entry of
+    its own stays selectable through its own stage. A None path deletes that stage's lock."""
+    root = _project(
+        tmp_path, {"pipeline.py": _MAKE_AND_OTHER_PIPELINE, "data/raw/rows.csv": "v\n1\n2\n"}
+    )
+    _ok(_pivot(root, "repro"))
+    for stage_name, head_path in head_paths.items():
+        lock_path = root / ".pivot" / "stages" / "d" / f"{stage_name}.lock"
+        if head_path is None:
+            lock_path.unlink()
+            continue
+        lock_data = yaml.safe_load(lock_path.read_text())
+        lock_data["outs"][0]["path"] = head_path
+        lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
+    _commit(root, "hand-edited locks")
+    (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")
+    _ok(_pivot(root, "repro"))
+
+    for target, answer in expected.items():
+        result = _pivot(root, "diff", "--json", target)
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = {e["path"]: (e["old_rows"], e["new_rows"]) for e in json.loads(result.stdout)}
+        assert rows == answer, (target, rows)
 
 
 _SHOUT_PIPELINE = """\

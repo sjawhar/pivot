@@ -9,15 +9,16 @@ For runtime mutual exclusion during concurrent execution, see
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
-import pathlib
+import posixpath
 import re
-from typing import TypeGuard, cast
+from typing import TYPE_CHECKING, TypeGuard, cast, override
 
 import yaml
 
-from pivot import yaml_config
+from pivot import exceptions, path_policy, yaml_config
 from pivot.storage import cache
 from pivot.types import (
     ArtifactIdentity,
@@ -30,8 +31,13 @@ from pivot.types import (
     OutEntry,
     StorageLockData,
     identity_from_key,
+    identity_key,
     is_dir_hash,
 )
+
+if TYPE_CHECKING:
+    import pathlib
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,18 @@ def variant_name_error(name: str) -> str | None:
     return stage_name_error(name)
 
 
+@dataclasses.dataclass(frozen=True)
+class UnsafeLockPath:
+    """A recorded path that is not project-relative POSIX form."""
+
+    field: str
+    value: str
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.field}: {self.value!r} is not a project-relative POSIX path"
+
+
 def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     """Validate that parsed YAML has the storage format's shape, field by field.
 
@@ -89,9 +107,9 @@ def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
     hand-edited or partially written lock makes the stage stale instead of crashing a reader
     or letting status and repro disagree. The first failing field is logged at debug.
     """
-    error = _lock_shape_error(data)
+    error = lock_data_error(data)
     if error is not None:
-        logger.debug("Lock data rejected: field %s has the wrong type or is missing", error)
+        logger.debug("Lock data rejected: %s", error)
         return False
     return True
 
@@ -104,15 +122,12 @@ def _is_nonempty_str(value: object) -> bool:
     return isinstance(value, str) and value != ""
 
 
-def _is_project_relative_posix_path(value: object) -> bool:
-    if not isinstance(value, str) or not value or "\\" in value:
-        return False
-    path = pathlib.PurePosixPath(value)
-    return (
-        not path.is_absolute()
-        and path.as_posix() == value
-        and all(part not in {".", ".."} for part in path.parts)
-    )
+def _path_error(value: object, field: str) -> str | UnsafeLockPath | None:
+    if not isinstance(value, str) or not value:
+        return field
+    if path_policy.recorded_path_error(value) is not None:
+        return UnsafeLockPath(field, value)
+    return None
 
 
 def _is_str_mapping(value: object, *, str_values: bool) -> bool:
@@ -124,7 +139,7 @@ def _is_str_mapping(value: object, *, str_values: bool) -> bool:
     return not str_values or all(isinstance(item, str) for item in mapping.values())
 
 
-def _manifest_error(value: object, field: str) -> str | None:
+def _manifest_error(value: object, field: str) -> str | UnsafeLockPath | None:
     if not isinstance(value, list):
         return field
     for index, raw in enumerate(cast("list[object]", value)):
@@ -132,8 +147,8 @@ def _manifest_error(value: object, field: str) -> str | None:
         if not isinstance(raw, dict):
             return entry_field
         entry = cast("dict[str, object]", raw)
-        if not _is_nonempty_str(entry.get("relpath")):
-            return f"{entry_field}.relpath"
+        if error := _path_error(entry.get("relpath"), f"{entry_field}.relpath"):
+            return error
         if not cache.is_valid_hash(entry.get("hash")):
             return f"{entry_field}.hash"
         if not _is_int(entry.get("size")):
@@ -143,16 +158,16 @@ def _manifest_error(value: object, field: str) -> str | None:
     return None
 
 
-def _empty_dirs_error(value: object, field: str) -> str | None:
+def _empty_dirs_error(value: object, field: str) -> str | UnsafeLockPath | None:
     if not isinstance(value, list):
         return field
     for index, relpath in enumerate(cast("list[object]", value)):
-        if not _is_project_relative_posix_path(relpath):
-            return f"{field}[{index}]"
+        if error := _path_error(relpath, f"{field}[{index}]"):
+            return error
     return None
 
 
-def _entry_error(raw: object, field: str, list_key: str) -> str | None:
+def _entry_error(raw: object, field: str, list_key: str) -> str | UnsafeLockPath | None:
     """Check one ``deps`` or ``outs`` entry against DepEntry / OutEntry."""
     if not isinstance(raw, dict):
         return field
@@ -169,15 +184,13 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | None:
     if (
         list_key == "outs"
         and "path" in entry
-        and not _is_project_relative_posix_path(entry["path"])
+        and (error := _path_error(entry["path"], f"{field}.path"))
     ):
-        return f"{field}.path"
+        return error
     if "size" in entry and not _is_int(entry["size"]):
         return f"{field}.size"
-    if "manifest" in entry:
-        error = _manifest_error(entry["manifest"], f"{field}.manifest")
-        if error is not None:
-            return error
+    if "manifest" in entry and (error := _manifest_error(entry["manifest"], f"{field}.manifest")):
+        return error
     if "empty_dirs" in entry:
         if "manifest" not in entry:
             return f"{field}.empty_dirs"
@@ -185,10 +198,12 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | None:
     return None
 
 
-def _lock_shape_error(data: object) -> str | None:
-    """Return the first field of ``data`` that breaks StorageLockData, or None if none does.
+def lock_data_error(data: object) -> str | UnsafeLockPath | None:
+    """Return the first reason parsed data cannot safely be consumed as a lock, or None.
 
-    Extra top-level keys are allowed for forward compatibility.
+    The reason is the first field that breaks StorageLockData, or an ``UnsafeLockPath`` for a
+    recorded path that is not project-relative POSIX form. Extra top-level keys are allowed for
+    forward compatibility.
     """
     if not isinstance(data, dict):
         return "<document>"
@@ -273,6 +288,34 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
     )
 
 
+def _member_relpaths(entry: DepEntry | OutEntry) -> Iterator[str]:
+    """Yield the manifest relpaths and empty directories a directory entry records."""
+    if "manifest" in entry:
+        for item in entry["manifest"]:
+            yield item["relpath"]
+    if "empty_dirs" in entry:
+        yield from entry["empty_dirs"]
+
+
+def _recorded_paths(data: StorageLockData) -> Iterator[tuple[str, str | None, str | None]]:
+    """Yield each path a lock records with its output path or dependency name.
+
+    A yielded output path names the directory that owns a member. A yielded dependency names
+    the directory dependency that owns its member. The caller formats either only when it must
+    report a validation refusal or control-character warning.
+    """
+    for dep in data["deps"]:
+        dependency = identity_key(ArtifactIdentity(dep["producer"], dep["key"]))
+        for relpath in _member_relpaths(dep):
+            yield relpath, None, dependency
+    for out in data["outs"]:
+        out_path = out["path"] if "path" in out else None
+        if out_path is not None:
+            yield out_path, None, None
+        for relpath in _member_relpaths(out):
+            yield relpath, out_path, None
+
+
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
     """Convert storage format (list-based) to internal LockData (identity-keyed)."""
     dep_hashes = dict[ArtifactIdentity, HashInfo]()
@@ -329,7 +372,18 @@ class StageLock:
             with open(self.path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not is_lock_data(data):
-                logger.debug("Lock file %s failed validation; treating it as missing", self.path)
+                error = lock_data_error(data)
+                assert error is not None
+                if isinstance(error, UnsafeLockPath):
+                    logger.warning(
+                        "Lock file %s failed validation: %s; treating it as missing",
+                        self.path,
+                        error,
+                    )
+                else:
+                    logger.debug(
+                        "Lock file %s failed validation; treating it as missing", self.path
+                    )
                 return None
             return _convert_from_storage_format(data, stage_name=self.stage_name)
         except FileNotFoundError:
@@ -339,8 +393,41 @@ class StageLock:
             return None
 
     def write(self, data: LockData) -> None:
-        """Write lock file atomically, converting to storage format."""
+        """Write lock file atomically, converting to storage format.
+
+        Every recorded path must pass ``path_policy.recorded_path_error``, the rule ``read``
+        applies, so this never writes a lock that ``read`` refuses; a path that fails raises
+        InvalidPathError naming it. A recorded name that holds a control character is written,
+        and one warning names every such name.
+        """
         storage_data = _convert_to_storage_format(data)
+        with_control = list[str]()
+        for recorded, out_path, dependency in _recorded_paths(storage_data):
+            reason = path_policy.recorded_path_error(recorded)
+            has_control = reason is None and path_policy.has_control_character(recorded)
+            if reason is None and not has_control:
+                continue
+            if dependency is not None:
+                shown = f"{recorded!r} in dependency {dependency!r}"
+            elif out_path is not None:
+                shown = repr(posixpath.join(out_path, recorded))
+            else:
+                shown = repr(recorded)
+            if reason is not None:
+                raise exceptions.InvalidPathError(
+                    f"Stage '{self.stage_name}' cannot record {shown}: {reason}; rename it"
+                )
+            with_control.append(shown)
+        if with_control:
+            one = len(with_control) == 1
+            logger.warning(
+                "Stage '%s' records %s, whose %s a control character; a later release will "
+                + "refuse such names, so rename %s",
+                self.stage_name,
+                ", ".join(with_control),
+                "name holds" if one else "names hold",
+                "it" if one else "them",
+            )
 
         def write_yaml(fd: int) -> None:
             with os.fdopen(fd, "w") as f:

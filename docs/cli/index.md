@@ -37,6 +37,29 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
+**Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
+current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
+project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
+`../data/x.csv`.
+
+An absolute path that reaches the project through a symlink outside it counts as the place it
+points to in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch`, `pull` and `track`. The
+symlink can point to the project root, to one of its ancestors, or to a directory inside the
+project: from a `link -> project` symlink, `link/data/x.csv` names `data/x.csv`. A symlink
+inside the project is not followed: from `project/dlink -> data`, `dlink/x.csv` matches no
+output in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch` and `pull`, so give the path it
+points to, `data/x.csv`. `track` tracks a file through such a symlink, with a warning that the
+file is inside a symlinked directory.
+
+`pivot get` refuses every absolute path ("Path traversal not allowed in target").
+`pivot check-ignore` keeps a path under a symlink as typed, so a pattern anchored to the project
+root, such as `data/*.tmp`, does not match it. Give those two the path relative to the project
+root.
+
+A path that leaves the project, including `link/../x.csv`, is refused by `checkout`, `push`,
+`fetch`, `pull` and `track` (`resolves outside project root`) and matches no output in
+`diff`, `repro` and `dag`.
+
 ---
 
 ## Environment Variables
@@ -312,6 +335,9 @@ pivot verify [STAGES...] [OPTIONS]
 
 Checks that all stages are cached (code, params, deps match lock files) and output files exist locally or on remote. Use in CI pre-merge gates to ensure pipeline is reproducible.
 
+For a directory output, `pivot verify` also checks that the workspace path is a directory. A file
+at that path fails verification.
+
 **Arguments:**
 
 - `STAGES` - Stage names to verify (optional, verifies all if not specified)
@@ -391,6 +417,9 @@ pivot checkout [TARGETS...] [OPTIONS]
 | `--force` / `-f` | Overwrite existing files when every required cache object is available; otherwise refuse without changing the workspace file |
 | `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files and empty directories; if a file differs from the target, or an extra file or directory exists, replaces the directory when every such file is pivot's own earlier output (its content is in the cache; an extra empty directory holds nothing to lose), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite |
 | `--all` | Checkout all targets (ignore target filtering) |
+
+Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
+counts separately.
 
 ---
 
@@ -558,7 +587,19 @@ pivot diff TARGETS... [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Data files to compare (required)
+- `TARGETS` - Stage outputs to compare (required): a stage name, or a path at, inside or above a
+  stage output. `.` compares every output. A directory output compares its CSV, JSON, and JSONL
+  files one by one, and a path inside it compares the files at or below that path. A target that
+  names no CSV, JSON, or JSONL file is named in a warning and not compared. An output that moved
+  to a new path since git HEAD is compared as removed at its old path and added at its new one; a
+  path that holds a file at git HEAD and a directory in the workspace, or the reverse, is named
+  in a warning with both kinds and not compared.
+
+Each `--json` entry carries `change_type`: `added`, `removed` or `modified`. A kind change has
+no entry, only its warning. When git HEAD's side of an entry is not in the local cache, as in a
+fresh clone, the entry keeps its change type with that side's rows and columns `null`. A warning
+names the path and says to run `pivot fetch`, which fills the cache without touching the
+workspace, so the next diff compares that entry; every other entry is compared as usual.
 
 **Options:**
 

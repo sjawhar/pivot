@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import errno
 import os
 import pathlib
 import tempfile
@@ -273,10 +272,7 @@ class WorkspaceStore:
         self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
-        if ref.member is not None:
-            if path.is_dir():
-                raise IsADirectoryError(errno.EISDIR, "a directory, not a file", str(path))
-        elif ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir():
+        if ref.directory is None and (ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir()):
             return cache.hash_directory(path, state_db, cache_dir=self._cache_dir)
         file_hash, _ = cache.hash_file(path, state_db)
         return types.FileHash(hash=file_hash)

@@ -137,6 +137,24 @@ def _get_stage_missing_workspace_files(
     return missing
 
 
+def _get_stage_misplaced_directory_outputs(stage_name: str) -> list[str]:
+    """Get the paths of a stage's directory outputs that hold something other than a directory.
+
+    ``pivot commit`` records whatever sits at an output's path, so a file there can carry a
+    valid lock and cache entry while every consumer of the directory fails to read it.
+    """
+    stage_info = cli_helpers.get_stage(stage_name)
+    workspace_store = cli_helpers.require_workspace_store()
+    misplaced = list[str]()
+    for out in stage_info["outs"]:
+        if out.tag is not types.ArtifactTag.DIRECTORY:
+            continue
+        path = workspace_store.resolve_display_path(out)
+        if path.exists() and not path.is_dir():
+            misplaced.append(project.to_relative_path(path))
+    return misplaced
+
+
 def _get_stage_missing_hashes(
     stage_name: str,
     local_hashes: set[str],
@@ -263,6 +281,18 @@ def _verify_stages(
                     name=stage_name,
                     status="failed",
                     reason=stage_info["reason"] or "Stage is stale",
+                    missing_files=[],
+                )
+            )
+            continue
+
+        misplaced = _get_stage_misplaced_directory_outputs(stage_name)
+        if misplaced:
+            results.append(
+                StageVerifyInfo(
+                    name=stage_name,
+                    status="failed",
+                    reason=f"Not a directory, but a directory output: {', '.join(misplaced)}",
                     missing_files=[],
                 )
             )
