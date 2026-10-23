@@ -43,6 +43,16 @@ def _helper_session(pid: int) -> int:
     return int(pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[3])
 
 
+def _helper_wait_for_stop(harness: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + 10
+    status = pathlib.Path(f"/proc/{harness.pid}/stat")
+    while time.monotonic() < deadline:
+        if status.read_text().rsplit(")", 1)[1].split()[0] == "T":
+            return
+        time.sleep(0.01)
+    raise AssertionError("run.py did not stop")
+
+
 def _helper_semaphores(sid: int) -> set[pathlib.Path]:
     return set(pathlib.Path("/dev/shm").glob(f"sem.loky-{sid}-*"))
 
@@ -95,7 +105,42 @@ def test_real_pivot_second_signal_keeps_graceful_cleanup(
 
         exit_code = harness.wait(timeout=30)
         left, semaphores = _helper_wait_for_cleanup(sid, before)
-        assert exit_code in (-first, 128 + first), exit_code
+        assert exit_code in (-first, 128 + first, -second, 128 + second), exit_code
+        assert not left, f"measured session still has live processes: {left}"
+        assert not semaphores, f"pivot leaked semaphore files: {sorted(semaphores)}"
+    finally:
+        if harness.poll() is None:
+            harness.kill()
+            harness.wait()
+        run_test_helpers.kill_session(sid)
+        for path in _helper_semaphores(sid) - before:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+
+def test_real_pivot_pending_stop_signals_keep_graceful_cleanup(tmp_path: pathlib.Path) -> None:
+    argv = [sys.executable, str(_RUN_PY), "--project", "chain-100", "--variant", f"a={_PIVOT}"]
+    argv += ["--reps", "1", "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
+    before = set(pathlib.Path("/dev/shm").glob("sem.loky-*"))
+    harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sid = 0
+    try:
+        sid = _helper_session(_helper_repro_pid(harness))
+        assert len(_helper_wait_for_members(sid)) >= 4, "pivot did not start its worker session"
+        harness.send_signal(signal.SIGSTOP)
+        _helper_wait_for_stop(harness)
+        harness.send_signal(signal.SIGINT)
+        harness.send_signal(signal.SIGTERM)
+        harness.send_signal(signal.SIGCONT)
+
+        exit_code = harness.wait(timeout=30)
+        left, semaphores = _helper_wait_for_cleanup(sid, before)
+        assert exit_code in (
+            -signal.SIGINT,
+            128 + signal.SIGINT,
+            -signal.SIGTERM,
+            128 + signal.SIGTERM,
+        ), exit_code
         assert not left, f"measured session still has live processes: {left}"
         assert not semaphores, f"pivot leaked semaphore files: {sorted(semaphores)}"
     finally:

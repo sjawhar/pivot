@@ -183,7 +183,15 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
 
 
 def _first_queued_stop_signal(fallback: int) -> int:
-    """Return the first delivered stop signal, using the wakeup pipe's arrival order."""
+    """Return the first observed stop signal from the wakeup pipe.
+
+    run.py's status is the first stop signal it observes. Two stop signals that are pending together
+    have no observable order, and run.py reports the one the wakeup pipe lists first. CPython writes
+    the byte in `trip_signal` at
+    https://github.com/python/cpython/blob/v3.13.16/Modules/signalmodule.c#L323; Linux documents
+    pending-standard-signal delivery order as unspecified at
+    https://man7.org/linux/man-pages/man7/signal.7.html.
+    """
     if _stop_signal_read_fd is None:
         return fallback
     try:
@@ -197,7 +205,15 @@ def _first_queued_stop_signal(fallback: int) -> int:
 
 
 def _stop_on_signal(signum: int, _frame: object) -> None:
-    """Raise once so the stop sequence reports the first SIGINT or SIGTERM."""
+    """Stop once using the first observed stop signal.
+
+    run.py's status is the first stop signal it observes. Two stop signals that are pending together
+    have no observable order, and run.py reports the one the wakeup pipe lists first. CPython writes
+    the byte in `trip_signal` at
+    https://github.com/python/cpython/blob/v3.13.16/Modules/signalmodule.c#L323; Linux documents
+    pending-standard-signal delivery order as unspecified at
+    https://man7.org/linux/man-pages/man7/signal.7.html.
+    """
     global _first_stop_signal
     signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
     if _first_stop_signal is not None:
