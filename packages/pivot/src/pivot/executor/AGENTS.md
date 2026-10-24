@@ -10,7 +10,7 @@ run, within `worker.TERMINATION_GRACE_S`. The manager also ignores SIGTERM (mult
 already makes it ignore SIGINT), so a stop signalled to the whole process group leaves it to
 its owner's shutdown, which removes its `pymp-*` directory.
 
-One-shot Engines give idle workers `core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S`; long-lived watch,
+One-shot Engines give idle workers `core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S`. Long-lived watch,
 serve and TUI Engines use no idle timeout so they stay warm between runs. A run's first
 submission starts the run's resource width (`Scheduler.resource_width`). After it,
 `core.submit()` drives loky's private `_max_workers` to the submitted work count, so idle workers

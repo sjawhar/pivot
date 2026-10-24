@@ -217,12 +217,14 @@ def submit[T](
     keepalive_pings: int = 0,
     **kwargs: object,
 ) -> concurrent.futures.Future[T]:
-    """Submit work, growing only when every live worker already has work.
+    """Submit work and set how many workers loky keeps: the larger of the unfinished work count
+    and ``prestart_target``, at most ``max_workers``.
 
-    ``prestart_target`` is the worker count to start now: the run's resource width at its first
-    submission, and later the direct consumers that the scheduler predicts will become
-    resource-admissible when this stage completes. ``keepalive_pings`` counts submitted
-    keep-alive pings that have not finished: they last milliseconds, so they are not work.
+    A worker starts when every live worker already has work, or to reach ``prestart_target``.
+    ``prestart_target`` is the run's resource width at its first submission. Later, it counts
+    the direct consumers that the scheduler predicts will become resource-admissible when this
+    stage completes. ``keepalive_pings`` counts submitted keep-alive pings that have not
+    finished. They last milliseconds, so they are not work.
     """
     pending = len(pool._pending_work_items) - keepalive_pings
     target_workers = max(pending + 1, prestart_target)

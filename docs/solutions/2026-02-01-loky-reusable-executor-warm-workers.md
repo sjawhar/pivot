@@ -47,10 +47,11 @@ The key behaviors:
    parent's direct consumer wave. The Engine records each direct consumer wave's half-timeout
    deadline, and its existing 100 ms execution loop services those deadlines, so a parent
    costs no thread. Once a deadline passes, the loop sends a barrier-coordinated ping to each
-   idle pre-started worker. Pings stop and queued ping futures are cancelled when the parent
-   resolves, fails, or the run ends; those workers then follow the normal timeout.
-2. **Later dispatches** - An existing idle worker takes the stage. A new worker starts only when
-   every live worker already has work.
+   idle pre-started worker. When the parent resolves or fails, or the run ends, the pings stop
+   and the Engine cancels the queued ping futures. Those workers then follow the normal timeout.
+2. **Later dispatches** - An existing idle worker takes the stage. A new worker starts when
+   every live worker already has work, or for the direct consumer wave of the parent that the
+   Engine dispatches.
 3. **Idle cleanup** - One-shot Engines give idle workers a 10-second timeout. An idle worker
    exits after the 10-second idle timeout, or occasionally after a second one, when loky's
    worker loses its process-lock race. The timeout is 126 times the 78.898 ms maximum
@@ -180,7 +181,7 @@ submission helper controls how many workers are live:
 | Aspect | Standard ProcessPoolExecutor | Pivot reusable executor |
 |---|---|---|
 | Pool lifetime | Per `with` block | Engine lifetime |
-| Worker spawn | Every run | When an admitted stage has no idle worker |
+| Worker spawn | Every run | The run's resource width at its first submission, then when an admitted stage has no idle worker or for a parent's direct consumer wave |
 | Import overhead | Every worker spawn | Once per worker lifetime |
 | One-shot idle worker | N/A | Exits after the idle timeout |
 | Long-lived idle worker | N/A | Waits for the next run |

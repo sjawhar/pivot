@@ -124,8 +124,8 @@ starts at most two workers for an otherwise-wide grade wave, and a chain starts 
 first submission, a dispatch starts a worker when an admitted stage finds every live worker
 busy, or for the scheduler-admissible direct consumer wave of the parent it dispatches. For a
 parent that runs past half the one-shot idle timeout, the pool pings idle workers pre-started
-for that wave. The ping restarts the worker’s idle clock without blocking it on the parent;
-when the parent resolves, pings stop and those workers become ordinary idle workers. A run
+for that wave. The ping restarts the worker’s idle clock without blocking it on the parent.
+When the parent resolves, pings stop and those workers become ordinary idle workers. A run
 whose stages all skip in the coordinator starts no workers.
 
 For a one-shot Engine, an idle worker exits after the 10-second idle timeout, or occasionally
