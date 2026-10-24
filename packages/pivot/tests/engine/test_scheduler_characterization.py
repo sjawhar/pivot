@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import sys
 from typing import TYPE_CHECKING
 
@@ -242,9 +243,13 @@ def test_resource_width_counts_a_fan_up_to_the_limit() -> None:
 
 def _helper_resource_width_lines(scheduler: Scheduler, *, limit: int) -> tuple[int, int]:
     """Return resource_width's result and the lines it executed: a count, not a clock, so
-    machine load cannot change it."""
+    machine load cannot change it. It takes a free sys.monitoring tool id, so a profiler or
+    coverage tool that holds one keeps it."""
     code = Scheduler.resource_width.__code__
-    tool = sys.monitoring.PROFILER_ID
+    tool = next(
+        (candidate for candidate in range(6) if sys.monitoring.get_tool(candidate) is None), None
+    )
+    assert tool is not None, "every sys.monitoring tool id is in use"
     lines = 0
 
     def _count(_code: types.CodeType, _line: int) -> None:
@@ -285,9 +290,8 @@ def test_resource_width_steps_grow_linearly_on_a_long_chain(cpu: int) -> None:
     width, lines = _helper_resource_width_lines(scheduler, limit=16)
 
     assert width == 1
-    # The heap replay runs about 54 lines per stage of a chain, the first-in first-out walk
-    # about 8. A replay that rescans every pending stage per admission runs about 2,500 per
-    # stage at this length, and more as it grows.
+    # A replay that rescans every pending stage per admission runs about 2,500 lines per stage
+    # at this length, and more as it grows.
     assert lines <= 100 * count, f"resource_width executed {lines} lines for {count} stages"
 
 
@@ -335,6 +339,155 @@ def test_resource_width_counts_a_wave_after_a_shared_resource_drains() -> None:
     )
 
     assert scheduler.resource_width(limit=16) == 8
+
+
+def test_resource_width_stops_at_the_widest_point_a_resource_allows() -> None:
+    """Two one-slot resources each hold back a second stage, and a fan of two waits behind
+    one of them. The replay reaches s1, z2, f0 and f1 at once, so the early stop must not end
+    it at three."""
+    scheduler = _helper_init_scheduler(
+        execution_order=["a0", "s0", "s1", "z", "z2", "f0", "f1"],
+        edges=[("z", "f0"), ("z", "f1")],
+        stage_resources={
+            "a0": {"cpu": 1},
+            "s0": {"cpu": 1, "sh": 1},
+            "s1": {"cpu": 1, "sh": 1},
+            "z": {"cpu": 1, "t": 1},
+            "z2": {"cpu": 1, "t": 1},
+            "f0": {"cpu": 1},
+            "f1": {"cpu": 1},
+        },
+        resource_capacity={"cpu": 16, "sh": 1, "t": 1},
+    )
+
+    assert scheduler.resource_width(limit=16) == 4
+
+
+def _helper_locked_grades(count: int, *, grades_per_lock: int) -> Scheduler:
+    """A source feeding ``count`` grades on a two-slot resource, each grade also holding one of
+    ``count // grades_per_lock`` one-slot locks, so most grades carry a request of their own."""
+    grades = [f"g{index:04d}" for index in range(count)]
+    locks = [f"lock_{index // grades_per_lock}" for index in range(count)]
+    return _helper_init_scheduler(
+        execution_order=["source", *grades],
+        edges=[("source", grade) for grade in grades],
+        stage_resources={"source": {"cpu": 1}}
+        | {
+            grade: {"cpu": 1, "shared": 1, lock: 1}
+            for grade, lock in zip(grades, locks, strict=True)
+        },
+        resource_capacity={"cpu": 16, "shared": 2} | dict.fromkeys(locks, 1),
+    )
+
+
+@pytest.mark.parametrize(
+    ("count", "grades_per_lock"),
+    [
+        pytest.param(1_000, 1, id="1,000 grades, each with its own lock"),
+        pytest.param(3_000, 1, id="3,000 grades, each with its own lock"),
+        pytest.param(3_000, 2, id="3,000 grades, two per lock"),
+    ],
+)
+def test_resource_width_steps_stay_linear_with_many_distinct_requests(
+    count: int, grades_per_lock: int
+) -> None:
+    """Each admission looks only at stages that a release could let in, not at every distinct
+    request, so grades that each carry their own lock cost a bounded number of lines each. The
+    result stays exact: the two-slot resource holds two grades at once."""
+    scheduler = _helper_locked_grades(count, grades_per_lock=grades_per_lock)
+
+    width, lines = _helper_resource_width_lines(scheduler, limit=16)
+
+    assert width == 2
+    assert lines <= 100 * count, f"resource_width executed {lines} lines for {count} grades"
+
+
+def _helper_orthogonal_vectors(count: int) -> Scheduler:
+    """2 × ``count`` independent stages whose one-slot resources encode an Orthogonal Vectors
+    instance with no orthogonal pair: every first-half stage holds ``a`` and one of ``c0`` or
+    ``c1``, and every second-half stage holds ``b``, ``c0`` and ``c1``. So no two stages ever
+    run at once, and an exact replay must try every pair."""
+    first = [f"f{index:04d}" for index in range(count)]
+    second = [f"s{index:04d}" for index in range(count)]
+    requests = {stage: {"cpu": 1, "a": 1, f"c{index % 2}": 1} for index, stage in enumerate(first)}
+    requests |= {stage: {"cpu": 1, "b": 1, "c0": 1, "c1": 1} for stage in second}
+    return _helper_init_scheduler(
+        execution_order=first + second,
+        stage_resources=requests,
+        resource_capacity={"cpu": 16, "a": 1, "b": 1, "c0": 1, "c1": 1},
+    )
+
+
+@pytest.mark.parametrize("count", [500, 2_000])
+def test_resource_width_returns_its_limit_when_an_exact_replay_costs_too_much(count: int) -> None:
+    """An input on which an exact answer needs about n² steps returns ``limit``, main's worker
+    count, after a number of lines in proportion to its stages and requested resources (the
+    inputs the budget counts), not to their square. A small copy of the same input stays within
+    the budget and returns the exact width, 1."""
+    scheduler = _helper_orthogonal_vectors(count)
+    inputs = 2 * count + 3 * count + 4 * count
+
+    width, lines = _helper_resource_width_lines(scheduler, limit=16)
+
+    assert width == 16
+    assert lines <= 100 * inputs, f"resource_width executed {lines} lines for {inputs} inputs"
+    assert _helper_orthogonal_vectors(5).resource_width(limit=16) == 1
+
+
+def _helper_dense_random(seed: int, count: int) -> Scheduler:
+    """``count`` stages drawn as a random-DAG differential draws them: an edge density of 0,
+    0.02, 0.1 or 0.3, a cpu capacity of 1 to 20, and up to five more resources of capacity 1
+    to 4. Each stage asks for 1 to 3 cpu (all of it one time in 20), and for a random amount of
+    each other resource with probability 0.4."""
+    rng = random.Random(seed)
+    names = [f"s{index:04d}" for index in range(count)]
+    density = rng.choice([0.0, 0.02, 0.1, 0.3])
+    edges = [(names[j], names[i]) for i in range(count) for j in range(i) if rng.random() < density]
+    capacity = {"cpu": rng.randint(1, 20)}
+    capacity |= {f"r{index}": rng.randint(1, 4) for index in range(rng.randint(0, 5))}
+    requests = dict[str, dict[str, int]]()
+    for name in names:
+        cpu = capacity["cpu"]
+        requests[name] = {"cpu": cpu if rng.random() < 0.05 else rng.randint(1, min(3, cpu))}
+        for resource in list(capacity)[1:]:
+            if rng.random() < 0.4:
+                requests[name][resource] = rng.randint(1, capacity[resource])
+    return _helper_init_scheduler(
+        execution_order=names, edges=edges, stage_resources=requests, resource_capacity=capacity
+    )
+
+
+def test_resource_width_returns_its_limit_on_a_dense_run_over_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A random 400-stage run whose stages each ask for several small resources needs more
+    steps than the budget allows, so it gets ``limit``, main's worker count, within a number of
+    lines in proportion to the budget. With no budget the replay gives its exact width, 10."""
+    scheduler = _helper_dense_random(2, 400)
+    inputs = (
+        len(scheduler.stage_states)
+        + sum(map(len, scheduler._upstream_unfinished.values()))
+        + sum(map(len, scheduler.stage_resources.values()))
+    )
+    budget = engine_graph._AUGMENT_STEPS + engine_graph._REPLAY_STEPS_PER_INPUT * inputs
+
+    width, lines = _helper_resource_width_lines(scheduler, limit=16)
+
+    assert width == 16
+    assert lines <= 10 * budget, f"resource_width executed {lines} lines for a {budget}-step budget"
+    monkeypatch.setattr(engine_graph, "_REPLAY_STEPS_PER_INPUT", 10**12)
+    assert scheduler.resource_width(limit=16) == 10
+
+
+@pytest.mark.parametrize("execution_order", [[], ["a"]], ids=["no stages", "one stage"])
+@pytest.mark.parametrize("limit", [0, -1])
+def test_resource_width_rejects_a_limit_below_one(execution_order: list[str], limit: int) -> None:
+    scheduler = _helper_init_scheduler(
+        execution_order=execution_order, resource_capacity={"cpu": 1}
+    )
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        scheduler.resource_width(limit=limit)
 
 
 def test_fan_in_waits_for_all_upstream() -> None:

@@ -120,13 +120,16 @@ The worker pool starts processes when the run submits work. The run's first subm
 the run's resource width: the most of its stages that one replayed schedule runs at once,
 within resource capacities (`Scheduler.resource_width`). The width counts every stage of the
 run, including stages that are cached or skipped later. A `local_grade: 2` limit therefore
-starts at most two workers for an otherwise-wide grade wave, and a chain starts one. After the
-first submission, a dispatch starts a worker when an admitted stage finds every live worker
-busy, or for the scheduler-admissible direct consumer wave of the parent it dispatches. For a
-parent that runs past half the one-shot idle timeout, the pool pings idle workers pre-started
-for that wave. The ping restarts the worker’s idle clock without blocking it on the parent.
-When the parent resolves, pings stop and those workers become ordinary idle workers. A run
-whose stages all skip in the coordinator starts no workers.
+starts at most two workers for an otherwise-wide grade wave, and a chain starts one. The replay
+has a step budget: 10,000 steps plus 8 per stage, dependency and requested resource. Below it
+the width is exact. A run that needs more starts `get_width()`'s pool size, as it does with no
+resource limits. Random runs of 400 or more stages whose stages each ask for several small
+resources can need more. After the first submission, a dispatch starts a worker when an admitted
+stage finds every live worker busy, or for the scheduler-admissible direct consumer wave of the
+parent it dispatches. For a parent that runs past half the one-shot idle timeout, the pool pings
+idle workers pre-started for that wave. The ping restarts the worker’s idle clock without
+blocking it on the parent. When the parent resolves, pings stop and those workers become
+ordinary idle workers. A run whose stages all skip in the coordinator starts no workers.
 
 For a one-shot Engine, an idle worker exits after the 10-second idle timeout, or occasionally
 after a second one, when loky's worker loses its process-lock race. The timeout is 126 times the

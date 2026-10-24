@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import heapq
+import itertools
 from typing import TYPE_CHECKING
 
 from pivot.engine import graph as engine_graph
@@ -212,29 +213,45 @@ class Scheduler:
         schedule whose stages finish in another order can run more stages at once.
 
         When no resource can fill before ``limit`` stages run, every ready stage starts at once,
-        so the replay is a first-in first-out walk of the stages. Otherwise ready stages wait in
-        one heap per resource request, ordered by stage order. Stages with the same request fit
-        or do not fit together, so each admission looks at one head per distinct request, and a
-        stage that does not fit is not looked at again until a stage finishes. Either way the
-        replay takes O((n + e) log n) steps for n stages and e dependencies, and it builds the
-        consumer lists only once a stage has to finish.
+        so the replay is a first-in first-out walk of the stages.
 
-        The heap replay also stops once no set of unfinished stages can run wider than the
-        widest point so far. Stages with the same request run at most as many at once as each
-        resource of that request holds. The sum of that count over the requests of unfinished
-        stages bounds every later point, so many stages behind one small resource stop the replay
-        as soon as that resource is full. The result is the same as a full replay.
+        Otherwise a ready stage that does not fit waits in a group: the first resource in its
+        request that blocks it, and the amount it needs of that resource. Each resource keeps a
+        heap of the amounts its waiting groups need, so a finish reaches only the groups that
+        its release opens, and wakes the earliest stage of each. A woken stage that starts or
+        waits again wakes the next one while the group stays open. So an admission looks only
+        at stages that a release could have let in. The replay also stops once no set of
+        unfinished stages can run wider than the widest point so far: per request, at most as
+        many stages as its resources hold, and per resource, at most its capacity of its users.
+
+        Below a step budget the result equals a full replay. Above it the method returns
+        ``limit``, and the Engine passes ``get_width``'s pool size as ``limit``, so the run starts
+        as many workers as it would with no resource limits, never more. The budget is
+        ``engine_graph._AUGMENT_STEPS`` steps plus ``engine_graph._REPLAY_STEPS_PER_INPUT`` per
+        stage, dependency and requested resource. Random DAGs of 400 or more stages, each stage
+        requesting several small resources at random amounts, can exceed it: 22 of 299 at 400
+        stages and 4 of 30 at 1,000 stages did.
+
+        An exact answer can cost more than ``get_width``. Give each of 2n independent stages
+        one-slot resources that encode an Orthogonal Vectors instance, with every first-half
+        stage also on one shared one-slot resource and every second-half stage on another. The
+        replay then reaches width 2 exactly when some first-half and second-half stages share
+        no resource, which takes about n² steps to decide unless the Strong Exponential Time
+        Hypothesis fails. With the budget the method takes O((n + e + r) log(n + r)) time for
+        n stages, e dependencies and r requested resources.
+
+        Raises:
+            ValueError: ``limit`` is below 1.
         """
+        if limit < 1:
+            raise ValueError(f"resource_width limit must be at least 1, got {limit}")
         capacity = self._resource_capacity
+        # initialize() fills _stage_resources and _upstream_unfinished in the same stage order.
+        requests = [tuple(request.items()) for request in self._stage_resources.values()]
+        kinds = collections.Counter(requests)
         unfinished = [len(upstream) for upstream in self._upstream_unfinished.values()]
-        requests = [
-            tuple(self._stage_resources[stage].items()) for stage in self._upstream_unfinished
-        ]
-        left = collections.Counter(requests)
         consumers: list[list[int]] | None = None
-        if all(
-            limit * amount <= capacity[resource] for request in left for resource, amount in request
-        ):
+        if all(limit * amount <= capacity[resource] for kind in kinds for resource, amount in kind):
             started = collections.deque(
                 position for position, count in enumerate(unfinished) if not count
             )
@@ -249,45 +266,84 @@ class Scheduler:
                 widest = max(widest, len(started))
             return min(widest, limit)
 
-        ready = collections.defaultdict[tuple[tuple[str, int], ...], list[int]](list)
-        for position, count in enumerate(unfinished):
-            if not count:
-                # Appended in stage order, so each list is already a heap
-                ready[requests[position]].append(position)
-        # The most stages of each request that its resources hold at once
-        slots = {
-            request: min(
-                (capacity[resource] // amount for resource, amount in request), default=count
-            )
-            for request, count in left.items()
+        stages = len(requests)
+        inputs = stages + sum(unfinished) + sum(map(len, requests))
+        # The step budgets of get_width and resource_width live together in engine.graph.
+        steps_per_input = engine_graph._REPLAY_STEPS_PER_INPUT  # pyright: ignore[reportPrivateUsage]
+        budget = engine_graph._AUGMENT_STEPS + steps_per_input * inputs  # pyright: ignore[reportPrivateUsage]
+        # Per request: the most stages with it that its resources hold at once. A request that
+        # only one stage makes holds at most that stage.
+        kind_slots = dict[tuple[tuple[str, int], ...], int]()
+        kind_bound = 0
+        for kind, count in kinds.items():
+            if count > 1:
+                for resource, amount in kind:
+                    held = capacity[resource] // amount
+                    if held < count:
+                        count = held
+                kind_slots[kind] = count
+            kind_bound += count
+        # Per resource: its unfinished users beyond its capacity, which never run at once.
+        users = collections.Counter(itertools.chain.from_iterable(self._stage_resources.values()))
+        excess = {
+            resource: count - capacity[resource]
+            for resource, count in users.items()
+            if count > capacity[resource]
         }
-        bound = sum(min(count, slots[request]) for request, count in left.items())
+        excess_heap = [(-over, resource) for resource, over in excess.items()]
+        heapq.heapify(excess_heap)
+        remaining = stages
+        bound = min(kind_bound, remaining - (-excess_heap[0][0] if excess_heap else 0))
+
+        # Stages to check, in stage order. Appended in stage order, so already a heap.
+        candidates = [position for position, count in enumerate(unfinished) if not count]
+        # A group is a resource and an amount of it. Each group's waiting stages, a heap
+        waiting = collections.defaultdict[tuple[str, int], list[int]](list)
+        # Per resource, a heap of the amounts whose groups wait for a release
+        closed = collections.defaultdict[str, list[int]](list)
+        woken = set[tuple[str, int]]()  # groups with a stage among the candidates
+        woken_from: list[tuple[str, int] | None] = [None] * stages
         counts = dict.fromkeys(capacity, 0)
         running = collections.deque[int]()
         widest = 0
+        steps = 0
         while True:
-            while True:
-                best = -1
-                best_request: tuple[tuple[str, int], ...] = ()
-                for request, heap in ready.items():
-                    if not heap or 0 <= best < heap[0]:
-                        continue
+            while candidates:
+                position = heapq.heappop(candidates)
+                request = requests[position]
+                steps += 1 + len(request)
+                for resource, amount in request:
+                    if counts[resource] + amount > capacity[resource]:
+                        group = (resource, amount)
+                        queue = waiting[group]
+                        if not queue and group not in woken:
+                            heapq.heappush(closed[resource], amount)
+                        heapq.heappush(queue, position)
+                        break
+                else:
                     for resource, amount in request:
-                        if counts[resource] + amount > capacity[resource]:
-                            break
-                    else:
-                        best = heap[0]
-                        best_request = request
-                if best < 0:
-                    break
-                heapq.heappop(ready[best_request])
-                for resource, amount in best_request:
-                    counts[resource] += amount
-                running.append(best)
-            if len(running) > widest:
-                widest = len(running)
-                if widest >= limit:
+                        counts[resource] += amount
+                    running.append(position)
+                    if len(running) >= limit:
+                        return limit
+                    if len(running) >= bound:
+                        return max(widest, len(running))
+                group = woken_from[position]
+                if group is not None:
+                    woken_from[position] = None
+                    woken.discard(group)
+                    resource, amount = group
+                    if waiting[group]:
+                        if counts[resource] + amount <= capacity[resource]:
+                            nxt = heapq.heappop(waiting[group])
+                            woken_from[nxt] = group
+                            woken.add(group)
+                            heapq.heappush(candidates, nxt)
+                        else:
+                            heapq.heappush(closed[resource], amount)
+                if steps > budget:
                     return limit
+            widest = max(widest, len(running))
             if not running or widest >= bound:
                 return widest
             if consumers is None:
@@ -296,18 +352,42 @@ class Scheduler:
             request = requests[finished]
             for resource, amount in request:
                 counts[resource] -= amount
-            if left[request] <= slots[request]:
-                bound -= 1
-            left[request] -= 1
+                if resource in excess:
+                    excess[resource] -= 1
+                # Every waiting group on this resource needs more than was free before the
+                # release, so the groups that the release lets in are its smallest amounts
+                amounts = closed[resource]
+                free = capacity[resource] - counts[resource]
+                while amounts and amounts[0] <= free:
+                    steps += 1
+                    group = (resource, heapq.heappop(amounts))
+                    nxt = heapq.heappop(waiting[group])
+                    woken_from[nxt] = group
+                    woken.add(group)
+                    heapq.heappush(candidates, nxt)
+            remaining -= 1
+            if kinds[request] <= kind_slots.get(request, 1):
+                kind_bound -= 1
+            kinds[request] -= 1
+            while excess_heap and -excess_heap[0][0] != excess[excess_heap[0][1]]:
+                _, resource = heapq.heappop(excess_heap)
+                if excess[resource] > 0:
+                    heapq.heappush(excess_heap, (-excess[resource], resource))
+            bound = min(kind_bound, remaining - (-excess_heap[0][0] if excess_heap else 0))
+            if widest >= bound:
+                return widest
             for consumer in consumers[finished]:
                 unfinished[consumer] -= 1
                 if not unfinished[consumer]:
-                    heapq.heappush(ready[requests[consumer]], consumer)
+                    heapq.heappush(candidates, consumer)
+            if steps > budget:
+                return limit
 
     def _consumer_positions(self) -> list[list[int]]:
         """Each stage's direct consumers, by position in stage order."""
-        position = {stage: index for index, stage in enumerate(self._upstream_unfinished)}
-        consumers = [list[int]() for _ in position]
+        position = dict(zip(self._upstream_unfinished, itertools.count()))
+        # A literal: list[int]() makes a generic-alias call per stage, three times the cost.
+        consumers: list[list[int]] = [[] for _ in position]
         for index, upstream in enumerate(self._upstream_unfinished.values()):
             for producer in upstream:
                 consumers[position[producer]].append(index)
