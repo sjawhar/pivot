@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import sys
+from typing import TYPE_CHECKING
+
 import networkx as nx
 import pytest
 
 from pivot.engine import graph as engine_graph
 from pivot.engine.scheduler import Scheduler
 from pivot.engine.types import NodeType, StageExecutionState
+
+if TYPE_CHECKING:
+    import types
 
 
 def _helper_init_scheduler(
@@ -232,6 +238,103 @@ def test_resource_width_counts_a_fan_up_to_the_limit() -> None:
 
     assert scheduler.resource_width(limit=8) == 3
     assert scheduler.resource_width(limit=2) == 2
+
+
+def _helper_resource_width_lines(scheduler: Scheduler, *, limit: int) -> tuple[int, int]:
+    """Return resource_width's result and the lines it executed: a count, not a clock, so
+    machine load cannot change it."""
+    code = Scheduler.resource_width.__code__
+    tool = sys.monitoring.PROFILER_ID
+    lines = 0
+
+    def _count(_code: types.CodeType, _line: int) -> None:
+        nonlocal lines
+        lines += 1
+
+    sys.monitoring.use_tool_id(tool, "resource_width step count")
+    try:
+        sys.monitoring.register_callback(tool, sys.monitoring.events.LINE, _count)
+        sys.monitoring.set_local_events(tool, code, sys.monitoring.events.LINE)
+        width = scheduler.resource_width(limit=limit)
+    finally:
+        sys.monitoring.set_local_events(tool, code, sys.monitoring.events.NO_EVENTS)
+        sys.monitoring.register_callback(tool, sys.monitoring.events.LINE, None)
+        sys.monitoring.free_tool_id(tool)
+    return width, lines
+
+
+@pytest.mark.parametrize(
+    "cpu",
+    [
+        pytest.param(16, id="no resource fills before the limit"),
+        pytest.param(8, id="cpu fills before the limit"),
+    ],
+)
+def test_resource_width_steps_grow_linearly_on_a_long_chain(cpu: int) -> None:
+    """The replay executes a bounded number of lines per stage, so a long chain costs steps in
+    proportion to its length, not to its square. A cpu capacity below the limit sends the
+    replay through its heaps; 16 lets every ready stage start at once."""
+    count = 1_000
+    names = [f"s{index:04d}" for index in range(count)]
+    scheduler = _helper_init_scheduler(
+        execution_order=names,
+        edges=list(zip(names, names[1:], strict=False)),
+        resource_capacity={"cpu": cpu},
+    )
+
+    width, lines = _helper_resource_width_lines(scheduler, limit=16)
+
+    assert width == 1
+    # The heap replay runs about 54 lines per stage of a chain, the first-in first-out walk
+    # about 8. A replay that rescans every pending stage per admission runs about 2,500 per
+    # stage at this length, and more as it grows.
+    assert lines <= 100 * count, f"resource_width executed {lines} lines for {count} stages"
+
+
+def _helper_capped_fan(count: int, *, capacity: int) -> Scheduler:
+    """A source feeding ``count`` grades that share one resource of ``capacity`` slots."""
+    grades = [f"g{index:04d}" for index in range(count)]
+    return _helper_init_scheduler(
+        execution_order=["source", *grades],
+        edges=[("source", grade) for grade in grades],
+        stage_resources={"source": {"cpu": 1}}
+        | {grade: {"cpu": 1, "shared": 1} for grade in grades},
+        resource_capacity={"cpu": 16, "shared": capacity},
+    )
+
+
+def test_resource_width_stops_once_a_shared_resource_is_full() -> None:
+    """Once the grades fill their shared resource, no later point of the replay can be wider,
+    so the replay stops without finishing the remaining grades one by one."""
+    count = 1_000
+    scheduler = _helper_capped_fan(count, capacity=2)
+
+    width, lines = _helper_resource_width_lines(scheduler, limit=16)
+
+    assert width == 2
+    assert lines <= 20 * count, f"resource_width executed {lines} lines for {count} grades"
+
+
+def test_resource_width_counts_a_wave_after_a_shared_resource_drains() -> None:
+    """The early stop counts stages still waiting behind a full resource: a fan of eight
+    stages that runs after two grades on a one-slot resource is still counted."""
+    fan = [f"f{index}" for index in range(8)]
+    scheduler = _helper_init_scheduler(
+        execution_order=["source", "g0", "g1", "join", *fan],
+        edges=[
+            ("source", "g0"),
+            ("source", "g1"),
+            ("g0", "join"),
+            ("g1", "join"),
+            *(("join", stage) for stage in fan),
+        ],
+        stage_resources={"source": {"cpu": 1}, "g0": {"cpu": 1, "shared": 1}}
+        | {"g1": {"cpu": 1, "shared": 1}, "join": {"cpu": 1}}
+        | {stage: {"cpu": 1} for stage in fan},
+        resource_capacity={"cpu": 16, "shared": 1},
+    )
+
+    assert scheduler.resource_width(limit=16) == 8
 
 
 def test_fan_in_waits_for_all_upstream() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import heapq
 from typing import TYPE_CHECKING
 
 from pivot.engine import graph as engine_graph
@@ -191,37 +192,108 @@ class Scheduler:
         started, each only when nothing else can start. Resource capacities bound the result:
         four grades that share a two-slot resource count as two, and a chain counts as one. A
         schedule whose stages finish in another order can run more stages at once.
+
+        When no resource can fill before ``limit`` stages run, every ready stage starts at once,
+        so the replay is a first-in first-out walk of the stages. Otherwise ready stages wait in
+        one heap per resource request, ordered by stage order. Stages with the same request fit
+        or do not fit together, so each admission looks at one head per distinct request, and a
+        stage that does not fit is not looked at again until a stage finishes. Either way the
+        replay takes O((n + e) log n) steps for n stages and e dependencies, and it builds the
+        consumer lists only once a stage has to finish.
+
+        The heap replay also stops once no set of unfinished stages can run wider than the
+        widest point so far. Stages with the same request run at most as many at once as each
+        resource of that request holds. The sum of that count over the requests of unfinished
+        stages bounds every later point, so many stages behind one small resource stop the replay
+        as soon as that resource is full. The result is the same as a full replay.
         """
-        waiting = {stage: set(upstream) for stage, upstream in self._upstream_unfinished.items()}
-        counts = collections.defaultdict[str, int](int)
-        running = list[str]()
-        pending = list(self._stage_states)
+        capacity = self._resource_capacity
+        unfinished = [len(upstream) for upstream in self._upstream_unfinished.values()]
+        requests = [
+            tuple(self._stage_resources[stage].items()) for stage in self._upstream_unfinished
+        ]
+        left = collections.Counter(requests)
+        consumers: list[list[int]] | None = None
+        if all(
+            limit * amount <= capacity[resource] for request in left for resource, amount in request
+        ):
+            started = collections.deque(
+                position for position, count in enumerate(unfinished) if not count
+            )
+            widest = len(started)
+            while started and widest < limit:
+                if consumers is None:
+                    consumers = self._consumer_positions()
+                for consumer in consumers[started.popleft()]:
+                    unfinished[consumer] -= 1
+                    if not unfinished[consumer]:
+                        started.append(consumer)
+                widest = max(widest, len(started))
+            return min(widest, limit)
+
+        ready = collections.defaultdict[tuple[tuple[str, int], ...], list[int]](list)
+        for position, count in enumerate(unfinished):
+            if not count:
+                # Appended in stage order, so each list is already a heap
+                ready[requests[position]].append(position)
+        # The most stages of each request that its resources hold at once
+        slots = {
+            request: min(
+                (capacity[resource] // amount for resource, amount in request), default=count
+            )
+            for request, count in left.items()
+        }
+        bound = sum(min(count, slots[request]) for request, count in left.items())
+        counts = dict.fromkeys(capacity, 0)
+        running = collections.deque[int]()
         widest = 0
-        while pending or running:
-            for stage in list(pending):
-                if waiting[stage]:
-                    continue
-                request = self._stage_resources[stage]
-                if any(
-                    counts[resource] + amount > self._resource_capacity[resource]
-                    for resource, amount in request.items()
-                ):
-                    continue
-                for resource, amount in request.items():
+        while True:
+            while True:
+                best = -1
+                best_request: tuple[tuple[str, int], ...] = ()
+                for request, heap in ready.items():
+                    if not heap or 0 <= best < heap[0]:
+                        continue
+                    for resource, amount in request:
+                        if counts[resource] + amount > capacity[resource]:
+                            break
+                    else:
+                        best = heap[0]
+                        best_request = request
+                if best < 0:
+                    break
+                heapq.heappop(ready[best_request])
+                for resource, amount in best_request:
                     counts[resource] += amount
-                running.append(stage)
-                pending.remove(stage)
-            widest = max(widest, len(running))
-            if widest >= limit:
-                return limit
-            if not running:
+                running.append(best)
+            if len(running) > widest:
+                widest = len(running)
+                if widest >= limit:
+                    return limit
+            if not running or widest >= bound:
                 return widest
-            stage = running.pop(0)
-            for resource, amount in self._stage_resources[stage].items():
+            if consumers is None:
+                consumers = self._consumer_positions()
+            finished = running.popleft()
+            request = requests[finished]
+            for resource, amount in request:
                 counts[resource] -= amount
-            for consumer in self._downstream[stage]:
-                waiting[consumer].discard(stage)
-        return widest
+            if left[request] <= slots[request]:
+                bound -= 1
+            left[request] -= 1
+            for consumer in consumers[finished]:
+                unfinished[consumer] -= 1
+                if not unfinished[consumer]:
+                    heapq.heappush(ready[requests[consumer]], consumer)
+
+    def _consumer_positions(self) -> list[list[int]]:
+        """Each stage's direct consumers, by position in stage order."""
+        position = {stage: index for index, stage in enumerate(self._upstream_unfinished)}
+        consumers = [list[int]() for _ in position]
+        for index, upstream in enumerate(self._upstream_unfinished.values()):
+            for producer in upstream:
+                consumers[position[producer]].append(index)
+        return consumers
 
     def acquire_resources(self, stage: str) -> None:
         """Reserve a stage's resources immediately before it is admitted."""
