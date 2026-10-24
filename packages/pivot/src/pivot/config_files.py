@@ -1,7 +1,8 @@
 """Reading one config file: the YAML parser, dotted keys, and the global config path.
 
-A leaf: it imports nothing from pivot but ``exceptions``, so the state directory and the merged
-config can both read config files without importing each other.
+A leaf outside the ``pivot.config`` package: it imports nothing from pivot but ``exceptions``,
+so ``pivot.state_dir`` reads config files without loading ``pivot.config``, and the merged config
+in ``pivot.config.io`` imports ``pivot.state_dir`` without an import cycle.
 """
 
 import pathlib

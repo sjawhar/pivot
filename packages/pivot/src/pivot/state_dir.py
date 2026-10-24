@@ -1,8 +1,8 @@
 """The project's state directory: where ``core.state_dir`` points, and Pivot's single creator of it.
 
-Resolution reads ``<root>/.pivot/config.yaml`` through ``config.files`` only, so this module
-never needs the merged config. ``config.io`` imports this module for its state-directory
-transitions and effective cache; nothing here imports ``config.io``.
+Resolution reads ``<root>/.pivot/config.yaml`` through ``pivot.config_files`` only, so this module
+never loads the ``pivot.config`` package. ``config.io`` imports this module for its
+state-directory transitions and effective cache; nothing here imports ``pivot.config``.
 """
 
 import contextvars
@@ -11,8 +11,7 @@ import os
 import pathlib
 import typing
 
-from pivot import exceptions, project
-from pivot.config import files as config_files
+from pivot import config_files, exceptions, project
 
 logger = logging.getLogger(__name__)
 

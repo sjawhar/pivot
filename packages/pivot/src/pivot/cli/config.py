@@ -4,7 +4,7 @@ from typing import Any, cast
 import click
 import pydantic
 
-from pivot import config, exceptions
+from pivot import config, config_files, exceptions
 from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -54,7 +54,7 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     """Display all configuration values."""
     data: dict[str, Any]
     if use_global:
-        data = config.load_config_file(config.get_global_config_path())
+        data = config.load_config_file(config_files.get_global_config_path())
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
     else:
@@ -130,7 +130,7 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         raise click.ClickException(f"Unknown config key: '{key}'")
 
     if use_global:
-        data = config.load_config_file(config.get_global_config_path())
+        data = config.load_config_file(config_files.get_global_config_path())
         value = _get_nested_value(data, key)
         source = config.ConfigScope.GLOBAL
         # Outside a project nothing ignores the value. An unreadable local config only drops

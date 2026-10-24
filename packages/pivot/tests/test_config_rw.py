@@ -3,8 +3,7 @@ from typing import Any
 
 import pytest
 
-from pivot import project
-from pivot.config import files as config_files
+from pivot import config_files, project
 from pivot.config import io
 
 # --- parse_dotted_key tests ---

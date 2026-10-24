@@ -195,7 +195,7 @@ def test_config_set_global_flag(
 ) -> None:
     global_config = tmp_path / ".config" / "pivot" / "config.yaml"
 
-    from pivot.config import files as config_files
+    from pivot import config_files
 
     monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
@@ -212,7 +212,7 @@ def test_config_set_global_rejects_project_state_dir(
     """core.state_dir is local because it identifies one project's own state."""
     global_config = tmp_path / ".config" / "pivot" / "config.yaml"
 
-    from pivot.config import files as config_files
+    from pivot import config_files
 
     monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
@@ -353,7 +353,7 @@ def test_config_unset_global_flag(
     global_config.parent.mkdir(parents=True)
     global_config.write_text("display:\n  precision: 3\n")
 
-    from pivot.config import files as config_files
+    from pivot import config_files
 
     monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
@@ -409,12 +409,9 @@ def test_config_get_global_flag(
     global_config = global_dir / "config.yaml"
     global_config.write_text("display:\n  precision: 7\n")
 
-    from pivot import config
-    from pivot.config import files as config_files
+    from pivot import config_files
 
-    # Patch both locations since CLI uses `config.get_global_config_path`
     monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
-    monkeypatch.setattr(config, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):
         # Set local value (different from global)

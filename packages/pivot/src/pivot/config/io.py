@@ -10,9 +10,8 @@ from typing import Any, cast
 
 import ruamel.yaml
 
-from pivot import exceptions, project
+from pivot import config_files, exceptions, project
 from pivot import state_dir as state_dir_mod
-from pivot.config import files as config_files
 from pivot.config import models
 
 logger = logging.getLogger(__name__)

@@ -1,4 +1,3 @@
-from pivot.config.files import get_global_config_path as get_global_config_path
 from pivot.config.io import DEFAULT_CHECKOUT_MODE_ORDER as DEFAULT_CHECKOUT_MODE_ORDER
 from pivot.config.io import edit_config as edit_config
 from pivot.config.io import get_cache_dir as get_cache_dir
