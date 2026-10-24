@@ -675,11 +675,15 @@ class Pipeline:
     def _materialize_stages(self) -> None:
         new_registry = registry.StageRegistry()
         closure = self._upstream_closure()
+        # One lookup per project root: outside a CLI invocation each lookup reads the config.
+        stage_state_dirs = {self._root: self._stage_state_dir()}
 
         for foreign_pipeline, foreign_node in closure:
             qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
+            if foreign_pipeline._root not in stage_state_dirs:
+                stage_state_dirs[foreign_pipeline._root] = foreign_pipeline._stage_state_dir()
             stage_info = _emit_stage_info(
-                foreign_node, qualified_name, foreign_pipeline._stage_state_dir()
+                foreign_node, qualified_name, stage_state_dirs[foreign_pipeline._root]
             )
             new_registry.add_existing(stage_info)
 
@@ -687,7 +691,7 @@ class Pipeline:
 
         for node in self._stages:
             qualified_name = f"{self._name}/{node.name}"
-            stage_info = _emit_stage_info(node, qualified_name, self._stage_state_dir())
+            stage_info = _emit_stage_info(node, qualified_name, stage_state_dirs[self._root])
             new_registry.add_existing(stage_info)
 
         materialized_stages = set(new_registry.list_stages())

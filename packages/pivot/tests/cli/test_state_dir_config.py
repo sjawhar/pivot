@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 from conftest import GitRepo, init_git_repo
-from pivot import cli, compose, exceptions, import_artifact, parameters, project, stage_def
+from pivot import cli, compose, config, exceptions, import_artifact, parameters, project, stage_def
 from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
 from pivot.config import io as config_io
@@ -132,6 +132,33 @@ def test_repro_keeps_all_state_in_the_configured_state_dir(
     assert (state_dir / "state.lmdb").is_dir()
     assert (state_dir / "locks").is_dir()
     assert (state_dir / ".gitignore").is_file()
+
+
+def test_each_in_process_invocation_reads_an_edited_state_dir(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """An embedder's next CLI invocation follows a `core.state_dir` edited after the last one.
+
+    The merged config and the resolved state directory each last one invocation, so the second
+    `status` opens its state database and locates its cache under the edited directory.
+    """
+    root = tmp_path / "project"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / ".pivot").mkdir()
+    _write_acceptance_pipeline(root)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PIVOT_CACHE_DIR", raising=False)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(project, "_project_root_cache", None)
+    located_cache = mocker.spy(config, "locate_cache_dir")
+
+    cli.cli.main(["status"], standalone_mode=False)
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
+    cli.cli.main(["status"], standalone_mode=False)
+
+    assert (root / "altstate" / "state.lmdb").is_dir()
+    assert located_cache.spy_return == (root / "altstate" / "cache").resolve()
 
 
 @pytest.mark.parametrize(

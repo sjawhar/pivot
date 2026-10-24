@@ -27,7 +27,6 @@ import pytest
 from moto import server as moto_server
 
 from pivot import project
-from pivot import state_dir as state_dir_mod
 from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
@@ -235,7 +234,6 @@ def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
         logging.getLogger(name).handlers.clear()
     yield
     project._project_root_cache = None
-    state_dir_mod.clear_state_dir_cache()
 
 
 @pytest.fixture

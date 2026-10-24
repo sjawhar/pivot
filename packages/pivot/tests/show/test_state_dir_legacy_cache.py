@@ -32,9 +32,9 @@ def _configure_state_dir(root: pathlib.Path) -> None:
 @pytest.fixture(autouse=True)
 def _report_state_dir_warnings() -> Generator[None]:
     """Report state-directory warnings for this test only, as one CLI invocation does."""
-    token = state_dir_mod.begin_state_dir_warnings()
+    token = state_dir_mod.begin_invocation(report=True)
     yield
-    state_dir_mod.end_state_dir_warnings(token)
+    state_dir_mod.end_invocation(token)
 
 
 def test_data_cache_reader_uses_legacy_cache_object(

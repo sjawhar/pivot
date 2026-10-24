@@ -15,11 +15,9 @@ from pivot import config_files, exceptions, project
 
 logger = logging.getLogger(__name__)
 
-_state_dir_cache = dict[pathlib.Path, pathlib.Path]()
-
 
 class StateDirWarnings(typing.TypedDict):
-    """What one CLI invocation has already reported about the state directory."""
+    """What one invocation has already reported about the state directory."""
 
     # Global config files whose ignored core.state_dir was reported.
     ignored_global: set[pathlib.Path]
@@ -31,11 +29,25 @@ class StateDirWarnings(typing.TypedDict):
     cache_stage_overlap: set[tuple[pathlib.Path, pathlib.Path]]
 
 
-# Set by the CLI callback for one invocation without --quiet. None (loky workers, shell
-# completion, library callers, -q) means these warnings stay silent.
-_state_dir_warnings = contextvars.ContextVar[StateDirWarnings | None](
-    "state_dir_warnings", default=None
+class StateDirInvocation(typing.TypedDict):
+    """One invocation's state-directory record: what it resolved, and what it reported."""
+
+    # The state directory of each project root, read from its config once per invocation.
+    resolved: dict[pathlib.Path, pathlib.Path]
+    # None under --quiet and for a worker's stage: these warnings stay silent.
+    reported: StateDirWarnings | None
+
+
+# Set by the CLI callback for one CLI invocation, and by a worker for one stage. Outside one
+# (shell completion, library callers), every lookup reads the config and nothing is reported.
+_invocation = contextvars.ContextVar[StateDirInvocation | None](
+    "state_dir_invocation", default=None
 )
+
+
+def _reported() -> StateDirWarnings | None:
+    invocation = _invocation.get()
+    return None if invocation is None else invocation["reported"]
 
 
 STATE_GITIGNORE_CONTENT = """\
@@ -79,9 +91,11 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     to one project, so a global value is ignored, and reported once per invocation when the CLI
     enabled that. A configured value is resolved with ``resolve_state_dir_value``; absent
     configuration keeps state in ``<root>/.pivot``. The ``.pivot`` marker and its configuration
-    always remain at the project root.
+    always remain at the project root. Within one invocation (``begin_invocation``), each root's
+    config is read once; outside one, every call reads it.
     """
-    if (cached := _state_dir_cache.get(root)) is not None:
+    invocation = _invocation.get()
+    if invocation is not None and (cached := invocation["resolved"].get(root)) is not None:
         return cached
 
     config_path = root / ".pivot" / "config.yaml"
@@ -96,7 +110,8 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
         raise exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
 
     warn_if_global_state_dir_ignored(root, shadowed=present)
-    _state_dir_cache[root] = state_dir
+    if invocation is not None:
+        invocation["resolved"][root] = state_dir
     return state_dir
 
 
@@ -125,7 +140,7 @@ def state_dir_or_default(root: pathlib.Path, *, warn: bool = True) -> pathlib.Pa
             return state_dir
         problem = f"{target_problem} (core.state_dir in {config_path})"
         reason = "The state directory cannot be used"
-    reported = _state_dir_warnings.get()
+    reported = _reported()
     if warn and reported is not None and config_path not in reported["unusable"]:
         reported["unusable"].add(config_path)
         logger.warning(f"{problem}. {reason}; Pivot uses the default .pivot.")
@@ -207,7 +222,7 @@ def legacy_cache_files_dir_for(cache_files_dir: pathlib.Path) -> pathlib.Path | 
 
 def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
     """Warn once per invocation that reads fall back to the 0.5.2 state layout for ``state_dir``."""
-    reported = _state_dir_warnings.get()
+    reported = _reported()
     if reported is None or state_dir in reported["legacy"]:
         return
     legacy = legacy_state_dir_for(state_dir)
@@ -233,7 +248,7 @@ def report_cache_stage_overlap(
     cache_dir: pathlib.Path, stages_dir: pathlib.Path, fallback_cache_dir: pathlib.Path
 ) -> None:
     """Warn once per invocation that an effective cache directory overlaps durable stage locks."""
-    reported = _state_dir_warnings.get()
+    reported = _reported()
     if reported is None:
         return
     key = (cache_dir, stages_dir)
@@ -248,26 +263,37 @@ def report_cache_stage_overlap(
     )
 
 
-def begin_state_dir_warnings() -> contextvars.Token[StateDirWarnings | None]:
-    """Report state-directory problems, each once, until the returned token is reset."""
-    return _state_dir_warnings.set(
+def begin_invocation(*, report: bool) -> contextvars.Token[StateDirInvocation | None]:
+    """Start one invocation's record, used until the returned token is reset.
+
+    Its resolution cache starts empty, so the invocation reads each project's config afresh.
+    With ``report``, each state-directory problem is warned once; without it, none is.
+    """
+    reported = (
         StateDirWarnings(
             ignored_global=set[pathlib.Path](),
             unusable=set[pathlib.Path](),
             legacy=set[pathlib.Path](),
             cache_stage_overlap=set[tuple[pathlib.Path, pathlib.Path]](),
         )
+        if report
+        else None
+    )
+    return _invocation.set(
+        StateDirInvocation(resolved=dict[pathlib.Path, pathlib.Path](), reported=reported)
     )
 
 
-def end_state_dir_warnings(token: contextvars.Token[StateDirWarnings | None]) -> None:
-    """Stop reporting, restoring whatever reporting state ``begin_state_dir_warnings`` replaced."""
-    _state_dir_warnings.reset(token)
+def end_invocation(token: contextvars.Token[StateDirInvocation | None]) -> None:
+    """End an invocation, restoring whatever record ``begin_invocation`` replaced."""
+    _invocation.reset(token)
 
 
 def clear_state_dir_cache() -> None:
-    """Forget every resolved state directory, so the next lookup reads the config again."""
-    _state_dir_cache.clear()
+    """Forget this invocation's resolved state directories, so the next lookup reads the config."""
+    invocation = _invocation.get()
+    if invocation is not None:
+        invocation["resolved"].clear()
 
 
 def ignored_global_state_dir_message(
@@ -285,11 +311,11 @@ def ignored_global_state_dir_message(
 def warn_if_global_state_dir_ignored(root: pathlib.Path, *, shadowed: bool) -> None:
     """Log, once per invocation, that the global config's ``core.state_dir`` is ignored.
 
-    Silent outside ``begin_state_dir_warnings``. ``shadowed`` says the project
-    sets its own value. The global file is read only to decide whether to warn: when it cannot
-    be read, this says nothing, and reporting that stays with the normal config load.
+    Silent outside an invocation that reports (``begin_invocation``). ``shadowed`` says the
+    project sets its own value. The global file is read only to decide whether to warn: when it
+    cannot be read, this says nothing, and reporting that stays with the normal config load.
     """
-    reported = _state_dir_warnings.get()
+    reported = _reported()
     if reported is None:
         return
     global_path = config_files.get_global_config_path()

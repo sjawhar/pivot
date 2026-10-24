@@ -55,6 +55,7 @@ from pivot import (
     stage_def,
     types,
 )
+from pivot import state_dir as state_dir_mod
 from pivot.storage import artifact_lock, cache, lock, state
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -1110,8 +1111,10 @@ def execute_stage(
 
     A stage interrupted by a stop signal (``unwind_when_stopped``) fails without committing
     anything. After SIGTERM or the death of its Pivot process, the worker exits once the stage
-    has unwound instead of returning.
+    has unwound instead of returning. Each stage is one state-directory invocation: it reads
+    the project config once, and reports nothing, which the Pivot process does.
     """
+    invocation = state_dir_mod.begin_invocation(report=False)
     try:
         _begin_stage()
         result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
@@ -1122,6 +1125,7 @@ def execute_stage(
         )
     finally:
         _stop.stage_running = False
+        state_dir_mod.end_invocation(invocation)
     if _stop.exit_requested:
         _exit_worker(1)
     result["user_code_files"] = user_code_files()
