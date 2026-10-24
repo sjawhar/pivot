@@ -483,6 +483,71 @@ def test_push_dry_run_ignores_a_cache_object_that_is_not_a_regular_file(
     assert "No files to push" in result.stdout, output
 
 
+_TABLE_PIPELINE = """\
+import pandas
+
+from pivot import Pipeline, stage
+
+
+@stage
+def table(value: str) -> pandas.DataFrame:
+    return pandas.DataFrame({"v": [len(value)]})
+
+
+with Pipeline("test") as pipeline:
+    table(pipeline.input("input.txt", t=str))
+"""
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("diff", "--no-tui", "data/test/table.jsonl"),
+        ("diff", "--json", "data/test/table.jsonl"),
+        ("push", "--dry-run"),
+        ("push", "--dry-run", "test/table"),
+        ("fetch", "--dry-run", "test/table"),
+        ("pull", "--dry-run", "test/table"),
+    ],
+    ids=["diff", "diff-json", "push-n", "push-n-stage", "fetch-n-stage", "pull-n-stage"],
+)
+def test_a_read_only_command_creates_no_configured_state_dir(
+    tmp_path: pathlib.Path, args: tuple[str, ...]
+) -> None:
+    """With a hand-edited `core.state_dir` that does not exist yet, 0.5.2 creates nothing here."""
+    home = tmp_path / "home"
+    root = tmp_path / "project"
+    root.mkdir()
+    for git_args in (
+        ("init", "-q"),
+        ("config", "user.email", "test@example.com"),
+        ("config", "user.name", "test"),
+    ):
+        _ok(helpers.run_cli(root, home, "git", *git_args))
+    _ok(helpers.run_pivot(root, home, "init"))
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "input.txt").write_text("input\n")
+    (root / "pipeline.py").write_text(_TABLE_PIPELINE)
+    _ok(helpers.run_pivot(root, home, "repro"))
+    remotes = "remotes:\n  origin: s3://unused-bucket/cache\n"
+    (root / ".pivot" / "config.yaml").write_text(remotes)
+    _ok(helpers.run_cli(root, home, "git", "add", "-A"))
+    _ok(helpers.run_cli(root, home, "git", "commit", "-qm", "base"))
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: altstate\n{remotes}")
+    table = root / "data" / "test" / "table.jsonl"
+    table.unlink()
+    table.write_text('{"v": 99}\n')
+    marker_entries = sorted(path.relative_to(root) for path in (root / ".pivot").rglob("*"))
+
+    result = helpers.run_pivot(root, home, *args)
+
+    _ok(result)
+    assert not (root / "altstate").exists(), sorted((root / "altstate").rglob("*"))
+    assert sorted(path.relative_to(root) for path in (root / ".pivot").rglob("*")) == (
+        marker_entries
+    )
+
+
 _METRIC_PIPELINE = """\
 from typing import Annotated
 

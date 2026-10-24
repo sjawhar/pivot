@@ -102,8 +102,9 @@ def push(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = config.get_cache_dir()
-    state_dir = config.get_state_dir()
+    # A dry run only reads, so it creates no state.
+    cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
+    state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
@@ -191,8 +192,9 @@ def fetch(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = config.get_cache_dir()
-    state_dir = config.get_state_dir()
+    # A dry run only reads, so it creates no state.
+    cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
+    state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
@@ -291,8 +293,9 @@ def pull(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = config.get_cache_dir()
-    state_dir = config.get_state_dir()
+    # A dry run only reads, so it creates no state.
+    cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
+    state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)

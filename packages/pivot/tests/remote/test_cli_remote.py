@@ -64,7 +64,7 @@ def test_push_dry_run(
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -93,7 +93,7 @@ def test_push_dry_run_with_no_files_prints_the_release_line(
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
 
-        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -260,7 +260,7 @@ def test_fetch_dry_run_with_targets(
             cli_helpers, "get_all_stages", return_value={"train_model": mocker.MagicMock()}
         )
 
-        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -294,7 +294,7 @@ def test_fetch_dry_run_all(
 
         mock_remote.list_hashes = mock_list_hashes
 
-        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -435,7 +435,7 @@ def test_pull_dry_run_with_targets(
             cli_helpers, "get_all_stages", return_value={"train_model": mocker.MagicMock()}
         )
 
-        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
@@ -470,7 +470,7 @@ def test_pull_dry_run_all(
 
         mock_remote.list_hashes = mock_list_hashes
 
-        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",

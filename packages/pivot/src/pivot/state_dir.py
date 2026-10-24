@@ -384,21 +384,27 @@ def make_nested_cache_dir(cache_dir: pathlib.Path) -> None:
         gitignore.write("# Pivot cache; never commit it\n*\n")
 
 
-def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
-    """Return an initialized project's state directory, creating it when absent.
+def locate_state_dir(root: pathlib.Path) -> pathlib.Path:
+    """Return an initialized project's state directory without creating anything.
 
     An empty hand-edited ``core.state_dir`` falls back to ``<root>/.pivot`` through
-    ``state_dir_or_default``.
-    Other invalid config values still raise ``ConfigError``. A directory this call creates gets
-    the default ``.gitignore``. One that already exists is left as it is, so a deleted
-    ``.pivot/.gitignore`` stays deleted until ``init`` writes it. A directory that cannot be
-    created (``state_dir_target_problem``) is returned as it is, so the command fails where it
-    opens it, as 0.5.2 did.
+    ``state_dir_or_default``. Other invalid config values still raise ``ConfigError``.
     """
     try:
-        state_dir = state_dir_for(root)
+        return state_dir_for(root)
     except exceptions.EmptyStateDirError:
         return state_dir_or_default(root)
+
+
+def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
+    """``locate_state_dir``, created when absent.
+
+    A directory this call creates gets the default ``.gitignore``. One that already exists is
+    left as it is, so a deleted ``.pivot/.gitignore`` stays deleted until ``init`` writes it. A
+    directory that cannot be created (``state_dir_target_problem``) is returned as it is, so the
+    command fails where it opens it, as 0.5.2 did.
+    """
+    state_dir = locate_state_dir(root)
     if (
         os.path.isdir(state_dir)
         or not (root / ".pivot").is_dir()

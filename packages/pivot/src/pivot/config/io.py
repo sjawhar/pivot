@@ -359,8 +359,18 @@ def get_cache_dir() -> pathlib.Path:
     return cache_dir
 
 
+def locate_state_dir() -> pathlib.Path:
+    """Return the current project's configured state directory without creating it.
+
+    The merged config is loaded first, so an invalid config fails here with its own message.
+    A reader that opens the state database still creates the directory there (``StateDB``).
+    """
+    get_merged_config()
+    return state_dir_mod.locate_state_dir(project.get_project_root())
+
+
 def get_state_dir() -> pathlib.Path:
-    """Get the current project's configured state directory, created when absent."""
+    """``locate_state_dir``, created when absent, for a command that writes state."""
     get_merged_config()
     return state_dir_mod.ensure_state_dir(project.get_project_root())
 
