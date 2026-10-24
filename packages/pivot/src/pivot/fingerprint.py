@@ -1410,6 +1410,10 @@ def _written_in_user_source(function: types.FunctionType) -> bool:
 
 def _user_member_value(value: Any) -> Any:
     """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it."""
+    # A @fingerprint_by_name helper held as a class attribute keeps the mark:
+    # the predicate accepts it and the walk records it by name.
+    if fingerprinted_by_name(value):
+        return value
     if isinstance(value, functools.partial):
         return cast("Any", value)
     if inspect.isfunction(value):
@@ -1417,6 +1421,8 @@ def _user_member_value(value: Any) -> Any:
             return value
         unwrapped = inspect.unwrap(value)
         if unwrapped is not value and inspect.isfunction(unwrapped):
+            if fingerprinted_by_name(unwrapped):
+                return unwrapped
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
         return _UNREAD
     if isinstance(value, type):
@@ -1426,6 +1432,8 @@ def _user_member_value(value: Any) -> Any:
     if callable(value):
         unwrapped = inspect.unwrap(value)
         if unwrapped is not value and inspect.isfunction(unwrapped):
+            if fingerprinted_by_name(unwrapped):
+                return unwrapped
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
     if hasattr(value, "__get__") and _is_user_class_instance(value):
         return value
@@ -2627,7 +2635,10 @@ def _schema_hash(model: type[_PydanticModelProtocol]) -> str:
         default_factory = getattr(field_info, "default_factory", None)
         if type(default).__name__ == "PydanticUndefinedType":
             if default_factory is not None and callable(default_factory):
-                default_hashes[field_name] = hash_function_ast(default_factory)
+                if fingerprinted_by_name(default_factory):
+                    default_hashes[field_name] = _library_name(default_factory)
+                else:
+                    default_hashes[field_name] = hash_function_ast(default_factory)
             continue
         value_str = _serialize_value_for_hash(default)
         default_hashes[field_name] = xxhash.xxh64(value_str.encode()).hexdigest()
@@ -3096,6 +3107,21 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
     )
 
 
+def fingerprinted_by_name(obj: Any) -> bool:
+    """Whether *obj* carries the ``@pivot.fingerprint_by_name`` mark.
+
+    The mark stores ``id(obj)`` at decoration time. A ``functools.wraps``
+    wrapper that copies ``__dict__`` carries the id of the original, so this
+    predicate returns False for the wrapper.
+    """
+    try:
+        d: dict[str, Any] = object.__getattribute__(obj, "__dict__")
+        stored = d.get("__pivot_fingerprint_by_name__")
+        return stored is not None and stored == id(obj)
+    except AttributeError:
+        return False
+
+
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins, nor pivot's own
     packages: ``is_library_path``)."""
@@ -3121,6 +3147,11 @@ def is_user_code(obj: Any) -> bool:
 
 def _is_user_code_impl(obj: Any) -> bool:
     """Internal implementation of is_user_code."""
+    # A @fingerprint_by_name helper is treated as library code: the walk
+    # records it by name and never descends into its body.
+    if fingerprinted_by_name(obj):
+        return False
+
     module = _get_module(obj)
     if module is None:
         return False
