@@ -327,6 +327,45 @@ def test_get_target_hashes_no_pipeline_reads_each_stage_from_its_own_lock_locati
     assert sync.get_target_hashes(["b:output"], state_dir, all_stages=None) == {"bbbbbbbbbbbbbbbb"}
 
 
+def test_get_target_hashes_file_path_target_reads_its_stage_lock_where_it_is(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A file-path target under a pipeline finds its producer's lock as StageLock finds it.
+
+    The same partly migrated project as above: `altstate/stages` holds only stage `a`'s lock and
+    `.pivot/stages` holds only stage `b`'s. The workspace path of `b`'s output resolves to `b`,
+    whose lock is read from `.pivot/stages`.
+    """
+    (set_project_root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
+    refs = {stage: _helper_ref(stage, "output", types.ArtifactTag.DATA) for stage in ("a", "b")}
+    all_stages = {
+        stage: RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
+            state_dir=None, outs=[ref], incremental_inputs={}, input_paths={}
+        )
+        for stage, ref in refs.items()
+    }
+    for stages_dir, stage, digest in (
+        (set_project_root / "altstate" / "stages", "a", "aaaaaaaaaaaaaaaa"),
+        (set_project_root / ".pivot" / "stages", "b", "bbbbbbbbbbbbbbbb"),
+    ):
+        lock.StageLock(stage, stages_dir).write(
+            LockData(
+                code_manifest={},
+                params={},
+                dep_hashes={},
+                output_hashes={refs[stage].identity: FileHash(hash=digest)},
+            )
+        )
+    workspace = store.WorkspaceStore(
+        project_root=set_project_root, pipeline_name="test", input_bindings={}
+    )
+    state_dir = set_project_root / "altstate"
+
+    for stage, digest in (("a", "aaaaaaaaaaaaaaaa"), ("b", "bbbbbbbbbbbbbbbb")):
+        target = str(workspace.resolve_display_path(refs[stage]))
+        assert sync.get_target_hashes([target], state_dir, all_stages=all_stages) == {digest}
+
+
 def test_get_target_hashes_pvt_file_target_without_pipeline(
     set_project_root: pathlib.Path,
 ) -> None:

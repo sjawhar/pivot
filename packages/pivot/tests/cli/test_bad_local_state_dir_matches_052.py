@@ -6,9 +6,11 @@ or it names a directory that cannot exist or be created: a regular file, `/root/
 non-root user, and a child of a read-only directory. A command 0.5.2 ran still runs with 0.5.2's
 exit code. A command 0.5.2 failed still fails, in one `Error:` line and without a traceback.
 
-`_052_EXIT_CODES` holds the released package's codes. Running this file captures them again:
+`_052_EXIT_CODES` holds the released package's codes. Running this file from `packages/pivot`
+captures them again:
 
-    uv run --no-project --isolated --with pivot==0.5.2 --with pytest python <this file>
+    uv run --no-project --isolated --with pivot==0.5.2 --with pytest \
+        python -m tests.cli.test_bad_local_state_dir_matches_052
 
 Re-capture whenever a command or a case is added. Pass `--pivot <binary>` to print another
 build's codes with the same scenarios.
@@ -23,12 +25,11 @@ import os
 import pathlib
 import shutil
 import subprocess
-import sys
 import tempfile
 
 import pytest
 
-_PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+from tests import helpers
 
 _PIPELINE = """\
 from pivot import Pipeline, stage
@@ -335,11 +336,6 @@ _052_EXIT_CODES: dict[str, dict[str, int]] = {
 }
 
 
-def _run(cwd: pathlib.Path, home: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "HOME": str(home)}
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False, env=env)
-
-
 def _build_base(directory: pathlib.Path, pivot: str) -> pathlib.Path:
     """A committed project that ``pivot`` has reproduced, beside its own HOME."""
     home = directory / "home"
@@ -351,14 +347,14 @@ def _build_base(directory: pathlib.Path, pivot: str) -> pathlib.Path:
         ("config", "user.email", "test@example.com"),
         ("config", "user.name", "test"),
     ):
-        assert _run(root, home, "git", *git_args).returncode == 0
-    assert _run(root, home, pivot, "init").returncode == 0
+        assert helpers.run_cli(root, home, "git", *git_args).returncode == 0
+    assert helpers.run_cli(root, home, pivot, "init").returncode == 0
     (root / "data" / "raw").mkdir(parents=True)
     (root / "data" / "raw" / "input.txt").write_text("input\n")
     (root / "pipeline.py").write_text(_PIPELINE)
-    assert _run(root, home, pivot, "repro").returncode == 0
-    assert _run(root, home, "git", "add", "-A").returncode == 0
-    assert _run(root, home, "git", "commit", "-qm", "base").returncode == 0
+    assert helpers.run_cli(root, home, pivot, "repro").returncode == 0
+    assert helpers.run_cli(root, home, "git", "add", "-A").returncode == 0
+    assert helpers.run_cli(root, home, "git", "commit", "-qm", "base").returncode == 0
     return directory
 
 
@@ -380,7 +376,7 @@ def _case(
 
 @pytest.fixture(scope="session")
 def base_project(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    return _build_base(tmp_path_factory.mktemp("base"), _PIVOT)
+    return _build_base(tmp_path_factory.mktemp("base"), helpers.PIVOT)
 
 
 @pytest.mark.parametrize("case", list(_CASES))
@@ -392,7 +388,7 @@ def test_command_exits_as_on_052(
     if os.geteuid() == 0 and case in {"unwritable-absolute", "read-only-parent"}:
         pytest.skip("root ignores permission bits")
     home, root = _case(base_project, tmp_path, case)
-    result = _run(root, home, _PIVOT, *_COMMANDS[command])
+    result = helpers.run_pivot(root, home, *_COMMANDS[command])
     output = result.stdout + result.stderr
     assert "Traceback" not in output, output
     # Ruling (main, 11:16Z): 0.5.2 treats '' as the project root, so show sees no runs;
@@ -417,7 +413,7 @@ def test_every_created_configured_state_directory_has_the_template(
     root = copy / "project"
     (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: fresh\n")
 
-    _ = _run(root, home, _PIVOT, *_COMMANDS[command])
+    _ = helpers.run_pivot(root, home, *_COMMANDS[command])
 
     fresh = root / "fresh"
     if fresh.exists():
@@ -443,7 +439,7 @@ def _capture(pivot: str) -> None:
         def run_one(index: int) -> tuple[str, str, subprocess.CompletedProcess[str]]:
             case, command = runs[index]
             home, root = _case(base, pathlib.Path(tmp) / str(index), case)
-            return case, command, _run(root, home, pivot, *_COMMANDS[command])
+            return case, command, helpers.run_cli(root, home, pivot, *_COMMANDS[command])
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(run_one, range(len(runs))))
@@ -464,5 +460,5 @@ def _capture(pivot: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pivot", default=_PIVOT)
+    parser.add_argument("--pivot", default=helpers.PIVOT)
     _capture(parser.parse_args().pivot)
