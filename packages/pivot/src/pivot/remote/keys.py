@@ -81,7 +81,11 @@ async def stream_to_fd(read_chunk: Callable[[], Awaitable[bytes]], fd: int) -> s
 
 
 def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
-    """Raise RemoteError if the downloaded object at ``location`` is not ``expected_hash``."""
+    """Raise RemoteError if the downloaded object at ``location`` is not ``expected_hash``.
+
+    The digest detects accidental corruption during storage or transfer. It does not
+    authenticate remote content.
+    """
     if actual_hash != expected_hash:
         root = project.get_project_root()
         state_db_path = state_dir_mod.state_dir_or_default(root, warn=False) / "state.lmdb"

@@ -111,7 +111,7 @@ def test_config_get_reports_the_pivot_052_cache_default(
 def test_config_get_reports_the_configured_state_cache_default(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """With core.state_dir set, the reported cache default is the real `<state_dir>/cache`."""
+    """With core.state_dir set, the reported cache default is the real `<state dir>/cache`."""
     with isolated_pivot_dir(runner, tmp_path):
         pathlib.Path(".pivot/config.yaml").write_text("core:\n  state_dir: altstate\n")
         text = runner.invoke(cli.cli, ["config", "get", "cache.dir"])
