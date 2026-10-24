@@ -2004,6 +2004,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        release.unlink()
 
 
 def _watch_missing_input_pipeline(*, missing: bool) -> str:
