@@ -9,6 +9,9 @@ from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 
+# The key path of `core.state_dir` in a config file.
+_STATE_DIR_PATH = ("core", "state_dir")
+
 
 def _format_value(value: Any) -> str:
     """Format a config value for display."""
@@ -20,16 +23,16 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-def _flatten_config(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    """Flatten nested config dict to dotted keys."""
-    result = dict[str, Any]()
+def _flatten_config(data: dict[str, Any], path: tuple[str, ...] = ()) -> dict[tuple[str, ...], Any]:
+    """Flatten a nested config dict to the key path of each value, as the file nests them."""
+    result = dict[tuple[str, ...], Any]()
     for key, value in data.items():
-        full_key = f"{prefix}.{key}" if prefix else key
+        full_path = (*path, key)
         if isinstance(value, dict) and key != "remotes":
             nested = cast("dict[str, Any]", value)
-            result.update(_flatten_config(nested, full_key))
+            result.update(_flatten_config(nested, full_path))
         else:
-            result[full_key] = value
+            result[full_path] = value
     return result
 
 
@@ -75,8 +78,16 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     # `--global` and `--local` print the stored text as 0.5.2 does; the merged listing marks a
     # value the state directory cannot use.
     merged_listing = not (use_global or use_local)
-    for key in sorted(flat.keys()):
-        value = flat[key]
+    # Inside a project, every `--global` row that comes from the file's `core.state_dir` entry,
+    # whatever that value's type, is ignored: a mapping there flattens to several rows.
+    global_state_dir_ignored = (
+        use_global
+        and any(path[:2] == _STATE_DIR_PATH for path in flat)
+        and state_dir_mod.report_ignored_global_state_dir()
+    )
+    for path in sorted(flat, key=".".join):
+        key = ".".join(path)
+        value = flat[path]
         if key == "remotes" and isinstance(value, dict):
             remotes_dict = cast("dict[str, str]", value)
             for remote_name, remote_url in remotes_dict.items():
@@ -89,7 +100,7 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
             if use_global:
                 # Every row comes from the global file, so every label does too.
                 source = config.ConfigSource.GLOBAL
-                if key == "core.state_dir" and state_dir_mod.report_ignored_global_state_dir():
+                if global_state_dir_ignored and path[:2] == _STATE_DIR_PATH:
                     source = config.ConfigSource.GLOBAL_IGNORED
             else:
                 configured_value, source = config.get_config_value(key)

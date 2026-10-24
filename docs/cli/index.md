@@ -826,10 +826,11 @@ It fails in one line when the local `core.state_dir` is not a string. It marks a
 `invalid: core.state_dir must be a path`.
 
 `--local` and `--global` show the values stored in that one file, as written, and exit 0 for any
-stored `core.state_dir`: `core.state_dir: 5` shows as `core.state_dir = 5 (local)`, and
-`--json` prints the file's values as JSON. Inside a project, `--global` labels a global
-`core.state_dir` `(global, ignored)`, because only the project's own `.pivot/config.yaml` sets the
-state directory.
+stored `core.state_dir`: `core.state_dir: 5` shows as `core.state_dir = 5 (local)`. Inside a
+project, the text forms label every row of a global `core.state_dir` `(global, ignored)`, whatever
+its type: a mapping shows one row for each nested key. Only the project's own
+`.pivot/config.yaml` sets the state directory. `--json` prints the values as JSON, with no source
+labels for any key.
 
 ---
 
