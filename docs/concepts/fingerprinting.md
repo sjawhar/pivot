@@ -289,6 +289,44 @@ that are part of the stage's code; editing one marks the stage "Code changed".
 **Use sparingly.** File-level hashing is less precise: any change anywhere
 in the file triggers a re-run.
 
+
+## @pivot.fingerprint_by_name
+
+A helper function that cannot change a stage's output — process bookkeeping,
+file locks, log rotation — can carry this mark so Pivot records it by its
+module and qualified name only, never its body:
+
+```python
+from pivot import fingerprint_by_name
+
+
+@fingerprint_by_name
+def process_start():
+    """Read /proc for a running process."""
+    ...
+```
+
+A stage that calls a marked helper does not rerun when the helper's body
+changes. It reruns once when the helper moves to another module, when the
+helper gets a new name, or when someone removes the mark.
+
+The decorator accepts a module-level function, and a `functools.wraps` or
+`contextlib.contextmanager` wrapper of one. It refuses a class, a method, a
+lambda, a nested function, a `functools.partial`, a helper that imports a
+user module in its body, and a helper that uses `importlib.import_module` or
+`__import__`. Import the module at the top of the helper's file instead.
+
+A stage cannot carry `@fingerprint_by_name`. Use `@no_fingerprint()` to opt
+a stage out of AST fingerprinting.
+
+Pivot does not walk code that only a marked helper calls. If that code
+imports a user module in its body, the run-time check counts the import, and
+the stage warns and reruns each run. Move that import to the top of its
+module to clear it.
+
+Soundness is the user's choice: if a marked helper can change a stage's
+output, Pivot does not see the change.
+
 ## Performance
 
 Fingerprinting runs once during pipeline discovery (single-threaded, in

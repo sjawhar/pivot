@@ -974,6 +974,16 @@ class Pipeline:
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
+        # Refuse a stage marked with @fingerprint_by_name: that mark is for helpers, not stages.
+        if fingerprint.fingerprinted_by_name(stage_wrapper) or fingerprint.fingerprinted_by_name(
+            original_func
+        ):
+            msg = (
+                f"{qualified_name}: @fingerprint_by_name marks a helper, not a stage. "
+                "Use @no_fingerprint() to opt a stage out of AST fingerprinting."
+            )
+            self._validation_errors.append(msg)
+
         # Read @no_fingerprint marks from this @stage wrapper, never from the shared function:
         # functools.wraps copies marks set below @stage, and marks set above land here directly.
         node = _StageNode(
