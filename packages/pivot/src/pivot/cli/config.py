@@ -72,6 +72,9 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         click.echo("No configuration set")
         return
 
+    # `--global` and `--local` print the stored text as 0.5.2 does; the merged listing marks a
+    # value the state directory cannot use.
+    merged_listing = not (use_global or use_local)
     for key in sorted(flat.keys()):
         value = flat[key]
         if key == "remotes" and isinstance(value, dict):
@@ -93,7 +96,11 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
                 if source == config.ConfigSource.GLOBAL_IGNORED:
                     value = configured_value
             row = f"{key} = {_format_value(value)} ({source})"
-            if key == "core.state_dir" and not state_dir_mod.is_valid_state_dir_value(value):
+            if (
+                merged_listing
+                and key == "core.state_dir"
+                and not state_dir_mod.is_valid_state_dir_value(value)
+            ):
                 row += " invalid: core.state_dir must be a path"
             click.echo(row)
 

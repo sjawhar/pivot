@@ -468,7 +468,11 @@ def test_non_string_state_dir_matches_release_display_contract(
 def test_scoped_config_list_shows_a_non_string_state_dir_as_052_does(
     tmp_path: pathlib.Path, value: str, stored_value: str, scope: tuple[str, ...]
 ) -> None:
-    """0.5.2 exits 0 and shows the stored value for scoped `config list`; plain `config list` still exits 1."""
+    """Scoped `config list` exits 0 and prints 0.5.2's stdout for a non-string value: no note.
+
+    `--global` inside a project labels the value `(global, ignored)`, as `config get --global`
+    does; 0.5.2 labelled it with the merged source. Plain `config list` still exits 1.
+    """
     home = tmp_path / "home"
     (home / ".config" / "pivot").mkdir(parents=True)
     root = tmp_path / "project"
@@ -482,8 +486,11 @@ def test_scoped_config_list_shows_a_non_string_state_dir_as_052_does(
     listed = helpers.run_pivot(root, home, "config", "list", *scope)
 
     assert listed.returncode == 0, listed.stdout + listed.stderr
-    if "--json" in scope:
-        assert json.loads(listed.stdout)["core"]["state_dir"] == yaml.safe_load(value)
-    else:
-        assert f"core.state_dir = {stored_value}" in listed.stdout, listed.stdout
+    expected: dict[tuple[str, ...], str] = {
+        ("--local",): f"core.state_dir = {stored_value} (local)\n",
+        ("--local", "--json"): json.dumps({"core": {"state_dir": yaml.safe_load(value)}}, indent=2)
+        + "\n",
+        ("--global",): f"core.state_dir = {stored_value} (global, ignored)\n",
+    }
+    assert listed.stdout == expected[scope]
     assert helpers.run_pivot(root, home, "config", "list").returncode == 1

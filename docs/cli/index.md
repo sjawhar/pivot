@@ -820,6 +820,17 @@ pivot config list [OPTIONS]
 | `--local` | Show only local config |
 | `--json` | Output as JSON |
 
+Without `--global` or `--local`, `config list` shows the merged configuration after validation.
+It fails in one line when the local `core.state_dir` is not a string. It marks any other
+`core.state_dir` that is not a path, such as an empty value, with
+`invalid: core.state_dir must be a path`.
+
+`--local` and `--global` show the values stored in that one file, as written, and exit 0 for any
+stored `core.state_dir`: `core.state_dir: 5` shows as `core.state_dir = 5 (local)`, and
+`--json` prints the file's values as JSON. Inside a project, `--global` labels a global
+`core.state_dir` `(global, ignored)`, because only the project's own `.pivot/config.yaml` sets the
+state directory.
+
 ---
 
 ### `pivot config get`
