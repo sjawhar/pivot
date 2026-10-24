@@ -26,6 +26,17 @@ _KILLED_WORKER_JOIN_S = 5.0
 _FileStamp = tuple[int, int, int, int, int]
 
 
+# A ping round normally clears as soon as each idle worker has taken one ping; the timeout only
+# bounds a round whose estimate of idle workers was off by a worker that exited meanwhile.
+_KEEPALIVE_PING_TIMEOUT_S = 0.25
+
+
+def _keepalive_ping(barrier: threading.Barrier) -> None:
+    """Restart one idle worker's idle clock; the barrier spreads a round over distinct workers."""
+    with contextlib.suppress(threading.BrokenBarrierError):
+        _ = barrier.wait(_KEEPALIVE_PING_TIMEOUT_S)
+
+
 def _file_stamp(path: str) -> _FileStamp | None:
     """Return the stat signature and content digest of a user-code file, or None if unreadable.
 
@@ -70,41 +81,84 @@ class WorkerPool:
     _accepting: bool = True
     _in_run: bool = False
     _max_workers: int = 0
+    _idle_timeout_s: float | None = None
+    # Parent -> (next ping deadline, consumer workers to keep warm). The Engine loop services
+    # the deadlines, so a parent costs no thread.
+    _keepalives: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # Ping futures are grouped by parent so completion and shutdown cancel queued pings.
+    _pings: dict[str, list[concurrent.futures.Future[None]]] = field(default_factory=dict)
     _user_code_files: dict[str, _FileStamp | None] = field(default_factory=dict)
     _code_changed: bool = False
 
-    def start(self, *, max_workers: int) -> None:
+    def start(self, *, max_workers: int, idle_timeout_s: float | None = None) -> None:
         """Start a run without shrinking workers warmed by earlier runs."""
         if self._in_run:
             return
         self._max_workers = max(self._max_workers, max_workers)
-        executor = typing.cast(
-            "loky.ProcessPoolExecutor", executor_core.create_executor(self._max_workers)
-        )
-        fresh_workers = executor is not self._executor
-        if self._executor is executor and self._has_stale_user_code():
-            executor_core.restart_workers(self._max_workers, self._max_workers)
-            executor = typing.cast(
-                "loky.ProcessPoolExecutor",
-                executor_core.create_executor(self._max_workers),
+        executor = self._executor
+        fresh_workers = True
+        if executor is None:
+            executor = executor_core.create_executor(
+                self._max_workers, idle_timeout_s=idle_timeout_s
             )
-            fresh_workers = True
+        elif (
+            self._idle_timeout_s != idle_timeout_s
+            or self._has_stale_user_code()
+            or not executor_core.is_executor_usable(executor, self._max_workers)
+        ):
+            executor = self._replace_executor(idle_timeout_s)
+        else:
+            fresh_workers = False
+        # An argument change can make loky replace a live reusable executor during first use.
+        # Recheck every acquisition so this pool never keeps its narrowed call queue.
+        if not executor_core.is_executor_usable(executor, self._max_workers):
+            executor = self._replace_executor(idle_timeout_s)
         if fresh_workers:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
         self._executor = executor
+        self._idle_timeout_s = idle_timeout_s
         self._output_queue = typing.cast("mp.Queue[OutputMessage]", self._new_output_queue())
         self._shutdown_event = threading.Event()
         self._accepting = True
         self._in_run = True
 
-    def restart(self, *, max_workers: int) -> int:
-        """Replace every worker with a fresh one, as many as the next ``start`` asks for.
+    def restart(self, *, max_workers: int) -> None:
+        """Replace every worker before a reload starts its next run.
 
-        Returns the worker count, which never shrinks below the pool's earlier size.
+        ``max_workers`` is the reloaded run's width; that many fresh workers start together.
+        If starting them fails, the pool holds no executor and the next ``start()`` creates
+        one, as on first use.
         """
         self._max_workers = max(self._max_workers, max_workers)
-        return executor_core.restart_workers(self._max_workers, self._max_workers)
+        self._executor = self._replace_executor(self._idle_timeout_s, warm_workers=max_workers)
+        self._restamp_user_code_files()
+
+    def _replace_executor(
+        self, idle_timeout_s: float | None, *, warm_workers: int = 0
+    ) -> loky.ProcessPoolExecutor:
+        """Stop this pool's workers, then return a fresh executor.
+
+        The pool stops the executor it holds rather than asking loky for "the" reusable
+        executor: loky 3.7 keeps one per thread, and a watch reload restarts from an anyio
+        worker thread, so the executor this pool holds need not be the one loky finds on the
+        calling thread. The pool forgets the old executor as soon as it is shut down, so a
+        failure starting the fresh workers never leaves it holding one that rejects work.
+
+        A reload warms ``warm_workers`` workers, all started together, before its next run. A
+        replacement that ``start()`` makes belongs to that run's critical path, so it warms
+        none and lets its submitted stages start every worker they need in parallel.
+        """
+        if self._executor is not None:
+            executor = self._executor
+            self._executor = None
+            executor.shutdown(wait=True, kill_workers=True)
+        if warm_workers:
+            executor_core.restart_workers(
+                self._max_workers, warm_workers=warm_workers, idle_timeout_s=idle_timeout_s
+            )
+            return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
+        return executor_core.create_fresh_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 
     def _new_output_queue(self) -> object:
         """Return a fresh queue from the engine-lifetime manager, replacing it if unreachable."""
@@ -174,6 +228,7 @@ class WorkerPool:
         fn: typing.Callable[..., _T],
         /,
         *args: object,
+        prestart_target: int = 0,
         **kwargs: object,
     ) -> concurrent.futures.Future[_T]:
         """Submit work to the underlying executor."""
@@ -181,7 +236,72 @@ class WorkerPool:
             raise RuntimeError("WorkerPool is not accepting new submissions")
         if self._executor is None:
             raise RuntimeError("WorkerPool not started")
-        return self._executor.submit(fn, *args, **kwargs)
+        self._prune_pings()
+        return executor_core.submit(
+            self._executor,
+            self._max_workers,
+            fn,
+            *args,
+            prestart_target=prestart_target,
+            keepalive_pings=self._active_ping_count(),
+            **kwargs,
+        )
+
+    def keep_consumers_warm(self, parent: str, worker_count: int) -> None:
+        """Keep ``parent``'s pre-started consumer workers from idling out while it runs.
+
+        ``run_due_keepalives`` pings up to ``worker_count`` idle workers every half idle timeout
+        until ``release_consumers(parent)`` or the end of the run.
+        """
+        if worker_count <= 0 or self._idle_timeout_s is None:
+            return
+        if parent in self._keepalives:
+            raise RuntimeError(f"workers already kept warm for {parent!r}")
+        self._keepalives[parent] = (time.monotonic() + self._idle_timeout_s / 2, worker_count)
+
+    def run_due_keepalives(self) -> None:
+        """Ping pre-started idle workers whose parent has crossed the half-timeout deadline."""
+        if not self._keepalives:
+            return
+        if self._executor is None or self._manager is None or self._idle_timeout_s is None:
+            return
+        now = time.monotonic()
+        for parent, (deadline, worker_count) in list(self._keepalives.items()):
+            if deadline > now:
+                continue
+            pings = min(worker_count, executor_core.idle_worker_count(self._executor))
+            if pings > 0:
+                barrier = self._manager.Barrier(pings)
+                self._pings.setdefault(parent, []).extend(
+                    executor_core.submit_to_live_workers(self._executor, _keepalive_ping, barrier)
+                    for _ in range(pings)
+                )
+            self._keepalives[parent] = (now + self._idle_timeout_s / 2, worker_count)
+        self._prune_pings()
+
+    def release_consumers(self, parent: str) -> None:
+        """Stop pinging a resolved parent's consumers and cancel queued ping work."""
+        self._keepalives.pop(parent, None)
+        for ping in self._pings.pop(parent, []):
+            _ = ping.cancel()
+
+    def _prune_pings(self) -> None:
+        for parent, pings in list(self._pings.items()):
+            active = [ping for ping in pings if not ping.done()]
+            if active:
+                self._pings[parent] = active
+            else:
+                del self._pings[parent]
+
+    def _active_ping_count(self) -> int:
+        return sum(len(pings) for pings in self._pings.values())
+
+    def _stop_keepalives(self) -> None:
+        self._keepalives.clear()
+        for pings in self._pings.values():
+            for ping in pings:
+                _ = ping.cancel()
+        self._pings.clear()
 
     def stop_accepting(self) -> None:
         """Stop accepting new submissions without shutting down workers."""
@@ -190,6 +310,7 @@ class WorkerPool:
     def end_run(self) -> None:
         """Release this run's queue while keeping workers warm for the next run."""
         self._accepting = False
+        self._stop_keepalives()
         self._output_queue = None
         self._shutdown_event = None
         self._in_run = False
@@ -198,6 +319,7 @@ class WorkerPool:
         """Shut down workers and the manager when the owning Engine exits."""
         self._accepting = False
         self._in_run = False
+        self._stop_keepalives()
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
@@ -221,6 +343,7 @@ class WorkerPool:
         """
         self._accepting = False
         self._in_run = False
+        self._stop_keepalives()
         try:
             if self._executor is not None:
                 executor = self._executor

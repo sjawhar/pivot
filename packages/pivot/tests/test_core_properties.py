@@ -15,6 +15,7 @@ from hypothesis import strategies as st
 
 from pivot import compose, exceptions, loaders, run_history
 from pivot.engine import graph as engine_graph
+from pivot.engine.scheduler import Scheduler
 from pivot.registry import RegistryStageInfo
 from pivot.storage import lock
 from pivot.types import (
@@ -341,6 +342,81 @@ def test_width_cut_short_never_undersizes_the_pool(
     with mock.patch.object(engine_graph, "_AUGMENT_STEPS", steps):
         width = engine_graph.get_width(stage_dag, run, limit=limit)
     assert min(largest, limit) <= width <= limit
+
+
+def _full_replay_width(
+    order: list[str],
+    upstream: dict[str, set[str]],
+    requests: dict[str, dict[str, int]],
+    capacity: dict[str, int],
+) -> int:
+    """Scheduler.resource_width's replay with neither its heaps nor its early stop: start every
+    ready stage that fits, in stage order, then finish the stage that started first."""
+    waiting = {stage: set(upstream[stage]) for stage in order}
+    counts = dict.fromkeys(capacity, 0)
+    pending = list(order)
+    running = list[str]()
+    widest = 0
+    while pending or running:
+        for stage in list(pending):
+            fits = all(
+                counts[resource] + amount <= capacity[resource]
+                for resource, amount in requests[stage].items()
+            )
+            if waiting[stage] or not fits:
+                continue
+            for resource, amount in requests[stage].items():
+                counts[resource] += amount
+            running.append(stage)
+            pending.remove(stage)
+        widest = max(widest, len(running))
+        if not running:
+            break
+        stage = running.pop(0)
+        for resource, amount in requests[stage].items():
+            counts[resource] -= amount
+        for consumer in order:
+            waiting[consumer].discard(stage)
+    return widest
+
+
+@_SETTINGS
+@hypothesis.given(_acyclic_edges(), st.data())
+def test_resource_width_matches_a_full_replay(
+    case: tuple[int, list[set[int]]], data: st.DataObject
+) -> None:
+    """The heaps and the early stop change only the cost: on any DAG, with stages sharing small
+    resources, resource_width equals a full replay of the same admission order, up to the
+    limit."""
+    count, deps = case
+    stages = _stages_from_edges(count, deps)
+    graph = engine_graph.build_graph(stages)
+    order = engine_graph.get_execution_order(engine_graph.get_stage_dag(graph))
+    capacity = {
+        "cpu": data.draw(st.integers(1, count + 1)),
+        "a": data.draw(st.integers(1, 3)),
+        "b": data.draw(st.integers(1, 3)),
+    }
+    requests = dict[str, dict[str, int]]()
+    for stage in order:
+        request = {"cpu": data.draw(st.integers(1, capacity["cpu"]))}
+        for resource in data.draw(st.sets(st.sampled_from(["a", "b"]))):
+            request[resource] = data.draw(st.integers(1, capacity[resource]))
+        requests[stage] = request
+    limit = data.draw(st.integers(1, count + 1))
+    scheduler = Scheduler()
+    scheduler.initialize(order, graph, stage_resources=requests, resource_capacity=capacity)
+    upstream = {
+        stage: {
+            producer
+            for producer in engine_graph.get_upstream_stages(graph, stage)
+            if producer in order
+        }
+        for stage in order
+    }
+
+    expected = min(_full_replay_width(order, upstream, requests, capacity), limit)
+    assert scheduler.resource_width(limit=limit) == expected
 
 
 # =============================================================================

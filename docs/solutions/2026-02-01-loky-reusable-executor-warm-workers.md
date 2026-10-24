@@ -32,70 +32,119 @@ Use Pivot's `_get_executor()` policy, which sets the shared timeout, child initi
 reuse mode:
 
 ```python
-def create_executor(max_workers: int) -> Executor:
-    """Get Pivot's reusable executor."""
-    return _get_executor(max_workers)
+def create_executor(
+    max_workers: int, *, idle_timeout_s: float | None = None
+) -> loky.ProcessPoolExecutor:
+    """Get Pivot's reusable executor without growing it before work is submitted."""
+    return _get_executor(max_workers, idle_timeout_s=idle_timeout_s)
 ```
 
 The key behaviors:
 
-1. **First call** - Creates the reusable executor, then spawns processes on warm-up or submit
-2. **Later compatible calls** - Reuse the executor; loky may resize if requested capacity grows
-3. **Workers stay alive** - Between runs in a long-lived Engine, workers idle and remain ready
-4. **Imports cached** - Libraries imported by stages remain loaded for each worker lifetime
+1. **First dispatch** - The run's first submission starts the run's resource width
+   (`Scheduler.resource_width`), capped by the Engine's limit. After it, `core.submit()` sets
+   loky's private `_max_workers` to the number of submitted, unfinished stages, or to a
+   parent's direct consumer wave. The Engine records each direct consumer wave's half-timeout
+   deadline, and its existing 100 ms execution loop services those deadlines, so a parent
+   costs no thread. Once a deadline passes, the loop sends a barrier-coordinated ping to each
+   idle pre-started worker. When the parent resolves or fails, or the run ends, the pings stop
+   and the Engine cancels the queued ping futures. Those workers then follow the normal timeout.
+2. **Later dispatches** - An existing idle worker takes the stage. A new worker starts when
+   every live worker already has work, or for the direct consumer wave of the parent that the
+   Engine dispatches.
+3. **Idle cleanup** - One-shot Engines give idle workers a 10-second timeout. An idle worker
+   exits after the 10-second idle timeout, or occasionally after a second one, when loky's
+   worker loses its process-lock race. The timeout is 126 times the 78.898 ms maximum
+   coordinator handoff gap measured on a 100-stage pandas/NumPy chain, while remaining short
+   relative to long remote-stage waits.
+4. **Long-lived Engines** - Watch, serve and persistent TUI Engines use no idle timeout, so a
+   later run reuses their warm workers.
 
-### Pre-warming Workers
+Pivot constrains Loky to `>=3.5.6,<3.8`: 3.5.0–3.5.5 print `resource_tracker` tracebacks on
+Python 3.13, and the code reads private executor state that a later release may move. It
+finds the reusable executor in the legacy `_executor` singleton (3.5.6, 3.6) or 3.7's
+`_executor_storage`; an unknown layout raises an error naming the installed Loky version. The
+fresh-wheel test installs 3.5.6, 3.6.0 and 3.7.0 and checks the worker count and idle exit for
+each. An upgrade must recheck reusable-executor lookup plus `_max_workers` and
+`_pending_work_items` submission accounting; an upstream change can reintroduce refill churn.
 
-To ensure workers are ready before the first real task, submit no-op functions:
+loky fixes an executor's call queue when it creates the executor: `queue_size` is
+2 × max(cpu, width) + 1. It refuses to reuse an executor whose queue is smaller than the
+requested width. Because `submit()` narrows loky's `_max_workers`, Pivot applies loky's whole
+reuse test itself. `_reusable_worker_target` passes the requested width whenever loky will replace
+the executor (missing, shut down, broken, arguments changed or a queue too small).
+`WorkerPool.start()` retains only an executor that exists, is neither shut down nor broken, and
+has a queue that fits the pool's width; it rechecks every newly acquired executor too. Without
+both, a wide run after a narrow one could get a queue that holds submitted stages back until a
+slot frees. An upgrade must also recheck `queue_size`, `_flags` and reusable-executor argument
+storage.
 
-```python
-def _noop() -> None:
-    """Module-level function for pickling."""
-    pass
+### Starting Process Trackers for the TUI
 
-def _warm_workers(pool: loky.ProcessPoolExecutor, count: int) -> None:
-    """Submit no-ops to establish worker channels."""
-    futures = [pool.submit(_noop) for _ in range(count)]
-    for f in futures:
-        f.result()
+Textual captures `sys.stderr` with an object whose `fileno()` is -1. Both loky's and
+`multiprocessing`'s resource trackers pass `sys.stderr.fileno()` while launching, so the
+trackers must start before Textual begins. `core.start_resource_trackers()` does that in
+`run_tui_with_engine()`.
 
-def prepare_workers(width: int, max_workers: int | None = None) -> int:
-    """Pre-warm Pivot's configured reusable worker pool before TUI startup."""
-    workers = compute_max_workers(width, max_workers)
-    _warm_workers(_get_executor(workers), workers)
-    return workers
-```
-
-Pre-warming is important when using a TUI: Textual inherits file descriptors at startup, and loky workers created after TUI initialization can inherit TUI's PTY descriptors, causing display corruption. The caller passes the width the engine will compute for the run (`engine.graph.get_width`), so the engine reuses the pre-warmed workers instead of resizing the pool.
+Workers themselves may start after the TUI begins. They use the already-running trackers, and
+Pivot's normal worker output queue continues to capture stage logs.
 
 ### Killing Workers for Code Reload
 
-In watch mode, code changes require fresh workers with updated imports:
+In watch mode, code changes require fresh workers with updated imports. `WorkerPool.restart()`
+first shuts down the executor the pool holds with `kill_workers=True`, then starts the reloaded
+run's width of fresh workers together and waits for one of them to run a no-op. A replacement
+that `start()` makes for its own run warms none, so the run submits every stage at once and loky
+starts them in parallel:
 
 ```python
-def restart_workers(width: int, max_workers: int | None = None) -> int:
-    """Kill existing workers and spawn fresh ones."""
-    workers = compute_max_workers(width, max_workers)
-    _warm_workers(_get_executor(workers, kill_workers=True), workers)
-    return workers
+def _replace_executor(
+    self, idle_timeout_s: float | None, *, warm_workers: int = 0
+) -> loky.ProcessPoolExecutor:
+    if self._executor is not None:
+        executor = self._executor
+        self._executor = None
+        executor.shutdown(wait=True, kill_workers=True)
+    if warm_workers:
+        executor_core.restart_workers(
+            self._max_workers, warm_workers=warm_workers, idle_timeout_s=idle_timeout_s
+        )
+        return executor_core.create_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
+    return executor_core.create_fresh_executor(self._max_workers, idle_timeout_s=idle_timeout_s)
 ```
 
-`reuse=False` makes loky replace a compatible live executor instead of returning it unchanged,
-ensuring updated imports are loaded.
+The pool shuts down the executor it holds rather than asking loky for "the" reusable executor.
+Loky 3.7 keeps one reusable executor per thread, and the reload restarts from an anyio worker
+thread that never created the pool's executor, so `get_reusable_executor(kill_workers=True)`
+there finds no executor and leaves the previous workers alive. `reuse=False` still makes loky
+replace a compatible live executor instead of returning it unchanged. Every path that replaces
+the pool's executor goes through `_replace_executor`: a reload's `restart()`, and a `start()`
+that finds stale user code, a different idle timeout or an unusable executor (missing, shut
+down, broken or a call queue smaller than the pool's width). After a restart from another thread,
+loky's lookup on the calling thread no longer finds the executor the pool holds, so a `start()`
+that let loky swap it for a new timeout would leave the restart's worker alive.
+
+The pool forgets the old executor as soon as it is shut down. If the fresh worker then fails to
+start, the Engine logs the failed restart and the pool holds no executor, so the next run's
+`start()` creates one as on first use. A shut-down executor rejects every submission, so
+keeping it would make that run fail. `restart_workers()` also shuts down the executor it just
+created, killing its workers, before the error propagates: on loky 3.7 that executor sits in the
+reload thread's slot, where no pool holds it, so its fresh worker would otherwise outlive the
+failure and run beside the next run's workers, one beyond the cap.
 
 ### Cleanup on Exit
 
 The Engine shuts its workers and manager down when it exits. An atexit fallback remains useful
 when code creates a reusable executor outside an Engine context.
 
-Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler), and
-workers use `timeout=None`, so nothing else would end them. The output-queue manager therefore
-starts with `_init_manager`, which runs `_exit_when_parent_dies`, a thread that exits it once its
-parent pid changes. It also makes the manager ignore SIGTERM, as multiprocessing makes it ignore
-SIGINT: a stop sent to the whole process group (systemd, GNU `timeout`) would otherwise kill it
-before its finalizer removes its `pymp-*` directory. Every worker starts with
-`core._init_worker`, which runs `worker.unwind_when_stopped` (and, while a discovery's import
-session lasts, installs discovery's checked loader):
+Neither path runs when the coordinator is killed (SIGKILL, or a SIGTERM with no handler).
+The output-queue manager therefore starts with `_init_manager`, which runs
+`_exit_when_parent_dies`, a thread that exits it once its parent pid changes. It also makes the
+manager ignore SIGTERM, as multiprocessing makes it ignore SIGINT: a stop sent to the whole
+process group (systemd, GNU `timeout`) would otherwise kill it before its finalizer removes its
+`pymp-*` directory. Every worker starts with `core._init_worker`, which runs
+`worker.unwind_when_stopped` (and, while a discovery's import session lasts, installs
+discovery's checked loader):
 
 - SIGTERM raises `worker.WorkerTerminated` (a `KeyboardInterrupt`) in the running stage, so its
   cleanup runs, and the worker exits once the stage has unwound, or after
@@ -122,19 +171,23 @@ left waiting never exits. Start any new long-lived child process with one of the
 
 ## Key Insight
 
-The standard library's `ProcessPoolExecutor` is designed for batch workloads where pool creation is amortized over many tasks. For iterative workflows with frequent re-runs, the per-run overhead dominates.
+The standard library's `ProcessPoolExecutor` is designed for batch workloads where pool creation
+is amortized over many tasks. For iterative workflows with frequent re-runs, the per-run
+overhead dominates.
 
-`loky.get_reusable_executor()` inverts this by treating the worker pool as long-lived
-infrastructure rather than per-invocation ephemera:
+`loky.get_reusable_executor()` makes the worker pool long-lived infrastructure while Pivot's
+submission helper controls how many workers are live:
 
 | Aspect | Standard ProcessPoolExecutor | Pivot reusable executor |
 |---|---|---|
 | Pool lifetime | Per `with` block | Engine lifetime |
-| Worker spawn | Every run | Once, after a code restart, or when capacity grows |
+| Worker spawn | Every run | The run's resource width at its first submission, then when an admitted stage has no idle worker or for a parent's direct consumer wave |
 | Import overhead | Every worker spawn | Once per worker lifetime |
-| Idle workers | Terminated | Wait for next task until Engine exit |
+| One-shot idle worker | N/A | Exits after the idle timeout |
+| Long-lived idle worker | N/A | Waits for the next run |
 
-The tradeoff is memory: idle workers consume RAM. For pipelines where iteration speed matters more than memory footprint, warm workers provide significant latency reduction.
+The tradeoff is deliberate: one-shot runs reclaim workers while they wait, while long-lived
+interactive Engines retain their warm pool for the next run.
 
 ### Why Not threading?
 
