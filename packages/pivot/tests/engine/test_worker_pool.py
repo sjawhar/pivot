@@ -389,36 +389,66 @@ def _helper_started_at(seconds: float) -> float:
     return started
 
 
+def _helper_hold_until_released(ready_dir: str, release: str) -> int:
+    (pathlib.Path(ready_dir) / str(os.getpid())).write_text("")
+    release_path = pathlib.Path(release)
+    deadline = time.monotonic() + 600  # a hang guard only; the test always releases
+    while not release_path.exists():
+        assert time.monotonic() < deadline, "test did not release waiting workers"
+        time.sleep(0.01)
+    return os.getpid()
+
+
 def test_wider_run_after_a_narrow_one_starts_its_stages_together(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A watch session's wide run after a narrow one needs a new executor (its call queue is too
-    small). Replacing it must not start one stage a whole worker start-up ahead of the rest:
-    on main every stage of the wide run starts together; none may start more than half a stage
-    after the first (the late count PR 502's own makespan probe uses)."""
-    hook = tmp_path / "hook"
-    hook.mkdir()
-    (hook / "sitecustomize.py").write_text(_SLOW_STARTUP_HOOK)
-    width = _WIDER_THAN_A_NARROW_QUEUE
+    small). As on main, the replacement must start no worker before the run submits its stages:
+    a worker started and waited for there puts its start-up ahead of every other worker's, so
+    one stage starts a whole worker start-up before the rest. Every stage must then hold a
+    worker at once. The checks are counts, not times, so machine load cannot change them.
+
+    loky sizes a call queue from the CPU count, so one CPU makes the narrow run's queue (3) too
+    small for a run of 4. The width is the same on every machine."""
+    monkeypatch.setenv("LOKY_MAX_CPU_COUNT", "1")
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    release = tmp_path / "release"
+    width = 4
+    executor_core._cleanup_worker_pool()
     pool = WorkerPool()
     try:
         pool.start(max_workers=1)
         assert pool.submit(_helper_identity, 1).result(timeout=60) == 1
         pool.end_run()
+        narrow = pool._executor
+        assert narrow is not None
+        assert narrow.queue_size < width, "precondition: the narrow run's queue fits the wide run"
 
-        with monkeypatch.context() as patched:
-            patched.setenv(
-                "PYTHONPATH",
-                os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])),
-            )
-            pool.start(max_workers=width)
-            futures = [pool.submit(_helper_started_at, _STAGE_S) for _ in range(width)]
-            starts = sorted(future.result(timeout=120) for future in futures)
+        pool.start(max_workers=width)
+        executor = pool._executor
+        assert executor is not None
+        assert executor.queue_size >= width, (
+            f"call queue {executor.queue_size} holds back stages of a {width}-wide run"
+        )
+        early = sorted(executor._processes)
+        assert not early, (
+            f"{len(early)} worker(s) started before the run's first submission: {early}; "
+            + "a stage on one starts a whole worker start-up before the rest"
+        )
+        futures = [
+            pool.submit(_helper_hold_until_released, str(ready_dir), str(release))
+            for _ in range(width)
+        ]
+        deadline = time.monotonic() + 300  # a hang guard only
+        while (running := len(list(ready_dir.iterdir()))) < width:
+            assert time.monotonic() < deadline, f"only {running} of {width} stages ran at once"
+            time.sleep(0.01)
+        release.write_text("")
+        assert len({future.result(timeout=60) for future in futures}) == width
         pool.end_run()
-        offsets = [round(start - starts[0], 2) for start in starts]
-        late = [offset for offset in offsets if offset > _STAGE_S / 2]
-        assert not late, f"{len(late)} of {width} stages started late: offsets {offsets}"
     finally:
+        release.write_text("")
         pool.shutdown()
 
 
