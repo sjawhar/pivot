@@ -194,7 +194,7 @@ _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
 _pending_ast_writes: list[AstHashEntry] = []
 
-# Pending manifest cache writes, flushed at process exit.
+# Pending manifest cache writes, flushed as each CLI invocation ends (`flush_and_close`).
 # Format: list of (key_bytes, value_bytes) tuples.
 _pending_manifest_writes: list[tuple[bytes, bytes]] = []
 
@@ -291,25 +291,30 @@ class FunctionIdentity(TypedDict):
 
 
 def _close_state_db() -> None:
-    """Close the readonly StateDB on process exit."""
-    global _state_db
+    """Close the readonly StateDB; the next lookup opens it again."""
+    global _state_db, _state_db_init_attempted
     if _state_db is not None:
         _state_db.close()
         _state_db = None
+    _state_db_init_attempted = False
 
 
-atexit.register(_close_state_db)
+def flush_and_close() -> None:
+    """Write the pending cache entries, then close the readonly StateDB.
 
-
-@atexit.register
-def _flush_pending_caches() -> None:  # pyright: ignore[reportUnusedFunction] - called by atexit
-    """Flush all pending cache writes at process exit.
-
-    Registered AFTER _close_state_db so LIFO ordering runs this first.
-    Flush opens its own writable StateDB, so readonly close is irrelevant.
+    The CLI calls this as each invocation ends, while the invocation still holds the state
+    directory it decided, and process exit calls it for a library caller. Entries that fail
+    to write are dropped: the caches are best effort, and a later retry could resolve another
+    state directory. The flush opens its own writable StateDB.
     """
     flush_ast_hash_cache()
     flush_manifest_cache()
+    _pending_ast_writes.clear()
+    _pending_manifest_writes.clear()
+    _close_state_db()
+
+
+atexit.register(flush_and_close)
 
 
 def _get_state_db() -> "StateDB | None":
@@ -1069,7 +1074,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     """Like get_stage_fingerprint, but with manifest-level caching.
 
     A hit skips the walk; `_try_manifest_cache_hit` says what it checks. On a miss the walk
-    records every live value it reads, and the result is queued for flush at process exit.
+    records every live value it reads, and the result is queued for `flush_and_close`.
     """
     _t = metrics.start()
 

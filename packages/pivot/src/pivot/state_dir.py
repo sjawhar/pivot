@@ -263,11 +263,15 @@ def report_cache_stage_overlap(
     )
 
 
-def begin_invocation(*, report: bool) -> contextvars.Token[StateDirInvocation | None]:
+def begin_invocation(
+    *, report: bool, state_dirs: dict[pathlib.Path, pathlib.Path] | None = None
+) -> contextvars.Token[StateDirInvocation | None]:
     """Start one invocation's record, used until the returned token is reset.
 
-    Its resolution cache starts empty, so the invocation reads each project's config afresh.
-    With ``report``, each state-directory problem is warned once; without it, none is.
+    Its resolution cache starts with ``state_dirs`` and reads the config of any other project
+    afresh. A worker's stage passes the state directory its Pivot process decided for the
+    command, so a ``core.state_dir`` edited during a ``--watch`` session never reaches it. With
+    ``report``, each state-directory problem is warned once; without it, none is.
     """
     reported = (
         StateDirWarnings(
@@ -280,7 +284,9 @@ def begin_invocation(*, report: bool) -> contextvars.Token[StateDirInvocation | 
         else None
     )
     return _invocation.set(
-        StateDirInvocation(resolved=dict[pathlib.Path, pathlib.Path](), reported=reported)
+        StateDirInvocation(
+            resolved=dict[pathlib.Path, pathlib.Path](state_dirs or {}), reported=reported
+        )
     )
 
 

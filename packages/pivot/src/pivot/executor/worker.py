@@ -1111,10 +1111,14 @@ def execute_stage(
 
     A stage interrupted by a stop signal (``unwind_when_stopped``) fails without committing
     anything. After SIGTERM or the death of its Pivot process, the worker exits once the stage
-    has unwound instead of returning. Each stage is one state-directory invocation: it reads
-    the project config once, and reports nothing, which the Pivot process does.
+    has unwound instead of returning. Each stage is one state-directory invocation that starts
+    with the state directory the Pivot process decided for the command (``project_state_dir``),
+    so the worker never reads ``core.state_dir`` itself; it reports nothing, which the Pivot
+    process does.
     """
-    invocation = state_dir_mod.begin_invocation(report=False)
+    invocation = state_dir_mod.begin_invocation(
+        report=False, state_dirs={stage_info["project_root"]: stage_info["project_state_dir"]}
+    )
     try:
         _begin_stage()
         result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)

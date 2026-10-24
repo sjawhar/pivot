@@ -194,14 +194,27 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     # One invocation reads the config once: its state-directory record and the merged config
     # both start afresh, so an embedder's next invocation sees edits made in between. Like the
     # CLI's other warnings about project files, the state-directory warnings give way to
-    # --quiet, and each invocation reports each problem once.
+    # --quiet, and each invocation reports each problem once. Close callbacks run last first,
+    # so the fingerprint caches are written while the record still holds the state directory.
     if not ctx.resilient_parsing:
         from pivot import state_dir as state_dir_mod
         from pivot.config import io as config_io
 
         token = state_dir_mod.begin_invocation(report=not quiet)
         ctx.call_on_close(lambda: state_dir_mod.end_invocation(token))
+        ctx.call_on_close(_flush_fingerprint_caches)
         config_io.clear_config_cache()
+
+
+def _flush_fingerprint_caches() -> None:
+    """Write this invocation's pending fingerprint-cache entries to its state directory.
+
+    A command that never fingerprinted never imported the module, and has nothing pending.
+    """
+    if "pivot.fingerprint" in sys.modules:
+        from pivot import fingerprint
+
+        fingerprint.flush_and_close()
 
 
 def main() -> None:
