@@ -4,8 +4,10 @@ from typing import Any, cast
 import click
 import pydantic
 
-from pivot import config, exceptions
+from pivot import config, config_files, exceptions
+from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
+from pivot.cli import decorators as cli_decorators
 
 
 def _format_value(value: Any) -> str:
@@ -31,6 +33,13 @@ def _flatten_config(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return result
 
 
+def _raise_for_non_string_state_dir(data: dict[str, Any]) -> None:
+    """Keep config-list's release failure concise when its stored state value has the wrong type."""
+    value = _get_nested_value(data, "core.state_dir")
+    if value is not None and not isinstance(value, str):
+        raise click.ClickException("core.state_dir must be a string")
+
+
 @click.group()
 def config_cmd() -> None:
     """View and modify Pivot configuration."""
@@ -40,14 +49,16 @@ def config_cmd() -> None:
 @click.option("--global", "use_global", is_flag=True, help="Show only global config")
 @click.option("--local", "use_local", is_flag=True, help="Show only local config")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@cli_decorators.with_error_handling
 def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     """Display all configuration values."""
     data: dict[str, Any]
     if use_global:
-        data = config.load_config_file(config.get_global_config_path())
+        data = config.load_config_file(config_files.get_global_config_path())
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
     else:
+        _raise_for_non_string_state_dir(config.load_config_file(config.get_local_config_path()))
         merged = config.get_merged_config()
         data = merged.model_dump()
 
@@ -61,16 +72,37 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         click.echo("No configuration set")
         return
 
+    # `--global` and `--local` print the stored text as 0.5.2 does; the merged listing marks a
+    # value the state directory cannot use.
+    merged_listing = not (use_global or use_local)
     for key in sorted(flat.keys()):
         value = flat[key]
         if key == "remotes" and isinstance(value, dict):
             remotes_dict = cast("dict[str, str]", value)
             for remote_name, remote_url in remotes_dict.items():
-                _, source = config.get_config_value(f"remotes.{remote_name}")
+                if use_global:
+                    source = config.ConfigSource.GLOBAL
+                else:
+                    _, source = config.get_config_value(f"remotes.{remote_name}")
                 click.echo(f"remotes.{remote_name} = {remote_url} ({source})")
         else:
-            _, source = config.get_config_value(key)
-            click.echo(f"{key} = {_format_value(value)} ({source})")
+            if use_global:
+                # Every row comes from the global file, so every label does too.
+                source = config.ConfigSource.GLOBAL
+                if key == "core.state_dir" and state_dir_mod.report_ignored_global_state_dir():
+                    source = config.ConfigSource.GLOBAL_IGNORED
+            else:
+                configured_value, source = config.get_config_value(key)
+                if source == config.ConfigSource.GLOBAL_IGNORED:
+                    value = configured_value
+            row = f"{key} = {_format_value(value)} ({source})"
+            if (
+                merged_listing
+                and key == "core.state_dir"
+                and not state_dir_mod.is_valid_state_dir_value(value)
+            ):
+                row += " invalid: core.state_dir must be a path"
+            click.echo(row)
 
 
 def _get_nested_value(data: dict[str, Any], key: str) -> Any:
@@ -95,6 +127,7 @@ def _get_nested_value(data: dict[str, Any], key: str) -> Any:
 @click.option("--global", "use_global", is_flag=True, help="Get from global config only")
 @click.option("--local", "use_local", is_flag=True, help="Get from local config only")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@cli_decorators.with_error_handling
 def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -> None:
     """Get a configuration value by dotted key."""
     if use_global and use_local:
@@ -104,9 +137,14 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         raise click.ClickException(f"Unknown config key: '{key}'")
 
     if use_global:
-        data = config.load_config_file(config.get_global_config_path())
+        data = config.load_config_file(config_files.get_global_config_path())
         value = _get_nested_value(data, key)
         source = config.ConfigScope.GLOBAL
+        # Outside a project nothing ignores the value. An unreadable local config only drops
+        # the warning: labeling a global value never needs the local file.
+        global_state_dir = key == "core.state_dir" and value is not None
+        if global_state_dir and state_dir_mod.report_ignored_global_state_dir():
+            source = config.ConfigSource.GLOBAL_IGNORED
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
         value = _get_nested_value(data, key)
@@ -125,6 +163,7 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
 @click.argument("key", shell_complete=completion.complete_config_keys)
 @click.argument("value")
 @click.option("--global", "use_global", is_flag=True, help="Set in global config")
+@cli_decorators.with_error_handling
 def config_set(key: str, value: str, use_global: bool) -> None:
     """Set a configuration value."""
     try:
@@ -136,20 +175,28 @@ def config_set(key: str, value: str, use_global: bool) -> None:
         raise click.ClickException(f"Invalid value for '{key}': {errors}") from e
 
     scope = config.ConfigScope.GLOBAL if use_global else config.ConfigScope.LOCAL
-    config.set_config_value(key, validated, scope)
+    try:
+        notices = config.set_config_value(key, validated, scope)
+    except exceptions.ConfigValidationError as e:
+        raise click.ClickException(str(e)) from e
+    for notice in notices:
+        click.echo(notice)
     click.echo(f"Set {key} = {_format_value(validated)} in {scope} config")
 
 
 @config_cmd.command("unset")
 @click.argument("key", shell_complete=completion.complete_config_keys)
 @click.option("--global", "use_global", is_flag=True, help="Unset from global config")
+@cli_decorators.with_error_handling
 def config_unset(key: str, use_global: bool) -> None:
     """Remove a configuration value (reverts to default or inherited value)."""
     if not config.is_valid_key(key):
         raise click.ClickException(f"Unknown config key: '{key}'")
 
     scope = config.ConfigScope.GLOBAL if use_global else config.ConfigScope.LOCAL
-    removed = config.unset_config_value(key, scope)
+    removed, notices = config.unset_config_value(key, scope)
+    for notice in notices:
+        click.echo(notice)
 
     if removed:
         click.echo(f"Removed {key} from {scope} config")

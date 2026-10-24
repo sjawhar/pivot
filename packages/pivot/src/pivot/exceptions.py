@@ -372,6 +372,10 @@ class ConfigError(PivotError):
     """Base class for configuration errors."""
 
 
+class EmptyStateDirError(ConfigError):
+    """Raised when a project config's ``core.state_dir`` is the empty string."""
+
+
 class ConfigValidationError(ConfigError):
     """Raised when config value fails validation."""
 

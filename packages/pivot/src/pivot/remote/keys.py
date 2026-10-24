@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING
 
 import xxhash
 
-from pivot import exceptions
+from pivot import exceptions, project
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache
 
 if TYPE_CHECKING:
@@ -86,6 +87,10 @@ def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
     authenticate remote content.
     """
     if actual_hash != expected_hash:
+        root = project.get_project_root()
+        state_db_path = state_dir_mod.state_dir_or_default(root, warn=False) / "state.lmdb"
+        if state_db_path.is_relative_to(root):
+            state_db_path = state_db_path.relative_to(root)
         raise exceptions.RemoteError(
             f"Hash mismatch: expected {expected_hash}, got {actual_hash} "
             + f"for {location}. Delete {location} from the remote, then run "
@@ -93,7 +98,7 @@ def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
             + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
             + "against this remote for this object. Pivot records hashes those commands "
             + "upload, download, or find, then skips recorded hashes. If every machine "
-            + "with a good copy has recorded it, delete `.pivot/state.lmdb/` before "
+            + f"with a good copy has recorded it, delete `{state_db_path}/` before "
             + "pushing; this also clears run history and local caches."
         )
 
@@ -119,7 +124,7 @@ async def atomic_download(
     """
     with contextlib.ExitStack() as stack:
         if overwrite:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
+            state_dir_mod.make_dirs(local_path.parent)
             fd, name = tempfile.mkstemp(dir=local_path.parent, prefix=".pivot_download_")
             os.close(fd)
             tmp_path = local_path.with_name(os.path.basename(name))

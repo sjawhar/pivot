@@ -4,6 +4,7 @@ import pydantic
 import pytest
 
 from pivot import config, project
+from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
 from pivot.exceptions import ConfigError
 
@@ -23,6 +24,14 @@ def _write_config(project_root: pathlib.Path, content: str) -> None:
     config_file = project_root / ".pivot" / "config.yaml"
     config_file.write_text(content)
     config_io.clear_config_cache()
+
+
+def test_ensure_state_dir_does_not_create_a_project_marker(tmp_path: pathlib.Path) -> None:
+    """A pipeline constructed outside a project must not turn its parent into a project."""
+    result = state_dir_mod.ensure_state_dir(tmp_path)
+
+    assert result == tmp_path / ".pivot"
+    assert not result.exists()
 
 
 # --- cache.dir tests ---
@@ -59,6 +68,15 @@ def test_cache_dir_default_when_no_config(project_root: pathlib.Path) -> None:
 
     result = config.get_cache_dir()
     assert result == project_root / ".pivot" / "cache"
+
+
+def test_cache_dir_default_uses_the_configured_state_dir(project_root: pathlib.Path) -> None:
+    """The implicit cache follows core.state_dir."""
+    _write_config(project_root, "core:\n  state_dir: alternate-state\n")
+
+    result = config.get_cache_dir()
+
+    assert result == project_root / "alternate-state" / "cache"
 
 
 # --- PIVOT_CACHE_DIR env var tests ---
@@ -154,6 +172,13 @@ def test_state_dir_default_when_no_config(project_root: pathlib.Path) -> None:
 
     result = config.get_state_dir()
     assert result == project_root / ".pivot"
+
+
+def test_state_dir_for_reads_the_project_configuration(project_root: pathlib.Path) -> None:
+    """The project resolver is the source of truth for state location."""
+    _write_config(project_root, "core:\n  state_dir: custom-state\n")
+
+    assert state_dir_mod.state_dir_for(project_root) == project_root / "custom-state"
 
 
 # --- Error handling tests ---

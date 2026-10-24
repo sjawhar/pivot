@@ -24,15 +24,13 @@ import then imports; and the AD2 hand-off shapes (`threading.Timer`, an asyncio 
 `concurrent.futures.wait`, a daemon thread that outlives the stage).
 """
 
-import os
 import pathlib
 import subprocess
-import sys
 
 import pytest
 import yaml
+from tests import helpers
 
-_PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _LINES = "Local Set Default Proof Using\nSet Default Proof Using\nLemma a\n"
 
 # helpers/lib.py starts a loader named `plugin-loader*` at import time. The loader waits until the
@@ -109,23 +107,13 @@ with Pipeline("t") as pipeline:
 """
 
 
-def _run(project: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
-    }
-    return subprocess.run(
-        [str(_PIVOT), *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
-    )
-
-
 def _ok(result: subprocess.CompletedProcess[str]) -> str:
     assert result.returncode == 0, result.stdout + result.stderr
     return " ".join((result.stdout + result.stderr).split())
 
 
 def _project(tmp_path: pathlib.Path, lib: str, pipeline: str) -> pathlib.Path:
+    home = tmp_path / "home"
     project = tmp_path / "project"
     files = {
         "helpers/__init__.py": "",
@@ -138,7 +126,7 @@ def _project(tmp_path: pathlib.Path, lib: str, pipeline: str) -> pathlib.Path:
         (project / rel).parent.mkdir(parents=True, exist_ok=True)
         (project / rel).write_text(text)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    _ok(_run(project, "init"))
+    _ok(helpers.run_pivot(project, home, "init"))
     return project
 
 
@@ -152,10 +140,11 @@ def test_d1_body_import_of_module_whose_loader_thread_imports_after_it_returns_i
 ) -> None:
     """A loader thread a covered module starts may import after that module's import returns.
     Its import belongs to the covered import, so the stage emits no warning and reuses its result."""
+    home = tmp_path / "home"
     project = _project(tmp_path, _LOADER_LIBS[shape], _BODY_IMPORT_PIPELINE)
 
-    first = _ok(_run(project, "repro"))
-    again = _run(project, "repro", "--json")
+    first = _ok(helpers.run_pivot(project, home, "repro"))
+    again = helpers.run_pivot(project, home, "repro", "--json")
     _ok(again)
 
     assert "does not cover" not in first, first
@@ -166,14 +155,15 @@ def test_d1_body_import_of_module_whose_loader_thread_imports_after_it_returns_i
 def test_d1_loader_thread_stage_reruns_on_a_lib_edit(tmp_path: pathlib.Path, shape: str) -> None:
     """Once the stage reuses a loader thread's covered import, editing the covered module reruns
     the stage without an uncovered-import warning."""
+    home = tmp_path / "home"
     project = _project(tmp_path, _LOADER_LIBS[shape], _BODY_IMPORT_PIPELINE)
-    _ok(_run(project, "repro"))
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
     (project / "helpers" / "lib.py").write_text(
         _LOADER_LIBS[shape].replace("VALUE = 1\n", "VALUE = 100\n")
     )
 
-    edited = _ok(_run(project, "repro"))
+    edited = _ok(helpers.run_pivot(project, home, "repro"))
 
     assert "does not cover" not in edited, edited
     assert _value(project) == 103
@@ -184,10 +174,11 @@ def test_d1_control_a_thread_the_stage_starts_after_the_covered_import_still_war
 ) -> None:
     """A thread the stage, rather than a covered module, starts after a covered import returns is
     not covered: its import is counted and the stage reruns."""
+    home = tmp_path / "home"
     project = _project(tmp_path, "VALUE = 1\n", _STAGE_THREAD_PIPELINE)
 
-    first = _ok(_run(project, "repro"))
-    again = _run(project, "repro", "--json")
+    first = _ok(helpers.run_pivot(project, home, "repro"))
+    again = helpers.run_pivot(project, home, "repro", "--json")
     _ok(again)
 
     assert "does not cover: plugin" in first, first
@@ -238,8 +229,9 @@ _A_DOES_NOT_IMPORT_PLUGIN = '    return {"v": 1 + 0 * len(text)}'
 
 
 def _warm_project(tmp_path: pathlib.Path, shape: str, a_body: str) -> pathlib.Path:
+    home = tmp_path / "home"
     project = _project(tmp_path, _JOINED_THREAD_LIBS[shape], _WARM_PIPELINE.format(a_body=a_body))
-    _ok(_run(project, "config", "set", "core.max_workers", "1"))
+    _ok(helpers.run_pivot(project, home, "config", "set", "core.max_workers", "1"))
     return project
 
 
@@ -254,11 +246,12 @@ def test_d2_covered_import_whose_joined_thread_imports_a_module_an_upstream_stag
 ) -> None:
     """A covered module's joined loader imports a module an upstream stage already loaded.
     The loader remains covered, so `count` emits no warning and reuses across data refreshes."""
+    home = tmp_path / "home"
     project = _warm_project(tmp_path, shape, _A_IMPORTS_PLUGIN)
 
-    first = _ok(_run(project, "repro"))
+    first = _ok(helpers.run_pivot(project, home, "repro"))
     _refresh_input(project, 1)
-    refreshed = _run(project, "repro", "--json")
+    refreshed = helpers.run_pivot(project, home, "repro", "--json")
     _ok(refreshed)
 
     assert "does not cover" not in first, first
@@ -272,11 +265,12 @@ def test_d2_control_without_the_upstream_import_the_same_layout_caches(
 ) -> None:
     """Without the upstream import, `plugin` is not resident when `count`'s covered module starts
     its loader; `count` still reuses across data refreshes."""
+    home = tmp_path / "home"
     project = _warm_project(tmp_path, shape, _A_DOES_NOT_IMPORT_PLUGIN)
 
-    first = _ok(_run(project, "repro"))
+    first = _ok(helpers.run_pivot(project, home, "repro"))
     _refresh_input(project, 1)
-    refreshed = _run(project, "repro", "--json")
+    refreshed = helpers.run_pivot(project, home, "repro", "--json")
     _ok(refreshed)
 
     assert "does not cover" not in first, first
@@ -486,12 +480,13 @@ _COVERED_HANDOFFS = sorted(set(_HANDOFFS) - set(_COUNTED_HANDOFFS))
 
 
 def _handoff_project(tmp_path: pathlib.Path, shape: str) -> pathlib.Path:
+    home = tmp_path / "home"
     files = _HANDOFFS[shape]
     project = _project(tmp_path, files.get("helpers/lib.py", ""), files["pipeline.py"])
     for rel, text in files.items():
         (project / rel).parent.mkdir(parents=True, exist_ok=True)
         (project / rel).write_text(text)
-    _ok(_run(project, "config", "set", "core.max_workers", "1"))
+    _ok(helpers.run_pivot(project, home, "config", "set", "core.max_workers", "1"))
     return project
 
 
@@ -504,14 +499,15 @@ def test_thread_a_covered_import_hands_work_to_is_covered(
     joined by the stage or ending while the stage works; a thread started by such a thread; a
     `threading.Timer`; an asyncio loop on such a thread; futures it waits on; a daemon thread
     that outlives the stage): the stage warns nothing, caches, and reruns on a lib edit."""
+    home = tmp_path / "home"
     project = _handoff_project(tmp_path, shape)
 
-    first = _ok(_run(project, "repro"))
-    again = _run(project, "repro", "--json")
+    first = _ok(helpers.run_pivot(project, home, "repro"))
+    again = helpers.run_pivot(project, home, "repro", "--json")
     _ok(again)
     lib = project / "helpers" / "lib.py"
     lib.write_text(lib.read_text().replace("VALUE = 1\n", "VALUE = 100\n"))
-    edited = _ok(_run(project, "repro"))
+    edited = _ok(helpers.run_pivot(project, home, "repro"))
 
     assert "does not cover" not in first, first
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
@@ -525,9 +521,10 @@ def test_import_handed_to_a_thread_that_existed_before_the_covered_import_is_cou
     """Stated limit (i): a thread that existed before the covered import (a pool an earlier
     stage's import started in the same worker) is not a covered thread, so the import a covered
     module hands it is counted; the warning names the module and the fix."""
+    home = tmp_path / "home"
     project = _handoff_project(tmp_path, "pool-before-import")
 
-    first = _ok(_run(project, "repro"))
+    first = _ok(helpers.run_pivot(project, home, "repro"))
 
     assert (
         "Stage 't/count' imported user modules its fingerprint does not cover: plugin." in first
@@ -539,9 +536,10 @@ def test_import_handed_to_a_thread_that_existed_before_the_covered_import_is_cou
 def test_covered_thread_of_one_stage_is_not_covered_in_the_next(tmp_path: pathlib.Path) -> None:
     """A thread `scaled`'s covered import started is covered only for `scaled`: its import while
     `count` runs next in the same worker is counted for `count`."""
+    home = tmp_path / "home"
     project = _handoff_project(tmp_path, "covered-thread-in-next-stage")
 
-    first = _ok(_run(project, "repro"))
+    first = _ok(helpers.run_pivot(project, home, "repro"))
 
     assert "Stage 't/count' imported user modules its fingerprint does not cover: late." in first, (
         first
@@ -584,14 +582,15 @@ def test_module_the_stage_loads_by_hand_stays_counted_when_a_covered_import_then
     """The stage registers `late` with `exec_module` while no covered thread runs (the manual
     loader case), then first-imports the covered `helpers.lib`, whose top level imports `late`.
     The load is counted: the stage warns and reruns, and an edit to `late` is seen."""
+    home = tmp_path / "home"
     project = _project(tmp_path, "import late\n\nVALUE = 1\n", _OWN_LOAD_PIPELINE)
     (project / "late.py").write_text("VALUE = 0\n")
 
-    first = _ok(_run(project, "repro"))
-    again = _run(project, "repro", "--json")
+    first = _ok(helpers.run_pivot(project, home, "repro"))
+    again = helpers.run_pivot(project, home, "repro", "--json")
     _ok(again)
     (project / "late.py").write_text("VALUE = 100\n")
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
 
     assert "does not cover: late." in first, first
     assert '"stage": "t/count", "status": "ran"' in again.stdout, again.stdout

@@ -43,6 +43,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import enum
 import logging
 import pathlib
@@ -120,7 +121,7 @@ def _get_explanations_in_parallel(
     tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     max_workers = min(8, len(execution_order))
     locks = explain.read_locks(execution_order, all_stages, default_state_dir)
     producer_hashes = explain.producer_output_hashes(locks.values())
@@ -132,7 +133,9 @@ def _get_explanations_in_parallel(
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+            # Workers run in this context, so a warning they report counts as this command's.
             future = pool.submit(
+                contextvars.copy_context().run,
                 explain.get_stage_explanation,
                 stage_name,
                 fingerprint,
@@ -176,7 +179,7 @@ def _make_workspace_store(pipeline: registry.PipelineLike) -> store_mod.Workspac
         project_root=project.get_project_root(),
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
-        cache_dir=config.get_cache_dir() / "files",
+        cache_dir=config.locate_cache_dir() / "files",
     )
 
 
@@ -348,8 +351,8 @@ def get_tracked_files_status(
     results = list[TrackedFileInfo]()
 
     # Use state_db for hash caching (mtime-based)
-    cache_dir = config.get_cache_dir() / "files"
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    cache_dir = config.locate_cache_dir() / "files"
+    with state_mod.StateDB(config.locate_state_dir()) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
@@ -408,7 +411,7 @@ def get_remote_status(
     if not local_hashes:
         return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    with state_mod.StateDB(config.locate_state_dir()) as state_db:
         transfer.check_remote_url(state_db, resolved_name, remote_storage)
         status = asyncio.run(
             transfer.compare_status(local_hashes, remote_storage, state_db, resolved_name)
@@ -429,7 +432,7 @@ def _pluralize(count: int, singular: str) -> str:
 
 def find_orphaned_lock_files(all_stages: dict[str, RegistryStageInfo]) -> list[str]:
     """Find lock files in the registered stages' state dirs that belong to no registered stage."""
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     state_dirs = {default_state_dir} | {
         registry.get_stage_state_dir(stage_info, default_state_dir)
         for stage_info in all_stages.values()

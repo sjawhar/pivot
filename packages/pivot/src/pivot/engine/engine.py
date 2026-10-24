@@ -31,6 +31,7 @@ from pivot import (
     registry,
     types,
 )
+from pivot import state_dir as state_dir_mod
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
@@ -1215,8 +1216,8 @@ class Engine:
         run_id = self._current_run_id or run_history.generate_run_id()
         self._current_run_id = run_id  # May already be set by _handle_run_requested
 
-        # Ensure state directory exists
-        default_state_dir.mkdir(parents=True, exist_ok=True)
+        # Use the common state creator so a configured directory receives its ignore file.
+        state_dir_mod.make_state_dir(default_state_dir)
 
         # Initialize orchestration state after every stage request has been validated.
         await self._initialize_orchestration(

@@ -22,11 +22,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot.executor import worker
+from tests import helpers
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-_PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="reads the /proc process table"
@@ -191,14 +191,14 @@ def _helper_running(
     root.mkdir()
     markers.mkdir()
     with_quick = workers > 1
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    env = helpers.cli_env(tmp_path / "home")
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     for args in (["init"], ["config", "set", "core.max_workers", str(workers)]):
-        subprocess.run([_PIVOT, *args], cwd=root, env=env, check=True, capture_output=True)
+        subprocess.run([helpers.PIVOT, *args], cwd=root, env=env, check=True, capture_output=True)
     (root / "pipeline.py").write_text(
         _PIPELINE.format(markers=str(markers), cleanup=cleanup, with_quick=with_quick)
     )
-    command = [_PIVOT, "repro", *(["--watch"] if watch else [])]
+    command = [helpers.PIVOT, "repro", *(["--watch"] if watch else [])]
     if ignore_sigint:
         command = ["sh", "-c", 'trap "" INT; exec "$0" "$@"', *command]
     log = tmp_path / "pivot.log"

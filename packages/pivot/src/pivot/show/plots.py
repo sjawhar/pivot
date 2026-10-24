@@ -8,6 +8,7 @@ import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
 from pivot import project, types
+from pivot import state_dir as state_dir_mod
 from pivot.show import common
 from pivot.storage import cache
 from pivot.types import ChangeType, OutputFormat
@@ -158,7 +159,7 @@ def render_plots_html(
     output_path: pathlib.Path,
 ) -> pathlib.Path:
     """Generate simple HTML image gallery."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    state_dir_mod.make_dirs(output_path.parent)
     proj_root = project.get_project_root()
 
     plot_divs = list[str]()

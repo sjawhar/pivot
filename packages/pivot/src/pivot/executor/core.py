@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 import loky
 
 from pivot import config, discovery, exceptions, parameters, project, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
@@ -229,7 +230,7 @@ def run(
     Args:
         stages: Target stages to run (and their dependencies). If None, runs all.
         single_stage: If True, run only the specified stages without dependencies.
-        cache_dir: Directory for lock files. Defaults to .pivot/cache.
+        cache_dir: Cache directory, defaulting to `<state dir>/cache`.
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Most workers, and the ``cpu`` resource capacity (default: ``core.max_workers``).
         resource_capacity: Per-run resource capacity overrides.
@@ -382,8 +383,9 @@ def prepare_worker_info(
     # Use stage's state_dir if set, otherwise fall back to default
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
 
-    # Ensure state directory exists (workers open StateDB in readonly mode)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # Create the state directory through the common path so a newly configured directory has
+    # its state ignore file before a worker writes under it.
+    state_dir_mod.make_state_dir(state_dir)
 
     # The fingerprint is computed first: it sets `unsafe_fingerprint`.
     fingerprint = pipeline.ensure_fingerprint(stage_info["name"])

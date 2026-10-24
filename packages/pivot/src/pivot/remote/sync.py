@@ -7,6 +7,7 @@ import pathlib
 from typing import TYPE_CHECKING
 
 from pivot import config, exceptions, metrics, names, project, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.remote import config as remote_config
 from pivot.remote import protocol
 from pivot.storage import cache, lock, track
@@ -23,28 +24,32 @@ logger = logging.getLogger(__name__)
 
 
 def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
-    """Scan local cache and return all content hashes.
-
-    Uses os.scandir for efficiency - DirEntry caches stat results, eliminating
-    redundant syscalls compared to pathlib.iterdir + is_file/is_dir.
-    """
+    """Scan current and legacy default caches for all local content hashes."""
     _t = metrics.start()
-    files_dir = cache_dir / "files"
-    if not files_dir.exists():
-        metrics.end("sync.get_local_cache_hashes", _t)
-        return set()
+    files_dirs = [cache_dir / "files"]
+    legacy_files_dir = state_dir_mod.legacy_cache_files_dir_for(files_dirs[0])
+    if legacy_files_dir is not None:
+        files_dirs.append(legacy_files_dir)
 
     hashes = set[str]()
-    with os.scandir(files_dir) as prefix_entries:
-        for prefix_entry in prefix_entries:
-            if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
-                continue
-            with os.scandir(prefix_entry.path) as hash_entries:
-                for hash_entry in hash_entries:
-                    if hash_entry.is_file():
+    for files_dir in files_dirs:
+        if not files_dir.exists():
+            continue
+        is_legacy = files_dir == legacy_files_dir
+        with os.scandir(files_dir) as prefix_entries:
+            for prefix_entry in prefix_entries:
+                if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
+                    continue
+                with os.scandir(prefix_entry.path) as hash_entries:
+                    for hash_entry in hash_entries:
                         full_hash = prefix_entry.name + hash_entry.name
-                        if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
+                        object_path = pathlib.Path(hash_entry.path)
+                        if cache.is_valid_hash(full_hash) and cache.is_cache_object_path(
+                            object_path
+                        ):
                             hashes.add(full_hash)
+                            if is_legacy:
+                                state_dir_mod.report_legacy_state_dir(cache_dir.parent)
 
     metrics.end("sync.get_local_cache_hashes", _t)
     return hashes
@@ -135,12 +140,18 @@ def _get_file_hash_from_stages(
 
     from pivot.cli import helpers as cli_helpers
 
+    # Stage names come from the configured stages directory and its 0.5.2 counterpart; each lock
+    # is read through StageLock, which finds a stage's lock where it is, one stage at a time.
     stages_dir = lock.get_stages_dir(state_dir)
-    if not stages_dir.exists():
-        return None
+    stage_names = set[str]()
+    for scanned_dir in (stages_dir, state_dir_mod.legacy_stages_dir_for(stages_dir)):
+        if scanned_dir is not None and scanned_dir.is_dir():
+            stage_names.update(
+                lock_file.relative_to(scanned_dir).with_suffix("").as_posix()
+                for lock_file in scanned_dir.rglob("*.lock")
+            )
 
-    for lock_file in stages_dir.rglob("*.lock"):
-        stage_name = lock_file.relative_to(stages_dir).with_suffix("").as_posix()
+    for stage_name in sorted(stage_names):
         try:
             stage_info = cli_helpers.get_stage(stage_name)
             non_cached_paths = {
@@ -407,8 +418,8 @@ async def _push_async(
     items = list[tuple[pathlib.Path, str]]()
     skipped_non_file = 0
     for hash_ in status["local_only"]:
-        cache_path = cache.get_cache_path(files_dir, hash_)
-        if cache_path.is_file():
+        cache_path = cache.resolve_cache_object_path(files_dir, hash_)
+        if cache_path is not None and cache_path.is_file():
             items.append((cache_path, hash_))
         else:
             skipped_non_file += 1

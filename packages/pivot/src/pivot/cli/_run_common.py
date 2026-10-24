@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import logging
 import sys
@@ -611,7 +612,11 @@ def run_tui_with_engine(
         except Exception:
             logger.debug("Event poller stopped", exc_info=True)
 
-    engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
+    # The engine thread runs in this context, so the state-directory warnings it reports belong
+    # to this invocation (and stay silent under --quiet), as on the main thread.
+    engine_thread = threading.Thread(
+        target=contextvars.copy_context().run, args=(engine_thread_target,), daemon=True
+    )
     poller_thread = threading.Thread(
         target=poller_thread_target, name=POLLER_THREAD_NAME, daemon=True
     )

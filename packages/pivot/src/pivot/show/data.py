@@ -14,6 +14,7 @@ import pandas
 import tabulate
 
 from pivot import config, loaders
+from pivot.storage import cache
 from pivot.types import (
     ChangeType,
     DataDiffResult,
@@ -559,14 +560,10 @@ def restore_data_from_cache(
     if not _HASH_PATTERN.fullmatch(file_hash.lower()):
         return None
 
-    cache_dir = config.get_cache_dir() / "files"
-    cached_path = cache_dir / file_hash[:2] / file_hash[2:]
+    cache_dir = config.locate_cache_dir() / "files"
+    cached_path = cache.resolve_cache_object_path(cache_dir, file_hash)
 
-    # Prevent symlink escape attacks
-    if cached_path.is_symlink():
-        return None
-
-    if not cached_path.exists():
+    if cached_path is None:
         return None
 
     # Create temp file with same extension

@@ -6,6 +6,7 @@ import boto3
 import xxhash
 from moto.server import ThreadedMotoServer
 
+from pivot import project
 from pivot.remote import keys, storage, sync
 from pivot.storage import cache, state
 
@@ -31,6 +32,8 @@ def test_pull_rejects_downloaded_bytes_that_do_not_match_cache_hash(
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     expected_hash = xxhash.xxh64(b"expected content").hexdigest()
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     cache_dir = tmp_path / ".pivot" / "cache"
     state_dir = tmp_path / ".pivot"
     server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)

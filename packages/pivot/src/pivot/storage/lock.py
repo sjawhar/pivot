@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, TypeGuard, cast, override
 import yaml
 
 from pivot import exceptions, path_policy, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache
 from pivot.types import (
     ArtifactIdentity,
@@ -48,24 +49,39 @@ _VALID_VARIANT_NAME = re.compile(r"[a-zA-Z0-9_.-]+")
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 
-STAGES_REL_PATH = ".pivot/stages"
+
+def stages_rel_path(state_dir: pathlib.Path, root: pathlib.Path) -> str:
+    """Return the git-relative directory holding lock files."""
+    return (state_dir / "stages").resolve().relative_to(root.resolve()).as_posix()
 
 
 def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
-    """Return the stages directory for lock files.
-
-    Lock files are stored in .pivot/stages/ (git-tracked) rather than
-    .pivot/cache/stages/ so they can be versioned for reproducibility.
-    """
+    """Return the state directory's git-tracked lock file directory."""
     return state_dir / "stages"
+
+
+def resolve_stage_lock_path(stages_dir: pathlib.Path, stage_name: str) -> pathlib.Path:
+    """Return an existing stage lock, falling back to the matching 0.5.2 lock once."""
+    primary_path = stages_dir / f"{stage_name}.lock"
+    if primary_path.exists():
+        return primary_path
+    legacy_stages_dir = state_dir_mod.legacy_stages_dir_for(stages_dir)
+    if legacy_stages_dir is None:
+        return primary_path
+    legacy_path = legacy_stages_dir / f"{stage_name}.lock"
+    if legacy_path.exists():
+        state_dir_mod.report_legacy_state_dir(stages_dir.parent)
+        return legacy_path
+    return primary_path
 
 
 def stage_name_error(name: str) -> str | None:
     """Return why ``name`` cannot name a lock file, or None if it can.
 
     This is the single rule for stage, pipeline and variant names. A name is a relative path
-    of non-empty segments under ``.pivot/stages``: no leading or doubled ``/``, and no ``.``
-    or ``..`` segment, so the lock file can never land outside that directory.
+    of non-empty segments under the state directory's ``stages`` directory: no leading or
+    doubled ``/`, and no ``.`` or ``..`` segment, so the lock file can never land outside that
+    directory.
     """
     if not name or not _VALID_STAGE_NAME.fullmatch(name):
         return "use only letters, digits and the characters _ @ . / -"
@@ -357,6 +373,7 @@ class StageLock:
 
     stage_name: str
     path: pathlib.Path
+    stages_dir: pathlib.Path
 
     def __init__(self, stage_name: str, stages_dir: pathlib.Path) -> None:
         """Initialize a stage lock for the given stage in stages_dir."""
@@ -364,12 +381,14 @@ class StageLock:
         if reason is not None:
             raise ValueError(f"Invalid stage name {stage_name!r}: {reason}")
         self.stage_name = stage_name
+        self.stages_dir = stages_dir
         self.path = stages_dir / f"{stage_name}.lock"
 
     def read(self) -> LockData | None:
-        """Read lock file, converting storage format to internal format."""
+        """Read the configured lock, using its legacy location only on a primary miss."""
+        path = resolve_stage_lock_path(self.stages_dir, self.stage_name)
         try:
-            with open(self.path) as f:
+            with open(path) as f:
                 data: object = yaml.load(f, Loader=yaml_config.Loader)
             if not is_lock_data(data):
                 error = lock_data_error(data)
@@ -377,19 +396,17 @@ class StageLock:
                 if isinstance(error, UnsafeLockPath):
                     logger.warning(
                         "Lock file %s failed validation: %s; treating it as missing",
-                        self.path,
+                        path,
                         error,
                     )
                 else:
-                    logger.debug(
-                        "Lock file %s failed validation; treating it as missing", self.path
-                    )
+                    logger.debug("Lock file %s failed validation; treating it as missing", path)
                 return None
             return _convert_from_storage_format(data, stage_name=self.stage_name)
         except FileNotFoundError:
             return None  # Normal case - lock doesn't exist yet
         except (UnicodeDecodeError, yaml.YAMLError) as e:
-            logger.warning("Failed to parse lock file %s: %s", self.path, e)
+            logger.warning("Failed to parse lock file %s: %s", path, e)
             return None
 
     def write(self, data: LockData) -> None:

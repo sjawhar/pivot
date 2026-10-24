@@ -191,6 +191,17 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         raise click.UsageError("--verbose and --quiet are mutually exclusive")
     ctx.obj = CliContext(verbose=verbose, quiet=quiet)
     _setup_logging(verbose, quiet)
+    # One invocation reads the config once: its state-directory record and the merged config
+    # both start afresh, so an embedder's next invocation sees edits made in between. Like the
+    # CLI's other warnings about project files, the state-directory warnings give way to
+    # --quiet, and each invocation reports each problem once.
+    if not ctx.resilient_parsing:
+        from pivot import state_dir as state_dir_mod
+        from pivot.config import io as config_io
+
+        token = state_dir_mod.begin_invocation(report=not quiet)
+        ctx.call_on_close(lambda: state_dir_mod.end_invocation(token))
+        config_io.clear_config_cache()
 
 
 def main() -> None:

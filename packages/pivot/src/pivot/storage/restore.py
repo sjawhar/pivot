@@ -10,6 +10,7 @@ import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
 from pivot.types import HashInfo
@@ -97,12 +98,28 @@ def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | None:
 def get_lock_data_from_revision(
     stage_name: str, rev: str, state_dir: pathlib.Path
 ) -> StorageLockData | None:
-    """Read and parse lock file for a stage from a git revision."""
-    stages_dir = lock.get_stages_dir(state_dir)
-    rel_path = str(stages_dir.relative_to(project.get_project_root()) / f"{stage_name}.lock")
-    content = git.read_file_from_revision(rel_path, rev)
-    if content is None:
+    """Read a stage lock from a revision, including a matching 0.5.2 lock location."""
+    root = project.get_project_root()
+    try:
+        stages_dir = lock.stages_rel_path(state_dir, root)
+    except ValueError:
+        stages_dir = None
+    if stages_dir is not None:
+        content = git.read_file_from_revision(f"{stages_dir}/{stage_name}.lock", rev)
+        if content is not None:
+            return _parse_lock_data_from_bytes(content)
+
+    legacy_stages_dir = ".pivot/stages"
+    if stages_dir == legacy_stages_dir:
         return None
+    content = git.read_file_from_revision(f"{legacy_stages_dir}/{stage_name}.lock", rev)
+    if content is None:
+        if stages_dir is None:
+            raise exceptions.ConfigError(
+                "core.state_dir is outside the project, so lock files are not in git"
+            ) from None
+        return None
+    state_dir_mod.report_legacy_state_dir(state_dir)
     return _parse_lock_data_from_bytes(content)
 
 
@@ -267,8 +284,8 @@ def restore_file(
         should_try_cache = True
         if "manifest" not in output_hash:
             file_hash = output_hash["hash"]
-            cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-            should_try_cache = cached_path.exists()
+            cached_path = cache.resolve_cache_object_path(cache_dir / "files", file_hash)
+            should_try_cache = cached_path is not None
 
         if should_try_cache:
             try:

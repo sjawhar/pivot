@@ -37,10 +37,10 @@ Rules for `pipeline.py`:
 - Errors in the block (unsupported argument types, wrong arity) are collected
   and reported together when the block exits.
 
-`Pipeline(name, root=None)` takes the pipeline name. A pipeline always keeps its
-lock files and state in the project's `.pivot/` and its outputs in the project's
-`data/`, so `root` may only be the project root (the top-most directory that
-contains `.pivot/`) or omitted; discovery refuses any other `root`.
+`Pipeline(name, root=None)` takes the pipeline name. A pipeline keeps its lock files and state in
+the project's configured state directory and its outputs in the project's `data/`, so `root` may
+only be the project root (the top-most directory that contains `.pivot/`) or omitted; discovery
+refuses any other `root`.
 
 ### Where Pivot looks
 
@@ -105,9 +105,9 @@ variant and a full name overrides one (see [Parameters](parameters.md)).
 
 ## Several Pipelines
 
-Pipeline names must be unique within a project. A pipeline's name is the
-directory of its lock files (`.pivot/stages/<pipeline>/`) and outputs
-(`data/<pipeline>/`), so two pipelines with one name would share both.
+Pipeline names must be unique within a project. A pipeline's name is the directory of its lock
+files (`<state dir>/stages/<pipeline>/`) and outputs (`data/<pipeline>/`), so two pipelines with
+one name would share both.
 `pivot repro --all` refuses two `pipeline.py` files that declare the same
 name, and names both files.
 
@@ -149,9 +149,37 @@ itself.
 
 ## State and Cache Layout
 
+`core.state_dir` selects the state directory and defaults to `.pivot`. The `.pivot/` marker stays
+at the project root and holds the project configuration.
+
+A state directory belongs to one project. Set `core.state_dir` in the project's own
+`.pivot/config.yaml`: a value in the global config is ignored, with a warning. Never point two
+projects at the same directory, including with an absolute path. They would share lock files
+and overwrite each other's records of what ran, so each would see the other's stages as stale.
+
+`config get core.state_dir` shows the stored configuration value. It does not resolve the state
+directory, create anything, or warn when that stored value is unusable. `config list` likewise
+does not resolve state; it displays a validated merged configuration. As in Pivot 0.5.2, a
+non-string `core.state_dir` makes `config list` fail in one line that names the key and its
+expected string type. A command that reads or writes state does resolve it. If
+`.pivot/config.yaml` cannot be read, or its `core.state_dir` cannot be used or created as a
+writable, searchable directory (including a read-only directory), that command prints one
+warning naming the file and the problem. Pivot creates a configured state directory on its first
+write. Every state-using command that Pivot 0.5.2 ran keeps its exit code and uses the default
+`.pivot`; a state-using command that 0.5.2 failed still fails in one error line. The exception
+is a hand-edited empty value: `show` returns 0 because it reads the retained `.pivot` run
+history, and `history` reports that same history. `--quiet` silences the warning.
+
+When a project created by Pivot 0.5.2 sets `core.state_dir`, Pivot reads a stage lock missing
+from the configured directory, and its cached objects, from `.pivot` until the state is moved.
+Pivot warns once per command and directs new writes to the configured state directory; move the
+tracked locks with `git mv .pivot/stages "<state dir>/stages"`.
+
 ```
 <project_root>/
   .pivot/
+    config.yaml
+  <state dir>/
     cache/files/       # Content-addressable cache (shared across pipelines)
     stages/<pipeline>/ # Per-stage lock files (commit these)
     state.lmdb/        # LMDB database (hashes, generations, run cache)

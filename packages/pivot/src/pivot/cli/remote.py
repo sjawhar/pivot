@@ -102,8 +102,9 @@ def push(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = config.get_cache_dir()
-    state_dir = config.get_state_dir()
+    # A dry run only reads, so it creates no state.
+    cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
+    state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
@@ -134,7 +135,7 @@ def push(
     # Remote hash tracking is project-level (not per-stage), so use the
     # project-level StateDB regardless of --all mode.
     with (
-        state.StateDB(config.get_state_dir()) as state_db,
+        state.StateDB(state_dir) as state_db,
         cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
     ):
         result = transfer.push(
@@ -191,8 +192,9 @@ def fetch(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = config.get_cache_dir()
-    state_dir = config.get_state_dir()
+    # A dry run only reads, so it creates no state.
+    cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
+    state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
@@ -218,7 +220,7 @@ def fetch(
         return
 
     with (
-        state.StateDB(config.get_state_dir()) as state_db,
+        state.StateDB(state_dir) as state_db,
         cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
     ):
         result = transfer.pull(
@@ -291,8 +293,9 @@ def pull(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    cache_dir = config.get_cache_dir()
-    state_dir = config.get_state_dir()
+    # A dry run only reads, so it creates no state.
+    cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
+    state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
@@ -327,7 +330,7 @@ def pull(
 
     # Step 1: Fetch from remote to cache
     with (
-        state.StateDB(config.get_state_dir()) as state_db,
+        state.StateDB(state_dir) as state_db,
         cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
     ):
         fetch_result = transfer.pull(
