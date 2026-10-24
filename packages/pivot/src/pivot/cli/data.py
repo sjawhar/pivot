@@ -174,7 +174,9 @@ def get(
       pivot get --rev v1.0 model.pkl -o old.pkl   # Get file to alternate location
       pivot get --rev abc123 train                # Get all outputs from stage
     """
-    cache_dir = config.get_cache_dir()
+    # Located, not created: each write creates the state it needs where it writes (the restore
+    # lock, the remote-fallback cache write), so a target that is skipped creates nothing.
+    cache_dir = config.locate_cache_dir()
 
     checkout_modes = (
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
@@ -193,7 +195,7 @@ def get(
             cli_decorators.store_pipeline_in_context(pipeline)
     all_stages = {} if pipeline is None else cli_helpers.get_all_stages()
     proj_root = project.get_project_root()
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     stage_targets = dict[str, restore.StageTarget]()
     for target in targets:
         resolved = cli_targets.resolve_cli_target(target, all_stages)

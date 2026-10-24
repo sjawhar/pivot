@@ -345,9 +345,13 @@ def restore_file(
                     path=path_str,
                     message=f"Error: {dest_path} - failed to write from remote: {e}",
                 )
-            # Cache the fetched content for future use (best effort). An object already there
-            # is kept: another process may be linking it (cache.publish_cache_object).
+            # Cache the fetched content for future use (best effort). `get` located its cache
+            # without creating anything; this is its one write into the cache, so the creating
+            # getter prepares the cache here: the state directory, and a custom `cache.dir`
+            # inside it, each with its ignore file. An object already there is kept: another
+            # process may be linking it (cache.publish_cache_object).
             try:
+                config.get_cache_dir()
                 cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
                 with cache.staged_cache_file(cached_path) as staged:
                     staged.write_bytes(remote_content)

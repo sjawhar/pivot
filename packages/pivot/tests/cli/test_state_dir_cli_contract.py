@@ -499,22 +499,9 @@ with Pipeline("test") as pipeline:
 """
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ("diff", "--no-tui", "data/test/table.jsonl"),
-        ("diff", "--json", "data/test/table.jsonl"),
-        ("push", "--dry-run"),
-        ("push", "--dry-run", "test/table"),
-        ("fetch", "--dry-run", "test/table"),
-        ("pull", "--dry-run", "test/table"),
-    ],
-    ids=["diff", "diff-json", "push-n", "push-n-stage", "fetch-n-stage", "pull-n-stage"],
-)
-def test_a_read_only_command_creates_no_configured_state_dir(
-    tmp_path: pathlib.Path, args: tuple[str, ...]
-) -> None:
-    """With a hand-edited `core.state_dir` that does not exist yet, 0.5.2 creates nothing here."""
+def _committed_table_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """A reproduced, committed project with a remote, then a hand-edited `core.state_dir:
+    altstate` that does not exist yet."""
     home = tmp_path / "home"
     root = tmp_path / "project"
     root.mkdir()
@@ -534,18 +521,75 @@ def test_a_read_only_command_creates_no_configured_state_dir(
     _ok(helpers.run_cli(root, home, "git", "add", "-A"))
     _ok(helpers.run_cli(root, home, "git", "commit", "-qm", "base"))
     (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: altstate\n{remotes}")
+    return home, root
+
+
+def _marker_entries(root: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(path.relative_to(root) for path in (root / ".pivot").rglob("*"))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("diff", "--no-tui", "data/test/table.jsonl"),
+        ("diff", "--json", "data/test/table.jsonl"),
+        ("push", "--dry-run"),
+        ("push", "--dry-run", "test/table"),
+        ("fetch", "--dry-run", "test/table"),
+        ("pull", "--dry-run", "test/table"),
+    ],
+    ids=["diff", "diff-json", "push-n", "push-n-stage", "fetch-n-stage", "pull-n-stage"],
+)
+def test_a_read_only_command_creates_no_configured_state_dir(
+    tmp_path: pathlib.Path, args: tuple[str, ...]
+) -> None:
+    """With a hand-edited `core.state_dir` that does not exist yet, 0.5.2 creates nothing here."""
+    home, root = _committed_table_project(tmp_path)
     table = root / "data" / "test" / "table.jsonl"
     table.unlink()
     table.write_text('{"v": 99}\n')
-    marker_entries = sorted(path.relative_to(root) for path in (root / ".pivot").rglob("*"))
+    marker_entries = _marker_entries(root)
 
     result = helpers.run_pivot(root, home, *args)
 
     _ok(result)
     assert not (root / "altstate").exists(), sorted((root / "altstate").rglob("*"))
-    assert sorted(path.relative_to(root) for path in (root / ".pivot").rglob("*")) == (
-        marker_entries
-    )
+    assert _marker_entries(root) == marker_entries
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["data/raw/input.txt", "data/test/table.jsonl", "test/table"],
+    ids=["input", "output", "stage"],
+)
+def test_get_of_a_present_target_creates_no_configured_state_dir(
+    tmp_path: pathlib.Path, target: str
+) -> None:
+    """`get` skips a target that is already there, and creates nothing, as 0.5.2 and main do."""
+    home, root = _committed_table_project(tmp_path)
+    marker_entries = _marker_entries(root)
+
+    result = helpers.run_pivot(root, home, "get", "--rev", "HEAD", target)
+
+    _ok(result)
+    assert "Skipped" in result.stdout, result.stdout
+    assert not (root / "altstate").exists(), sorted((root / "altstate").rglob("*"))
+    assert _marker_entries(root) == marker_entries
+
+
+def test_get_that_restores_creates_the_configured_state_dir_where_it_writes(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Control: a restore takes its lock in the configured directory, which gets its ignore file."""
+    home, root = _committed_table_project(tmp_path)
+    (root / "data" / "raw" / "input.txt").unlink()
+
+    result = helpers.run_pivot(root, home, "get", "--rev", "HEAD", "data/raw/input.txt")
+
+    _ok(result)
+    assert (root / "data" / "raw" / "input.txt").read_text() == "input\n"
+    assert (root / "altstate" / ".gitignore").is_file()
+    assert (root / "altstate" / "locks").is_dir()
 
 
 _METRIC_PIPELINE = """\
