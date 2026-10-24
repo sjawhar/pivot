@@ -76,7 +76,13 @@ class Scheduler:
         stage_resources: dict[str, dict[str, int]],
         resource_capacity: dict[str, int],
     ) -> None:
-        """Reset and configure scheduler state for a new execution."""
+        """Reset and configure scheduler state for a new execution.
+
+        Raises:
+            ValueError: ``stage_resources`` does not name exactly the stages of
+                ``execution_order``, a capacity is below 1, a request is below 1, or a stage
+                requests a resource with no capacity.
+        """
         self._resource_counts.clear()
         self._upstream_unfinished.clear()
         self._downstream.clear()
@@ -101,6 +107,18 @@ class Scheduler:
         for resource, capacity in self._resource_capacity.items():
             if capacity <= 0:
                 raise ValueError(f"Resource {resource!r} has non-positive capacity {capacity}")
+
+        for stage_name, request in stage_resources.items():
+            for resource, amount in request.items():
+                if amount <= 0:
+                    msg = (
+                        f"Stage {stage_name!r} requests non-positive amount {amount} "
+                        + f"of resource {resource!r}"
+                    )
+                    raise ValueError(msg)
+                if resource not in self._resource_capacity:
+                    msg = f"Stage {stage_name!r} requests resource {resource!r} with no capacity"
+                    raise ValueError(msg)
 
         for stage_name in execution_order:
             if graph is not None:

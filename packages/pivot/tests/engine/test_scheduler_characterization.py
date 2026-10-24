@@ -497,6 +497,42 @@ def test_initialize_validates_stage_resource_consistency() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("stage_resources", "resource_capacity", "match"),
+    [
+        pytest.param(
+            {"A": {"cpu": 1}}, {"cpu": 0}, "non-positive capacity 0", id="capacity of zero"
+        ),
+        pytest.param({"A": {"cpu": 0}}, {"cpu": 2}, "non-positive amount 0", id="request of zero"),
+        pytest.param(
+            {"A": {"cpu": 1, "gpu": -1}},
+            {"cpu": 2, "gpu": 1},
+            "non-positive amount -1",
+            id="negative request",
+        ),
+        pytest.param(
+            {"A": {"cpu": 1, "gpu": 1}},
+            {"cpu": 2},
+            "resource 'gpu' with no capacity",
+            id="resource with no capacity",
+        ),
+    ],
+)
+def test_initialize_rejects_resources_no_engine_run_builds(
+    stage_resources: dict[str, dict[str, int]], resource_capacity: dict[str, int], match: str
+) -> None:
+    """The Engine gives every resource a positive capacity and every request a positive
+    amount, so initialize() rejects anything else instead of failing later in the run."""
+    scheduler = Scheduler()
+    with pytest.raises(ValueError, match=match):
+        scheduler.initialize(
+            execution_order=["A"],
+            graph=None,
+            stage_resources=stage_resources,
+            resource_capacity=resource_capacity,
+        )
+
+
 def test_cascade_failure_blocks_all_transitive_downstream() -> None:
     """When A fails, both B (direct) and C (transitive) get BLOCKED."""
     scheduler = _helper_init_scheduler(
