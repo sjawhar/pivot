@@ -570,9 +570,15 @@ def test_reusable_worker_target_uses_requested_width_when_executor_is_broken(
     assert executor_core._reusable_worker_target(2, kill_workers=False) == 2
 
 
-def test_argument_changed_singleton_gets_a_queue_that_fits() -> None:
+def test_argument_changed_singleton_gets_a_queue_that_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A live reusable executor narrowed by its last submission must still get the requested
-    width when loky replaces it because only the idle timeout changed."""
+    width when loky replaces it because only the idle timeout changed.
+
+    loky sizes a call queue from the CPU count. With one CPU, a queue built for one worker holds
+    3 calls, too few for a run of 16, so a wrongly sized replacement fails on any machine."""
+    monkeypatch.setenv("LOKY_MAX_CPU_COUNT", "1")
     width = 16
     executor_core.restart_workers(width, idle_timeout_s=None)
     before = executor_core.create_executor(width, idle_timeout_s=None)
