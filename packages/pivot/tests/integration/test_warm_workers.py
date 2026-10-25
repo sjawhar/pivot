@@ -35,6 +35,7 @@ from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
+    import concurrent.futures
     from collections.abc import Callable
     from multiprocessing.process import BaseProcess
 
@@ -296,7 +297,7 @@ async def test_consecutive_runs_in_one_engine_reuse_the_same_worker(
 
 def test_smaller_run_does_not_shrink_warm_worker_pool() -> None:
     """A one-stage run retains the N warmed workers a later full run needs."""
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     pool = WorkerPool()
     try:
         pool.start(max_workers=3)
@@ -343,7 +344,7 @@ def test_deserialization_import_change_restarts_before_next_run(
     monkeypatch.syspath_prepend(str(helpers))
     module = importlib.import_module(module_name)
     marker.unlink()
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     pool = WorkerPool()
     try:
         pool.start(max_workers=1)
@@ -377,7 +378,7 @@ def test_deleted_worker_module_restarts_instead_of_reusing_cached_code(
     helper = helpers / f"{module_name}.py"
     helper.write_text('def value() -> str:\n    return "alpha"\n')
     monkeypatch.syspath_prepend(str(helpers))
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     pool = WorkerPool()
     try:
         pool.start(max_workers=1)
@@ -411,7 +412,7 @@ def test_edit_that_keeps_file_timestamps_restarts_before_next_run(
     helper.write_text('def value() -> str:\n    return "alpha"\n')
     monkeypatch.syspath_prepend(str(helpers))
     module = importlib.import_module(module_name)
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     target = str(helper.resolve())
     frozen = os.stat(target)
     real_stat = os.stat
@@ -488,7 +489,7 @@ def _helper_cmdline(pid: int) -> str:
 def test_unreachable_manager_is_replaced_between_runs(failure: str) -> None:
     """A manager that died, or whose socket a temp cleaner removed, is replaced at the next run
     instead of ending the session."""
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     pool = WorkerPool()
     try:
         pool.start(max_workers=1)
@@ -566,6 +567,138 @@ def test_killed_pivot_leaves_no_child_processes(
                 os.kill(pid, signal.SIGKILL)
 
 
+# Each stage starts a child in its own session, so only the stage's cleanup or Pivot can stop
+# it, then holds its worker until it is stopped; its cleanup stops the child and says it ran.
+_HOLDING_PIPELINE = """\
+import os
+import pathlib
+import subprocess
+import time
+
+from pivot.compose import Pipeline, stage
+
+MARKERS = {markers!r}
+
+
+def _hold(name):
+    child = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    (pathlib.Path(MARKERS) / (name + ".pid")).write_text(str(os.getpid()))
+    try:
+        time.sleep(300)
+    finally:
+        child.kill()
+        child.wait()
+        (pathlib.Path(MARKERS) / (name + ".cleaned")).write_text("")
+    return name
+
+
+@stage
+def hold_a() -> str:
+    return _hold("hold_a")
+
+
+@stage
+def hold_b() -> str:
+    return _hold("hold_b")
+
+
+with Pipeline("warm") as pipeline:
+    hold_a()
+    hold_b()
+"""
+
+
+class _RaiseWhileStagesHold:
+    """Event source that fails mid-run: once every holding stage runs on a worker, it records
+    the pool's workers with every process they started, then raises."""
+
+    _markers: pathlib.Path
+    _stages: list[str]
+    _eng: engine_mod.Engine
+    workers: set[int]
+    processes: dict[int, str]
+
+    def __init__(self, markers: pathlib.Path, stages: list[str], eng: engine_mod.Engine) -> None:
+        self._markers = markers
+        self._stages = stages
+        self._eng = eng
+        self.workers = set[int]()
+        self.processes = dict[int, str]()
+
+    async def run(self, send: MemoryObjectSendStream[InputEvent]) -> None:
+        del send
+        with anyio.fail_after(60):
+            while not all((self._markers / f"{stage}.pid").exists() for stage in self._stages):
+                await anyio.sleep(0.05)
+        self.workers = _helper_pool_worker_pids(self._eng._worker_pool)
+        table = _helper_process_table()
+        self.processes = {pid: table[pid][1] for pid in self.workers}
+        for pid in self.workers:
+            self.processes.update(_helper_descendants(pid))
+        raise RuntimeError("source failed mid-run")
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the /proc process table")
+async def test_exception_exit_stops_running_workers_before_hard_cancel_returns(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An Engine that exits on an exception hard-cancels its pool. Each running stage is
+    stopped so its cleanup runs, and every worker, with each process it started, is gone once
+    ``hard_cancel`` returns: none is left to loky's later kill or to a new parent such as init."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _HOLDING_PIPELINE.format(markers=str(markers)))
+    stages = ["hold_a", "hold_b"]
+    source: _RaiseWhileStagesHold | None = None
+    survivors = list[dict[int, str]]()
+    hard_cancel = WorkerPool.hard_cancel
+
+    def checking_hard_cancel(self: WorkerPool) -> None:
+        hard_cancel(self)
+        # hard_cancel waits for the workers it stops; allow one 0.1 s poll after it returns.
+        assert source is not None
+        deadline = time.monotonic() + 0.1
+        while True:
+            table = _helper_process_table()
+            alive = {
+                pid: started
+                for pid, started in source.processes.items()
+                if pid in table and table[pid][1] == started
+            }
+            if not alive or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        survivors.append(alive)
+
+    monkeypatch.setattr(WorkerPool, "hard_cancel", checking_hard_cancel)
+    try:
+        with pytest.raises(ExceptionGroup) as raised:
+            async with engine_mod.Engine(pipeline=pipeline) as eng:
+                source = _RaiseWhileStagesHold(markers, stages, eng)
+                eng.add_source(
+                    sources.OneShotSource(stages=None, force=True, reason="test", max_workers=2)
+                )
+                eng.add_source(source)
+                await eng.run(exit_on_completion=False)
+        assert raised.group_contains(RuntimeError, match="source failed mid-run")
+        assert len(survivors) == 1, "the exception exit should hard-cancel the pool"
+        assert source is not None
+        stage_pids = {int((markers / f"{stage}.pid").read_text()) for stage in stages}
+        assert stage_pids <= source.workers, "each stage should run on one of the pool's workers"
+        assert not survivors[0], "processes outlived hard_cancel:\n" + "\n".join(
+            f"{pid}: {_helper_cmdline(pid)}" for pid in survivors[0]
+        )
+        uncleaned = [stage for stage in stages if not (markers / f"{stage}.cleaned").exists()]
+        assert not uncleaned, f"the stop cut off the cleanup of {uncleaned}"
+    finally:
+        for alive in survivors:
+            for pid in alive:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+
+
 @pytest.mark.anyio
 async def test_watch_reload_restarts_workers_after_user_code_changes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -629,7 +762,7 @@ with Pipeline("warm") as pipeline:
     value()
 """,
     )
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     output = _helper_output_path(root, pipeline, "warm/value")
     recorder = _Recorder()
     requests = _RunRequests()
@@ -680,7 +813,7 @@ with Pipeline("warm") as pipeline:
     value()
 """,
     )
-    executor_core.restart_workers(1, 1)
+    executor_core.restart_workers(1, idle_timeout_s=None)
     output = _helper_output_path(root, pipeline, "warm/value")
     recorder = _Recorder()
     requests = _RunRequests()
@@ -757,10 +890,118 @@ with Pipeline("width") as pipeline:
     right(shared)
 """
 
-# Imported by every Python process the command starts: each loky worker records when it started,
-# and the pivot process records when it starts the Textual TUI. With PIVOT_TEST_CHECKS_AFTER_TUI
-# set, the pivot process's engine checks the tracked files only once the TUI has mounted, the
-# order a busy machine sometimes gives.
+
+_RESOURCE_LIMITED_PIPELINE = """\
+import time
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def source() -> str:
+    return "source"
+
+
+@stage(resources={"local_grade": 1})
+def grade(value: str) -> str:
+    time.sleep(0.5)
+    return value
+
+
+with Pipeline("resources") as pipeline:
+    shared = source()
+    for index in range(4):
+        with pipeline.variant(str(index)):
+            grade(shared)
+"""
+
+# The parent sleeps longer than the one-shot idle timeout; the fan of four becomes ready only
+# when it finishes.
+_LONG_PARENT_FAN_PIPELINE = """\
+import time
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def source() -> str:
+    time.sleep({parent_s!r})
+    return "source"
+
+
+@stage
+def fan(value: str) -> str:
+    return value
+
+
+with Pipeline("fan") as pipeline:
+    shared = source()
+    for index in range(4):
+        with pipeline.variant(str(index)):
+            fan(shared)
+"""
+
+
+# The parent fails while an independent stage outlives the idle timeout and then counts the
+# live workers; workers reserved for the failed parent's fan must be gone by then. A worker
+# that loses loky's process-lock race when its timeout fires waits one more timeout (loky
+# `_process_worker`), so the bystander allows up to two.
+_FAILED_PARENT_FAN_PIPELINE = """\
+import os
+import pathlib
+import time
+
+import psutil
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def source() -> str:
+    time.sleep({parent_s!r})
+    raise RuntimeError("parent fails")
+
+
+@stage
+def fan(value: str) -> str:
+    return value
+
+
+def _live_workers() -> int:
+    count = 0
+    for child in psutil.Process(os.getppid()).children():
+        try:
+            if "loky.backend.popen_loky_posix" in " ".join(child.cmdline()):
+                count += 1
+        except psutil.NoSuchProcess:  # exited (or a zombie) between listing and inspecting
+            continue
+    return count
+
+
+@stage
+def bystander() -> str:
+    time.sleep({wait_s!r})
+    deadline = time.monotonic() + {timeout_s!r}
+    live = _live_workers()
+    while live != 1 and time.monotonic() < deadline:
+        time.sleep(0.1)
+        live = _live_workers()
+    pathlib.Path({live_path!r}).write_text(str(live))
+    return "bystander"
+
+
+with Pipeline("fan") as pipeline:
+    shared = source()
+    for index in range(4):
+        with pipeline.variant(str(index)):
+            fan(shared)
+    bystander()
+"""
+
+
+# Imported by every Python process the command starts: each loky worker records when it started.
+# With PIVOT_TEST_CHECKS_AFTER_TUI set, the pivot process's engine checks the tracked files only
+# once the TUI has mounted, the order a busy machine sometimes gives.
 _WORKER_LOG_HOOK = """\
 import os
 import sys
@@ -774,42 +1015,35 @@ def _log(event):
 
 if sys.orig_argv[1:3] == ["-m", "loky.backend.popen_loky_posix"]:
     _log("worker")
-elif len(sys.orig_argv) > 1 and os.path.basename(sys.orig_argv[1]) == "pivot":
-    from pivot.cli import _run_common
+elif (
+    len(sys.orig_argv) > 1
+    and os.path.basename(sys.orig_argv[1]) == "pivot"
+    and os.environ.get("PIVOT_TEST_CHECKS_AFTER_TUI")
+):
+    import threading
 
-    _run_tui_with_engine = _run_common.run_tui_with_engine
+    import anyio
+    import pivot_tui.run
+    from pivot.engine import engine
 
-    def _logged_run_tui_with_engine(*args, **kwargs):
-        _log("tui")
-        return _run_tui_with_engine(*args, **kwargs)
+    _mounted = threading.Event()
+    _on_mount = pivot_tui.run.PivotApp.on_mount
+    _orchestrate_execution = engine.Engine._orchestrate_execution
 
-    _run_common.run_tui_with_engine = _logged_run_tui_with_engine
+    async def _marked_on_mount(self):
+        _mounted.set()
+        await _on_mount(self)
 
-    if os.environ.get("PIVOT_TEST_CHECKS_AFTER_TUI"):
-        import threading
+    async def _orchestrate_execution_after_tui(self, *args, **kwargs):
+        # The run checks the tracked files first, so it checks them after the TUI started.
+        with anyio.fail_after(60):
+            while not _mounted.is_set():
+                await anyio.sleep(0.01)
+        _log("held")
+        return await _orchestrate_execution(self, *args, **kwargs)
 
-        import anyio
-        import pivot_tui.run
-        from pivot.engine import engine
-
-        _mounted = threading.Event()
-        _on_mount = pivot_tui.run.PivotApp.on_mount
-        _orchestrate_execution = engine.Engine._orchestrate_execution
-
-        async def _marked_on_mount(self):
-            _mounted.set()
-            await _on_mount(self)
-
-        async def _orchestrate_execution_after_tui(self, *args, **kwargs):
-            # The run checks the tracked files first, so it checks them after the TUI started.
-            with anyio.fail_after(60):
-                while not _mounted.is_set():
-                    await anyio.sleep(0.01)
-            _log("held")
-            return await _orchestrate_execution(self, *args, **kwargs)
-
-        pivot_tui.run.PivotApp.on_mount = _marked_on_mount
-        engine.Engine._orchestrate_execution = _orchestrate_execution_after_tui
+    pivot_tui.run.PivotApp.on_mount = _marked_on_mount
+    engine.Engine._orchestrate_execution = _orchestrate_execution_after_tui
 """
 
 
@@ -827,14 +1061,10 @@ def _helper_logging_env(tmp_path: pathlib.Path) -> tuple[dict[str, str], pathlib
     return env, worker_log
 
 
-def _helper_started_workers(worker_log: pathlib.Path, command: list[str]) -> int:
-    """Count the workers the command started, requiring each to start before any TUI did."""
+def _helper_started_workers(worker_log: pathlib.Path) -> int:
+    """Count workers that the command started."""
     events = [line.split() for line in worker_log.read_text().splitlines()]
-    workers = [float(at) for event, at in events if event == "worker"]
-    tuis = [float(at) for event, at in events if event == "tui"]
-    late = [at for at in workers if tuis and at > tuis[0]]
-    assert not late, f"{' '.join(command)}: {len(late)} of {len(workers)} workers started late"
-    return len(workers)
+    return sum(event == "worker" for event, _at in events)
 
 
 def _helper_pivot(root: pathlib.Path, env: dict[str, str], *args: str) -> str:
@@ -899,28 +1129,162 @@ def test_repro_runs_a_chain_of_stages_on_one_worker(
     assert len(pids) == 1, f"the chain ran on {len(pids)} workers: {sorted(pids)}"
 
 
+def test_resource_capacity_bounds_workers_started(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path.resolve() / "project"
+    _helper_project(root, monkeypatch, _RESOURCE_LIMITED_PIPELINE)
+    _helper_configure_workers(root, 8)
+    config_path = root / ".pivot" / "config.yaml"
+    config_path.write_text(config_path.read_text() + "resources:\n  local_grade: 2\n")
+    env, worker_log = _helper_logging_env(tmp_path)
+
+    _helper_pivot(root, env, "repro")
+
+    assert _helper_started_workers(worker_log) == 2
+
+
+# `prep` feeds `middle`, which feeds two tasks: the run is two stages wide only once `middle`
+# finishes.
+_LATE_FAN_PIPELINE = """\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def prep() -> str:
+    return "prep"
+
+
+@stage
+def middle(value: str) -> str:
+    return value
+
+
+@stage
+def task(value: str) -> str:
+    return value
+
+
+with Pipeline("late_fan") as pipeline:
+    shared = middle(prep())
+    for index in range(2):
+        with pipeline.variant(str(index)):
+            task(shared)
+"""
+
+
+@pytest.mark.anyio
+async def test_first_submission_starts_the_runs_resource_width(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run's first submission asks for the run's resource width of workers, not only for
+    its first stage's direct consumers, so a wave two stages later does not wait for a worker
+    to start."""
+    root = tmp_path.resolve() / "project"
+    pipeline = _helper_project(root, monkeypatch, _LATE_FAN_PIPELINE)
+    targets = list[int]()
+    submit = WorkerPool.submit
+
+    def recording_submit(
+        self: WorkerPool,
+        fn: Callable[..., Any],
+        /,
+        *args: object,
+        prestart_target: int = 0,
+        **kwargs: object,
+    ) -> concurrent.futures.Future[Any]:
+        targets.append(prestart_target)
+        return submit(self, fn, *args, prestart_target=prestart_target, **kwargs)
+
+    monkeypatch.setattr(WorkerPool, "submit", recording_submit)
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_source(sources.OneShotSource(stages=None, force=True, reason="test", max_workers=8))
+        await eng.run(exit_on_completion=True)
+
+    assert len(targets) == 4, f"the run submitted {len(targets)} of its 4 stages"
+    assert targets[0] == 2, f"the first submission asked for {targets[0]} workers, not 2"
+
+
+@pytest.mark.slow
+def test_fan_after_parent_longer_than_idle_timeout_starts_each_worker_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker started for a fan while its parent runs must not exit idle before the fan is
+    ready and then be started again: the run starts no more workers than the fan has stages."""
+    root = tmp_path.resolve() / "project"
+    parent_s = executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S + 5
+    _helper_project(root, monkeypatch, _LONG_PARENT_FAN_PIPELINE.format(parent_s=parent_s))
+    _helper_configure_workers(root, 8)
+    env, worker_log = _helper_logging_env(tmp_path)
+
+    _helper_pivot(root, env, "repro")
+
+    started = _helper_started_workers(worker_log)
+    assert started <= 4, (
+        f"a four-stage fan after a {parent_s:g} s parent started {started} workers: workers "
+        "started while the parent ran exited idle and were started again for the fan"
+    )
+
+
+@pytest.mark.slow
+def test_workers_reserved_for_a_failed_parent_exit_within_the_idle_timeout(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers pre-started for a fan whose parent fails become ordinary idle workers and exit."""
+    root = tmp_path.resolve() / "project"
+    live_path = tmp_path / "live-workers"
+    parent_s = executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S / 2 + 1
+    wait_s = parent_s + executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S + 5
+    _helper_project(
+        root,
+        monkeypatch,
+        _FAILED_PARENT_FAN_PIPELINE.format(
+            parent_s=parent_s,
+            wait_s=wait_s,
+            timeout_s=executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S,
+            live_path=str(live_path),
+        ),
+    )
+    _helper_configure_workers(root, 8)
+    env, _ = _helper_logging_env(tmp_path)
+
+    proc = subprocess.run(
+        [str(pathlib.Path(sys.executable).parent / "pivot"), "repro", "--keep-going"],
+        cwd=root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert live_path.read_text() == "1", (
+        f"{live_path.read_text()} workers were alive {wait_s:g} s after the parent failed; "
+        "only the one running the bystander should be"
+    )
+
+
 @pytest.mark.parametrize(
-    ("max_workers", "command", "workers"),
+    ("max_workers", "command", "worker_limit"),
     [
         pytest.param(8, ["repro"], 3, id="repro"),
-        pytest.param(8, ["repro", "--tui"], 3, id="repro-tui-prewarm"),
+        pytest.param(8, ["repro", "--tui"], 3, id="repro-tui"),
         pytest.param(2, ["repro"], 2, id="repro-configured-cap"),
-        # `pivot run` orders left and right after source, so two of the three run at once.
+        # `pivot run` orders left and right after source, so no more than two run at once.
         pytest.param(8, ["run", "--force", "source", "left", "right"], 2, id="run"),
-        pytest.param(
-            8, ["run", "--tui", "--force", "source", "left", "right"], 2, id="run-tui-prewarm"
-        ),
+        pytest.param(8, ["run", "--tui", "--force", "source", "left", "right"], 2, id="run-tui"),
     ],
 )
-def test_command_starts_as_many_workers_as_stages_can_run_at_once(
+def test_command_starts_no_more_workers_than_stages_that_can_run(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     max_workers: int,
     command: list[str],
-    workers: int,
+    worker_limit: int,
 ) -> None:
-    """A command starts one worker per stage that can run at once, up to the configured worker
-    count; a TUI's pre-warm starts the same workers its engine then uses."""
+    """A command starts no workers beyond the stages its scheduler admits."""
     root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _WIDTH_PIPELINE)
     _helper_configure_workers(root, max_workers)
@@ -928,8 +1292,8 @@ def test_command_starts_as_many_workers_as_stages_can_run_at_once(
 
     _helper_pivot(root, env, *command)
 
-    started = _helper_started_workers(worker_log, command)
-    assert started == workers, f"{' '.join(command)} started {started} workers"
+    started = _helper_started_workers(worker_log)
+    assert started <= worker_limit, f"{' '.join(command)} started {started} workers"
 
 
 # `lone` reads a tracked input, so the run can restore it from the cache.
@@ -948,27 +1312,23 @@ _TRACKED_WIDTH_PIPELINE = _WIDTH_PIPELINE.replace(
         ),
     ],
 )
-def test_tui_starts_its_workers_before_the_tui_when_a_tracked_input_is_restored(
+def test_tui_restores_tracked_input_when_missing(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, command: list[str]
 ) -> None:
-    """The pre-warm restores a missing tracked input before it sizes the pool, as the engine
-    does, so no worker starts after Textual does."""
+    """The engine restores a missing tracked input before the stage that consumes it runs."""
     root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     _helper_configure_workers(root, 8)
-    env, worker_log = _helper_logging_env(tmp_path)
+    env, _ = _helper_logging_env(tmp_path)
     tracked = root / "data" / "raw" / "x.txt"
     tracked.parent.mkdir(parents=True)
     tracked.write_text("tracked")
     _helper_pivot(root, env, "track", "data/raw/x.txt")
     tracked.unlink()
-    worker_log.unlink(missing_ok=True)
 
     _helper_pivot(root, env, *command)
 
     assert (root / "data" / "width" / "lone.txt").read_text() == "tracked"
-    started = _helper_started_workers(worker_log, command)
-    assert started == 3, f"{' '.join(command)} started {started} workers"
 
 
 @pytest.mark.parametrize(
@@ -993,8 +1353,7 @@ def test_tui_warns_once_about_a_changed_tracked_file_whenever_the_engine_checks_
     order: dict[str, str],
 ) -> None:
     """A tracked file edited since `pivot track` is reported once, outside the TUI's screen,
-    whether the engine checks it before the TUI starts or while the TUI runs. The pre-warm only
-    restores missing tracked files; checking the others stays the engine's."""
+    whether the engine checks it before the TUI starts or while the TUI runs."""
     root = tmp_path.resolve() / "project"
     _helper_project(root, monkeypatch, _TRACKED_WIDTH_PIPELINE)
     env, worker_log = _helper_logging_env(tmp_path)
@@ -1349,12 +1708,10 @@ with Pipeline("broken") as pipeline:
 """
 
 
-def test_repro_tui_prewarm_leaves_out_the_stages_a_keep_going_run_skips(
+def test_repro_tui_runs_stages_available_with_keep_going(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Across all pipelines with keep-going, the engine leaves out stages with a missing
-    dependency; the TUI's pre-warm leaves them out too, so it starts only the workers the
-    engine then uses."""
+    """Across all pipelines with keep-going, the run leaves out stages with a missing input."""
     root = tmp_path.resolve() / "project"
     for name, source in [("width", _WIDTH_PIPELINE), ("broken", _BROKEN_PIPELINE)]:
         (root / name).mkdir(parents=True)
@@ -1368,8 +1725,7 @@ def test_repro_tui_prewarm_leaves_out_the_stages_a_keep_going_run_skips(
     _helper_pivot(root, env, *command)
 
     assert (root / "data" / "width" / "left.txt").read_text() == "source left"
-    started = _helper_started_workers(worker_log, command)
-    assert started == 3, f"{' '.join(command)} started {started} workers"
+    assert _helper_started_workers(worker_log) <= 3
 
 
 _CHAIN_OF_THREE_PIPELINE = """\
@@ -1398,31 +1754,29 @@ with Pipeline("warm") as pipeline:
 """
 
 
-def _helper_live_worker_pids() -> set[int]:
-    """The worker processes of Pivot's reusable loky executor."""
-    reusable_executor = importlib.import_module("loky.reusable_executor")
-    return set(cast("Any", reusable_executor)._executor._processes)
+def _helper_pool_worker_pids(pool: WorkerPool | None) -> set[int]:
+    """The worker processes of the executor ``pool`` holds."""
+    assert pool is not None and pool._executor is not None, "the pool holds no executor"
+    return set(pool._executor._processes)
 
 
 @pytest.mark.anyio
-async def test_watch_reload_restarts_the_workers_the_next_run_uses(
+async def test_watch_reload_restarts_its_runs_width_of_warm_workers(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A reload that narrows the pipeline restarts as many workers as the warm pool holds, so
-    the run after it starts no other worker."""
+    """A reload replaces its workers with the narrowed run's width before that run begins."""
     root = tmp_path.resolve() / "project"
     pipeline = _helper_project(root, monkeypatch, _THREE_PID_PIPELINE)
     recorder = _Recorder()
     restarted = list[set[int]]()
     after_run = set[int]()
-    restart_workers = executor_core.restart_workers
+    restart = WorkerPool.restart
 
-    def recording_restart(width: int, max_workers: int | None = None) -> int:
-        workers = restart_workers(width, max_workers)
-        restarted.append(_helper_live_worker_pids())
-        return workers
+    def recording_restart(self: WorkerPool, *, max_workers: int) -> None:
+        restart(self, max_workers=max_workers)
+        restarted.append(_helper_pool_worker_pids(self))
 
-    monkeypatch.setattr(executor_core, "restart_workers", recording_restart)
+    monkeypatch.setattr(WorkerPool, "restart", recording_restart)
     async with engine_mod.Engine(pipeline=pipeline) as eng:
         eng.add_sink(recorder)
         eng.add_source(sources.FilesystemSource(watch_paths=[root], debounce_ms=50))
@@ -1436,11 +1790,11 @@ async def test_watch_reload_restarts_the_workers_the_next_run_uses(
                 start=first_idle,
             )
             await recorder.wait_for(_helper_engine_state(EngineState.IDLE), start=reload)
-            after_run = _helper_live_worker_pids()
+            after_run = _helper_pool_worker_pids(eng._worker_pool)
             tg.cancel_scope.cancel()
 
-    assert [len(pids) for pids in restarted] == [3], "the reload restarts the warm pool's size"
-    assert after_run == restarted[0], "the run after the reload started other workers"
+    assert [len(pids) for pids in restarted] == [1], "a chain's reload starts one warm worker"
+    assert after_run == restarted[0], "the narrowed run should reuse the restarted worker"
 
 
 @pytest.mark.anyio

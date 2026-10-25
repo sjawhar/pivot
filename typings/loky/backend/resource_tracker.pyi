@@ -1,0 +1,3 @@
+"""Type stubs for loky's resource tracker."""
+
+def ensure_running() -> None: ...

@@ -1901,7 +1901,11 @@ def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
 
 
 def test_repro_watch_ctrl_c_exits_while_a_reload_import_hangs(tmp_path: pathlib.Path) -> None:
-    """Ctrl-C stops plain watch at once even while an edited pipeline.py's import never returns."""
+    """Ctrl-C stops plain watch while an edited pipeline.py's import is still blocked.
+
+    The import blocks on a FIFO that the test opens for writing only after watch exits, so the
+    import cannot finish before the exit: watch exits while it is blocked or not at all. The
+    30 s limit stops a hang. It is not a speed requirement."""
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
     (project / ".pivot").mkdir()
@@ -1926,8 +1930,10 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     pipeline_py = project / "pipeline.py"
     pipeline_py.write_text(source)
     output_path = project / "data" / "test" / "process.txt"
-    # Outside the project, so neither the marker nor the logs are watch events
+    # Outside the project, so neither the markers nor the logs are watch events
     importing = tmp_path / "importing"
+    release = tmp_path / "release"
+    os.mkfifo(release)
     stdout_path = tmp_path / "watch.stdout"
     stderr_path = tmp_path / "watch.stderr"
     env = os.environ.copy()
@@ -1958,7 +1964,7 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
         pipeline_py.write_text(
             source
             + f"\npathlib.Path({str(importing)!r}).write_text('importing')\n"
-            + "import time\ntime.sleep(600)\n"
+            + f"pathlib.Path({str(release)!r}).read_text()\n"
         )
         for _ in range(300):
             if importing.exists():
@@ -1968,15 +1974,23 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
 
         proc.send_signal(signal.SIGINT)
         try:
-            proc.wait(timeout=2)
+            proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            pytest.fail(f"watch was still running 2 s after Ctrl-C\n{_logs()}")
+            pytest.fail(f"watch did not exit on Ctrl-C during the blocked import\n{_logs()}")
         assert proc.returncode == 0, _logs()
         assert "Watch mode stopped." in stdout_path.read_text(), _logs()
     finally:
+        # Unblock the import only now: an exit before this point happened while it was blocked.
+        try:
+            writer = os.open(release, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:  # ENXIO: no reader, so no import is still waiting
+            pass
+        else:
+            os.close(writer)
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        release.unlink()
 
 
 def _watch_missing_input_pipeline(*, missing: bool) -> str:
