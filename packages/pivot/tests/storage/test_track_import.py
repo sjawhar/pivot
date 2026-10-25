@@ -101,7 +101,7 @@ def test_discover_import_pvt_files(tmp_path: pathlib.Path) -> None:
         },
     )
 
-    result = track.discover_import_pvt_files(tmp_path, ())
+    result = track.discover_import_pvt_files(tmp_path)
 
     assert len(result) == 1, "Should find only import files"
     imported_path = str(tmp_path / "imported.csv")

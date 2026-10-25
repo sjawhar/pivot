@@ -217,8 +217,7 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     stage_outputs = {} if pipeline is None else _get_all_stage_outputs()
 
     # Discover existing .pvt files
-    stages = () if pipeline is None else cli_helpers.get_all_stages().values()
-    existing_tracked = track_mod.discover_pvt_files(project_root, stages)
+    existing_tracked = track_mod.discover_pvt_files(project_root)
 
     for path_str in paths:
         result = _track_single_path(

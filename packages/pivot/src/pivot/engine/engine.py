@@ -1083,12 +1083,10 @@ class Engine:
 
         # Verify tracked files before building DAG
         project_root = project.get_project_root()
-        all_stages = self._get_all_stages()
-        executor_core.verify_tracked_files(
-            project_root, all_stages.values(), checkout_missing=checkout_missing
-        )
+        executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
         # Build bipartite graph (single source of truth)
+        all_stages = self._get_all_stages()
         graph = engine_graph.build_graph(all_stages)
         pipeline = self._pipeline
         if pipeline is None:

@@ -1,10 +1,7 @@
-import os
 import pathlib
-from collections.abc import Iterator
 
 import pytest
 
-from pivot import compose
 from pivot.exceptions import SecurityValidationError
 from pivot.storage import track
 
@@ -226,7 +223,7 @@ def test_discover_pvt_files_finds_files(tmp_path: pathlib.Path) -> None:
         {"path": "model.pkl", "hash": "hash2", "size": 200},
     )
 
-    result = track.discover_pvt_files(tmp_path, ())
+    result = track.discover_pvt_files(tmp_path)
 
     assert len(result) == 2
     # Keys should be absolute paths to data files
@@ -240,7 +237,7 @@ def test_discover_pvt_files_finds_files(tmp_path: pathlib.Path) -> None:
 
 def test_discover_pvt_files_empty_directory(tmp_path: pathlib.Path) -> None:
     """Empty directory returns empty dict."""
-    result = track.discover_pvt_files(tmp_path, ())
+    result = track.discover_pvt_files(tmp_path)
 
     assert result == {}
 
@@ -255,7 +252,7 @@ def test_discover_pvt_files_skips_invalid(tmp_path: pathlib.Path) -> None:
     # Invalid file
     (tmp_path / "invalid.csv.pvt").write_text("not: valid: yaml: [")
 
-    result = track.discover_pvt_files(tmp_path, ())
+    result = track.discover_pvt_files(tmp_path)
 
     assert len(result) == 1
     assert str(tmp_path / "valid.csv") in result
@@ -278,7 +275,7 @@ def test_discover_pvt_files_with_directory_manifest(tmp_path: pathlib.Path) -> N
         },
     )
 
-    result = track.discover_pvt_files(tmp_path, ())
+    result = track.discover_pvt_files(tmp_path)
 
     assert len(result) == 1
     images_path = str(tmp_path / "images")
@@ -287,54 +284,6 @@ def test_discover_pvt_files_with_directory_manifest(tmp_path: pathlib.Path) -> N
     manifest = result[images_path].get("manifest")
     assert manifest is not None
     assert len(manifest) == 3
-
-
-_WalkEntry = tuple[str, list[str], list[str]]
-
-
-@compose.stage
-def _helper_tree() -> str:
-    return "tree"
-
-
-def test_discover_pvt_files_does_not_enter_outputs_or_state_dirs(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The walk lists no stage output directory and no .git or .pivot directory.
-
-    A stage may write a directory at an output's path (a loader that writes a tree); `pivot
-    track` refuses paths that overlap an output, so nothing tracked lives inside one.
-    """
-    with compose.Pipeline("p", root=tmp_path) as pipeline:
-        _helper_tree()
-    output_dir = tmp_path / "data" / "p" / "_helper_tree.txt"
-    for skipped in (output_dir / "nested", tmp_path / ".git", tmp_path / ".pivot" / "cache"):
-        skipped.mkdir(parents=True)
-        track.write_pvt_file(skipped / "x.csv.pvt", {"path": "x.csv", "hash": "h0", "size": 1})
-    track.write_pvt_file(
-        tmp_path / "data" / "p" / "notes.csv.pvt", {"path": "notes.csv", "hash": "h1", "size": 1}
-    )
-    track.write_pvt_file(
-        tmp_path / "data" / "raw" / "in.csv.pvt", {"path": "in.csv", "hash": "h2", "size": 1}
-    )
-    listed = list[str]()
-    walk = os.walk
-
-    def _recording_walk(top: pathlib.Path, followlinks: bool) -> Iterator[_WalkEntry]:
-        for entry in walk(top, followlinks=followlinks):
-            listed.append(os.path.relpath(entry[0], tmp_path))
-            yield entry
-
-    monkeypatch.setattr(os, "walk", _recording_walk)
-
-    stages = [pipeline.get_stage(name) for name in pipeline.list_stages()]
-    result = track.discover_pvt_files(tmp_path, stages)
-
-    assert sorted(result) == [
-        str(tmp_path / "data" / "p" / "notes.csv"),
-        str(tmp_path / "data" / "raw" / "in.csv"),
-    ]
-    assert sorted(listed) == [".", "data", "data/p", "data/raw"]
 
 
 # Validation

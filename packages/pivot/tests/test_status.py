@@ -216,7 +216,7 @@ def test_tracked_files_clean(set_project_root: pathlib.Path) -> None:
     pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=7)
     track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
 
-    results = status.get_tracked_files_status(set_project_root, ())
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
@@ -236,7 +236,7 @@ def test_tracked_files_modified(set_project_root: pathlib.Path) -> None:
 
     data_file.write_text("modified content")
 
-    results = status.get_tracked_files_status(set_project_root, ())
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
@@ -250,7 +250,7 @@ def test_tracked_files_missing(set_project_root: pathlib.Path) -> None:
     pvt_data = track.PvtData(path="data.txt", hash="abc123", size=100)
     track.write_pvt_file(set_project_root / "data.txt.pvt", pvt_data)
 
-    results = status.get_tracked_files_status(set_project_root, ())
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
@@ -261,7 +261,7 @@ def test_tracked_files_empty(set_project_root: pathlib.Path) -> None:
     """Should return empty list when no tracked files."""
     (set_project_root / ".git").mkdir(exist_ok=True)
 
-    results = status.get_tracked_files_status(set_project_root, ())
+    results = status.get_tracked_files_status(set_project_root)
 
     assert results == []
 
@@ -281,7 +281,7 @@ def test_tracked_directory_clean(set_project_root: pathlib.Path) -> None:
     pvt_data = track.PvtData(path="data", hash=dir_hash["hash"], size=total_size)
     track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
 
-    results = status.get_tracked_files_status(set_project_root, ())
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data"
@@ -304,7 +304,7 @@ def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
 
     (data_dir / "file1.txt").write_text("modified content")
 
-    results = status.get_tracked_files_status(set_project_root, ())
+    results = status.get_tracked_files_status(set_project_root)
 
     assert len(results) == 1
     assert results[0]["path"] == "data"
@@ -333,7 +333,7 @@ def test_tracked_files_progress_callback(set_project_root: pathlib.Path) -> None
     def on_progress(completed: int, total: int) -> None:
         progress_calls.append((completed, total))
 
-    results = status.get_tracked_files_status(set_project_root, (), on_progress)
+    results = status.get_tracked_files_status(set_project_root, on_progress)
 
     assert len(results) == 2
     assert progress_calls == [(1, 2), (2, 2)]

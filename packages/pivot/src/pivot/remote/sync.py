@@ -178,16 +178,14 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
     return track.pvt_to_hash_info(track_data)
 
 
-def _get_tracked_hashes(
-    proj_root: pathlib.Path, all_stages: dict[str, RegistryStageInfo]
-) -> set[str]:
+def _get_tracked_hashes(proj_root: pathlib.Path) -> set[str]:
     """Blob hashes of every `pivot track`-ed file or directory in the project.
 
     Imports are left out: `pivot import` writes the file straight to the workspace, so its
     blob never enters the local cache and push never sends it to this project's remote.
     """
     hashes = set[str]()
-    for pvt_data in track.discover_pvt_files(proj_root, all_stages.values()).values():
+    for pvt_data in track.discover_pvt_files(proj_root).values():
         if track.is_import(pvt_data):
             continue
         hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt_data))
@@ -260,7 +258,7 @@ def get_target_hashes(
                                         hashes |= dep_blobs
                                     continue
                                 if tracked_hashes is None:
-                                    tracked_hashes = _get_tracked_hashes(proj_root, all_stages)
+                                    tracked_hashes = _get_tracked_hashes(proj_root)
                                 hashes |= dep_blobs & tracked_hashes
                         continue
             else:

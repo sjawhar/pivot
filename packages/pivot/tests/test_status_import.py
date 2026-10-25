@@ -54,7 +54,7 @@ def test_status_import_update_available(tmp_path: pathlib.Path, mocker: MockerFi
         ),
     )
 
-    results = status.get_import_status(tmp_path, ())
+    results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
     assert results[0].status is ImportCheckStatus.UPDATE_AVAILABLE
@@ -95,7 +95,7 @@ def test_status_import_up_to_date(tmp_path: pathlib.Path, mocker: MockerFixture)
         ),
     )
 
-    results = status.get_import_status(tmp_path, ())
+    results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
     assert results[0].status is ImportCheckStatus.UP_TO_DATE
@@ -128,7 +128,7 @@ def test_status_import_network_error(tmp_path: pathlib.Path, mocker: MockerFixtu
         new=AsyncMock(side_effect=ConnectionError("Network unreachable")),
     )
 
-    results = status.get_import_status(tmp_path, ())
+    results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
     assert results[0].status is ImportCheckStatus.ERROR

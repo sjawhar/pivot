@@ -92,7 +92,7 @@ def test_discover_import_pvt_files_end_to_end(tmp_path: pathlib.Path) -> None:
         track.PvtData(path="another.csv", hash="hash_another", size=200),
     )
 
-    result = track.discover_import_pvt_files(tmp_path, ())
+    result = track.discover_import_pvt_files(tmp_path)
 
     assert len(result) == 2, f"Expected 2 import files, got {len(result)}: {list(result.keys())}"
     # Verify all results have source

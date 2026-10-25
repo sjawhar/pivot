@@ -78,8 +78,8 @@ def _helper_normalize_path(
 
 def _helper_discover_imports(
     imports: dict[str, PvtData],
-) -> Callable[[pathlib.Path, object], dict[str, PvtData]]:
-    def _discover(root: pathlib.Path, stages: object) -> dict[str, PvtData]:
+) -> Callable[[pathlib.Path], dict[str, PvtData]]:
+    def _discover(root: pathlib.Path) -> dict[str, PvtData]:
         return imports
 
     return _discover

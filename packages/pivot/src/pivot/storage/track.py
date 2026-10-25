@@ -13,13 +13,7 @@ from pivot.storage import cache
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
-    from pivot.registry import RegistryStageInfo
     from pivot.types import DirManifestEntry, HashInfo
-
-# Directories that hold git's or pivot's own state, never a tracked path's .pvt
-_STATE_DIR_NAMES = frozenset({".git", ".pivot"})
 
 # Use union types to avoid type: ignore on fallback assignment
 _Loader: type[yaml.SafeLoader] | type[yaml.CSafeLoader]
@@ -148,31 +142,13 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
     return pvt_path.with_suffix("")
 
 
-def discover_pvt_files(
-    root: pathlib.Path, stages: Iterable[RegistryStageInfo]
-) -> dict[str, PvtData]:
-    """Find all .pvt files under root, return {data_path: PvtData}.
-
-    The walk enters no ``.git`` or ``.pivot`` directory and no output of ``stages``:
-    ``pivot track`` refuses a path that overlaps a stage output, so no .pvt lives inside one,
-    and an output directory can hold far more files than the rest of the project.
-    """
+def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
+    """Find all .pvt files under root, return {data_path: PvtData}."""
     from pivot import project
-    from pivot.storage import store
 
-    outputs = {
-        os.path.normpath(store.relative_output_path(out)) for info in stages for out in info["outs"]
-    }
     result = dict[str, PvtData]()
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        rel_dir = os.path.relpath(dirpath, root)
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if name not in _STATE_DIR_NAMES
-            and os.path.normpath(os.path.join(rel_dir, name)) not in outputs
-        ]
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
         for fname in filenames:
             if not fname.endswith(".pvt"):
                 continue
@@ -196,13 +172,9 @@ def is_import(data: PvtData) -> bool:
     return "source" in data
 
 
-def discover_import_pvt_files(
-    root: pathlib.Path, stages: Iterable[RegistryStageInfo]
-) -> dict[str, PvtData]:
-    """Find all import .pvt files under root (``stages`` as for ``discover_pvt_files``)."""
-    return {
-        path: data for path, data in discover_pvt_files(root, stages).items() if is_import(data)
-    }
+def discover_import_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
+    """Find all import .pvt files under root."""
+    return {path: data for path, data in discover_pvt_files(root).items() if is_import(data)}
 
 
 def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:

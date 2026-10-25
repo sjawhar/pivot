@@ -23,7 +23,6 @@ from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
-    from collections.abc import Iterable
 
     from pivot.engine import types as engine_types
     from pivot.registry import RegistryStageInfo
@@ -452,38 +451,30 @@ def _restore_tracked_file(
     )
 
 
-def restore_missing_tracked_files(
-    project_root: pathlib.Path, stages: Iterable[RegistryStageInfo]
-) -> None:
+def restore_missing_tracked_files(project_root: pathlib.Path) -> None:
     """Restore each tracked file missing from the workspace from the cache.
 
     Files that exist are neither checked nor touched; a file the cache lacks stays missing for
-    ``verify_tracked_files`` to report. ``stages`` are the registered stages, whose outputs the
-    search for .pvt files skips.
+    ``verify_tracked_files`` to report.
     """
     cache_dir = config.get_cache_dir() / "files"
-    for data_path, track_data in track.discover_pvt_files(project_root, stages).items():
+    for data_path, track_data in track.discover_pvt_files(project_root).items():
         path = pathlib.Path(data_path)
         if not path.exists() and _restore_tracked_file(path, track_data, cache_dir):
             logger.info(f"Restored tracked file: {data_path}")
 
 
-def verify_tracked_files(
-    project_root: pathlib.Path,
-    stages: Iterable[RegistryStageInfo],
-    checkout_missing: bool = False,
-) -> None:
+def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
     """Verify all .pvt tracked files exist and warn on hash mismatches.
 
     Args:
         project_root: Project root directory.
-        stages: The registered stages, whose outputs the search for .pvt files skips.
         checkout_missing: If True, restore missing tracked files from cache before validating.
             Only restores files that don't exist - never overwrites existing files.
     """
     from pivot import metrics
 
-    tracked_files = track.discover_pvt_files(project_root, stages)
+    tracked_files = track.discover_pvt_files(project_root)
     if not tracked_files:
         return
 
