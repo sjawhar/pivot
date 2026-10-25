@@ -504,7 +504,7 @@ def checkout(
     )
 
     # Discover tracked files
-    tracked_files = track.discover_pvt_files(project_root)
+    tracked_files = track.discover_pvt_files(project_root, _all_stages_in_context().values())
 
     # Get stage output info from lock files (cached outputs only)
     pipeline = cli_decorators.get_pipeline_from_context()

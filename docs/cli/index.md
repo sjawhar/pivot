@@ -393,7 +393,9 @@ pivot track PATHS... [OPTIONS]
 |--------|-------------|
 | `--force` / `-f` | Overwrite existing .pvt files |
 
-Creates `.pvt` manifest files for tracking files outside of stage outputs.
+Creates `.pvt` manifest files for tracking files outside of stage outputs. A path that overlaps
+a stage output is refused, so a command that loads the pipeline does not look for `.pvt` files
+inside its stage outputs. No command looks inside `.git` or `.pivot` directories.
 
 ---
 

@@ -81,7 +81,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     import networkx as nx
     from networkx import DiGraph
@@ -96,13 +96,13 @@ UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
 
 
 def _discover_tracked_files(
-    allow_missing: bool,
+    allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
     """Discover tracked files for .pvt hash lookup when allow_missing is set."""
     if not allow_missing:
         return None, None
 
-    tracked_files = track.discover_pvt_files(project.get_project_root())
+    tracked_files = track.discover_pvt_files(project.get_project_root(), all_stages.values())
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in tracked_files:
         tracked_trie[pathlib.Path(path).parts] = path
@@ -191,7 +191,7 @@ def get_pipeline_explanations(
 ) -> list[StageExplanation]:
     _t = metrics.start()
     try:
-        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+        tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
         if graph is None:
             graph = engine_graph.build_graph(all_stages)
         stage_graph = engine_graph.get_stage_dag(graph)
@@ -283,7 +283,7 @@ def get_pipeline_status(
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     _t = metrics.start()
     try:
-        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+        tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
         if graph is None:
             graph = engine_graph.build_graph(all_stages)
         stage_graph = engine_graph.get_stage_dag(graph)
@@ -335,15 +335,17 @@ def _explanations_to_status(explanations: list[StageExplanation]) -> list[Pipeli
 
 def get_tracked_files_status(
     project_root: pathlib.Path,
+    stages: Iterable[RegistryStageInfo],
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[TrackedFileInfo]:
     """Get status for all tracked files.
 
     Args:
         project_root: Project root directory.
+        stages: The registered stages, whose outputs the search for .pvt files skips.
         on_progress: Optional callback called with (completed, total) after each file.
     """
-    tracked = track.discover_pvt_files(project_root)
+    tracked = track.discover_pvt_files(project_root, stages)
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
@@ -561,9 +563,11 @@ async def _check_imports_batch(
     return results
 
 
-def get_import_status(project_root: pathlib.Path) -> list[ImportStatusInfo]:
+def get_import_status(
+    project_root: pathlib.Path, stages: Iterable[RegistryStageInfo]
+) -> list[ImportStatusInfo]:
     """Check update status for all imported artifacts concurrently."""
-    import_pvts = track.discover_import_pvt_files(project_root)
+    import_pvts = track.discover_import_pvt_files(project_root, stages)
     if not import_pvts:
         return []
     return asyncio.run(_check_imports_batch(import_pvts, project_root))
