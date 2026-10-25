@@ -23,9 +23,14 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-def _flatten_config(data: dict[str, Any], path: tuple[str, ...] = ()) -> dict[tuple[str, ...], Any]:
-    """Flatten a nested config dict to the key path of each value, as the file nests them."""
-    result = dict[tuple[str, ...], Any]()
+def _flatten_config(data: dict[str, Any], path: tuple[Any, ...] = ()) -> dict[tuple[Any, ...], Any]:
+    """Flatten a nested config dict to the key path of each value, as the file nests them.
+
+    A segment keeps the value YAML read: a mapping key can be an integer, a boolean or null,
+    and the path stays a tuple so a row still says which entry it comes from. `_render_key`
+    renders each segment for display.
+    """
+    result = dict[tuple[Any, ...], Any]()
     for key, value in data.items():
         full_path = (*path, key)
         if isinstance(value, dict) and key != "remotes":
@@ -34,6 +39,11 @@ def _flatten_config(data: dict[str, Any], path: tuple[str, ...] = ()) -> dict[tu
         else:
             result[full_path] = value
     return result
+
+
+def _render_key(path: tuple[Any, ...]) -> str:
+    """Render a key path as the dotted key a reader sees, segment by segment."""
+    return ".".join(str(segment) for segment in path)
 
 
 def _raise_for_non_string_state_dir(data: dict[str, Any]) -> None:
@@ -85,8 +95,8 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         and any(path[:2] == _STATE_DIR_PATH for path in flat)
         and state_dir_mod.report_ignored_global_state_dir()
     )
-    for path in sorted(flat, key=".".join):
-        key = ".".join(path)
+    for path in sorted(flat, key=_render_key):
+        key = _render_key(path)
         value = flat[path]
         if key == "remotes" and isinstance(value, dict):
             remotes_dict = cast("dict[str, str]", value)
