@@ -14,10 +14,17 @@ import subprocess
 import sys
 import types
 
+import cloudpickle
 import pytest
 import yaml
 
-from pivot import decorators, exceptions, fingerprint, fingerprint_by_name  # noqa: F401
+from pivot import (  # noqa: F401
+    decorators,
+    discovery,
+    exceptions,
+    fingerprint,
+    fingerprint_by_name,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -31,7 +38,9 @@ def module_dir(tmp_path: pathlib.Path):
     yield tmp_path
     sys.path.remove(str(tmp_path))
     to_remove = [
-        name for name in sys.modules if name.startswith(("fbn_", "fbn2_", "fbnhelp_", "fbnstage_"))
+        name
+        for name in sys.modules
+        if name.startswith(("fbn_", "fbn2_", "fbnhelp_", "fbnstage_", "rk_"))
     ]
     for name in to_remove:
         del sys.modules[name]
@@ -57,6 +66,15 @@ def _import_fresh(name: str, *, parent_dir: pathlib.Path | None = None) -> types
 def _write(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def _fresh(*names: str) -> types.ModuleType:
+    """Import `names` again from their files, in order, and return the last."""
+    for name in names:
+        sys.modules.pop(name, None)
+    linecache.clearcache()
+    importlib.invalidate_caches()
+    return [importlib.import_module(name) for name in names][-1]
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +160,7 @@ def test_marked_helper_move_to_another_module_reruns(
 ) -> None:
     """Moving a @fingerprint_by_name helper to another module changes the fingerprint.
 
-    Kills mutant m6 (ext: entry drops the module).
+    The `ext:` entry holds the module and the qualified name, so the module is part of it.
     """
     monkeypatch.setattr("pivot.project._project_root_cache", module_dir)
     _write(
@@ -328,8 +346,8 @@ def test_class_is_refused() -> None:
 def test_module_level_lambda_is_refused() -> None:
     """@fingerprint_by_name refuses a module-level lambda.
 
-    Kills mutant m8: the lambda check is separate from the nested-function check.
-    A module-level lambda has qualname '<lambda>' (no '<locals>').
+    The lambda check stands on its own. A module-level lambda has qualname '<lambda>' and no
+    '<locals>', so the nested-function check does not reach it.
     """
     # Create in a module so the lambda is module-level, not nested.
     _ns: dict[str, object] = {}
@@ -358,7 +376,7 @@ def test_nested_function_is_refused() -> None:
 def test_partial_is_refused() -> None:
     """@fingerprint_by_name refuses a functools.partial.
 
-    Kills mutant m9.
+    The mark needs a function to name. A partial is an object that holds one.
     """
 
     def helper():
@@ -375,7 +393,7 @@ def test_partial_is_refused() -> None:
 def test_builtin_is_refused() -> None:
     """@fingerprint_by_name refuses a builtin.
 
-    Kills mutant m9.
+    The mark needs a Python function to name. A builtin has no module-level definition.
     """
     with pytest.raises(TypeError, match="requires a function"):
         decorators.fingerprint_by_name(len)  # pyright: ignore[reportArgumentType]
@@ -384,7 +402,7 @@ def test_builtin_is_refused() -> None:
 def test_callable_instance_is_refused() -> None:
     """@fingerprint_by_name refuses a callable instance.
 
-    Kills mutant m9.
+    The mark needs a function to name. An instance carries state the walk reads instead.
     """
 
     class CallableObj:
@@ -398,7 +416,7 @@ def test_callable_instance_is_refused() -> None:
 def test_method_is_refused(module_dir: pathlib.Path) -> None:
     """@fingerprint_by_name refuses a method defined in a class body.
 
-    Kills C1: qualname != name for methods.
+    A method's qualified name holds its class, so it is not a module-level function.
     """
     _write(
         module_dir / "fbnhelp_method.py",
@@ -464,7 +482,8 @@ def test_wraps_wrapper_over_marked_helper_reruns_on_wrapper_body_change(
     """A functools.wraps wrapper over a marked function: the wrapper body is
     fingerprinted. A change to the wrapper body reruns the stage.
 
-    Kills R1: the mark must not spread through __dict__ copying.
+    `functools.wraps` copies `__dict__`, and so the mark, into the wrapper. The mark names the
+    function it was applied to, so the wrapper stays user code.
     """
     _write(
         module_dir / "fbnhelp_r1.py",
@@ -512,7 +531,7 @@ def test_wraps_wrapper_over_marked_helper_reruns_on_wrapper_body_change(
     mod = _import_fresh("fbnstage_r1")
     fp2 = fingerprint.get_stage_fingerprint(mod.my_stage)
 
-    assert fp1 != fp2, "Wrapper body change must change fingerprint (R1)"
+    assert fp1 != fp2, "Wrapper body change must change fingerprint"
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +544,8 @@ def test_marked_contextmanager_as_class_attribute_cached(
 ) -> None:
     """A marked @contextmanager helper held as a class attribute: body change → cached.
 
-    Kills R2: _user_member_value must check fingerprinted_by_name before unwrapping.
+    The class walk reads each member through `_user_member_value`, which records a marked
+    member by name.
     """
     _write(
         module_dir / "fbnhelp_r2cm.py",
@@ -562,13 +582,14 @@ def test_marked_contextmanager_as_class_attribute_cached(
     mod = _import_fresh("fbnstage_r2cm")
     fp2 = fingerprint.get_stage_fingerprint(mod.my_stage)
 
-    assert fp1 == fp2, "Marked CM as class attribute: body change must stay cached (R2)"
+    assert fp1 == fp2, "Marked CM as class attribute: body change must stay cached"
+    assert fp2["ext:fbnstage_r2cm.Locks.lock"] == "fbnhelp_r2cm.locked", fp2
 
 
 def test_marked_cache_as_class_attribute_cached(module_dir: pathlib.Path) -> None:
     """A marked @functools.cache helper held as a class attribute: body change → cached.
 
-    Kills R2.
+    The class walk records the marked function behind the cache wrapper by name.
     """
     _write(
         module_dir / "fbnhelp_r2ca.py",
@@ -604,7 +625,60 @@ def test_marked_cache_as_class_attribute_cached(module_dir: pathlib.Path) -> Non
     mod = _import_fresh("fbnstage_r2ca")
     fp2 = fingerprint.get_stage_fingerprint(mod.my_stage)
 
-    assert fp1 == fp2, "Marked cache as class attribute: body change must stay cached (R2)"
+    assert fp1 == fp2, "Marked cache as class attribute: body change must stay cached"
+    assert fp2["ext:fbnstage_r2ca.Tools.compute"] == "fbnhelp_r2ca.start", fp2
+
+
+_HELD_HELPER = {
+    "contextmanager": "import contextlib\n\nfrom pivot import fingerprint_by_name\n\n\n"
+    "@fingerprint_by_name\n@contextlib.contextmanager\ndef member():\n    yield 'v1'\n",
+    "cache": "import functools\n\nfrom pivot import fingerprint_by_name\n\n\n"
+    "@fingerprint_by_name\n@functools.cache\ndef member(x):\n    return x * 2\n",
+}
+
+_HELD_STAGE = """\
+from {module} import member
+
+
+class Holder:
+    held = member
+
+
+def my_stage():
+    holder = Holder()
+    return holder.held
+"""
+
+
+@pytest.mark.parametrize("wrapper", list(_HELD_HELPER))
+def test_marked_class_attribute_the_stage_never_names_is_recorded_by_name(
+    module_dir: pathlib.Path, wrapper: str
+) -> None:
+    """A class holds a marked helper, and the stage reads the class without naming the member.
+    The class walk records the member by its module and qualified name, so a move of the helper
+    to another module changes the stage fingerprint."""
+    helper = _HELD_HELPER[wrapper]
+    _write(module_dir / f"fbnhelp_held1_{wrapper}.py", helper)
+    _write(
+        module_dir / f"fbnstage_held_{wrapper}.py",
+        _HELD_STAGE.format(module=f"fbnhelp_held1_{wrapper}"),
+    )
+    names = (f"fbnhelp_held1_{wrapper}", f"fbnstage_held_{wrapper}")
+    first = fingerprint.get_stage_fingerprint(_fresh(*names).my_stage)
+    entry = f"ext:fbnstage_held_{wrapper}.Holder.held"
+    assert first[entry] == f"fbnhelp_held1_{wrapper}.member", first
+
+    _write(module_dir / f"fbnhelp_held2_{wrapper}.py", helper)
+    _write(
+        module_dir / f"fbnstage_held_{wrapper}.py",
+        _HELD_STAGE.format(module=f"fbnhelp_held2_{wrapper}"),
+    )
+    # The rewritten stage file keeps its size and mtime second, so drop its bytecode.
+    shutil.rmtree(module_dir / "__pycache__", ignore_errors=True)
+    moved = (f"fbnhelp_held2_{wrapper}", f"fbnstage_held_{wrapper}")
+    second = fingerprint.get_stage_fingerprint(_fresh(*moved).my_stage)
+    assert second[entry] == f"fbnhelp_held2_{wrapper}.member", second
+    assert first != second, "a move of the marked member kept the stage fingerprint"
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +691,7 @@ def test_marked_helper_as_partial_argument_body_change_cached(
 ) -> None:
     """A marked helper bound as a functools.partial argument: body change → cached.
 
-    Kills mutant m2 (_function_identity keeps body hash for marked function).
+    The identity of a marked function holds its module and qualified name, and no code hash.
     """
     _write(
         module_dir / "fbnhelp_m2.py",
@@ -649,7 +723,7 @@ def test_marked_helper_as_partial_argument_body_change_cached(
     mod = _import_fresh("fbnstage_m2")
     fp2 = fingerprint.get_stage_fingerprint(mod.my_stage)
 
-    assert fp1 == fp2, "Marked helper as partial arg: body change must stay cached (m2)"
+    assert fp1 == fp2, "Marked helper as partial arg: body change must stay cached"
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +929,7 @@ def test_marked_helper_contextmanager_body_change_cached(
 
 
 # =============================================================================
-# CLI acceptance tests (from PR512 tester)
+# CLI acceptance tests
 # =============================================================================
 
 
@@ -984,9 +1058,9 @@ def test_unmarked_decorator_above_a_marked_helper_is_still_fingerprinted(
     tmp_path: pathlib.Path,
 ) -> None:
     """`functools.wraps` copies the function's `__dict__`, and so the mark, onto the user's own
-    wrapper. The wrapper is unmarked user code, but the stage records it by name only: an edit to
-    `doubled` changes the output, and the stage stays cached with the old output. Main records
-    `func:lib.h.helper` and `func:lib.h.helper.<wrapper>` and reruns."""
+    wrapper. The mark names the function it was applied to, so the wrapper stays user code. The
+    manifest holds the wrapper's code and the marked function's name, and an edit to the
+    wrapper reruns the stage with the new output."""
     project = _project(tmp_path, _WRAPS_ABOVE)
     out = project / "data" / "leak" / "s.txt"
     assert _status(_run(project, "repro", "--json"), "leak/s")[0] == "ran"
@@ -1035,11 +1109,10 @@ with Pipeline("m") as pipeline:
 
 
 def test_marked_method_is_refused(tmp_path: pathlib.Path) -> None:
-    """At f54054fc each case loads: `pivot list` exits 0. For the plain method, the class walk
-    then records the method by name only, so a change in what the method calls changes the
-    output and the stage stays cached (head kept `5:17`, main reran and gave `6:17`). Each case
-    must be refused when the module loads, with a message that names the decorator and the
-    method."""
+    """`@fingerprint_by_name` marks a module-level function. A method, a staticmethod and a
+    classmethod are refused when the module loads, with a message that names the decorator and
+    the method. Without the refusal the class walk records the method by name, and a change in
+    what the method calls leaves the stage cached with a stale output."""
     for case, body in _METHOD_CASES.items():
         files = {
             "lib/__init__.py": "",
@@ -1095,10 +1168,9 @@ with Pipeline("tr") as pipeline:
 
 def test_stated_limit_reruns_every_run_and_both_docs_say_so(tmp_path: pathlib.Path) -> None:
     """Code reached only through a marked helper is not walked. When that code imports a user
-    module in its body, the stage warns and reruns on every run. The CLI does this at f54054fc,
-    but the decorator's sections in docs/concepts/fingerprinting.md and
-    skills/writing-pivot-stages/SKILL.md do not say it, and no test covered it. Each section must
-    say that the stage reruns on every (or each) run."""
+    module in its body, the stage warns and reruns on every run. The decorator's sections in
+    docs/concepts/fingerprinting.md and skills/writing-pivot-stages/SKILL.md must say that the
+    stage reruns on every (or each) run."""
     project = _project(tmp_path, _LIMIT)
     for _ in range(2):
         result = _run(project, "repro")
@@ -1149,10 +1221,9 @@ with Pipeline("bi") as pipeline:
 def test_marked_helper_that_imports_a_user_module_dynamically_is_refused(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Main refuses this helper unmarked (`'helper' uses dynamic imports`). At f54054fc the mark
-    skips that check: the stage runs, then warns and reruns on every run. The contract says a
-    marked helper whose body imports a user module is refused. It must be refused, and the
-    message must name the helper."""
+    """A marked helper whose body loads a user module with `importlib.import_module` is
+    refused, as an unmarked one is. The message names the helper. Without the refusal the stage
+    runs, then warns and reruns on every run."""
     project = _project(tmp_path, _DYNAMIC)
     result = _run(project, "repro")
     text = _flat(result.stdout + result.stderr)
@@ -1194,13 +1265,11 @@ with Pipeline("mv") as pipeline:
 
 
 def test_recorded_file_claim_matches_behavior(tmp_path: pathlib.Path) -> None:
-    """The settled contract, the docstring and the fingerprinting guide say a marked helper is
-    recorded by its module, qualified name and file. The manifest entry is
-    `ext:<binding> = <module>.<qualname>` and holds no file: moving `lib/procs.py` to
-    `lib/procs/__init__.py` leaves the stage cached. The text and the behavior must agree: either
-    the move reruns the stage, or neither the docstring nor the guide says the file is recorded.
-    Which of the two is a contract ruling; BET's helpers are outside the project root, where no
-    project-relative file exists."""
+    """A marked helper is recorded by its module and qualified name, and by no file. The
+    manifest entry is `ext:<binding> = <module>.<qualname>`, so moving `lib/procs.py` to
+    `lib/procs/__init__.py` leaves the stage cached. Neither the decorator's docstring nor the
+    fingerprinting guide says that the file is part of the record. BET's helpers sit outside
+    the project root, where no project-relative file exists."""
     project = _project(tmp_path, _MOVE)
     assert _status(_run(project, "repro", "--json"), "mv/s")[0] == "ran"
     package = project / "lib" / "procs"
@@ -1259,10 +1328,10 @@ with Pipeline("params") as pipeline:
 
 
 def test_marked_default_factory_body_edit_keeps_the_stage_cached(tmp_path: pathlib.Path) -> None:
-    """`fingerprint._schema_hash` hashes a field's `default_factory` with `hash_function_ast`,
-    which never asks `fingerprinted_by_name`. At f54054fc an edit to the marked factory's body
-    that keeps its value reruns the stage as "Code changed". The value the factory returns is in
-    the lock's params, so a value change still reruns the stage."""
+    """A pydantic field's `default_factory` is hashed with `hash_function_ast`, which hashes a
+    marked factory by its name. An edit to the marked factory's body that keeps its value
+    leaves the stage cached. The value the factory returns is in the lock's params, so a value
+    change still reruns the stage."""
     project = _project(tmp_path, _FACTORY)
     assert _status(_run(project, "repro", "--json"), "params/join")[0] == "ran"
 
@@ -1370,7 +1439,7 @@ with Pipeline("up") as pipeline:
 }
 
 # The locks `pivot repro` with pivot 0.5.8 (PyPI, CPython 3.13) wrote for `_UPGRADE`, in a
-# fresh tree with a fresh `.pivot/state.lmdb` on pivot-slices. The PR 512 tester recorded them.
+# fresh tree with a fresh `.pivot/state.lmdb`.
 _LOCKS_0_5_8 = {
     "area": """\
 schema_version: 2
@@ -1486,10 +1555,8 @@ outs:
 
 def test_upgrade_from_0_5_8_reruns_nothing(tmp_path: pathlib.Path) -> None:
     """A project with no mark that 0.5.8 ran to completion is all cached under this version,
-    from a fresh `.pivot/state.lmdb`. `test_upgrade_preserves_fingerprint_schema` asserts only
-    that the schema constant is 30 and that keys start with known prefixes, so a change to any
-    unmarked manifest value passes it: the tester showed it passes with `fingerprinted_by_name`
-    also true for every `functools.wraps` wrapper. This test compares whole manifests."""
+    from a fresh `.pivot/state.lmdb`. The comparison is of whole manifests, value by value, so
+    a change to any unmarked manifest value fails it."""
     assert _LOCKS_0_5_8, "the 0.5.8 locks are not recorded"
     project = _project(tmp_path, _UPGRADE)
     first = _statuses(_run(project, "repro", "--json"))
@@ -1502,3 +1569,347 @@ def test_upgrade_from_0_5_8_reruns_nothing(tmp_path: pathlib.Path) -> None:
     shutil.rmtree(project / ".pivot" / "state.lmdb")
     upgraded = _statuses(_run(project, "repro", "--json"))
     assert {status for status, _ in upgraded.values()} == {"cached"}, upgraded
+
+
+# ---------------------------------------------------------------------------------------------
+# A C-level cache wrapper above the mark (PR512_RECHECK.md F1).
+# ---------------------------------------------------------------------------------------------
+
+_CACHE_ABOVE = """\
+import functools
+
+import rk_inner
+from pivot import fingerprint_by_name
+
+
+@{cache}
+@fingerprint_by_name
+def start():
+    return rk_inner.decode() + {body}
+"""
+
+
+@pytest.mark.parametrize("cache", ["functools.cache", "functools.lru_cache(maxsize=8)"])
+def test_cache_wrapper_above_the_mark_records_the_marked_function_by_name(
+    module_dir: pathlib.Path, cache: str
+) -> None:
+    """A cache wrapper above the mark is unmarked user code, so the walk reads it. Through its
+    `__wrapped__` the walk reaches the marked function and records it by name. An edit to the
+    marked function's body, or to a function that only the marked function calls, keeps the
+    stage fingerprint. The manifest holds the name of the marked function and no code."""
+    _write(module_dir / "rk_inner.py", "def decode():\n    return 'i1'\n")
+    _write(module_dir / "rk_cache_h.py", _CACHE_ABOVE.format(cache=cache, body="'b1'"))
+    _write(
+        module_dir / "rk_cache_s.py",
+        "from rk_cache_h import start\n\n\ndef my_stage():\n    return start()\n",
+    )
+    names = ("rk_inner", "rk_cache_h", "rk_cache_s")
+    first = fingerprint.get_stage_fingerprint(_fresh(*names).my_stage)
+
+    _write(module_dir / "rk_cache_h.py", _CACHE_ABOVE.format(cache=cache, body="'b2-changed'"))
+    second = fingerprint.get_stage_fingerprint(_fresh(*names).my_stage)
+    assert first == second, "a body edit of the marked function changed the fingerprint"
+
+    _write(module_dir / "rk_inner.py", "def decode():\n    return 'i2-changed'\n")
+    third = fingerprint.get_stage_fingerprint(_fresh(*names).my_stage)
+    assert second == third, "an edit to a callee of the marked function changed the fingerprint"
+    assert {key: value for key, value in third.items() if not key.startswith("self:")} == {
+        "ext:rk_cache_s.start": "rk_cache_h.start"
+    }, third
+
+
+def test_the_walk_of_a_cache_wrapper_above_the_mark_reads_no_marked_body(
+    module_dir: pathlib.Path,
+) -> None:
+    """`get_stage_fingerprint` of a cache wrapper itself walks what the wrapper reads. The
+    unwrap behind the wrapper stops at the marked function, so the manifest holds the wrapper's
+    own name hash and nothing the marked body reads."""
+    _write(module_dir / "rk_inner.py", "def decode():\n    return 'i1'\n")
+    _write(
+        module_dir / "rk_direct_h.py",
+        _CACHE_ABOVE.format(cache="functools.cache", body="'b1'").replace("rk_cache", "rk_direct"),
+    )
+    wrapper = _fresh("rk_inner", "rk_direct_h").start
+    manifest = fingerprint.get_stage_fingerprint(wrapper)
+    assert [key for key in manifest if not key.startswith("self:")] == [], manifest
+
+
+# ---------------------------------------------------------------------------------------------
+# The canonical form of a value that holds a copy of the mark (PR512_RECHECK.md F2, F3).
+# ---------------------------------------------------------------------------------------------
+
+
+def test_the_canonical_form_of_a_cache_wrapper_above_the_mark_holds_no_address(
+    module_dir: pathlib.Path,
+) -> None:
+    """`functools.cache` copies the marked function's `__dict__`, and so the mark, into its
+    wrapper. The canonical form of a partial that holds the wrapper reads that `__dict__`. The
+    canonical form is the same in every process, so it holds no memory address and no mark."""
+    _write(
+        module_dir / "rk_canon_h.py",
+        "import functools\n\nfrom pivot import fingerprint_by_name\n\n\n"
+        + "@functools.cache\n@fingerprint_by_name\ndef start():\n    return 1\n",
+    )
+    wrapper = _fresh("rk_canon_h").start
+    text = fingerprint._serialize_value_for_hash(functools.partial(print, wrapper))
+    for address in (id(wrapper), id(wrapper.__wrapped__)):
+        assert str(address) not in text, f"the canonical form holds address {address}: {text}"
+    assert fingerprint._BY_NAME_MARK not in text, f"the canonical form holds the mark: {text}"
+
+
+_OBJECT_WITH_MARK = """\
+import functools
+
+from pivot import fingerprint_by_name
+
+
+@fingerprint_by_name
+def start():
+    return 1
+
+
+class Wrapping:
+    def __init__(self, func):
+        functools.update_wrapper(self, func)
+
+
+HELD = Wrapping(start)
+"""
+
+
+def test_the_canonical_form_of_an_object_that_holds_a_copy_of_the_mark_omits_the_mark(
+    module_dir: pathlib.Path,
+) -> None:
+    """`functools.update_wrapper` copies `__dict__`, and so the mark, into any object. The
+    canonical form of a user object reads its `__dict__`, and it leaves the mark out, so no
+    lock holds it."""
+    _write(module_dir / "rk_obj_h.py", _OBJECT_WITH_MARK)
+    held = _fresh("rk_obj_h").HELD
+    assert fingerprint._BY_NAME_MARK in vars(held)
+    text = fingerprint._serialize_value_for_hash(held)
+    assert "rk_obj_h.Wrapping" in text, text
+    assert fingerprint._BY_NAME_MARK not in text, f"the canonical form holds the mark: {text}"
+
+
+_CANON_IN_CHILD = """\
+import functools
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import rk_canon_h
+from pivot import fingerprint
+
+print(fingerprint._serialize_value_for_hash(functools.partial(print, rk_canon_h.start)))
+"""
+
+
+def test_the_canonical_form_of_a_marked_partial_argument_is_the_same_in_two_processes(
+    module_dir: pathlib.Path,
+) -> None:
+    """A lock holds the canonical form of a stage's partial arguments, and a later run reads it
+    in another process. The canonical form of a partial that binds a cache wrapper of a marked
+    helper is the same in both processes."""
+    _write(
+        module_dir / "rk_canon_h.py",
+        "import functools\n\nfrom pivot import fingerprint_by_name\n\n\n"
+        + "@functools.cache\n@fingerprint_by_name\ndef start():\n    return 1\n",
+    )
+    here = fingerprint._serialize_value_for_hash(
+        functools.partial(print, _fresh("rk_canon_h").start)
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", _CANON_IN_CHILD, str(module_dir)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    assert child.stdout.strip() == here, f"{child.stdout.strip()!r} != {here!r}"
+
+
+_CACHED_PARTIAL = {
+    "lib/__init__.py": "",
+    "lib/h.py": """\
+import functools
+
+from pivot import fingerprint_by_name
+
+
+@functools.cache
+@fingerprint_by_name
+def process_start() -> int:
+    return 5
+
+
+def apply(fn) -> int:
+    return fn()
+
+
+RUNNER = functools.partial(apply, process_start)
+""",
+    "pipeline.py": """\
+from pivot import Pipeline, stage
+
+from lib import h
+
+
+@stage
+def s(text: str) -> str:
+    return f"{h.RUNNER()}:{len(text)}\\n"
+
+
+with Pipeline("leak") as pipeline:
+    s(pipeline.input("in.txt", t=str))
+""",
+}
+
+
+def test_a_cached_marked_helper_in_a_partial_argument_is_cached_on_the_next_run(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage reads a `functools.cache` wrapper of a marked helper through a partial argument.
+    The lock records the partial's arguments in canonical form, which is the same in every
+    process. The second run is cached, and an edit to the marked body keeps the stage cached."""
+    project = _project(tmp_path, _CACHED_PARTIAL)
+    assert _status(_run(project, "repro", "--json"), "leak/s")[0] == "ran"
+    assert _status(_run(project, "repro", "--json"), "leak/s") == ("cached", "unchanged")
+
+    helper = project / "lib" / "h.py"
+    helper.write_text(
+        helper.read_text().replace("    return 5\n", "    value = 5\n    return value\n")
+    )
+    assert _status(_run(project, "repro", "--json"), "leak/s") == ("cached", "unchanged")
+    assert (project / "data" / "leak" / "s.txt").read_text() == "5:17\n"
+
+
+# ---------------------------------------------------------------------------------------------
+# The mark names the object it was applied to, also after that object is freed.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_function_that_receives_a_copy_of_the_mark_never_reads_as_marked() -> None:
+    """The mark names the function it was applied to. Another function that receives a copy of
+    the mark's `__dict__` entry (a clone made with `__dict__.update`, or a wrapper whose
+    `__wrapped__` is gone) is a different object. It never reads as marked, also when it takes
+    the memory address of the freed original."""
+    code_marked = compile("def helper():\n    return 1\n", "<rk-marked>", "exec").co_consts[0]
+    code_other = compile("def other():\n    return 2\n", "<rk-other>", "exec").co_consts[0]
+    namespace: dict[str, object] = {"__name__": "rk_copied_mark"}
+    for attempt in range(50):
+        original = decorators.fingerprint_by_name(types.FunctionType(code_marked, namespace))
+        address = id(original)
+        copied = dict(vars(original))
+        del original
+        clone = types.FunctionType(code_other, namespace)
+        clone.__dict__.update(copied)
+        assert not fingerprint.fingerprinted_by_name(clone), (
+            f"attempt {attempt}: a clone with a copied mark reads as marked "
+            f"(at the original's address: {id(clone) == address})"
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+# `__import__` of a user module in a marked body (PR512_RECHECK.md F4).
+# ---------------------------------------------------------------------------------------------
+
+
+def test_dunder_import_of_a_user_module_in_a_marked_body_is_refused(
+    module_dir: pathlib.Path,
+) -> None:
+    """Decoration refuses a marked helper whose body loads a user module with `__import__`, as
+    the decorator's guide, the skill and the PR body say. The message names the helper."""
+    _write(module_dir / "rk_user_mod.py", "VALUE = 1\n")
+    _write(
+        module_dir / "rk_dunder.py",
+        "def helper():\n    return __import__('rk_user_mod').VALUE\n",
+    )
+    mod = _fresh("rk_user_mod", "rk_dunder")
+    with pytest.raises(exceptions.StageDefinitionError, match="helper"):
+        decorators.fingerprint_by_name(mod.helper)
+
+
+# ---------------------------------------------------------------------------------------------
+# A marked helper as a partial argument and as a default value: its identity has no code.
+# ---------------------------------------------------------------------------------------------
+
+_PARTIAL_ARG_HELPER = """\
+from pivot import fingerprint_by_name
+
+
+@fingerprint_by_name
+def process_start():
+    return {body}
+"""
+
+_PARTIAL_ARG_STAGE = """\
+import functools
+
+from rk_arg_h import process_start
+
+
+def _apply(fn):
+    return fn()
+
+
+RUNNER = functools.partial(_apply, process_start)
+
+
+def my_stage(start=process_start):
+    return RUNNER() + start()
+"""
+
+
+def test_a_marked_helper_bound_as_a_partial_argument_keeps_the_fingerprint(
+    module_dir: pathlib.Path,
+) -> None:
+    """A marked helper bound as a `functools.partial` argument, and held as a stage default
+    value, is named by module and qualified name, with no code. An edit to its body keeps the
+    stage fingerprint and the stage's manifest-cache key."""
+    _write(module_dir / "rk_arg_h.py", _PARTIAL_ARG_HELPER.format(body="'v1'"))
+    _write(module_dir / "rk_arg_s.py", _PARTIAL_ARG_STAGE)
+    stage = _fresh("rk_arg_h", "rk_arg_s").my_stage
+    first = fingerprint.get_stage_fingerprint(stage)
+    first_key = fingerprint._make_manifest_cache_key("arg/s", stage)
+
+    _write(module_dir / "rk_arg_h.py", _PARTIAL_ARG_HELPER.format(body="'v2-body-changed'"))
+    stage = _fresh("rk_arg_h", "rk_arg_s").my_stage
+    assert fingerprint.get_stage_fingerprint(stage) == first
+    assert fingerprint._make_manifest_cache_key("arg/s", stage) == first_key
+
+
+# ---------------------------------------------------------------------------------------------
+# Discovery's pickle-by-value decision (PR512_RECHECK.md item 6, mutant mP).
+# ---------------------------------------------------------------------------------------------
+
+
+def test_discovery_pickles_a_module_with_a_marked_helper_by_value_as_without_the_mark(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Discovery chooses pickling by value per project module. A project module that holds a
+    marked helper is pickled by value, as the same module without the mark is."""
+    found = dict[str, bool]()
+    for variant, mark in (("marked", "@fingerprint_by_name\n"), ("plain", "")):
+        root = tmp_path / variant
+        (root / ".git").mkdir(parents=True)
+        (root / ".pivot").mkdir()
+        module = f"rk_pbv_{variant}"
+        (root / f"{module}.py").write_text(
+            "from pivot import fingerprint_by_name\n\n\n"
+            + mark
+            + "def helper() -> str:\n    return 'payload'\n"
+        )
+        (root / "pipeline.py").write_text(
+            "import pathlib\n\n"
+            + "from pivot.compose import Pipeline, stage\n"
+            + f"from {module} import helper\n\n\n"
+            + "@stage\ndef build() -> str:\n    return helper()\n\n\n"
+            + "with Pipeline('test', root=pathlib.Path(__file__).parent) as pipeline:\n"
+            + "    build()\n"
+        )
+        try:
+            assert discovery.discover_pipeline(project_root=root) is not None
+            found[variant] = module in cloudpickle.list_registry_pickle_by_value()
+        finally:
+            discovery.discover_pipeline(project_root=tmp_path / "empty")
+            sys.modules.pop(module, None)
+    assert found == {"marked": True, "plain": True}, found

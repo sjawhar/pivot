@@ -43,15 +43,21 @@ def fingerprint_by_name[F: Callable[..., object]](func: F) -> F:
     and the stage warns and reruns each run. Move that import to the top of
     its module to clear it.
 
+    A `functools.cache` or `functools.lru_cache` decorator above the mark
+    keeps the record by name. A decorator with a body of its own above the
+    mark adds that body to the fingerprint. The marked function below it
+    stays a name.
+
     Soundness is the user's choice: if a marked helper can change a stage's
     output, Pivot does not see the change.
 
     Use bare: ``@fingerprint_by_name``, not ``@fingerprint_by_name()``.
     """
     _validate_fingerprint_by_name_target(func)
-    # Store id(func) so functools.update_wrapper, which copies __dict__,
-    # does not make a user wrapper appear marked.
-    func.__dict__[_FINGERPRINT_BY_NAME_ATTR] = id(func)
+    # Store the function itself. `functools.update_wrapper` copies `__dict__`, so the copy in
+    # a wrapper holds another function, and the wrapper does not read as marked. An identity
+    # check also holds after the function's address is reused.
+    func.__dict__[_FINGERPRINT_BY_NAME_ATTR] = func
     return func
 
 
@@ -100,8 +106,9 @@ def _check_body_at_decoration(func: types.FunctionType) -> None:
     from pivot import exceptions as _exc
     from pivot import fingerprint as _fp
 
-    # The walk's own dynamic-import detector.
-    _fp._check_dynamic_name_access(func, tree)  # pyright: ignore[reportPrivateUsage] - internal API within pivot
+    # The walk's own dynamic-import detector. The walk does not read a marked body, so a
+    # `__import__` call in it is refused here rather than counted on every run.
+    _fp._check_dynamic_name_access(func, tree, dunder_import=True)  # pyright: ignore[reportPrivateUsage] - internal API within pivot
 
     for imp in _fp._body_imports(func, tree):  # pyright: ignore[reportPrivateUsage] - internal API within pivot
         if _fp._is_user_module_name(imp.module):  # pyright: ignore[reportPrivateUsage] - internal API within pivot

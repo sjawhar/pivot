@@ -316,6 +316,11 @@ lambda, a nested function, a `functools.partial`, a helper that imports a
 user module in its body, and a helper that uses `importlib.import_module` or
 `__import__`. Import the module at the top of the helper's file instead.
 
+A `functools.cache` or `functools.lru_cache` decorator above the mark keeps
+the record by name. Pivot reads the wrapper and finds the marked function
+behind it. A decorator with a body of its own above the mark adds that body
+to the fingerprint. The marked function below it stays a name.
+
 A stage cannot carry `@fingerprint_by_name`. Use `@no_fingerprint()` to opt
 a stage out of AST fingerprinting.
 

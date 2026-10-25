@@ -378,8 +378,9 @@ def _function_identity(func: Callable[..., Any], active: tuple[int, ...]) -> Fun
         defaults=[],
     )
     if not is_user_code(func):
-        # An install path outside the project differs from machine to machine.
-        if file is not None and pathlib.PurePath(file).is_absolute():
+        # An install path outside the project differs from machine to machine, and a function
+        # the walk records by name is named by its module and qualified name only.
+        if file is not None and (pathlib.PurePath(file).is_absolute() or _recorded_by_name(func)):
             identity["file"] = None
         return identity
     if id(func) in active:
@@ -764,7 +765,7 @@ def _read_step(owner: Any, step: str) -> Any:
                 module = _body_import_module(arg)
                 return _UNREAD if module is None else module
             case "u":
-                return inspect.unwrap(owner)
+                return inspect.unwrap(owner, stop=fingerprinted_by_name)
             case "pf":
                 return owner.func
             case "pa":
@@ -1166,9 +1167,14 @@ def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
         return None
 
 
-def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
+def _check_dynamic_name_access(
+    func: Callable[..., Any], tree: ast.Module, *, dunder_import: bool = False
+) -> None:
     """Refuse `getattr` with a computed name, `globals()`/`locals()`, and `x.import_module(...)`.
 
+    With `dunder_import`, also refuse `__import__(...)` and `x.__import__(...)`. The
+    `@fingerprint_by_name` decorator asks for this: the walk does not read a marked body, so
+    the worker's stage-import check would count such an import of a user module on every run.
     Other dynamic imports are left to the worker's stage-import check, which makes a stage that
     loads uncovered user code at run time not reusable.
     """
@@ -1189,7 +1195,14 @@ def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> No
                     + "which bypasses fingerprint tracking."
                 )
                 raise exceptions.StageDefinitionError(message)
-        elif isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+            dynamic = dunder_import and node.func.id == "__import__"
+        elif isinstance(node.func, ast.Attribute):
+            dynamic = node.func.attr == "import_module" or (
+                dunder_import and node.func.attr == "__import__"
+            )
+        else:
+            dynamic = False
+        if dynamic:
             message = (
                 f"'{getattr(func, '__qualname__', '?')}' uses dynamic imports. "
                 + "Use static imports instead."
@@ -1233,14 +1246,16 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
             return manifest
         # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
         # getclosurevars rejects it. The function it wraps reads the module values, so walk
-        # that function's globals, nonlocals and defaults instead.
-        unwrapped = inspect.unwrap(func)
+        # that function's globals, nonlocals and defaults instead. The unwrap stops at a marked
+        # function, and the walk does not enter it.
+        unwrapped = inspect.unwrap(func, stop=fingerprinted_by_name)
         if unwrapped is not func and inspect.isfunction(unwrapped):
             _record_read(func, "u")
-            with _walking("u"):
-                for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
-                    if not key.startswith("self:"):
-                        manifest[key] = value
+            if not fingerprinted_by_name(unwrapped):
+                with _walking("u"):
+                    for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
+                        if not key.startswith("self:"):
+                            manifest[key] = value
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
@@ -1409,20 +1424,21 @@ def _written_in_user_source(function: types.FunctionType) -> bool:
 
 
 def _user_member_value(value: Any) -> Any:
-    """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it."""
-    # A @fingerprint_by_name helper held as a class attribute keeps the mark:
-    # the predicate accepts it and the walk records it by name.
-    if fingerprinted_by_name(value):
+    """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it.
+
+    A member the walk records by name (`_recorded_by_name`) is returned before any unwrap, so
+    a marked `@contextmanager` or `@functools.cache` helper held as a class attribute keeps its
+    name in the manifest. Each unwrap below stops at a marked function.
+    """
+    if _recorded_by_name(value):
         return value
     if isinstance(value, functools.partial):
         return cast("Any", value)
     if inspect.isfunction(value):
         if _written_in_user_source(value):
             return value
-        unwrapped = inspect.unwrap(value)
+        unwrapped = inspect.unwrap(value, stop=fingerprinted_by_name)
         if unwrapped is not value and inspect.isfunction(unwrapped):
-            if fingerprinted_by_name(unwrapped):
-                return unwrapped
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
         return _UNREAD
     if isinstance(value, type):
@@ -1430,10 +1446,8 @@ def _user_member_value(value: Any) -> Any:
     if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
-        unwrapped = inspect.unwrap(value)
+        unwrapped = inspect.unwrap(value, stop=fingerprinted_by_name)
         if unwrapped is not value and inspect.isfunction(unwrapped):
-            if fingerprinted_by_name(unwrapped):
-                return unwrapped
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
     if hasattr(value, "__get__") and _is_user_class_instance(value):
         return value
@@ -2449,7 +2463,11 @@ def _process_bound_values(
                 )
     elif callable(value) and (_is_user_class_instance(value) or _carries_instance(value)):
         _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
-    elif callable(value) and inspect.isfunction(inspect.unwrap(value)) and is_user_code(value):
+    elif (
+        callable(value)
+        and inspect.isfunction(inspect.unwrap(value, stop=fingerprinted_by_name))
+        and is_user_code(value)
+    ):
         _process_callable_dependency(binding_ref, value, manifest, visited)
 
 
@@ -2635,10 +2653,7 @@ def _schema_hash(model: type[_PydanticModelProtocol]) -> str:
         default_factory = getattr(field_info, "default_factory", None)
         if type(default).__name__ == "PydanticUndefinedType":
             if default_factory is not None and callable(default_factory):
-                if fingerprinted_by_name(default_factory):
-                    default_hashes[field_name] = _library_name(default_factory)
-                else:
-                    default_hashes[field_name] = hash_function_ast(default_factory)
+                default_hashes[field_name] = hash_function_ast(default_factory)
             continue
         value_str = _serialize_value_for_hash(default)
         default_hashes[field_name] = xxhash.xxh64(value_str.encode()).hexdigest()
@@ -2696,7 +2711,8 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     canonical({field: value})]`, field by field, so a secret inside one reaches that leaf
     rather than the generated repr's mask. An object whose class keeps `object.__repr__`
     (which holds the address) and that has a `__dict__` becomes
-    `[module.qualname, canonical(vars(obj))]`. A compiled regex becomes
+    `[module.qualname, canonical(vars(obj))]`, without the `@fingerprint_by_name` mark that
+    `functools.update_wrapper` copies into a wrapper. A compiled regex becomes
     `["re.Pattern", canonical(pattern), flags]`, so its full pattern is recorded. Other leaves
     keep their `repr`, tagged with their type. A class is a leaf, even a pydantic model class:
     only an instance is dumped.
@@ -2751,7 +2767,10 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
     if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
         inner = (*active, id(value))
-        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value), inner)]
+        attributes = vars(value)
+        if _BY_NAME_MARK in attributes:
+            attributes = {name: item for name, item in attributes.items() if name != _BY_NAME_MARK}
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(attributes, inner)]
     return [type(value).__name__, repr(value)]
 
 
@@ -2912,6 +2931,11 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
             _active_source_map.setdefault(rel_path, digest)
     _t = metrics.start()
     try:
+        # 0. A function the walk records by name (`_recorded_by_name`) gets a hash of that
+        # name. Its body is not read.
+        if _recorded_by_name(func):
+            return xxhash.xxh64(f"by-name:{_library_name(func)}".encode()).hexdigest()
+
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
         # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
         try:
@@ -3107,19 +3131,56 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
     )
 
 
-def fingerprinted_by_name(obj: Any) -> bool:
-    """Whether *obj* carries the ``@pivot.fingerprint_by_name`` mark.
+_BY_NAME_MARK = "__pivot_fingerprint_by_name__"
 
-    The mark stores ``id(obj)`` at decoration time. A ``functools.wraps``
-    wrapper that copies ``__dict__`` carries the id of the original, so this
-    predicate returns False for the wrapper.
+
+def fingerprinted_by_name(obj: Any) -> bool:
+    """Whether `@pivot.fingerprint_by_name` marked `obj` itself.
+
+    The mark is the marked object, in the `__dict__` of that object. `functools.update_wrapper`
+    copies `__dict__` into a wrapper, so the copy in a wrapper holds a different object, and the
+    wrapper is not marked.
     """
     try:
-        d: dict[str, Any] = object.__getattribute__(obj, "__dict__")
-        stored = d.get("__pivot_fingerprint_by_name__")
-        return stored is not None and stored == id(obj)
+        namespace: Mapping[str, Any] = object.__getattribute__(obj, "__dict__")
+        return namespace.get(_BY_NAME_MARK) is obj
     except AttributeError:
         return False
+
+
+def _recorded_by_name(obj: Any) -> bool:
+    """Whether the walk records `obj` by its module and qualified name for a mark.
+
+    That is a marked function, a method bound to one, and a library wrapper object without
+    Python code of its own (functools.cache, lru_cache) whose `__wrapped__` chain reaches a
+    marked function through such wrappers only. `inspect.getsource` and the walk of a C-level
+    wrapper follow `__wrapped__` into the marked function, so such a wrapper gets the record of
+    the marked function. A Python function on the chain (a functools.wraps decorator) or an
+    instance of a user class is user code: the walk records its code.
+    """
+    if fingerprinted_by_name(obj):
+        return True
+    if inspect.ismethod(obj):
+        return _recorded_by_name(obj.__func__)
+    if inspect.isfunction(obj) or isinstance(obj, (type, types.ModuleType)):
+        return False
+    if is_user_code(type(obj)):
+        return False
+    seen = {id(obj)}
+    current: object = obj
+    while True:
+        try:
+            namespace: Mapping[str, Any] = object.__getattribute__(current, "__dict__")
+        except AttributeError:
+            return False
+        current = namespace.get("__wrapped__")
+        if current is None or id(current) in seen:
+            return False
+        if fingerprinted_by_name(current):
+            return True
+        if inspect.isfunction(current) or isinstance(current, (type, types.ModuleType)):
+            return False
+        seen.add(id(current))
 
 
 def is_user_code(obj: Any) -> bool:
@@ -3147,9 +3208,9 @@ def is_user_code(obj: Any) -> bool:
 
 def _is_user_code_impl(obj: Any) -> bool:
     """Internal implementation of is_user_code."""
-    # A @fingerprint_by_name helper is treated as library code: the walk
+    # A function the walk records by name (`_recorded_by_name`) is library code: the walk
     # records it by name and never descends into its body.
-    if fingerprinted_by_name(obj):
+    if _recorded_by_name(obj):
         return False
 
     module = _get_module(obj)

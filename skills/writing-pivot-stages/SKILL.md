@@ -222,6 +222,10 @@ decorator accepts module-level functions and `functools.wraps` /
 helper that imports a user module in its body, and a helper that uses
 `importlib.import_module` or `__import__`.
 
+A `functools.cache` or `functools.lru_cache` decorator above the mark keeps
+the record by name. A decorator with a body of its own above the mark adds
+that body to the fingerprint. The marked function below it stays a name.
+
 Pivot does not walk code that only a marked helper calls. If that code
 imports a user module in its body, the run-time check counts the import,
 and the stage warns and reruns each run. Move that import to the top of its
