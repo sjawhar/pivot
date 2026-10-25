@@ -274,8 +274,10 @@ def restore_file(
             message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
         )
 
-    # Ensure parent directory exists before any restore strategy
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure parent directory exists before any restore strategy. A parent inside the
+    # configured state directory is made as Pivot makes that directory, with its ignore file,
+    # before the restore lock or the copy writes anything there.
+    state_dir_mod.make_dirs(dest_path.parent)
 
     # Strategy 1: Try local cache (if hash available)
     if output_hash is not None:
