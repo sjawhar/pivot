@@ -184,6 +184,8 @@ class Scheduler:
         # ``_downstream`` is transitive. The ``_upstream_unfinished`` check below keeps the
         # direct consumers whose only unfinished upstream stage is ``stage``.
         downstream = set(self._downstream.get(stage, []))
+        if not downstream:
+            return 0
         count = 0
         for candidate, state in self._stage_states.items():
             if candidate not in downstream or state != StageExecutionState.PENDING:

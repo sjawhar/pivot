@@ -34,10 +34,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Idle timeout for the workers of an Engine that exits after its run. A 100-stage pandas/NumPy
-# chain on pivot-dirout had a 78.898 ms maximum coordinator handoff gap. Ten seconds is 126
-# times that gap, while freeing workers during the multi-minute farm waits that motivated
-# idle-worker reclamation.
 ONE_SHOT_WORKER_IDLE_TIMEOUT_S: Final[float] = 10.0
 
 

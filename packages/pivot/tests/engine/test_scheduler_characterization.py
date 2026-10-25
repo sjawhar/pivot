@@ -420,10 +420,10 @@ def _helper_orthogonal_vectors(count: int) -> Scheduler:
 
 @pytest.mark.parametrize("count", [500, 2_000])
 def test_resource_width_returns_its_limit_when_an_exact_replay_costs_too_much(count: int) -> None:
-    """An input on which an exact answer needs about n² steps returns ``limit``, main's worker
-    count, after a number of lines in proportion to its stages and requested resources (the
-    inputs the budget counts), not to their square. A small copy of the same input stays within
-    the budget and returns the exact width, 1."""
+    """An input on which an exact answer needs about n² steps returns ``limit`` after a number
+    of lines in proportion to its stages and requested resources (the inputs the budget
+    counts), not to their square. A small copy of the same input stays within the budget and
+    returns the exact width, 1."""
     scheduler = _helper_orthogonal_vectors(count)
     inputs = 2 * count + 3 * count + 4 * count
 
@@ -461,8 +461,8 @@ def test_resource_width_returns_its_limit_on_a_dense_run_over_the_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A random 400-stage run whose stages each ask for several small resources needs more
-    steps than the budget allows, so it gets ``limit``, main's worker count, within a number of
-    lines in proportion to the budget. With no budget the replay gives its exact width, 10."""
+    steps than the budget allows, so it gets ``limit`` within a number of lines in proportion
+    to the budget. With no budget the replay gives its exact width, 10."""
     scheduler = _helper_dense_random(2, 400)
     inputs = (
         len(scheduler.stage_states)

@@ -403,7 +403,7 @@ def test_wider_run_after_a_narrow_one_starts_its_stages_together(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A watch session's wide run after a narrow one needs a new executor (its call queue is too
-    small). As on main, the replacement must start no worker before the run submits its stages:
+    small). The replacement must start no worker before the run submits its stages:
     a worker started and waited for there puts its start-up ahead of every other worker's, so
     one stage starts a whole worker start-up before the rest. Every stage must then hold a
     worker at once. The checks are counts, not times, so machine load cannot change them.
@@ -455,9 +455,9 @@ def test_wider_run_after_a_narrow_one_starts_its_stages_together(
 def test_run_after_a_reload_restart_starts_its_stages_together(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A watch reload restarts workers before its re-run, as main does. That re-run must start
-    every stage together, as on main: a restart that warmed fewer workers than the re-run can
-    start at once leaves the rest a whole worker start-up behind the first stage."""
+    """A watch reload restarts workers before its re-run. That re-run must start every stage
+    together: a restart that warmed fewer workers than the re-run can start at once leaves the
+    rest a whole worker start-up behind the first stage."""
     hook = tmp_path / "hook"
     hook.mkdir()
     (hook / "sitecustomize.py").write_text(_SLOW_STARTUP_HOOK)
