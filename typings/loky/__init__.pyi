@@ -9,12 +9,22 @@ from typing import Any, Literal, TypeVar
 
 _T = TypeVar("_T")
 
+class _ExecutorFlags:
+    shutdown: bool
+    # The exception that broke the executor, or None.
+    broken: BaseException | None
+
 class ProcessPoolExecutor(Executor):
     """Process pool executor that can be used with concurrent.futures."""
 
+    _flags: _ExecutorFlags
+    _max_workers: int
+    _pending_work_items: dict[int, object]
     _processes: dict[int, BaseProcess]
     # None once the executor has been shut down.
     _processes_management_lock: AbstractContextManager[object] | None
+    # Call-queue capacity, fixed at creation: 2 * max(cpu_count, max_workers) + 1.
+    queue_size: int
 
     def __init__(
         self,

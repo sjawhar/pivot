@@ -32,7 +32,6 @@ from pivot.engine import engine, sinks
 from pivot.engine import graph as engine_graph
 from pivot.engine import sources as engine_sources
 from pivot.engine import watch as engine_watch
-from pivot.executor import prepare_workers
 from pivot.types import (
     DisplayCategory,
     ExecutionResultEvent,
@@ -263,19 +262,6 @@ def _run_pipeline(
                 )
             )
         return {}
-
-    # Pre-warm loky executor before starting Textual TUI, as many workers as the engine will use
-    if tui:
-        prepare_workers(
-            _run_common.tui_prewarm_width(
-                stages_list,
-                single_stage=False,
-                all_pipelines=cli_decorators.get_all_pipelines_from_context(),
-                on_error=on_error,
-                # Watch mode's startup run does not restore tracked files.
-                checkout_missing=checkout_missing and not watch,
-            )
-        )
 
     # Set up run_id if using TUI
     run_id: str | None = None
