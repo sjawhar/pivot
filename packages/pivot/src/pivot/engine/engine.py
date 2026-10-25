@@ -262,6 +262,10 @@ class Engine:
     _futures: dict[concurrent.futures.Future[StageResult], str]
     _worker_pool: worker_pool_mod.WorkerPool | None
     _effective_max_workers: int
+    _worker_idle_timeout_s: float | None
+    # Workers the run's first submission starts: the run's resource width
+    # (Scheduler.resource_width). Zero once that submission is made.
+    _first_submission_workers: int
 
     # Run state machine (Task 10/11)
     _run_state: _RunState
@@ -332,6 +336,8 @@ class Engine:
         self._futures = dict[concurrent.futures.Future[StageResult], str]()
         self._worker_pool = None
         self._effective_max_workers = 1
+        self._worker_idle_timeout_s = None
+        self._first_submission_workers = 0
 
         # Run state machine (Task 10/11)
         self._run_state = _RunState.IDLE
@@ -491,6 +497,9 @@ class Engine:
 
         # Create fresh dispatch completion event (Events can only be set once)
         self._dispatch_complete = anyio.Event()
+        self._worker_idle_timeout_s = (
+            executor_core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S if exit_on_completion else None
+        )
 
         async with anyio.create_task_group() as tg:
             self._run_task_group = tg
@@ -1276,6 +1285,7 @@ class Engine:
                     try:
                         # Main execution loop
                         while self._futures:
+                            self._worker_pool.run_due_keepalives()
                             # Snapshot futures keys before passing to thread to avoid
                             # "dictionary changed size during iteration" race condition.
                             # The main async loop can modify _futures while thread waits.
@@ -1651,6 +1661,7 @@ class Engine:
             resource_capacity=resource_capacity,
         )
         self._effective_max_workers = max_workers
+        self._first_submission_workers = self._scheduler.resource_width(limit=max_workers)
 
         # Emit initial state events for all stages
         for stage_name, initial_state in self._scheduler.stage_states.items():
@@ -1672,7 +1683,10 @@ class Engine:
         if self._worker_pool is None:
             self._worker_pool = worker_pool_mod.WorkerPool()
         if not self._worker_pool.in_run:
-            self._worker_pool.start(max_workers=self._effective_max_workers)
+            self._worker_pool.start(
+                max_workers=self._effective_max_workers,
+                idle_timeout_s=self._worker_idle_timeout_s,
+            )
         return self._worker_pool
 
     async def _start_ready_stages(
@@ -1779,14 +1793,26 @@ class Engine:
                     store_spec=store_spec,
                 )
 
+                active_after_parent = len(self._futures)
+                prestart_limit = self._effective_max_workers - active_after_parent
+                direct_consumers = self._scheduler.preview_direct_consumers(
+                    stage_name,
+                    limit=prestart_limit,
+                )
+                prestart_target = max(
+                    active_after_parent + direct_consumers, self._first_submission_workers
+                )
+                self._first_submission_workers = 0
                 future = pool.submit(
                     worker.execute_stage,
                     stage_name,
                     worker_info,
                     cache_dir,
                     pool.output_queue(),
+                    prestart_target=prestart_target,
                 )
                 self._futures[future] = stage_name
+                pool.keep_consumers_warm(stage_name, direct_consumers)
 
                 stage_start_times[stage_name] = time.perf_counter()
 
@@ -2219,6 +2245,10 @@ class Engine:
     ) -> float:
         """Handle a stage completing execution. Returns duration in milliseconds."""
         duration_ms = (time.perf_counter() - start_time) * 1000
+        # Stop keeping this stage's consumer workers warm; from here they are ordinary idle
+        # workers that the consumers reuse or the idle timeout reclaims.
+        if self._worker_pool is not None:
+            self._worker_pool.release_consumers(stage_name)
         # Record completed output state before replaying deferred file events.
         self._record_watch_output_stats(stage_name)
         await self._set_stage_state(stage_name, StageExecutionState.COMPLETED)
@@ -2681,10 +2711,11 @@ class Engine:
             stages = list(runnable or all_stages)
 
         if stages:
-            # Restart worker pool so workers pick up reloaded code, at the size the next run
-            # asks for. Run in thread to avoid blocking the event loop during process
-            # kill/spawn. Catch errors so dispatch-time source validation can rebuild the pool
-            # on its next use.
+            # Restart the worker pool with the re-run's width of fresh workers so the next run
+            # picks up reloaded code and starts its stages together. Run in thread to avoid
+            # blocking the event loop during process kill/spawn.
+            # A failed restart leaves the pool without an executor, so the re-run's start()
+            # creates new workers; the failure is logged rather than ending the session.
             coordinator = self._get_watch_coordinator()
             if coordinator is not None and coordinator.should_restart_workers(
                 parallel=self._stored_parallel
@@ -2698,13 +2729,11 @@ class Engine:
                     self._worker_pool = worker_pool_mod.WorkerPool()
                 worker_pool = self._worker_pool
                 try:
-                    workers = await anyio.to_thread.run_sync(
-                        lambda: worker_pool.restart(max_workers=width)
-                    )
-                    _logger.info("Worker pool restarted for code reload (%d workers)", workers)
+                    await anyio.to_thread.run_sync(lambda: worker_pool.restart(max_workers=width))
+                    _logger.info("Worker pool restarted for code reload")
                 except Exception:
                     _logger.warning(
-                        "Failed to restart worker pool - continuing with existing workers",
+                        "Failed to restart worker pool - the next run starts new workers",
                         exc_info=True,
                     )
 

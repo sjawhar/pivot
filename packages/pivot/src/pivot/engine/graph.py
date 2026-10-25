@@ -570,6 +570,9 @@ def get_width(stage_dag: nx.DiGraph[str], stages: list[str], *, limit: int) -> i
 # Steps of augmenting-path search `get_width` takes before it settles for an upper bound. A
 # count, not a clock, so one graph and limit always give one size.
 _AUGMENT_STEPS = 10_000
+# Steps per stage, dependency and requested resource that `Scheduler.resource_width`'s replay
+# takes beyond `_AUGMENT_STEPS` before it settles for its limit, `get_width`'s pool size.
+_REPLAY_STEPS_PER_INPUT = 8
 
 
 def _augment(

@@ -1468,7 +1468,7 @@ def _helper_bipartite_chain(names: list[str]) -> nx.DiGraph[str]:
 @pytest.mark.parametrize(
     ("parallel", "max_workers", "expected_restart_calls"),
     [
-        pytest.param(True, 4, [(1, 1)], id="parallel-restarts-workers"),
+        pytest.param(True, 4, [(1, 1, None)], id="parallel-restarts-worker"),
         pytest.param(False, None, [], id="non-parallel-skips-restart"),
     ],
 )
@@ -1476,15 +1476,15 @@ async def test_engine_handle_code_or_config_changed_restart_behavior(
     monkeypatch: pytest.MonkeyPatch,
     parallel: bool,
     max_workers: int | None,
-    expected_restart_calls: list[tuple[int, int | None]],
+    expected_restart_calls: list[tuple[int, int, float | None]],
 ) -> None:
-    """A reload restarts workers only in parallel mode, one for each stage of the reloaded
-    pipeline that can run at once, and no fewer than the pool held: a chain of three needs one."""
-    restart_calls = list[tuple[int, int | None]]()
+    """A parallel reload starts its run's width of fresh workers before the run."""
+    restart_calls = list[tuple[int, int, float | None]]()
 
-    def mock_restart_workers(width: int, max_workers: int | None = None) -> int:
-        restart_calls.append((width, max_workers))
-        return width
+    def mock_restart_workers(
+        max_workers: int, *, warm_workers: int, idle_timeout_s: float | None
+    ) -> None:
+        restart_calls.append((max_workers, warm_workers, idle_timeout_s))
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 
@@ -1564,9 +1564,8 @@ async def test_engine_handle_code_or_config_changed_no_restart_on_failed_reload(
 
     restart_calls = list[object]()
 
-    def mock_restart_workers(*args: object, **kwargs: object) -> int:
+    def mock_restart_workers(*args: object, **kwargs: object) -> None:
         restart_calls.append(args)
-        return 1
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 
@@ -1591,7 +1590,10 @@ async def test_engine_handle_code_or_config_changed_continues_on_restart_failure
 ) -> None:
     """_handle_code_or_config_changed continues if restart_workers raises."""
 
-    def mock_restart_workers(width: int, max_workers: int | None = None) -> int:
+    def mock_restart_workers(
+        max_workers: int, *, warm_workers: int, idle_timeout_s: float | None
+    ) -> None:
+        del max_workers, warm_workers, idle_timeout_s
         raise RuntimeError("loky pool broken")
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
@@ -1642,9 +1644,8 @@ async def test_engine_handle_data_artifact_changed_does_not_restart_workers(
     """_handle_data_artifact_changed does NOT restart worker pool (data-only change)."""
     restart_calls = list[object]()
 
-    def mock_restart_workers(*args: object, **kwargs: object) -> int:
+    def mock_restart_workers(*args: object, **kwargs: object) -> None:
         restart_calls.append(args)
-        return 1
 
     monkeypatch.setattr("pivot.executor.core.restart_workers", mock_restart_workers)
 

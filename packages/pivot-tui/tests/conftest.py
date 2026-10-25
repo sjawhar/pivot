@@ -265,12 +265,9 @@ def clear_source_caches() -> Generator[None]:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def prewarm_worker_pool() -> Generator[None]:
-    """Pre-warm loky worker pool before tests run.
-
-    This eliminates cold-start overhead on the first test that uses workers.
-    """
-    executor_core.prepare_workers(width=2, parallel=True, max_workers=2)
+def start_resource_trackers() -> Generator[None]:
+    """Start process trackers before any in-process Textual capture begins."""
+    executor_core.start_resource_trackers()
     yield
 
 

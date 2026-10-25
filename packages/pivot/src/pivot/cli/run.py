@@ -23,7 +23,6 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import engine
 from pivot.engine import sources as engine_sources
-from pivot.executor import prepare_workers
 from pivot.types import (
     DisplayCategory,
     ExecutionResultEvent,
@@ -35,7 +34,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from pivot.executor import ExecutionSummary
-
+    from pivot.executor import core as executor_core
 
 _logger = logging.getLogger(__name__)
 
@@ -85,7 +84,6 @@ def _run_with_tui(
     Uses run_tui_with_engine helper: background thread for engine,
     main thread for TUI (required for signal handlers like SIGTSTP).
     """
-    from pivot.executor import core as executor_core
 
     try:
         from pivot_tui import run as tui_run
@@ -95,20 +93,6 @@ def _run_with_tui(
         ) from err
 
     from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
-
-    # Pre-warm loky executor before starting Textual TUI, as many workers as the engine will use.
-    # Textual manipulates terminal file descriptors which breaks loky's
-    # resource tracker if spawned after Textual starts.
-    # `run`'s engine is not told about --all, so it skips no stage for a missing dependency.
-    prepare_workers(
-        _run_common.tui_prewarm_width(
-            stages_list,
-            single_stage=True,
-            all_pipelines=False,
-            on_error=on_error,
-            checkout_missing=checkout_missing,
-        )
-    )
 
     cancel_event = threading.Event()
     pipeline = cli_decorators.get_pipeline_from_context()

@@ -2288,7 +2288,7 @@ requires-dist = [
     { name = "joblib", marker = "extra == 'dev'", specifier = ">=1.4.0" },
     { name = "joblib-stubs", marker = "extra == 'dev'", specifier = ">=1.5.0" },
     { name = "lmdb", specifier = ">=1.4.0" },
-    { name = "loky", specifier = ">=3.4" },
+    { name = "loky", specifier = ">=3.5.6,<3.8" },
     { name = "matplotlib", marker = "extra == 'matplotlib'", specifier = ">=3.5" },
     { name = "matplotlib-stubs", marker = "extra == 'dev'", specifier = ">=0.3" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6.0" },
