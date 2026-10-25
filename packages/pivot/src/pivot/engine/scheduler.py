@@ -227,8 +227,8 @@ class Scheduler:
         many stages as its resources hold, and per resource, at most its capacity of its users.
 
         Below a step budget the result equals a full replay. Above it the method returns
-        ``limit``, and the Engine passes ``get_width``'s pool size as ``limit``, so the run starts
-        as many workers as it would with no resource limits, never more. The budget is
+        ``limit``. The Engine passes ``get_width``'s pool size as ``limit``, so a run over the
+        budget starts that pool size, the most workers it may hold at once. The budget is
         ``engine_graph._AUGMENT_STEPS`` steps plus ``engine_graph._REPLAY_STEPS_PER_INPUT`` per
         stage, dependency and requested resource. Random DAGs of 400 or more stages, each stage
         requesting several small resources at random amounts, can exceed it: 22 of 299 at 400

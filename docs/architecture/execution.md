@@ -122,8 +122,8 @@ within resource capacities (`Scheduler.resource_width`). The width counts every 
 run, including stages that are cached or skipped later. A `local_grade: 2` limit therefore
 starts at most two workers for an otherwise-wide grade wave, and a chain starts one. The replay
 has a step budget: 10,000 steps plus 8 per stage, dependency and requested resource. Below it
-the width is exact. A run that needs more starts `get_width()`'s pool size, as it does with no
-resource limits. Random runs of 400 or more stages whose stages each ask for several small
+the width is exact. A run that needs more starts `get_width()`'s pool size, the most workers it
+may hold at once. Random runs of 400 or more stages whose stages each ask for several small
 resources can need more. After the first submission, a dispatch starts a worker when an admitted
 stage finds every live worker busy, or for the scheduler-admissible direct consumer wave of the
 parent it dispatches. For a parent that runs past half the one-shot idle timeout, the pool pings
@@ -132,10 +132,11 @@ blocking it on the parent. When the parent resolves, pings stop and those worker
 ordinary idle workers. A run whose stages all skip in the coordinator starts no workers.
 
 For a one-shot Engine, an idle worker exits after the 10-second idle timeout, or occasionally
-after a second one, when loky's worker loses its process-lock race. The timeout is 126 times the
-78.898 ms maximum coordinator handoff gap measured on a 100-stage pandas/NumPy chain, while
-remaining short compared with remote-stage waits. A persistent watch, serve or TUI Engine keeps
-idle workers alive between its runs for a warm next run.
+after a second one, when loky's worker loses its process-lock race. The timeout is 116 times the
+largest coordinator handoff gap of five 100-stage pandas/NumPy chains, 70.959 to 86.164 ms,
+measured at `3f72f1f2` on a 32-CPU cloud machine, while remaining short compared with
+remote-stage waits. A persistent watch, serve or TUI Engine keeps idle workers alive between its
+runs for a warm next run.
 
 ### Textual Startup
 

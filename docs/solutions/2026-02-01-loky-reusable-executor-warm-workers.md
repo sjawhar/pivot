@@ -54,9 +54,9 @@ The key behaviors:
    Engine dispatches.
 3. **Idle cleanup** - One-shot Engines give idle workers a 10-second timeout. An idle worker
    exits after the 10-second idle timeout, or occasionally after a second one, when loky's
-   worker loses its process-lock race. The timeout is 126 times the 78.898 ms maximum
-   coordinator handoff gap measured on a 100-stage pandas/NumPy chain, while remaining short
-   relative to long remote-stage waits.
+   worker loses its process-lock race. The timeout is 116 times the largest coordinator handoff
+   gap of five 100-stage pandas/NumPy chains, 70.959 to 86.164 ms, measured at `3f72f1f2` on a
+   32-CPU cloud machine, while remaining short relative to long remote-stage waits.
 4. **Long-lived Engines** - Watch, serve and persistent TUI Engines use no idle timeout, so a
    later run reuses their warm workers.
 
