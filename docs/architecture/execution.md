@@ -113,36 +113,43 @@ when a run starts (it died, or its socket was removed) is replaced then.
 
 ### Pool Size
 
-A run starts one worker per stage it can run at once, up to `core.max_workers`: the width of
-the run's stage graph, the largest set of its stages none of which consumes, directly or through
-other stages of the run, another's output (`engine/graph.py` `get_width`). A chain of stages runs
-on one worker; five stages that read one source stage run on five. The width counts every stage
-of the run, including stages that will skip, so a partial run starts as many workers as a full
-one. The widest topological level can be smaller: with stages A and S, and B and C that both
-read S, the levels {A, S} and {B, C} hold two stages each, but A, B and C can all run together,
-so the width is three. The widest level is still a lower bound, so once it reaches
-`core.max_workers` the pool takes the cap without computing the width. Below the cap, the search
-for the width takes a fixed number of steps; a pipeline it does not settle in that many gets an
-upper bound on the width instead, never fewer workers than its stages that can run at once.
+`get_width()` gives the Engine an upper bound from the run's stage graph, capped by
+`core.max_workers`. It limits admission and the workers that the run's first submission starts.
 
-A TUI pre-warms the same number of workers before Textual starts. It restores missing tracked
-files first when `--checkout-missing` asks for it, and it counts the stages the engine will run
-(`get_runnable_stages`): with `--all --keep-going`, a stage with a missing dependency and
-everything downstream of it are left out of both. `pivot run` runs its named stages in the given
-order and starts a stage once the named stages it consumes from have finished, so its width is
-that of the named stages alone.
+The worker pool starts processes when the run submits work. The run's first submission starts
+the run's resource width: the most of its stages that one replayed schedule runs at once,
+within resource capacities (`Scheduler.resource_width`). The width counts every stage of the
+run, including stages that are cached or skipped later. A `local_grade: 2` limit therefore
+starts at most two workers for an otherwise-wide grade wave, and a chain starts one. The replay
+has a step budget: 10,000 steps plus 8 per stage, dependency and requested resource. Below it
+the width is exact. A run that needs more starts `get_width()`'s pool size, the most workers it
+may hold at once. Random runs of 400 or more stages whose stages each ask for several small
+resources can need more. After the first submission, a dispatch starts a worker when an admitted
+stage finds every live worker busy, or for the scheduler-admissible direct consumer wave of the
+parent it dispatches. For a parent that runs past half the one-shot idle timeout, the pool pings
+idle workers pre-started for that wave. The ping restarts the worker’s idle clock without
+blocking it on the parent. When the parent resolves, pings stop and those workers become
+ordinary idle workers. A run whose stages all skip in the coordinator starts no workers.
 
-The width bounds the pool, not the schedule: stage `resources` still limit how many stages run
-together.
+For a one-shot Engine, an idle worker exits after the 10-second idle timeout, or occasionally
+after a second one, when loky's worker loses its process-lock race. The timeout is 116 times the
+largest coordinator handoff gap of five 100-stage pandas/NumPy chains, 70.959 to 86.164 ms,
+measured at `3f72f1f2` on a 32-CPU cloud machine, while remaining short compared with
+remote-stage waits. A persistent watch, serve or TUI Engine keeps idle workers alive between its
+runs for a warm next run.
+
+### Textual Startup
+
+Before Textual captures `sys.stderr`, Pivot starts loky's and `multiprocessing`'s resource
+trackers. Textual's captured stream has no valid file descriptor, and those tracker launchers
+need one. Workers can start after the TUI begins and use the already-running trackers.
 
 ### Warm Workers
 
-Workers stay alive across runs in one Engine, so imports from earlier stages remain available.
-Before a later run reuses workers, Pivot replaces them if a user-code module they imported
-changed. Worker capacity grows for a wider run but does not shrink for a narrower one: the
-scheduler still limits that run's parallelism, while a later wide run reuses every warm worker.
-A watch-mode code reload restarts the pool the same way, at the larger of the reloaded
-pipeline's width and the pool's earlier size, so the run after it starts no other worker.
+Workers stay alive across runs in one long-lived Engine, so imports from earlier stages remain
+available. Before a later run reuses workers, Pivot replaces them if a user-code module they
+imported changed. A watch-mode code reload starts the reloaded run's width of fresh workers
+together, so that run starts its stages at once.
 
 ## Stage resources
 
