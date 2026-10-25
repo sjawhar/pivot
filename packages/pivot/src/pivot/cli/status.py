@@ -77,9 +77,9 @@ def status(
     remote_status: RemoteSyncInfo | None = None
 
     orphaned_locks = list[str]()
+    all_stages = {} if pipeline is None else cli_helpers.get_all_stages()
 
     if show_stages and pipeline is not None:
-        all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)
         orphaned_locks = status_mod.find_orphaned_lock_files(all_stages)
 
@@ -120,7 +120,9 @@ def status(
             pbar.update(1)
 
         try:
-            tracked_status = status_mod.get_tracked_files_status(project_root, on_progress)
+            tracked_status = status_mod.get_tracked_files_status(
+                project_root, all_stages.values(), on_progress
+            )
         finally:
             if pbar is not None:
                 pbar.close()
@@ -139,7 +141,7 @@ def status(
 
     import_statuses = list[status_mod.ImportStatusInfo]()
     if check_imports:
-        import_statuses = status_mod.get_import_status(project_root)
+        import_statuses = status_mod.get_import_status(project_root, all_stages.values())
 
     # Compute counts once for suggestions and output
     if explain and pipeline_explanations:

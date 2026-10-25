@@ -97,6 +97,22 @@ def test_run_fails_when_tracked_file_missing(
         executor.run(pipeline=test_pipeline)
 
 
+def test_run_ignores_pvt_inside_a_stage_output(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path
+) -> None:
+    """The check of tracked files does not search a stage's output for .pvt files."""
+    (pipeline_dir / "data.csv").write_text("x")
+    _register_data_stage(_process_simple)
+    track.write_pvt_file(
+        _output("process") / "ghost.csv.pvt", {"path": "ghost.csv", "hash": "abc123", "size": 1}
+    )
+
+    results = executor.run(pipeline=test_pipeline)
+
+    assert results["test/process"]["status"] == "ran"
+    assert _output("process").read_text() == "done"
+
+
 def test_run_succeeds_with_hash_mismatch(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
