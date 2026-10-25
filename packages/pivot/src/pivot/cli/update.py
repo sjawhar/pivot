@@ -68,7 +68,8 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
                 continue
             pairs.append((pvt_path, pvt_data))
     else:
-        imports = track.discover_import_pvt_files(root)
+        # update loads no pipeline, so the search for .pvt files has no outputs to skip
+        imports = track.discover_import_pvt_files(root, ())
         pairs = list[tuple[pathlib.Path, track.PvtData]]()
         for data_path_str, pvt_data in imports.items():
             pvt_path = track.get_pvt_path(pathlib.Path(data_path_str))
