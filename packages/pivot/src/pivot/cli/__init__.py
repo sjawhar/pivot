@@ -195,7 +195,8 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     # both start afresh, so an embedder's next invocation sees edits made in between. Like the
     # CLI's other warnings about project files, the state-directory warnings give way to
     # --quiet, and each invocation reports each problem once. Close callbacks run last first,
-    # so the fingerprint caches are written while the record still holds the state directory.
+    # so the fingerprint caches are written before the record ends. Each pending entry names
+    # the state directory that produced it, so a later flush, at process exit, writes there too.
     if not ctx.resilient_parsing:
         from pivot import state_dir as state_dir_mod
         from pivot.config import io as config_io

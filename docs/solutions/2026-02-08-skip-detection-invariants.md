@@ -93,7 +93,9 @@ Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → has
 **Flush boundaries** (where pending manifest cache writes are committed to StateDB):
 - After discovery loads `pipeline.py` (`discovery.py`)
 - In watch mode, before reload
-- As each CLI invocation ends, before its state-directory record ends (`fingerprint.flush_and_close`, from the `cli` callback's close callbacks), so the writes go to the state directory the command decided, also after a `core.state_dir` edit during a `--watch` session. Process exit runs it again for a library caller.
+- As each CLI invocation ends (`fingerprint.flush_and_close`, from the `cli` callback's close callbacks). Process exit runs it again for a library caller and for a TUI session whose engine thread fingerprints after that callback.
+
+**Where a pending entry is written:** each entry is filed under the state directory read where it was produced (`fingerprint._producing_state_dir`), and every flush writes it there and resolves no state directory. A flush runs where its producer no longer does, so a `core.state_dir` edited in between never takes the entries of a run that used the previous directory.
 
 **Selective invalidation in watch mode:** When a source file changes, the engine uses a reverse index to find which manifest cache entries depend on that file, and invalidates only those entries. This avoids re-fingerprinting all stages when only one source file changed. The reverse index is built by scanning all `sm:` entries' source maps.
 

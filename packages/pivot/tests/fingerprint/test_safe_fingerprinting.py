@@ -611,22 +611,17 @@ def test_unsafe_env_allows_non_scalar_capture(
 def test_unsafe_capture_does_not_populate_manifest_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cached = dict[str, dict[str, str]]()
+    writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
 
-    class ManifestWrites(list[tuple[bytes, bytes]]):
-        @typing.override
-        def append(self, entry: tuple[bytes, bytes]) -> None:
-            cached["unsafe-cache"] = json.loads(entry[1])["m"]
+    def cache_hit(_stage_name: str, _func: Callable[..., object]) -> dict[str, str] | None:
+        return None
 
-    def cache_hit(stage_name: str, _func: Callable[..., object]) -> dict[str, str] | None:
-        return cached.get(stage_name)
-
-    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", ManifestWrites())
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", cache_hit)
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_mutable_list)
 
-    assert "unsafe-cache" not in cached
+    assert writes == {}, "an unsafe capture queues no manifest for any state directory"
 
     monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING")
     with pytest.raises(exceptions.StageDefinitionError):

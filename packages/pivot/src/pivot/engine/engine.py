@@ -1500,6 +1500,7 @@ class Engine:
             started_at=started_at,
             ended_at=ended_at,
             retention=retention,
+            state_dir=default_state_dir,
         )
 
         # Materialize presentation symlinks for successful stages
@@ -2375,8 +2376,14 @@ class Engine:
         started_at: str,
         ended_at: str,
         retention: int,
+        state_dir: pathlib.Path,
     ) -> None:
-        """Build and write run manifest to StateDB."""
+        """Write the run manifest to the state directory this run used.
+
+        The run decided that directory before its first stage, and a ``--watch`` session can
+        outlive an edit of ``core.state_dir``, so the manifest of a finished run is never sent
+        to a directory the next run would use.
+        """
         from pivot import run_history
 
         stages_records = dict[str, run_history.StageRunRecord]()
@@ -2400,7 +2407,7 @@ class Engine:
             stages=stages_records,
         )
 
-        with state_mod.StateDB(config.get_state_dir()) as state_db:
+        with state_mod.StateDB(state_dir) as state_db:
             state_db.write_run(manifest)
             state_db.prune_runs(retention)
 

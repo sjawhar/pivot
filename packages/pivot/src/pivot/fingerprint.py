@@ -192,11 +192,15 @@ _schema_hash_cache: weakref.WeakKeyDictionary[type, str] = weakref.WeakKeyDictio
 # readonly StateDB and fingerprinting should complete during discovery.
 _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
-_pending_ast_writes: list[AstHashEntry] = []
 
-# Pending manifest cache writes, flushed as each CLI invocation ends (`flush_and_close`).
-# Format: list of (key_bytes, value_bytes) tuples.
-_pending_manifest_writes: list[tuple[bytes, bytes]] = []
+# Pending cache writes, each filed under the state directory of the run that produced it
+# (`_producing_state_dir`). A flush writes every entry to the directory it is filed under and
+# resolves none, because a flush runs where its producer no longer does: the end of a CLI
+# invocation, a TUI quit during fingerprinting, process exit for a library caller. A
+# `core.state_dir` edited in between never takes a previous run's entries.
+_pending_ast_writes = dict[pathlib.Path, list[AstHashEntry]]()
+# Manifest cache values: (key_bytes, value_bytes) tuples.
+_pending_manifest_writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
 
 
 # Source files visited during a single stage's fingerprinting.
@@ -290,6 +294,24 @@ class FunctionIdentity(TypedDict):
     defaults: list[tuple[str, Any]]
 
 
+def _producing_state_dir() -> pathlib.Path | None:
+    """The state directory a cache entry produced now belongs to, or None when it has none.
+
+    Read where the entry is produced, never where it is written. A CLI invocation resolves
+    its state directory once and every producer of that invocation, the engine thread of a
+    TUI session included, reads that one; a library caller reads the configured value of the
+    run it is in. An unreadable or unusable configuration leaves the entry unfiled, and the
+    caches are best effort, so it is dropped.
+    """
+    try:
+        from pivot.config import io
+
+        return io.get_state_dir()
+    except Exception:
+        # ConfigError (unusable value), ProjectNotInitializedError, OSError (creation), etc.
+        return None
+
+
 def _close_state_db() -> None:
     """Close the readonly StateDB; the next lookup opens it again."""
     global _state_db, _state_db_init_attempted
@@ -302,10 +324,10 @@ def _close_state_db() -> None:
 def flush_and_close() -> None:
     """Write the pending cache entries, then close the readonly StateDB.
 
-    The CLI calls this as each invocation ends, while the invocation still holds the state
-    directory it decided, and process exit calls it for a library caller. Entries that fail
-    to write are dropped: the caches are best effort, and a later retry could resolve another
-    state directory. The flush opens its own writable StateDB.
+    The CLI calls this as each invocation ends, process exit calls it for a library caller,
+    and either can run after the run that produced the entries. Each entry goes to the state
+    directory it was filed under, so neither resolves one here. Entries that fail to write
+    are dropped: the caches are best effort. The flush opens its own writable StateDB.
     """
     flush_ast_hash_cache()
     flush_manifest_cache()
@@ -329,11 +351,13 @@ def _get_state_db() -> "StateDB | None":
     if _state_db_init_attempted:
         return None  # Already tried and failed
     _state_db_init_attempted = True
+    state_dir = _producing_state_dir()
+    if state_dir is None:
+        return None
     try:
-        from pivot.config import io
         from pivot.storage import state
 
-        _state_db = state.StateDB(io.get_state_dir(), readonly=True)
+        _state_db = state.StateDB(state_dir, readonly=True)
         return _state_db
     except Exception:
         # OSError (filesystem), ImportError (module), lmdb.Error, etc.
@@ -870,48 +894,54 @@ def _walk_to(path: tuple[str, ...], owners: dict[tuple[str, ...], Any]) -> Any:
 
 
 def flush_ast_hash_cache() -> None:
-    """Flush pending AST hash writes to StateDB (call from coordinator)."""
+    """Write each pending AST hash to the state directory it is filed under."""
     global _pending_ast_writes
     if not _pending_ast_writes:
         return
 
     pending = _pending_ast_writes
-    _pending_ast_writes = []
+    _pending_ast_writes = dict[pathlib.Path, list[AstHashEntry]]()
 
-    try:
-        from pivot.config import io
-        from pivot.storage import state
+    for state_dir, entries in pending.items():
+        try:
+            from pivot.storage import state
 
-        with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.save_ast_hash_many(pending)
-        metrics.count("fingerprint.ast_hash_cache.flush")
-    except Exception:
-        # OSError (filesystem), ImportError (module), lmdb.Error, etc.
-        # Restore pending writes on failure so they can be retried on next flush.
-        # This prevents permanent loss of cache entries on transient failures.
-        _pending_ast_writes.extend(pending)
-        _logger.debug("Failed to flush AST hash cache (%d entries)", len(pending), exc_info=True)
+            with state.StateDB(state_dir, readonly=False) as db:
+                db.save_ast_hash_many(entries)
+            metrics.count("fingerprint.ast_hash_cache.flush")
+        except Exception:
+            # OSError (filesystem), ImportError (module), lmdb.Error, etc.
+            # Restore pending writes on failure so they can be retried on next flush.
+            # This prevents permanent loss of cache entries on transient failures.
+            _pending_ast_writes.setdefault(state_dir, list[AstHashEntry]()).extend(entries)
+            _logger.debug(
+                "Failed to flush AST hash cache (%d entries)", len(entries), exc_info=True
+            )
 
 
 def flush_manifest_cache() -> None:
-    """Flush pending manifest writes to StateDB."""
+    """Write each pending manifest to the state directory it is filed under."""
     global _pending_manifest_writes
     if not _pending_manifest_writes:
         return
 
     pending = _pending_manifest_writes
-    _pending_manifest_writes = []
+    _pending_manifest_writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
 
-    try:
-        from pivot.config import io
-        from pivot.storage import state
+    for state_dir, entries in pending.items():
+        try:
+            from pivot.storage import state
 
-        with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.put_raw_many(pending)
-        metrics.count("fingerprint.manifest_cache.flush")
-    except Exception:
-        _pending_manifest_writes.extend(pending)
-        _logger.debug("Failed to flush manifest cache (%d entries)", len(pending), exc_info=True)
+            with state.StateDB(state_dir, readonly=False) as db:
+                db.put_raw_many(entries)
+            metrics.count("fingerprint.manifest_cache.flush")
+        except Exception:
+            _pending_manifest_writes.setdefault(state_dir, list[tuple[bytes, bytes]]()).extend(
+                entries
+            )
+            _logger.debug(
+                "Failed to flush manifest cache (%d entries)", len(entries), exc_info=True
+            )
 
 
 def _normalize_changed_paths(
@@ -955,43 +985,48 @@ def _manifest_references_paths(raw: bytes, changed_paths: set[str]) -> bool:
 def invalidate_manifests_for_paths(
     paths: Sequence[str | os.PathLike[str] | pathlib.Path],
 ) -> None:
-    """Invalidate cached manifests that reference changed source files."""
-    global _pending_manifest_writes
+    """Invalidate cached manifests that reference changed source files.
 
+    A reload runs this where the edited pipeline will run, so the stored manifests of that
+    state directory are the ones scanned. A pending manifest that reads a changed file is
+    dropped wherever it is filed, because it must reach no state directory.
+    """
     if not paths:
         return
     changed_paths = _normalize_changed_paths(paths)
     if not changed_paths:
         return
 
-    from pivot.config import io
+    state_dir = _producing_state_dir()
+    if state_dir is None:
+        return
+
     from pivot.storage import state
 
     keys_to_delete = set[bytes]()
     try:
-        with state.StateDB(io.get_state_dir(), readonly=True) as db:
+        with state.StateDB(state_dir, readonly=True) as db:
             for key, raw in db.iter_prefix(b"sm:"):
                 if _manifest_references_paths(raw, changed_paths):
                     keys_to_delete.add(key)
     except Exception:
         _logger.debug("Failed to scan manifest cache for invalidation", exc_info=True)
 
-    if _pending_manifest_writes:
-        pending_keys = set[bytes]()
-        for key, raw in _pending_manifest_writes:
-            if _manifest_references_paths(raw, changed_paths):
-                pending_keys.add(key)
-        if pending_keys:
-            keys_to_delete.update(pending_keys)
-            _pending_manifest_writes = [
-                (key, value) for key, value in _pending_manifest_writes if key not in pending_keys
-            ]
+    for pending_dir, pending in _pending_manifest_writes.items():
+        stale = {key for key, raw in pending if _manifest_references_paths(raw, changed_paths)}
+        if not stale:
+            continue
+        _pending_manifest_writes[pending_dir] = [
+            (key, value) for key, value in pending if key not in stale
+        ]
+        if pending_dir == state_dir:
+            keys_to_delete.update(stale)
 
     if not keys_to_delete:
         return
 
     try:
-        with state.StateDB(io.get_state_dir(), readonly=False) as db:
+        with state.StateDB(state_dir, readonly=False) as db:
             db.delete_raw_many(list(keys_to_delete))
     except Exception:
         _logger.debug(
@@ -1103,7 +1138,8 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
 
         # Inside a stage_fingerprint_scope, refusals are raised later; never cache them.
         refused = errors is not None and len(errors) > errors_before
-        if not _unsafe_capture_warning.get() and not refused:
+        state_dir = None if _unsafe_capture_warning.get() or refused else _producing_state_dir()
+        if state_dir is not None:
             _record_project_modules(source_map)
             key = _make_manifest_cache_key(stage_name, func)
             value = json.dumps(
@@ -1114,7 +1150,9 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
                 },
                 separators=(",", ":"),
             ).encode()
-            _pending_manifest_writes.append((key, value))
+            _pending_manifest_writes.setdefault(state_dir, list[tuple[bytes, bytes]]()).append(
+                (key, value)
+            )
 
         return manifest
     finally:
@@ -2946,13 +2984,16 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         # 4. Store in memory cache
         _hash_function_ast_cache[func] = result
 
-        # 5. Queue persistent write (if source info available and not skipping)
+        # 5. Queue persistent write under this run's state directory (if source info
+        # available and not skipping)
         if source_info is not None and qualname is not None:
-            rel_path, digest = source_info
-            _pending_ast_writes.append(
-                (rel_path, digest, qualname, _PYTHON_VERSION, _CACHE_SCHEMA_VERSION, result)
-            )
-            metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
+            state_dir = _producing_state_dir()
+            if state_dir is not None:
+                rel_path, digest = source_info
+                _pending_ast_writes.setdefault(state_dir, list[AstHashEntry]()).append(
+                    (rel_path, digest, qualname, _PYTHON_VERSION, _CACHE_SCHEMA_VERSION, result)
+                )
+                metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
 
         return result
     finally:

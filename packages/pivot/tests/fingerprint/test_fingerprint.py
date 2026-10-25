@@ -28,6 +28,16 @@ from pivot import ast_utils, exceptions, fingerprint, loaders
 from pivot.storage import state as state_mod
 
 
+def _pending_ast_entries() -> list[fingerprint.AstHashEntry]:
+    """Every queued AST-hash entry, whichever state directory it is filed under."""
+    return [entry for entries in fingerprint._pending_ast_writes.values() for entry in entries]
+
+
+def _pending_manifest_entries() -> list[tuple[bytes, bytes]]:
+    """Every queued manifest entry, whichever state directory it is filed under."""
+    return [entry for entries in fingerprint._pending_manifest_writes.values() for entry in entries]
+
+
 def _const_key(name: str) -> str:
     return f"const:{__name__}.{name}"
 
@@ -1949,9 +1959,9 @@ def reset_fingerprint_cache_state(monkeypatch):
 
     # Restore original state
     fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_ast_writes.extend(orig_pending)
+    fingerprint._pending_ast_writes.update(orig_pending)
     fingerprint._pending_manifest_writes.clear()
-    fingerprint._pending_manifest_writes.extend(orig_pending_manifest)
+    fingerprint._pending_manifest_writes.update(orig_pending_manifest)
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = orig_db
     fingerprint._state_db_init_attempted = orig_attempted
@@ -2119,13 +2129,13 @@ def my_stage():
 
         # Step 1: First call - should compute and queue
         hash1 = fingerprint.hash_function_ast(func)
-        assert len(fingerprint._pending_ast_writes) == 1
+        assert len(_pending_ast_entries()) == 1
         assert isinstance(hash1, str)
         assert len(hash1) == 16  # xxhash64 hexdigest
 
         # Step 2: Flush to StateDB
         fingerprint.flush_ast_hash_cache()
-        assert len(fingerprint._pending_ast_writes) == 0
+        assert len(_pending_ast_entries()) == 0
 
         # Clear memory cache to force persistent lookup
         fingerprint._hash_function_ast_cache.clear()
@@ -2148,7 +2158,7 @@ def my_stage():
         hash2 = fingerprint.hash_function_ast(func2)
         assert hash2 == hash1
         # No new pending writes (cache hit)
-        assert len(fingerprint._pending_ast_writes) == 0
+        assert len(_pending_ast_entries()) == 0
 
         # Step 4: Modify the file (change mtime/size)
         import time
@@ -2172,7 +2182,7 @@ def my_stage():
         # Step 5: Should miss cache (mtime changed) and compute new hash
         hash3 = fingerprint.hash_function_ast(func3)
         assert hash3 != hash1  # Different code = different hash
-        assert len(fingerprint._pending_ast_writes) == 1  # Queued for cache
+        assert len(_pending_ast_entries()) == 1  # Queued for cache
     finally:
         sys.modules.pop("my_stage", None)
         # Clean up fingerprint module state
@@ -2225,7 +2235,7 @@ def graceful_stage():
         assert len(hash_result) == 16  # xxhash64 hexdigest
 
         # Entries are still queued (flush will fail gracefully too)
-        assert len(fingerprint._pending_ast_writes) == 1
+        assert len(_pending_ast_entries()) == 1
 
         # Flush should not raise either
         fingerprint.flush_ast_hash_cache()  # Fails silently
@@ -2262,7 +2272,7 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
         ("src/b.py", "1123456789abcdef", "func_b", py_ver, schema_ver, "bbbb444455556666"),
         ("src/c.py", "2123456789abcdef", "MyClass.method", py_ver, schema_ver, "cccc777788889999"),
     ]
-    fingerprint._pending_ast_writes.extend(test_entries)
+    fingerprint._pending_ast_writes[db_path] = list(test_entries)
 
     # Flush to StateDB
     fingerprint.flush_ast_hash_cache()
@@ -2276,7 +2286,7 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
             )
 
     # Pending writes should be cleared
-    assert len(fingerprint._pending_ast_writes) == 0
+    assert len(_pending_ast_entries()) == 0
 
 
 # ==============================================================================
@@ -2420,7 +2430,7 @@ def test_cached_manifest_source_map_includes_module_attribute_source(
     (tmp_path / "f8_stage.py").write_text(
         "import f8_settings\n\n\ndef scale(x):\n    return x * f8_settings.FACTOR\n"
     )
-    writes = list[tuple[bytes, bytes]]()
+    writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
     try:
@@ -2430,7 +2440,7 @@ def test_cached_manifest_source_map_includes_module_attribute_source(
         sys.modules.pop("f8_stage", None)
         sys.modules.pop("f8_settings", None)
 
-    ((_key, raw),) = writes
+    ((_key, raw),) = _pending_manifest_entries()
     assert "f8_settings.py" in json.loads(raw)["s"]
 
 
@@ -2527,14 +2537,14 @@ def test_recorded_reads_detect_each_changed_live_value(
     source = {"factor": 1, "width": 2, "offset": 3, "by": 4, "scale": 5}
     (tmp_path / "reads_settings.py").write_text(f"SOURCE = {source!r}\nATTR = 6\n")
     (tmp_path / "reads_stage.py").write_text(_READS_MODULE)
-    writes = list[tuple[bytes, bytes]]()
+    writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
     try:
         settings = importlib.import_module("reads_settings")
         module = importlib.import_module("reads_stage")
         fingerprint.get_stage_fingerprint_cached("r/stage", module.stage)
-        ((_key, raw),) = writes
+        ((_key, raw),) = _pending_manifest_entries()
         reads = json.loads(raw)["r"]
         del sys.modules["reads_stage"]
         module = importlib.import_module("reads_stage")
@@ -2594,7 +2604,7 @@ def test_recorded_reads_replay_method_and_body_import_reads(
     (tmp_path / "replay_lib.py").write_text(_REPLAY_LIB)
     (tmp_path / "replay_body.py").write_text(_REPLAY_BODY)
     (tmp_path / "replay_stage.py").write_text(_REPLAY_STAGE)
-    writes = list[tuple[bytes, bytes]]()
+    writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
     monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
     names = ("replay_stage", "replay_lib", "replay_body")
@@ -2605,7 +2615,7 @@ def test_recorded_reads_replay_method_and_body_import_reads(
         manifest = fingerprint.get_stage_fingerprint_cached("r/stage", module.stage)
         assert manifest["const:replay_lib.LIMIT"] == "1", manifest
         assert manifest["const:replay_body.BODY"] == "2", manifest
-        ((_key, raw),) = writes
+        ((_key, raw),) = _pending_manifest_entries()
         reads = json.loads(raw)["r"]
         for name in names:
             del sys.modules[name]
@@ -2732,11 +2742,11 @@ def cached_stage():
         # First call — computes and queues
         manifest1 = fingerprint.get_stage_fingerprint_cached("cached_stage", module.cached_stage)
         assert "self:cached_stage" in manifest1
-        assert len(fingerprint._pending_manifest_writes) == 1
+        assert len(_pending_manifest_entries()) == 1
 
         # Flush
         fingerprint.flush_manifest_cache()
-        assert len(fingerprint._pending_manifest_writes) == 0
+        assert len(_pending_manifest_entries()) == 0
 
         # Clear in-memory caches to force persistent lookup
         fingerprint._hash_function_ast_cache.clear()
@@ -2749,7 +2759,7 @@ def cached_stage():
         manifest2 = fingerprint.get_stage_fingerprint_cached("cached_stage", module.cached_stage)
         assert manifest2 == manifest1
         # No new pending writes (cache hit)
-        assert len(fingerprint._pending_manifest_writes) == 0
+        assert len(_pending_manifest_entries()) == 0
     finally:
         sys.modules.pop("cached_stage", None)
         if fingerprint._state_db is not None:
@@ -2821,7 +2831,7 @@ def changing_stage():
             "changing_stage", module2.changing_stage
         )
         assert manifest2 != manifest1  # Different code = different manifest
-        assert len(fingerprint._pending_manifest_writes) == 1  # Queued for flush
+        assert len(_pending_manifest_entries()) == 1  # Queued for flush
     finally:
         sys.modules.pop("changing_stage", None)
         if fingerprint._state_db is not None:
@@ -2891,7 +2901,7 @@ def main_stage():
 
         # Recompute — should miss because helper_mod.py stat fails
         fingerprint.get_stage_fingerprint_cached("main_stage", mod_m.main_stage)
-        assert len(fingerprint._pending_manifest_writes) == 1  # Cache miss -> re-queued
+        assert len(_pending_manifest_entries()) == 1  # Cache miss -> re-queued
     finally:
         sys.modules.pop("helper_mod", None)
         sys.modules.pop("main_mod", None)
@@ -3006,17 +3016,17 @@ def test_flush_manifest_cache_failure_restores_pending(tmp_path, monkeypatch):
         lambda: blocker / "subdir",
     )
 
-    # Queue some entries
+    # Queue some entries under the directory the failing flush will try to write
+    state_dir = blocker / "subdir"
     fingerprint._pending_manifest_writes.clear()
     test_entries = [(b"sm:test_stage\x003.13\x001", b'{"m":{},"s":{}}')]
-    fingerprint._pending_manifest_writes.extend(test_entries)
+    fingerprint._pending_manifest_writes[state_dir] = list(test_entries)
 
     # Flush should fail (blocker is a file, so mkdir(parents=True) raises NotADirectoryError)
     fingerprint.flush_manifest_cache()
 
-    # Entries should be restored for retry
-    assert len(fingerprint._pending_manifest_writes) == 1
-    assert fingerprint._pending_manifest_writes[0] == test_entries[0]
+    # Entries should be restored for retry, under the same directory
+    assert fingerprint._pending_manifest_writes == {state_dir: test_entries}
 
     # Clean up
     fingerprint._pending_manifest_writes.clear()
@@ -3143,7 +3153,7 @@ def no_db_stage():
 
         assert "self:no_db_stage" in manifest
         # Should still queue for flush (even though flush may fail later)
-        assert len(fingerprint._pending_manifest_writes) == 1
+        assert len(_pending_manifest_entries()) == 1
     finally:
         sys.modules.pop("no_db_stage", None)
         fingerprint._pending_manifest_writes.clear()
@@ -3368,13 +3378,11 @@ def test_stage():
         manifest = fingerprint.get_stage_fingerprint_cached("test_stage", func)
         assert isinstance(manifest, dict)
         assert "self:test_stage" in manifest
-        assert len(fingerprint._pending_manifest_writes) > 0, "Should queue manifest writes"
+        assert len(_pending_manifest_entries()) > 0, "Should queue manifest writes"
 
         # Step 2: Flush to StateDB
         fingerprint.flush_manifest_cache()
-        assert len(fingerprint._pending_manifest_writes) == 0, (
-            "Pending writes should be empty after flush"
-        )
+        assert len(_pending_manifest_entries()) == 0, "Pending writes should be empty after flush"
 
         # Step 3: Verify manifest is in StateDB
         with state.StateDB(db_path, readonly=True) as db:
