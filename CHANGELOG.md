@@ -2,6 +2,41 @@
 
 <!-- version list -->
 
+## v0.5.9 (2026-10-25)
+
+### Bug Fixes
+
+- **engine**: A watch reload on loky 3.7 stops the previous run's workers, where 0.5.8 kept them
+  alive beside the new ones ([#502](https://github.com/sjawhar/pivot/pull/502),
+  [`d770e2e`](https://github.com/sjawhar/pivot/commit/d770e2ef074119e3731e8badbddf3eb9e9398e74))
+
+- **executor**: Idle workers of a one-shot run exit after a 10-second idle timeout, so a run that
+  waits on a long stage no longer keeps every worker it started alive
+  ([#502](https://github.com/sjawhar/pivot/pull/502),
+  [`d770e2e`](https://github.com/sjawhar/pivot/commit/d770e2ef074119e3731e8badbddf3eb9e9398e74))
+
+- **executor**: Reclaim idle one-shot workers ([#502](https://github.com/sjawhar/pivot/pull/502),
+  [`d770e2e`](https://github.com/sjawhar/pivot/commit/d770e2ef074119e3731e8badbddf3eb9e9398e74))
+
+### Continuous Integration
+
+- **bench**: Accept either stop status when two stop signals arrive together
+  ([#511](https://github.com/sjawhar/pivot/pull/511),
+  [`825fa47`](https://github.com/sjawhar/pivot/commit/825fa474b9fe3434bdb70410e7d9fc577b60f91f))
+
+- **bench**: Accept either stop status when two stop signals arrive together, so the benchmark
+  harness test no longer fails when both signals are pending
+  ([#511](https://github.com/sjawhar/pivot/pull/511),
+  [`825fa47`](https://github.com/sjawhar/pivot/commit/825fa474b9fe3434bdb70410e7d9fc577b60f91f))
+
+### Performance Improvements
+
+- **engine**: A run's first submission sizes its workers by replaying its schedule within resource
+  limits, so four stages under local_grade: 2 start two workers, not four
+  ([#502](https://github.com/sjawhar/pivot/pull/502),
+  [`d770e2e`](https://github.com/sjawhar/pivot/commit/d770e2ef074119e3731e8badbddf3eb9e9398e74))
+
+
 ## v0.5.8 (2026-10-23)
 
 ### Bug Fixes
