@@ -1,9 +1,9 @@
 ---
 date: 2026-02-02
 category: design-patterns
-tags: [pathlib, path-resolution, symlinks, cross-platform, brainstorming]
+tags: [pathlib, path-resolution, symlinks, posix, backslash, brainstorming]
 module: storage
-symptoms: [symlink-escape, cross-platform-paths, input-bindings]
+symptoms: [symlink-escape, backslash-read-as-separator, input-bindings]
 ---
 
 # Path Resolution Design Patterns in Python
@@ -36,21 +36,11 @@ Input bindings and output locations are relative to the project root (the top-mo
 
 **Chosen:** `os.path.normpath()` - store the symlink path, not the target.
 
-### 4. Windows Path Handling
+### 4. A Backslash Is Part of a Name
 
-Python's `pathlib.Path` on Unix treats backslashes as literal characters, not separators.
+Pivot runs on POSIX only (Linux and macOS), where `/` is the one path separator and a backslash is an ordinary character in a file or directory name. `pathlib.Path` on POSIX already treats it that way: `Path("a\\b.csv").parts == ("a\\b.csv",)`.
 
-**Solution:** Use `PureWindowsPath` which parses both `/` and `\` as separators on any platform:
-```python
-from pathlib import PureWindowsPath
-
-def normalize_to_posix(path: str) -> str:
-    return PureWindowsPath(path).as_posix()
-
-normalize_to_posix("foo\\bar")     # → "foo/bar"
-normalize_to_posix("foo/bar")      # → "foo/bar"
-normalize_to_posix("foo\\bar/baz") # → "foo/bar/baz"
-```
+Never convert user input with `PureWindowsPath(...).as_posix()` or `.replace("\\", "/")`. Pivot once did both (in `project.normalize_path` and in the `.pivotignore` filter), so a tracked file under a directory named `dir\with\backslash` was looked up at `dir/with/backslash/f.csv`: `pivot status` listed it as missing, `pivot repro` refused to run, `pivot checkout` restored it into a new `dir/with/backslash/` tree, and `pivot track`, `push` and `pull` could not find it by name. A `.pivotignore` pattern follows gitignore syntax, where a backslash escapes the character after it (`a\\b.csv` matches the file `a\b.csv`).
 
 ### 5. Path Formats at Different Layers
 
@@ -66,13 +56,11 @@ normalize_to_posix("foo\\bar/baz") # → "foo/bar/baz"
 
 ```python
 import os.path
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 def normalize_path(path: str, base: Path) -> Path:
     """Normalize path relative to base, preserving symlinks."""
-    # Handle Windows paths
-    posix_path = PureWindowsPath(path).as_posix()
-    p = Path(posix_path)
+    p = Path(path)  # a backslash stays part of a name
 
     # Make absolute from base
     abs_path = p.absolute() if p.is_absolute() else (base / p).absolute()
@@ -101,11 +89,9 @@ def to_project_relative(abs_path: Path, project_root: Path) -> str:
 
 **Workaround:** `Path(os.path.normpath(path.absolute()))`
 
-### PurePosixPath doesn't parse backslashes
+### Test names that hold a backslash
 
-On Unix, `PurePosixPath("foo\\bar")` has one component `"foo\\bar"`, not two.
-
-**Solution:** Always use `PureWindowsPath` for parsing user input, then `.as_posix()` for internal use.
+A conversion that splits on a backslash goes unnoticed with ordinary names. Test with a directory and a file whose names hold one, and check that a command finds the file at that path and writes nothing at the path the split gives.
 
 ## Invariant: Registration vs Execution Path Validation
 
@@ -128,4 +114,4 @@ When designing path resolution:
 3. Use `normpath` not `resolve` if symlinks should be preserved
 4. Never call `.resolve()`, `.exists()`, or `.is_symlink()` on artifact paths at registration time — see invariant above
 5. Test with symlinks pointing outside project root (especially cross-filesystem cache scenarios)
-6. Test with Windows-style paths if accepting user input
+6. Test with names that hold a backslash, and never read one as a separator

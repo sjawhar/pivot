@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v0.5.10 (2026-10-26)
+
+### Bug Fixes
+
+- **cli**: Keep pivot status --json output to one JSON document
+  ([#517](https://github.com/sjawhar/pivot/pull/517),
+  [`a9c6280`](https://github.com/sjawhar/pivot/commit/a9c62800d67f12e012b6e8d413e1ef161c1ba864))
+
+### Build System
+
+- **ruff**: Keep ruff's default excludes so a fixer never enters .venv
+  ([#515](https://github.com/sjawhar/pivot/pull/515),
+  [`d3bb6d5`](https://github.com/sjawhar/pivot/commit/d3bb6d569eda3f9f891f6d6ac0e798719da05176))
+
+### Testing
+
+- **benchmarks**: Find the measured session without racing /proc or killing session 0
+  ([#524](https://github.com/sjawhar/pivot/pull/524),
+  [`959c922`](https://github.com/sjawhar/pivot/commit/959c922681d5814505960cdd8497be8614dd3a87))
+
+
 ## v0.5.9 (2026-10-25)
 
 ### Bug Fixes
