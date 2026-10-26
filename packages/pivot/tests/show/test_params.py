@@ -6,15 +6,15 @@ from typing import TYPE_CHECKING
 import pytest
 import yaml
 
-from helpers import register_test_stage
 from pivot import stage_def
 from pivot.show import params
 from pivot.types import ChangeType, OutputFormat
+from tests import helpers
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike as Pipeline
     from tests.conftest import ValidLockContentFactory
 
 
@@ -26,8 +26,7 @@ if TYPE_CHECKING:
 def test_collect_params_from_stages_empty(mock_discovery: Pipeline) -> None:
     """Empty registry returns empty result."""
     result = params.collect_params_from_stages()
-    assert result["params"] == {}
-    assert result["unknown_stages"] == []
+    assert result == {}
 
 
 class _MyParams(stage_def.StageParams):
@@ -41,7 +40,7 @@ def _helper_params_stage(params: _MyParams) -> None:
 
 def test_collect_params_from_stages_with_params(mock_discovery: Pipeline) -> None:
     """Collects params from stage with Pydantic model."""
-    register_test_stage(
+    helpers.register_test_stage(
         _helper_params_stage,
         name="train",
         params=_MyParams(),
@@ -49,10 +48,9 @@ def test_collect_params_from_stages_with_params(mock_discovery: Pipeline) -> Non
 
     result = params.collect_params_from_stages()
 
-    assert "train" in result["params"]
-    assert result["params"]["train"]["learning_rate"] == 0.01
-    assert result["params"]["train"]["epochs"] == 10
-    assert result["unknown_stages"] == []
+    assert "test/train" in result
+    assert result["test/train"]["learning_rate"] == 0.01
+    assert result["test/train"]["epochs"] == 10
 
 
 def _helper_no_params_stage() -> None:
@@ -61,11 +59,11 @@ def _helper_no_params_stage() -> None:
 
 def test_collect_params_from_stages_without_params(mock_discovery: Pipeline) -> None:
     """Stages without params are not included."""
-    register_test_stage(_helper_no_params_stage, name="no_params")
+    helpers.register_test_stage(_helper_no_params_stage, name="no_params")
 
     result = params.collect_params_from_stages()
 
-    assert "no_params" not in result["params"]
+    assert "test/no_params" not in result
 
 
 class _OverrideParams(stage_def.StageParams):
@@ -78,14 +76,14 @@ def _helper_override_stage(params: _OverrideParams) -> None:
 
 def test_collect_params_from_stages_with_overrides(mock_discovery: Pipeline) -> None:
     """Applies params.yaml overrides."""
-    register_test_stage(_helper_override_stage, name="train", params=_OverrideParams())
+    helpers.register_test_stage(_helper_override_stage, name="train", params=_OverrideParams())
 
     params_yaml = mock_discovery.root / "params.yaml"
-    params_yaml.write_text(yaml.dump({"train": {"learning_rate": 0.05}}))
+    params_yaml.write_text(yaml.dump({"test/train": {"learning_rate": 0.05}}))
 
     result = params.collect_params_from_stages()
 
-    assert result["params"]["train"]["learning_rate"] == 0.05
+    assert result["test/train"]["learning_rate"] == 0.05
 
 
 class _FilterParams(stage_def.StageParams):
@@ -108,25 +106,19 @@ def test_collect_params_from_stages_filters_by_stage_names(
     mock_discovery: Pipeline,
 ) -> None:
     """Filters to specific stage names."""
-    register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
-    register_test_stage(_helper_filter_b, name="stage_b", params=_FilterParams())
-    register_test_stage(_helper_filter_c, name="stage_c", params=_FilterParams())
+    helpers.register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
+    helpers.register_test_stage(_helper_filter_b, name="stage_b", params=_FilterParams())
+    helpers.register_test_stage(_helper_filter_c, name="stage_c", params=_FilterParams())
 
-    result = params.collect_params_from_stages(["stage_a", "stage_c"])
+    result = params.collect_params_from_stages(["test/stage_a", "test/stage_c"])
 
-    assert "stage_a" in result["params"]
-    assert "stage_b" not in result["params"]
-    assert "stage_c" in result["params"]
+    assert "test/stage_a" in result
+    assert "test/stage_b" not in result
+    assert "test/stage_c" in result
 
 
-def test_collect_params_from_stages_unknown_stage(
-    mock_discovery: Pipeline,
-) -> None:
-    """Unknown stage name is returned in unknown_stages list."""
-    result = params.collect_params_from_stages(["nonexistent"])
-
-    assert "nonexistent" not in result["params"]
-    assert result["unknown_stages"] == ["nonexistent"]
+# Unknown stage names are rejected before collection by cli.helpers.resolve_stage_names;
+# covered by cli/test_cli_params.py::test_params_show_unknown_stage_error.
 
 
 # =============================================================================
@@ -157,20 +149,20 @@ def test_get_params_from_head_with_lock_file(
     """Returns params from lock file at HEAD."""
     from pivot import git
 
-    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
+    helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
 
     lock_content = yaml.dump(make_valid_lock_content(params={"lr": 0.05, "epochs": 10}))
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/stages/train.lock": lock_content.encode()},
+        return_value={".pivot/stages/test/train.lock": lock_content.encode()},
     )
 
     result = params.get_params_from_head()
 
-    assert "train" in result["params"]
-    assert result["params"]["train"]["lr"] == 0.05
-    assert result["params"]["train"]["epochs"] == 10
+    assert "test/train" in result["params"]
+    assert result["params"]["test/train"]["lr"] == 0.05
+    assert result["params"]["test/train"]["epochs"] == 10
     assert result["git_available"] is True
 
 
@@ -181,7 +173,7 @@ def test_get_params_from_head_no_lock_file(
     """Missing lock file means stage not in result."""
     from pivot import git
 
-    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
+    helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     mocker.patch.object(git, "read_files_from_head", return_value={})
     mocker.patch.object(git, "is_git_repo_with_head", return_value=True)
 
@@ -198,7 +190,7 @@ def test_get_params_from_head_no_git_repo(
     """Returns git_available=False when not in git repo."""
     from pivot import git
 
-    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
+    helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     mocker.patch.object(git, "read_files_from_head", return_value={})
     mocker.patch.object(git, "is_git_repo_with_head", return_value=False)
 
@@ -215,7 +207,7 @@ def test_get_params_from_head_invalid_yaml(
     """Invalid YAML in lock file is skipped."""
     from pivot import git
 
-    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
+    helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -234,12 +226,12 @@ def test_get_params_from_head_missing_params_key(
     """Lock file without params key is skipped."""
     from pivot import git
 
-    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
+    helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     lock_content = yaml.dump({"deps": []})
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/stages/train.lock": lock_content.encode()},
+        return_value={".pivot/stages/test/train.lock": lock_content.encode()},
     )
 
     result = params.get_params_from_head()
@@ -254,12 +246,12 @@ def test_get_params_from_head_empty_params(
     """Lock file with empty params dict is skipped."""
     from pivot import git
 
-    register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
+    helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
     lock_content = yaml.dump({"params": {}})
     mocker.patch.object(
         git,
         "read_files_from_head",
-        return_value={".pivot/stages/train.lock": lock_content.encode()},
+        return_value={".pivot/stages/test/train.lock": lock_content.encode()},
     )
 
     result = params.get_params_from_head()
@@ -275,8 +267,8 @@ def test_get_params_from_head_filters_by_stage_names(
     """Filters to specific stage names."""
     from pivot import git
 
-    register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
-    register_test_stage(_helper_filter_b, name="stage_b", params=_FilterParams())
+    helpers.register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
+    helpers.register_test_stage(_helper_filter_b, name="stage_b", params=_FilterParams())
 
     lock_a = yaml.dump(make_valid_lock_content(params={"value": 1}))
     lock_b = yaml.dump(make_valid_lock_content(params={"value": 2}))
@@ -284,15 +276,15 @@ def test_get_params_from_head_filters_by_stage_names(
         git,
         "read_files_from_head",
         return_value={
-            ".pivot/stages/stage_a.lock": lock_a.encode(),
-            ".pivot/stages/stage_b.lock": lock_b.encode(),
+            ".pivot/stages/test/stage_a.lock": lock_a.encode(),
+            ".pivot/stages/test/stage_b.lock": lock_b.encode(),
         },
     )
 
-    result = params.get_params_from_head(["stage_a"])
+    result = params.get_params_from_head(["test/stage_a"])
 
-    assert "stage_a" in result["params"]
-    assert "stage_b" not in result["params"]
+    assert "test/stage_a" in result["params"]
+    assert "test/stage_b" not in result["params"]
 
 
 # =============================================================================

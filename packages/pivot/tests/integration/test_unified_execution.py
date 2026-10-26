@@ -11,19 +11,19 @@ from typing import TYPE_CHECKING, override
 
 import pytest
 
-from helpers import register_test_stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks, sources
 from pivot.types import StageStatus
+from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
 
     from pivot.engine.types import OutputEvent, RunRequested
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike as Pipeline
 
 
-def _helper_noop(params: None) -> dict[str, str]:
+def _helper_noop() -> dict[str, str]:
     """No-op stage for testing."""
     return {"result": "ok"}
 
@@ -50,7 +50,6 @@ def minimal_pipeline(
 
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
-    monkeypatch.setattr(config, "get_state_db_path", lambda: tmp_path / "state" / "state.db")
     monkeypatch.chdir(tmp_path)
 
     # Create .pivot directory (required for project root detection)
@@ -65,20 +64,20 @@ async def test_engine_run_completes_with_exit_on_completion(
     minimal_pipeline: Pipeline,
 ) -> None:
     """Engine.run(exit_on_completion=True) should exit when stages complete."""
-    register_test_stage(_helper_noop, name="test_stage")
+    helpers.register_test_stage(_helper_noop, name="test_stage")
 
     async with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         eng.add_sink(collector)
-        eng.add_source(sources.OneShotSource(stages=["test_stage"], force=True, reason="test"))
+        eng.add_source(sources.OneShotSource(stages=["test/test_stage"], force=True, reason="test"))
 
         # This should complete without hanging
         await eng.run(exit_on_completion=True)
 
         results = await collector.get_results()
-        assert "test_stage" in results
+        assert "test/test_stage" in results
         # Stage completes (any terminal status is acceptable - the point is it doesn't hang)
-        assert results["test_stage"]["status"] in (
+        assert results["test/test_stage"]["status"] in (
             StageStatus.RAN,
             StageStatus.CACHED,
             StageStatus.BLOCKED,
@@ -92,12 +91,14 @@ async def test_engine_exit_on_completion_true_exits_when_idle(
     minimal_pipeline: Pipeline,
 ) -> None:
     """Engine.run(exit_on_completion=True) should exit as soon as stages complete."""
-    register_test_stage(_helper_noop, name="blocking_test")
+    helpers.register_test_stage(_helper_noop, name="blocking_test")
 
     async with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         eng.add_sink(collector)
-        eng.add_source(sources.OneShotSource(stages=["blocking_test"], force=True, reason="test"))
+        eng.add_source(
+            sources.OneShotSource(stages=["test/blocking_test"], force=True, reason="test")
+        )
 
         # Should complete quickly when exit_on_completion=True
         import time
@@ -110,7 +111,7 @@ async def test_engine_exit_on_completion_true_exits_when_idle(
         assert elapsed < 10.0
 
         results = await collector.get_results()
-        assert "blocking_test" in results
+        assert "test/blocking_test" in results
 
 
 def test_pipeline_reloaded_event_includes_stages_field() -> None:
@@ -138,8 +139,8 @@ async def test_result_collector_sink_collects_all_stage_results(
     minimal_pipeline: Pipeline,
 ) -> None:
     """ResultCollectorSink should collect results from all stages."""
-    register_test_stage(_helper_noop, name="stage_1")
-    register_test_stage(_helper_noop, name="stage_2")
+    helpers.register_test_stage(_helper_noop, name="stage_1")
+    helpers.register_test_stage(_helper_noop, name="stage_2")
 
     async with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
@@ -149,8 +150,8 @@ async def test_result_collector_sink_collects_all_stage_results(
         await eng.run(exit_on_completion=True)
 
         results = await collector.get_results()
-        assert "stage_1" in results
-        assert "stage_2" in results
+        assert "test/stage_1" in results
+        assert "test/stage_2" in results
 
 
 @pytest.mark.anyio
@@ -164,11 +165,13 @@ async def test_oneshot_source_passes_orchestration_params(
 
     class EventCapturingEngine(engine_mod.Engine):
         @override
-        async def _handle_run_requested(self, event: RunRequested) -> None:
+        async def _handle_run_requested(
+            self, event: RunRequested, *, recover_missing: bool = False
+        ) -> None:
             captured_events.append(event)
-            await super()._handle_run_requested(event)
+            await super()._handle_run_requested(event, recover_missing=recover_missing)
 
-    register_test_stage(_helper_noop, name="param_test")
+    helpers.register_test_stage(_helper_noop, name="param_test")
 
     async with EventCapturingEngine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
@@ -176,7 +179,7 @@ async def test_oneshot_source_passes_orchestration_params(
 
         # Create source with specific orchestration params
         source = sources.OneShotSource(
-            stages=["param_test"],
+            stages=["test/param_test"],
             force=True,
             reason="test",
             single_stage=True,
@@ -189,7 +192,7 @@ async def test_oneshot_source_passes_orchestration_params(
 
     assert len(captured_events) == 1
     event = captured_events[0]
-    assert event["stages"] == ["param_test"]
+    assert event["stages"] == ["test/param_test"]
     assert event["force"] is True
     assert event.get("single_stage") is True
     assert event.get("no_commit") is True

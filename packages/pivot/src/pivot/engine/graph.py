@@ -2,31 +2,34 @@
 
 from __future__ import annotations
 
+import collections
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
 import networkx as nx
-import pygtrie
 
+from pivot import project
+from pivot import types as pivot_types
 from pivot.engine.types import NodeType
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
+    from pivot.exceptions import DependencyNotFoundError
     from pivot.registry import RegistryStageInfo
-    from pivot.storage.track import PvtData
+    from pivot.storage.store import Store
 
 __all__ = [
     "artifact_node",
     "stage_node",
     "build_graph",
-    "build_tracked_trie",
+    "validate_dependency_sources",
+    "skips_missing_dependencies",
+    "get_runnable_stages",
     "get_consumers",
     "get_producer",
-    "get_watch_paths",
     "get_downstream_stages",
     "get_upstream_stages",
     "get_stage_dag",
+    "get_width",
     "update_stage",
     "get_artifact_consumers",
     "get_execution_order",
@@ -39,7 +42,7 @@ class GraphView(TypedDict):
     """Pre-extracted graph data for rendering.
 
     Decouples renderers from the internal bipartite graph representation.
-    All node identifiers are plain strings (stage names, artifact paths)
+    All node identifiers are plain strings (stage names, artifact identities)
     with no encoding prefixes.
 
     Edge direction is data-flow: producer -> consumer / input -> output.
@@ -51,9 +54,20 @@ class GraphView(TypedDict):
     artifact_edges: list[tuple[str, str]]
 
 
-def artifact_node(path: Path) -> str:
-    """Create artifact node ID from path."""
-    return f"artifact:{path}"
+def _coerce_identity(
+    identity: pivot_types.ArtifactIdentity | pathlib.Path | str,
+) -> pivot_types.ArtifactIdentity:
+    if isinstance(identity, pivot_types.ArtifactIdentity):
+        return identity
+    if isinstance(identity, pathlib.Path):
+        return _path_identity(str(identity))
+    return _path_identity(identity)
+
+
+def artifact_node(identity: pivot_types.ArtifactIdentity | pathlib.Path | str) -> str:
+    """Create artifact node ID from identity."""
+    resolved = _coerce_identity(identity)
+    return f"artifact:{pivot_types.identity_key(resolved)}"
 
 
 def stage_node(name: str) -> str:
@@ -64,67 +78,37 @@ def stage_node(name: str) -> str:
 def parse_node(node: str) -> tuple[NodeType, str]:
     """Extract NodeType and value from node ID.
 
-    Handles colons in paths by only splitting on the first colon.
+    Splits on the first colon to preserve identity strings with colons.
     """
     prefix, value = node.split(":", 1)
     return NodeType(prefix), value
 
 
-def _build_outputs_map(stages: dict[str, RegistryStageInfo]) -> dict[str, str]:
-    """Build mapping from output path to stage name.
-
-    Returns:
-        Dict of output_path -> stage_name
-
-    Note:
-        All paths are already normalized (absolute) by registry.py,
-        so simple dict lookup is sufficient.
-    """
-    return {
-        out_path: stage_name
-        for stage_name, stage_info in stages.items()
-        for out_path in stage_info["outs_paths"]
-    }
+def _path_identity(path: str) -> pivot_types.ArtifactIdentity:
+    return pivot_types.ArtifactIdentity(path, None)
 
 
-def _build_outputs_trie(stages: dict[str, RegistryStageInfo]) -> pygtrie.Trie[tuple[str, str]]:
-    """Build trie of output paths for directory dependency resolution."""
-    trie: pygtrie.Trie[tuple[str, str]] = pygtrie.Trie()
+def _output_identities(
+    out: pivot_types.ArtifactRef,
+) -> list[pivot_types.ArtifactIdentity]:
+    return [out.identity]
+
+
+def _dep_identity(dep: pivot_types.ArtifactRef) -> pivot_types.ArtifactIdentity:
+    """The artifact node a dependency hangs from: one file of a directory is its directory."""
+    return pivot_types.source_identity(dep)
+
+
+def _build_outputs_map(
+    stages: dict[str, RegistryStageInfo],
+) -> dict[pivot_types.ArtifactIdentity, str]:
+    """Build mapping from output identity to stage name."""
+    outputs_map = dict[pivot_types.ArtifactIdentity, str]()
     for stage_name, stage_info in stages.items():
-        for out_path in stage_info["outs_paths"]:
-            out_key = pathlib.Path(out_path).parts
-            trie[out_key] = (stage_name, out_path)
-    return trie
-
-
-def _find_producers_for_path_with_artifacts(
-    dep_path: str, outputs_trie: pygtrie.Trie[tuple[str, str]]
-) -> list[tuple[str, str]]:
-    """Find stages and their output paths overlapping the dependency path.
-
-    Returns:
-        List of (stage_name, output_path) tuples for producers with outputs
-        that overlap the dependency path (either as parent or child).
-    """
-    dep_key = pathlib.Path(dep_path).parts
-    results = list[tuple[str, str]]()
-    seen_stages = set[str]()
-
-    # Case 1: Dependency is parent of outputs (dir depends on files inside)
-    if outputs_trie.has_subtrie(dep_key):
-        for stage_name, out_path in outputs_trie.values(prefix=dep_key):
-            if stage_name not in seen_stages:
-                results.append((stage_name, out_path))
-                seen_stages.add(stage_name)
-
-    # Case 2: Dependency is child of output (file depends on parent dir)
-    prefix_item = outputs_trie.shortest_prefix(dep_key)
-    if prefix_item is not None and prefix_item.value is not None:
-        stage_name, out_path = prefix_item.value
-        if stage_name not in seen_stages:
-            results.append((stage_name, out_path))
-
-    return results
+        for out in stage_info["outs"]:
+            for identity in _output_identities(out):
+                outputs_map[identity] = stage_name
+    return outputs_map
 
 
 def _check_acyclic(g: nx.DiGraph[str]) -> None:
@@ -159,113 +143,96 @@ def _check_acyclic(g: nx.DiGraph[str]) -> None:
     )
 
 
-def build_tracked_trie(tracked_files: dict[str, PvtData]) -> pygtrie.Trie[str]:
-    """Build trie of tracked file paths for dependency checking.
+def validate_dependency_sources(
+    stages: dict[str, RegistryStageInfo],
+    store: Store | None = None,
+) -> list[DependencyNotFoundError]:
+    """Check that every dependency is either produced by a stage or exists on disk.
 
-    Keys are path tuples (from Path.parts), values are the absolute path string.
+    Collects ALL errors instead of failing on the first.
+
+    Returns a list of :class:`~pivot.exceptions.DependencyNotFoundError` for
+    unresolvable deps.  With *store=None*, only structural checks run (wrong
+    output key on a known stage); external-dep existence is silently skipped.
     """
-    trie: pygtrie.Trie[str] = pygtrie.Trie()
-    for abs_path in tracked_files:
-        path_key = pathlib.Path(abs_path).parts
-        trie[path_key] = abs_path
-    return trie
+    from pivot import exceptions
 
+    outputs_map = _build_outputs_map(stages)
+    stage_names = set(stages.keys())
+    errors = list[exceptions.DependencyNotFoundError]()
 
-def _is_tracked_path(dep: str, tracked_trie: pygtrie.Trie[str]) -> bool:
-    """Check if dependency is a tracked file (exact match or inside tracked directory)."""
-    dep_key = pathlib.Path(dep).parts
+    for stage_name, info in stages.items():
+        for dep in info["deps"].values():
+            dep_identity = _dep_identity(dep)
+            if dep_identity in outputs_map:
+                continue
+            if dep_identity.producer in stage_names:
+                errors.append(
+                    exceptions.DependencyNotFoundError(
+                        stage=stage_name,
+                        dep=pivot_types.identity_key(dep_identity),
+                        available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+                    )
+                )
+                continue
+            if store is None:
+                continue
+            if store.exists(dep):
+                continue
+            try:
+                input_path = store.checkout(dep)
+            except FileNotFoundError:
+                input_path = None
+                input_path_display = None
+            else:
+                input_path_display = project.to_relative_path(input_path)
+            errors.append(
+                exceptions.DependencyNotFoundError(
+                    stage=stage_name,
+                    dep=pivot_types.identity_key(dep_identity),
+                    available_outputs=[pivot_types.identity_key(out) for out in outputs_map],
+                    input_path=input_path,
+                    input_path_display=input_path_display,
+                )
+            )
 
-    # Exact match
-    if dep_key in tracked_trie:
-        return True
-
-    # Dependency is inside a tracked directory
-    prefix_item = tracked_trie.shortest_prefix(dep_key)
-    if prefix_item is not None and prefix_item.value is not None:
-        return True
-
-    # Dependency is a directory containing tracked files
-    return tracked_trie.has_subtrie(dep_key)
+    return errors
 
 
 def build_graph(
     stages: dict[str, RegistryStageInfo],
-    validate: bool = False,
-    tracked_files: dict[str, PvtData] | None = None,
 ) -> nx.DiGraph[str]:
     """Build bipartite artifact-stage graph from stage definitions.
 
     Args:
         stages: Dict mapping stage name to RegistryStageInfo.
-        validate: If True, validate that all dependencies exist.
-        tracked_files: Dict of tracked file paths -> PvtData (from .pvt files).
-            If provided, tracked files are recognized as valid dependency sources.
-
     Returns:
         Directed graph where:
-        - Nodes are either artifacts (files) or stages (functions)
+        - Nodes are either artifacts (identities) or stages (functions)
         - Edges go: artifact -> stage (consumed by) and stage -> artifact (produces)
 
     Raises:
         CyclicGraphError: If graph contains cycles (always checked)
-        DependencyNotFoundError: If dependency doesn't exist (when validate=True)
     """
-    from pivot import exceptions
-
     g: nx.DiGraph[str] = nx.DiGraph()
-
-    # Build lookup structures - outputs_trie needed for directory dependency edges
-    outputs_map = _build_outputs_map(stages)
-    outputs_trie = _build_outputs_trie(stages)
-    tracked_trie = build_tracked_trie(tracked_files) if tracked_files else None
 
     for stage_name, info in stages.items():
         stage = stage_node(stage_name)
         g.add_node(stage, type=NodeType.STAGE)
 
         # Deps: artifact -> stage
-        for dep_path in info["deps_paths"]:
-            artifact = artifact_node(pathlib.Path(dep_path))
+        for dep in info["deps"].values():
+            dep_identity = _dep_identity(dep)
+            artifact = artifact_node(dep_identity)
             g.add_node(artifact, type=NodeType.ARTIFACT)
             g.add_edge(artifact, stage)
 
-            # Check for direct producer via exact match
-            producer = outputs_map.get(dep_path)
-            if producer:
-                continue
-
-            # Check for directory dependency via trie - add edges from output files
-            # inside the directory to ensure proper stage DAG extraction
-            producers_info = _find_producers_for_path_with_artifacts(dep_path, outputs_trie)
-            if producers_info:
-                for _, out_path in producers_info:
-                    out_artifact = artifact_node(pathlib.Path(out_path))
-                    # Ensure output artifact node exists and add edge to consuming stage
-                    if out_artifact not in g:
-                        g.add_node(out_artifact, type=NodeType.ARTIFACT)
-                    g.add_edge(out_artifact, stage)
-                continue
-
-            # Validation: check dependency source exists (only when validate=True)
-            if validate:
-                # Check if exists on disk
-                if pathlib.Path(dep_path).exists():
-                    continue
-                # Check if tracked file
-                if tracked_trie and _is_tracked_path(dep_path, tracked_trie):
-                    continue
-                # Dependency not found
-                raise exceptions.DependencyNotFoundError(
-                    stage=stage_name,
-                    dep=dep_path,
-                    available_outputs=list(outputs_map.keys()),
-                )
-
         # Outs: stage -> artifact
         for out in info["outs"]:
-            artifact = artifact_node(pathlib.Path(str(out.path)))
-            g.add_node(artifact, type=NodeType.ARTIFACT)
-            g.add_edge(stage, artifact)
+            for identity in _output_identities(out):
+                artifact = artifact_node(identity)
+                g.add_node(artifact, type=NodeType.ARTIFACT)
+                g.add_edge(stage, artifact)
 
     # Always check for cycles - a cyclic graph is never valid
     _check_acyclic(g)
@@ -273,53 +240,39 @@ def build_graph(
     return g
 
 
-def get_consumers(g: nx.DiGraph[str], path: Path) -> list[str]:
+def get_consumers(g: nx.DiGraph[str], identity: pivot_types.ArtifactIdentity) -> list[str]:
     """Get stages that depend on this artifact.
 
     Args:
         g: The bipartite graph.
-        path: Path to the artifact.
+        identity: Artifact identity.
 
     Returns:
         List of stage names that consume this artifact.
     """
-    node = artifact_node(path)
+    node = artifact_node(identity)
     if node not in g:
         return []
     return [parse_node(n)[1] for n in g.successors(node) if g.nodes[n]["type"] == NodeType.STAGE]
 
 
-def get_producer(g: nx.DiGraph[str], path: Path) -> str | None:
+def get_producer(g: nx.DiGraph[str], identity: pivot_types.ArtifactIdentity) -> str | None:
     """Get the stage that produces this artifact.
 
     Args:
         g: The bipartite graph.
-        path: Path to the artifact.
+        identity: Artifact identity.
 
     Returns:
         Stage name that produces this artifact, or None if it's an input.
     """
-    node = artifact_node(path)
+    node = artifact_node(identity)
     if node not in g:
         return None
     for pred in g.predecessors(node):
         if g.nodes[pred]["type"] == NodeType.STAGE:
             return parse_node(pred)[1]
     return None
-
-
-def get_watch_paths(g: nx.DiGraph[str]) -> list[Path]:
-    """Get all artifact paths (for filesystem watcher).
-
-    Args:
-        g: The bipartite graph.
-
-    Returns:
-        List of all artifact paths in the graph.
-    """
-    return [
-        pathlib.Path(parse_node(n)[1]) for n in g.nodes() if g.nodes[n]["type"] == NodeType.ARTIFACT
-    ]
 
 
 def get_downstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:
@@ -343,6 +296,38 @@ def get_downstream_stages(g: nx.DiGraph[str], stage_name: str) -> list[str]:
     return downstream
 
 
+def skips_missing_dependencies(*, all_pipelines: bool, on_error: pivot_types.OnError) -> bool:
+    """Whether a run leaves out stages with a missing dependency instead of stopping: one
+    across all pipelines that keeps going past failures."""
+    return all_pipelines and on_error == pivot_types.OnError.KEEP_GOING
+
+
+def get_runnable_stages(
+    stages: dict[str, RegistryStageInfo],
+    store: Store,
+    *,
+    all_pipelines: bool,
+    on_error: pivot_types.OnError,
+) -> tuple[dict[str, RegistryStageInfo] | None, list[DependencyNotFoundError]]:
+    """Return the stages a run executes, with the missing dependencies found.
+
+    A run across all pipelines that keeps going past failures leaves out each stage with a
+    missing dependency and every stage downstream of it. Any other run stops at a missing
+    dependency, and the stages are None.
+    """
+    errors = validate_dependency_sources(stages, store=store)
+    if not errors:
+        return stages, errors
+    if not skips_missing_dependencies(all_pipelines=all_pipelines, on_error=on_error):
+        return None, errors
+    graph = build_graph(stages)
+    broken = set[str]()
+    for error in errors:
+        broken.add(error.stage)
+        broken.update(get_downstream_stages(graph, error.stage))
+    return {name: info for name, info in stages.items() if name not in broken}, errors
+
+
 def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInfo) -> None:
     """Incrementally update graph when a stage's definition changes.
 
@@ -358,19 +343,19 @@ def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInf
 
     # Get current deps and outs from graph
     current_deps = {
-        pathlib.Path(parse_node(n)[1])
+        pivot_types.identity_from_key(parse_node(n)[1])
         for n in g.predecessors(stage)
         if g.nodes[n]["type"] == NodeType.ARTIFACT
     }
     current_outs = {
-        pathlib.Path(parse_node(n)[1])
+        pivot_types.identity_from_key(parse_node(n)[1])
         for n in g.successors(stage)
         if g.nodes[n]["type"] == NodeType.ARTIFACT
     }
 
     # Get new deps and outs from info
-    new_deps = {pathlib.Path(p) for p in new_info["deps_paths"]}
-    new_outs = {pathlib.Path(str(out.path)) for out in new_info["outs"]}
+    new_deps = {_dep_identity(ref) for ref in new_info["deps"].values()}
+    new_outs = {ref.identity for ref in new_info["outs"]}
 
     # Remove old deps
     for removed_dep in current_deps - new_deps:
@@ -447,10 +432,186 @@ def get_stage_dag(g: nx.DiGraph[str]) -> nx.DiGraph[str]:
     return stage_dag
 
 
+def get_width(stage_dag: nx.DiGraph[str], stages: list[str], *, limit: int) -> int:
+    """Return the most of ``stages`` that can run at once, or ``limit`` if that is fewer.
+
+    The scheduler starts a stage once the stages of the run it consumes from have finished,
+    so stages can run together exactly when no chain of run stages connects any two of them.
+    The largest such set is the stage count minus a maximum matching that pairs each stage
+    with one stage it transitively depends on (Dilworth's theorem, by Konig's).
+
+    The widest topological level is such a set, so once it holds ``limit`` stages the matching
+    is skipped. Below ``limit`` the result is exact, unless the search for the matching runs
+    out of steps; then it is an upper bound on the width, never fewer than the stages that can
+    run at once. The stages are numbered from their names and dependencies alone, so the result
+    does not depend on the order of ``stages``.
+
+    Args:
+        stage_dag: Stage-only DAG (from get_stage_dag)
+        stages: The stages of the run; dependencies through stages outside it do not count
+        limit: The most workers the pool may have
+    """
+    names = sorted(set(stages))
+    count = len(names)
+    index = dict(zip(names, range(count), strict=True))
+    upstream = [[index[up] for up in stage_dag.successors(name) if up in index] for name in names]
+    downstream = [list[int]() for _ in names]
+    for i, producers in enumerate(upstream):
+        for j in producers:
+            downstream[j].append(i)
+    # Producers first, in an order fixed by the names and dependencies alone; a stage's level is
+    # one more than its deepest dependency's.
+    waiting = [len(producers) for producers in upstream]
+    topological = [i for i, pending in enumerate(waiting) if pending == 0]
+    level = [0] * count
+    for i in topological:
+        deeper = level[i] + 1
+        for k in downstream[i]:
+            if level[k] < deeper:
+                level[k] = deeper
+            waiting[k] -= 1
+            if not waiting[k]:
+                topological.append(k)
+    # Stages on one level, counted from the producers or from the last consumers, never reach
+    # each other, so the widest level is a lower bound on the width.
+    remaining = [0] * count
+    for i in reversed(topological):
+        deeper = remaining[i] + 1
+        for j in upstream[i]:
+            if remaining[j] < deeper:
+                remaining[j] = deeper
+    widest = max(
+        max(collections.Counter(level).values(), default=0),
+        max(collections.Counter(remaining).values(), default=0),
+    )
+    if widest >= limit:
+        return limit
+
+    # Renumber consumers first, so stage i depends only on stages numbered above i. Each
+    # stage lists its dependencies deepest first, the ones a chain of stages most likely runs
+    # through, ties by number.
+    consumers_first = topological[::-1]
+    number = [0] * count
+    for position, i in enumerate(consumers_first):
+        number[i] = position
+    direct = [list[int]() for _ in names]
+    # A stable sort keeps equal levels in consumers-first order, that is, by number.
+    for j in sorted(consumers_first, key=level.__getitem__, reverse=True):
+        numbered = number[j]
+        for i in downstream[j]:
+            direct[number[i]].append(numbered)
+    order = range(count - 1, -1, -1)  # producers first
+
+    # The stages a matching leaves unmatched are an upper bound on the width.
+    owner = [-1] * count  # the stage each dependency is matched to
+    unmatched = list[int]()
+    for i in reversed(order):
+        for j in direct[i]:
+            if owner[j] == -1:
+                owner[j] = i
+                break
+        else:
+            unmatched.append(i)
+    if len(unmatched) == widest:
+        return widest
+    matched_bits = bytearray((count + 7) // 8)
+    for j, stage in enumerate(owner):
+        if stage != -1:
+            matched_bits[j >> 3] |= 1 << (j & 7)
+    taken = int.from_bytes(matched_bits, "little")  # bitset of matched dependencies
+
+    # Bitset of the run stages each stage transitively depends on, built from each
+    # dependency's own set with the dependency added.
+    reach = [0] * len(names)
+    closed = [0] * len(names)
+    for i in order:
+        bits = 0
+        for j in direct[i]:
+            bits |= closed[j]
+        reach[i] = bits
+        closed[i] = bits | (1 << i)
+    still_unmatched = list[int]()
+    for i in unmatched:
+        free_bits = reach[i] & ~taken
+        if free_bits:
+            free = (free_bits & -free_bits).bit_length() - 1
+            owner[free] = i
+            taken |= 1 << free
+        else:
+            still_unmatched.append(i)
+
+    # Augment in rounds. Within a round no search explores a dependency an earlier search
+    # explored. That can hide an augmenting path once a search succeeds, so rounds repeat until
+    # one matches no stage: the matching did not change during that round, so no stage it left
+    # unmatched has an augmenting path, and the matching is maximum. The searches share a
+    # budget of steps; once it runs out, the stages still unmatched bound the width from above,
+    # so the pool may be larger than the width but never smaller.
+    budget = _AUGMENT_STEPS
+    unmatched_count = len(still_unmatched)
+    while unmatched_count > widest:
+        seen = 0
+        left = list[int]()
+        for start in still_unmatched:
+            matched, seen, budget = _augment(start, reach, owner, seen, budget)
+            if matched:
+                unmatched_count -= 1
+                if unmatched_count == widest:
+                    return widest
+            elif budget == 0:
+                return min(unmatched_count, limit)
+            else:
+                left.append(start)
+        if len(left) == len(still_unmatched):
+            break
+        still_unmatched = left
+    return min(unmatched_count, limit)
+
+
+# Steps of augmenting-path search `get_width` takes before it settles for an upper bound. A
+# count, not a clock, so one graph and limit always give one size.
+_AUGMENT_STEPS = 10_000
+# Steps per stage, dependency and requested resource that `Scheduler.resource_width`'s replay
+# takes beyond `_AUGMENT_STEPS` before it settles for its limit, `get_width`'s pool size.
+_REPLAY_STEPS_PER_INPUT = 8
+
+
+def _augment(
+    start: int, reach: list[int], owner: list[int], seen: int, budget: int
+) -> tuple[bool, int, int]:
+    """Match ``start`` along an augmenting path, if one exists, without recursion.
+
+    ``seen`` holds dependencies known to lead to no augmenting path. Returns whether ``start``
+    was matched, ``seen`` with the dependencies this search explored, and the steps left of
+    ``budget``; a search that runs out of steps returns unmatched with none left.
+    """
+    path = [start]  # stages on the path; path[k + 1] owns dependencies[k]
+    dependencies = list[int]()
+    while path:
+        if budget == 0:
+            return False, seen, 0
+        budget -= 1
+        candidates = reach[path[-1]] & ~seen
+        if not candidates:
+            path.pop()
+            if dependencies:
+                dependencies.pop()
+            continue
+        lowest = candidates & -candidates
+        seen |= lowest
+        dependency = lowest.bit_length() - 1
+        dependencies.append(dependency)
+        if owner[dependency] == -1:
+            for stage, matched in zip(path, dependencies, strict=True):
+                owner[matched] = stage
+            return True, seen, budget
+        path.append(owner[dependency])
+    return False, seen, budget
+
+
 def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:
     """Extract a renderer-friendly view from the bipartite graph.
 
-    Walks the bipartite graph, collecting stage names, artifact paths,
+    Walks the bipartite graph, collecting stage names, artifact identities,
     and derived edges without exposing the internal node encoding.
 
     Edge semantics (data-flow direction):
@@ -478,7 +639,7 @@ def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:
 
     # Derive stage-to-stage edges (producer -> consumer)
     # Walk: stage -> artifact (produces) -> stage (consumes)
-    # Use set to deduplicate edges (directory deps can create multiple paths)
+    # Use set to deduplicate edges
     for node in g.nodes():
         if g.nodes[node]["type"] != NodeType.STAGE:
             continue
@@ -518,20 +679,20 @@ def extract_graph_view(g: nx.DiGraph[str]) -> GraphView:
 
 def get_artifact_consumers(
     g: nx.DiGraph[str],
-    path: Path,
+    identity: pivot_types.ArtifactIdentity,
     include_downstream: bool = True,
 ) -> list[str]:
     """Get all stages affected by a change to this artifact.
 
     Args:
         g: The bipartite graph.
-        path: Path to the artifact.
+        identity: Artifact identity.
         include_downstream: If True, include transitive dependents.
 
     Returns:
         Sorted list of stage names that would be affected (deterministic order).
     """
-    direct = get_consumers(g, path)
+    direct = get_consumers(g, identity)
     if not direct:
         return []
 

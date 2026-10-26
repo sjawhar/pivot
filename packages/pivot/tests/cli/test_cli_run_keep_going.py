@@ -2,103 +2,89 @@
 
 Both run and repro default to fail-fast.
 Use --keep-going / -k to continue after failures.
+
+Any stage failure makes run/repro exit 1 (#452 commit 378abd0, "return
+non-zero exit on repro/run stage failure").
 """
 
 from __future__ import annotations
 
 import json
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
-from helpers import register_test_stage
-from pivot import cli, loaders, outputs
+from pivot import cli, compose
 
 if TYPE_CHECKING:
-    import pytest
-    from click.testing import CliRunner
+    import pathlib
 
-    from pivot.pipeline.pipeline import Pipeline
+    from click.testing import CliRunner
 
 # =============================================================================
 # Module-level stage functions for testing (required for pickling)
 # =============================================================================
 
 
-class _FailingTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("failing.txt", loaders.PathOnly())]
-
-
-class _SucceedingTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("succeeding.txt", loaders.PathOnly())]
-
-
-class _FirstTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("first.txt", loaders.PathOnly())]
-
-
-class _SecondTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("second.txt", loaders.PathOnly())]
-
-
-class _IndependentTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("independent.txt", loaders.PathOnly())]
-
-
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-
-class _DownstreamTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("downstream.txt", loaders.PathOnly())]
-
-
-def _stage_failing(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _FailingTxtOutputs:
+@compose.stage
+def failing(input_file: str) -> str:
     raise RuntimeError("Intentional failure")
 
 
-def _stage_succeeding(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _SucceedingTxtOutputs:
-    pathlib.Path("succeeding.txt").write_text("success")
-    return {"output": pathlib.Path("succeeding.txt")}
+@compose.stage
+def succeeding(input_file: str) -> str:
+    return "success"
 
 
-def _stage_first_failing(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _FirstTxtOutputs:
+@compose.stage
+def first(input_file: str) -> str:
     raise RuntimeError("First failed")
 
 
-def _stage_second(
-    first: Annotated[pathlib.Path, outputs.Dep("first.txt", loaders.PathOnly())],
-) -> _SecondTxtOutputs:
-    _ = first
-    pathlib.Path("second.txt").write_text("should not run")
-    return {"output": pathlib.Path("second.txt")}
+@compose.stage
+def second(first_output: str) -> str:
+    return "should not run"
 
 
-def _stage_independent(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _IndependentTxtOutputs:
-    pathlib.Path("independent.txt").write_text("runs fine")
-    return {"output": pathlib.Path("independent.txt")}
+@compose.stage
+def independent(input_file: str) -> str:
+    return "runs fine"
 
 
-def _stage_downstream(
-    failing: Annotated[pathlib.Path, outputs.Dep("failing.txt", loaders.PathOnly())],
-) -> _DownstreamTxtOutputs:
-    _ = failing
-    pathlib.Path("downstream.txt").write_text("ran")
-    return {"output": pathlib.Path("downstream.txt")}
+@compose.stage
+def downstream(failing_output: str) -> str:
+    return "ran"
 
 
-def _stage_process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    pathlib.Path("output.txt").write_text("processed")
-    return {"output": pathlib.Path("output.txt")}
+@compose.stage
+def process(input_file: str) -> str:
+    return "processed"
+
+
+def _output(pipeline: compose.Pipeline, stage_name: str) -> pathlib.Path:
+    return pipeline.root / "data" / "test" / f"{stage_name}.txt"
+
+
+def _input(pipeline: compose.Pipeline) -> str:
+    raw_dir = pipeline.root / "data" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "input.txt").write_text("data")
+    return pipeline.input("input.txt", t=str)
+
+
+def _register_failing_and_succeeding(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        raw = _input(pipeline)
+        failing(raw)
+        succeeding(raw)
+
+
+def _register_failing_and_downstream(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        downstream(failing(_input(pipeline)))
+
+
+def _register_process(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        process(_input(pipeline))
 
 
 # =============================================================================
@@ -107,91 +93,69 @@ def _stage_process(
 
 
 def test_repro_keep_going_flag_continues_after_failure(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going continues independent stages after failure."""
-    (tmp_path / "input.txt").write_text("data")
-
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_succeeding, name="succeeding")
+    _register_failing_and_succeeding(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
-    assert "succeeding" in result.output and "done" in result.output
-    assert (tmp_path / "succeeding.txt").read_text() == "success"
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
+    assert "test/succeeding" in result.output and "done" in result.output
+    assert _output(mock_discovery, "succeeding").read_text() == "success"
 
 
 def test_repro_keep_going_flag_skips_downstream(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going skips stages downstream of failed stage."""
-    (tmp_path / "input.txt").write_text("data")
-
-    register_test_stage(_stage_first_failing, name="first")
-    register_test_stage(_stage_second, name="second")
-    register_test_stage(_stage_independent, name="independent")
+    with mock_discovery:
+        raw = _input(mock_discovery)
+        second(first(raw))
+        independent(raw)
 
     result = runner.invoke(cli.cli, ["repro", "--keep-going"])
 
-    assert result.exit_code == 0
-    assert "first" in result.output and "FAILED" in result.output
+    assert result.exit_code == 1, result.output
+    assert "test/first" in result.output and "FAILED" in result.output
     # Blocked stages now show as "blocked" in console output
-    assert "second" in result.output and "blocked" in result.output
-    # Summary shows blocked count
-    assert "blocked" in result.output
-    assert "independent" in result.output and "done" in result.output
+    assert "test/second" in result.output and "blocked" in result.output
+    assert "test/independent" in result.output and "done" in result.output
+    assert not _output(mock_discovery, "second").exists()
 
 
 def test_repro_keep_going_short_flag(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro -k short flag works the same as --keep-going."""
-    (tmp_path / "input.txt").write_text("data")
-
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_succeeding, name="succeeding")
+    _register_failing_and_succeeding(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro", "-k"])
 
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
-    assert "succeeding" in result.output and "done" in result.output
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
+    assert "test/succeeding" in result.output and "done" in result.output
 
 
 def test_repro_without_keep_going_stops_on_failure(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro default behavior stops pipeline on first failure (downstream stages blocked)."""
-    (tmp_path / "input.txt").write_text("data")
-
-    # Use dependent stages to test deterministically:
-    # failing runs first, downstream depends on its output
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_downstream, name="downstream")
+    # Dependent stages make this deterministic: downstream consumes failing's output
+    _register_failing_and_downstream(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro"])
 
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
     # Without --keep-going, downstream stages show as blocked
-    assert "downstream" in result.output and "blocked" in result.output
-    # Summary shows blocked count
-    assert "blocked" in result.output
-    assert not (tmp_path / "downstream.txt").exists()
+    assert "test/downstream" in result.output and "blocked" in result.output
+    assert not _output(mock_discovery, "downstream").exists()
 
 
 def test_repro_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
@@ -204,72 +168,59 @@ def test_repro_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
 
 
 def test_repro_keep_going_with_json_output(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going works with --json output mode."""
-    (tmp_path / "input.txt").write_text("data")
-
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_succeeding, name="succeeding")
+    _register_failing_and_succeeding(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro", "--keep-going", "--json"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1, result.output
     # Parse JSONL output - look for the execution result event
     lines = result.output.strip().split("\n")
     events = [json.loads(line) for line in lines if line.strip()]
 
     # Should have both stage completions (JSONL uses stage_complete)
-    stage_completed_events = [e for e in events if e.get("type") == "stage_complete"]
+    stage_completed_events = [e for e in events if e["type"] == "stage_complete"]
     assert len(stage_completed_events) == 2
 
     statuses = {e["stage"]: e["status"] for e in stage_completed_events}
-    assert statuses["failing"] == "failed"
-    assert statuses["succeeding"] == "ran"
+    assert statuses["test/failing"] == "failed"
+    assert statuses["test/succeeding"] == "ran"
 
 
 def test_repro_keep_going_with_dry_run(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going is accepted with --dry-run (flag is no-op since nothing executes)."""
-    (tmp_path / "input.txt").write_text("data")
-
-    register_test_stage(_stage_process, name="process")
+    _register_process(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro", "--keep-going", "--dry-run"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # Dry run shows what would run without executing
-    assert "would run" in result.output.lower() or "Would run" in result.output
+    assert "would run" in result.output.lower()
     # The output file should NOT exist (dry run doesn't execute)
-    assert not (tmp_path / "output.txt").exists()
+    assert not _output(mock_discovery, "process").exists()
 
 
 def test_repro_keep_going_with_dry_run_json(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --keep-going works with --dry-run --json combination."""
-    (tmp_path / "input.txt").write_text("data")
-
-    register_test_stage(_stage_process, name="process")
+    _register_process(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro", "--keep-going", "--dry-run", "--json"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # Should produce valid JSON output
     output = json.loads(result.output)
     assert "stages" in output
     # The stage should be listed as "would_run"
-    assert output["stages"]["process"]["would_run"] is True
+    assert output["stages"]["test/process"]["would_run"] is True
 
 
 # =============================================================================
@@ -286,79 +237,59 @@ def test_run_fail_fast_flag_shown_in_help(runner: CliRunner) -> None:
 
 
 def test_run_default_fails_fast(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run defaults to fail-fast mode (stops on first failure)."""
-    (tmp_path / "input.txt").write_text("data")
-
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_succeeding, name="succeeding")
+    _register_failing_and_succeeding(mock_discovery)
 
     # Run both stages - default should be fail-fast
-    result = runner.invoke(cli.cli, ["run", "failing", "succeeding"])
+    result = runner.invoke(cli.cli, ["run", "test/failing", "test/succeeding"])
 
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
 
 
 def test_run_fail_fast_stops_early(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --fail-fast prevents subsequent stages from executing after a failure."""
-    (tmp_path / "input.txt").write_text("data")
+    _register_failing_and_succeeding(mock_discovery)
 
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_succeeding, name="succeeding")
+    result = runner.invoke(cli.cli, ["run", "--fail-fast", "test/failing", "test/succeeding"])
 
-    result = runner.invoke(cli.cli, ["run", "--fail-fast", "failing", "succeeding"])
-
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
 
 
 def test_run_keep_going_continues_after_failure(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --keep-going continues after failures."""
-    (tmp_path / "input.txt").write_text("data")
+    _register_failing_and_succeeding(mock_discovery)
 
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_succeeding, name="succeeding")
+    result = runner.invoke(cli.cli, ["run", "--keep-going", "test/failing", "test/succeeding"])
 
-    result = runner.invoke(cli.cli, ["run", "--keep-going", "failing", "succeeding"])
-
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
-    assert "succeeding" in result.output and "done" in result.output
-    assert (tmp_path / "succeeding.txt").read_text() == "success"
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
+    assert "test/succeeding" in result.output and "done" in result.output
+    assert _output(mock_discovery, "succeeding").read_text() == "success"
 
 
 def test_run_keep_going_short_flag(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run -k short flag works the same as --keep-going."""
-    (tmp_path / "input.txt").write_text("data")
+    _register_failing_and_succeeding(mock_discovery)
 
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_succeeding, name="succeeding")
+    result = runner.invoke(cli.cli, ["run", "-k", "test/failing", "test/succeeding"])
 
-    result = runner.invoke(cli.cli, ["run", "-k", "failing", "succeeding"])
-
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
-    assert "succeeding" in result.output and "done" in result.output
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
+    assert "test/succeeding" in result.output and "done" in result.output
 
 
 def test_run_keep_going_flag_shown_in_help(runner: CliRunner) -> None:
@@ -379,51 +310,39 @@ def test_repro_fail_fast_flag_shown_in_help(runner: CliRunner) -> None:
 
 
 def test_repro_fail_fast_stops_on_failure(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --fail-fast stops pipeline on first failure (same as default)."""
-    (tmp_path / "input.txt").write_text("data")
-
-    # Use dependent stages: failing runs first, downstream depends on its output
-    register_test_stage(_stage_failing, name="failing")
-    register_test_stage(_stage_downstream, name="downstream")
+    _register_failing_and_downstream(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro", "--fail-fast"])
 
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
-    assert "downstream" in result.output and "blocked" in result.output
-    assert not (tmp_path / "downstream.txt").exists()
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
+    assert "test/downstream" in result.output and "blocked" in result.output
+    assert not _output(mock_discovery, "downstream").exists()
 
 
 def test_run_fail_fast_and_keep_going_mutually_exclusive(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --fail-fast and --keep-going are mutually exclusive."""
-    register_test_stage(_stage_process, name="process")
-    (tmp_path / "input.txt").write_text("data")
+    _register_process(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--fail-fast", "--keep-going", "process"])
+    result = runner.invoke(cli.cli, ["run", "--fail-fast", "--keep-going", "test/process"])
 
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output.lower()
 
 
 def test_repro_fail_fast_and_keep_going_mutually_exclusive(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repro --fail-fast and --keep-going are mutually exclusive."""
-    register_test_stage(_stage_process, name="process")
-    (tmp_path / "input.txt").write_text("data")
+    _register_process(mock_discovery)
 
     result = runner.invoke(cli.cli, ["repro", "--fail-fast", "--keep-going"])
 

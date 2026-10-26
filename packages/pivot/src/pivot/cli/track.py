@@ -49,10 +49,15 @@ def _get_all_stage_outputs() -> dict[str, pathlib.Path]:
         Resolves all paths upfront and fails fast if any are problematic.
         This provides clear error messages showing ALL issues at once.
     """
+    store = cli_helpers.get_workspace_store()
+    if store is None:
+        return {}
+
+    # Workspace paths of every declared output (the same resolution checkout/verify use)
     outputs_normalized = set[str]()
     for stage_name in cli_helpers.list_stages():
         info = cli_helpers.get_stage(stage_name)
-        outputs_normalized.update(info.get("outs_paths", []))
+        outputs_normalized.update(str(store.resolve_display_path(out)) for out in info["outs"])
 
     # Pre-resolve all stage outputs with explicit error handling
     outputs_resolved = dict[str, pathlib.Path]()
@@ -81,21 +86,27 @@ def _track_single_path(
     stage_outputs_resolved: dict[str, pathlib.Path],
     existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
+    *,
+    warn_left_out_symlinks: bool,
 ) -> TrackResult:
     """Track a single file or directory.
+
+    ``warn_left_out_symlinks`` logs the warning naming the symlinks a tracked directory leaves
+    out; the caller turns it off under ``--quiet``, like this command's other warning.
 
     Returns:
         TrackResult with optional warning and the tracked path for the caller to handle output.
     """
-    # Normalize path from cwd (preserving symlinks) for consistency with registry/pvt
-    path = project.normalize_path(path_str, base=pathlib.Path.cwd())
-
-    # Validate resolved path is within project root
+    # Normalize path from cwd (preserving symlinks) for consistency with registry/pvt, and
+    # validate it is within project root; a path typed through a symlink to the project is
+    # placed under the project root
     project_root = project.get_project_root()
-    try:
-        path.relative_to(project_root)
-    except ValueError:
-        raise click.ClickException(f"Path '{path_str}' resolves outside project root") from None
+    relative = project.relative_within(
+        project.normalize_path(path_str, base=pathlib.Path.cwd()), project_root
+    )
+    if relative is None:
+        raise click.ClickException(f"Path '{path_str}' resolves outside project root")
+    path = project_root / relative
 
     abs_path_str = str(path)
 
@@ -144,30 +155,32 @@ def _track_single_path(
 
     # Hash and cache
     if path.is_dir():
-        tree_hash, manifest = cache.hash_directory(path)
+        dir_hash = cache.hash_directory(
+            path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
+        )
+        manifest = dir_hash["manifest"]
         total_size = sum(e["size"] for e in manifest)
         num_files = len(manifest)
 
-        # Save each file to cache
         for entry in manifest:
             file_path = path / entry["relpath"]
             file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
-            if not file_cache_path.exists():
-                cache.copy_to_cache(file_path, file_cache_path)
+            cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
 
         pvt_data: track_mod.PvtData = {
             "path": path.name,
-            "hash": tree_hash,
+            "hash": dir_hash["hash"],
             "size": total_size,
             "num_files": num_files,
             "manifest": manifest,
         }
+        if "empty_dirs" in dir_hash:
+            pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
     else:
         file_hash, _ = cache.hash_file(path)
         file_size = path.stat().st_size
         file_cache_path = cache.get_cache_path(cache_dir, file_hash)
-        if not file_cache_path.exists():
-            cache.copy_to_cache(path, file_cache_path)
+        cache.copy_to_cache(path, file_cache_path)
 
         pvt_data = {
             "path": path.name,
@@ -207,7 +220,14 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     existing_tracked = track_mod.discover_pvt_files(project_root)
 
     for path_str in paths:
-        result = _track_single_path(path_str, cache_dir, stage_outputs, existing_tracked, force)
+        result = _track_single_path(
+            path_str,
+            cache_dir,
+            stage_outputs,
+            existing_tracked,
+            force,
+            warn_left_out_symlinks=not quiet,
+        )
         if not quiet:
             if result["warning"]:
                 click.echo(result["warning"], err=True)

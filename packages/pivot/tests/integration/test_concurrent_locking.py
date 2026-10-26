@@ -1,149 +1,197 @@
-"""Integration tests for concurrent pivot execution with artifact locks.
+"""Integration tests for concurrent execution and artifact locking.
 
-Tests use real subprocess.Popen to launch multiple `pivot run` processes
-concurrently and verify that artifact locks coordinate access correctly.
+The subprocesses use real ``pivot run`` commands. The generated pipelines use
+handles, so read/write locking is exercised on ArtifactIdentity rather than
+user-selected output paths.
 """
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import os
 import pathlib
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING
 
-from conftest import init_git_repo
+from tests.conftest import init_git_repo
 
-# Resolve pivot CLI binary from the same venv as the test runner
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+# Resolve pivot CLI binary from the same venv as the test runner.
 _PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
+
 
 # ---------------------------------------------------------------------------
 # Pipeline templates
 # ---------------------------------------------------------------------------
 
-_PIPELINE_DISJOINT = '''\
-import os
+_PIPELINE_DISJOINT = """\
 import pathlib
 import time
-from typing import Annotated, TypedDict
-from pivot.pipeline.pipeline import Pipeline
-from pivot.outputs import Out
-from pivot import loaders
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+from pivot.compose import Pipeline, stage
 
 
-class _OutputA(TypedDict):
-    data: Annotated[pathlib.Path, Out("output_a.txt", loaders.PathOnly())]
+def record(label: str) -> None:
+    with pathlib.Path("timing.log").open("a") as timing:
+        timing.write(f"{label} {time.monotonic()}\\n")
 
 
-class _OutputB(TypedDict):
-    data: Annotated[pathlib.Path, Out("output_b.txt", loaders.PathOnly())]
+def wait_for(label: str) -> None:
+    # Both runs must be inside their stages at once; a run serialised behind the other
+    # never sees its partner start and fails here instead of passing on timing luck.
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        lines = pathlib.Path("timing.log").read_text().splitlines()
+        if any(line.startswith(label + " ") for line in lines):
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"partner {label} never started")
 
 
-def stage_a() -> _OutputA:
-    """Writes output_a.txt with controlled sleep."""
-    duration = float(os.environ.get("STAGE_A_SLEEP", "2"))
-    time.sleep(duration)
-    p = pathlib.Path("output_a.txt")
-    p.write_text("hello from a")
-    return _OutputA(data=p)
+@stage
+def stage_a() -> str:
+    record("a_start")
+    wait_for("b_start")
+    record("a_end")
+    return "hello from a"
 
 
-def stage_b() -> _OutputB:
-    """Writes output_b.txt (disjoint from A)."""
-    duration = float(os.environ.get("STAGE_B_SLEEP", "2"))
-    time.sleep(duration)
-    p = pathlib.Path("output_b.txt")
-    p.write_text("hello from b")
-    return _OutputB(data=p)
+@stage
+def stage_b() -> str:
+    record("b_start")
+    wait_for("a_start")
+    record("b_end")
+    return "hello from b"
 
 
-pipeline.register(stage_a)
-pipeline.register(stage_b)
-'''
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    stage_a()
+    stage_b()
+"""
 
 _PIPELINE_OVERLAPPING = """\
 import os
 import pathlib
 import time
-from typing import Annotated, TypedDict
-from pivot.pipeline.pipeline import Pipeline
-from pivot.outputs import Dep, Out
-from pivot.loaders import PathOnly
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+from pivot.compose import Pipeline, stage
 
 
-class _OutputA(TypedDict):
-    data: Annotated[pathlib.Path, Out("output_a.txt", PathOnly())]
+@stage
+def stage_a() -> str:
+    pathlib.Path("stage_a_started").touch()
+    time.sleep(float(os.environ.get("STAGE_A_SLEEP", "3")))
+    return "hello from a"
 
 
-class _OutputC(TypedDict):
-    data: Annotated[pathlib.Path, Out("output_c.txt", PathOnly())]
+@stage
+def stage_c(dep_a: str) -> str:
+    return f"got: {dep_a}"
 
 
-def stage_a() -> _OutputA:
-    duration = float(os.environ.get("STAGE_A_SLEEP", "3"))
-    time.sleep(duration)
-    p = pathlib.Path("output_a.txt")
-    p.write_text("hello from a")
-    return _OutputA(data=p)
-
-
-def stage_c(
-    dep_a: Annotated[pathlib.Path, Dep("output_a.txt", PathOnly())],
-) -> _OutputC:
-    content = dep_a.read_text()
-    p = pathlib.Path("output_c.txt")
-    p.write_text(f"got: {content}")
-    return _OutputC(data=p)
-
-
-pipeline.register(stage_a)
-pipeline.register(stage_c)
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    a = stage_a()
+    stage_c(a)
 """
 
-_PIPELINE_CROSSED = '''\
+_PIPELINE_CROSSED = """\
 import os
 import pathlib
 import time
-from typing import Annotated, TypedDict
-from pivot.pipeline.pipeline import Pipeline
-from pivot.outputs import Out
-from pivot.loaders import PathOnly
-from pivot import loaders
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+from pivot.compose import Pipeline, stage
 
 
-class _OutputX(TypedDict):
-    data: Annotated[pathlib.Path, Out("output_x.txt", PathOnly())]
-
-
-class _OutputY(TypedDict):
-    data: Annotated[pathlib.Path, Out("output_y.txt", PathOnly())]
-
-
-def stage_x() -> _OutputX:
-    """Writes output_x.txt with brief sleep."""
+@stage
+def stage_x() -> str:
     time.sleep(float(os.environ.get("STAGE_X_SLEEP", "0.5")))
-    p = pathlib.Path("output_x.txt")
-    p.write_text("hello from x")
-    return _OutputX(data=p)
+    return "hello from x"
 
 
-def stage_y() -> _OutputY:
-    """Writes output_y.txt with brief sleep."""
+@stage
+def stage_y() -> str:
     time.sleep(float(os.environ.get("STAGE_Y_SLEEP", "0.5")))
-    p = pathlib.Path("output_y.txt")
-    p.write_text("hello from y")
-    return _OutputY(data=p)
+    return "hello from y"
 
 
-pipeline.register(stage_x)
-pipeline.register(stage_y)
-'''
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    stage_x()
+    stage_y()
+"""
+
+
+# `make` is a widely read cached stage: `slow_use` reads it for as long as the test wants (it
+# waits for `release_slow_use`), `quick_use` reads it and returns at once.
+_PIPELINE_SHARED_OUTPUT = """\
+import pathlib
+import time
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def make() -> str:
+    return "made"
+
+
+@stage
+def slow_use(made: str) -> str:
+    pathlib.Path("slow_use_started").touch()
+    deadline = time.monotonic() + 120
+    while not pathlib.Path("release_slow_use").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return f"slow saw {made}"
+
+
+@stage
+def quick_use(made: str) -> str:
+    return f"quick saw {made}"
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    made = make()
+    slow_use(made)
+    quick_use(made)
+"""
+
+# Loaded by every pivot process the hook directory is on PYTHONPATH for: logs each lock
+# request that asks for WRITE, and each restore of an output from the cache, with the pid.
+_LOCK_AND_RESTORE_LOG_HOOK = """\
+import os
+import pathlib
+
+from pivot.storage import artifact_lock, store
+
+_log = pathlib.Path(os.environ["PIVOT_TEST_HOOK_LOG"])
+_acquire_many = artifact_lock.LocalFlockLockService.acquire_many
+_restore_from_cache = store.WorkspaceStore.restore_from_cache
+
+
+def _record(line):
+    with _log.open("a") as log:
+        log.write(f"{os.getpid()} {line}\\n")
+
+
+def acquire_many(self, requests, on_status=None):
+    written = [r["key"] for r in requests if r["mode"] is artifact_lock.LockMode.WRITE]
+    if written:
+        _record("write " + ",".join(written))
+    return _acquire_many(self, requests, on_status)
+
+
+def restore_from_cache(self, ref, output_hash, **kwargs):
+    _record("restore")
+    return _restore_from_cache(self, ref, output_hash, **kwargs)
+
+
+artifact_lock.LocalFlockLockService.acquire_many = acquire_many
+store.WorkspaceStore.restore_from_cache = restore_from_cache
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -173,16 +221,65 @@ def _helper_make_env(**extra: str) -> dict[str, str]:
 def _helper_run_pivot(
     tmp_path: pathlib.Path,
     stage: str,
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    resolve_deps: bool = False,
 ) -> subprocess.Popen[bytes]:
-    """Start `pivot run <stage> --force` as a background process."""
+    """Start an isolated `run` or dependency-resolving `repro` stage command."""
+    qualified_stage = stage if "/" in stage else f"test/{stage}"
+    command = "repro" if resolve_deps else "run"
     return subprocess.Popen(
-        [_PIVOT_BIN, "run", stage, "--force"],
+        [_PIVOT_BIN, command, qualified_stage, "--force"],
         cwd=tmp_path,
         env=env or os.environ.copy(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def _helper_wait_for_path(path: pathlib.Path, timeout: float = 30.0) -> None:
+    """Wait until a stage has started under its artifact lock."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for {path}")
+
+
+def _helper_wait_for_write_lock(lock_path: pathlib.Path) -> None:
+    """Wait until another process owns lock_path exclusively, instead of sleeping by guess."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if lock_path.exists():
+            fd = os.open(lock_path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        time.sleep(0.01)
+    raise TimeoutError(f"writer never acquired artifact lock {lock_path}")
+
+
+def _helper_output(project: pathlib.Path, stage: str) -> pathlib.Path:
+    return project / "data" / "test" / f"{stage}.txt"
+
+
+def test_wait_for_write_lock_waits_until_lock_is_held(tmp_path: pathlib.Path) -> None:
+    """Contention tests start their reader only after the writer owns the artifact lock."""
+    lock_path = tmp_path / "lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _helper_wait_for_write_lock(lock_path)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -191,27 +288,19 @@ def _helper_run_pivot(
 
 
 def test_disjoint_runs_proceed_in_parallel(tmp_path: pathlib.Path) -> None:
-    """Two stages with disjoint outputs run concurrently without blocking.
-
-    stage_a and stage_b both sleep for STAGE_A_SLEEP/STAGE_B_SLEEP seconds.
-    If they run in parallel, wall time < sum of individual durations.
-    """
-    sleep_seconds = 3
+    """Two independent artifact writers run concurrently without blocking."""
     _helper_setup_project(tmp_path, _PIPELINE_DISJOINT)
-    env = _helper_make_env(STAGE_A_SLEEP=str(sleep_seconds), STAGE_B_SLEEP=str(sleep_seconds))
 
-    start = time.monotonic()
-    proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    proc_b = _helper_run_pivot(tmp_path, "stage_b", env=env)
+    proc_a = _helper_run_pivot(tmp_path, "stage_a")
+    proc_b = _helper_run_pivot(tmp_path, "stage_b")
     try:
-        stdout_a, stderr_a = proc_a.communicate(timeout=30)
-        stdout_b, stderr_b = proc_b.communicate(timeout=30)
+        stdout_a, stderr_a = proc_a.communicate(timeout=90)
+        stdout_b, stderr_b = proc_b.communicate(timeout=90)
     finally:
-        for p in (proc_a, proc_b):
-            if p.poll() is None:
-                p.kill()
-                p.wait()
-    elapsed = time.monotonic() - start
+        for process in (proc_a, proc_b):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     assert proc_a.returncode == 0, (
         f"stage_a failed:\nstdout={stdout_a.decode()}\nstderr={stderr_a.decode()}"
@@ -219,43 +308,34 @@ def test_disjoint_runs_proceed_in_parallel(tmp_path: pathlib.Path) -> None:
     assert proc_b.returncode == 0, (
         f"stage_b failed:\nstdout={stdout_b.decode()}\nstderr={stderr_b.decode()}"
     )
+    assert _helper_output(tmp_path, "stage_a").read_text() == "hello from a"
+    assert _helper_output(tmp_path, "stage_b").read_text() == "hello from b"
 
-    assert (tmp_path / "output_a.txt").exists(), "output_a.txt not created"
-    assert (tmp_path / "output_b.txt").exists(), "output_b.txt not created"
-
-    # Both stages sleep in parallel, so total wall time should be ~sleep_seconds,
-    # not 2*sleep_seconds. Allow generous overhead for subprocess startup + worker pool
-    # init, especially on CI runners where resources are constrained.
-    max_serial_time = sleep_seconds * 2 + 2
-    assert elapsed < max_serial_time, (
-        f"Wall time {elapsed:.1f}s >= {max_serial_time}s — stages may not have run in parallel"
-    )
+    events = {
+        label: float(timestamp)
+        for label, timestamp in (
+            line.split() for line in (tmp_path / "timing.log").read_text().splitlines()
+        )
+    }
+    assert events["a_start"] < events["b_end"] and events["b_start"] < events["a_end"], events
 
 
 def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
-    """stage_c depends on output_a.txt. When both run concurrently:
-
-    - stage_a holds WRITE lock on output_a.txt (sleeps)
-    - stage_c needs READ lock on output_a.txt (blocks until stage_a finishes)
-    - Both should eventually succeed
-    """
-    sleep_seconds = 3
+    """A consumer waits for a concurrently running producer then reads its output."""
     _helper_setup_project(tmp_path, _PIPELINE_OVERLAPPING)
-    env = _helper_make_env(STAGE_A_SLEEP=str(sleep_seconds))
+    env = _helper_make_env(STAGE_A_SLEEP="3")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    # Small delay so stage_a starts first and grabs the lock
-    time.sleep(0.5)
-    proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env)
-
+    _helper_wait_for_path(tmp_path / "stage_a_started")
+    proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env, resolve_deps=True)
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)
         stdout_c, stderr_c = proc_c.communicate(timeout=30)
     finally:
-        for p in (proc_a, proc_c):
-            if p.poll() is None:
-                p.kill()
-                p.wait()
+        for process in (proc_a, proc_c):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     assert proc_a.returncode == 0, (
         f"stage_a failed:\nstdout={stdout_a.decode()}\nstderr={stderr_a.decode()}"
@@ -263,35 +343,25 @@ def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
     assert proc_c.returncode == 0, (
         f"stage_c failed:\nstdout={stdout_c.decode()}\nstderr={stderr_c.decode()}"
     )
-
-    assert (tmp_path / "output_a.txt").exists(), "output_a.txt not created"
-    assert (tmp_path / "output_c.txt").exists(), "output_c.txt not created"
-    assert "hello from a" in (tmp_path / "output_c.txt").read_text(), (
-        "stage_c did not read stage_a's output correctly"
-    )
+    assert _helper_output(tmp_path, "stage_a").read_text() == "hello from a"
+    assert _helper_output(tmp_path, "stage_c").read_text() == "got: hello from a"
 
 
 def test_no_deadlock_deterministic_ordering(tmp_path: pathlib.Path) -> None:
-    """Two stages with disjoint WRITE locks complete without deadlock.
-
-    Both stage_x and stage_y write to different files and sleep briefly.
-    Locks are always acquired in sorted key order, preventing deadlocks.
-    If a deadlock occurred, the timeout would fire.
-    """
+    """Two disjoint writers complete concurrently without deadlock."""
     _helper_setup_project(tmp_path, _PIPELINE_CROSSED)
     env = _helper_make_env(STAGE_X_SLEEP="1", STAGE_Y_SLEEP="1")
 
     proc_x = _helper_run_pivot(tmp_path, "stage_x", env=env)
     proc_y = _helper_run_pivot(tmp_path, "stage_y", env=env)
-
     try:
         stdout_x, stderr_x = proc_x.communicate(timeout=30)
         stdout_y, stderr_y = proc_y.communicate(timeout=30)
     finally:
-        for p in (proc_x, proc_y):
-            if p.poll() is None:
-                p.kill()
-                p.wait()
+        for process in (proc_x, proc_y):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     assert proc_x.returncode == 0, (
         f"stage_x failed (possible deadlock):\nstdout={stdout_x.decode()}\nstderr={stderr_x.decode()}"
@@ -299,35 +369,27 @@ def test_no_deadlock_deterministic_ordering(tmp_path: pathlib.Path) -> None:
     assert proc_y.returncode == 0, (
         f"stage_y failed (possible deadlock):\nstdout={stdout_y.decode()}\nstderr={stderr_y.decode()}"
     )
-
-    assert (tmp_path / "output_x.txt").exists(), "output_x.txt not created"
-    assert (tmp_path / "output_y.txt").exists(), "output_y.txt not created"
+    assert _helper_output(tmp_path, "stage_x").read_text() == "hello from x"
+    assert _helper_output(tmp_path, "stage_y").read_text() == "hello from y"
 
 
 def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
-    """When a process blocks on an artifact lock, status messages are emitted.
-
-    stage_a sleeps while holding WRITE lock on output_a.txt. stage_c tries to
-    READ output_a.txt and must wait. The blocked process should emit a
-    "waiting" message to its output.
-    """
-    sleep_seconds = 4
+    """A lock-blocked consumer succeeds without leaking lock-wait text to console output."""
     _helper_setup_project(tmp_path, _PIPELINE_OVERLAPPING)
-    env = _helper_make_env(STAGE_A_SLEEP=str(sleep_seconds))
+    env = _helper_make_env(STAGE_A_SLEEP="4")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
-    # Ensure stage_a starts first and grabs the write lock
-    time.sleep(1.0)
+    stage_a_lock = tmp_path / ".pivot" / "locks" / hashlib.sha256(b"test/stage_a").hexdigest()
+    _helper_wait_for_write_lock(stage_a_lock)
     proc_c = _helper_run_pivot(tmp_path, "stage_c", env=env)
-
     try:
         stdout_a, stderr_a = proc_a.communicate(timeout=30)
         stdout_c, stderr_c = proc_c.communicate(timeout=30)
     finally:
-        for p in (proc_a, proc_c):
-            if p.poll() is None:
-                p.kill()
-                p.wait()
+        for process in (proc_a, proc_c):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     assert proc_a.returncode == 0, (
         f"stage_a failed:\nstdout={stdout_a.decode()}\nstderr={stderr_a.decode()}"
@@ -335,8 +397,113 @@ def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
     assert proc_c.returncode == 0, (
         f"stage_c failed:\nstdout={stdout_c.decode()}\nstderr={stderr_c.decode()}"
     )
-
     combined_c = stdout_c.decode() + stderr_c.decode()
-    assert "waiting for artifact lock" not in combined_c.lower(), (
-        "Lock-wait message should not be emitted in console output"
-    )
+    assert "waiting for artifact lock" not in combined_c.lower()
+
+
+def _helper_built_shared_output_project(tmp_path: pathlib.Path) -> None:
+    """Build `_PIPELINE_SHARED_OUTPUT` once, so every stage is cached."""
+    _helper_setup_project(tmp_path, _PIPELINE_SHARED_OUTPUT)
+    (tmp_path / "release_slow_use").touch()
+    built = subprocess.run([_PIVOT_BIN, "repro"], cwd=tmp_path, capture_output=True, timeout=180)
+    assert built.returncode == 0, built.stdout.decode() + built.stderr.decode()
+    (tmp_path / "release_slow_use").unlink()
+    (tmp_path / "slow_use_started").unlink()
+
+
+def _helper_start_slow_consumer(tmp_path: pathlib.Path) -> subprocess.Popen[bytes]:
+    """Run `slow_use` again in its own pivot process and wait until it is inside the stage,
+    holding READ on `make`'s output for as long as the test withholds `release_slow_use`."""
+    slow = _helper_run_pivot(tmp_path, "slow_use")
+    _helper_wait_for_path(tmp_path / "slow_use_started", timeout=120)
+    return slow
+
+
+def _helper_finish(process: subprocess.Popen[bytes], timeout: float) -> tuple[str, bool]:
+    """Wait up to ``timeout`` for ``process``; return its output and whether it finished."""
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        return stdout.decode() + stderr.decode(), False
+    return stdout.decode() + stderr.decode(), True
+
+
+def test_skip_of_a_cached_stage_does_not_wait_for_its_running_consumers(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A repro whose closure holds a widely read cached stage skips it at once, though another
+    pivot run is executing one of its consumers: deciding to skip only reads the output, so
+    it does not wait for the READ every running consumer holds on it."""
+    _helper_built_shared_output_project(tmp_path)
+    slow = _helper_start_slow_consumer(tmp_path)
+    try:
+        quick = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "test/quick_use"],
+            cwd=tmp_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        quick_out, quick_finished = _helper_finish(quick, timeout=30)
+    finally:
+        (tmp_path / "release_slow_use").touch()
+        slow_out, slow_finished = _helper_finish(slow, timeout=60)
+
+    assert quick_finished, f"the cached repro waited for the running consumer:\n{quick_out}"
+    assert quick.returncode == 0, quick_out
+    assert "0 ran, 2 cached" in quick_out, quick_out
+    assert slow_finished and slow.returncode == 0, slow_out
+    assert _helper_output(tmp_path, "slow_use").read_text() == "slow saw made"
+
+
+def test_racing_skips_restore_a_missing_cached_output_once(tmp_path: pathlib.Path) -> None:
+    """Two repros that both find a cached stage's output missing restore it from the cache
+    exactly once. Each waits for WRITE on the output, held off here by a running consumer's
+    READ, and decides again once it has WRITE: the second finds the output the first restored."""
+    _helper_built_shared_output_project(tmp_path)
+    hook_dir = tmp_path / "hook"
+    hook_dir.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(_LOCK_AND_RESTORE_LOG_HOOK)
+    hook_log = tmp_path / "hook.log"
+    hook_log.touch()
+    env = _helper_make_env(PIVOT_TEST_HOOK_LOG=str(hook_log))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(hook_dir), env.get("PYTHONPATH")]))
+    output = _helper_output(tmp_path, "make")
+
+    slow = _helper_start_slow_consumer(tmp_path)
+    racers = list[subprocess.Popen[bytes]]()
+    try:
+        output.unlink()
+        racers = [
+            subprocess.Popen(
+                [_PIVOT_BIN, "repro", "test/make"],
+                cwd=tmp_path,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _ in range(2)
+        ]
+
+        def _waiting_for_write() -> set[str]:
+            lines = hook_log.read_text().splitlines()
+            return {line.split()[0] for line in lines if line.split()[1] == "write"}
+
+        deadline = time.monotonic() + 120
+        while len(_waiting_for_write()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(_waiting_for_write()) == 2, hook_log.read_text()
+        time.sleep(1)  # both are now retrying WRITE behind the consumer's READ
+    finally:
+        (tmp_path / "release_slow_use").touch()
+        slow_out, slow_finished = _helper_finish(slow, timeout=60)
+        racer_results = [_helper_finish(racer, timeout=60) for racer in racers]
+
+    assert slow_finished and slow.returncode == 0, slow_out
+    for racer, (racer_out, finished) in zip(racers, racer_results, strict=True):
+        assert finished and racer.returncode == 0, racer_out
+        assert "0 ran, 1 cached" in racer_out, racer_out
+    restores = [line for line in hook_log.read_text().splitlines() if line.endswith(" restore")]
+    assert len(restores) == 1, hook_log.read_text()
+    assert output.read_text() == "made"

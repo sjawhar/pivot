@@ -6,7 +6,7 @@ Pivot is designed for high-performance pipeline execution with automatic code ch
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  User Pipeline Code (pipeline.py or pivot.yaml)             │
+│  User Pipeline Code (pipeline.py: @stage + Pipeline)        │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -69,19 +69,9 @@ preprocess (produces data/clean.csv)
   train (consumes data/clean.csv)
 ```
 
-#### Path Resolution
+#### Dependency Resolution
 
-The graph builder uses two strategies to match dependencies to outputs:
-
-1. **Exact match (O(1)):** Dictionary lookup via `_build_outputs_map()`
-   - Maps each output path to its producing stage
-   - Handles the common case of explicit path dependencies
-
-2. **Directory overlap (O(log n)):** pygtrie prefix tree for parent/child relationships
-   - `has_subtrie()`: Dependency is parent of outputs (`data/` depends on `data/file.csv`)
-   - `shortest_prefix()`: Dependency is child of output (`data/file.csv` depends on `data/`)
-
-This handles cases where a stage declares a directory output and another stage depends on a file within that directory (or vice versa).
+The graph builder matches each dependency to its producer by artifact identity: `_build_outputs_map()` maps every output's `ArtifactIdentity` (producing stage plus output key) to that stage, and a dependency handle carries the identity of the output it was created from. A dependency on one file of a directory output carries its own identity (the directory's key with the file's path appended) and hangs from the directory's node (`types.source_identity`), so the edge exists while its lock records only that file. A dependency with no producer is a pipeline input, resolved to its bound workspace path by the store. Paths play no part in matching, so two stages can never be linked by an accidental path prefix. Paths still decide where outputs land, so `StageRegistry.add_existing` refuses an output whose workspace path (`storage/store.py` `relative_output_path`) equals, contains, or lies inside another registered output's path.
 
 ### Scheduler
 
@@ -89,10 +79,12 @@ Coordinates deterministic scheduling (sync, no IO):
 
 - Maintains per-stage execution state
 - Tracks upstream/downstream completion
-- Enforces mutex groups (including exclusive `*`)
+- Holds per-stage resource permits until completion
 - Decides which stages are eligible to start
 
-Implemented in `packages/pivot/src/pivot/engine/scheduler.py` and owned by the Engine.
+Each stage holds one CPU unit by default. A decorator can request additional resources with
+`@stage(resources={"gpu": 1})`; non-CPU resources default to capacity 1 and can be configured
+per run. Implemented in `packages/pivot/src/pivot/engine/scheduler.py` and owned by the Engine.
 
 ### WatchCoordinator
 
@@ -140,7 +132,7 @@ Runs stages in worker processes:
 
 - `WorkerPool` wraps a loky `ProcessPoolExecutor` with `spawn` context
 - Uses a manager-backed output queue for worker log streaming
-- Warm workers with preloaded imports (reusable executor)
+- Warm workers retain stage imports across runs in one Engine
 - True parallelism (not limited by GIL)
 
 ### Lock Files
@@ -156,8 +148,8 @@ Lock files use relative paths for portability across machines.
 
 ## Data Flow
 
-1. **Discovery** - CLI discovers pipeline (pipeline.py or pivot.yaml)
-2. **Registration** - Stages registered from Python code (or YAML config)
+1. **Discovery** - CLI finds and runs `pipeline.py`
+2. **Construction** - `@stage` calls inside `with Pipeline(...)` record stages; the block's exit builds the `StageRegistry`
 3. **DAG Construction** - Build dependency graph from outputs/inputs
 4. **Fingerprinting** - Hash code, params, and dependency content
 5. **Comparison** - Compare fingerprints with lock files
@@ -175,11 +167,12 @@ Lock files use relative paths for portability across machines.
 │       ├── ab/
 │       │   └── cdef...  # Files keyed by xxhash64
 │       └── ...
-├── stages/              # Per-stage lock files
-│   ├── preprocess.lock
-│   └── train.lock
+├── stages/              # Per-stage lock files, one directory per pipeline
+│   └── demo/
+│       ├── preprocess.lock
+│       └── train.lock
 ├── config.yaml          # Remote configuration
-└── state.db             # LMDB database (hash cache, generations, run cache, remote index)
+└── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)
 ```
 
 ## Key Design Decisions
@@ -210,9 +203,14 @@ Files are stored by their content hash:
 
 ### Warm Worker Pool
 
-**Problem:** Importing numpy/pandas takes seconds per stage.
+**Problem:** Importing numpy/pandas takes seconds per worker.
 
-**Solution:** `loky.get_reusable_executor()` keeps workers alive across stage executions within a run. The first stage execution imports heavy dependencies; subsequent stages reuse those imports. In watch mode, each run creates a fresh pool, and code reloads trigger an explicit restart via `executor_core.restart_workers()`.
+**Solution:** `loky.get_reusable_executor()` keeps imports available for a worker's lifetime.
+A run's first submission starts the run's resource width of workers, and later stages start
+more only when every live worker is busy or a parent's consumers are about to be ready.
+One-shot Engines release idle workers after the idle timeout. Long-lived Engines keep workers
+warm between runs. Each run gets a fresh output queue, and Pivot replaces workers before a
+later run when a user-code module they imported changed.
 
 ### Trie for Path Validation
 

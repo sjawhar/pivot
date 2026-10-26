@@ -1,23 +1,18 @@
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING
 
-import pytest
-
-from pivot import loaders
-from pivot import outputs as outputs_mod
+from pivot import loaders, types
 from pivot.registry import RegistryStageInfo
 from pivot.remote import storage as remote_storage
 from pivot.remote import sync
 from pivot.storage import cache as cache_mod
-from pivot.storage import lock, track
+from pivot.storage import lock, store, track
 from pivot.storage import state as state_mod
 from pivot.types import DirHash, DirManifestEntry, FileHash, LockData, TransferResult
 
 if TYPE_CHECKING:
-    import pathlib
-    from collections.abc import Callable
-
     from pytest_mock import MockerFixture
 
 # =============================================================================
@@ -74,7 +69,7 @@ def _write_lock_with_dir_output(
         code_manifest={},
         params={},
         dep_hashes={},
-        output_hashes={"output_dir": dir_hash},
+        output_hashes={types.ArtifactIdentity(stage_name, "output_dir"): dir_hash},
     )
     stage_lock = lock.StageLock(stage_name, stages_dir)
     stage_lock.write(lock_data)
@@ -110,7 +105,7 @@ def test_get_stage_dep_hashes_excludes_tree_hash(set_project_root: pathlib.Path)
     lock_data = LockData(
         code_manifest={},
         params={},
-        dep_hashes={str(set_project_root / "input_dir"): dep_hash},
+        dep_hashes={types.ArtifactIdentity("input_dir", None): dep_hash},
         output_hashes={},
     )
     stage_lock = lock.StageLock("my_stage", stages_dir)
@@ -127,14 +122,13 @@ def test_get_stage_dep_hashes_excludes_tree_hash(set_project_root: pathlib.Path)
 # =============================================================================
 
 
-def _helper_out_cache_false(path: str) -> outputs_mod.Out[pathlib.Path]:
-    """Factory for Out(cache=False) — used in parametrized tests."""
-    return outputs_mod.Out(path=path, loader=loaders.PathOnly(), cache=False)
-
-
-def _helper_metric(path: str) -> outputs_mod.Metric:
-    """Factory for Metric — used in parametrized tests."""
-    return outputs_mod.Metric(path=path)
+def _helper_ref(producer: str, key: str | None, tag: types.ArtifactTag) -> types.ArtifactRef:
+    return types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer, key),
+        format=loaders.CSV() if tag is types.ArtifactTag.DATA else loaders.JSON(),
+        python_type=pathlib.Path,
+        tag=tag,
+    )
 
 
 def test_get_target_hashes_invalid_stage_name_falls_through(
@@ -151,51 +145,30 @@ def test_get_target_hashes_invalid_stage_name_falls_through(
     assert result == set()
 
 
-@pytest.mark.parametrize(
-    "make_noncached",
-    [
-        pytest.param(_helper_out_cache_false, id="out-cache-false"),
-        pytest.param(_helper_metric, id="metric"),
-    ],
-)
-def test_get_target_hashes_excludes_noncached_outputs(
-    set_project_root: pathlib.Path,
-    make_noncached: Callable[[str], outputs_mod.BaseOut],
-) -> None:
-    """get_target_hashes excludes cache=False outputs from returned hashes."""
+def test_get_target_hashes_excludes_noncached_outputs(set_project_root: pathlib.Path) -> None:
+    """get_target_hashes excludes non-cached (metric) outputs from returned hashes."""
     state_dir = set_project_root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-
-    cached_out = outputs_mod.Out(
-        path=str(set_project_root / "output.csv"),
-        loader=loaders.PathOnly(),
-        cache=True,
-    )
-    noncached = make_noncached(str(set_project_root / "metrics.json"))
-
-    expanded_cached = outputs_mod.require_expanded(cached_out)
-    expanded_noncached = outputs_mod.require_expanded(noncached)
-
+    cached_ref = _helper_ref("my_stage", "output", types.ArtifactTag.DATA)
+    metric_ref = _helper_ref("my_stage", "metrics", types.ArtifactTag.METRIC)
     all_stages = {
         "my_stage": RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
             state_dir=None,
-            outs=[expanded_cached, expanded_noncached],
+            outs=[cached_ref, metric_ref],
+            incremental_inputs={},
+            input_paths={},
         )
     }
-
-    cached_hash = FileHash(hash="1111111111111111")
-    noncached_hash = FileHash(hash="2222222222222222")
-    lock_data = LockData(
-        code_manifest={},
-        params={},
-        dep_hashes={},
-        output_hashes={
-            str(set_project_root / "output.csv"): cached_hash,
-            str(set_project_root / "metrics.json"): noncached_hash,
-        },
+    lock.StageLock("my_stage", lock.get_stages_dir(state_dir)).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                cached_ref.identity: FileHash(hash="1111111111111111"),
+                metric_ref.identity: FileHash(hash="2222222222222222"),
+            },
+        )
     )
-    lock.StageLock("my_stage", stages_dir).write(lock_data)
 
     result = sync.get_target_hashes(["my_stage"], state_dir, all_stages=all_stages)
 
@@ -206,53 +179,41 @@ def test_get_target_hashes_excludes_noncached_outputs(
 def test_get_target_hashes_file_target_excludes_noncached(
     set_project_root: pathlib.Path,
 ) -> None:
-    """File-path target for a cache=False output returns no hashes."""
+    """File-path target for a non-cached output returns no hashes; a cached one returns its hash."""
     state_dir = set_project_root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-
-    # Stage with one cached and one non-cached output
-    cached_out = outputs_mod.Out(
-        path=str(set_project_root / "output.csv"),
-        loader=loaders.PathOnly(),
-        cache=True,
-    )
-    metric_out = outputs_mod.Metric(path=str(set_project_root / "metrics.json"))
-
-    expanded_cached = outputs_mod.require_expanded(cached_out)
-    expanded_metric = outputs_mod.require_expanded(metric_out)
-
+    cached_ref = _helper_ref("my_stage", "output", types.ArtifactTag.DATA)
+    metric_ref = _helper_ref("my_stage", "metrics", types.ArtifactTag.METRIC)
     all_stages = {
         "my_stage": RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
             state_dir=None,
-            outs=[expanded_cached, expanded_metric],
+            outs=[cached_ref, metric_ref],
+            incremental_inputs={},
+            input_paths={},
         )
     }
-
-    cached_hash = FileHash(hash="1111111111111111")
-    metric_hash = FileHash(hash="2222222222222222")
-    lock_data = LockData(
-        code_manifest={},
-        params={},
-        dep_hashes={},
-        output_hashes={
-            str(set_project_root / "output.csv"): cached_hash,
-            str(set_project_root / "metrics.json"): metric_hash,
-        },
+    lock.StageLock("my_stage", lock.get_stages_dir(state_dir)).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                cached_ref.identity: FileHash(hash="1111111111111111"),
+                metric_ref.identity: FileHash(hash="2222222222222222"),
+            },
+        )
     )
-    lock.StageLock("my_stage", stages_dir).write(lock_data)
-
-    # Target the non-cached file directly by path (not stage name)
-    # This exercises _get_file_hash_from_stages (sync.py:107-124)
-    result = sync.get_target_hashes(
-        [str(set_project_root / "metrics.json")], state_dir, all_stages=all_stages
+    workspace = store.WorkspaceStore(
+        project_root=set_project_root, pipeline_name="test", input_bindings={}
     )
+    metric_path = workspace.resolve_display_path(metric_ref)
+    cached_path = workspace.resolve_display_path(cached_ref)
+
+    # Target the non-cached file directly by its workspace path (not stage name)
+    result = sync.get_target_hashes([str(metric_path)], state_dir, all_stages=all_stages)
     assert "2222222222222222" not in result, "Non-cached file target should return no hashes"
 
-    # Target the cached file directly — should return its hash
-    result_cached = sync.get_target_hashes(
-        [str(set_project_root / "output.csv")], state_dir, all_stages=all_stages
-    )
+    # Target the cached file directly by its workspace path — should return its hash
+    result_cached = sync.get_target_hashes([str(cached_path)], state_dir, all_stages=all_stages)
     assert "1111111111111111" in result_cached, "Cached file target should return its hash"
 
 
@@ -319,25 +280,22 @@ async def test_push_skips_directory_cache_paths(
 # =============================================================================
 
 
-def test_get_target_hashes_file_path_with_lock_files_no_pipeline(
+def test_get_target_hashes_identity_target_with_lock_files_no_pipeline(
     set_project_root: pathlib.Path,
 ) -> None:
-    """File path target resolves via lock file even without a pipeline."""
+    """Identity target resolves via lock file scan even without a pipeline."""
     state_dir = set_project_root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-
-    abs_output = str(set_project_root / "data" / "output.csv")
     output_hash = FileHash(hash="aabbccdd11223344")
-    lock_data = LockData(
-        code_manifest={},
-        params={},
-        dep_hashes={},
-        output_hashes={abs_output: output_hash},
+    lock.StageLock("train", lock.get_stages_dir(state_dir)).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={types.ArtifactIdentity("train", "output"): output_hash},
+        )
     )
-    lock.StageLock("train", stages_dir).write(lock_data)
 
-    result = sync.get_target_hashes([abs_output], state_dir, all_stages=None)
+    result = sync.get_target_hashes(["train:output"], state_dir, all_stages=None)
 
     assert result == {"aabbccdd11223344"}, "Should resolve hash from lock file without pipeline"
 
@@ -390,13 +348,16 @@ def test_get_target_hashes_unresolved_file_target_returns_empty(
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
 
-    lock_data = LockData(
-        code_manifest={},
-        params={},
-        dep_hashes={},
-        output_hashes={str(set_project_root / "other" / "file.csv"): FileHash(hash="aaaa")},
+    lock.StageLock("train", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                types.ArtifactIdentity("train", "file"): FileHash(hash="aaaa000000000000")
+            },
+        )
     )
-    lock.StageLock("train", stages_dir).write(lock_data)
 
     result = sync.get_target_hashes(
         [str(set_project_root / "nonexistent.csv")], state_dir, all_stages=None

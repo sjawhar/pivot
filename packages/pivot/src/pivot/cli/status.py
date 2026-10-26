@@ -7,11 +7,13 @@ import click
 import tqdm
 
 from pivot import config, exceptions, project
+from pivot import explain as explain_mod
 from pivot import status as status_mod
 from pivot.cli import completion, console
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
+from pivot.remote import config as remote_config
 from pivot.types import (
     ExplainOutput,
     ExplainStageJson,
@@ -22,6 +24,7 @@ from pivot.types import (
     StatusOutput,
     TrackedFileInfo,
     TrackedFileStatus,
+    dep_change_to_json,
 )
 
 
@@ -57,7 +60,7 @@ def status(
     stages_list = cli_helpers.stages_to_list(stages)
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is not None:
-        cli_helpers.validate_stages_exist(stages_list)
+        stages_list = cli_helpers.resolve_stage_names(stages_list)
 
     project_root = project.get_project_root()
     resolved_cache_dir = config.get_cache_dir()
@@ -73,17 +76,19 @@ def status(
     tracked_status = list[TrackedFileInfo]()
     remote_status: RemoteSyncInfo | None = None
 
+    orphaned_locks = list[str]()
+
     if show_stages and pipeline is not None:
-        # Build bipartite graph for consistent execution order with Engine
         all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)
+        orphaned_locks = status_mod.find_orphaned_lock_files(all_stages)
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
                 stages_list,
                 single_stage=False,
                 all_stages=all_stages,
-                stage_registry=cli_helpers.get_registry(),
+                pipeline=cli_helpers.get_pipeline(),
                 graph=graph,
             )
         else:
@@ -91,7 +96,7 @@ def status(
                 stages_list,
                 single_stage=False,
                 all_stages=all_stages,
-                stage_registry=cli_helpers.get_registry(),
+                pipeline=cli_helpers.get_pipeline(),
                 graph=graph,
             )
 
@@ -137,15 +142,45 @@ def status(
         import_statuses = status_mod.get_import_status(project_root)
 
     # Compute counts once for suggestions and output
-    # When explain mode is used, compute from explanations; otherwise from status
     if explain and pipeline_explanations:
         stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
+        stage_reasons = [
+            (e["stage_name"], e["reason"], e["upstream_stale"]) for e in pipeline_explanations
+        ]
     else:
         stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
+        stage_reasons = [(s["name"], s["reason"], s["upstream_stale"]) for s in pipeline_status]
+    # Pull restores missing outputs without recomputing; skip the count when there is no
+    # remote to pull from. The count reads only explain's reasons, so it is cheap.
+    missing_outputs_count = 0
+    if remote_config.list_remotes():
+        # Stages arrive in execution order. A stage is pullable when its outputs are missing
+        # and every stale upstream is itself pullable: in a plain clone the downstream stages
+        # are stale only because their upstream's outputs are missing too, and pull restores
+        # all of them. A stage current on its own (e.g. a committed metric) passes through
+        # when its stale upstreams are pullable, but has nothing to pull itself. A stage
+        # downstream of a stage that must recompute is recomputed by repro.
+        pullable = set[str]()
+        for name, reason, upstream_stale in stage_reasons:
+            if not pullable.issuperset(upstream_stale):
+                continue
+            if reason == explain_mod.OUTPUTS_MISSING_REASON:
+                pullable.add(name)
+                missing_outputs_count += 1
+            elif reason.startswith(status_mod.UPSTREAM_STALE_REASON_PREFIX):
+                pullable.add(name)
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
-    suggestions = status_mod.get_suggestions(stale_count, modified_count, push_count, pull_count)
+    suggestions = status_mod.get_suggestions(
+        stale_count,
+        modified_count,
+        push_count,
+        pull_count,
+        len(orphaned_locks),
+        missing_outputs_count=missing_outputs_count,
+        remote_configured=missing_outputs_count > 0,
+    )
 
     # Quiet mode: no output, exit 1 if there are issues needing attention
     if quiet and not output_json:
@@ -249,7 +284,7 @@ def _output_explain_json(
                 is_forced=exp["is_forced"],
                 code_changes=exp["code_changes"],
                 param_changes=exp["param_changes"],
-                dep_changes=exp["dep_changes"],
+                dep_changes=[dep_change_to_json(change) for change in exp["dep_changes"]],
                 upstream_stale=exp["upstream_stale"],
             )
             stages.append(stage_data)

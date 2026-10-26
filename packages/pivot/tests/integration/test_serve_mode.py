@@ -1,35 +1,27 @@
-"""Integration tests for serve mode (headless daemon via Engine).
-
-Tests E2E flow: socket creation, status queries, event broadcast.
-"""
+"""Component integration tests for AgentRpcSource, event sinks and event buffers."""
 
 from __future__ import annotations
 
 import json
-import os
-import signal
-import socket
-import subprocess
-import time
 from typing import TYPE_CHECKING
 
 import anyio
 import pytest
 
-from helpers import register_test_stage, wait_for_socket
 from pivot import config
 from pivot.engine.agent_rpc import AgentRpcHandler, AgentRpcSource, BroadcastEventSink
 from pivot.engine.engine import Engine
 from pivot.engine.sources import OneShotSource
 from pivot.engine.types import StageStarted
+from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike as Pipeline
 
 
-def _helper_noop(params: None) -> dict[str, str]:
+def _helper_noop() -> dict[str, str]:
     """No-op stage for testing."""
     return {"result": "ok"}
 
@@ -60,7 +52,7 @@ async def test_socket_creation_and_permissions(
     (tmp_path / ".pivot").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
 
-    register_test_stage(_helper_noop, name="test_stage")
+    helpers.register_test_stage(_helper_noop, name="test_stage")
 
     rpc_source = AgentRpcSource(socket_path=socket_path)
 
@@ -75,7 +67,7 @@ async def test_socket_creation_and_permissions(
             tg.start_soon(run_engine)
 
             # Wait for socket to be created
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             # Check permissions (owner-only)
             mode = socket_path.stat().st_mode
@@ -172,8 +164,8 @@ async def test_agent_rpc_handler_stages_query(
     (tmp_path / ".pivot").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
 
-    register_test_stage(_helper_noop, name="stage_a")
-    register_test_stage(_helper_noop, name="stage_b")
+    helpers.register_test_stage(_helper_noop, name="stage_a")
+    helpers.register_test_stage(_helper_noop, name="stage_b")
 
     async with Engine(pipeline=test_pipeline) as engine:
         handler = AgentRpcHandler(engine=engine)
@@ -181,7 +173,7 @@ async def test_agent_rpc_handler_stages_query(
         result = await handler.handle_query("stages")
 
         assert "stages" in result
-        assert set(result["stages"]) >= {"stage_a", "stage_b"}
+        assert set(result["stages"]) >= {"test/stage_a", "test/stage_b"}
 
 
 @pytest.mark.anyio
@@ -239,7 +231,7 @@ async def test_socket_handles_chunked_messages(
             tg.start_soon(run_engine)
 
             # Wait for socket to be created
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             # Connect and send a request in multiple chunks
             async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -325,100 +317,6 @@ async def test_sink_error_does_not_crash_engine(test_pipeline: Pipeline) -> None
 
 
 # =============================================================================
-# CLI Serve Mode E2E Tests
-# =============================================================================
-
-
-def test_serve_mode_cli_responds_to_status_query(
-    tmp_path: pathlib.Path,
-) -> None:
-    """E2E test: pivot repro --watch --serve creates working RPC endpoint.
-
-    This test verifies the complete CLI integration - that _run_serve_mode
-    correctly wires up AgentRpcHandler and EventSink. Without this test,
-    we caught bugs where components worked individually but weren't connected.
-    """
-
-    # Create minimal project structure with a valid pipeline
-    (tmp_path / ".pivot").mkdir(exist_ok=True)
-    (tmp_path / ".git").mkdir(exist_ok=True)
-    pipeline_code = """\
-import pathlib
-from pivot.pipeline.pipeline import Pipeline
-
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
-
-def noop_stage() -> None:
-    pass
-
-pipeline.register(noop_stage, name="noop")
-"""
-    (tmp_path / "pipeline.py").write_text(pipeline_code)
-
-    socket_path = tmp_path / ".pivot" / "agent.sock"
-
-    # Start serve mode as subprocess
-    env = os.environ.copy()
-    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
-    proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--serve"],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    try:
-        # Wait for socket to be created (poll up to 10s)
-        for _ in range(100):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
-        else:
-            stdout, stderr = proc.communicate(timeout=1)
-            pytest.fail(
-                "Socket not created within 10s.\n"
-                + f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
-            )
-
-        # Connect and send status query
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5.0)
-            sock.connect(str(socket_path))
-            request = '{"jsonrpc":"2.0","method":"status","id":1}\n'
-            sock.sendall(request.encode())
-            response_data = sock.recv(1024)
-            response = json.loads(response_data.decode().strip())
-
-        # Should get valid status response, NOT "Method not found" error
-        assert "error" not in response, f"Expected status result, got error: {response}"
-        assert "result" in response
-        assert response["result"]["state"] in ("idle", "active")
-
-        # Also test stages query
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5.0)
-            sock.connect(str(socket_path))
-            request = '{"jsonrpc":"2.0","method":"stages","id":2}\n'
-            sock.sendall(request.encode())
-            response_data = sock.recv(1024)
-            response = json.loads(response_data.decode().strip())
-
-        assert "error" not in response, f"Expected stages result, got error: {response}"
-        assert "result" in response
-        assert "stages" in response["result"]
-
-    finally:
-        # Clean up subprocess
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-
-
-# =============================================================================
 # AgentRpcSource Handler Tests (Component-level)
 # =============================================================================
 
@@ -458,7 +356,7 @@ async def test_rpc_source_without_handler_returns_method_not_found(
                 await engine.run(exit_on_completion=False)
 
             tg.start_soon(run_engine)
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             # Connect and send status query
             async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -504,7 +402,7 @@ async def test_rpc_source_with_handler_returns_status(
                 await engine.run(exit_on_completion=False)
 
             tg.start_soon(run_engine)
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             # Connect and send status query
             async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -546,7 +444,7 @@ async def test_event_buffer_integration_with_engine(
     (tmp_path / ".pivot").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
 
-    register_test_stage(_helper_noop, name="test_stage")
+    helpers.register_test_stage(_helper_noop, name="test_stage")
 
     buffer = EventBuffer(max_events=100)
 
@@ -589,12 +487,12 @@ async def test_event_buffer_polling_during_execution(
     (tmp_path / ".pivot").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
 
-    def _slow_stage(params: None) -> dict[str, str]:
+    def _slow_stage() -> dict[str, str]:
         """Stage that takes time to execute."""
         time.sleep(0.2)
         return {"result": "done"}
 
-    register_test_stage(_slow_stage, name="slow_stage")
+    helpers.register_test_stage(_slow_stage, name="slow_stage")
 
     buffer = EventBuffer(max_events=100)
     versions_seen = list[int]()

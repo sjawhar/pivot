@@ -8,18 +8,21 @@ to avoid watch path issues with non-existent output files.
 from __future__ import annotations
 
 import os
+import pathlib
 import signal
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
 import pytest
 
-from conftest import send_rpc
+from conftest import send_rpc, wait_for_engine_ready
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Generator
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 @pytest.fixture
@@ -36,34 +39,43 @@ def serve_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     # Use pipeline.py with a simple stage (no outputs)
     pipeline_code = """\
 import pathlib
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline as ComposePipeline, stage
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+_cp = ComposePipeline("test", root=pathlib.Path(__file__).parent)
 
+@stage
 def my_stage() -> None:
     print("my_stage executed")
 
-pipeline.register(my_stage, name="my_stage")
-
+@stage
 def other_stage() -> None:
     print("other_stage executed")
 
-pipeline.register(other_stage, name="other_stage")
+with _cp:
+    my_stage()
+    other_stage()
+
+pipeline = _cp
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
     sock_path = tmp_path / ".pivot" / "agent.sock"
+    stdout_path = tmp_path / "serve.stdout"
+    stderr_path = tmp_path / "serve.stderr"
 
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
 
-    proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--serve", "--force"],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # Server output goes to files, not pipes: nothing reads a pipe until teardown, and
+    # the server logs on every RPC connection close, so a pipe fills and blocks it.
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--serve", "--force"],
+            cwd=tmp_path,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
 
     try:
         # Wait for socket
@@ -72,21 +84,13 @@ pipeline.register(other_stage, name="other_stage")
                 break
             time.sleep(0.1)
         else:
-            stdout, stderr = proc.communicate(timeout=1)
             pytest.fail(
                 "Socket not created within 10s.\n"
-                + f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+                + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+                + f"stderr: {stderr_path.read_text(errors='replace')}"
             )
 
-        # Poll until status query succeeds (server is ready)
-        for _ in range(30):
-            try:
-                response = send_rpc(sock_path, "status")
-                if "result" in response:
-                    break
-            except (ConnectionRefusedError, FileNotFoundError):
-                pass
-            time.sleep(0.1)
+        wait_for_engine_ready(sock_path)
 
         yield sock_path
     finally:
@@ -104,7 +108,7 @@ def test_force_rerun_single_stage_accepted(serve_pipeline: pathlib.Path) -> None
     Verifies that the RPC "run" method with force=True and a specific stage
     returns "accepted", indicating the command was received and queued.
     """
-    response = send_rpc(serve_pipeline, "run", {"stages": ["my_stage"], "force": True})
+    response = send_rpc(serve_pipeline, "run", {"stages": ["test/my_stage"], "force": True})
     assert "result" in response, f"Expected result, got: {response}"
     assert response["result"] == "accepted", f"Expected 'accepted', got: {response['result']}"
 
@@ -126,7 +130,7 @@ def test_force_rerun_multiple_stages_accepted(serve_pipeline: pathlib.Path) -> N
     Verifies that multiple stage names can be passed in the stages list.
     """
     response = send_rpc(
-        serve_pipeline, "run", {"stages": ["my_stage", "other_stage"], "force": True}
+        serve_pipeline, "run", {"stages": ["test/my_stage", "test/other_stage"], "force": True}
     )
     assert "result" in response, f"Expected result, got: {response}"
     assert response["result"] == "accepted"
@@ -137,7 +141,7 @@ def test_force_rerun_without_force_flag(serve_pipeline: pathlib.Path) -> None:
 
     Verifies that the run command works with force=False as well.
     """
-    response = send_rpc(serve_pipeline, "run", {"stages": ["my_stage"], "force": False})
+    response = send_rpc(serve_pipeline, "run", {"stages": ["test/my_stage"], "force": False})
     assert "result" in response, f"Expected result, got: {response}"
     assert response["result"] == "accepted"
 
@@ -167,19 +171,22 @@ def test_force_rerun_triggers_events(serve_pipeline: pathlib.Path) -> None:
     initial_version = initial_result["version"]
 
     # Send force re-run command
-    run_response = send_rpc(serve_pipeline, "run", {"stages": ["my_stage"], "force": True})
+    run_response = send_rpc(serve_pipeline, "run", {"stages": ["test/my_stage"], "force": True})
     assert run_response.get("result") == "accepted"
 
-    # Wait a bit for the engine to process
-    time.sleep(0.5)
-
-    # Check for new events
-    events_response = send_rpc(serve_pipeline, "events_since", {"version": initial_version})
-    assert "result" in events_response, f"Expected events result, got: {events_response}"
-    events_result = events_response["result"]
-    assert isinstance(events_result, dict), f"Expected dict result, got: {type(events_result)}"
-    assert "version" in events_result, "Expected version field"
+    # Poll until the engine has processed the command and the event version advances
+    deadline = time.monotonic() + 10.0
+    new_version = initial_version
+    while time.monotonic() < deadline:
+        events_response = send_rpc(serve_pipeline, "events_since", {"version": initial_version})
+        assert "result" in events_response, f"Expected events result, got: {events_response}"
+        events_result = events_response["result"]
+        assert isinstance(events_result, dict), f"Expected dict result, got: {type(events_result)}"
+        assert "version" in events_result, "Expected version field"
+        new_version = events_result["version"]
+        if new_version > initial_version:
+            break
+        time.sleep(0.05)
 
     # The version should have advanced (indicating new events were generated)
-    new_version = events_result["version"]
-    assert new_version > initial_version, "Events should have been generated"
+    assert new_version > initial_version, "Events should have been generated within 10s"

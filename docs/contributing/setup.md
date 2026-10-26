@@ -35,8 +35,9 @@ uv run ruff check .
 # Type check
 uv run basedpyright .
 
-# Run tests (parallel)
-uv run pytest tests/ -n auto
+# Run tests (parallel). With CI set, the wheel smoke test also runs and needs uv's path:
+# PIVOT_TEST_UV="$(command -v uv)" uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto
+uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto
 ```
 
 **All four must pass before merging.**
@@ -46,7 +47,7 @@ uv run pytest tests/ -n auto
 One-liner to run all checks:
 
 ```bash
-uv run ruff format . && uv run ruff check . && uv run basedpyright . && uv run pytest tests/ -n auto
+uv run ruff format . && uv run ruff check . && uv run basedpyright . && uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto
 ```
 
 ## Project Structure
@@ -57,8 +58,8 @@ src/pivot/
 ├── config/              # Configuration handling
 ├── executor/            # Stage execution
 ├── pipeline/            # Pipeline loading
-├── remote/              # S3 storage
-├── show/                # Display commands
+├── remote/              # S3 and GCS remote storage
+├── show/                # selection.py: output selection; data.py: decoding and comparison
 ├── storage/             # Cache and lock files
 ├── tui/                 # Terminal UI
 ├── watch/               # Watch mode
@@ -66,7 +67,6 @@ src/pivot/
 ├── discovery.py         # Pipeline discovery
 ├── fingerprint.py       # Code fingerprinting
 ├── loaders.py           # Data loaders
-├── outputs.py           # Output type definitions
 ├── registry.py          # Stage registry
 ├── stage_def.py         # Stage definitions
 └── types.py             # Type definitions
@@ -94,7 +94,7 @@ tests/
 
 Before opening a PR:
 
-- [ ] All tests pass (`pytest tests/ -n auto`)
+- [ ] All tests pass (`uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto`)
 - [ ] Code is formatted (`ruff format .`)
 - [ ] Linting passes (`ruff check .`)
 - [ ] Type checking passes (`basedpyright .`)

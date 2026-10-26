@@ -8,7 +8,7 @@ Watch mode monitors your project for file changes and automatically re-runs affe
 pivot repro --watch
 ```
 
-Pivot runs the full pipeline once, then watches for changes. When you save a file, it re-runs only the stages affected by that change — the stage whose [dependency](../concepts/dependencies.md) changed, plus all downstream stages.
+Pivot first runs the pipeline once with normal [skip detection](../concepts/caching.md), so stale stages run and cached ones are skipped (`--force` re-runs every stage on this first run). It then watches for changes. When you save a file, it re-runs only the stages affected by that change — the stage whose [dependency](../concepts/dependencies.md) changed, plus all downstream stages.
 
 ### With the Interactive TUI
 
@@ -59,7 +59,10 @@ Watch mode reacts to **external** file changes — files you edit in your editor
 
 Changes that trigger re-runs:
 
-- Editing a source file that a stage depends on (via `Dep`)
+- Editing an input file declared with `pipeline.input()`
+- Editing a file inside a directory declared with `pipeline.input()` reruns that directory's
+  consumer, alongside any stage that declares the file directly
+- Editing through a symlinked path reruns every stage that consumes the same underlying input file
 - Editing a stage's Python source code (detected by [fingerprinting](../concepts/fingerprinting.md))
 - Editing parameter files
 
@@ -74,11 +77,11 @@ Changes that do **not** trigger re-runs:
 By default, watch mode runs the entire pipeline. Target specific stages to narrow the scope:
 
 ```bash
-# Watch and re-run only train and its dependencies
-pivot repro train --watch
+# Watch and re-run only demo/train and its dependencies
+pivot repro demo/train --watch
 
 # Watch multiple stages
-pivot repro train evaluate --watch
+pivot repro demo/train demo/evaluate --watch
 ```
 
 Only the targeted stages (and their upstream [dependencies](../concepts/dependencies.md)) are monitored and re-run.
@@ -114,7 +117,7 @@ For headless environments (CI watchers, remote dev servers), serve mode runs the
 pivot repro --watch --serve
 ```
 
-This creates `.pivot/agent.sock` — a JSON-RPC 2.0 endpoint that the TUI or external tools can connect to for status queries and triggering runs.
+This creates `.pivot/agent.sock` — a JSON-RPC 2.0 endpoint that the TUI or external tools can connect to for status queries and triggering runs. Ctrl-C or SIGTERM (a service manager's stop, sent once or several times, to the server or its whole process group) shuts the `pivot` command's server down, removes the socket and exits 0. Run in-process through `pivot.cli.main()`, serve leaves the caller's signal handlers alone, so the caller decides what SIGTERM does.
 
 ## Error Handling
 
@@ -123,6 +126,8 @@ By default, watch mode stops on the first failure (`--fail-fast`). Use `--keep-g
 ```bash
 pivot repro --watch --keep-going
 ```
+
+If a stage reads an input file that does not exist yet, for example because you saved `pipeline.py` with a new stage before creating its file, watch mode logs `Pipeline invalid - waiting for fix` with the missing path, runs nothing and keeps watching. Creating the file runs the stages that were waiting for it, also when the file arrives inside a new directory (`mkdir -p`, `mv`, `cp -r` or `tar -x`). With `--all --keep-going`, a stage whose input is missing is instead skipped with a `Skipping:` warning while the other stages run; watch mode waits as above only when no stage is left to run.
 
 ## Tips
 

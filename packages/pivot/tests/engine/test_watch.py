@@ -4,34 +4,46 @@ from __future__ import annotations
 
 import pathlib
 
+import anyio
 import networkx as nx
+import pytest
 
+from pivot import project
+from pivot import types as pivot_types
 from pivot.engine import graph as engine_graph
-from pivot.engine.types import NodeType, StageExecutionState
+from pivot.engine import sources
+from pivot.engine.types import InputEvent, NodeType, StageExecutionState
 from pivot.engine.watch import WatchCoordinator
 
 
 def _helper_build_graph(
     stages: dict[str, dict[str, list[str]]],
-) -> nx.DiGraph[str]:
-    """Build a minimal bipartite graph for testing.
+) -> tuple[nx.DiGraph[str], dict[pathlib.Path, pivot_types.ArtifactIdentity]]:
+    """Build a minimal identity graph and its filesystem path index."""
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    identities = dict[pathlib.Path, pivot_types.ArtifactIdentity]()
 
-    Args:
-        stages: Mapping of stage_name -> {"deps": [paths], "outs": [paths]}
-    """
-    g: nx.DiGraph[str] = nx.DiGraph()
+    def _identity(path_str: str, producer: str | None = None) -> pivot_types.ArtifactIdentity:
+        path = project.normalize_path(path_str)
+        if path not in identities:
+            identities[path] = pivot_types.ArtifactIdentity(
+                producer or f"input/{path.name}",
+                None,
+            )
+        return identities[path]
+
     for name, info in stages.items():
         stage = engine_graph.stage_node(name)
-        g.add_node(stage, type=NodeType.STAGE)
+        graph.add_node(stage, type=NodeType.STAGE)
         for dep in info.get("deps", []):
-            art = engine_graph.artifact_node(pathlib.Path(dep))
-            g.add_node(art, type=NodeType.ARTIFACT)
-            g.add_edge(art, stage)
+            artifact = engine_graph.artifact_node(_identity(dep))
+            graph.add_node(artifact, type=NodeType.ARTIFACT)
+            graph.add_edge(artifact, stage)
         for out in info.get("outs", []):
-            art = engine_graph.artifact_node(pathlib.Path(out))
-            g.add_node(art, type=NodeType.ARTIFACT)
-            g.add_edge(stage, art)
-    return g
+            artifact = engine_graph.artifact_node(_identity(out, producer=name))
+            graph.add_node(artifact, type=NodeType.ARTIFACT)
+            graph.add_edge(stage, artifact)
+    return graph, identities
 
 
 def _helper_state_map(
@@ -53,14 +65,14 @@ def _helper_state_map(
 
 def test_affected_stages_returns_consumers_and_downstream() -> None:
     """Changed input affects its consumer and all transitive downstream stages."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "extract": {"deps": ["/data/raw.csv"], "outs": ["/data/clean.csv"]},
             "train": {"deps": ["/data/clean.csv"], "outs": ["/models/model.pkl"]},
             "evaluate": {"deps": ["/models/model.pkl"], "outs": ["/results/metrics.json"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     affected = coord.get_affected_stages([pathlib.Path("/data/raw.csv")])
     assert set(affected) == {"extract", "train", "evaluate"}, (
@@ -70,24 +82,24 @@ def test_affected_stages_returns_consumers_and_downstream() -> None:
 
 def test_affected_stages_unknown_path_returns_empty() -> None:
     """Path not in graph returns no affected stages."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     assert coord.get_affected_stages([pathlib.Path("/unknown.csv")]) == []
 
 
 def test_affected_stages_deduplicates() -> None:
     """Multiple paths affecting the same stage are deduplicated."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input1.csv", "/input2.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     affected = coord.get_affected_stages(
         [
@@ -98,6 +110,139 @@ def test_affected_stages_deduplicates() -> None:
     assert affected == ["stage_a"], "should deduplicate"
 
 
+def test_affected_output_path_does_not_resolve_to_an_input(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An output symlink must not gain consumers of the input it resolves to."""
+    input_path = tmp_path / "input.txt"
+    input_path.write_text("input")
+    output_path = tmp_path / "output.txt"
+    output_path.symlink_to(input_path)
+    graph, artifact_paths = _helper_build_graph(
+        {
+            "source": {"outs": [str(output_path)]},
+            "consume_output": {"deps": [str(output_path)]},
+            "consume_input": {"deps": [str(input_path)]},
+        }
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+
+    assert coord.get_affected_stages([output_path]) == ["consume_output"]
+
+
+@pytest.mark.parametrize(
+    "event_dir",
+    [pytest.param("real", id="physical"), pytest.param("linked", id="logical")],
+)
+def test_output_event_under_symlinked_parent_uses_output_identity(
+    tmp_path: pathlib.Path, event_dir: str
+) -> None:
+    """Either spelling of an output event retains its producer and skips raw-input aliases."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    linked_dir = tmp_path / "linked"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    output_path = linked_dir / "out.txt"
+    physical_output = real_dir / "out.txt"
+    physical_output.write_text("output")
+    raw_alias = tmp_path / "raw-alias.txt"
+    raw_alias.symlink_to(physical_output)
+    graph, artifact_paths = _helper_build_graph(
+        {
+            "source": {"outs": [str(output_path)]},
+            "consume_output": {"deps": [str(output_path)]},
+            "consume_input": {"deps": [str(raw_alias)]},
+        }
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+    event_path = tmp_path / event_dir / "out.txt"
+
+    assert coord.get_producer(event_path) == "source"
+    assert (
+        coord.should_filter_path(
+            event_path,
+            get_stage_state=_helper_state_map(StageExecutionState.RUNNING).__getitem__,
+        )
+        is True
+    )
+    assert coord.get_affected_stages([event_path]) == ["consume_output"]
+
+
+@pytest.mark.anyio
+async def test_watchfiles_physical_output_event_uses_symlinked_output_identity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Whatever spelling watchfiles reports for the output, it routes as the output."""
+    real_dir = tmp_path / "real"
+    linked_dir = tmp_path / "linked"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    real_dir.mkdir()
+    output_path = linked_dir / "out.txt"
+    physical_output = real_dir / "out.txt"
+    raw_alias = tmp_path / "raw-alias.txt"
+    raw_alias.symlink_to(physical_output)
+    graph, artifact_paths = _helper_build_graph(
+        {
+            "source": {"outs": [str(output_path)]},
+            "consume_output": {"deps": [str(output_path)]},
+            "consume_input": {"deps": [str(raw_alias)]},
+        }
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+    source = sources.FilesystemSource(watch_paths=[tmp_path], debounce_ms=50)
+    send, receive = anyio.create_memory_object_stream[InputEvent](1)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        await anyio.wait_all_tasks_blocked()
+        output_path.write_text("output")
+        with anyio.fail_after(10):
+            event = await receive.receive()
+        assert event["type"] == "data_artifact_changed"
+        output_events = [
+            pathlib.Path(event_path)
+            for event_path in event["paths"]
+            if pathlib.Path(event_path).name == "out.txt"
+        ]
+        assert output_events, f"watchfiles reported no output path: {event['paths']}"
+        running = _helper_state_map(StageExecutionState.RUNNING)
+        for event_path in output_events:
+            assert coord.get_producer(event_path) == "source", event_path
+            assert coord.should_filter_path(event_path, get_stage_state=running.__getitem__), (
+                event_path
+            )
+            assert coord.get_affected_stages([event_path]) == ["consume_output"], event_path
+        tg.cancel_scope.cancel()
+
+
+def test_symlink_event_refreshes_retargeted_input_alias(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A symlink event refreshes aliases before an edit arrives through its new target."""
+    first_target = tmp_path / "first"
+    second_target = tmp_path / "second"
+    first_target.mkdir()
+    second_target.mkdir()
+    first_input = first_target / "a.txt"
+    second_input = second_target / "a.txt"
+    first_input.write_text("first")
+    second_input.write_text("second")
+    alias = tmp_path / "alias"
+    alias.symlink_to(first_target, target_is_directory=True)
+    graph, artifact_paths = _helper_build_graph(
+        {"aliasdir": {"deps": [str(alias)], "outs": [str(tmp_path / "output.txt")]}}
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+
+    assert coord.get_affected_stages([first_input]) == ["aliasdir"]
+
+    alias.unlink()
+    alias.symlink_to(second_target, target_is_directory=True)
+    assert coord.get_affected_stages([alias]) == ["aliasdir"]
+
+    assert coord.get_affected_stages([second_input]) == ["aliasdir"]
+
+
 # =============================================================================
 # Path Filtering
 # =============================================================================
@@ -105,12 +250,12 @@ def test_affected_stages_deduplicates() -> None:
 
 def test_should_filter_path_true_for_preparing_and_running_producer() -> None:
     """Paths produced by a PREPARING, WAITING_ON_LOCK, or RUNNING stage are filtered."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
     output = pathlib.Path("/output.csv")
 
     for state in (
@@ -126,12 +271,12 @@ def test_should_filter_path_true_for_preparing_and_running_producer() -> None:
 
 def test_should_filter_path_false_for_non_executing_producer() -> None:
     """Paths produced by PENDING, BLOCKED, READY, or COMPLETED stages are NOT filtered."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
     output = pathlib.Path("/output.csv")
 
     for state in (
@@ -148,12 +293,12 @@ def test_should_filter_path_false_for_non_executing_producer() -> None:
 
 def test_should_filter_path_false_for_input_artifact() -> None:
     """Input artifacts (no producer) should never be filtered."""
-    g = _helper_build_graph(
+    graph, artifact_paths = _helper_build_graph(
         {
             "stage_a": {"deps": ["/input.csv"], "outs": ["/output.csv"]},
         }
     )
-    coord = WatchCoordinator(graph=g)
+    coord = WatchCoordinator(graph, artifact_paths)
 
     state_map = _helper_state_map(StageExecutionState.RUNNING)
     assert (
@@ -169,11 +314,11 @@ def test_should_filter_path_false_for_input_artifact() -> None:
 
 def test_should_restart_workers_true_when_parallel() -> None:
     """Worker restart recommended when parallel mode is enabled."""
-    coord = WatchCoordinator(graph=nx.DiGraph())
+    coord = WatchCoordinator(nx.DiGraph(), {})
     assert coord.should_restart_workers(parallel=True) is True
 
 
 def test_should_restart_workers_false_when_not_parallel() -> None:
     """Worker restart not recommended in sequential mode."""
-    coord = WatchCoordinator(graph=nx.DiGraph())
+    coord = WatchCoordinator(nx.DiGraph(), {})
     assert coord.should_restart_workers(parallel=False) is False

@@ -1,31 +1,242 @@
 from __future__ import annotations
 
 import json
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING, Annotated
 
-import helpers
-from helpers import register_test_stage
-from pivot import cli, discovery, loaders, outputs, project
-from pivot.cli import decorators as cli_decorators
-from pivot.pipeline import pipeline as pipeline_mod
-from pivot.storage import cache
+import pandas as pd
+import pytest
+
+from pivot import cli, compose, discovery, executor, loaders, project
+from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
+    import pathlib
+    from collections.abc import Callable
+
     import click.testing
     from pytest import MonkeyPatch
     from pytest_mock import MockerFixture
 
     from conftest import GitRepo
-    from pivot.pipeline.pipeline import Pipeline
 
 # =============================================================================
-# Output TypedDicts for annotation-based stages
+# Module-level stage functions (required for pickling)
 # =============================================================================
 
 
-class _CsvOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
+@compose.stage
+def make_csv(source: pd.DataFrame) -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return source
+
+
+@compose.stage
+def make_output() -> str:
+    return "stage output content"
+
+
+# make_csv writes its output here (WorkspaceStore layout data/<pipeline>/<stage>.<ext>)
+_CSV_REL = "data/test/make_csv.csv"
+
+
+def _run_csv_stage(
+    pipeline: compose.Pipeline, commit_fn: Callable[[str], str], initial: str
+) -> pathlib.Path:
+    """Register make_csv, run it with `initial` as input, commit, and return the output path."""
+    raw = pipeline.root / "data" / "raw" / "source.csv"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_text(initial)
+    with pipeline:
+        make_csv(pipeline.input("source.csv", t=pd.DataFrame))
+    results = executor.run(pipeline=pipeline)
+    assert results["test/make_csv"]["status"] == "ran", results
+    output = pipeline.root / _CSV_REL
+    assert output.read_text() == initial, "CSV round-trip should reproduce the input"
+    commit_fn("Initial CSV output")
+    return output
+
+
+_OLD_RENDER_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class Old(TypedDict):
+    old: Annotated[str, loaders.Text()]
+
+
+@stage
+def render() -> Old:
+    return {"old": "old revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+_REMOVED_KEY_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class New(TypedDict):
+    new: Annotated[str, loaders.Text()]
+
+
+@stage
+def render() -> New:
+    return {"new": "new revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+_OLD_FORMAT_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class Old(TypedDict):
+    value: Annotated[str, loaders.Text()]
+
+
+@stage
+def render() -> Old:
+    return {"value": "old revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+_NEW_FORMAT_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+class New(TypedDict):
+    value: Annotated[str, loaders.JSON()]
+
+
+@stage
+def render() -> New:
+    return {"value": "new revision"}
+
+
+with Pipeline("rev") as pipeline:
+    render()
+"""
+
+
+def _commit_old_render_revision(
+    runner: click.testing.CliRunner,
+    repo_path: pathlib.Path,
+    commit: Callable[[str], str],
+    pipeline_source: str,
+) -> tuple[str, pathlib.Path]:
+    repo_path.joinpath("pipeline.py").write_text(pipeline_source)
+    initialized = runner.invoke(cli.cli, ["init"])
+    assert initialized.exit_code == 0, initialized.output
+    repro = runner.invoke(cli.cli, ["repro"])
+    assert repro.exit_code == 0, repro.output
+    sha = commit("old render output")
+    return sha, repo_path / "data" / "rev" / "render"
+
+
+def test_get_stage_from_old_revision_after_output_key_removed(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A v2 revision lock restores an old output even after the live pipeline removes its key."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    sha, output_dir = _commit_old_render_revision(runner, repo_path, commit, _OLD_RENDER_PIPELINE)
+    old_path = output_dir / "old.txt"
+    old_path.unlink()
+    repo_path.joinpath("pipeline.py").write_text(_REMOVED_KEY_PIPELINE)
+    live = discovery.discover_pipeline(repo_path)
+    assert live is not None
+    assert [ref.identity.key for ref in live.get_stage("rev/render")["outs"]] == ["new"]
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha, "rev/render"])
+
+    assert result.exit_code == 0, result.output
+    assert old_path.read_text() == "old revision"
+    assert not (output_dir / "new.txt").exists()
+
+    old_path.unlink()
+    redirected = repo_path / "from-old-revision.txt"
+    redirected_result = runner.invoke(
+        cli.cli, ["get", "--rev", sha, "--output", str(redirected), "rev/render"]
+    )
+
+    assert redirected_result.exit_code == 0, redirected_result.output
+    assert redirected.read_text() == "old revision"
+
+
+def test_get_pathless_old_lock_names_removed_key_and_revision(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An older pathless lock cannot restore a key the current pipeline no longer defines."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    _sha, output_dir = _commit_old_render_revision(runner, repo_path, commit, _OLD_RENDER_PIPELINE)
+    stage_lock = lock.StageLock("rev/render", repo_path / ".pivot" / "stages")
+    lock_data = stage_lock.read()
+    assert lock_data is not None
+    assert "output_paths" in lock_data
+    del lock_data["output_paths"]
+    stage_lock.write(lock_data)
+    pathless_sha = commit("pathless older lock")
+    (output_dir / "old.txt").unlink()
+    repo_path.joinpath("pipeline.py").write_text(_REMOVED_KEY_PIPELINE)
+    live = discovery.discover_pipeline(repo_path)
+    assert live is not None
+
+    result = runner.invoke(cli.cli, ["get", "--rev", pathless_sha, "rev/render"])
+
+    assert result.exit_code == 1, result.output
+    assert "output key 'old'" in result.output
+    assert pathless_sha in result.output
+
+
+def test_get_stage_from_old_revision_uses_the_revisions_output_format(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A v2 revision lock restores old bytes to its old extension, not the live format's path."""
+    repo_path, commit = git_repo
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    sha, output_dir = _commit_old_render_revision(runner, repo_path, commit, _OLD_FORMAT_PIPELINE)
+    old_path = output_dir / "value.txt"
+    old_path.unlink()
+    repo_path.joinpath("pipeline.py").write_text(_NEW_FORMAT_PIPELINE)
+    live = discovery.discover_pipeline(repo_path)
+    assert live is not None
+    assert [ref.identity.key for ref in live.get_stage("rev/render")["outs"]] == ["value"]
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha, "rev/render"])
+
+    assert result.exit_code == 0, result.output
+    assert old_path.read_text() == "old revision"
+    assert not (output_dir / "value.json").exists()
+
+
+def _rewrite(path: pathlib.Path, content: str) -> None:
+    # Remove first: the workspace file may be a link into the cache
+    path.unlink()
+    path.write_text(content)
 
 
 # =============================================================================
@@ -66,9 +277,7 @@ def test_get_in_main_help(runner: click.testing.CliRunner) -> None:
 # =============================================================================
 
 
-def test_diff_no_stages(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
-) -> None:
+def test_diff_no_stages(runner: click.testing.CliRunner, mock_discovery: compose.Pipeline) -> None:
     """Diff with no registered stages should report no data files."""
     result = runner.invoke(cli.cli, ["diff", "--no-tui", "data.csv"])
     assert result.exit_code == 0
@@ -81,11 +290,10 @@ def test_diff_no_stages(
 
 
 def test_diff_key_and_positional_conflict(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
+    runner: click.testing.CliRunner, mock_discovery: compose.Pipeline
 ) -> None:
     """Diff should error when both --key and --positional are specified."""
-    # Need to create a file so the targets validation passes
-    pathlib.Path("data.csv").write_text("id,name\n1,alice\n")
+    (mock_discovery.root / "data.csv").write_text("id,name\n1,alice\n")
     result = runner.invoke(cli.cli, ["diff", "--no-tui", "--key", "id", "--positional", "data.csv"])
     assert result.exit_code != 0
     assert "Cannot use both --key and --positional" in result.output
@@ -97,7 +305,7 @@ def test_diff_key_and_positional_conflict(
 
 
 def test_diff_requires_targets(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mock_discovery: Pipeline
+    runner: click.testing.CliRunner, mock_discovery: compose.Pipeline
 ) -> None:
     """Diff requires at least one target."""
     result = runner.invoke(cli.cli, ["diff", "--no-tui"])
@@ -110,302 +318,123 @@ def test_diff_requires_targets(
 # =============================================================================
 
 
-def _helper_make_csv_output() -> _CsvOutputs:
-    """Helper stage that produces a CSV output."""
-    pathlib.Path("output.csv").write_text("id,value\n1,10\n2,20\n")
-    return {"output": pathlib.Path("output.csv")}
-
-
 def test_diff_csv_file(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """Diff CSV files against HEAD."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    _, commit = git_repo
+    csv_file = _run_csv_stage(mock_discovery, commit, "id,value\n1,10\n2,20\n")
 
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
+    _rewrite(csv_file, "id,value\n1,10\n2,25\n3,30\n")  # Changed row 2, added row 3
 
-    # Register stage with CSV output
-    register_test_stage(
-        _helper_make_csv_output,
-        name="make_csv",
-    )
-
-    # Create initial CSV and cache it
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n1,10\n2,20\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    # Create lock file with output hash
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    lock_path = repo_path / ".pivot" / "stages" / "make_csv.lock"
-    lock_path.write_text(lock_content)
-
-    # Commit to create HEAD state
-    commit("Initial CSV output")
-
-    # Modify the CSV file in workspace (remove link first since cache creates hardlink/symlink)
-    csv_file.unlink()
-    csv_file.write_text("id,value\n1,10\n2,25\n3,30\n")  # Changed row 2, added row 3
-
-    result = runner.invoke(cli.cli, ["diff", "--no-tui", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    # Should show row changes
-    assert "output.csv" in result.output
+    assert _CSV_REL in result.output
     assert "Rows:" in result.output
+    assert "(added)" not in result.output, (
+        "File existed at HEAD; it must be diffed as modified, not reported as added"
+    )
 
 
 def test_diff_json_output(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """--json outputs structured diff."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    _, commit = git_repo
+    csv_file = _run_csv_stage(mock_discovery, commit, "id,value\n1,10\n")
 
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
+    _rewrite(csv_file, "id,value\n1,99\n")
 
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    # Create initial CSV and cache it
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n1,10\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Initial")
-
-    # Modify workspace (remove link first since cache creates hardlink/symlink)
-    csv_file.unlink()
-    csv_file.write_text("id,value\n1,99\n")
-
-    result = runner.invoke(cli.cli, ["diff", "--json", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--json", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    # Output should be valid JSON
     data: list[dict[str, object]] = json.loads(result.output)
     assert isinstance(data, list)
-    assert len(data) > 0
-    assert "path" in data[0]
-    assert data[0]["path"] == "output.csv"
+    assert len(data) == 1
+    assert data[0]["path"] == _CSV_REL
+    assert data[0]["old_rows"] == 1, "HEAD version (1 row) must be restored from cache"
 
 
 def test_diff_key_columns(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """--key uses columns for row matching."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    _, commit = git_repo
+    csv_file = _run_csv_stage(mock_discovery, commit, "id,name,value\n1,alice,10\n2,bob,20\n")
 
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
+    # Modify: update alice's value, add charlie
+    _rewrite(csv_file, "id,name,value\n1,alice,15\n2,bob,20\n3,charlie,30\n")
 
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    # Create initial CSV with key column
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,name,value\n1,alice,10\n2,bob,20\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Initial")
-
-    # Modify: update alice's value, add charlie (remove link first since cache creates hardlink/symlink)
-    csv_file.unlink()
-    csv_file.write_text("id,name,value\n1,alice,15\n2,bob,20\n3,charlie,30\n")
-
-    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--key", "id", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--key", "id", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    # Should detect modified row (alice) and added row (charlie)
-    assert "output.csv" in result.output
+    assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 2 -> 3 (+1)" in result.output
+    assert "+1 added" in result.output
+    assert "~1 modified" in result.output
 
 
 def test_diff_positional(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """--positional uses row position matching."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
-
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
-
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    # Create initial CSV
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n1,10\n2,20\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Initial")
+    _, commit = git_repo
+    csv_file = _run_csv_stage(mock_discovery, commit, "id,value\n1,10\n2,20\n")
 
     # Reorder rows (positional diff will see changes, key-based might not)
-    # Remove link first since cache creates hardlink/symlink
-    csv_file.unlink()
-    csv_file.write_text("id,value\n2,20\n1,10\n")
+    _rewrite(csv_file, "id,value\n2,20\n1,10\n")
 
-    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--positional", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--positional", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    assert "output.csv" in result.output
+    assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "REORDER ONLY" in result.output
+    assert "Same content, different row order" in result.output
 
 
 def test_diff_no_changes_message(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """No changes shows explicit message, not empty output."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
-
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
-
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n1,10\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Initial")
+    _, commit = git_repo
+    _run_csv_stage(mock_discovery, commit, "id,value\n1,10\n")
 
     # Don't modify - workspace same as HEAD
-    # Workspace hash should match HEAD hash
-
-    result = runner.invoke(cli.cli, ["diff", "--no-tui", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    # Should have an explicit message about no changes
     assert "No data file changes" in result.output
 
 
 def test_diff_json_empty_returns_valid_json(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """Empty diff returns valid JSON, not empty string."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
-
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
-
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n1,10\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Initial")
+    _, commit = git_repo
+    _run_csv_stage(mock_discovery, commit, "id,value\n1,10\n")
 
     # No changes - same content as HEAD
-
-    result = runner.invoke(cli.cli, ["diff", "--json", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--json", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     # With --json flag, should always return valid JSON (empty list when no changes)
     data: list[dict[str, object]] = json.loads(result.output)
-    assert isinstance(data, list)
-    assert len(data) == 0
+    assert data == []
 
 
 # =============================================================================
@@ -414,44 +443,26 @@ outs:
 
 
 def test_get_stage_output(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    mock_discovery: compose.Pipeline,
 ) -> None:
-    """get with stage name target."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
-
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    # Create output and cache it
-    output_file = repo_path / "result.txt"
-    output_file.write_text("stage output content")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(output_file, cache_dir)
-    assert output_hash is not None
-
-    # Create lock file for the stage
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: result.txt
-    hash: {output_hash["hash"]}
-"""
-    lock_path = repo_path / ".pivot" / "stages" / "make_output.lock"
-    lock_path.write_text(lock_content)
-
+    """get with stage name target restores the stage's outputs at their workspace paths."""
+    _, commit = git_repo
+    with mock_discovery:
+        make_output()
+    results = executor.run(pipeline=mock_discovery)
+    assert results["test/make_output"]["status"] == "ran", results
+    output_file = mock_discovery.root / "data" / "test" / "make_output.txt"
     sha = commit("Stage output")
 
     # Delete output file
     output_file.unlink()
-    assert not output_file.exists()
 
-    result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "make_output"])
+    result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "test/make_output"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "Restored" in result.output
-    assert output_file.exists()
     assert output_file.read_text() == "stage output content"
 
 
@@ -516,10 +527,9 @@ def test_diff_without_prior_run_discovers_pipeline(
     monkeypatch.chdir(repo_path)
     (repo_path / ".pivot").mkdir()
 
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
+    # Mock discovery to return a pipeline rooted at the git repo
+    pipeline = compose.Pipeline("test", root=repo_path)
+    discover = mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
     mocker.patch.object(project, "_project_root_cache", repo_path)
     # IMPORTANT: Do NOT mock get_pipeline_from_context - we want to test that
     # ensure_stages_registered() is called and populates the context
@@ -532,9 +542,10 @@ def test_diff_without_prior_run_discovers_pipeline(
 
     # Should not raise NoPipelineError - discovery should have been called
     assert "No pipeline found" not in result.output
-    # The test passes if discovery succeeded (no error about missing pipeline)
-    # It may show "No data files found" since we have no registered stages, which is fine
-    assert result.exit_code == 0 or "No data" in result.output
+    discover.assert_called()
+    # With no registered stages it reports no data files
+    assert result.exit_code == 0, result.output
+    assert "No data files found" in result.output
 
 
 def test_get_without_prior_run_discovers_pipeline(
@@ -542,23 +553,17 @@ def test_get_without_prior_run_discovers_pipeline(
     git_repo: GitRepo,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """pivot get discovers pipeline without needing prior command."""
+    """pivot get works in a project with a pipeline without needing prior command."""
     repo_path, commit = git_repo
     monkeypatch.chdir(repo_path)
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     # Reset cache so discovery finds this project root
-    project._project_root_cache = None
+    monkeypatch.setattr(project, "_project_root_cache", None)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
 
-    # Create minimal pivot.yaml with stage
-    (repo_path / "pivot.yaml").write_text("""\
-stages:
-  process:
-    python: stages.process
-    outs:
-      output.csv: {}
-""")
-    (repo_path / "stages.py").write_text("def process(): pass")
+    (repo_path / "pipeline.py").write_text(
+        "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
+    )
 
     # Create output and cache it
     output_file = repo_path / "output.csv"
@@ -587,7 +592,7 @@ size: 8
     # Should restore the file successfully
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "Restored" in result.output
-    assert output_file.exists()
+    assert output_file.read_text() == "x,y\n3,4"
 
 
 # =============================================================================
@@ -598,194 +603,86 @@ size: 8
 def test_diff_summary_flag(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """--summary flag shows only schema and counts, not detailed rows."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    _, commit = git_repo
+    csv_file = _run_csv_stage(mock_discovery, commit, "id,value\n1,10\n2,20\n")
 
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
+    _rewrite(csv_file, "id,value,new_col\n1,10,100\n2,25,200\n3,30,300\n")
 
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    # Create initial CSV and cache it
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n1,10\n2,20\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Initial CSV")
-
-    # Modify the CSV file (remove link first since cache creates hardlink/symlink)
-    csv_file.unlink()
-    csv_file.write_text("id,value,new_col\n1,10,100\n2,25,200\n3,30,300\n")
-
-    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--summary", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--summary", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    assert "output.csv" in result.output
-    # Summary should show counts but not detailed row-by-row changes
-    assert "Rows:" in result.output or "Schema" in result.output
+    assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 2 -> 3 (+1)" in result.output
+    assert "Columns: 2 -> 3 (+1 added, -0 removed)" in result.output
 
 
 def test_diff_markdown_output(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """--md outputs Markdown-formatted diff."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    _, commit = git_repo
+    csv_file = _run_csv_stage(mock_discovery, commit, "id,value\n1,10\n")
 
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
+    _rewrite(csv_file, "id,value\n1,99\n")
 
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    # Create initial CSV and cache it
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n1,10\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Initial")
-
-    # Modify workspace (remove link first since cache creates hardlink/symlink)
-    csv_file.unlink()
-    csv_file.write_text("id,value\n1,99\n")
-
-    result = runner.invoke(cli.cli, ["diff", "--md", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--md", _CSV_REL])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    # --md produces summary output (same format as plain for now)
-    # Verify the diff summary is present
-    assert "output.csv" in result.output
-    assert "Rows:" in result.output or "Row changes:" in result.output
+    assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 1 -> 1 (0)" in result.output
+    assert "~1 modified" in result.output
 
 
 def test_diff_max_rows_parameter(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """--max-rows limits comparison rows."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
-
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
-
-    register_test_stage(_helper_make_csv_output, name="make_csv")
-
-    # Create large CSV and cache it
-    csv_file = repo_path / "output.csv"
+    _, commit = git_repo
     rows = "\n".join([f"{i},{i * 10}" for i in range(1, 101)])
-    csv_file.write_text(f"id,value\n{rows}\n")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
+    csv_file = _run_csv_stage(mock_discovery, commit, f"id,value\n{rows}\n")
 
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Large CSV")
-
-    # Modify one row (remove link first since cache creates hardlink/symlink)
-    csv_file.unlink()
+    # Modify one row
     rows_modified = "\n".join([f"{i},{i * 10 if i != 50 else 9999}" for i in range(1, 101)])
-    csv_file.write_text(f"id,value\n{rows_modified}\n")
+    _rewrite(csv_file, f"id,value\n{rows_modified}\n")
 
-    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--max-rows", "10", "output.csv"])
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", "--max-rows", "10", _CSV_REL])
 
-    # Should succeed without error even with max-rows limit
+    # The comparison must use the HEAD file, not render the workspace file as newly added.
     assert result.exit_code == 0, f"Failed: {result.output}"
-    assert "output.csv" in result.output
+    assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 100 -> 100 (0)" in result.output
+    assert "~1 modified" in result.output
 
 
 def test_diff_empty_csv_file(
     runner: click.testing.CliRunner,
     git_repo: GitRepo,
-    mocker: MockerFixture,
+    mock_discovery: compose.Pipeline,
 ) -> None:
     """Diff handles empty CSV files gracefully."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    _, commit = git_repo
+    csv_file = _run_csv_stage(mock_discovery, commit, "id,value\n")  # Header only
 
-    # Create Pipeline with git_repo path and mock discovery to return it
-    pipeline = pipeline_mod.Pipeline("test", root=repo_path)
-    helpers.set_test_pipeline(pipeline)
-    mocker.patch.object(discovery, "discover_pipeline", return_value=pipeline)
-    mocker.patch.object(project, "_project_root_cache", repo_path)
-    mocker.patch.object(cli_decorators, "get_pipeline_from_context", return_value=pipeline)
+    _rewrite(csv_file, "id,value\n1,10\n")
 
-    register_test_stage(_helper_make_csv_output, name="make_csv")
+    result = runner.invoke(cli.cli, ["diff", "--no-tui", _CSV_REL])
 
-    # Create empty CSV and cache it
-    csv_file = repo_path / "output.csv"
-    csv_file.write_text("id,value\n")  # Header only, no data rows
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache.save_to_cache(csv_file, cache_dir)
-    assert output_hash is not None
-
-    lock_content = f"""code_manifest: {{}}
-params: {{}}
-deps: []
-outs:
-  - path: output.csv
-    hash: {output_hash["hash"]}
-"""
-    (repo_path / ".pivot" / "stages" / "make_csv.lock").write_text(lock_content)
-    commit("Empty CSV")
-
-    # Modify to add rows (remove link first since cache creates hardlink/symlink)
-    csv_file.unlink()
-    csv_file.write_text("id,value\n1,10\n")
-
-    result = runner.invoke(cli.cli, ["diff", "--no-tui", "output.csv"])
-
-    # Should handle empty file without crashing
+    # The header-only HEAD file must be compared with the workspace file, not treated as absent.
     assert result.exit_code == 0, f"Failed: {result.output}"
-    assert "output.csv" in result.output
+    assert _CSV_REL in result.output
+    assert "(added)" not in result.output, result.output
+    assert "Rows: 0 -> 1 (+1)" in result.output
+    assert "+1 added" in result.output
 
 
 # =============================================================================
@@ -814,8 +711,7 @@ def test_get_multiple_files(
     result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "--force", "file1.txt", "file2.txt"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    # Both files should be mentioned in output
-    assert "file1.txt" in result.output or "Restored" in result.output
+    assert "Restored" in result.output
     # Verify files restored
     assert (repo_path / "file1.txt").read_text() == "content1"
     assert (repo_path / "file2.txt").read_text() == "content2"
@@ -842,12 +738,24 @@ def test_get_output_with_multiple_targets_fails(
     # Should fail - can't use -o with multiple targets
     assert result.exit_code != 0
     assert "output" in result.output.lower() or "multiple" in result.output.lower()
+    assert not (repo_path / "output.txt").exists()
 
 
-def test_get_symlink_checkout_mode(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+@pytest.mark.parametrize(
+    ("mode", "expect_symlink"),
+    [
+        pytest.param("symlink", True, id="symlink"),
+        pytest.param("hardlink", False, id="hardlink"),
+    ],
+)
+def test_get_link_checkout_modes(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: MonkeyPatch,
+    mode: str,
+    expect_symlink: bool,
 ) -> None:
-    """--checkout-mode symlink creates symlinks."""
+    """--checkout-mode symlink/hardlink restores via the requested link type."""
     repo_path, commit = git_repo
     (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
@@ -855,12 +763,10 @@ def test_get_symlink_checkout_mode(
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
 
     # Create file and cache it
-    from pivot.storage import cache as cache_mod
-
     data_file = repo_path / "data.txt"
     data_file.write_text("cached content")
     cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache_mod.save_to_cache(data_file, cache_dir)
+    output_hash = cache.save_to_cache(data_file, cache_dir)
     assert output_hash is not None
 
     # Create .pvt file to track it
@@ -868,8 +774,7 @@ def test_get_symlink_checkout_mode(
 hash: {output_hash["hash"]}
 size: 14
 """
-    pvt_path = repo_path / "data.txt.pvt"
-    pvt_path.write_text(pvt_content)
+    (repo_path / "data.txt.pvt").write_text(pvt_content)
 
     sha = commit("Track data file")
 
@@ -877,66 +782,12 @@ size: 14
     data_file.unlink()
     assert not data_file.exists()
 
-    # Test symlink mode
     result = runner.invoke(
         cli.cli,
-        ["get", "--rev", sha[:7], "--checkout-mode", "symlink", "data.txt"],
+        ["get", "--rev", sha[:7], "--checkout-mode", mode, "data.txt"],
     )
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "Restored" in result.output
-    assert data_file.exists()
-    # With symlink mode, file should be a symlink
-    assert data_file.is_symlink()
-    assert data_file.read_text() == "cached content"
-
-
-def test_get_hardlink_checkout_mode(
-    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
-) -> None:
-    """--checkout-mode hardlink creates hardlinks."""
-    repo_path, commit = git_repo
-    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True)
-    (repo_path / ".pivot" / "stages").mkdir(parents=True)
-
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    # Create file and cache it
-    from pivot.storage import cache as cache_mod
-
-    data_file = repo_path / "data.txt"
-    data_file.write_text("cached content")
-    cache_dir = repo_path / ".pivot" / "cache" / "files"
-    output_hash = cache_mod.save_to_cache(data_file, cache_dir)
-    assert output_hash is not None
-
-    # Create .pvt file to track it
-    pvt_content = f"""path: data.txt
-hash: {output_hash["hash"]}
-size: 14
-"""
-    pvt_path = repo_path / "data.txt.pvt"
-    pvt_path.write_text(pvt_content)
-
-    sha = commit("Track data file")
-
-    # Delete data file
-    data_file.unlink()
-    assert not data_file.exists()
-
-    # Test hardlink mode
-    result = runner.invoke(
-        cli.cli,
-        ["get", "--rev", sha[:7], "--checkout-mode", "hardlink", "data.txt"],
-    )
-
-    assert result.exit_code == 0, f"Failed: {result.output}"
-    assert "Restored" in result.output
-    assert data_file.exists()
-    # With hardlink mode, file should not be a symlink
-    assert not data_file.is_symlink()
-    # Verify it's a hardlink by checking link count (if supported by filesystem)
-    stat_info = data_file.stat()
-    # Hardlinked file has nlink > 1
-    assert stat_info.st_nlink >= 1  # At least the file exists
+    assert data_file.is_symlink() is expect_symlink
     assert data_file.read_text() == "cached content"

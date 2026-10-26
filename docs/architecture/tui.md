@@ -30,7 +30,7 @@ The TUI is a **pure RPC client** — it communicates with the engine exclusively
 
 The `run_tui_with_engine()` helper in `_run_common.py` coordinates three threads:
 
-1. **Main thread**: Runs the Textual TUI (`app.run()`). Required for signal handlers. Owns its own `RpcPivotClient` connected in `on_mount()` for UI commands (`run`, `cancel`, `commit`, `set_on_error`, `diff_output`).
+1. **Main thread**: Runs the Textual TUI (`app.run()`). Required for signal handlers. Owns its own `RpcPivotClient` connected in `on_mount()` for UI commands (`run`, `cancel`, `commit`, `set_on_error`, `diff_output`). Before it starts the engine thread it enters `defer_console_logging()`, which attaches a filter to each root log handler that writes to stdout or stderr and wraps each handler's whole filter-and-emit cycle under one lock. Until `app.run()` starts, records print as usual and a warning is remembered only after its terminal write completes. Starting Textual takes those same locks before redirecting stderr. While the TUI runs, the handler prints nothing: the filter holds each distinct warning or error logged on any thread (same logger, level, message and exception), skipping those already printed, and prints them once `app.run()` returns. The engine's tracked-file and `Skipping:` warnings are among them. `Pipeline invalid` records carry the error they report; `pivot repro --watch --tui` supplies `Engine.pipeline_error` at release, which prints only a record the engine still reports. Records from `pivot_tui` describe the TUI itself and are dropped.
 
 2. **Engine thread**: Runs `anyio.run(engine_fn)` with the pipeline engine and RPC socket server. Sets `socket_ready` after the Unix socket is listening.
 
@@ -50,7 +50,9 @@ Each thread has its own anyio event loop — socket connections are never shared
 
 - `EventPoller.stop()` uses a `threading.Event` + task group cancellation to interrupt blocked RPC calls
 - TUI quit handlers call `poller.stop()` then `client.disconnect()`
-- `poller_thread.join(timeout=2.0)` ensures clean shutdown before process exit
+- `run_tui_with_engine()` owns a second `threading.Event`, `poller_stop`. The engine thread sets it in its `finally` when the engine finishes, and the main thread sets it once `app.run()` returns. The poller's connect-retry loop waits on it between attempts and gives up as soon as it is set, so a one-shot engine that finishes and removes its socket before the poller connects does not leave the poller retrying. A connected poller is stopped by the same event.
+- Because `poller_stop` is always set by the time `app.run()` returns, `poller_thread.join()` waits with no timeout.
+- When the engine thread ends it posts `TuiShutdown(error=...)`. Run mode exits on it. Watch mode ignores a normal shutdown and keeps running until the user quits, but on an engine error it exits with return code 1, and `run_tui_with_engine()` re-raises the engine's exception so the command fails.
 - Both engine and poller threads are daemon threads — killed on process exit as fallback
 
 ## Message Types
@@ -62,14 +64,14 @@ All message types are defined in `src/pivot/types.py`:
 | `TuiStatusMessage` | Coordinator | Stage lifecycle (started, completed, failed, skipped) with timing |
 | `TuiLogMessage` | Worker | stdout/stderr lines from stage execution |
 | `TuiWatchMessage` | Watch engine | Watch status (waiting, detecting, restarting, error) |
-| `TuiReloadMessage` | Watch engine | Stage list changed after code reload (add/remove stages) |
+| `TuiReloadMessage` | Watch engine | Stage list changed after code reload, or why the edited pipeline is invalid |
 
 Key fields:
 
 - **TuiStatusMessage**: `type`, `stage`, `index`, `total`, `status`, `reason`, `elapsed` (seconds, or `None` if still running), `run_id`
 - **TuiLogMessage**: `type`, `stage`, `line`, `is_stderr`, `timestamp`
 - **TuiWatchMessage**: `type`, `status` (WatchStatus enum), `message`
-- **TuiReloadMessage**: `type`, `stages` (list of current stage names after reload)
+- **TuiReloadMessage**: `type`, `stages` (current stage names), `stages_added`, `stages_removed`, `stages_modified`, `error`. When `error` is set (a syntax error, a missing `pipeline` variable, a stage that fails to fingerprint, a `params.yaml` that fails its checks, or a run that found a stage over its resource capacity or an input missing), the app keeps its stage list, titles itself `Pipeline invalid - waiting for fix`, and shows the error on a line under the header until a message with `error` unset clears it: a good reload, or the data change that finds the missing input.
 
 ## Execution History
 

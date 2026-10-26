@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import dataclasses
 import enum
+import pathlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Required, TypedDict, TypeGuard, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NamedTuple,
+    NotRequired,
+    Required,
+    TypedDict,
+    TypeGuard,
+    cast,
+)
 
 if TYPE_CHECKING:
+    from pivot import loaders as loaders_module
     from pivot.run_history import RunCacheEntry
 
 # =============================================================================
@@ -95,6 +108,11 @@ class DisplayCategory(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
+# The worker logs every LossyOutputWarning as "Stage '<stage>' wrote <output> <phrase>: ...";
+# the console report keys on the phrase to show those warnings uncapped.
+LOSSY_OUTPUT_PHRASE = "in a form Pivot cannot read back"
+
+
 def categorize_stage_result(status: StageStatus) -> DisplayCategory:
     """Map status to display category for consistent UI."""
     match status:
@@ -124,14 +142,6 @@ def parse_stage_name(name: str) -> tuple[str, str]:
     return (name, "")
 
 
-class StageDisplayStatus(enum.StrEnum):
-    """Display status for stage progress output."""
-
-    FINGERPRINTING = "fingerprinting"
-    RUNNING = "running"
-    WAITING = "waiting"
-
-
 class OnError(enum.StrEnum):
     """Error handling mode."""
 
@@ -149,6 +159,8 @@ class DeferredWrites(TypedDict, total=False):
     dep_generations: dict[str, int]  # {dep_path: generation}
     run_cache_input_hash: str
     run_cache_entry: RunCacheEntry
+    # A run the stage-import check flagged: delete any run-cache entry at this input hash.
+    run_cache_delete_input_hash: str
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
 
@@ -162,6 +174,7 @@ class StageResult(TypedDict):
     output_lines: list[tuple[str, bool]]
     metrics: NotRequired[list[tuple[str, float]]]  # (name, duration_ms) for cross-process
     deferred_writes: NotRequired[DeferredWrites]
+    user_code_files: NotRequired[list[str]]  # Absolute source paths workers imported
 
 
 # =============================================================================
@@ -173,8 +186,9 @@ class StageResult(TypedDict):
 #
 #   FileHash          Simple {hash: str} for individual files.
 #
-#   DirHash           Tree hash with manifest listing all files. The manifest
-#                     enables incremental sync (only transfer changed files).
+#   DirHash           Tree hash with manifest listing all files, plus the directory's
+#                     empty directories. The manifest enables incremental sync (only
+#                     transfer changed files).
 #
 #   HashInfo          Union type for hashes (files or directories).
 #
@@ -196,10 +210,17 @@ class DirManifestEntry(TypedDict):
 
 
 class DirHash(TypedDict):
-    """Hash info for a directory with full manifest."""
+    """Hash info for a directory with full manifest.
+
+    ``empty_dirs`` lists the directories that hold no stored file and no other directory, as
+    relpaths, sorted. Restoring the files recreates their parents and these recreate every
+    other directory, so a restored directory has exactly the directories the hashed one had.
+    The key is present only when the list is non-empty.
+    """
 
     hash: str
     manifest: list[DirManifestEntry]
+    empty_dirs: NotRequired[list[str]]
 
 
 HashInfo = FileHash | DirHash
@@ -230,36 +251,145 @@ class OutputFormat(enum.StrEnum):
 #
 # Two representations exist for different purposes:
 #
-#   StorageLockData   On-disk YAML format. Uses project-relative paths
-#                     (portable across machines) and list-based deps/outs
-#                     (stable YAML output). This is the only place relative
-#                     paths appear in lockfiles — converted at read/write
-#                     boundary in storage/lock.py.
+#   StorageLockData   On-disk YAML format. Uses project-relative identity keys
+#                     and list-based deps/outs (stable YAML output).
 #
-#   LockData          In-memory format. Uses canonical absolute paths
-#                     (matching registry/engine convention, fast comparisons)
-#                     and dict-based deps/outs (O(1) lookups by path).
+#   LockData          In-memory format. Uses ArtifactIdentity keys
+#                     and dict-based deps/outs (O(1) lookups by identity).
 #
 # Conversion happens at read/write time in storage/lock.py.
 #
 
 
+class ArtifactIdentity(NamedTuple):
+    producer: str
+    key: str | None
+
+
+class ArtifactIdentityJson(TypedDict):
+    producer: str
+    key: str | None
+
+
+def identity_to_json(identity: ArtifactIdentity) -> ArtifactIdentityJson:
+    return ArtifactIdentityJson(producer=identity.producer, key=identity.key)
+
+
+def identity_from_json(payload: ArtifactIdentityJson) -> ArtifactIdentity:
+    return ArtifactIdentity(payload["producer"], payload["key"])
+
+
+def identity_key(identity: ArtifactIdentity) -> str:
+    if identity.key is None:
+        return identity.producer
+    return f"{identity.producer}:{identity.key}"
+
+
+def identity_from_key(key: str) -> ArtifactIdentity:
+    if ":" in key:
+        producer, artifact_key = key.split(":", 1)
+        return ArtifactIdentity(producer, artifact_key)
+    return ArtifactIdentity(key, None)
+
+
+class ArtifactTag(enum.StrEnum):
+    INPUT = "input"
+    DATA = "data"
+    METRIC = "metric"
+    PLOT = "plot"
+    DIRECTORY = "directory"
+    INCREMENTAL = "incremental"
+
+
+@dataclasses.dataclass(eq=False)
+class ArtifactRef:
+    """One output a stage writes, or one artifact a stage reads.
+
+    ``directory`` is set on a dependency that reads one file of a directory output: the
+    directory output's identity. The ref's own identity is that identity with the file's path
+    appended to the key (``stage:file.json``, or ``stage:output/file.json`` for a keyed
+    output), so a lock records the hash of that file alone.
+    """
+
+    identity: ArtifactIdentity
+    format: (
+        loaders_module.Reader[Any] | loaders_module.Writer[Any] | loaders_module.Loader[Any, Any]
+    )
+    python_type: type
+    tag: ArtifactTag
+    directory: ArtifactIdentity | None = None
+
+
+def source_identity(ref: ArtifactRef) -> ArtifactIdentity:
+    """The artifact a dependency reads from: the directory output for one of its files.
+
+    Every other ref is its own source. The DAG, artifact locks and watch mode treat a file of
+    a directory as part of the directory its producer writes.
+    """
+    return ref.identity if ref.directory is None else ref.directory
+
+
+def directory_file_identity(directory: ArtifactIdentity, path: str) -> ArtifactIdentity:
+    """The identity of one file of a directory output: the file's path appended to the key.
+
+    ``stage:path`` for a stage's return value, ``stage:output/path`` for a ``TypedDict`` field.
+    """
+    return ArtifactIdentity(
+        directory.producer, path if directory.key is None else f"{directory.key}/{path}"
+    )
+
+
+def validate_artifact_identity(identity: ArtifactIdentity) -> None:
+    if identity.producer.strip() == "":
+        raise ValueError("Artifact producer cannot be empty")
+    if pathlib.PurePath(identity.producer).is_absolute():
+        raise ValueError(f"Artifact producer cannot be absolute: {identity.producer!r}")
+    bad_chars = {"\\", "\0", ":"}
+    if bad_chars & set(identity.producer):
+        raise ValueError(
+            f"Artifact producer cannot contain backslashes, null bytes, or colons: {identity.producer!r}"
+        )
+    for segment in identity.producer.split("/"):
+        if segment in {".", ".."}:
+            raise ValueError(
+                f"Artifact producer cannot contain traversal segments: {identity.producer!r}"
+            )
+
+    if identity.key is None:
+        return
+    if pathlib.PurePath(identity.key).is_absolute():
+        raise ValueError(f"Artifact key cannot be absolute: {identity.key!r}")
+    if identity.key.strip() == "":
+        raise ValueError("Artifact key cannot be empty")
+    if bad_chars & set(identity.key):
+        raise ValueError(
+            f"Artifact key cannot contain backslashes, null bytes, or colons: {identity.key!r}"
+        )
+    for segment in identity.key.split("/"):
+        if segment in {".", ".."}:
+            raise ValueError(f"Artifact key cannot contain traversal segments: {identity.key!r}")
+
+
 class DepEntry(TypedDict):
     """Entry in deps list for lock file storage."""
 
-    path: str
+    producer: str
+    key: str | None
     hash: str
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
+    empty_dirs: NotRequired[list[str]]
 
 
 class OutEntry(TypedDict):
     """Entry in outs list for lock file storage."""
 
-    path: str
+    key: str | None
     hash: str
+    path: NotRequired[str]
     size: NotRequired[int]
     manifest: NotRequired[list[DirManifestEntry]]
+    empty_dirs: NotRequired[list[str]]
 
 
 class StorageLockData(TypedDict):
@@ -274,12 +404,13 @@ class StorageLockData(TypedDict):
 
 
 class LockData(TypedDict):
-    """Internal representation of stage lock data (dict-based, absolute paths)."""
+    """Internal representation of stage lock data (dict-based, identity-keyed)."""
 
     code_manifest: dict[str, str]
     params: dict[str, Any]
-    dep_hashes: dict[str, HashInfo]
-    output_hashes: dict[str, HashInfo]
+    dep_hashes: dict[ArtifactIdentity, HashInfo]
+    output_hashes: dict[ArtifactIdentity, HashInfo]
+    output_paths: NotRequired[dict[ArtifactIdentity, str]]
 
 
 class OutputMessageKind(enum.StrEnum):
@@ -329,7 +460,7 @@ class ChangeType(enum.StrEnum):
 class CodeChange(TypedDict):
     """Change info for a code component in the fingerprint."""
 
-    key: str  # e.g., "func:helper_a", "mod:utils.helper"
+    key: str  # e.g., "func:helper_a", "const:settings.FACTOR"
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType
@@ -347,16 +478,16 @@ class ParamChange(TypedDict):
 class DepChange(TypedDict):
     """Change info for an input dependency file."""
 
-    path: str
+    identity: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType
 
 
 class OutputChange(TypedDict):
-    """Change info for an output file."""
+    """Change info for an output artifact."""
 
-    path: str
+    identity: ArtifactIdentity
     old_hash: str | None
     new_hash: str | None
     change_type: ChangeType | None  # None means unchanged
@@ -373,6 +504,7 @@ class ChangeDecision(TypedDict, total=False):
     changed: Required[bool]
     reason: Required[str]
     code_changes: list[CodeChange]
+    run_cache_allowed: Required[bool]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
 
@@ -423,7 +555,7 @@ class RemoteStatus(TypedDict):
 class RawPivotConfig(TypedDict, total=False):
     """Raw config file structure (.pivot/config.yaml)."""
 
-    remotes: dict[str, str]  # {remote_name: s3_url}
+    remotes: dict[str, str]  # {remote_name: s3:// or gs:// url}
     default_remote: str
 
 
@@ -482,6 +614,24 @@ class StatusOutput(TypedDict, total=False):
     suggestions: list[str]
 
 
+class DepChangeJson(TypedDict):
+    """A DepChange as JSON: the identity as ``{producer, key}``, as the RPC sends it."""
+
+    identity: ArtifactIdentityJson
+    old_hash: str | None
+    new_hash: str | None
+    change_type: ChangeType
+
+
+def dep_change_to_json(change: DepChange) -> DepChangeJson:
+    return DepChangeJson(
+        identity=identity_to_json(change["identity"]),
+        old_hash=change["old_hash"],
+        new_hash=change["new_hash"],
+        change_type=change["change_type"],
+    )
+
+
 class ExplainStageJson(TypedDict):
     """JSON-serializable stage explanation for status --explain --json output."""
 
@@ -492,7 +642,7 @@ class ExplainStageJson(TypedDict):
     is_forced: bool
     code_changes: list[CodeChange]
     param_changes: list[ParamChange]
-    dep_changes: list[DepChange]
+    dep_changes: list[DepChangeJson]
     upstream_stale: list[str]
 
 
@@ -541,6 +691,7 @@ class DataDiffResult(TypedDict):
     """Result of comparing two data files."""
 
     path: str
+    change_type: ChangeType
     old_rows: int | None
     new_rows: int | None
     old_cols: list[str] | None
@@ -604,7 +755,7 @@ class TuiStatusMessage(TypedDict):
     elapsed: float | None
     run_id: str
     explanation: NotRequired[StageExplanation | None]
-    output_summary: NotRequired[list[dict[str, object]] | None]
+    output_summary: NotRequired[list[OutputChange] | None]
 
 
 class TuiWatchMessage(TypedDict):
@@ -616,26 +767,18 @@ class TuiWatchMessage(TypedDict):
 
 
 class TuiReloadMessage(TypedDict):
-    """Registry reload notification for TUI display."""
+    """Registry reload notification for TUI display.
+
+    ``error`` is set when the edited pipeline is invalid; ``stages`` then lists the stages of
+    the pipeline still loaded.
+    """
 
     type: Literal[TuiMessageType.RELOAD]
     stages: list[str]
     stages_added: list[str]
     stages_removed: list[str]
     stages_modified: list[str]
-
-
-TuiMessage = TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage | None
-
-
-def is_tui_status_message(msg: TuiMessage) -> TypeGuard[TuiStatusMessage]:
-    """TypeGuard to narrow TuiMessage to TuiStatusMessage."""
-    return msg is not None and msg["type"] == TuiMessageType.STATUS
-
-
-def is_tui_log_message(msg: TuiMessage) -> TypeGuard[TuiLogMessage]:
-    """TypeGuard to narrow TuiMessage to TuiLogMessage."""
-    return msg is not None and msg["type"] == TuiMessageType.LOG
+    error: str | None
 
 
 # =============================================================================
@@ -845,8 +988,8 @@ class AgentStageInfo(TypedDict):
     """Stage info returned by stages() RPC method."""
 
     name: str
-    deps: list[str]
-    outs: list[str]
+    deps: list[ArtifactIdentityJson]
+    outs: list[ArtifactIdentityJson]
 
 
 class AgentStagesResult(TypedDict):
@@ -855,43 +998,6 @@ class AgentStagesResult(TypedDict):
     stages: list[AgentStageInfo]
 
 
-# =============================================================================
-# Stage Function Types
-# =============================================================================
-#
-# Stage functions are the core unit of pipeline definition. Their return type
-# determines how outputs are tracked and persisted.
-#
-# Valid return types (validated at registration time):
-#
-#   1. None
-#      No tracked outputs. Stage executes for side effects or writes directly.
-#
-#   2. TypedDict with Out-annotated fields
-#      Multiple named outputs. Each field must have Annotated[T, Out(...)] type.
-#      Example:
-#          class TrainOutputs(TypedDict):
-#              model: Annotated[bytes, Out("model.pkl", Pickle())]
-#              metrics: Annotated[dict, Out("metrics.json", JSON())]
-#
-#   3. Annotated[T, Out(...)]
-#      Single tracked output. Return value is written directly.
-#      Example:
-#          def transform(...) -> Annotated[DataFrame, Out("out.csv", CSV())]:
-#              return df.dropna()
-#
-#   4. Any other type
-#      No tracked outputs. Return value is ignored by the framework.
-#
-# Note: The constraint "TypedDict where all fields have Out annotations" cannot
-# be expressed in Python's type system. Validation is performed at registration
-# time in stage_def.extract_stage_definition().
-#
-
-# Return type for stage functions. The actual constraint is validated at
-# registration time - see valid return types documentation above.
-type StageReturn = Any
-
-# Callable type for stage functions. Parameters are injected based on
-# Annotated[T, Dep(...)] type hints at runtime.
-type StageFunc = Callable[..., StageReturn]
+# A stage function; compose derives its deps from handle arguments and its outputs
+# from the return annotation.
+type StageFunc = Callable[..., Any]

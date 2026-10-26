@@ -23,20 +23,26 @@ def test_it():
 
 Only dunders (`__name__`, `__init__`) are filtered from fingerprinting. Single underscore functions like `_helper()` ARE tracked.
 
-### Lambda Fingerprinting Is Non-Deterministic
+### Lambdas Without Source Are Hashed by Code Object
 
-Lambdas without accessible source code fall back to `id(func)`, which changes every interpreter session. This causes unnecessary re-runs.
+A lambda in a source file is hashed by its AST. One without accessible source (`eval`, `exec`, a REPL) is hashed by `marshal` of its `__code__` with the source path removed: stable across interpreter sessions, and sensitive to bytecode and constants. Only a callable with neither source nor `__code__` is hashed by `id()`, which differs between sessions and reruns its stage every time.
 
-**Always use named functions in stage definitions:**
+**Prefer named functions in stage definitions**, whose AST hash ignores formatting and comments:
 
 ```python
-# Bad - non-deterministic fingerprint
-filter_func = lambda x: x > 0.5
+# Hashed by code object: any compiler-visible change reruns
+filter_func = eval("lambda x: x > 0.5")
 
-# Good - stable AST-based fingerprint
+# AST-based fingerprint
 def filter_positive(x: float) -> bool:
     return x > 0.5
 ```
+
+### User Code Never Loads Through Mtime-Checked Bytecode
+
+CPython reuses a cached `.pyc` while the source's size and whole-second mtime match the ones it recorded, so an edit that keeps a file's size, written in the second its previous version was written and cached, imports the previous code. While a discovery's import session lasts (from that discovery until the next one ends it), every file fingerprinting treats as user code (`fingerprint.is_library_path` is false for its resolved path; under the project root, outside the tooling directories discovery skips) imports through `discovery._ProjectSourceLoader`: in the process that discovered, and in every worker, whose pool installs the same path hook as its initializer (`discovery.install_user_code_loader`). A file `is_library_path` counts as a library's, pivot's own packages under an editable install of pivot included, loads as CPython loads it and its bytecode is left alone; what it counts is stated once, in `packages/pivot/tests/fingerprint/README.md` decision 17. A worker imports by name a stage's module that discovery does not send by value (one outside the root, or under it in a `src` layout) and any module a stage body imports. The loader caches checked-hash bytecode (PEP 552), checked against the source's content on every import by any process, after replacing other bytecode for the file (removing it under `sys.dont_write_bytecode`). It compiles from source when it cannot write the cache (a read-only `__pycache__`), under `sys.dont_write_bytecode`, and under `--check-hash-based-pycs never`, which workers do not inherit. A library package symlinked into the root loads as CPython loads it. A process pivot does not start, such as a subprocess a stage runs, imports with CPython's loader and can still read mtime-checked bytecode left in a read-only `__pycache__`. Before the first discovery, or after a session ends, imports get CPython's default loader: a test that rewrites a module and imports it outside a session, for example with `importlib.util.spec_from_file_location`, should remove `importlib.util.cache_from_source(path)` first.
+
+Fingerprinting's own caches, of function hashes (`fp:`) and stage manifests (`sm:`), record each source file by the digest of its content, not by its mtime, size and inode, which an edit can keep to the nanosecond (two writes inside one kernel timestamp tick, or a tool that restores the mtime).
 
 ## Multiprocessing
 
@@ -69,36 +75,47 @@ def my_stage():
         f.write("ran\n")
 ```
 
-### Stage Functions Must Be Module-Level
+### Stage Functions Belong at Module Level
 
-Workers receive pickled functions. Lambdas, closures, and `__main__` definitions fail.
+Workers receive stage functions by pickling (loky uses cloudpickle). A `@stage` defined inside a factory function does pickle and run, and the values it captures are fingerprinted, but configuration passed that way bypasses `StageParams`: it is not shown by `pivot params`, cannot be overridden in `params.yaml`, and the stage name no longer says which configuration it ran with. Define stages at module level and pass configuration as `StageParams`.
 
 ```python
 # Good
-def process_data(): ...
+class ProcessParams(StageParams):
+    threshold: float = 0.5
 
-# Bad - closure captures variable
+
+@stage
+def process(data: pd.DataFrame, params: ProcessParams) -> pd.DataFrame: ...
+
+
+# Bad - configuration hidden in a closure
 def make_stage(threshold):
-    def process():
-        if value > threshold:  # Captures threshold!
-            ...
+    @stage
+    def process(data: pd.DataFrame) -> pd.DataFrame:
+        return data[data["value"] > threshold]
+
+    return process
 ```
 
 ## Types
 
-### Stage Functions and TypedDicts Must Be Module-Level
+### Return-Type TypedDicts Should Be Module-Level
 
-`get_type_hints()` needs importable `__module__` for type resolution.
+With postponed/string annotations (for example, `from __future__ import annotations`), Pivot resolves a stage's return annotation with `get_type_hints()`, which looks names up in the function's module namespace. A `TypedDict` defined inside a function is not there, and the pipeline fails to load with `name 'ProcessOutputs' is not defined`. Without postponed annotations Python 3.13 can preserve a function-local `TypedDict`, but module-level definitions work in both cases and are the project convention.
 
 ```python
 # Good - module level
 class ProcessOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("out.csv", loaders.PathOnly())]
+    rows: pd.DataFrame
+    summary: Annotated[dict, metric]
 
-def process(...) -> ProcessOutputs:
-    ...
 
-# Bad - inline
+@stage
+def process(data: pd.DataFrame) -> ProcessOutputs: ...
+
+
+# Bad with postponed annotations - inline
 def create_stage():
     class ProcessOutputs(TypedDict):  # Can't resolve type hints!
         ...
@@ -116,9 +133,11 @@ if not func_node.body:
 
 ## Storage
 
-### IncrementalOut Uses COPY Mode
+### Incremental Outputs Use COPY Mode
 
-`IncrementalOut` always copies from cache rather than hardlinking/symlinking. This is intentional - the stage modifies the file in-place, so hardlinks would corrupt the cache.
+An `Annotated[T, incremental]` output restores its previous cached artifact as a
+writable copy before the stage receives the value bound by `pipeline.previous()`.
+Copy mode prevents in-place changes from corrupting the cached version.
 
 ### Path Strategies in StateDB
 

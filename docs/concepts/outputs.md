@@ -1,328 +1,329 @@
 # Outputs
 
-Outputs declare the files a stage writes. They form the other half of the
-[DAG](artifacts-and-dag.md) — every output path can become a
-[dependency](dependencies.md) for downstream stages.
+A stage's outputs are its return value. Pivot saves whatever the stage returns,
+chooses the file path, and makes the saved artifact available to downstream
+stages through the handle the stage call returned.
 
-## The return-type pattern
+## The return type decides the format
 
-Outputs are declared in the stage function's **return type**, not its parameters.
-For multiple outputs, use a `TypedDict` where each field is annotated with an
-output spec:
+The return annotation is required (`-> None` means the stage has no outputs).
+Pivot picks a writer from it:
+
+| Return type | Saved as | Extension |
+|-------------|----------|-----------|
+| `pandas.DataFrame` | JSON Lines (`DataFrameJSONL()`) | `.jsonl` |
+| `dict`, `list` (including `dict[str, int]` etc.) | YAML (`YAML()`) | `.yaml` |
+| `str` | text (`Text()`) | `.txt` |
+| `pathlib.Path` | a file or directory created outside the project, moved by `PathOnly()` | `.dat` (or a directory) |
+| `Annotated[T, <loader>]` | that loader | the loader's extension |
+| `Annotated[dict, metric]` | YAML, stored under `metrics/` | `.yaml` |
+| `Annotated[Figure, plot]` | PNG via `MatplotlibFigure()`, stored under `plots/` | `.png` |
+| `Annotated[T, incremental]` | the type's default `Loader`, restored before the stage runs | the loader's extension |
+| `Annotated[dict[str, T], directory]` | a directory, one file per key, each written by `T`'s writer (or a loader given beside the tag) | none on the directory; each key names its file |
+| a `TypedDict` | one output per field, each field typed as above | per field |
+
+Any other type fails when the pipeline is built:
+`Cannot infer serialization format for type int. Use Annotated[T, format] on
+the return type to specify explicitly.`
+
+`Annotated` appears only on return types and `TypedDict` fields. Stage
+parameters are never annotated with loaders; inputs take their format from
+the producing stage or from `pipeline.input()`.
+
+## Where outputs are stored
+
+| Output | Path |
+|--------|------|
+| Single output of stage `s` in pipeline `p` | `data/p/s.<ext>` |
+| Field `f` of a `TypedDict` output | `data/p/s/f.<ext>` |
+| Tagged `directory` | `data/p/s/` (or `data/p/s/f/` for a field), one file per key inside it |
+| Tagged `metric` | `metrics/p/...` instead of `data/p/...` |
+| Tagged `plot` | `plots/p/...` instead of `data/p/...` |
+
+Extensions come from the writer: `jsonl`, `csv`, `yaml`, `json`, `txt`, `pkl`,
+`png`, and `dat` for custom writers. Variant stages keep their `@` suffix in the
+file name (`data/p/scale@x2.csv`).
+
+For a `pathlib.Path` return, the stage must create a file or directory outside
+the project and return its path. Pivot moves it to the managed output path. A
+returned path inside the project is rejected because Pivot must not take
+ownership of a file it did not create.
+
+## Example
 
 ```python
+# pipeline.py
 from typing import Annotated, TypedDict
-from pandas import DataFrame
-import pivot
 
-class TrainOutputs(TypedDict):
-    predictions: Annotated[DataFrame, pivot.Out("predictions.csv", pivot.loaders.CSV())]
-    metrics: Annotated[dict, pivot.Metric("metrics.json")]
+import matplotlib.figure
+import pandas as pd
 
-def train(
-    data: Annotated[DataFrame, pivot.Dep("features.csv", pivot.loaders.CSV())],
-) -> TrainOutputs:
-    model = fit(data)
+from pivot import Pipeline, loaders, metric, plot, stage
+
+
+class SplitResult(TypedDict):
+    train: pd.DataFrame
+    test: Annotated[pd.DataFrame, loaders.CSV()]
+    sizes: Annotated[dict, metric]
+
+
+@stage
+def split(raw: pd.DataFrame) -> SplitResult:
+    cut = len(raw) // 2
     return {
-        "predictions": model.predict(data),
-        "metrics": {"accuracy": 0.95, "f1": 0.91},
+        "train": raw.iloc[:cut],
+        "test": raw.iloc[cut:],
+        "sizes": {"train": cut, "test": len(raw) - cut},
     }
+
+
+@stage
+def chart(train: pd.DataFrame) -> Annotated[matplotlib.figure.Figure, plot]:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    ax.bar(train["id"], train["value"])
+    return fig
+
+
+@stage
+def report(test: pd.DataFrame) -> str:
+    return f"{len(test)} test rows\n"
+
+
+with Pipeline("out") as pipeline:
+    parts = split(pipeline.input("values.csv"))
+    chart(parts.train)
+    report(parts["test"])
 ```
 
-The stage returns a plain dict matching the TypedDict keys. Pivot serializes
-each value to its declared path using the specified [loader](loaders.md).
+After `pivot repro`:
 
-### Single-output shorthand
+```
+data/out/split/train.jsonl
+data/out/split/test.csv
+metrics/out/split/sizes.yaml
+plots/out/chart.png
+data/out/report.txt
+```
 
-When a stage produces exactly one file, skip the TypedDict and annotate the
-return type directly:
+The plot needs matplotlib: `pip install "pivot[matplotlib]"`.
+
+## Multi-output stages
+
+A `TypedDict` return type declares several outputs. The stage returns a dict
+with exactly those keys (`SplitResult(train=..., ...)` works too). Downstream,
+select one field from the handle with `parts.train` or `parts["train"]`; each
+field is a separate artifact with its own hash, so a change that only affects
+`sizes` does not re-run stages that consume `train`.
+
+Define the `TypedDict` at module level. The field name `_single` is reserved.
+
+## Directory artifacts
+
+A stage can return a `pathlib.Path` to a directory it created outside the
+project. `PathOnly()` moves that directory to Pivot's managed output path and
+Pivot caches it as an artifact. A stage that returns a `dict[str, T]` tagged
+`directory` also makes a directory artifact; see
+[Directory outputs](#directory-outputs).
+
+A directory artifact, input or output, is hashed and cached whole. Every file
+under it counts, including names that code fingerprinting or watch mode may
+ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
+them changes the directory hash, and all of them return on restore.
+
+Empty directories are part of a directory artifact too: adding or removing one
+changes the directory hash, and every one the hash records comes back on
+restore, so an artifact restored from a hash Pivot 0.3.4 or later recorded
+holds the same directories as the one the stage built, in every checkout mode.
+
+A directory hash Pivot 0.3.3 or earlier recorded lists no empty directories,
+and neither does any hash of a directory that had none. The two look the same,
+so Pivot cannot tell whether such a directory had any. Restoring an output from
+such a lock where none is on disk (in a fresh clone, with `pivot checkout`, or
+with `pivot repro` after the output was deleted) leaves its empty directories
+out, and the stage stays cached.
+
+When an output on disk holds the files such a lock records plus empty
+directories it does not, `pivot repro` does not restore the output to the lock,
+which would delete them. `pivot status` shows the stage stale ("Output holds
+empty directories its lock does not record"), and `pivot repro` runs it, or
+takes its outputs from a run-cache entry that records the directories, so its
+lock records them from then on. An empty directory you add inside such an
+output yourself makes the stage run once, and the output the stage builds
+replaces yours, without that directory. `pivot checkout` leaves such an output
+as it is; `pivot checkout --force` is the exception that restores it to the
+lock, deleting its empty directories, and the stage stays cached.
+
+An output that lacks the empty directories its stage makes matches its old lock
+and stays cached, whether it was restored from that lock as above or Pivot
+0.3.4 or 0.3.5 deleted them (those versions restored such an output to its old
+lock). To repair it, re-run the stages that write the directories (`pivot run
+--force <stage>`, then `pivot repro`) so their locks record them. To re-record
+a tracked directory, run `pivot track --force <path>`.
+
+A symlink inside a directory artifact is not stored: it is left out of the
+manifest and does not come back on restore. When a stage writes the artifact,
+or `pivot track` records it, Pivot logs one warning naming each symlink it
+left out, for example `Directory artifact data/p/bundle.dat leaves out symlink
+link.txt`; replace the link with a real file or directory. A later release
+refuses these symlinks. The one exception is a link Pivot made itself: a
+symlink-mode checkout links each file to an object in the configured cache
+(`cache.dir`), and that link counts as the file it points to. A link to a
+hash-named file anywhere else is a user symlink.
+
+A lock records each file of a directory artifact by its path inside the
+directory, and Pivot reads back every path it writes. Any character a file name
+holds is recorded, spaces and format characters included (a macOS screenshot's
+narrow no-break space, `Screenshot … 10.00.00 AM.png`). A name with a
+backslash cannot be recorded: the stage, or `pivot commit`, fails and names the
+file, and the previous lock is kept. A name with a control character (a TAB,
+an escape, DEL) is recorded with a warning naming it; a later release refuses
+these names, so rename such files.
+
+## Directory outputs
+
+Tag a `dict[str, T]` return value with `directory` when a stage writes a
+variable set of files. Each key is a file's path inside the directory and each
+value is written by `T`'s default writer, or by the loader given beside the
+tag. The loader never comes from a key's extension, so give keys the extension
+of the files the loader writes:
+
+A directory handle is not a collection while `pipeline.py` is loading. Do not iterate it or test
+membership; name one member (`parts["train.csv"]`) or pass the handle itself.
 
 ```python
-def clean(
-    raw: Annotated[DataFrame, pivot.Dep("raw.csv", pivot.loaders.CSV())],
-) -> Annotated[DataFrame, pivot.Out("clean.csv", pivot.loaders.CSV())]:
-    return raw.dropna()
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def split(raw: pd.DataFrame) -> Annotated[dict[str, pd.DataFrame], directory, loaders.CSV()]:
+    return {f"{name}.csv": frame for name, frame in raw.groupby("split")}
+
+
+@stage
+def count(parts: dict[str, pd.DataFrame]) -> dict[str, int]:
+    return {name: len(frame) for name, frame in parts.items()}
+
+
+@stage
+def fit(train: pd.DataFrame) -> dict[str, int]:
+    return {"rows": len(train)}
+
+
+with Pipeline("dirs") as pipeline:
+    parts = split(pipeline.input("values.csv"))
+    count(parts)
+    fit(parts["train.csv"])
 ```
 
-The stage returns the value directly (not wrapped in a dict). Pivot saves it
-to the declared path.
+After `pivot repro`, `data/dirs/split/` holds one CSV per split. The directory
+is one artifact: it is cached, restored, pushed, pulled, checked out and
+verified whole, and a rerun that returns fewer keys leaves only those files.
+A `TypedDict` field can be tagged `directory` too (`data/p/s/f/`).
 
-## Output types at a glance
+A downstream stage takes the directory in one of two ways:
 
-| Type | Syntax | Cached | Use case |
-|------|--------|--------|----------|
-| `Out[W]` | `Out(path, writer, cache=True)` | Yes | Standard file output |
-| `Metric` | `Metric(path)` | No | JSON metrics (git-tracked) |
-| `Plot[W]` | `Plot(path, writer)` | Yes | Visualization files |
-| `IncrementalOut[W,R]` | `IncrementalOut(path, loader)` | Yes | State carried across runs |
-| `DirectoryOut[T]` | `DirectoryOut(path + "/", writer)` | Yes | Dynamic file sets |
+- **The whole directory** (`count(parts)`): the parameter receives a `dict`
+  from each file's path inside the directory to its value, read with the
+  producer's loader. The stage reruns when any file changes.
+- **One file** (`fit(parts["train.csv"])`, or `out.parts["train.csv"]` for a
+  `TypedDict` field): the parameter receives that file's value, or its path
+  when the producer's files are `pathlib.Path`. The consumer's lock records
+  that file's hash alone, so it reruns when that file changes and not when
+  another file in the directory does. A run where the producer did not write
+  the file fails the consumer with `missing deps:` naming the producer and the
+  file, and a path that names a directory inside the output fails it with
+  `unreadable deps:`; `pivot status` reads the file's hash from the
+  producer's lock when the directory is not on disk.
 
-All output types are frozen dataclasses. They are immutable, picklable, and
-their code is fingerprinted for change detection.
+A key must be a relative path with an extension, with no `..`, backslash,
+colon or null byte (each file is named `stage:path` as a dependency). Two keys
+that normalize to one path, two that differ only by case, and a key inside
+another key's path (`a.json` beside `a.json/b.json`) are refused too. Every
+output of the stage is checked before any is written, so a refused key fails
+the stage in one line naming it, the output and the key, and leaves the
+previous run's outputs, cache and lock as they were. A file named by a consumer
+is checked by the same rules when the pipeline is built, naming the consumer,
+the producer and the key, and a `TypedDict` field named like a file of a
+directory field (`parts/a.json` beside `parts`) is refused when the stage is
+defined. A directory of files whose loader only writes, such as
+`MatplotlibFigure()`, is a valid output, but no stage can depend on it or on
+one of its files.
 
-## `Out` — standard file output
+## Incremental outputs
 
-The workhorse output type. Writes a single file (or multiple files) using a
-[Writer](loaders.md):
+Tag a return value with `incremental` when the stage needs its own prior output.
+Bind the matching parameter to `pipeline.previous()`, or use
+`pipeline.previous("key")` for a field of a `TypedDict` result. The first run
+receives the loader's `empty()` value; later runs restore the cached output as a
+writable copy before calling the stage. Previous-output parameters do not create
+DAG edges.
 
 ```python
-class Results(TypedDict):
-    report: Annotated[dict, pivot.Out("report.json", pivot.loaders.JSON())]
-    data: Annotated[DataFrame, pivot.Out("processed.csv", pivot.loaders.CSV())]
+from typing import Annotated
+
+from pivot import Pipeline, incremental, stage
+
+
+@stage
+def update_cache(previous: dict[str, int]) -> Annotated[dict[str, int], incremental]:
+    return {"count": previous.get("count", 0) + 1}
+
+
+with Pipeline("state") as pipeline:
+    update_cache(previous=pipeline.previous())
 ```
 
-**Parameters:**
+An incremental output requires a full `Loader` with `load()`, `save()`, and a
+concrete `empty()` implementation; a writer-only format such as
+`MatplotlibFigure()` and loaders that inherit the default raising `empty()`
+(including `PathOnly()` and `Pickle()`) are rejected. An existing incremental
+output without a lock-file cache entry is refused unless
+`pivot repro --allow-uncached-incremental` is explicit.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `path` | `str \| list[str] \| tuple[str, ...]` | required | Output file path(s) |
-| `loader` | `Writer[W]` | required | Serializer for the data (named `loader` for consistency with `Dep`; accepts any `Writer`) |
-| `cache` | `bool` | `True` | Whether to cache in `.pivot/cache` |
+## Metrics and plots
 
-### Multi-file outputs
+`metric` and `plot` (imported from `pivot`) are tags, not paths:
 
-A single output key can write multiple files:
+- `Annotated[dict, metric]` saves YAML under `metrics/`. `pivot metrics show`
+  and `pivot metrics diff` read every metric output. Metric files are not
+  copied into the cache; commit them to git.
+- `Annotated[Figure, plot]` saves a PNG under `plots/` and closes the figure.
+  `pivot plots show` renders all plot outputs as an HTML gallery.
 
-```python
-class ShardOutputs(TypedDict):
-    shards: Annotated[list[dict], pivot.Out(["shard_a.json", "shard_b.json"], pivot.loaders.JSON())]
+A tag can be combined with an explicit writer: `Annotated[pd.DataFrame, metric,
+loaders.CSV()]` saves a CSV under `metrics/`.
 
-def split(...) -> ShardOutputs:
-    return {"shards": [data_a, data_b]}  # list matches path list
-```
-
-The return value must be a list/tuple with the same length as the path list.
-Each element is written to the corresponding path.
-
-### Disabling caching
-
-Set `cache=False` to skip caching for outputs that shouldn't be stored
-(e.g., temporary files or files you want to always regenerate):
-
-```python
-debug_log: Annotated[str, pivot.Out("debug.log", pivot.loaders.Text(), cache=False)]
-```
-
-## `Metric` — git-tracked JSON metrics
-
-`Metric` is a specialized `Out` for small JSON values that should be
-version-controlled rather than cached:
-
-```python
-class EvalOutputs(TypedDict):
-    scores: Annotated[dict, pivot.Metric("metrics/eval.json")]
-```
-
-**Defaults that differ from `Out`:**
-
-| Parameter | `Out` default | `Metric` default |
-|-----------|---------------|------------------|
-| `loader` | required | `JSON()` (automatic) |
-| `cache` | `True` | `False` |
-
-Metrics are not cached by default because they're small and belong in git for
-tracking experiment history. The loader defaults to `JSON()` — you typically
-don't need to specify it.
-
-`Metric` accepts any JSON-serializable value: dicts, lists, strings, numbers,
-booleans, or `None`.
-
-## `Plot` — visualization output
-
-`Plot` extends `Out` with optional metadata for visualization tools:
-
-```python
-import pathlib
-from matplotlib.figure import Figure
-import pivot
-
-class TrainOutputs(TypedDict):
-    # Automatic: Pivot saves the figure and closes it
-    loss_curve: Annotated[Figure, pivot.Plot("plots/loss.png", pivot.loaders.MatplotlibFigure())]
-
-    # Manual: stage creates the file, Pivot just tracks it
-    roc_plot: Annotated[pathlib.Path, pivot.Plot("plots/roc.png", pivot.loaders.PathOnly())]
-```
-
-**Extra parameters** (beyond `Out`):
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `x` | `str \| None` | `None` | X-axis column name (for structured plot data) |
-| `y` | `str \| None` | `None` | Y-axis column name (for structured plot data) |
-| `template` | `str \| None` | `None` | Plot template identifier |
-
-`MatplotlibFigure()` is a write-only loader that calls `fig.savefig()` and then
-`plt.close(fig)` to prevent memory leaks. Format is inferred from the file
-extension (`.png`, `.pdf`, `.svg`).
-
-## `IncrementalOut` — state across runs {#incrementalout}
-
-`IncrementalOut` is for outputs that accumulate state across runs. Before the
-stage executes, Pivot restores the previous output from cache so the stage can
-read, modify, and write it back.
-
-```python
-from typing import Annotated, TypedDict
-import pivot
-
-class CacheOutputs(TypedDict):
-    cache: Annotated[dict, pivot.IncrementalOut("cache.json", pivot.loaders.JSON())]
-
-def update_cache(
-    cache: Annotated[dict, pivot.IncrementalOut("cache.json", pivot.loaders.JSON())],
-    new_data: Annotated[DataFrame, pivot.Dep("new_data.csv", pivot.loaders.CSV())],
-) -> CacheOutputs:
-    # `cache` contains the previous run's output (or {} on first run)
-    cache["latest"] = process(new_data)
-    return {"cache": cache}
-```
-
-### How it works
-
-1. Before execution, Pivot checks for a cached previous output
-2. If found, restores it and injects as the parameter value
-3. If not found (first run), uses the loader's `empty()` method (e.g., `{}` for
-   `JSON`, empty `DataFrame` for `CSV`)
-4. Stage reads, modifies, and returns the updated value
-5. Pivot writes and re-caches the result
-
-### Rules
-
-- The `IncrementalOut` must appear on **both** a parameter and a return field
-- Path and loader must match between input and output
-- For TypedDict returns, the parameter name must match the return field name
-- For single-output stages, only one `IncrementalOut` parameter is allowed
-- The input does **not** create a DAG edge (it's self-referential)
-- Requires a `Loader` (not just `Reader` or `Writer`) since it reads and writes
-
-## `DirectoryOut` — dynamic file sets
-
-When the number or names of output files aren't known until runtime, use
-`DirectoryOut`:
-
-```python
-from typing import Annotated, TypedDict
-import pivot
-
-class TaskMetrics(TypedDict):
-    accuracy: float
-    loss: float
-
-class ProcessOutputs(TypedDict):
-    results: Annotated[dict[str, TaskMetrics], pivot.DirectoryOut("metrics/tasks/", pivot.loaders.YAML())]
-
-def process_tasks(...) -> ProcessOutputs:
-    return {
-        "results": {
-            "task_a.yaml": TaskMetrics(accuracy=0.95, loss=0.12),
-            "task_b.yaml": TaskMetrics(accuracy=0.87, loss=0.31),
-        }
-    }
-```
-
-**How it works:**
-
-- Path **must** end with `/` (enforced at construction time)
-- Return value is `dict[str, T]` where keys are relative paths within the
-  directory and values are the data to serialize
-- Each key must include a file extension
-- Keys are validated: no absolute paths, no `..` traversal, no empty names
-- Duplicate keys after normalization are rejected
-- Case collisions are detected (for cross-platform safety)
-
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `path` | `str` (ending with `/`) | required | Output directory |
-| `loader` | `Writer[T]` | required | Serializer for each file |
-| `cache` | `bool` | `True` | Whether to cache files |
-
-Each file in the directory is cached individually by content hash. Downstream
-stages can depend on the directory (`Dep("metrics/tasks/")`) or on specific
-files within it (`Dep("metrics/tasks/task_a.yaml")`).
-
-## Overriding output paths
-
-Like [dependencies](dependencies.md), output paths can be overridden at
-registration time:
-
-```python
-# Simple path override
-pipeline.register(train, out_path_overrides={
-    "predictions": "v2/predictions.csv",
-})
-
-# Override with options
-pipeline.register(train, out_path_overrides={
-    "predictions": {"path": "v2/predictions.csv", "cache": False},
-})
-```
-
-For single-output stages, the override key can be any string (there's only one
-output to override):
-
-```python
-pipeline.register(clean, out_path_overrides={
-    "output": "cleaned_v2.csv",
-})
-```
-
-`IncrementalOut` paths cannot be overridden (input and output paths must match).
-
-## Decision tree: which output type?
-
-```
-Is this a JSON metric you want in git?
-  └─ Yes → Metric("path.json")
-
-Is this a visualization?
-  └─ Yes → Plot("path.png", MatplotlibFigure())
-
-Does this output carry state between runs?
-  └─ Yes → IncrementalOut("path", loader)
-
-Are the output files determined at runtime?
-  └─ Yes → DirectoryOut("dir/", writer)
-
-Everything else:
-  └─ Out("path", writer)
-```
+A `dict` or `list` output is written as YAML. Numpy scalars and arrays are
+converted to plain Python numbers and lists, so `{"mean": df["v"].mean()}`
+works. A DataFrame, a dataclass, or any other object inside it is written with
+Python-specific YAML tags that `pivot metrics show` and downstream stages cannot
+read, and the `pivot repro` report prints a warning under the stage naming the
+output, the type and where it sits. Convert it first (`df.to_dict()`,
+`dataclasses.asdict(x)`); a later release will fail the stage instead.
 
 ## How Pivot writes outputs
 
 After a stage returns, Pivot:
 
-1. Validates all TypedDict keys are present in the return value
-2. Resolves each output path relative to the project root
-3. Creates parent directories as needed
-4. Writes each file sequentially using the output's loader
-5. Hashes the written files for cache storage
-6. Updates the stage's lock file with output hashes
+1. Checks that a `TypedDict` return value contains every declared key, and
+   checks every output's value (a directory output's keys, and that a returned
+   `pathlib.Path` lies outside the project) before writing any of them
+2. Replaces each previous output with the new value, written by its writer to
+   the path above, creating directories
+3. Hashes each file and copies it into `.pivot/cache/` (except metrics)
+4. Records the hashes in the stage's lock file under `.pivot/stages/`
 
-Validation (step 1) happens before any writes begin, so missing keys or type
-mismatches are caught early. However, there is no rollback — if the third of
-five writes fails, the first two are already on disk.
-
-## Multi-file paths and expansion
-
-Internally, Pivot expands multi-file outputs (`Out(["a.csv", "b.csv"], ...)`)
-into individual single-path output specs for DAG construction and caching. Each
-file is tracked and cached independently. This means fine-grained cache hits —
-if only one file in a multi-file output changes, only that file is re-cached.
-
-## Summary
-
-| Pattern | When to use |
-|---------|------------|
-| `TypedDict` with `Out` fields | Multiple outputs from one stage |
-| `Annotated[T, Out(...)]` return | Single output |
-| `Metric("path.json")` | Small JSON values for git tracking |
-| `Plot("path.png", writer)` | Visualizations |
-| `IncrementalOut("path", loader)` | State that accumulates across runs |
-| `DirectoryOut("dir/", writer)` | Runtime-determined file sets |
-| `cache=False` | Outputs that shouldn't be cached |
+The previous output stays on disk while the stage runs, so a stage that reads
+its own output path sees the last run's file. Read a previous output through
+`pipeline.previous()` on an `incremental` output instead. If a check in step 1
+fails, the stage fails and the previous outputs, cache and lock stay as they
+were.
 
 ---
 

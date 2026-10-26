@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import json
+import pathlib
+from typing import TYPE_CHECKING
+
+import yaml
+
+from conftest import isolated_pivot_dir
+from pivot import cli
+
+if TYPE_CHECKING:
+    from click.testing import CliRunner
+
+
+_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, incremental, stage
+
+
+@stage
+def update(row: str, previous: dict[str, int]) -> Annotated[dict[str, int], incremental]:
+    values = dict(previous)
+    values[row.strip()] = len(values) + 1
+    return values
+
+
+with Pipeline("incremental") as pipeline:
+    update(pipeline.input("row.txt"), previous=pipeline.previous())
+"""
+
+_CSV_PIPELINE = """\
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, incremental, loaders, stage
+
+
+@stage
+def keep(previous: pd.DataFrame) -> Annotated[pd.DataFrame, incremental, loaders.CSV()]:
+    return previous
+
+
+with Pipeline("incremental") as pipeline:
+    keep(previous=pipeline.previous())
+"""
+
+_PROBE_PIPELINE = """\
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import pathlib
+from typing import Annotated
+
+from pivot import Pipeline, incremental, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Probe(loaders.Loader[dict[str, int]]):
+    def empty(self) -> dict[str, int]:
+        return {}
+
+    def load(self, path: pathlib.Path) -> dict[str, int]:
+        before = path.read_text()
+        pathlib.Path("incremental-probe.json").write_text(
+            json.dumps({"nlink": os.stat(path).st_nlink, "writable": os.access(path, os.W_OK)})
+        )
+        path.write_text(before + " ")
+        return json.loads(before)
+
+    def save(self, data: dict[str, int], path: pathlib.Path) -> None:
+        path.write_text(json.dumps(data))
+
+
+@stage
+def grow(previous: dict[str, int]) -> Annotated[dict[str, int], incremental, Probe()]:
+    return {"count": previous.get("count", 0) + 1}
+
+
+with Pipeline("incremental") as pipeline:
+    grow(pipeline.previous())
+"""
+
+
+def test_incremental_previous_restores_a_writable_copy(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An incremental loader can edit its restored prior value without touching the cache."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_PROBE_PIPELINE)
+
+        first = runner.invoke(cli.cli, ["repro", "--force"])
+        assert first.exit_code == 0, first.output
+        lock_data = yaml.safe_load(
+            pathlib.Path(".pivot", "stages", "incremental", "grow.lock").read_text()
+        )
+        first_hash = lock_data["outs"][0]["hash"]
+        cache_path = pathlib.Path(".pivot", "cache", "files", first_hash[:2], first_hash[2:])
+        cached_before = cache_path.read_text()
+
+        second = runner.invoke(cli.cli, ["repro", "--force"])
+
+        assert second.exit_code == 0, second.output
+        assert json.loads(pathlib.Path("incremental-probe.json").read_text()) == {
+            "nlink": 1,
+            "writable": True,
+        }
+        assert cache_path.read_text() == cached_before
+
+
+def _write_pipeline_and_input() -> None:
+    pathlib.Path("pipeline.py").write_text(_PIPELINE)
+    raw_dir = pathlib.Path("data", "raw")
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "row.txt").write_text("first\n")
+
+
+def _make_workspace_output_uncached() -> None:
+    stage_lock = pathlib.Path(".pivot", "stages", "incremental", "update.lock")
+    stage_lock.unlink()
+
+
+def test_uncached_incremental_flags_are_orthogonal_through_cli(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Force does not bypass the guard; the allow flag does with or without force."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_pipeline_and_input()
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, first.output
+
+        _make_workspace_output_uncached()
+        forced = runner.invoke(cli.cli, ["repro", "--force"])
+        assert forced.exit_code != 0
+        assert "not in cache" in forced.output
+
+        allowed = runner.invoke(cli.cli, ["repro", "--allow-uncached-incremental"])
+        assert allowed.exit_code == 0, allowed.output
+
+        _make_workspace_output_uncached()
+        forced_allowed = runner.invoke(
+            cli.cli, ["repro", "--force", "--allow-uncached-incremental"]
+        )
+        assert forced_allowed.exit_code == 0, forced_allowed.output
+
+
+def test_incremental_csv_empty_first_value_loads_on_next_run(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A CSV incremental stage can pass its first empty value through twice."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_CSV_PIPELINE)
+
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, first.output
+
+        second = runner.invoke(cli.cli, ["repro", "--force"])
+        assert second.exit_code == 0, second.output
+        assert "1 ran" in second.output

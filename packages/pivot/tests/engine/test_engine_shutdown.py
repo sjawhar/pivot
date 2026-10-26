@@ -11,19 +11,19 @@ from typing import TYPE_CHECKING, Any, cast
 import anyio
 import pytest
 
-from conftest import AsyncEventCaptureSink
-from helpers import register_test_stage
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks, sources
 from pivot.types import LogMessage, OutputMessage, OutputMessageKind, StageStatus
+from tests import helpers
+from tests.conftest import AsyncEventCaptureSink
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike as Pipeline
 
 
-def _helper_noop(params: None) -> dict[str, str]:
+def _helper_noop() -> dict[str, str]:
     """No-op stage for testing."""
     return {"result": "ok"}
 
@@ -70,19 +70,19 @@ async def _helper_drain_with_signal(
 @pytest.mark.anyio
 async def test_engine_shutdown_completes_without_hanging(minimal_pipeline: Pipeline) -> None:
     """Engine shutdown should complete without hanging."""
-    register_test_stage(_helper_noop, name="test_stage")
+    helpers.register_test_stage(_helper_noop, name="test_stage")
 
     async with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         eng.add_sink(collector)
-        eng.add_source(sources.OneShotSource(stages=["test_stage"], force=True, reason="test"))
+        eng.add_source(sources.OneShotSource(stages=["test/test_stage"], force=True, reason="test"))
 
         with anyio.fail_after(10.0):
             await eng.run(exit_on_completion=True)
 
         results = await collector.get_results()
-        assert "test_stage" in results
-        assert results["test_stage"]["status"] in (
+        assert "test/test_stage" in results
+        assert results["test/test_stage"]["status"] in (
             StageStatus.RAN,
             StageStatus.CACHED,
             StageStatus.BLOCKED,
@@ -143,7 +143,7 @@ async def test_engine_shutdown_after_orchestration_exception(
     minimal_pipeline: Pipeline, mocker: MockerFixture
 ) -> None:
     """Engine should shut down cleanly even if orchestration raises."""
-    register_test_stage(_helper_noop, name="test_stage")
+    helpers.register_test_stage(_helper_noop, name="test_stage")
     mocker.patch.object(
         engine_mod.Engine,
         "_start_ready_stages",
@@ -152,7 +152,7 @@ async def test_engine_shutdown_after_orchestration_exception(
     )
 
     async with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
-        eng.add_source(sources.OneShotSource(stages=["test_stage"], force=True, reason="test"))
+        eng.add_source(sources.OneShotSource(stages=["test/test_stage"], force=True, reason="test"))
 
         with anyio.fail_after(10.0):
             with pytest.raises(BaseExceptionGroup) as excinfo:
@@ -164,20 +164,22 @@ async def test_engine_shutdown_after_orchestration_exception(
 @pytest.mark.anyio
 async def test_engine_shutdown_forwards_output_messages(minimal_pipeline: Pipeline) -> None:
     """Engine shutdown should forward output messages through the drain thread."""
-    register_test_stage(_helper_with_output, name="output_stage")
+    helpers.register_test_stage(_helper_with_output, name="output_stage")
 
     async with engine_mod.Engine(pipeline=minimal_pipeline) as eng:
         collector = sinks.ResultCollectorSink()
         event_sink = AsyncEventCaptureSink()
         eng.add_sink(collector)
         eng.add_sink(event_sink)
-        eng.add_source(sources.OneShotSource(stages=["output_stage"], force=True, reason="test"))
+        eng.add_source(
+            sources.OneShotSource(stages=["test/output_stage"], force=True, reason="test")
+        )
 
         with anyio.fail_after(10.0):
             await eng.run(exit_on_completion=True)
 
         results = await collector.get_results()
-        assert "output_stage" in results
+        assert "test/output_stage" in results
 
         log_lines = [event for event in event_sink.events if event["type"] == "log_line"]
         assert log_lines, f"Expected log_line events, got: {event_sink.events}"

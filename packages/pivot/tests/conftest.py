@@ -3,32 +3,47 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import linecache
 import logging
 import multiprocessing as mp
 import os
 import pathlib
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import TYPE_CHECKING
 
 import click.testing
 import pytest
+from moto import server as moto_server
 
 from pivot import project
-from pivot.cli import console
+from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
-from pivot.pipeline import pipeline as pipeline_mod
-from pivot.registry import StageRegistry
+from pivot.registry import PipelineLike, StageRegistry
 
-# Add tests directory to sys.path so helpers.py can be imported
 _tests_dir = pathlib.Path(__file__).parent
 if str(_tests_dir) not in sys.path:
     sys.path.insert(0, str(_tests_dir))
+_tests_root = _tests_dir.parent
+if str(_tests_root) not in sys.path:
+    sys.path.insert(0, str(_tests_root))
+pythonpath = os.environ.get("PYTHONPATH")
+if pythonpath:
+    os.environ["PYTHONPATH"] = os.pathsep.join([str(_tests_root), pythonpath])
+else:
+    os.environ["PYTHONPATH"] = str(_tests_root)
+
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -45,6 +60,18 @@ GitRepo = tuple[pathlib.Path, Callable[[str], str]]
 _MEMORY_PER_WORKER_BYTES = 2 * 1024**3
 # Hard cap on worker count to prevent resource exhaustion
 _MAX_WORKERS_CAP = 16
+
+
+def pytest_configure() -> None:
+    """Give every process the suite starts SIGINT at its default disposition.
+
+    A background job of a non-interactive shell (``cmd &`` in a script) starts with SIGINT
+    ignored, and an ignored signal stays ignored across exec, through ``uv run`` too. The tests
+    that press Ctrl-C on pivot would then wait out their timeouts. A handled signal resets to the
+    default on exec, so installing Python's own handler here gives each child the default.
+    """
+    if signal.getsignal(signal.SIGINT) is signal.SIG_IGN:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)
@@ -96,24 +123,6 @@ def tmp_pipeline_dir() -> Generator[pathlib.Path]:
 
 
 @pytest.fixture
-async def moto_s3_bucket(
-    moto_patch_session: object, aioboto3_s3_client: S3Client
-) -> AsyncGenerator[str]:
-    """Create a test bucket in moto with unique name for xdist support.
-
-    Uses pytest-aioboto3's moto_patch_session to mock S3 and aioboto3_s3_client
-    to create the bucket. Bucket name includes a unique suffix to prevent
-    conflicts when running tests in parallel with pytest-xdist.
-
-    Yields:
-        str: The bucket name (e.g., "test-bucket-a1b2c3d4").
-    """
-    bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
-    await aioboto3_s3_client.create_bucket(Bucket=bucket_name)
-    yield bucket_name
-
-
-@pytest.fixture
 def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
     data_file = tmp_pipeline_dir / "data.csv"
     data_file.write_text("id,value\n1,10\n2,20\n3,30\n")
@@ -121,31 +130,24 @@ def sample_data_file(tmp_pipeline_dir: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def test_pipeline(tmp_path: pathlib.Path) -> Generator[pipeline_mod.Pipeline]:
+def test_pipeline(tmp_path: pathlib.Path) -> Generator[PipelineLike]:
     """Provide a fresh Pipeline for tests.
-
-    Also sets up the module-level test pipeline in helpers.py so that
-    register_test_stage() works without explicit pipeline parameter.
 
     Note: This fixture does NOT mock the project root. Tests that register
     stages with path annotations should either:
     1. Use mock_discovery fixture (which mocks project root)
     2. Or explicitly mock project._project_root_cache themselves
     """
-    import helpers
-
-    pipeline = pipeline_mod.Pipeline("test", root=tmp_path)
-    helpers.set_test_pipeline(pipeline)
+    pipeline = Pipeline("test", root=tmp_path)
     yield pipeline
-    helpers.set_test_pipeline(None)
 
 
 @pytest.fixture
 def mock_discovery(
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: PipelineLike,
     mocker: MockerFixture,
     monkeypatch: pytest.MonkeyPatch,
-) -> pipeline_mod.Pipeline:
+) -> PipelineLike:
     """Mock discover_pipeline to return the test_pipeline.
 
     Use this fixture for CLI tests that need stages to be discovered
@@ -161,8 +163,7 @@ def mock_discovery(
     Tests using this fixture should NOT use isolated_filesystem() since
     this fixture already sets up the environment correctly.
 
-    Note: The test_pipeline fixture is automatically used, so stages
-    can be registered via register_test_stage().
+    Note: The test_pipeline fixture is automatically used.
     """
     from pivot import discovery
     from pivot.cli import decorators as cli_decorators
@@ -213,13 +214,11 @@ def _default_project_root(tmp_path_factory: pytest.TempPathFactory) -> pathlib.P
 
 
 @pytest.fixture(autouse=True)
-def reset_pivot_state(
-    mocker: MockerFixture, _default_project_root: pathlib.Path
-) -> Generator[None]:
+def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
     """Reset global pivot state between tests.
 
-    CliRunner can leave console singleton pointing to closed streams,
-    project root cache pointing to old directories, and merged config cached.
+    CliRunner can leave the project root cache pointing to old directories and merged
+    config cached.
 
     Sets project root to a default directory with .pivot to prevent
     ProjectNotInitializedError. Tests that need a specific project root
@@ -228,7 +227,6 @@ def reset_pivot_state(
     Tests using isolated_filesystem() that create their own .pivot should
     reset the cache: project._project_root_cache = None
     """
-    mocker.patch.object(console, "_console", None)
     # Direct assignment (not mocker.patch) so tests can override by setting to None
     project._project_root_cache = _default_project_root
     config_io.clear_config_cache()
@@ -249,6 +247,48 @@ def set_project_root(tmp_path: pathlib.Path, mocker: MockerFixture) -> Generator
     (tmp_path / ".pivot").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
     yield tmp_path
+
+
+_VENV_LIBRARY = "pivot_test_native_ext"
+
+
+@pytest.fixture
+def venv_inside_root_project(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[pathlib.Path]:
+    """A project whose virtualenv sits inside its root, as `uv venv` in the project makes.
+
+    `pipeline.py` imports a library from `<root>/.venv/.../site-packages` that, like numpy's C
+    extension, fails when imported a second time in one process.
+    """
+    site_packages = tmp_path / ".venv" / "lib" / "python3.13" / "site-packages"
+    library = site_packages / _VENV_LIBRARY
+    library.mkdir(parents=True)
+    (library / "__init__.py").write_text(
+        "import pathlib\n"
+        + "_marker = pathlib.Path(__file__).with_name('imported')\n"
+        + "if _marker.exists():\n"
+        + "    raise ImportError('cannot load module more than once per process')\n"
+        + "_marker.touch()\n"
+    )
+    (tmp_path / "pipeline.py").write_text(
+        "from typing import TypedDict\n\n"
+        + f"import {_VENV_LIBRARY}\n"
+        + "from pivot.compose import Pipeline, stage\n\n\n"
+        + "class TrainOutputs(TypedDict):\n    model: str\n    score: str\n\n\n"
+        + "@stage\n"
+        + "def train() -> TrainOutputs:\n"
+        + '    return {"model": "m", "score": "1"}\n\n\n'
+        + 'with Pipeline("venv") as pipeline:\n'
+        + "    train()\n"
+    )
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.syspath_prepend(str(site_packages))
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    yield tmp_path
+    sys.modules.pop(_VENV_LIBRARY, None)
 
 
 def init_git_repo(path: pathlib.Path, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
@@ -350,12 +390,9 @@ def clear_source_caches() -> Generator[None]:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def prewarm_worker_pool() -> Generator[None]:
-    """Pre-warm loky worker pool before tests run.
-
-    This eliminates cold-start overhead on the first test that uses workers.
-    """
-    executor_core.prepare_workers(stage_count=2, parallel=True, max_workers=2)
+def start_resource_trackers() -> Generator[None]:
+    """Start process trackers before any in-process Textual capture begins."""
+    executor_core.start_resource_trackers()
     yield
 
 
@@ -464,7 +501,7 @@ def output_queue() -> Generator[mp.Queue[OutputMessage]]:
 
 
 @pytest.fixture
-async def test_engine(test_pipeline: pipeline_mod.Pipeline) -> AsyncGenerator[Engine]:
+async def test_engine(test_pipeline: PipelineLike) -> AsyncGenerator[Engine]:
     """Provide a context-managed Engine instance.
 
     The engine is properly closed after each test to ensure sinks are cleaned up.
@@ -537,17 +574,175 @@ class AsyncEventCaptureSink:
 
 @pytest.fixture
 def minimal_pipeline(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: pipeline_mod.Pipeline
-) -> pipeline_mod.Pipeline:
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, test_pipeline: PipelineLike
+) -> PipelineLike:
     """Set up a minimal pipeline for testing."""
     from pivot import config
 
     monkeypatch.setattr(config, "get_cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr(config, "get_state_dir", lambda: tmp_path / "state")
-    monkeypatch.setattr(config, "get_state_db_path", lambda: tmp_path / "state" / "state.db")
     monkeypatch.chdir(tmp_path)
 
     (tmp_path / ".pivot").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
 
     return test_pipeline
+
+
+# =============================================================================
+# tests.helpers default pipeline
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def bind_test_pipeline_helper(request: pytest.FixtureRequest) -> Generator[None]:
+    """Point tests.helpers' default pipeline at the test_pipeline fixture.
+
+    Active only for tests that request test_pipeline (directly or through
+    mock_discovery, minimal_pipeline, test_engine, ...), so register_test_stage()
+    registers into that pipeline without an explicit pipeline argument.
+    """
+    if "test_pipeline" not in request.fixturenames:
+        yield
+        return
+    from tests import helpers
+
+    helpers.set_test_pipeline(request.getfixturevalue("test_pipeline"))
+    yield
+    helpers.set_test_pipeline(None)
+
+
+# =============================================================================
+# S3 (moto)
+# =============================================================================
+
+
+@pytest.fixture(scope="session")
+def moto_services() -> Generator[dict[str, str]]:
+    """Serve moto in-process, replacing pytest-aioboto3's moto_services.
+
+    The plugin's fixture runs ``moto_server`` as a subprocess with stdout/stderr
+    piped and never read; after ~70 requests in one pytest process the pipe
+    buffer fills with request logs, moto_server blocks writing, and every
+    later S3 call hangs. ThreadedMotoServer has no pipe to fill.
+    """
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    server = moto_server.ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    host, port = server.get_host_and_port()
+    yield {"s3": f"http://{host}:{port}"}
+    server.stop()
+
+
+@pytest.fixture
+async def moto_s3_bucket(
+    moto_patch_session: object, aioboto3_s3_client: S3Client
+) -> AsyncGenerator[str]:
+    """Create a test bucket in moto with unique name for xdist support.
+
+    Uses pytest-aioboto3's moto_patch_session to mock S3 and aioboto3_s3_client
+    to create the bucket. Bucket name includes a unique suffix to prevent
+    conflicts when running tests in parallel with pytest-xdist.
+
+    Yields:
+        str: The bucket name (e.g., "test-bucket-a1b2c3d4").
+    """
+    bucket_name = f"test-bucket-{uuid.uuid4().hex[:8]}"
+    await aioboto3_s3_client.create_bucket(Bucket=bucket_name)
+    yield bucket_name
+
+
+# =============================================================================
+# GCS (fake-gcs-server)
+# =============================================================================
+
+_FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.56.1"
+_FAKE_GCS_LABEL = "owner=pivot-tests"
+_FAKE_GCS_START_TIMEOUT = 60
+
+
+def _free_local_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+        return port
+
+
+def _fake_gcs_ready(endpoint: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{endpoint}/storage/v1/b", timeout=1) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, ConnectionError):
+        return False
+
+
+@pytest.fixture(scope="session")
+def fake_gcs_server() -> Generator[str]:
+    """Serve fake-gcs-server from Docker for this test process and yield its endpoint URL.
+
+    One container per xdist worker, removed when the worker's session ends. Without Docker the
+    GCS tests are skipped locally and fail in CI (``CI`` set), so CI never loses them silently.
+    """
+    if shutil.which("docker") is None:
+        message = "fake-gcs-server needs Docker, which is not installed"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+
+    port = _free_local_port()
+    endpoint = f"http://127.0.0.1:{port}"
+    run = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--detach",
+            "--label",
+            _FAKE_GCS_LABEL,
+            "--publish",
+            f"127.0.0.1:{port}:{port}",
+            _FAKE_GCS_IMAGE,
+            "-scheme",
+            "http",
+            "-port",
+            str(port),
+            "-backend",
+            "memory",
+            "-external-url",
+            endpoint,
+            "-log-level",
+            "error",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if run.returncode != 0:
+        pytest.fail(f"docker run {_FAKE_GCS_IMAGE} failed: {run.stderr.strip()}")
+    container = run.stdout.strip()
+    try:
+        deadline = time.monotonic() + _FAKE_GCS_START_TIMEOUT
+        while not _fake_gcs_ready(endpoint):
+            if time.monotonic() > deadline:
+                logs = subprocess.run(
+                    ["docker", "logs", container], capture_output=True, text=True
+                ).stderr
+                pytest.fail(f"fake-gcs-server did not answer at {endpoint}: {logs}")
+            time.sleep(0.1)
+        yield endpoint
+    finally:
+        subprocess.run(["docker", "rm", "--force", container], capture_output=True)
+
+
+@pytest.fixture
+def gcs_bucket(fake_gcs_server: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Create a uniquely named fake-gcs-server bucket and point gcloud-aio-storage at it."""
+    monkeypatch.setenv("STORAGE_EMULATOR_HOST", fake_gcs_server)
+    name = f"pivot-test-{uuid.uuid4().hex[:12]}"
+    request = urllib.request.Request(
+        f"{fake_gcs_server}/storage/v1/b?project=pivot-test",
+        data=json.dumps({"name": name}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as resp:
+        assert resp.status == 200, resp.read()
+    return name

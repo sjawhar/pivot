@@ -1,7 +1,7 @@
 ---
 tags: [python, paths, data-structures, trie]
 category: implementation
-module: trie
+module: status
 symptoms: ["false positive path overlaps", "directory vs file path confusion", "incorrect dependency detection"]
 ---
 
@@ -74,4 +74,4 @@ The pygtrie library provides efficient O(k) operations where k is the number of 
 - `shortest_prefix(key)` - find if any stored path is a prefix of key
 - Standard dict operations for exact matches
 
-This is used in Pivot's `src/pivot/trie.py` to validate that stage outputs don't overlap (preventing one stage from clobbering another's outputs).
+Pivot uses this in two places. `StageRegistry.add_existing` (`registry.py`) keeps a `pygtrie.Trie` of every registered output's workspace path and raises `OutputPathConflictError` when a new output equals, contains, or lies inside another's; each worker resolves paths in its own `WorkspaceStore`, so the registry is the only place that sees all outputs. Once every output is registered, `Pipeline._check_inputs_against_outputs` runs each input binding through `StageRegistry.check_input_path` against the same trie, so an input cannot read an output file, or a directory that holds one, without a DAG edge. `status.py` builds a trie of tracked (`.pvt`) paths and `explain.py` finds the tracked directory that contains a dependency.

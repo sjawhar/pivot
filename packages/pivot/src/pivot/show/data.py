@@ -7,15 +7,13 @@ import logging
 import os
 import pathlib
 import re
-from typing import TYPE_CHECKING, Any, TypedDict, cast, override
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy
 import pandas
 import tabulate
 
-from pivot import config, outputs, project
-from pivot.show import common
-from pivot.storage import cache
+from pivot import config, loaders
 from pivot.types import (
     ChangeType,
     DataDiffResult,
@@ -26,7 +24,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
 
 # Status symbols for diff display (plain text)
 STATUS_SYMBOLS: dict[ChangeType, str] = {
@@ -36,6 +34,7 @@ STATUS_SYMBOLS: dict[ChangeType, str] = {
 }
 
 logger = logging.getLogger(__name__)
+
 
 _DATA_EXTENSIONS: dict[str, DataFileFormat] = {
     ".csv": DataFileFormat.CSV,
@@ -50,29 +49,33 @@ _MAX_IN_MEMORY_SIZE = 100 * 1024 * 1024
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
-class _NumpyEncoder(json.JSONEncoder):
-    """JSON encoder that handles numpy types by converting to Python equivalents."""
+def json_default(o: object) -> object:
+    """Encode the numpy and pandas values a diff result holds as plain JSON values.
 
-    @override
-    def default(self, o: object) -> object:
-        if isinstance(o, numpy.integer):
-            return int(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.integer stub is generic
-        if isinstance(o, numpy.floating):
-            return float(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.floating stub is generic
-        if isinstance(o, numpy.bool_):
-            return bool(o)
-        if isinstance(o, numpy.ndarray):
-            return o.tolist()
-        if isinstance(o, (pandas.Timestamp, pandas.Timedelta)):
-            return str(o)
-        # Handle NaN/NaT values (float, numpy.floating, pandas.NaT, etc.)
-        # Cast to Any for pandas.isna() which accepts dynamic types from JSON
-        try:
-            if pandas.isna(cast("Any", o)):
-                return None
-        except (TypeError, ValueError):  # pragma: no cover
-            pass
-        return super().default(o)  # pragma: no cover
+    ``pivot diff --json`` and the ``diff_output`` RPC both encode through this, so a row value
+    reads the same in each: a numpy scalar as its Python value, a timestamp or timedelta as its
+    text, and NaN, NaT or NA as null.
+    """
+    if isinstance(o, numpy.integer):
+        return int(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.integer stub is generic
+    if isinstance(o, numpy.floating):
+        return float(o)  # pyright: ignore[reportUnknownArgumentType] - numpy.floating stub is generic
+    if isinstance(o, numpy.bool_):
+        return bool(o)
+    if isinstance(o, numpy.ndarray):
+        return o.tolist()
+    if isinstance(o, (pandas.Timestamp, pandas.Timedelta)):
+        return str(o)
+    # Handle NaN/NaT values (float, numpy.floating, pandas.NaT, etc.)
+    # Cast to Any for pandas.isna() which accepts dynamic types from JSON
+    try:
+        if pandas.isna(cast("Any", o)):
+            return None
+    except (TypeError, ValueError):  # pragma: no cover
+        pass
+    raise TypeError(  # pragma: no cover
+        f"Object of type {type(o).__name__} is not JSON serializable"
+    )
 
 
 class DataDiffEntry(TypedDict):
@@ -102,7 +105,7 @@ def load_dataframe(path: pathlib.Path) -> pandas.DataFrame:
         case DataFileFormat.JSON:
             return pandas.read_json(path)
         case DataFileFormat.JSONL:
-            return pandas.read_json(path, lines=True)
+            return loaders.DataFrameJSONL().load(path)
         case _:
             raise DataError(f"Unsupported data format: {path.suffix}")
 
@@ -118,7 +121,7 @@ def get_schema(path: pathlib.Path) -> dict[str, str]:
         case DataFileFormat.JSON:
             df = pandas.read_json(path)
         case DataFileFormat.JSONL:
-            df = pandas.read_json(path, lines=True, nrows=100)
+            df = loaders.DataFrameJSONL().load(path, max_rows=100)
         case _:
             raise DataError(f"Unsupported data format: {path.suffix}")
     return {str(col): str(dtype) for col, dtype in df.dtypes.items()}
@@ -135,8 +138,7 @@ def get_row_count(path: pathlib.Path) -> int:
             # Subtract header row, but don't go negative for empty files
             return max(0, count - 1)
         case DataFileFormat.JSONL:
-            with open(path) as f:
-                return sum(1 for _ in f)
+            return loaders.DataFrameJSONL().row_count(path)
         case _:
             # For JSON, we need to load it
             df = load_dataframe(path)
@@ -369,63 +371,56 @@ def diff_data_files(
     old_path: pathlib.Path | None,
     new_path: pathlib.Path | None,
     path_display: str,
+    *,
+    change_type: ChangeType,
     key_columns: list[str] | None = None,
     max_rows: int = 10000,
 ) -> DataDiffResult:
-    """Compare two data files and return detailed diff result."""
-    # Handle file added/removed cases
-    if old_path is None and new_path is not None:
-        new_df = load_dataframe(new_path)
-        new_cols = list(new_df.columns)
-        new_dtypes = {col: str(dtype) for col, dtype in new_df.dtypes.items()}
-        return DataDiffResult(
-            path=path_display,
-            old_rows=None,
-            new_rows=len(new_df),
-            old_cols=None,
-            new_cols=new_cols,
-            schema_changes=[
+    """Compare two data files and return detailed diff result.
+
+    A None path is a side that does not exist, or one that ``change_type`` says exists but
+    could not be read, such as a git HEAD object missing from the local cache; that side's
+    rows and columns are None.
+    """
+    if old_path is None or new_path is None:
+        old_df = None if old_path is None else load_dataframe(old_path)
+        new_df = None if new_path is None else load_dataframe(new_path)
+        schema_changes = list[SchemaChange]()
+        if change_type == ChangeType.ADDED and new_df is not None:
+            new_dtypes = {col: str(dtype) for col, dtype in new_df.dtypes.items()}
+            schema_changes = [
                 SchemaChange(
                     column=col,
                     old_dtype=None,
                     new_dtype=new_dtypes[col],
                     change_type=ChangeType.ADDED,
                 )
-                for col in new_cols
-            ],
-            row_changes=[],
-            reorder_only=False,
-            truncated=False,
-            summary_only=True,
-        )
-
-    if old_path is not None and new_path is None:
-        old_df = load_dataframe(old_path)
-        old_cols = list(old_df.columns)
-        old_dtypes = {col: str(dtype) for col, dtype in old_df.dtypes.items()}
-        return DataDiffResult(
-            path=path_display,
-            old_rows=len(old_df),
-            new_rows=None,
-            old_cols=old_cols,
-            new_cols=None,
-            schema_changes=[
+                for col in new_df.columns
+            ]
+        elif change_type == ChangeType.REMOVED and old_df is not None:
+            old_dtypes = {col: str(dtype) for col, dtype in old_df.dtypes.items()}
+            schema_changes = [
                 SchemaChange(
                     column=col,
                     old_dtype=old_dtypes[col],
                     new_dtype=None,
                     change_type=ChangeType.REMOVED,
                 )
-                for col in old_cols
-            ],
+                for col in old_df.columns
+            ]
+        return DataDiffResult(
+            path=path_display,
+            change_type=change_type,
+            old_rows=None if old_df is None else len(old_df),
+            new_rows=None if new_df is None else len(new_df),
+            old_cols=None if old_df is None else list(old_df.columns),
+            new_cols=None if new_df is None else list(new_df.columns),
+            schema_changes=schema_changes,
             row_changes=[],
             reorder_only=False,
             truncated=False,
             summary_only=True,
         )
-
-    if old_path is None or new_path is None:  # pragma: no cover
-        raise DataError("Both old and new paths are None")
 
     # Check file sizes for large file handling - BEFORE loading
     old_size = old_path.stat().st_size
@@ -441,6 +436,7 @@ def diff_data_files(
         schema_changes = _diff_schema(old_cols, new_cols, old_dtypes, new_dtypes)
         return DataDiffResult(
             path=path_display,
+            change_type=change_type,
             old_rows=get_row_count(old_path),
             new_rows=get_row_count(new_path),
             old_cols=old_cols,
@@ -478,6 +474,7 @@ def diff_data_files(
     if reorder_only:
         return DataDiffResult(
             path=path_display,
+            change_type=change_type,
             old_rows=len(old_df),
             new_rows=len(new_df),
             old_cols=old_cols,
@@ -501,6 +498,7 @@ def diff_data_files(
 
     return DataDiffResult(
         path=path_display,
+        change_type=change_type,
         old_rows=len(old_df),
         new_rows=len(new_df),
         old_cols=old_cols,
@@ -511,88 +509,6 @@ def diff_data_files(
         truncated=truncated,
         summary_only=False,
     )
-
-
-def get_data_outputs_from_stages() -> dict[str, str]:
-    """Get all data outputs (Out, not Metric/Plot) from Pipeline in context.
-
-    Returns dict mapping stage_name -> relative_path for data outputs.
-    """
-    from pivot.cli import helpers as cli_helpers
-
-    result = dict[str, str]()
-    proj_root = project.get_project_root()
-
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        for out in info["outs"]:
-            # Only include Out types that are data files (not Metric, Plot, etc.)
-            if not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                # Check if it's a supported data format
-                fmt = detect_format(pathlib.Path(rel_path))
-                if fmt != DataFileFormat.UNKNOWN:
-                    result[stage_name] = rel_path
-
-    return result
-
-
-def get_data_hashes_from_head() -> dict[str, str | None]:
-    """Read data output hashes from lock files at git HEAD.
-
-    Returns relative paths mapping to hashes (or None if no hash).
-    """
-    from pivot.cli import helpers as cli_helpers
-
-    result = dict[str, str | None]()
-    proj_root = project.get_project_root()
-
-    # Collect lock file paths and data paths per stage
-    stage_data_paths = dict[str, list[str]]()
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        for out in info["outs"]:
-            if not isinstance(out, (outputs.Metric, outputs.Plot)):
-                abs_path = str(project.normalize_path(out.path))
-                rel_path = project.to_relative_path(abs_path, proj_root)
-                fmt = detect_format(pathlib.Path(rel_path))
-                if fmt != DataFileFormat.UNKNOWN:
-                    stage_data_paths.setdefault(stage_name, []).append(rel_path)
-                    result[rel_path] = None
-
-    # Read all lock files from HEAD in one batch
-    lock_data_map = common.read_lock_files_from_head(list(stage_data_paths.keys()))
-
-    # Extract hashes from lock files
-    for stage_name, data_paths in stage_data_paths.items():
-        lock_data = lock_data_map.get(stage_name)
-        if lock_data is None:
-            continue
-
-        path_to_hash = common.extract_output_hashes_from_lock(lock_data)
-
-        for data_rel_path in data_paths:
-            if data_rel_path in path_to_hash:
-                result[data_rel_path] = path_to_hash[data_rel_path]
-
-    return result
-
-
-def get_data_hashes_from_workspace(paths: Sequence[str]) -> dict[str, str | None]:
-    """Compute hashes for data files in workspace."""
-    result = dict[str, str | None]()
-    proj_root = project.get_project_root()
-
-    for rel_path in paths:
-        abs_path = proj_root / rel_path
-        if abs_path.exists():
-            file_hash, _ = cache.hash_file(abs_path)
-            result[rel_path] = file_hash
-        else:
-            result[rel_path] = None
-
-    return result
 
 
 def diff_data_hashes(
@@ -690,8 +606,12 @@ def format_diff_summary(result: DataDiffResult) -> str:
         lines.append(f"  Rows: {old_rows:,} -> {new_rows:,} ({diff_str})")
     elif old_rows is not None:
         lines.append(f"  Rows: {old_rows:,} (removed)")
-    elif new_rows is not None:
+    elif new_rows is not None and result["change_type"] == ChangeType.ADDED:
         lines.append(f"  Rows: {new_rows:,} (added)")
+    elif new_rows is not None:
+        lines.append(f"  Rows: unknown -> {new_rows:,}")
+    else:
+        lines.append("  Rows: unknown (removed)")
 
     # Column counts
     old_cols = result["old_cols"]
@@ -742,7 +662,7 @@ def format_diff_table(
 ) -> str:
     """Format diff results for display."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(diffs, indent=2, cls=_NumpyEncoder)
+        return json.dumps(diffs, indent=2, default=json_default)
 
     if not diffs:
         return "No data file changes."
@@ -762,7 +682,7 @@ def format_row_changes_table(
 ) -> str:
     """Format row changes as a table."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(row_changes, indent=2, cls=_NumpyEncoder)
+        return json.dumps(row_changes, indent=2, default=json_default)
 
     if not row_changes:
         return "No row changes."

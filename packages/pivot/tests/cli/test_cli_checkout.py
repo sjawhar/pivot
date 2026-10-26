@@ -1,100 +1,114 @@
 from __future__ import annotations
 
+import json
+import os
 import pathlib
 import shutil
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
 import pytest
+import xxhash
 import yaml
 
 from conftest import isolated_pivot_dir
-from helpers import create_pipeline_py
-from pivot import cli, loaders, outputs
+from pivot import cli
 from pivot.storage import cache, lock, track
 
 if TYPE_CHECKING:
     import click.testing
+
+    from pivot.types import DirManifestEntry
+
+_EMPTY_PIPELINE = (
+    "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
+)
+
+# One stage `process` reading data/raw/input.txt, written to data/test/process.txt
+_PROCESS_PIPELINE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def process(input_file: str) -> str:
+    return "processed output"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
+"""
+
+# Stage with a cached data output and a metric output
+_MIXED_PIPELINE = """\
+from __future__ import annotations
+
+from typing import Annotated, TypedDict
+
+from pivot.compose import Pipeline, metric, stage
+
+
+class MixedOutputs(TypedDict):
+    output: str
+    metrics: Annotated[dict[str, float], metric]
+
+
+@stage
+def mixed(input_file: str) -> MixedOutputs:
+    return {"output": "cached output", "metrics": {"accuracy": 0.95}}
+
+
+with Pipeline("test") as pipeline:
+    mixed(pipeline.input("input.txt"))
+"""
+
+_TWO_OUTPUTS_PIPELINE = """\
+from __future__ import annotations
+
+from typing import TypedDict
+
+from pivot.compose import Pipeline, stage
+
+
+class TwoOutputs(TypedDict):
+    output1: str
+    output2: str
+
+
+@stage
+def two_stage(input_file: str) -> TwoOutputs:
+    return {"output1": "output 1", "output2": "output 2"}
+
+
+with Pipeline("test") as pipeline:
+    two_stage(pipeline.input("input.txt"))
+"""
+
+_PROCESS_OUT = pathlib.Path("data", "test", "process.txt")
 
 
 def _setup_test_project() -> pathlib.Path:
     """Set up minimal project structure for checkout tests.
 
     Note: .pivot and .git directories are created by isolated_pivot_dir,
-    so this only creates pivot.yaml and the cache directory.
+    so this only creates an empty pipeline.py and the cache directory.
     """
-    pathlib.Path("pivot.yaml").write_text("stages: {}")
+    pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
     cache_dir = pathlib.Path(".pivot") / "cache" / "files"
     cache_dir.mkdir(parents=True)
     return cache_dir
 
 
-# =============================================================================
-# Output TypedDicts for annotation-based stages
-# =============================================================================
+def _setup_stage_project(pipeline_code: str) -> None:
+    pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
+    raw = pathlib.Path("data", "raw")
+    raw.mkdir(parents=True)
+    (raw / "input.txt").write_text("data")
+    pathlib.Path("pipeline.py").write_text(pipeline_code)
 
 
-class _ProcessOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-
-class _StageAOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
-
-
-# =============================================================================
-# Module-level helper functions for stage registration
-# =============================================================================
-
-
-def _helper_process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _ProcessOutputs:
-    _ = input_file  # deps tracked but not loaded in this simple test
-    pathlib.Path("output.txt").write_text("processed output")
-    return {"output": pathlib.Path("output.txt")}
-
-
-def _helper_stage_a(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _StageAOutputs:
-    _ = input_file  # deps tracked but not loaded in this simple test
-    pathlib.Path("a.txt").write_text("output a")
-    return {"output": pathlib.Path("a.txt")}
-
-
-class _MixedOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-    metrics: Annotated[dict[str, float], outputs.Metric("metrics.json")]
-
-
-_MIXED_OUTPUTS_CODE = """
-class _MixedOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-    metrics: Annotated[dict[str, float], outputs.Metric("metrics.json")]
-"""
-
-
-def _helper_mixed(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _MixedOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("cached output")
-    pathlib.Path("metrics.json").write_text('{"accuracy": 0.95}')
-    return {"output": pathlib.Path("output.txt"), "metrics": {"accuracy": 0.95}}
-
-
-class _TwoOutputs(TypedDict):
-    output1: Annotated[pathlib.Path, outputs.Out("output1.txt", loaders.PathOnly())]
-    output2: Annotated[pathlib.Path, outputs.Out("output2.txt", loaders.PathOnly())]
-
-
-def _helper_two_outputs(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _TwoOutputs:
-    _ = input_file
-    pathlib.Path("output1.txt").write_text("output 1")
-    pathlib.Path("output2.txt").write_text("output 2")
-    return {"output1": pathlib.Path("output1.txt"), "output2": pathlib.Path("output2.txt")}
+def _stage_lock_path(stage_name: str) -> pathlib.Path:
+    return lock.get_stages_dir(pathlib.Path(".pivot")) / f"{stage_name}.lock"
 
 
 # =============================================================================
@@ -149,7 +163,6 @@ def test_checkout_tracked_file(runner: click.testing.CliRunner, tmp_path: pathli
         result = runner.invoke(cli.cli, ["checkout", "data.txt"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        assert data_file.exists()
         assert data_file.read_text() == "tracked content"
         assert "Restored" in result.output
 
@@ -161,17 +174,14 @@ def test_checkout_accepts_pvt_file_path(
     with isolated_pivot_dir(runner, tmp_path):
         cache_dir = _setup_test_project()
 
-        # Create a file, save to cache, then track it
         data_file = pathlib.Path("data.txt")
         data_file.write_text("tracked content")
         output_hash = cache.save_to_cache(data_file, cache_dir)
         assert output_hash is not None
 
-        # Create .pvt tracking file
         pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        # Delete original file
         data_file.unlink()
         assert not data_file.exists()
 
@@ -179,7 +189,6 @@ def test_checkout_accepts_pvt_file_path(
         result = runner.invoke(cli.cli, ["checkout", "data.txt.pvt"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        assert data_file.exists()
         assert data_file.read_text() == "tracked content"
         assert "Restored" in result.output
 
@@ -208,8 +217,6 @@ def test_checkout_all_tracked_files(
         result = runner.invoke(cli.cli, ["checkout"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        assert pathlib.Path("data1.txt").exists()
-        assert pathlib.Path("data2.txt").exists()
         assert pathlib.Path("data1.txt").read_text() == "content of data1.txt"
         assert pathlib.Path("data2.txt").read_text() == "content of data2.txt"
 
@@ -226,7 +233,6 @@ def test_checkout_tracked_directory(
     with isolated_pivot_dir(runner, tmp_path):
         _setup_test_project()
 
-        # Create directory with files
         data_dir = pathlib.Path("images")
         data_dir.mkdir()
         (data_dir / "cat.jpg").write_bytes(b"cat image")
@@ -236,17 +242,235 @@ def test_checkout_tracked_directory(
         result = runner.invoke(cli.cli, ["track", "images"])
         assert result.exit_code == 0, f"Track failed: {result.output}"
 
-        # Delete the directory
         shutil.rmtree(data_dir)
         assert not data_dir.exists()
 
-        # Checkout should restore it
         result = runner.invoke(cli.cli, ["checkout", "images"])
 
         assert result.exit_code == 0, f"Checkout failed: {result.output}"
-        assert data_dir.exists(), "Directory should be restored"
         assert (data_dir / "cat.jpg").read_bytes() == b"cat image"
         assert (data_dir / "dog.jpg").read_bytes() == b"dog image"
+
+
+def _helper_dir_set(root: pathlib.Path) -> set[str]:
+    """Every directory under root (following root itself if it is a symlink, nothing below)."""
+    return {
+        str(pathlib.Path(dirpath, name).relative_to(root))
+        for dirpath, dirnames, _ in os.walk(root)
+        for name in dirnames
+        if not pathlib.Path(dirpath, name).is_symlink()
+    }
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_checkout_tracked_directory_keeps_empty_dirs(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """`pivot track` records a directory's empty directories and checkout recreates them."""
+    with isolated_pivot_dir(runner, tmp_path):
+        cache_dir = _setup_test_project()
+        data_dir = pathlib.Path("images")
+        (data_dir / "raw" / "unsorted").mkdir(parents=True)
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        (data_dir / "empty").mkdir()
+        expected_dirs = _helper_dir_set(data_dir)
+
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+        pvt_data = track.read_pvt_file(track.get_pvt_path(data_dir))
+        assert pvt_data is not None
+        assert "empty_dirs" in pvt_data
+        assert pvt_data["empty_dirs"] == ["empty", "raw/unsorted"]
+
+        shutil.rmtree(data_dir)
+        result = runner.invoke(cli.cli, ["checkout", "--checkout-mode", mode, "images"])
+
+        assert result.exit_code == 0, f"Checkout failed: {result.output}"
+        assert _helper_dir_set(data_dir) == expected_dirs
+        assert cache.hash_directory(data_dir, cache_dir=cache_dir)["hash"] == pvt_data["hash"]
+
+
+_EMPTY_DIRS_PIPELINE = """\
+from __future__ import annotations
+
+import pathlib
+import tempfile
+from typing import Annotated, TypedDict
+
+from pivot import loaders
+from pivot.compose import Pipeline, stage
+
+
+class Made(TypedDict):
+    tree: pathlib.Path
+
+
+@stage
+def make() -> Made:
+    tree = pathlib.Path(tempfile.mkdtemp(prefix="pivot-empty-dirs-"))
+    (tree / "keep.txt").write_text("keep\\n")
+    (tree / "bundle" / "classifier_source").mkdir(parents=True)
+    (tree / "logs").mkdir()
+    return {"tree": tree}
+
+
+@stage
+def pack(tree: pathlib.Path) -> Annotated[dict, loaders.JSON()]:
+    return {
+        "entries": sorted(
+            str(p.relative_to(tree)) + ("/" if p.is_dir() else "") for p in tree.rglob("*")
+        )
+    }
+
+
+with Pipeline("empty") as pipeline:
+    made = make()
+    pack(made.tree)
+"""
+_EMPTY_DIRS_TREE = pathlib.Path("data", "empty", "make", "tree.dat")
+_EMPTY_DIRS_PACK = pathlib.Path("data", "empty", "pack.json")
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_restored_directory_output_keeps_empty_dirs_for_its_consumer(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """A directory output restored from the cache, by `pivot checkout` or by a cached
+    `pivot repro`, is the tree the stage built: a consumer that packs it produces the same
+    bytes as it did from the freshly built tree."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_stage_project(_EMPTY_DIRS_PIPELINE)
+        result = runner.invoke(cli.cli, ["config", "set", "cache.checkout_mode", mode])
+        assert result.exit_code == 0, result.output
+        result = runner.invoke(cli.cli, ["repro"])
+        assert result.exit_code == 0, result.output
+        fresh_dirs = _helper_dir_set(_EMPTY_DIRS_TREE)
+        fresh_pack = _EMPTY_DIRS_PACK.read_text()
+        assert fresh_dirs == {"bundle", "bundle/classifier_source", "logs"}
+        assert "bundle/classifier_source/" in fresh_pack
+
+        cache.remove_output(_EMPTY_DIRS_TREE)
+        result = runner.invoke(cli.cli, ["checkout", str(_EMPTY_DIRS_TREE)])
+        assert result.exit_code == 0, result.output
+        assert _helper_dir_set(_EMPTY_DIRS_TREE) == fresh_dirs, "checkout"
+
+        cache.remove_output(_EMPTY_DIRS_TREE)
+        result = runner.invoke(cli.cli, ["repro"])
+        assert result.exit_code == 0, result.output
+        assert _helper_dir_set(_EMPTY_DIRS_TREE) == fresh_dirs, "cached repro"
+        result = runner.invoke(cli.cli, ["run", "--force", "empty/pack"])
+        assert result.exit_code == 0, result.output
+
+        assert _EMPTY_DIRS_PACK.read_text() == fresh_pack
+        result = runner.invoke(cli.cli, ["status"])
+        assert result.exit_code == 0, result.output
+        assert "2 stages: 2 cached, 0 stale" in result.output, result.output
+
+
+def _helper_legacy_dir_hash(manifest: list[DirManifestEntry]) -> str:
+    """The hash pivot 0.3.3 recorded for a directory: its manifest alone, no empty dirs."""
+    manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    return xxhash.xxh64(manifest_json.encode()).hexdigest()
+
+
+def test_checkout_skips_untouched_tracked_directory_recorded_by_0_3_3(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A .pvt pivot 0.3.3 wrote lists none of a directory's empty directories. Checkout of
+    the untouched directory skips it, as 0.3.3 did, instead of calling it changed."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+        data_dir = pathlib.Path("images")
+        (data_dir / "slot").mkdir(parents=True)
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, result.output
+        pvt_path = track.get_pvt_path(data_dir)
+        pvt_data = track.read_pvt_file(pvt_path)
+        assert pvt_data is not None
+        assert "manifest" in pvt_data
+        track.write_pvt_file(
+            pvt_path,
+            track.PvtData(
+                path=pvt_data["path"],
+                hash=_helper_legacy_dir_hash(pvt_data["manifest"]),
+                size=pvt_data["size"],
+                manifest=pvt_data["manifest"],
+            ),
+        )
+
+        result = runner.invoke(cli.cli, ["checkout", "images"])
+
+        assert result.exit_code == 0, result.output
+        assert "different content" not in result.output
+        assert (data_dir / "slot").is_dir()
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_checkout_only_missing_keeps_empty_dirs_of_directory_tracked_by_0_3_3(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """`--only-missing` (and so a plain `pivot pull`) skips an untouched directory 0.3.3
+    tracked, keeping its empty directories for a later `pivot track --force` to record."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+        data_dir = pathlib.Path("tracked")
+        (data_dir / "slot").mkdir(parents=True)
+        (data_dir / "cls" / "src").mkdir(parents=True)
+        (data_dir / "k.txt").write_text("k")
+        result = runner.invoke(cli.cli, ["track", "tracked"])
+        assert result.exit_code == 0, result.output
+        pvt_path = track.get_pvt_path(data_dir)
+        pvt_data = track.read_pvt_file(pvt_path)
+        assert pvt_data is not None
+        assert "manifest" in pvt_data
+        track.write_pvt_file(
+            pvt_path,
+            track.PvtData(
+                path=pvt_data["path"],
+                hash=_helper_legacy_dir_hash(pvt_data["manifest"]),
+                size=pvt_data["size"],
+                manifest=pvt_data["manifest"],
+            ),
+        )
+
+        result = runner.invoke(
+            cli.cli, ["checkout", "--only-missing", "--checkout-mode", mode, "tracked"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _helper_dir_set(data_dir) == {"cls", "cls/src", "slot"}
+        assert not (data_dir / "k.txt").is_symlink()
+        result = runner.invoke(cli.cli, ["track", "--force", "tracked"])
+        assert result.exit_code == 0, result.output
+        retracked = track.read_pvt_file(pvt_path)
+        assert retracked is not None
+        assert "empty_dirs" in retracked
+        assert retracked["empty_dirs"] == ["cls/src", "slot"]
+
+
+@pytest.mark.parametrize("mode", ["hardlink", "symlink", "copy"])
+def test_checkout_skips_untouched_directory_output_recorded_by_0_3_3(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, mode: str
+) -> None:
+    """The same for a stage output whose lock pivot 0.3.3 wrote."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_stage_project(_EMPTY_DIRS_PIPELINE)
+        result = runner.invoke(cli.cli, ["config", "set", "cache.checkout_mode", mode])
+        assert result.exit_code == 0, result.output
+        result = runner.invoke(cli.cli, ["repro"])
+        assert result.exit_code == 0, result.output
+        lock_path = _stage_lock_path("empty/make")
+        document = yaml.safe_load(lock_path.read_text())
+        for out in document["outs"]:
+            out.pop("empty_dirs")
+            out["hash"] = _helper_legacy_dir_hash(out["manifest"])
+        lock_path.write_text(yaml.safe_dump(document))
+
+        result = runner.invoke(cli.cli, ["checkout", str(_EMPTY_DIRS_TREE)])
+
+        assert result.exit_code == 0, result.output
+        assert "different content" not in result.output
 
 
 def test_checkout_only_missing_restores_directory_with_missing_file(
@@ -261,27 +485,22 @@ def test_checkout_only_missing_restores_directory_with_missing_file(
     with isolated_pivot_dir(runner, tmp_path):
         _setup_test_project()
 
-        # Create directory with files
         data_dir = pathlib.Path("images")
         data_dir.mkdir()
         (data_dir / "cat.jpg").write_bytes(b"cat image")
         (data_dir / "dog.jpg").write_bytes(b"dog image")
 
-        # Track the directory (creates .pvt and caches content)
         result = runner.invoke(cli.cli, ["track", "images"])
         assert result.exit_code == 0, f"Track failed: {result.output}"
 
         # Delete one file, leaving directory partially populated
         (data_dir / "dog.jpg").unlink()
-        assert data_dir.exists(), "Directory should still exist"
         assert (data_dir / "cat.jpg").exists(), "cat.jpg should still exist"
         assert not (data_dir / "dog.jpg").exists(), "dog.jpg should be missing"
 
-        # --only-missing should restore the directory (including missing file)
         result = runner.invoke(cli.cli, ["checkout", "--only-missing", "images"])
 
         assert result.exit_code == 0, f"Checkout failed: {result.output}"
-        assert data_dir.exists(), "Directory should exist"
         assert (data_dir / "cat.jpg").read_bytes() == b"cat image"
         assert (data_dir / "dog.jpg").read_bytes() == b"dog image", (
             "Missing file should be restored"
@@ -289,18 +508,59 @@ def test_checkout_only_missing_restores_directory_with_missing_file(
         assert "Restored" in result.output, "Should show restoration message"
 
 
-def test_checkout_replaces_file_with_directory(
+def test_checkout_mode_collision_renders_tip_and_names_real_path(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Checkout replaces a file with a directory when types mismatch.
-
-    If a tracked directory is replaced by a file on disk, checkout should
-    restore the correct directory structure.
+    """A CacheModeCollisionError surfacing through `pivot checkout` must render its
+    actionable suggestion (not a bare message) and name the real workspace path, not the
+    restore's internal staging directory.
     """
     with isolated_pivot_dir(runner, tmp_path):
         _setup_test_project()
 
-        # Create and track a directory
+        data_dir = pathlib.Path("tools")
+        data_dir.mkdir()
+        script = data_dir / "run.sh"
+        script.write_text("#!/bin/sh\necho hi\n")
+        script.chmod(0o755)
+
+        result = runner.invoke(cli.cli, ["track", "tools"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+
+        pvt_data = track.read_pvt_file(pathlib.Path("tools.pvt"))
+        assert pvt_data is not None and "manifest" in pvt_data
+        entry_hash = next(e["hash"] for e in pvt_data["manifest"] if e["relpath"] == "run.sh")
+
+        # Simulate an object an older pivot (or `pivot pull`) cached non-executable.
+        cache_dir = pathlib.Path(".pivot") / "cache" / "files"
+        cache_path = cache.get_cache_path(cache_dir, entry_hash)
+        cache_path.chmod(0o444)
+
+        shutil.rmtree(data_dir)
+
+        # --checkout-mode accepts a single mode with no fallback, so there is no COPY to
+        # resolve the mismatch: the mode-collision error must surface.
+        result = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "hardlink", "tools"])
+
+        assert result.exit_code != 0, result.output
+        assert "Tip:" in result.output, (
+            f"CacheModeCollisionError's suggestion must render: {result.output}"
+        )
+        assert ".pivot_restore_" not in result.output, (
+            f"must not name the restore's internal staging path: {result.output}"
+        )
+        assert str(script) in result.output, (
+            f"must name the real workspace path 'tools/run.sh': {result.output}"
+        )
+
+
+def test_checkout_replaces_file_with_directory(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout replaces a file with a directory when types mismatch."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+
         data_dir = pathlib.Path("images")
         data_dir.mkdir()
         (data_dir / "cat.jpg").write_bytes(b"cat image")
@@ -314,7 +574,6 @@ def test_checkout_replaces_file_with_directory(
         pathlib.Path("images").write_bytes(b"oops, this is a file now")
         assert pathlib.Path("images").is_file(), "images should be a file"
 
-        # Checkout with --force should restore the directory
         result = runner.invoke(cli.cli, ["checkout", "--force", "images"])
 
         assert result.exit_code == 0, f"Checkout failed: {result.output}"
@@ -331,35 +590,36 @@ def test_checkout_replaces_file_with_directory(
 def test_checkout_stage_output(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """Checkout restores a stage output from cache using lock file hash."""
     with isolated_pivot_dir(runner, tmp_path):
-        # Set up project without pivot.yaml (we'll use pipeline.py instead)
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
-        pathlib.Path("input.txt").write_text("data")
+        _setup_stage_project(_PROCESS_PIPELINE)
 
-        # Create pipeline.py for CLI discovery
-        # Include the TypedDict definition since it's needed by the stage function
-        extra_code = """
-class _ProcessOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-"""
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=extra_code
-        )
-
-        # Run to generate output via CLI (repro runs the full pipeline)
         run_result = runner.invoke(cli.cli, ["repro"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
-        assert pathlib.Path("output.txt").exists()
+        assert _PROCESS_OUT.exists()
 
-        # Delete output
-        pathlib.Path("output.txt").unlink()
-        assert not pathlib.Path("output.txt").exists()
+        _PROCESS_OUT.unlink()
 
-        # Checkout should restore it
-        result = runner.invoke(cli.cli, ["checkout", "output.txt"])
+        result = runner.invoke(cli.cli, ["checkout", "test/process"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        assert pathlib.Path("output.txt").exists()
-        assert pathlib.Path("output.txt").read_text() == "processed output"
+        assert _PROCESS_OUT.read_text() == "processed output"
+
+
+def test_checkout_stage_output_by_path(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Checkout restores a stage output when targeted by its workspace path."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_stage_project(_PROCESS_PIPELINE)
+
+        run_result = runner.invoke(cli.cli, ["repro"])
+        assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
+
+        _PROCESS_OUT.unlink()
+
+        result = runner.invoke(cli.cli, ["checkout", str(_PROCESS_OUT)])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        assert _PROCESS_OUT.read_text() == "processed output"
 
 
 # =============================================================================
@@ -462,6 +722,7 @@ def test_checkout_errors_on_existing_file_with_different_content(
         assert "already exists" in result.output
         assert "--force" in result.output
         assert "--only-missing" in result.output
+        assert data_file.read_text() == "modified content", "Local edit must not be clobbered"
 
 
 def test_checkout_only_missing_skips_existing(
@@ -482,7 +743,7 @@ def test_checkout_only_missing_skips_existing(
         # File exists, --only-missing should skip it
         result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data.txt"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "Skipped" in result.output
 
 
@@ -504,7 +765,6 @@ def test_checkout_force_overwrites(runner: click.testing.CliRunner, tmp_path: pa
 
         # Modify file locally (possible since it's a copy)
         data_file.write_text("modified content")
-        assert data_file.read_text() == "modified content"
 
         # Force checkout should restore original
         result = runner.invoke(cli.cli, ["checkout", "--force", "data.txt"])
@@ -553,28 +813,15 @@ def test_checkout_unknown_target_suggests_list_and_track(
 def test_checkout_uncached_output_suggests_run_or_pull(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Uncached stage output suggests 'pivot run' or 'pivot pull'."""
+    """Uncached stage output suggests 'pivot repro' (or pull) as remediation."""
     with isolated_pivot_dir(runner, tmp_path):
-        # Set up project without pivot.yaml (we'll use pipeline.py instead)
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
-        pathlib.Path("input.txt").write_text("data")
-
         # Create pipeline but don't run it (so no cached output)
-        # Include the TypedDict definition since it's needed by the stage function
-        extra_code = """
-class _StageAOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
-"""
-        create_pipeline_py(
-            [_helper_stage_a], names={"_helper_stage_a": "stage_a"}, extra_code=extra_code
-        )
+        _setup_stage_project(_PROCESS_PIPELINE)
 
-        # Try to checkout the output that was never produced
-        result = runner.invoke(cli.cli, ["checkout", "a.txt"])
+        result = runner.invoke(cli.cli, ["checkout", "test/process"])
 
         assert result.exit_code != 0
-        # Should mention either run or pull as remediation
-        assert "pivot" in result.output.lower()
+        assert "pivot repro" in result.output or "pivot pull" in result.output, result.output
 
 
 def test_checkout_path_traversal_rejected(
@@ -600,8 +847,7 @@ def test_checkout_no_targets_no_files_shows_nothing_restored(
         # No tracked files, no stages - should complete successfully
         result = runner.invoke(cli.cli, ["checkout"])
 
-        # Should complete without error (no targets is valid)
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
 
 
 # =============================================================================
@@ -632,12 +878,9 @@ def test_checkout_partial_success_some_missing(
         # Checkout all (no targets) should restore data1, fail on data2
         result = runner.invoke(cli.cli, ["checkout"])
 
-        # Should exit non-zero due to partial failure
         assert result.exit_code == 1, (
             f"Expected exit code 1, got {result.exit_code}: {result.output}"
         )
-        # data1 should be restored
-        assert data1.exists()
         assert data1.read_text() == "content1"
         # Summary should indicate both success and failure
         assert "Restored 1 file(s)" in result.output
@@ -652,7 +895,6 @@ def test_checkout_duplicate_targets_deduplicated(
     with isolated_pivot_dir(runner, tmp_path):
         cache_dir = _setup_test_project()
 
-        # Create and track a file
         data_file = pathlib.Path("data.txt")
         data_file.write_text("tracked content")
         output_hash = cache.save_to_cache(data_file, cache_dir)
@@ -664,9 +906,7 @@ def test_checkout_duplicate_targets_deduplicated(
         # Checkout both data.txt and data.txt.pvt (duplicate targets)
         result = runner.invoke(cli.cli, ["checkout", "data.txt", "data.txt.pvt"])
 
-        # Should succeed and only restore once
         assert result.exit_code == 0, f"Failed: {result.output}"
-        assert data_file.exists()
         assert data_file.read_text() == "tracked content"
         # Only one "Restored" message
         assert result.output.count("Restored") == 1
@@ -679,13 +919,11 @@ def test_checkout_quiet_with_failures_shows_summary(
     with isolated_pivot_dir(runner, tmp_path):
         _setup_test_project()
 
-        # Create pvt file pointing to non-existent cache entry
         pvt_data = track.PvtData(path="data.txt", hash="deadbeef12345678", size=100)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
         result = runner.invoke(cli.cli, ["--quiet", "checkout"])
 
-        # Should fail
         assert result.exit_code == 1
         # Failure summary still shown even with --quiet
         assert "Missing 1 file(s)" in result.output
@@ -709,7 +947,6 @@ def test_checkout_multiple_matching_files_skipped(
                 path=name, hash=output_hash["hash"], size=len(f"content of {name}")
             )
             track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
-            # Files exist as symlinks after save_to_cache — hashes match
 
         result = runner.invoke(cli.cli, ["checkout"])
 
@@ -753,7 +990,6 @@ def test_checkout_shows_aggregate_counts(
     with isolated_pivot_dir(runner, tmp_path):
         cache_dir = _setup_test_project()
 
-        # Create 3 tracked files
         for i in range(1, 4):
             name = f"data{i}.txt"
             path = pathlib.Path(name)
@@ -762,7 +998,6 @@ def test_checkout_shows_aggregate_counts(
             assert output_hash is not None
             pvt_data = track.PvtData(path=name, hash=output_hash["hash"], size=8)
             track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
-            # Remove the file so it needs restoration
             path.unlink()
 
         result = runner.invoke(cli.cli, ["checkout"])
@@ -770,7 +1005,6 @@ def test_checkout_shows_aggregate_counts(
         assert result.exit_code == 0, f"Failed: {result.output}"
         # Should show count, not individual file names
         assert "Restored 3 file(s)" in result.output
-        # Individual "Restored: data1.txt" lines should NOT appear
         assert "Restored: data" not in result.output
 
 
@@ -782,46 +1016,31 @@ def test_checkout_shows_aggregate_counts(
 def test_checkout_restores_only_cached_outputs_not_metrics(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Checkout restores Out() outputs but skips Metric() outputs.
+    """Checkout restores data outputs but skips metric outputs.
 
-    When a stage has both Out() and Metric() outputs, deleting both and running
-    `pivot checkout` should only restore the Out() (cached) output. The Metric()
-    output is not cached — it's git-tracked and not Pivot's responsibility.
+    Metric outputs are not cached — they're git-tracked and not Pivot's
+    responsibility to restore.
     """
     with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
-        pathlib.Path("input.txt").write_text("data")
+        _setup_stage_project(_MIXED_PIPELINE)
 
-        create_pipeline_py(
-            [_helper_mixed],
-            names={"_helper_mixed": "mixed"},
-            extra_code=_MIXED_OUTPUTS_CODE,
-        )
-
-        # Run to generate both outputs
         run_result = runner.invoke(cli.cli, ["repro"])
         assert run_result.exit_code == 0, f"Repro failed: {run_result.output}"
-        assert pathlib.Path("output.txt").exists(), "Out() output should exist after repro"
-        assert pathlib.Path("metrics.json").exists(), "Metric() output should exist after repro"
+        data_out = pathlib.Path("data", "test", "mixed", "output.txt")
+        metric_out = pathlib.Path("metrics", "test", "mixed", "metrics.yaml")
+        assert data_out.exists(), "Data output should exist after repro"
+        assert metric_out.exists(), "Metric output should exist after repro"
 
-        # Delete both output files
-        pathlib.Path("output.txt").unlink(missing_ok=True)
-        # metrics.json may be a regular file (not cached/symlinked)
-        pathlib.Path("metrics.json").unlink(missing_ok=True)
-        assert not pathlib.Path("output.txt").exists()
-        assert not pathlib.Path("metrics.json").exists()
+        data_out.unlink()
+        metric_out.unlink()
 
-        # Checkout should restore only the cached output
         result = runner.invoke(cli.cli, ["checkout"])
 
         assert result.exit_code == 0, f"Checkout failed: {result.output}"
-        assert pathlib.Path("output.txt").exists(), (
-            "Cached Out() output should be restored by checkout"
+        assert data_out.read_text() == "cached output", (
+            "Cached data output should be restored by checkout"
         )
-        assert pathlib.Path("output.txt").read_text() == "cached output"
-        assert not pathlib.Path("metrics.json").exists(), (
-            "Non-cached Metric() output should NOT be restored by checkout"
-        )
+        assert not metric_out.exists(), "Non-cached metric output should NOT be restored"
 
 
 # =============================================================================
@@ -832,54 +1051,39 @@ def test_checkout_restores_only_cached_outputs_not_metrics(
 def test_checkout_pvt_without_pipeline(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Checkout restores .pvt tracked files even without pipeline.
-
-    When a project has .pvt files but no pivot.yaml/pipeline.py, checkout
-    should still restore the tracked files without errors.
-    """
+    """Checkout restores .pvt tracked files even without pipeline."""
     with isolated_pivot_dir(runner, tmp_path):
         # Set up cache directory but NO pipeline file
         cache_dir = pathlib.Path(".pivot") / "cache" / "files"
         cache_dir.mkdir(parents=True)
 
-        # Create and track a file
         data_file = pathlib.Path("data.txt")
         data_file.write_text("tracked content")
         output_hash = cache.save_to_cache(data_file, cache_dir)
         assert output_hash is not None
 
-        # Create .pvt tracking file
         pvt_data = track.PvtData(path="data.txt", hash=output_hash["hash"], size=15)
         track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
 
-        # Delete original file
         data_file.unlink()
         assert not data_file.exists()
 
-        # Checkout should restore it (no pipeline error)
         result = runner.invoke(cli.cli, ["checkout", "data.txt"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        assert data_file.exists(), "File should be restored"
         assert data_file.read_text() == "tracked content"
         assert "Restored" in result.output
-        assert "No pipeline" not in result.output.lower()
+        assert "no pipeline" not in result.output.lower()
 
 
 def test_checkout_all_without_pipeline(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Checkout all restores .pvt files and silently skips stage outputs without pipeline.
-
-    When a project has .pvt files but no pipeline, checkout with no targets
-    should restore tracked files and complete successfully without errors.
-    """
+    """Checkout all restores .pvt files and silently skips stage outputs without pipeline."""
     with isolated_pivot_dir(runner, tmp_path):
-        # Set up cache directory but NO pipeline file
         cache_dir = pathlib.Path(".pivot") / "cache" / "files"
         cache_dir.mkdir(parents=True)
 
-        # Create and track two files
         for name in ["data1.txt", "data2.txt"]:
             path = pathlib.Path(name)
             path.write_text(f"content of {name}")
@@ -889,18 +1093,14 @@ def test_checkout_all_without_pipeline(
                 path=name, hash=output_hash["hash"], size=len(f"content of {name}")
             )
             track.write_pvt_file(pathlib.Path(f"{name}.pvt"), pvt_data)
-            # Remove the symlink/hardlink
             path.unlink()
 
-        # Checkout all (no targets, no pipeline)
         result = runner.invoke(cli.cli, ["checkout"])
 
         assert result.exit_code == 0, f"Checkout failed: {result.output}"
-        assert pathlib.Path("data1.txt").exists()
-        assert pathlib.Path("data2.txt").exists()
         assert pathlib.Path("data1.txt").read_text() == "content of data1.txt"
         assert pathlib.Path("data2.txt").read_text() == "content of data2.txt"
-        assert "No pipeline" not in result.output.lower()
+        assert "no pipeline" not in result.output.lower()
 
 
 # =============================================================================
@@ -923,88 +1123,58 @@ def test_checkout_rejects_lock_with_invalid_hash(
     """Lock files with null/empty hashes are rejected at deserialization boundary.
 
     is_lock_data() rejects the entire lock file, so checkout treats the stage
-    as having no lock data — the output is not a known stage output.
+    as having no lock data.
     """
     with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
-        pathlib.Path("input.txt").write_text("data")
-
-        extra_code = """
-class _ProcessOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-"""
-        create_pipeline_py(
-            [_helper_process], names={"_helper_process": "process"}, extra_code=extra_code
-        )
+        _setup_stage_project(_PROCESS_PIPELINE)
 
         run_result = runner.invoke(cli.cli, ["repro"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
-        stages_dir = lock.get_stages_dir(pathlib.Path(".pivot"))
-        lock_path = stages_dir / "process.lock"
+        lock_path = _stage_lock_path("test/process")
         assert lock_path.exists(), f"Lock file not found at {lock_path}"
 
-        with open(lock_path) as f:
-            lock_yaml = yaml.safe_load(f)
+        lock_yaml = yaml.safe_load(lock_path.read_text())
         lock_yaml["outs"][0]["hash"] = bad_hash
-        with open(lock_path, "w") as f:
-            yaml.dump(lock_yaml, f)
+        lock_path.write_text(yaml.dump(lock_yaml))
 
-        pathlib.Path("output.txt").unlink()
+        _PROCESS_OUT.unlink()
 
-        result = runner.invoke(cli.cli, ["checkout", "output.txt"])
+        result = runner.invoke(cli.cli, ["checkout", "test/process"])
 
         assert result.exit_code != 0, "Corrupted lock file should cause checkout to fail"
-        assert "not a tracked file or stage output" in result.output
-        assert not pathlib.Path("output.txt").exists()
+        assert "pivot repro test/process" in result.output
+        assert not _PROCESS_OUT.exists()
 
 
 def test_checkout_rejects_entire_lock_when_any_hash_invalid(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """A single null hash invalidates the entire lock file — no partial trust.
-
-    Even valid outputs from the same stage are unavailable because the corrupted
-    lock file is rejected wholesale. Re-run the stage to regenerate.
-    """
+    """A single null hash invalidates the entire lock file — no partial trust."""
     with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path(".pivot/cache/files").mkdir(parents=True, exist_ok=True)
-        pathlib.Path("input.txt").write_text("data")
-
-        extra_code = """
-class _TwoOutputs(TypedDict):
-    output1: Annotated[pathlib.Path, outputs.Out("output1.txt", loaders.PathOnly())]
-    output2: Annotated[pathlib.Path, outputs.Out("output2.txt", loaders.PathOnly())]
-"""
-        create_pipeline_py(
-            [_helper_two_outputs],
-            names={"_helper_two_outputs": "two_stage"},
-            extra_code=extra_code,
-        )
+        _setup_stage_project(_TWO_OUTPUTS_PIPELINE)
 
         run_result = runner.invoke(cli.cli, ["repro"])
         assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
-        stages_dir = lock.get_stages_dir(pathlib.Path(".pivot"))
-        lock_path = stages_dir / "two_stage.lock"
-        with open(lock_path) as f:
-            lock_yaml = yaml.safe_load(f)
-        assert len(lock_yaml["outs"]) >= 2
+        lock_path = _stage_lock_path("test/two_stage")
+        lock_yaml = yaml.safe_load(lock_path.read_text())
+        assert len(lock_yaml["outs"]) == 2
         lock_yaml["outs"][1]["hash"] = None
-        with open(lock_path, "w") as f:
-            yaml.dump(lock_yaml, f)
+        lock_path.write_text(yaml.dump(lock_yaml))
 
-        pathlib.Path("output1.txt").unlink()
-        pathlib.Path("output2.txt").unlink()
+        out_dir = pathlib.Path("data", "test", "two_stage")
+        (out_dir / "output1.txt").unlink()
+        (out_dir / "output2.txt").unlink()
 
-        result = runner.invoke(cli.cli, ["checkout", "output1.txt"])
+        result = runner.invoke(cli.cli, ["checkout", "test/two_stage:output1"])
 
         assert result.exit_code != 0, (
             "Valid output should also fail — lock file is rejected entirely"
         )
-        assert "not a tracked file or stage output" in result.output
-        assert not pathlib.Path("output1.txt").exists()
-        assert not pathlib.Path("output2.txt").exists()
+        assert "pivot repro test/two_stage" in result.output
+        assert not (out_dir / "output1.txt").exists()
+        assert not (out_dir / "output2.txt").exists()
 
 
 def test_verbose_traceback_on_unhandled_error(

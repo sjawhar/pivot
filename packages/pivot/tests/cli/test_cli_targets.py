@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
 import click
 import pytest
 
-from helpers import register_test_stage
-from pivot import loaders, outputs
+from pivot import compose, types
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets
 from pivot.engine import graph as engine_graph
@@ -15,52 +13,40 @@ from pivot.engine import graph as engine_graph
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from pivot.pipeline.pipeline import Pipeline
+    import networkx as nx
 
 # =============================================================================
-# Output TypedDicts for annotation-based stages
-# =============================================================================
-
-
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-
-class _OutputCsvOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.csv", loaders.PathOnly())]
-
-
-class _OutputJsonOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.json", loaders.PathOnly())]
-
-
-# =============================================================================
-# Module-level helper functions
+# Module-level stage functions (required for pickling)
 # =============================================================================
 
 
-def _noop() -> None:
-    """Module-level no-op function for stage registration in tests."""
+@compose.stage
+def my_stage() -> str:
+    return "data"
 
 
-def _helper_stage(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
+@compose.stage
+def data() -> None:
+    """Stage whose name collides with a file path."""
 
 
-def _helper_stage_csv() -> _OutputCsvOutputs:
-    """Helper stage that produces output.csv."""
-    pathlib.Path("output.csv").write_text("data")
-    return {"output": pathlib.Path("output.csv")}
+@compose.stage
+def producer_stage() -> str:
+    return "data"
 
 
-def _helper_stage_json() -> _OutputJsonOutputs:
-    """Helper stage that produces output.json."""
-    pathlib.Path("output.json").write_text("{}")
-    return {"output": pathlib.Path("output.json")}
+@compose.stage
+def stage_a() -> str:
+    return "data"
+
+
+@compose.stage
+def stage_b() -> dict[str, int]:
+    return {}
+
+
+def _bipartite_graph() -> nx.DiGraph[str]:
+    return engine_graph.build_graph(cli_helpers.get_all_stages())
 
 
 # --- validate_targets tests ---
@@ -92,20 +78,24 @@ def test_validate_targets_logs_warning_for_invalid(caplog: pytest.LogCaptureFixt
 # --- _classify_targets tests ---
 
 
-def test_classify_targets_stage_only(mock_discovery: Pipeline, set_project_root: Path) -> None:
-    """Target that is only a stage name."""
-    # Register a real stage (autouse fixture clears between tests)
-    register_test_stage(_noop, name="my_stage")
+def test_classify_targets_stage_only(
+    mock_discovery: compose.Pipeline, set_project_root: Path
+) -> None:
+    """Target that is only a stage name (bare name resolves to its qualified form)."""
+    with mock_discovery:
+        my_stage()
 
     result = targets._classify_targets(["my_stage"], set_project_root)
 
     assert len(result) == 1
-    assert result[0]["target"] == "my_stage"
+    assert result[0]["target"] == "test/my_stage"
     assert result[0]["is_stage"] is True
     assert result[0]["is_file"] is False
 
 
-def test_classify_targets_file_only(mock_discovery: Pipeline, set_project_root: Path) -> None:
+def test_classify_targets_file_only(
+    mock_discovery: compose.Pipeline, set_project_root: Path
+) -> None:
     """Target that is only a file path."""
     data_file = set_project_root / "data.csv"
     data_file.touch()
@@ -118,7 +108,7 @@ def test_classify_targets_file_only(mock_discovery: Pipeline, set_project_root: 
     assert result[0]["is_file"] is True
 
 
-def test_classify_targets_neither(mock_discovery: Pipeline, set_project_root: Path) -> None:
+def test_classify_targets_neither(mock_discovery: compose.Pipeline, set_project_root: Path) -> None:
     """Target that is neither a stage nor existing file."""
     result = targets._classify_targets(["nonexistent"], set_project_root)
 
@@ -128,13 +118,14 @@ def test_classify_targets_neither(mock_discovery: Pipeline, set_project_root: Pa
 
 
 def test_classify_targets_both_warns(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     set_project_root: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Target that is both a stage name and file should warn."""
     # Register stage with same name as file
-    register_test_stage(_noop, name="data")
+    with mock_discovery:
+        data()
     data_file = set_project_root / "data"
     data_file.touch()
 
@@ -149,23 +140,27 @@ def test_classify_targets_both_warns(
 # --- resolve_output_paths tests ---
 
 
-def test_resolve_output_paths_file(mock_discovery: Pipeline, set_project_root: Path) -> None:
+def test_resolve_output_paths_file(
+    mock_discovery: compose.Pipeline, set_project_root: Path
+) -> None:
     """Resolving a file target should return the file path."""
     metrics_file = set_project_root / "my_metrics.yaml"
     metrics_file.touch()
 
     resolved, missing = targets.resolve_output_paths(
-        ["my_metrics.yaml"], set_project_root, outputs.Metric
+        ["my_metrics.yaml"], set_project_root, types.ArtifactTag.METRIC
     )
 
     assert "my_metrics.yaml" in resolved
     assert missing == []
 
 
-def test_resolve_output_paths_unknown(mock_discovery: Pipeline, set_project_root: Path) -> None:
+def test_resolve_output_paths_unknown(
+    mock_discovery: compose.Pipeline, set_project_root: Path
+) -> None:
     """Unknown targets should be returned in missing list."""
     resolved, missing = targets.resolve_output_paths(
-        ["nonexistent.yaml"], set_project_root, outputs.Metric
+        ["nonexistent.yaml"], set_project_root, types.ArtifactTag.METRIC
     )
 
     assert len(resolved) == 0
@@ -175,18 +170,14 @@ def test_resolve_output_paths_unknown(mock_discovery: Pipeline, set_project_root
 # --- resolve_plot_infos tests ---
 
 
-def test_resolve_plot_infos_file(mock_discovery: Pipeline, set_project_root: Path) -> None:
+def test_resolve_plot_infos_file(mock_discovery: compose.Pipeline, set_project_root: Path) -> None:
     """Resolving a file target should return PlotInfo with (direct) stage."""
     plot_file = set_project_root / "my_plot.png"
     plot_file.touch()
 
     resolved, missing = targets.resolve_plot_infos(["my_plot.png"], set_project_root)
 
-    assert len(resolved) == 1
-    assert resolved[0]["path"] == "my_plot.png"
-    assert resolved[0]["stage_name"] == "(direct)"
-    assert resolved[0]["x"] is None
-    assert resolved[0]["y"] is None
+    assert resolved == [{"path": "my_plot.png", "stage_name": "(direct)"}]
     assert missing == []
 
 
@@ -210,31 +201,35 @@ def test_format_unknown_targets_error_multiple() -> None:
 
 
 def test_resolve_and_validate_empty_targets(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
-    result = targets.resolve_and_validate((), set_project_root, outputs.Metric)
+    result = targets.resolve_and_validate((), set_project_root, types.ArtifactTag.METRIC)
 
     assert result is None
 
 
 def test_resolve_and_validate_raises_on_unknown(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
     """Should raise ClickException with helpful message for unknown targets."""
     with pytest.raises(click.ClickException) as exc_info:
-        targets.resolve_and_validate(("nonexistent.yaml",), set_project_root, outputs.Metric)
+        targets.resolve_and_validate(
+            ("nonexistent.yaml",), set_project_root, types.ArtifactTag.METRIC
+        )
 
     assert "neither a registered stage nor an existing file" in str(exc_info.value)
 
 
 def test_resolve_and_validate_returns_paths(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
     """Should return resolved paths on success."""
     metrics_file = set_project_root / "data.yaml"
     metrics_file.touch()
 
-    result = targets.resolve_and_validate(("data.yaml",), set_project_root, outputs.Metric)
+    result = targets.resolve_and_validate(
+        ("data.yaml",), set_project_root, types.ArtifactTag.METRIC
+    )
 
     assert result is not None
     assert "data.yaml" in result
@@ -244,111 +239,119 @@ def test_resolve_and_validate_returns_paths(
 
 
 def test_resolve_targets_to_stages_stage_name(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
     """Stage name resolves directly to itself."""
-    register_test_stage(_helper_stage_csv, name="my_stage")
+    with mock_discovery:
+        my_stage()
 
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
+    resolved, unresolved = targets.resolve_targets_to_stages(["test/my_stage"], _bipartite_graph())
 
-    resolved, unresolved = targets.resolve_targets_to_stages(["my_stage"], bipartite_graph)
-
-    assert "my_stage" in resolved, "Stage name should resolve directly"
+    assert resolved == {"test/my_stage"}, "Stage name should resolve directly"
     assert unresolved == [], "Should have no unresolved targets"
 
 
+def test_resolve_targets_to_stages_bare_stage_name(
+    mock_discovery: compose.Pipeline, set_project_root: Path
+) -> None:
+    """Bare stage name resolves to its qualified form."""
+    with mock_discovery:
+        my_stage()
+
+    resolved, unresolved = targets.resolve_targets_to_stages(["my_stage"], _bipartite_graph())
+
+    assert resolved == {"test/my_stage"}
+    assert unresolved == []
+
+
 def test_resolve_targets_to_stages_file_path(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
     """Output file path resolves to producer stage."""
-    register_test_stage(_helper_stage_csv, name="producer_stage")
+    with mock_discovery:
+        producer_stage()
 
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
+    resolved, unresolved = targets.resolve_targets_to_stages(
+        ["data/test/producer_stage.txt"], _bipartite_graph()
+    )
 
-    resolved, unresolved = targets.resolve_targets_to_stages(["output.csv"], bipartite_graph)
-
-    assert "producer_stage" in resolved, "File path should resolve to producer stage"
+    assert resolved == {"test/producer_stage"}, "File path should resolve to producer stage"
     assert unresolved == [], "Should have no unresolved targets"
 
 
 def test_resolve_targets_to_stages_unknown(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
     """Unknown target goes to unresolved list."""
-    register_test_stage(_helper_stage_csv, name="some_stage")
+    with mock_discovery:
+        producer_stage()
 
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
-
-    resolved, unresolved = targets.resolve_targets_to_stages(["nonexistent.csv"], bipartite_graph)
+    resolved, unresolved = targets.resolve_targets_to_stages(
+        ["nonexistent.csv"], _bipartite_graph()
+    )
 
     assert resolved == set(), "Should have no resolved stages"
     assert "nonexistent.csv" in unresolved, "Unknown target should be in unresolved"
 
 
-def test_resolve_targets_to_stages_mixed(mock_discovery: Pipeline, set_project_root: Path) -> None:
+def test_resolve_targets_to_stages_mixed(
+    mock_discovery: compose.Pipeline, set_project_root: Path
+) -> None:
     """Stage names and file paths mix correctly."""
-    register_test_stage(_helper_stage_csv, name="stage_a")
-    register_test_stage(_helper_stage_json, name="stage_b")
-
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
+    with mock_discovery:
+        stage_a()
+        stage_b()
 
     resolved, unresolved = targets.resolve_targets_to_stages(
-        ["stage_a", "output.json"], bipartite_graph
+        ["test/stage_a", "data/test/stage_b.yaml"], _bipartite_graph()
     )
 
-    assert "stage_a" in resolved, "Stage name should resolve"
-    assert "stage_b" in resolved, "File path should resolve to stage_b"
+    assert resolved == {"test/stage_a", "test/stage_b"}, (
+        "Stage name and stage_b's output path should both resolve"
+    )
     assert unresolved == [], "Should have no unresolved targets"
 
 
-def test_resolve_targets_to_stages_dedup(mock_discovery: Pipeline, set_project_root: Path) -> None:
+def test_resolve_targets_to_stages_dedup(
+    mock_discovery: compose.Pipeline, set_project_root: Path
+) -> None:
     """Duplicate paths to same stage deduplicate."""
-    register_test_stage(_helper_stage_csv, name="my_stage")
-
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
+    with mock_discovery:
+        my_stage()
 
     # Resolve both the stage name and its output file
     resolved, unresolved = targets.resolve_targets_to_stages(
-        ["my_stage", "output.csv"], bipartite_graph
+        ["test/my_stage", "data/test/my_stage.txt"], _bipartite_graph()
     )
 
-    assert len(resolved) == 1, "Should deduplicate to single stage"
-    assert "my_stage" in resolved, "Should contain the stage"
+    assert resolved == {"test/my_stage"}, "Should deduplicate to single stage"
     assert unresolved == [], "Should have no unresolved targets"
 
 
 def test_resolve_targets_to_stages_absolute_path(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
     """Absolute path to output file resolves to producer stage."""
-    register_test_stage(_helper_stage_csv, name="producer_stage")
+    with mock_discovery:
+        producer_stage()
 
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
+    abs_path = str(set_project_root / "data" / "test" / "producer_stage.txt")
+    resolved, unresolved = targets.resolve_targets_to_stages([abs_path], _bipartite_graph())
 
-    # Use absolute path to the output file
-    abs_path = str(set_project_root / "output.csv")
-    resolved, unresolved = targets.resolve_targets_to_stages([abs_path], bipartite_graph)
-
-    assert "producer_stage" in resolved, "Absolute path should resolve to producer stage"
+    assert resolved == {"test/producer_stage"}, "Absolute path should resolve to producer stage"
     assert unresolved == [], "Should have no unresolved targets"
 
 
 def test_resolve_targets_to_stages_dot_relative_path(
-    mock_discovery: Pipeline, set_project_root: Path
+    mock_discovery: compose.Pipeline, set_project_root: Path
 ) -> None:
-    """Dot-relative path (./output.csv) resolves to producer stage."""
-    register_test_stage(_helper_stage_csv, name="producer_stage")
+    """Dot-relative path (./data/test/producer_stage.txt) resolves to producer stage."""
+    with mock_discovery:
+        producer_stage()
 
-    all_stages = cli_helpers.get_all_stages()
-    bipartite_graph = engine_graph.build_graph(all_stages)
+    resolved, unresolved = targets.resolve_targets_to_stages(
+        ["./data/test/producer_stage.txt"], _bipartite_graph()
+    )
 
-    resolved, unresolved = targets.resolve_targets_to_stages(["./output.csv"], bipartite_graph)
-
-    assert "producer_stage" in resolved, "Dot-relative path should resolve to producer stage"
+    assert resolved == {"test/producer_stage"}, "Dot-relative path should resolve to producer stage"
     assert unresolved == [], "Should have no unresolved targets"

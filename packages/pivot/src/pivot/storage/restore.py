@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING, TypedDict, TypeGuard
 import xxhash
 import yaml
 
-from pivot import exceptions, git, project, yaml_config
+from pivot import config, exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
 from pivot.storage import cache, lock, track
-from pivot.types import DirHash, FileHash
+from pivot.types import HashInfo
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from pivot.storage.track import PvtData
-    from pivot.types import HashInfo, OutEntry, StorageLockData
+    from pivot.types import StorageLockData
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,15 @@ class TargetInfo(TypedDict):
     original_target: str
     paths: list[str]
     hashes: dict[str, HashInfo | None]
+
+
+class StageTarget(TypedDict):
+    """A CLI target naming a stage's outputs, resolved against the current pipeline."""
+
+    stage_name: str
+    state_dir: pathlib.Path
+    paths_by_key: dict[str | None, str]
+    """Fallback lock output key -> workspace path for older locks with no recorded path."""
 
 
 def _parse_yaml_bytes[T](
@@ -105,13 +114,6 @@ def get_pvt_data_from_revision(pvt_rel_path: str, rev: str) -> PvtData | None:
     return _parse_pvt_data_from_bytes(content)
 
 
-def _out_entry_to_output_hash(entry: OutEntry) -> HashInfo:
-    """Convert OutEntry to HashInfo."""
-    if "manifest" in entry:
-        return DirHash(hash=entry["hash"], manifest=entry["manifest"])
-    return FileHash(hash=entry["hash"])
-
-
 def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
     """Normalize target to relative path, validating it's within project."""
     # Security check: reject path traversal in user input
@@ -133,31 +135,51 @@ def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
 def resolve_targets(
     targets: Sequence[str],
     rev: str,
-    state_dir: pathlib.Path,
+    stage_targets: Mapping[str, StageTarget],
 ) -> list[TargetInfo]:
-    """Resolve targets to TargetInfo, determining if each is a file or stage."""
+    """Resolve targets to TargetInfo: a target in ``stage_targets`` is a stage, others are files."""
     proj_root = project.get_project_root()
     results = list[TargetInfo]()
 
     for target in targets:
-        # Try as stage name first (stage names don't have path separators)
-        if "/" not in target and "\\" not in target:
-            lock_data = get_lock_data_from_revision(target, rev, state_dir)
-            if lock_data is not None and "outs" in lock_data:
-                outs = lock_data["outs"]
-                paths = [entry["path"] for entry in outs]
-                hashes: dict[str, HashInfo | None] = {
-                    entry["path"]: _out_entry_to_output_hash(entry) for entry in outs
-                }
-                results.append(
-                    TargetInfo(
-                        target_type=TargetType.STAGE,
-                        original_target=target,
-                        paths=paths,
-                        hashes=hashes,
-                    )
+        if target in stage_targets:
+            stage_target = stage_targets[target]
+            stage_name = stage_target["stage_name"]
+            lock_data = get_lock_data_from_revision(stage_name, rev, stage_target["state_dir"])
+            if lock_data is None:
+                raise exceptions.TargetNotFoundError(
+                    f"Stage '{stage_name}' has no lock file at revision '{rev}'"
                 )
-                continue
+            paths_by_key = stage_target["paths_by_key"]
+            selected_key = types.identity_from_key(target).key
+            hashes = dict[str, HashInfo | None]()
+            for entry in lock_data["outs"]:
+                key = entry["key"]
+                if selected_key is not None and key != selected_key:
+                    continue
+                if "path" in entry:
+                    path = entry["path"]
+                elif key in paths_by_key:
+                    path = paths_by_key[key]
+                else:
+                    raise exceptions.TargetNotFoundError(
+                        f"Target '{target}' output key {key!r} at revision '{rev}' has no "
+                        + "recorded path and is not defined by the current pipeline"
+                    )
+                hashes[path] = lock.entry_hash_info(entry)
+            if not hashes:
+                raise exceptions.TargetNotFoundError(
+                    f"Target '{target}' recorded no outputs at revision '{rev}'"
+                )
+            results.append(
+                TargetInfo(
+                    target_type=TargetType.STAGE,
+                    original_target=target,
+                    paths=list(hashes),
+                    hashes=hashes,
+                )
+            )
+            continue
 
         # Normalize path (validates traversal and project bounds)
         rel_target = _normalize_target_path(target, proj_root)
@@ -166,18 +188,12 @@ def resolve_targets(
         # Try as a .pvt tracked file
         pvt_data = get_pvt_data_from_revision(pvt_rel_path, rev)
         if pvt_data is not None:
-            file_hash = pvt_data["hash"]
-            hash_info: HashInfo
-            if "manifest" in pvt_data:
-                hash_info = DirHash(hash=file_hash, manifest=pvt_data["manifest"])
-            else:
-                hash_info = FileHash(hash=file_hash)
             results.append(
                 TargetInfo(
                     target_type=TargetType.FILE,
                     original_target=target,
                     paths=[rel_target],
-                    hashes={rel_target: hash_info},
+                    hashes={rel_target: track.pvt_to_hash_info(pvt_data)},
                 )
             )
             continue
@@ -208,6 +224,20 @@ def _verify_content_hash(content: bytes, expected_hash: str) -> bool:
     return actual_hash == expected_hash
 
 
+def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> None:
+    """Atomically replace a cache-miss target under the cache restore lock."""
+
+    def write_content(fd: int) -> None:
+        with os.fdopen(fd, "wb") as file:
+            file.write(content)
+
+    with cache.restore_lock(dest_path, config.get_state_dir()) as lock_token:
+        staging_path = (
+            cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
+        )
+        cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -225,16 +255,6 @@ def restore_file(
             status=RestoreStatus.SKIPPED,
             path=path_str,
             message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
-        )
-
-    try:
-        if force and dest_path.exists():
-            cache.remove_output(dest_path)
-    except OSError as e:
-        return RestoreResult(
-            status=RestoreStatus.ERROR,
-            path=path_str,
-            message=f"Error: {dest_path} - failed to remove existing file: {e}",
         )
 
     # Ensure parent directory exists before any restore strategy
@@ -257,7 +277,7 @@ def restore_file(
                     output_hash,
                     cache_dir / "files",
                     checkout_modes=checkout_modes,
-                    state_dir=cache_dir.parent,
+                    state_dir=config.get_state_dir(),
                 )
                 if success:
                     return RestoreResult(
@@ -272,7 +292,7 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            dest_path.write_bytes(content)
+            _write_fallback_content(dest_path, content)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -301,22 +321,21 @@ def restore_file(
                     ),
                 )
             try:
-                dest_path.write_bytes(remote_content)
+                _write_fallback_content(dest_path, remote_content)
             except OSError as e:
                 return RestoreResult(
                     status=RestoreStatus.ERROR,
                     path=path_str,
                     message=f"Error: {dest_path} - failed to write from remote: {e}",
                 )
-            # Cache the fetched content for future use (best effort)
+            # Cache the fetched content for future use (best effort). An object already there
+            # is kept: another process may be linking it (cache.publish_cache_object).
             try:
                 cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-
-                def write_content(fd: int) -> None:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(remote_content)
-
-                cache.atomic_write_file(cached_path, write_content, mode=0o444)
+                with cache.staged_cache_file(cached_path) as staged:
+                    staged.write_bytes(remote_content)
+                    os.chmod(staged, 0o444)
+                    _ = cache.publish_cache_object(staged, cached_path)
             except OSError:
                 pass  # Caching failure is non-fatal
             return RestoreResult(
@@ -337,7 +356,7 @@ def restore_targets_from_revision(
     rev: str,
     output: pathlib.Path | None,
     cache_dir: pathlib.Path,
-    state_dir: pathlib.Path,
+    stage_targets: Mapping[str, StageTarget],
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
 ) -> tuple[list[str], bool]:
@@ -354,18 +373,14 @@ def restore_targets_from_revision(
         raise exceptions.RevisionNotFoundError(f"Cannot resolve revision: '{rev}'")
 
     # Resolve targets
-    target_infos = resolve_targets(targets, rev, state_dir)
+    target_infos = resolve_targets(targets, rev, stage_targets)
 
     # Validate -o usage
     if output is not None:
         if len(target_infos) != 1:
             raise exceptions.GetError("--output/-o can only be used with a single target")
-        if target_infos[0]["target_type"] == TargetType.STAGE:
-            raise exceptions.GetError(
-                "--output/-o cannot be used with stage names (use file path instead)"
-            )
         if len(target_infos[0]["paths"]) != 1:
-            raise exceptions.GetError("--output/-o cannot be used with directory targets")
+            raise exceptions.GetError("--output/-o can only be used with a single output")
 
     results = list[RestoreResult]()
 

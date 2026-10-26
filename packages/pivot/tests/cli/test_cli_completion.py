@@ -8,21 +8,30 @@ from unittest import mock
 import click
 import pytest
 
-from helpers import register_test_stage
-from pivot import discovery
+from pivot import compose, discovery
 from pivot.cli import completion
-from pivot.pipeline import pipeline as pipeline_mod
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline.pipeline import Pipeline
+
+@compose.stage
+def stage1() -> None:
+    """No-op stage for registration in tests."""
 
 
-def _noop() -> None:
-    """Module-level no-op function for stage registration in tests."""
+@compose.stage
+def stage2() -> None:
+    """No-op stage for registration in tests."""
+
+
+def _write_fresh_cache(root: Path, stages: list[str]) -> None:
+    """Write pipeline.py and a stage-name cache that _get_stages_fast accepts."""
+    config = root / "pipeline.py"
+    config.write_text("# pipeline")
+    completion._write_stages_cache(root, "pipeline.py", config.stat().st_mtime, stages)
 
 
 # =============================================================================
@@ -47,68 +56,6 @@ def mock_param() -> mock.MagicMock:
 # =============================================================================
 
 
-def test_get_stages_fast_simple_yaml(tmp_path: Path, mocker: MockerFixture) -> None:
-    """Fast path extracts names from simple pivot.yaml."""
-    yaml_content = """
-stages:
-  preprocess:
-    python: stages.preprocess
-  train:
-    python: stages.train
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
-
-    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
-
-    result = completion._get_stages_fast()
-    assert result is not None
-    assert set(result) == {"preprocess", "train"}
-
-
-def test_get_stages_fast_matrix_yaml(tmp_path: Path, mocker: MockerFixture) -> None:
-    """Fast path expands matrix configurations."""
-    yaml_content = """
-stages:
-  train:
-    python: stages.train
-    matrix:
-      model: [bert, gpt]
-      dataset: [swe, human]
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
-
-    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
-
-    result = completion._get_stages_fast()
-    assert result is not None
-    assert set(result) == {
-        "train@bert_swe",
-        "train@bert_human",
-        "train@gpt_swe",
-        "train@gpt_human",
-    }
-
-
-def test_get_stages_fast_mixed_simple_and_matrix(tmp_path: Path, mocker: MockerFixture) -> None:
-    """Fast path handles mix of simple and matrix stages."""
-    yaml_content = """
-stages:
-  preprocess:
-    python: stages.preprocess
-  train:
-    python: stages.train
-    matrix:
-      model: [bert, gpt]
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
-
-    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
-
-    result = completion._get_stages_fast()
-    assert result is not None
-    assert set(result) == {"preprocess", "train@bert", "train@gpt"}
-
-
 def test_get_stages_fast_returns_none_when_no_project_root(mocker: MockerFixture) -> None:
     """Returns None when no project root found."""
     mocker.patch.object(completion, "_find_project_root_fast", return_value=None)
@@ -117,55 +64,14 @@ def test_get_stages_fast_returns_none_when_no_project_root(mocker: MockerFixture
     assert result is None
 
 
-def test_get_stages_fast_returns_none_when_no_yaml(tmp_path: Path, mocker: MockerFixture) -> None:
-    """Returns None when pivot.yaml doesn't exist."""
+def test_get_stages_fast_returns_none_without_cache(tmp_path: Path, mocker: MockerFixture) -> None:
+    """Returns None (fallback to full discovery) when no stage cache exists."""
+    (tmp_path / "pipeline.py").write_text("# pipeline")
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion._get_stages_fast()
     assert result is None
-
-
-def test_get_stages_fast_returns_none_on_variants(tmp_path: Path, mocker: MockerFixture) -> None:
-    """Returns None when config has variants (needs fallback)."""
-    yaml_content = """
-stages:
-  train:
-    python: stages.train
-    variants: stages.get_variants
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
-
-    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
-
-    result = completion._get_stages_fast()
-    assert result is None
-
-
-def test_get_stages_fast_returns_none_on_yaml_error(tmp_path: Path, mocker: MockerFixture) -> None:
-    """Returns None on YAML parse error."""
-    (tmp_path / "pivot.yaml").write_text("invalid: yaml: [[[")
-
-    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
-
-    result = completion._get_stages_fast()
-    assert result is None
-
-
-def test_get_stages_fast_pivot_yml_alternative(tmp_path: Path, mocker: MockerFixture) -> None:
-    """Fast path works with pivot.yml (alternative extension)."""
-    yaml_content = """
-stages:
-  test:
-    python: stages.test
-"""
-    (tmp_path / "pivot.yml").write_text(yaml_content)
-
-    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
-
-    result = completion._get_stages_fast()
-    assert result is not None
-    assert result == ["test"]
 
 
 # =============================================================================
@@ -219,21 +125,19 @@ def test_find_project_root_fast_returns_none_when_no_marker(
 # =============================================================================
 
 
-def test_get_stages_full_returns_registered_stages(mock_discovery: Pipeline) -> None:
-    """Returns stages from registry after registration."""
-    _ = mock_discovery
-
-    # Register real stages (autouse fixture clears registry between tests)
-    register_test_stage(_noop, name="stage1")
-    register_test_stage(_noop, name="stage2")
+def test_get_stages_full_returns_registered_stages(mock_discovery: compose.Pipeline) -> None:
+    """Returns qualified stage names from the discovered pipeline."""
+    with mock_discovery:
+        stage1()
+        stage2()
 
     result = completion._get_stages_full()
 
-    assert set(result) == {"stage1", "stage2"}
+    assert set(result) == {"test/stage1", "test/stage2"}
 
 
 # =============================================================================
-# complete_stages tests - use real YAML files instead of mocking
+# complete_stages tests - use a real stage-name cache instead of mocking
 # =============================================================================
 
 
@@ -243,21 +147,12 @@ def test_complete_stages_filters_by_prefix(
     mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
-    """Filters stage names by incomplete prefix."""
-    yaml_content = """
-stages:
-  train:
-    python: stages.train
-  test:
-    python: stages.test
-  preprocess:
-    python: stages.preprocess
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    """Filters stage names by incomplete prefix (qualified and bare forms)."""
+    _write_fresh_cache(tmp_path, ["test/train", "test/test", "test/preprocess"])
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
-    result = completion.complete_stages(mock_ctx, mock_param, "tr")
-    assert result == ["train"]
+    assert completion.complete_stages(mock_ctx, mock_param, "test/tr") == ["test/train"]
+    assert completion.complete_stages(mock_ctx, mock_param, "tr") == ["train"]
 
 
 def test_complete_stages_empty_prefix_returns_all(
@@ -266,38 +161,43 @@ def test_complete_stages_empty_prefix_returns_all(
     mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
-    """Empty prefix returns all stages."""
-    yaml_content = """
-stages:
-  train:
-    python: stages.train
-  test:
-    python: stages.test
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    """Empty prefix returns all stages, qualified plus bare in single-pipeline mode."""
+    _write_fresh_cache(tmp_path, ["test/train", "test/test"])
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "")
-    assert set(result) == {"train", "test"}
+    assert set(result) == {"test/train", "test/test", "train", "test"}
 
 
-def test_complete_stages_falls_back_to_registry(
-    mock_discovery: Pipeline,
+def test_complete_stages_no_bare_names_with_multiple_pipelines(
+    tmp_path: Path,
     mock_ctx: mock.MagicMock,
     mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
-    """Falls back to registry when fast path returns None (no YAML)."""
-    _ = mock_discovery
-
-    # No YAML file, fast path returns None
-    mocker.patch.object(completion, "_find_project_root_fast", return_value=None)
-
-    # Register stages directly
-    register_test_stage(_noop, name="fallback_stage")
+    """Bare names are offered only when all stages share one pipeline prefix."""
+    _write_fresh_cache(tmp_path, ["a/train", "b/train"])
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "")
-    assert "fallback_stage" in result
+    assert set(result) == {"a/train", "b/train"}
+
+
+def test_complete_stages_falls_back_to_registry(
+    mock_discovery: compose.Pipeline,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
+    mocker: MockerFixture,
+) -> None:
+    """Falls back to discovery when fast path returns None (no cache)."""
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=None)
+
+    with mock_discovery:
+        stage1()
+
+    result = completion.complete_stages(mock_ctx, mock_param, "")
+    assert "test/stage1" in result
+    assert "stage1" in result
 
 
 def test_complete_stages_returns_empty_on_exception(
@@ -310,24 +210,14 @@ def test_complete_stages_returns_empty_on_exception(
     assert result == []
 
 
-def test_complete_stages_matrix_stage_completion(
+def test_complete_stages_variant_stage_completion(
     tmp_path: Path,
     mock_ctx: mock.MagicMock,
     mock_param: mock.MagicMock,
     mocker: MockerFixture,
 ) -> None:
-    """Completes matrix stage names correctly."""
-    yaml_content = """
-stages:
-  train:
-    python: stages.train
-    matrix:
-      model: [bert, gpt]
-      dataset: [swe]
-  preprocess:
-    python: stages.preprocess
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    """Completes variant stage names (stage@variant) correctly."""
+    _write_fresh_cache(tmp_path, ["test/train@bert_swe", "test/train@gpt_swe", "test/preprocess"])
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "train@b")
@@ -341,16 +231,7 @@ def test_complete_stages_case_sensitive(
     mocker: MockerFixture,
 ) -> None:
     """Completion is case-sensitive."""
-    yaml_content = """
-stages:
-  Train:
-    python: stages.Train
-  train:
-    python: stages.train
-  TRAIN:
-    python: stages.TRAIN
-"""
-    (tmp_path / "pivot.yaml").write_text(yaml_content)
+    _write_fresh_cache(tmp_path, ["test/Train", "test/train", "test/TRAIN"])
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion.complete_stages(mock_ctx, mock_param, "tr")
@@ -362,9 +243,34 @@ stages:
 # =============================================================================
 
 
-def test_complete_targets_is_alias_for_complete_stages() -> None:
-    """complete_targets is a direct alias for complete_stages."""
-    assert completion.complete_targets is completion.complete_stages
+def test_complete_targets_matches_complete_stages_without_key(
+    tmp_path: Path,
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
+    mocker: MockerFixture,
+) -> None:
+    """Without ':' in the prefix, complete_targets offers the same stage names as
+    complete_stages and does not load the pipeline."""
+    _write_fresh_cache(tmp_path, ["test/train", "test/eval"])
+    mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
+    load = mocker.patch.object(completion, "_discover_pipeline", autospec=True)
+
+    targets = completion.complete_targets(mock_ctx, mock_param, "tr")
+    stages = completion.complete_stages(mock_ctx, mock_param, "tr")
+
+    assert targets == stages == ["train"]
+    load.assert_not_called()
+
+
+@pytest.mark.usefixtures("venv_inside_root_project")
+def test_complete_targets_offers_keys_on_cold_cache_with_venv_inside_root(
+    mock_ctx: mock.MagicMock,
+    mock_param: mock.MagicMock,
+) -> None:
+    """`stage:<TAB>` with no stage-name cache completes the output keys."""
+    result = completion.complete_targets(mock_ctx, mock_param, "train:")
+
+    assert result == ["train:model", "train:score"]
 
 
 # =============================================================================
@@ -544,34 +450,8 @@ def test_complete_config_keys_handles_remotes_not_dict(
 # =============================================================================
 
 
-def test_detect_config_file_finds_pivot_yaml(tmp_path: Path) -> None:
-    """Detects pivot.yaml and returns its mtime."""
-    config = tmp_path / "pivot.yaml"
-    config.write_text("stages: {}")
-
-    result = completion._detect_config_file(tmp_path)
-
-    assert result is not None
-    name, mtime = result
-    assert name == "pivot.yaml"
-    assert mtime == config.stat().st_mtime
-
-
-def test_detect_config_file_finds_pivot_yml(tmp_path: Path) -> None:
-    """Detects pivot.yml when pivot.yaml doesn't exist."""
-    config = tmp_path / "pivot.yml"
-    config.write_text("stages: {}")
-
-    result = completion._detect_config_file(tmp_path)
-
-    assert result is not None
-    name, mtime = result
-    assert name == "pivot.yml"
-    assert mtime == config.stat().st_mtime
-
-
 def test_detect_config_file_finds_pipeline_py(tmp_path: Path) -> None:
-    """Detects pipeline.py when no YAML exists."""
+    """Detects pipeline.py and returns its mtime."""
     config = tmp_path / "pipeline.py"
     config.write_text("# pipeline")
 
@@ -583,20 +463,10 @@ def test_detect_config_file_finds_pipeline_py(tmp_path: Path) -> None:
     assert mtime == config.stat().st_mtime
 
 
-def test_detect_config_file_prefers_yaml_over_pipeline(tmp_path: Path) -> None:
-    """pivot.yaml takes precedence over pipeline.py."""
-    (tmp_path / "pivot.yaml").write_text("stages: {}")
-    (tmp_path / "pipeline.py").write_text("# pipeline")
-
-    result = completion._detect_config_file(tmp_path)
-
-    assert result is not None
-    name, _ = result
-    assert name == "pivot.yaml"
-
-
 def test_detect_config_file_returns_none_when_nothing_found(tmp_path: Path) -> None:
-    """Returns None when no config file exists."""
+    """Returns None when no config file exists (a leftover pivot.yaml is not a config)."""
+    (tmp_path / "pivot.yaml").write_text("stages: {}")
+
     result = completion._detect_config_file(tmp_path)
     assert result is None
 
@@ -795,37 +665,32 @@ def test_get_stages_fast_ignores_stale_cache(tmp_path: Path, mocker: MockerFixtu
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
-    # Fast path should return None (no yaml, cache invalid)
+    # Fast path should return None (cache invalid -> fall back to full discovery)
     result = completion._get_stages_fast()
 
-    assert result is None  # Falls through to None (no YAML file)
+    assert result is None
 
 
 def test_get_stages_full_writes_cache(
-    mock_discovery: Pipeline, tmp_path: Path, mocker: MockerFixture
+    mock_discovery: compose.Pipeline, tmp_path: Path, mocker: MockerFixture
 ) -> None:
     """Full discovery writes cache after successful discovery."""
-    _ = mock_discovery
-
     # Create pipeline.py config file
     config = tmp_path / "pipeline.py"
     config.write_text("# pipeline")
 
-    # Register stages
-    register_test_stage(_noop, name="discovered_stage")
+    with mock_discovery:
+        stage1()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     result = completion._get_stages_full()
 
     # Stage should be discovered
-    assert "discovered_stage" in result
+    assert result == ["test/stage1"]
 
-    # Cache should be written
-    cache_path = tmp_path / ".pivot" / "cache" / "stages.cache"
-    assert cache_path.exists()
-    content = cache_path.read_text()
-    assert "discovered_stage" in content
+    # Cache should be written and readable by the fast path
+    assert completion._get_stages_from_cache(tmp_path) == ["test/stage1"]
 
 
 def test_get_stages_full_skips_cache_on_mtime_change(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -838,10 +703,10 @@ def test_get_stages_full_skips_cache_on_mtime_change(tmp_path: Path, mocker: Moc
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
 
     # Create a mock pipeline that modifies the file during discovery
-    mock_pipeline = mocker.MagicMock(spec=pipeline_mod.Pipeline)
-    mock_pipeline.list_stages.return_value = ["stage1"]
+    mock_pipeline = mocker.MagicMock(spec=compose.Pipeline)
+    mock_pipeline.list_stages.return_value = ["test/stage1"]
 
-    def discover_and_modify() -> pipeline_mod.Pipeline:
+    def discover_and_modify() -> compose.Pipeline:
         # Simulate file change during discovery
         time.sleep(0.01)  # Ensure mtime changes
         config.write_text("# modified pipeline")
@@ -895,16 +760,15 @@ def test_get_stages_full_returns_empty_when_no_pipeline(mocker: MockerFixture) -
 
 
 def test_get_stages_full_handles_cache_write_oserror(
-    mock_discovery: Pipeline, tmp_path: Path, mocker: MockerFixture
+    mock_discovery: compose.Pipeline, tmp_path: Path, mocker: MockerFixture
 ) -> None:
     """Cache write failure is silently ignored, stages still returned."""
-    _ = mock_discovery
-
     # Create a config file so _detect_config_file succeeds
     config = tmp_path / "pipeline.py"
     config.write_text("# pipeline")
 
-    register_test_stage(_noop, name="resilient_stage")
+    with mock_discovery:
+        stage1()
 
     mocker.patch.object(completion, "_find_project_root_fast", return_value=tmp_path)
     # Make the cache write fail (e.g. read-only filesystem)
@@ -915,7 +779,7 @@ def test_get_stages_full_handles_cache_write_oserror(
     result = completion._get_stages_full()
 
     # Stages should still be returned despite cache write failure
-    assert "resilient_stage" in result
+    assert result == ["test/stage1"]
 
 
 # =============================================================================
@@ -1014,12 +878,12 @@ def test_complete_config_keys_skips_non_string_remote_names(
 
 def test_cache_roundtrip_preserves_stages(tmp_path: Path) -> None:
     """Writing then reading cache preserves the exact stage list."""
-    config = tmp_path / "pivot.yaml"
-    config.write_text("stages: {}")
+    config = tmp_path / "pipeline.py"
+    config.write_text("# pipeline")
     mtime = config.stat().st_mtime
 
-    stages = ["train", "test@bert_swe", "preprocess", "evaluate@gpt_human"]
-    completion._write_stages_cache(tmp_path, "pivot.yaml", mtime, stages)
+    stages = ["test/train", "test/train@bert_swe", "test/preprocess", "other/evaluate@gpt"]
+    completion._write_stages_cache(tmp_path, "pipeline.py", mtime, stages)
     result = completion._get_stages_from_cache(tmp_path)
 
     assert result == stages, "Roundtrip should preserve exact stage list and order"

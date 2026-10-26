@@ -8,13 +8,13 @@
 
 ## What is Pivot?
 
-Pivot is a Python pipeline tool with automatic code change detection. Define stages with typed Python functions and annotations, and Pivot figures out what needs to re-run — no manual dependency declarations, no stale caches.
+Pivot is a Python pipeline tool with automatic code change detection. Stages are plain Python functions; you wire them together by calling them inside a `Pipeline` block, and Pivot works out what needs to re-run.
 
 - **Automatic code change detection** using Python introspection
-- **Per-stage lock files** for fast parallel writes (32x faster than monolithic locks)
-- **Warm worker pools** with preloaded imports
-- **Content-addressable caching** with S3 remote storage
-- **DVC compatibility** via YAML export
+- **No paths in pipeline code**: Pivot chooses where every output is stored
+- **Per-stage lock files** for fast parallel writes
+- **Warm worker pools** that retain stage imports across runs
+- **Content-addressable caching** with S3 or Google Cloud Storage remotes
 
 ---
 
@@ -22,68 +22,55 @@ Pivot is a Python pipeline tool with automatic code change detection. Define sta
 
 ```bash
 pip install pivot
-pivot init
+mkdir my_project && cd my_project
+git init && pivot init
 ```
 
-### Python-First Pipeline Definition
+Put a raw input under `data/raw/`:
+
+```bash
+mkdir -p data/raw
+printf 'name,value\nalice,100\nbob,200\ncarol,\n' > data/raw/records.csv
+```
+
+Define stages and the pipeline in `pipeline.py`:
 
 ```python
 # pipeline.py
-import pathlib
-from typing import Annotated, TypedDict
+import pandas as pd
 
-import pandas
-import pivot
+from pivot import Pipeline, StageParams, stage
 
 
-class PreprocessOutputs(TypedDict):
-    clean: Annotated[pathlib.Path, pivot.Out("processed.parquet", pivot.loaders.PathOnly())]
+class CleanParams(StageParams):
+    min_value: int = 0
 
 
-def preprocess(
-    raw: Annotated[pandas.DataFrame, pivot.Dep("data.csv", pivot.loaders.CSV())],
-) -> PreprocessOutputs:
-    df = raw.dropna()
-    out_path = pathlib.Path("processed.parquet")
-    df.to_parquet(out_path)
-    return PreprocessOutputs(clean=out_path)
+@stage
+def clean(records: pd.DataFrame, params: CleanParams) -> pd.DataFrame:
+    kept = records.dropna()
+    return kept[kept["value"] >= params.min_value]
 
 
-class TrainOutputs(TypedDict):
-    model: Annotated[pathlib.Path, pivot.Out("model.pkl", pivot.loaders.PathOnly())]
+@stage
+def summarize(rows: pd.DataFrame) -> dict:
+    return {"count": len(rows), "total": int(rows["value"].sum())}
 
 
-def train(
-    data: Annotated[pathlib.Path, pivot.Dep("processed.parquet", pivot.loaders.PathOnly())],
-) -> TrainOutputs:
-    df = pandas.read_parquet(data)
-    model_path = pathlib.Path("model.pkl")
-    # ... train model ...
-    return TrainOutputs(model=model_path)
-
-
-# Create pipeline and register stages
-pipeline = pivot.Pipeline("my_pipeline")
-pipeline.register(preprocess)
-pipeline.register(train)
+with Pipeline("demo") as pipeline:
+    records = pipeline.input("records.csv")
+    cleaned = clean(records, params=CleanParams(min_value=50))
+    summarize(cleaned)
 ```
 
 ```bash
-pivot repro  # Runs both stages
-pivot repro  # Instant - nothing changed
+pivot repro  # runs clean, then summarize
+pivot repro  # nothing changed: both stages are cached
 ```
 
-Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`, and only `train` re-runs.
+Pivot writes outputs to `data/demo/clean.jsonl` and `data/demo/summarize.yaml`. Edit the body of `summarize` and only `summarize` re-runs. A change to `min_value` or `clean` re-runs `clean`; downstream stages run only when `clean` produces different output bytes.
 
----
-
-## Installation
-
-```bash
-pip install pivot
-```
-
-**Requirements:** Python 3.13+, Unix only (Linux/macOS)
+The [Quick Start guide](https://sjawhar.github.io/pivot/getting-started/quickstart/) walks through this pipeline step by step.
 
 ---
 
@@ -91,111 +78,108 @@ pip install pivot
 
 ### Automatic Code Change Detection
 
-Pivot detects when your Python functions change — no manual `deps:` declarations:
+Pivot fingerprints each stage function and every helper it calls. Edit a helper and the stages that use it re-run; edit a comment and nothing does.
 
 ```python
-def helper(x):
-    return x * 2  # Change this...
+def normalize(df):
+    return df / df.max()  # change this...
 
-def process():
-    data = load("data.csv")
-    return helper(data)  # ...and Pivot knows to re-run!
+
+@stage
+def process(raw: pd.DataFrame) -> pd.DataFrame:
+    return normalize(raw)  # ...and process re-runs
 ```
 
-Uses `inspect.getclosurevars()` + AST extraction with recursive fingerprinting for transitive dependencies.
+#### Module-level values
+
+Pivot tracks module-level `bool`, `int`, `float`, `str`, `bytes`, and `None` values, tuples
+and frozensets of those scalars, and compiled regular expressions used by a stage. Any other
+module-level value—such as a list, dict, set, nested collection, enum member, frozen model,
+instance, or a method bound to an instance—raises `StageDefinitionError`; put configuration in
+`StageParams` instead. Set `core.unsafe_fingerprinting=true` or
+`PIVOT_UNSAFE_FINGERPRINTING=1` only to downgrade that error to a warning.
 
 ### Explain Mode
 
-See *why* a stage would run:
+See why a stage would run:
 
 ```bash
-pivot repro --explain
-
-Stage: train
-  Status: WILL RUN
-  Reason: Code dependency changed
-  Changes:
-    func:helper_a  Old: 5995c853  New: a1b2c3d4
+pivot status --explain
 ```
 
-### Stage Parameters
+### Typed Stage Parameters
 
-Type-safe parameters via Pydantic:
+Each stage takes its configuration as a `StageParams` subclass (a Pydantic model) defined next to it. Parameter values are recorded in the stage's lock file, so changing one re-runs that stage. A `params.yaml` at the project root can override values per stage without editing code.
+
+### Incremental Outputs
+
+An incremental stage receives its own prior output without creating a DAG
+self-edge. Tag the return type, then bind the parameter with
+`pipeline.previous()`:
 
 ```python
-import pivot
+from typing import Annotated
 
-class TrainParams(pivot.StageParams):
-    learning_rate: float = 0.01
-    epochs: int = 100
+from pivot import Pipeline, incremental, stage
 
-def train(params: TrainParams, data: Annotated[...]) -> TrainOutputs:
-    ...
+
+@stage
+def update_cache(previous: dict[str, int]) -> Annotated[dict[str, int], incremental]:
+    return {"count": previous.get("count", 0) + 1}
+
+
+with Pipeline("state") as pipeline:
+    update_cache(previous=pipeline.previous())
 ```
 
-Parameter changes are tracked in lock files and trigger re-execution.
+The first run receives the loader's empty value. Later runs restore a writable
+copy of the last cached output before calling the stage. Use a `Loader` with
+`load()`, `save()`, and `empty()`; writer-only formats are rejected.
 
-### S3 Remote Cache
+### Remote Cache (S3 or GCS)
 
 Share outputs across machines and CI:
 
 ```bash
-pivot config set remotes.origin s3://my-bucket/pivot-cache
+pivot config set remotes.origin s3://my-bucket/pivot-cache   # or gs://my-bucket/pivot-cache
 pivot push                 # Upload to remote
-pivot pull train_model     # Download specific stage outputs
+pivot pull                 # Download and restore outputs
 ```
-
-### Import Artifacts
-
-Import artifacts from remote Pivot repositories:
-
-```bash
-pivot import https://github.com/org/ml-models model.pkl --rev v1.0
-pivot update               # Check and apply updates
-```
-
-### Incremental Outputs
-
-Outputs that preserve state between runs for append-only workloads. Before execution, previous versions are restored from cache; the stage modifies in place and the new version is cached.
 
 ### Data Diff
 
 Compare data file changes interactively:
 
 ```bash
-pivot diff output.csv                    # Interactive TUI
-pivot diff output.csv --key id --json    # Key-based matching, JSON output
+pivot diff data/demo/clean.jsonl
 ```
 
 ---
 
 ## Common Commands
 
+Stage names are qualified by their pipeline (`demo/clean`); `pivot list` prints them.
+
 ```bash
 pivot repro                    # Run entire pipeline (DAG-aware)
-pivot repro train evaluate     # Run specific stages + dependencies
+pivot repro demo/summarize     # Run demo/summarize and everything it depends on
 pivot repro --watch            # Watch mode - re-run on file changes
 pivot repro --show-output      # Stream stage stdout/stderr to terminal
-pivot run my_stage             # Run ONLY my_stage (no dep resolution)
+pivot run demo/clean           # Run ONLY demo/clean (no dependency resolution)
 pivot repro -n                 # Dry run - see what would execute
 
 pivot status                   # Show pipeline status
-pivot status --explain train   # Understand why a stage is stale
+pivot status --explain         # Understand why stages are stale
 pivot list --deps              # List stages with dependencies
 pivot dag --mermaid            # Visualize DAG as Mermaid diagram
 
-pivot diff output.csv          # Compare data files vs git HEAD
 pivot metrics show             # Display metric values
+pivot params show              # Display effective parameters
 pivot params diff              # Compare params against HEAD
 
 pivot push                     # Push cached outputs to remote
 pivot pull                     # Pull and restore from remote
-pivot fetch                    # Fetch to local cache only
 pivot verify --allow-missing   # CI gate: verify reproducibility
-
-pivot import REPO PATH         # Import artifact from remote repo
-pivot update --dry-run         # Check for import updates
-pivot fingerprint reset        # Clear cached fingerprints
 ```
 
 See the full [CLI Reference](https://sjawhar.github.io/pivot/cli/) for all commands and options.
@@ -206,10 +190,12 @@ See the full [CLI Reference](https://sjawhar.github.io/pivot/cli/) for all comma
 
 Full documentation at [sjawhar.github.io/pivot/](https://sjawhar.github.io/pivot/).
 
-- [Quick Start](https://sjawhar.github.io/pivot/getting-started/quickstart/) — Build your first pipeline in 5 minutes
-- [Concepts](https://sjawhar.github.io/pivot/concepts/) — Linear learning path from first principles to advanced caching
-- [CLI Reference](https://sjawhar.github.io/pivot/cli/) — All available commands
-- [Architecture](https://sjawhar.github.io/pivot/architecture/overview/) — Design decisions and internals
+- [Quick Start](https://sjawhar.github.io/pivot/getting-started/quickstart/): build your first pipeline
+- [Concepts](https://sjawhar.github.io/pivot/concepts/): stages, artifacts, parameters, fingerprinting, caching
+- [CLI Reference](https://sjawhar.github.io/pivot/cli/): all available commands
+- [Architecture](https://sjawhar.github.io/pivot/architecture/overview/): design decisions and internals
+
+Agents writing pipelines should load [`skills/writing-pivot-stages/SKILL.md`](skills/writing-pivot-stages/SKILL.md).
 
 ---
 
@@ -226,4 +212,3 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright   # Quality
 ## License
 
 TBD
-

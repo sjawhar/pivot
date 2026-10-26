@@ -14,7 +14,7 @@ pivot repro --tui
 pivot repro --watch --tui
 
 # Run specific stages
-pivot repro train evaluate --tui
+pivot repro demo/train demo/evaluate --tui
 ```
 
 The TUI requires the `pivot-tui` package. Install it with:
@@ -34,6 +34,18 @@ pivot repro --tui --tui-log messages.jsonl
 ### Minimum Terminal Size
 
 The TUI requires at least **80 columns by 24 rows**. If your terminal is smaller, a warning notification appears.
+
+### Warnings While the TUI Runs
+
+Pivot installs its console filter before it starts the engine thread. A warning it logs before
+the TUI starts prints at once, as without `--tui`. While the TUI owns the terminal, Pivot holds
+its own warnings and errors, such as a tracked file that changed since `pivot track`, and prints
+each distinct one once the TUI exits. A repeated warning from later watch runs is not printed
+again. A `Pipeline invalid` error prints only if the engine still reports that error at exit.
+
+A stage's own output, including anything it logs, stays in that stage's **Logs** tab and is not
+printed after the TUI exits. If the process is killed (SIGTERM, SIGHUP or SIGKILL) while the TUI
+runs, held warnings are lost.
 
 ## Layout
 
@@ -55,7 +67,7 @@ The TUI uses a two-panel layout:
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Stage List** (left) — shows all stages with status symbols. Stages are grouped by matrix variants and sorted by DAG level. Use `j`/`k` to navigate, `/` to filter by name, `Enter` to collapse groups.
+**Stage List** (left) — shows all stages with status symbols. Variants of one stage (`train@a`, `train@b`) are grouped together and stages are sorted by DAG level. Use `j`/`k` to navigate, `/` to filter by name, `Enter` to collapse groups.
 
 **Detail Panel** (right) — three tabs:
 
@@ -145,7 +157,7 @@ In run mode, the header title updates with progress (e.g., `pivot run (3/5)`). I
 
 ## Run Mode vs Watch Mode
 
-**Run mode** (`pivot repro --tui`) executes the pipeline once. The TUI shows progress and exits automatically when all stages complete. If you press `q` while stages are running, a confirmation dialog asks whether to kill workers.
+**Run mode** (`pivot repro --tui`) executes the pipeline once. The TUI shows progress and exits automatically when all stages complete. If you press `q` while stages are running, a confirmation dialog asks whether to stop starting further stages; stages already running finish.
 
 **Watch mode** (`pivot repro --watch --tui`) monitors the filesystem for changes and re-runs affected stages. The TUI stays open until you press `q`. Additional features in watch mode:
 

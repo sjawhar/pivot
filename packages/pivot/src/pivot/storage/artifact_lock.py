@@ -6,12 +6,14 @@ import enum
 import fcntl
 import hashlib
 import os
-import pathlib
 import time
 from collections.abc import Callable
-from typing import TypedDict, final
+from typing import TYPE_CHECKING, TypedDict, final
 
-from pivot import outputs, path_utils
+import pivot.types as types
+
+if TYPE_CHECKING:
+    import pathlib
 
 
 class LockMode(enum.IntEnum):
@@ -32,52 +34,37 @@ class LockRequest(TypedDict):
 
 
 def expand_lock_requests(
-    deps: list[str],
-    outs: list[outputs.ExpandedOut],
+    deps: dict[str, types.ArtifactRef],
+    outs: list[types.ArtifactRef],
     project_root: pathlib.Path,
+    *,
+    outs_mode: LockMode = LockMode.WRITE,
 ) -> list[LockRequest]:
-    """Expand deps/outs into lock requests with ancestor directory reads."""
+    """Expand deps/outs into lock requests: READ on each dep, ``outs_mode`` on each out.
+
+    A stage that writes its outputs takes WRITE on them. A check that only reads them (the
+    coordinator deciding whether a cached stage can skip) takes READ, so it does not wait for
+    the runs reading those outputs as their deps.
+    """
+    _ = project_root
     key_to_mode = dict[str, LockMode]()
 
-    for dep in deps:
-        key = path_utils.canonicalize_artifact_path(dep, project_root)
-        key = key.rstrip("/")
-        if not key:
-            key = "/"
+    for dep_ref in deps.values():
+        key = _lock_key(dep_ref)
         if key in key_to_mode and key_to_mode[key] is LockMode.WRITE:
             continue
         key_to_mode[key] = LockMode.READ
 
-    for out in outs:
-        key = path_utils.canonicalize_artifact_path(out.path, project_root)
-        key = key.rstrip("/")
-        if not key:
-            key = "/"
-        key_to_mode[key] = LockMode.WRITE
-
-    keys = list(key_to_mode)
-    for key in keys:
-        base = key.rstrip("/")
-        path = pathlib.Path(base)
-        for parent in path.parents:
-            if project_root in parent.parents:
-                _add_read_lock(key_to_mode, parent)
-                continue
-            if parent == project_root:
-                _add_read_lock(key_to_mode, parent)
-                break
-            break
+    for out_ref in outs:
+        key = _lock_key(out_ref)
+        key_to_mode[key] = max(key_to_mode.get(key, LockMode.READ), outs_mode)
 
     return [LockRequest(key=key, mode=key_to_mode[key]) for key in sorted(key_to_mode)]
 
 
-def _add_read_lock(key_to_mode: dict[str, LockMode], path: pathlib.Path) -> None:
-    key = path.as_posix()
-    if not key.endswith("/"):
-        key += "/"
-    if key in key_to_mode and key_to_mode[key] is LockMode.WRITE:
-        return
-    key_to_mode[key] = LockMode.READ
+def _lock_key(ref: types.ArtifactRef) -> str:
+    """One file of a directory output is locked as its directory, the unit its producer writes."""
+    return types.identity_key(types.source_identity(ref))
 
 
 # ---------------------------------------------------------------------------

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import os
+import pathlib
 import signal
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
 import pytest
 
-from conftest import send_rpc
+from conftest import send_rpc, wait_for_engine_ready
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Generator
+
+_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 @pytest.fixture
@@ -26,33 +30,42 @@ def tui_watch_pipeline(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     # Use pipeline.py only (not pivot.yaml) to avoid ambiguity error
     pipeline_code = """\
 import pathlib
-from pivot.pipeline.pipeline import Pipeline
+from pivot.compose import Pipeline as ComposePipeline, stage
 
-pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+_cp = ComposePipeline("test", root=pathlib.Path(__file__).parent)
 
+@stage
 def hello() -> None:
     print("Hello!")
 
-pipeline.register(hello, name="hello")
+with _cp:
+    hello()
+
+pipeline = _cp
 """
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
     sock_path = tmp_path / ".pivot" / "agent.sock"
+    stdout_path = tmp_path / "tui.stdout"
+    stderr_path = tmp_path / "tui.stderr"
 
     env = os.environ.copy()
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
     # TERM needed for TUI mode
     env["TERM"] = "xterm-256color"
 
-    # Start TUI watch mode WITHOUT --serve - the socket should still be created
-    proc = subprocess.Popen(
-        ["uv", "run", "pivot", "repro", "--watch", "--tui", "--force"],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.PIPE,  # TUI needs stdin
-    )
+    # Start TUI watch mode WITHOUT --serve - the socket should still be created.
+    # Output goes to files, not pipes: nothing reads a pipe until teardown, so the
+    # TUI's screen output and the server's per-connection logs would fill it and block.
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--tui", "--force"],
+            cwd=tmp_path,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            stdin=subprocess.PIPE,  # TUI needs stdin
+        )
 
     try:
         # Wait for socket to be created
@@ -61,21 +74,13 @@ pipeline.register(hello, name="hello")
                 break
             time.sleep(0.1)
         else:
-            stdout, stderr = proc.communicate(timeout=1)
             pytest.fail(
                 "Socket not created within 10s.\n"
-                + f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+                + f"stdout: {stdout_path.read_text(errors='replace')}\n"
+                + f"stderr: {stderr_path.read_text(errors='replace')}"
             )
 
-        # Poll until status query succeeds (server is ready)
-        for _ in range(30):
-            try:
-                response = send_rpc(sock_path, "status")
-                if "result" in response:
-                    break
-            except (ConnectionRefusedError, FileNotFoundError):
-                pass
-            time.sleep(0.1)
+        wait_for_engine_ready(sock_path)
 
         yield sock_path
     finally:
@@ -110,5 +115,69 @@ def test_tui_watch_mode_accepts_run_command(tui_watch_pipeline: pathlib.Path) ->
     sock_path = tui_watch_pipeline
 
     # Send a force run command for a specific stage
-    response = send_rpc(sock_path, "run", {"stages": ["hello"], "force": True})
+    response = send_rpc(sock_path, "run", {"stages": ["test/hello"], "force": True})
     assert response.get("result") == "accepted", f"Expected 'accepted': {response}"
+
+
+def test_tui_watch_mode_runs_in_a_project_whose_socket_path_exceeds_the_unix_socket_limit(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The TUI reaches its engine through ``.pivot/agent.sock`` in a project at any depth.
+
+    A Unix socket address holds at most 104 bytes on macOS and 108 on Linux; this project's
+    socket path is longer than both. The run's statuses reach the TUI only through its RPC
+    client, and the TUI writes each message it receives to ``--tui-log``.
+    """
+    project = tmp_path / ("deep-project-" * 10)
+    (project / ".pivot").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / "pipeline.py").write_text("""\
+import pathlib
+from pivot.compose import Pipeline, stage
+
+pipeline = Pipeline("test", root=pathlib.Path(__file__).parent)
+
+@stage
+def hello() -> None:
+    print("Hello!")
+
+with pipeline:
+    hello()
+""")
+    assert len(os.fsencode(project / ".pivot" / "agent.sock")) > 108
+    tui_log = tmp_path / "tui.jsonl"
+    stdout_path = tmp_path / "tui.stdout"
+    stderr_path = tmp_path / "tui.stderr"
+    env = os.environ.copy()
+    env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
+    env["TERM"] = "xterm-256color"
+
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            [_PIVOT_BIN, "repro", "--watch", "--tui", "--force", "--tui-log", str(tui_log)],
+            cwd=project,
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            stdin=subprocess.PIPE,
+        )
+    try:
+        statuses = list[str]()
+        deadline = time.monotonic() + 30
+        while "ran" not in statuses and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+            if tui_log.exists():
+                messages = [json.loads(line) for line in tui_log.read_text().splitlines()]
+                statuses = [m["status"] for m in messages if m["type"] == "status"]
+
+        assert "ran" in statuses, (
+            f"the TUI received no completed run (statuses {statuses}, exit code {proc.poll()}).\n"
+            + f"stderr: {stderr_path.read_text(errors='replace')[-2000:]}"
+        )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()

@@ -66,14 +66,16 @@ Sinks consume output events via `sink.handle()`:
 
 | Sink | Output | Use Case |
 |------|--------|----------|
-| `StaticConsoleSink` | Rich terminal (buffered) | Pipe/CI — buffers completions, prints sorted report on close |
-| `LiveConsoleSink` | Rich terminal (live) | TTY — live progress bar with running/completed counts |
+| `StaticConsoleSink` | Rich terminal (buffered) | Pipe/CI — buffers completions, prints a sorted report when each run ends |
+| `LiveConsoleSink` | Rich terminal (live) | TTY — live progress bar with running/completed counts for the current run; log records print above it |
 | `ResultCollectorSink` | Dict collection | Programmatic result access |
 | `JsonlSink` | JSONL records | `--jsonl` output for machine consumption |
 | `BroadcastEventSink` | Pub-sub | Agent RPC subscribers |
 | `EventBuffer` | Ring buffer | Agent RPC polling (`events_since`) |
 
 The CLI chooses between `StaticConsoleSink` and `LiveConsoleSink` automatically based on whether stdout is a TTY. The TUI is **not** a sink — it is a separate package (`pivot-tui`) that connects as a JSON-RPC client. See [TUI Architecture](tui.md).
+
+Both console sinks treat each `engine_state_changed` event as a run boundary: they print the finished run's report and reset their counters, so every watch-mode run reports only its own stages.
 
 Sinks are supervised by the Engine: each sink receives events via its own bounded
 queue. Slow or failing sinks are temporarily disabled and re-enabled after
@@ -156,7 +158,7 @@ async with Engine(pipeline=pipeline) as engine:
 | Event | Trigger | Action |
 |-------|---------|--------|
 | `DataArtifactChanged` | File modified | Run affected stages |
-| `CodeOrConfigChanged` | Python/config modified | Reload registry, run all |
+| `CodeOrConfigChanged` | Python/config modified, with the same watch batch's data files | Reload registry, run all |
 | `RunRequested` | CLI/RPC command | Run specified stages |
 | `CancelRequested` | User interrupt | Stop starting new stages |
 
@@ -168,7 +170,7 @@ async with Engine(pipeline=pipeline) as engine:
 | `StageStarted` | Stage begins | Stage name, index |
 | `StageCompleted` | Stage finishes | Status, reason, duration |
 | `LogLine` | Stage output | Line, is_stderr |
-| `PipelineReloaded` | Registry reload | Stages list, added/removed/modified |
+| `PipelineReloaded` | Registry reload, or the pipeline becomes invalid or valid again | Stages list, added/removed/modified, error |
 | `StageStateChanged` | State transition | Stage, old/new state |
 | `SinkStateChanged` | Sink disabled/enabled | Backoff state |
 | `EngineDiagnostic` | Non-fatal anomaly | Message, detail |

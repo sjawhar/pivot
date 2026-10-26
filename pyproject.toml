@@ -1,6 +1,6 @@
 [project]
 name = "pivot-workspace"
-version = "0.1.0"
+version = "0.5.9"
 requires-python = ">=3.13,<3.14"
 
 [dependency-groups]
@@ -14,7 +14,7 @@ exclude = [
   "**/.pytest_cache/**",
   "**/.ruff_cache/**",
   "**/.venv/**",
-  "benchmarks",
+  "**/.worktrees/**",
   "docs",
   "experiments",
   "pipelines",
@@ -56,11 +56,15 @@ reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 
+[[tool.basedpyright.executionEnvironments]]
+root = "benchmarks"
+extraPaths = ["benchmarks"]
+
 [tool.coverage.run]
 source = ["packages/pivot/src/pivot"]
 branch = true
 parallel = true
-concurrency = ["multiprocessing"]
+concurrency = ["multiprocessing", "thread"]
 omit = ["packages/pivot/tests/*", "*/site-packages/*"]
 
 [tool.coverage.report]
@@ -86,6 +90,7 @@ addopts = [
   "-v",
   "--strict-markers",
   "--tb=short",
+  "--import-mode=importlib",
 ]
 markers = [
   "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -102,8 +107,10 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["packages/pivot/src", "packages/pivot/tests", "packages/pivot-tui/src", "packages/pivot-tui/tests"]
-exclude = ["benchmarks", "experiments"]
+src = ["packages/pivot/src", "packages/pivot/tests", "packages/pivot-tui/src", "packages/pivot-tui/tests", "benchmarks"]
+# `extend-exclude` keeps ruff's default excludes (.venv, .git, ...); `exclude` would replace them.
+# Outside a git or jj repo ruff ignores .gitignore, so nested agent checkouts are named here too.
+extend-exclude = ["experiments", ".worktrees"]
 
 [tool.ruff.lint]
 select = [
@@ -155,5 +162,18 @@ pivot = { workspace = true }
 pivot-tui = { workspace = true }
 
 [tool.semantic_release]
-version_toml = ["pyproject.toml:project.version"]
-build_command = "uv lock --upgrade-package pivot && git add uv.lock && uv build"
+version_toml = [
+  "pyproject.toml:project.version",
+  "packages/pivot/pyproject.toml:project.version",
+  "packages/pivot-tui/pyproject.toml:project.version",
+]
+build_command = "uv lock --upgrade-package pivot --upgrade-package pivot-tui && git add uv.lock && uv build --all-packages"
+commit_message = "chore(release): {version}"
+major_on_zero = false
+allow_zero_version = true
+
+[tool.semantic_release.remote]
+# Push the release commit/tag via the checkout's SSH remote (DEPLOY_KEY) instead
+# of an HTTPS token URL. The deploy key bypasses the main branch ruleset; the
+# GITHUB_TOKEN actor does not. GH_TOKEN is still used for the GitHub release.
+ignore_token_for_push = true

@@ -11,7 +11,12 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
 - **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
 - **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
-- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (data class methods, dynamic name access)
+- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (dynamic name access, unsafe fingerprinting and the run cache)
+- **`test_fingerprint_gaps.py`** - CLI regressions for callable class members, dynamic-import spellings, and body imports
+- **`test_no_fingerprint.py`** - Worker skip/re-run behavior for `@no_fingerprint()` stages (file-level hashing)
+- **`test_fingerprint_properties.py`** - Hypothesis properties over generated stage bodies: fresh-process determinism, formatting insensitivity, one-token sensitivity, and `params.yaml` overrides vs. the run-cache key
+
+Loader fingerprint collision tests live in `tests/test_compose.py`.
 
 ---
 
@@ -55,24 +60,50 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Helper function body change                          | ✅        | `test_fingerprint.py::test_helper_function_captured`                                                                                |
 | Helper function via alias (`f = helper; f()`)        | ✅        | `test_fingerprint.py::test_aliased_function_captured`                                                                               |
 | Transitive helper (helper's helper)                  | ✅        | `test_fingerprint.py::test_transitive_dependencies_captured`                                                                        |
-| Global constant (int, float, str, bool, bytes, None) | ✅        | `test_fingerprint.py::test_constant_captured`, `test_fingerprint.py::test_multiple_constants_captured`                              |
-| Global constant change                               | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
-| Global collection (list, dict, set) with callables   | ✅        | `test_change_detection.py::test_list_callable_tracking`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
-| Global collection DATA (non-callable values)          | ❌        | `test_pydantic_defaults.py::test_list_constants_not_captured_as_const`                                                               |
-| Pydantic schema hash (model_json_schema)              | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                     |
-| Pydantic class in type hint                           | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                             |
-| Global class instance                                | ✅        | `test_change_detection.py::test_class_instance_tracked`, `test_change_detection.py::test_class_instance_change_causes_miss`         |
-| Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                                |
-| Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                   |
-| Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                          |
-| Class base/field annotation dependencies             | ✅        | `test_fingerprint.py::test_process_class_body_dependencies_tracks_bases_and_annotations`                                            |
-| StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                            |
-| StageParams regular method change                    | ✅        | `test_change_detection.py::test_stageparams_method_change_causes_miss`                                                              |
-| StageParams `ClassVar` change                        | ✅        | `test_change_detection.py::test_stageparams_class_variable_change_causes_miss`                                                      |
-| Nested function body change                          | ✅        | `test_fingerprint.py::test_nested_function_not_in_globals` (detected via parent AST hash)                                           |
+| Global primitive constant                            | ✅        | `test_fingerprint.py::test_constant_captured`, `test_fingerprint.py::test_multiple_constants_captured`                              |
+| Global primitive constant change                     | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
+| Global tuple, frozenset of scalars, or compiled regex | ✅ | `test_safe_fingerprinting.py::test_immutable_capture_is_tracked_by_value`, `test_safe_fingerprinting.py::test_editing_immutable_capture_changes_fingerprint`, `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage` |
+| Global list, dict, set, nested tuple, enum, or class instance | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises` |
+| Unsafe fingerprinting (refusal downgraded to a warning): result kept out of the run cache, by `pivot repro` and `pivot commit` | ✅ | `test_safe_fingerprinting.py::test_unsafe_result_is_kept_out_of_the_run_cache`, control `test_safe_fingerprinting.py::test_safe_result_is_filed_in_the_run_cache` |
+| `pivot config set core.unsafe_fingerprinting true` | ✅ | `test_safe_fingerprinting.py::test_config_set_accepts_unsafe_fingerprinting` |
+| Non-scalar module attribute                          | ✅ (error) | `test_integration.py::test_non_scalar_module_attribute_raises`                                                                      |
+| Method bound to an instance (`Scaler(3).apply`, `default_rng(0).normal`) as a global, cell, partial argument, loader field or `module.NAME` | ✅ (error) | `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`, `test_integration.py::test_non_scalar_module_attribute_raises`, `test_manifest_cache_cli.py::test_method_bound_to_an_instance_is_an_error` |
+| Method bound to a Logger, a scalar, a class or a library module's own state (`np.random.normal`) | 🚫 | `test_safe_fingerprinting.py::test_methods_bound_to_a_logger_scalar_or_library_are_allowed`, `test_manifest_cache_cli.py::test_method_bound_to_a_scalar_class_or_library_is_allowed` |
+| Pydantic schema hash (model_json_schema)             | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                    |
+| Pydantic class in type hint                          | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                           |
+| Pydantic class read as a global (`Out().scale`), import-time field default | ✅ | `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
+| Class attribute read as `Config.SCALE` (scalar, Enum member, function) | ✅ | `test_fingerprint.py::test_class_attributes_a_stage_reads_are_tracked_one_by_one`, `test_manifest_cache_cli.py::test_value_read_through_a_class_at_import_reruns_stage` |
+| Non-scalar class attribute read as `Config.COLUMNS` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_class_attribute_is_an_error` |
+| Class attribute the language or a library defines (`NamedTuple._fields`, `Enum._member_names_`, an inherited stdlib dict, a property object) | 🚫 (class AST only) | `test_manifest_cache_cli.py::test_class_attribute_the_language_or_a_library_defines_is_not_refused` |
+| `settings.Config.SCALE` (class reached through a user module) | ✅ | `test_manifest_cache_cli.py::test_class_attribute_read_through_a_module_at_import_reruns_stage`, `test_manifest_cache_cli.py::test_class_attribute_through_a_module_follows_the_class_rule`, `test_manifest_cache_cli.py::test_non_scalar_class_attribute_through_a_module_is_an_error` |
+| `settings.log`, `settings.ROUND` (a partial), `settings.AGG` (`np.mean`) | ✅ (same rule as the global form) | `test_manifest_cache_cli.py::test_logger_partial_and_library_function_read_through_a_module_are_accepted`, `test_manifest_cache_cli.py::test_library_function_rebound_in_a_module_reruns_stage` |
+| `pkg.sub.helper`, `pkg.sub.SCALE` (submodule through its package) | ✅ | `test_manifest_cache_cli.py::test_submodule_read_through_its_package_is_tracked` |
+| `cls.SCALE` in a classmethod, `Outer.Inner.X`, `Config().SCALE`, a `StageParams` `ClassVar` | ❌ | Not tracked; documented in `docs/architecture/fingerprinting.md` (use `StageParams`) |
+| Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                               |
+| Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                  |
+| Global read only inside a method of a user class (`Scaler().apply` reads `SCALE`) | ✅ | `test_change_detection.py::test_method_global_change_causes_miss` |
+| Compiled regex read only inside a method, class imported from another module (`ScopeWalk().step`) | ✅ | `test_change_detection.py::test_method_regex_change_causes_miss` |
+| Helper called only from a classmethod (`Runner.go` calls `bump`) | ✅ | `test_change_detection.py::test_method_helper_change_causes_miss` |
+| Callable class member (`partial`, `partialmethod`, nested class) | ✅ | `test_fingerprint_gaps.py::test_class_member_edit_reruns_stage` |
+| Callable instance class member | ✅ (error) | `test_fingerprint_gaps.py::test_dataclass_callable_member_is_refused` |
+| Decorator wrapper body on a class method | ✅ | `test_fingerprint_gaps.py::test_decorated_method_wrapper_edit_reruns_stage` |
+| Data class method reading a global (method walked, not refused) | ✅ | `test_change_detection.py::test_dataclass_method_reading_global_is_walked` |
+| Data class default from a module value | ✅ | `test_fingerprint_gaps.py::test_class_member_edit_reruns_stage[dataclass-field-default]` |
+| In-body `from X import` of a mutable loaded module value | ✅ (error) | `test_change_detection.py::test_in_body_from_import_of_non_scalar_is_refused` |
+| Relative in-body import (`from .sibling import value`) | ✅ | `test_change_detection.py::test_relative_in_body_import_change_causes_miss` |
+| Unloaded body import refused without running it | ✅ (error) | `test_fingerprint_gaps.py::test_guarded_unloaded_body_import_is_refused_without_running_it`, `test_change_detection.py::test_unloaded_body_import_is_refused_without_running_it` |
+| Static body import of a loaded submodule (`import pkg.sub`, `from pkg import sub`) | ✅ | `test_fingerprint_gaps.py::test_static_body_import_of_loaded_submodule_is_reused` |
+| Class base/field annotation dependencies             | ✅        | `test_fingerprint.py::test_process_class_body_dependencies_tracks_bases_and_annotations`                                           |
+| StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                           |
+| StageParams regular method change                    | ✅        | `test_change_detection.py::test_stageparams_method_change_causes_miss`                                                             |
+| StageParams `ClassVar` change                        | ✅        | `test_change_detection.py::test_stageparams_class_variable_change_causes_miss`                                                     |
+| Nested function body change                          | ✅        | `test_fingerprint.py::test_nested_function_not_in_globals` (detected via parent AST hash)                                          |
 | Globals referenced only by nested functions          | ✅        | `test_change_detection.py::test_nested_function_global_reference_detected`, `test_change_detection.py::test_nested_function_global_change_causes_miss` |
-| Helper starting with `_` prefix                      | ✅        | `test_change_detection.py::test_underscore_helper_change_detected`                                                                  |
-| Stdlib callable in closure (e.g., `typing.cast`)     | 🚫        | `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`                                                              |
+| Helper starting with `_` prefix                      | ✅        | `test_change_detection.py::test_underscore_helper_change_detected`                                                                 |
+| Stdlib callable via its module (e.g., `typing.cast`) | 🚫        | `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`                                                              |
+| Name rebound to another library function (`agg = np.mean` → `np.median`, from-import, partial) | ✅ | `test_manifest_cache_cli.py::test_rebinding_a_library_function_reruns_stage` |
+| Library function chosen at import (`getattr(np, os.environ[...])`) | ✅ | `test_manifest_cache_cli.py::test_library_function_chosen_at_import_reruns_stage` |
+| Library function in loader config stays cached | 🚫 | `test_manifest_cache_cli.py::test_library_function_in_loader_config_stays_cached` |
 | `logging.Logger` in closure                          | 🚫        | Loggers are functionally irrelevant for cache invalidation                                                                          |
 | Helper starting with `__` dunder                     | ❌        | `test_fingerprint.py::test_fingerprint_with_underscore_globals`                                                                     |
 
@@ -96,12 +127,11 @@ This document exhaustively catalogs what code changes are and are not detected b
 | ----------------------------------- | --------- | --------------------------------------------------------------------------------------- |
 | Module function body change         | ✅        | `test_integration.py::test_module_attr_change_detected`                                 |
 | Module function change (end-to-end) | ✅        | `test_change_detection.py::test_helper_via_module_attr_change_causes_miss`              |
-| Transitive dependency change        | ✅        | `test_change_detection.py::test_transitive_dependency_change_causes_miss`               |
+| Module immutable tuple, frozenset, or compiled regex | ✅ | `test_manifest_cache_cli.py::test_editing_immutable_module_value_reruns_stage` |
 | Module constant                     | ✅        | `test_integration.py::test_constant_via_module_attr_captured`                           |
 | Module constant captured            | ✅        | `test_change_detection.py::test_module_constant_captured_via_module_attr`               |
-| Module primitive collection         | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
 | Nested attribute (`X.sub.func`)     | ⚠️        | `test_fingerprint.py::test_extract_nested_attr_access` (extracted but not fully tested) |
-| Multiple attrs from same module     | ✅        | `test_fingerprint.py::test_multiple_module_attrs_detected`                              |
+| Multiple attrs from same module     | ✅ | `test_fingerprint.py::test_extract_multiple_attrs_same_module` |
 | Both import styles in same stage    | ✅        | `test_integration.py::test_both_import_styles_in_same_stage`                            |
 
 ---
@@ -110,9 +140,15 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                          | Detected? | Test Reference                                                       |
 | ------------------------------------ | --------- | -------------------------------------------------------------------- |
-| `from X import func` inside function | ❌        | `test_change_detection.py::test_lazy_import_change_detected` (xfail) |
-| `import X` inside function           | ❌        | **NO TEST** - same limitation                                        |
-| Conditional import inside function   | ❌        | **NO TEST** - same limitation                                        |
+| Loaded `from X import func` inside function | ✅ | `test_change_detection.py::test_loaded_body_import_is_tracked_as_a_helper` |
+| Unloaded user module (`import m`, `from m import f`, `import pkg.sub`, `pkg.sub` read through `import pkg`) | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_user_body_import_is_refused_at_definition`, `test_fingerprint_gaps.py::test_body_import_of_unloaded_submodule_through_loaded_package_is_refused`, `test_fingerprint_gaps.py::test_preloaded_package_attribute_of_unloaded_package_is_refused` |
+| Library module imported in the body | ✅ | `test_fingerprint_gaps.py::test_body_import_of_a_library_module_is_not_refused` |
+| User module loaded only at run time (partial, `vars`, `exec`, manual loader) | ✅ (not reused) | `test_fingerprint_gaps.py::test_runtime_dynamic_import_makes_result_not_reusable` |
+| Import from a thread an earlier stage left running | ✅ (not reused) | `test_fingerprint_gaps.py::test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage` |
+| `@no_fingerprint(code_deps=...)` stage importing a user module | ✅ (not checked; `code_deps` tracked) | `test_runtime_import_contract.py::test_d1_no_fingerprint_stage_with_body_import_is_reused` |
+| User loader `load`/`save` importing a loaded module (`dep:`/`out:` module keys) | ✅ | `test_runtime_import_contract.py::test_d2_user_loader_body_import_of_loaded_module_is_covered`, `test_fingerprint.py::test_covered_user_modules_reads_every_module_key_form` |
+| `pivot commit` after a flagged `repro` keeps the stage stale | ✅ | `test_runtime_import_contract.py::test_d3_commit_after_a_flagged_committing_repro_is_described`, `core/test_skip.py::test_carry_uncovered_import_keeps_marker_when_static_fingerprint_is_unchanged` |
+| Following the warning's fix clears it | ✅ | `test_fingerprint_gaps.py::test_following_the_uncovered_import_warning_fix_clears_it`, `test_runtime_import_contract.py::test_d4_uncovered_import_warning_names_a_fix_that_applies` |
 
 ---
 
@@ -130,11 +166,14 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                                | Detected? | Test Reference                                                            |
 | ------------------------------------------ | --------- | ------------------------------------------------------------------------- |
-| Stdlib function (e.g., `json.dumps`)       | 🚫        | `test_integration.py::test_stdlib_marked_callable_not_hashed`             |
-| Stdlib via module attr                     | 🚫        | `test_change_detection.py::test_stdlib_function_marked_callable`          |
+| Stdlib function (e.g., `json.dumps`)       | 🚫        | `test_integration.py::test_stdlib_module_attrs_not_tracked`               |
+| Stdlib via module attr                     | 🚫        | `test_change_detection.py::test_stdlib_module_attrs_not_tracked`          |
 | Third-party function (e.g., `numpy.array`) | 🚫        | `test_fingerprint.py::test_is_user_code_non_user` (pytest.fixture tested) |
 | Third-party package version change         | ❌        | **NO TEST** - versions not tracked                                        |
 | Pivot framework code (`StageParams`, etc.) | 🚫        | `test_fingerprint.py::test_is_user_code_pivot_is_framework`               |
+| `pivot_tui` installed editable by its own backend (`uv_build`) | 🚫 | `test_fingerprint.py::test_pivot_tui_installed_from_a_checkout_is_framework` |
+| A user module or package named `pivot_tui` | ✅        | `test_fingerprint.py::test_pivot_tui_is_pivot_s_package_only_where_the_pivot_tui_distribution_installed_it`, `cli/test_cli_acceptance.py::test_editing_a_project_package_named_pivot_tui_reruns_its_stage` |
+| The user's part of a namespace package shared with a package pip checked out under the interpreter's prefix (`pip install -e git+...`) | ✅ | `test_fingerprint.py::test_is_user_code_namespace_package_split_with_a_directory_under_the_prefix`, `cli/test_cli_acceptance.py::test_editing_the_user_s_part_of_a_namespace_shared_with_a_pip_checkout_reruns_its_stage` |
 | Builtin function (`len`, `print`)          | 🚫        | `test_fingerprint.py::test_fingerprint_builtin_function_skipped`          |
 
 ---
@@ -144,15 +183,47 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Change Type                              | Detected? | Test Reference                                                                                                                                |
 | ---------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `getattr(module, "func")`                | ❌        | **NO TEST** - can't resolve statically                                                                                                        |
-| `getattr(obj, name)` (non-literal)       | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_dynamic_getattr`                                                        |
-| `globals()` / `locals()`                 | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_globals`                                                                  |
+| `getattr(obj, name)` (non-literal)       | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_dynamic_getattr` |
+| `globals()` / `locals()`                 | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_globals` |
 | `func_dict[key]()` dispatch              | ✅        | `test_change_detection.py::test_dynamic_dispatch_change_detected`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
-| `eval()` / `exec()`                      | ❌        | **NO TEST** - can't analyze dynamically                                                                                                       |
-| `importlib.import_module(string)`        | ❌        | **NO TEST** - can't resolve statically                                                                                                        |
-| `importlib.import_module(...)` (call)    | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_import_module`                                                           |
-| Method call on instance (`obj.method()`) | ❌        | `test_change_detection.py::test_class_instance_method_change_detected` (xfail)                                                                |
-| Callback/function passed as argument     | ❌        | **NO TEST** - not tracked                                                                                                                     |
-| Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source)                                                            |
+| `eval()` / `exec()` of code reading other names | ❌        | **NO TEST** - can't analyze dynamically |
+| Lambda created by `eval()` (no source) | ✅        | `test_fingerprint_gaps.py::test_eval_lambda_is_hashed_by_its_code_object` |
+| `x.import_module(...)` call | ✅ (error) | `test_fingerprint.py::test_check_dynamic_name_access_rejects_import_module` (main's refusal) |
+| `functools.wraps` wrapper whose own body uses a computed `getattr`, `import_module` or `globals()` (decorator in `pipeline.py` or in a helper module) | ✅ (runs, as on main: the refusals read the wrapped function's source) | `test_fingerprint_gaps.py::test_dynamic_name_refusals_read_the_wrapped_function_source` (4 cases) |
+| Computed `getattr` in a function a wrapper reaches only through `__wrapped__` | ✅ (error, as on main) | `test_fingerprint_gaps.py::test_dynamic_name_refusal_reads_a_function_reached_only_through_wrapped` |
+| Other dynamic spelling of a user module (alias, `__import__`, partial, default, literal `getattr`) | ✅ (not reused) | `test_fingerprint_gaps.py::test_dynamic_import_spelling_of_a_user_module_makes_result_not_reusable` |
+| Relative `builtins.__import__` with package from `__name__`, `__spec__.parent` or `ModuleType` fallback | ✅ (not reused, cold or warm) | `test_fingerprint_gaps.py::test_relative_builtins_import_uses_cpythons_package_fallback` |
+| Dynamic import of a library (`__import__("json")`, an `import_module` alias) | ✅ | `test_fingerprint_gaps.py::test_dynamic_import_of_a_library_runs_and_caches` |
+| A resolved helper receiving `"import_module"` | ✅ | `test_fingerprint_gaps.py::test_resolved_helper_accepts_import_module_argument_name` |
+| Library that creates modules without a source file (`pyexpat.errors`) | ✅ | `test_fingerprint_gaps.py::test_library_that_creates_fileless_modules_caches` |
+| Body import of a loaded module that imports other user modules | ✅ | `test_fingerprint_gaps.py::test_body_import_of_loaded_module_that_imports_user_modules_is_reused`, `test_fingerprint_gaps.py::test_uncovered_dynamic_import_after_a_covered_import_still_warns` |
+| Body import of a loaded module that registers a module without the hooks (`exec_module`, `EntryPoint.load()`, `importlib.__import__`) | ✅ (cached, as on main) | `test_fingerprint_gaps.py::test_body_import_of_module_that_registers_a_module_without_the_hooks_is_reused` |
+| Thread the stage starts after its covered import returned | ✅ (not reused) | `test_fingerprint_gaps.py::test_thread_import_after_the_covered_import_returned_still_warns`, `test_covered_threads.py::test_d1_control_a_thread_the_stage_starts_after_the_covered_import_still_warns` |
+| Body import of a loaded module whose import starts a thread that imports a user module, joined inside the import (`__import__`, `ThreadPoolExecutor` + `import_module`) | ✅ (cached, as on main) | `test_fingerprint_gaps.py::test_body_import_of_module_whose_import_thread_imports_a_user_module_is_reused` |
+| Loader thread a covered import starts, importing after the import returned and joined by the stage | ✅ (cached; lib edit reruns) | `test_covered_threads.py::test_d1_body_import_of_module_whose_loader_thread_imports_after_it_returns_is_reused`, `test_covered_threads.py::test_d1_loader_thread_stage_reruns_on_a_lib_edit` |
+| Covered import's thread importing a module an upstream stage loaded in the same worker | ✅ (cached, warm or cold) | `test_covered_threads.py::test_d2_covered_import_whose_joined_thread_imports_a_module_an_upstream_stage_loaded_caches`, `test_covered_threads.py::test_d2_control_without_the_upstream_import_the_same_layout_caches` |
+| Hand-off shapes of a covered import: straddle (joined or working), nested thread, `threading.Timer`, `ThreadPoolExecutor`, asyncio loop on a thread, `concurrent.futures.wait`, daemon thread | ✅ (cached; lib edit reruns) | `test_covered_threads.py::test_thread_a_covered_import_hands_work_to_is_covered`, `execution/test_worker_contracts.py::test_thread_a_covered_import_starts_is_covered_after_the_import_returns` |
+| Pool that existed before the covered import (stated limit) | ✅ (not reused; warning names it) | `test_covered_threads.py::test_import_handed_to_a_thread_that_existed_before_the_covered_import_is_counted`, `execution/test_worker_contracts.py::test_hooked_import_on_a_thread_no_covered_thread_started_is_counted` |
+| Thread native code starts outside `_thread` (a C extension, `pthread_create` through `ctypes`) | ❌ (stated limit: not covered, so not reused) | Documented in `docs/architecture/fingerprinting.md` and `docs/concepts/fingerprinting.md`; import the module statically |
+| Covered thread of one stage importing during the next stage | ✅ (counted for the next stage) | `test_covered_threads.py::test_covered_thread_of_one_stage_is_not_covered_in_the_next`, `execution/test_worker_contracts.py::test_covered_thread_of_an_earlier_stage_is_not_covered_in_a_later_stage` |
+| Unhooked registration on another thread while a covered thread runs (stated limit) | ✅ (excused) | `execution/test_worker_contracts.py::test_unhooked_registration_on_another_thread_while_a_covered_thread_runs_is_excused` |
+| Pipe reader, parent watcher or stop-grace timer Pivot starts inside a covered import | ✅ (not reused: later manual load is counted) | `test_fingerprint_gaps.py::test_pivot_thread_started_inside_a_covered_import_does_not_excuse_a_later_manual_load`, `execution/test_worker_contracts.py::test_pivot_owned_worker_threads_start_through_the_bypass_helper` |
+| Stage registers a module without the hooks after every covered thread ended | ✅ (not reused) | `execution/test_worker_contracts.py::test_module_the_stage_registers_after_every_covered_thread_ended_is_counted` |
+| Covered thread still running when the stage returns, having loaded a module by either route | ✅ (excused) | `execution/test_worker_contracts.py::test_what_a_covered_thread_loads_is_excused_when_the_thread_outlives_the_stage` |
+| Every `_thread` start function hooked (`start_new_thread`, `start_new`, `start_joinable_thread`) | ✅ | `execution/test_worker_contracts.py::test_every_thread_start_function_is_hooked` |
+| Stage loads a module by hand, then a covered import imports it | ✅ (not reused) | `test_covered_threads.py::test_module_the_stage_loads_by_hand_stays_counted_when_a_covered_import_then_imports_it`, `execution/test_worker_contracts.py::test_module_the_stage_loads_outside_every_window_stays_counted_when_a_covered_import_uses_it` |
+| Covered import of a dependency an earlier stage loaded (warm worker) | ✅ (cached, warm or cold) | `test_fingerprint_gaps.py::test_covered_import_of_a_dependency_an_earlier_stage_loaded_is_reused_warm_or_cold`, `execution/test_worker_contracts.py::test_covered_import_of_an_already_resident_dependency_is_excused_on_its_own_thread` |
+| Module a covered module loads with `exec_module`, `EntryPoint.load()` or `importlib.__import__`: excused, not fingerprinted (stated limit) | ✅ (cached, as on main) | `test_fingerprint_gaps.py::test_body_import_of_module_that_registers_a_module_without_the_hooks_is_reused` |
+| Marked lock with a run-cache entry at its input hash or another (0.5.2, `pivot commit`) | ✅ (runs; entry deleted) | `test_run_cache_after_flagged_run.py::test_d1_forced_run_after_an_edit_is_not_undone_by_a_0_5_2_run_cache_entry`, `test_run_cache_after_flagged_run.py::test_d1_stage_a_forced_run_marked_reruns_on_the_next_edit`, `test_run_cache_after_flagged_run.py::test_d1_forced_run_after_no_commit_and_commit_is_not_undone`, `test_run_cache_after_flagged_run.py::test_flagged_run_deletes_the_run_cache_entry_at_its_input_hash`, `test_run_cache_after_flagged_run.py::test_status_explain_reports_a_marked_stage_as_will_run_not_run_cache`, `test_run_cache_after_flagged_run.py::test_marked_lock_is_not_satisfied_from_an_entry_at_another_input_hash`, `test_run_cache_after_flagged_run.py::test_commit_carrying_the_mark_deletes_the_entry_at_its_input_hash` |
+| Body import a raising `sys.meta_path` finder rejects | ✅ (runs and caches, as on main) | `test_fingerprint_gaps.py::test_body_import_a_raising_meta_path_finder_rejects_runs_and_caches` |
+| User class reached only through a pickled input | ✅ (not reused; annotation covers it) | `test_fingerprint_gaps.py::test_user_class_reached_only_through_a_loaded_input` |
+| Unloaded package located only by a `sys.meta_path` finder | ✅ (error) | `test_fingerprint_gaps.py::test_unloaded_package_found_by_a_meta_path_finder_is_refused` |
+| `runpy.run_path` / `runpy.run_module` of a top-level module | ❌ (stated limit) | `test_runtime_import_limits.py::test_d2_runpy_load_of_a_user_file_is_caught_or_listed_as_a_limit` |
+| Result cached by 0.5.2 for a dynamic-import stage | ❌ until `repro --force` (stated limit) | `test_runtime_import_limits.py::test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it` |
+| Upgrade where the static walk gains a user class method or user module | ✅ (one `Code changed` rerun, then reuse) | `test_runtime_import_limits.py::test_result_cached_by_0_5_2_is_reused_until_a_forced_run_marks_it`; audit upgrade probes |
+| Method call on instance (`obj.method()`) | ✅        | `test_change_detection.py::test_method_global_change_causes_miss`, `test_change_detection.py::test_method_regex_change_causes_miss` |
+| Callback/function passed as argument     | ❌        | **NO TEST** - not tracked |
+| Closure capturing outer variable         | ⚠️        | `test_fingerprint.py::test_fingerprint_with_nonlocal` (value captured, not source) |
 
 ---
 
@@ -166,6 +237,11 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Closure value with deterministic repr | ✅        | `test_fingerprint.py::test_fingerprint_captures_unrecognized_closure_value` |
 | Closure value with `0x` in repr (non-deterministic) | 🚫  | `test_fingerprint.py::test_hash_unrecognized_closure_value_memory_address_raises` |
 | Closure value with repr > 10KB        | 🚫        | `test_fingerprint.py::test_hash_unrecognized_closure_value_large_repr_raises` |
+| Two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) | ✅ | `test_manifest_cache_cli.py::test_two_closures_from_one_factory_keep_their_values_in_every_process` |
+| Secret in a helper default or loader field changes | ✅ | `test_manifest_cache_cli.py::test_changing_a_secret_read_by_a_stage_reruns_it`, `test_functools.py::test_secret_partial_argument_hashes_by_keyed_digest` |
+| Factory-built stage under a same-named pipeline, run separately | ✅ | `test_manifest_cache_cli.py::test_same_named_pipelines_run_separately_keep_factory_closures_apart` |
+| `include()` of two factory-built stages under one name | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_two_factory_closures_under_one_stage_name` |
+| `include()` of one stage read through two factory-built loaders | ✅ (error) | `test_manifest_cache_cli.py::test_include_refuses_one_stage_reading_through_two_factory_loaders` |
 
 ---
 
@@ -173,7 +249,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 
 | Change Type                               | Detected? | Test Reference                                                                  |
 | ----------------------------------------- | --------- | ------------------------------------------------------------------------------- |
-| Lambda function                           | ⚠️        | `test_fingerprint.py::test_lambda_function_fingerprinted` (hashed but unstable) |
+| Lambda function                           | ✅        | `test_fingerprint.py::test_lambda_function_fingerprinted`; without source, its `__code__` is hashed |
 | Function without source (builtin)         | ⚠️        | `test_fingerprint.py::test_hash_builtin_function` (fallback hash)               |
 | Function without `__code__`               | ⚠️        | `test_fingerprint.py::test_hash_function_no_code_object` (id-based hash)        |
 | Circular references                       | ✅        | `test_fingerprint.py::test_circular_reference_handled`                          |
@@ -185,7 +261,7 @@ This document exhaustively catalogs what code changes are and are not detected b
 | User-defined generic origin (`MyGeneric[int]`) | ✅   | `test_fingerprint.py::test_user_defined_generic_origin_tracked`                 |
 | Dotted string forward ref in class body   | ✅        | `test_fingerprint.py::test_collect_annotation_names_dotted_string_forward_ref`  |
 | Module not in sys.modules                 | ✅        | `test_fingerprint.py::test_is_user_code_module_not_in_sys_modules`              |
-| Attribute doesn't exist on module         | ✅        | `test_fingerprint.py::test_module_attr_with_attribute_error`                    |
+| Attribute doesn't exist on module         | ✅        | **NO TEST** - recorded as `"unknown"` in the manifest                           |
 | Function with complex AST                 | ✅        | `test_fingerprint.py::test_hash_complex_ast`                                    |
 | AST syntax error fallback                 | ✅        | `test_fingerprint.py::test_hash_function_syntax_error_fallback`                 |
 | Child manifest merge (no duplicate self:) | ✅        | `test_fingerprint.py::test_fingerprint_merges_child_manifest`                   |
@@ -202,6 +278,11 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Multiple runs stable                    | ✅        | `test_change_detection.py::test_multiple_runs_stable`           |
 | Same logic, different names → same hash | ✅        | `test_fingerprint.py::test_identical_functions_same_hash`       |
 | Dict key order doesn't affect hash      | ✅        | `test_change_detection.py::test_fingerprint_ordering_stability` |
+| Same source → same manifest in fresh processes (any hash seed) | ✅ | `test_fingerprint_properties.py::test_same_source_gives_same_manifest_in_fresh_processes` |
+| Formatting that keeps the syntax tree → same manifest | ✅ | `test_fingerprint_properties.py::test_formatting_that_keeps_the_syntax_tree_keeps_the_manifest` |
+| Any one-token body change → changed manifest | ✅ | `test_fingerprint_properties.py::test_changing_one_token_of_the_body_changes_the_manifest` |
+| Param override changes run-cache key iff effective params change | ✅ | `test_fingerprint_properties.py::test_override_changes_run_cache_key_exactly_when_effective_params_change` |
+| Override for one stage leaves other stages' keys | ✅ | `test_fingerprint_properties.py::test_override_for_one_stage_leaves_other_stages_run_cache_keys` |
 
 ---
 
@@ -216,6 +297,14 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Custom loader code change       | ✅        | `test_fingerprint.py::test_custom_loader_code_change_detected`              |
 | Custom loader fingerprinting    | ✅        | `test_fingerprint.py::test_custom_loader_fingerprint`                       |
 | Fingerprint stability           | ✅        | `test_fingerprint.py::test_loader_fingerprint_stable`                       |
+| Config collision between outputs| ✅        | `test_compose.py::test_output_loader_change_detected[same-class-different-config]`     |
+| YAML→CSV with existing CSV out  | ✅        | `test_compose.py::test_output_loader_change_detected[yaml-to-csv-with-existing-csv]`   |
+| @no_fingerprint loader collision| ✅        | `test_compose.py::test_no_fingerprint_output_loader_collision`                          |
+| Dep config collision            | ✅        | `test_compose.py::test_dep_loader_config_collision`                                     |
+| Scalar read in custom loader's own `save()` | ✅ | `test_manifest_cache_cli.py::test_editing_scalar_read_by_custom_loader_method_reruns_stage` |
+| Non-scalar read in custom loader's own `save()` | ✅ (error) | `test_manifest_cache_cli.py::test_non_scalar_read_by_custom_loader_method_is_an_error` |
+| Scalar read by a function in loader config | ✅ | `test_manifest_cache_cli.py::test_value_read_by_loader_config_function_reruns_stage` |
+| Pydantic model class in loader config edited | ✅ | `test_manifest_cache_cli.py::test_editing_model_class_used_by_loader_reruns_stage` |
 
 ---
 
@@ -234,7 +323,7 @@ Tests in `test_callback_vulnerabilities.py` document edge cases where callback c
 | `functools.partial` arguments tracked              | ✅        | `test_functools.py::test_partial_args_change_triggers_fingerprint_change`               |
 | `functools.partial` wrapped function tracked       | ✅        | `test_functools.py::test_partial_underlying_func_change_triggers_fingerprint_change`    |
 | Instance/container state callbacks not tracked     | ❌        | `test_callback_vulnerabilities.py::test_container_callback_change_detected`             |
-| Class attribute callbacks (runtime modified)       | ❌        | `test_callback_vulnerabilities.py::test_class_attribute_callback_change_detected`       |
+| Class attribute callbacks (runtime modified)       | ✅        | `test_callback_vulnerabilities.py::test_class_attribute_callback_change_detected`       |
 
 ---
 
@@ -246,6 +335,8 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 | ---------------------------------------------- | --------- | ------------------------------------------------------------------------------- |
 | Stage source file content change               | ✅        | `test_no_fingerprint.py::test_no_fingerprint_reruns_on_source_file_change`      |
 | `code_deps` file content change                | ✅        | `test_no_fingerprint.py::test_no_fingerprint_reruns_on_code_deps_change`        |
+| `code_deps` via `Pipeline`, `@no_fingerprint` inside `@stage` | ✅ | `test_no_fingerprint.py::test_no_fingerprint_code_deps_tracked_through_pipeline[no_fingerprint-inside-stage]` |
+| `code_deps` via `Pipeline`, `@no_fingerprint` outside `@stage` | ❌ | `test_no_fingerprint.py::test_no_fingerprint_code_deps_tracked_through_pipeline[no_fingerprint-outside-stage]` (strict xfail, red test) |
 | Unrelated file change (no re-run)              | ✅        | `test_no_fingerprint.py::test_no_fingerprint_skip_unrelated_change`             |
 | Comment/whitespace change in source file       | ✅        | Not separately tested — file hash changes on any content change                 |
 | Helper function in different file              | ❌        | Not detected unless listed in `code_deps`                                       |
@@ -261,7 +352,6 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 | ------------------------------------------------ | -------- | ----------------------------- |
 | Decorator on stage function not tracked          | Medium   | Easy                          |
 | Nested module attribute (`X.sub.func`) full test | Low      | Easy                          |
-| `import X` inside function not tracked           | Low      | Easy (already documented)     |
 | `eval()`/`exec()` limitation                     | Low      | Easy                          |
 | Third-party package version tracking             | Medium   | Hard (would need new feature) |
 | Type alias change with `from __future__`         | Low      | Hard (alias only in string annotation, not in bytecode) |
@@ -278,82 +368,129 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
 4. **Docstrings/comments ignored**: These don't affect behavior, so they're stripped from AST.
 
-5. **Lazy imports not tracked**: Imports inside function bodies are not detected. Recommended pattern: use module-level imports.
+5. **Imports inside function bodies are walked**: each `import` and `from ... import` statement in a user function's body is resolved (a relative one against the function's package) and what it binds is walked as a module-level import would be. A call `x.import_module(...)` is refused, as on main; other dynamic spellings are left to the worker's stage-import check.
 
-6. **Collection callable tracking**: Callables inside global collections (list, dict, set, tuple, frozenset) are detected and hashed. Only callables are tracked (not data values) to avoid sensitivity to mutable runtime state. Dict keys are sorted alphabetically for deterministic ordering; sets are also sorted.
+6. **Non-scalar module values are refused**: A stage may capture module-level `bool`, `int`,
+   `float`, `str`, `bytes`, and `None` values, a `tuple` or `frozenset` whose members are all
+   such scalars (one level deep), and a compiled regex (recorded by full pattern and flags).
+   Any other module-level value—including a list, dict, set, a tuple holding a collection or
+   object, enum member, frozen model, or class instance—raises `StageDefinitionError`.
 
-7. **Bytecode fallback uses marshal**: When source code is unavailable, `marshal.dumps(func.__code__)` captures the full code object including constants. This ensures that `return x + 1` and `return x + 999` produce different hashes (raw bytecode alone doesn't include constants).
+7. **Portable bytecode fallback**: When source is unavailable or a function is wrapped,
+   `marshal.dumps(__code__)` captures bytecode and constants. Pivot replaces every
+   `co_filename` (including nested code objects) before marshalling, so the result is stable
+   across checkout paths.
 
-8. **Class definition tracking**: Classes are tracked using the `class:` prefix (e.g., `class:MyProcessor`). The entire class definition is hashed including all methods, class variables, and decorators. Module-level class instances (e.g., `processor = Processor()`) have their class type tracked via `class:varname.__class__`.
+8. **Module-qualified manifest keys**: `func:`, `class:`, `const:`, `schema:`, `partial:`,
+   `ext:` and `loader:` keys use the definition or binding module. A value read as
+   `settings.NAME` gets the key it would get as a global (`const:settings.FACTOR`,
+   `func:settings.helper`, `ext:settings.AGG`). A manifest can therefore
+   contain `func:project.alpha.helper` and `func:project.beta.helper` without one overwriting
+   the other. A closure cell is keyed under the function that holds it: the stage function's
+   own cells under its definition (`const:project.make_stage.<locals>.make.factor`), a local
+   helper's cells under the binding it was reached through (`const:project.h2.factor`, with the
+   helper at `func:project.h2`), so two closures from one factory keep their own values.
 
-9. **Class body dependency tracking**: When `getclosurevars()` fails on a class, the class body is parsed to capture base classes and field annotations. Resolved user-code classes are fingerprinted transitively; third-party/stdlib bases are ignored.
+9. **Class body dependency tracking**: When `getclosurevars()` fails on a class, the class body
+   is parsed to capture base classes and field annotations. Resolved user-code classes are
+   fingerprinted transitively; third-party/stdlib bases are ignored.
 
-10. **Callable instances tracked as functions**: Objects with `__call__` methods are matched by the `callable()` check before the instance check. This means changes to non-`__call__` methods on such classes may not trigger cache invalidation. Workaround: use the class directly instead of a pre-instantiated callable.
+10. **Pydantic schemas ARE tracked**: Pydantic model classes used in type hints are automatically
+    detected and their JSON schemas are hashed via `model_json_schema()` (with titles/descriptions
+    stripped to avoid false invalidation from docstring changes). The fingerprint includes a
+    module-qualified class-AST key and schema key, e.g.
+    `class:project.params.Model` and `schema:project.params.Model`.
 
-11. **NamedTuple instances tracked as tuples**: `NamedTuple` instances inherit from `tuple` and are matched by the collection check. Changes to the `NamedTuple` class definition may not be detected. Workaround: use regular classes or dataclasses instead.
+    Nested model types are discovered by walking `model_fields` annotations, so changes to nested
+    models propagate. A placeholder is inserted before field walking to prevent infinite recursion
+    on self-referential models.
 
-12. **Pydantic schemas ARE tracked**: Pydantic model classes used in type hints are automatically detected and their JSON schemas are hashed via `model_json_schema()` (with titles/descriptions stripped to avoid false invalidation from docstring changes). The fingerprint includes:
-    - `class:ModelName` - Hash of the class AST (captures structural changes including validators)
-    - `schema:ModelName` - Hash of JSON schema + field defaults (captures field types, defaults, configuration)
+    Tests: `test_pydantic_defaults.py::test_pydantic_default_data_captured`,
+    `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`,
+    `test_pydantic_defaults.py::test_pydantic_default_change_triggers_different_hash`,
+    `test_fingerprint.py::test_recursive_pydantic_model_no_infinite_recursion`
 
-    Nested model types are discovered by walking `model_fields` annotations, so changes to nested models propagate. A placeholder is inserted before field walking to prevent infinite recursion on self-referential models.
+11. **`functools.wraps` / `__wrapped__` ARE tracked**: Functions decorated with
+    `@functools.wraps` are fingerprinted using portable bytecode hashing. Since
+    `inspect.getsource()` follows the `__wrapped__` chain and returns the original function's
+    source, Pivot hashes the wrapper's bytecode and still tracks the wrapped function through its
+    closure.
 
-    Tests: `test_pydantic_defaults.py::test_pydantic_default_data_captured`, `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`, `test_pydantic_defaults.py::test_pydantic_default_change_triggers_different_hash`, `test_fingerprint.py::test_recursive_pydantic_model_no_infinite_recursion`
+12. **`functools.partial` IS tracked**: Partial objects include module-qualified bound-argument
+    keys and the underlying user function's definition key. A user function or class bound as
+    an argument, directly, inside a nested partial, or inside a list, tuple, set or dict, gets
+    the stage-helper walk: its globals, closure values and defaults are tracked, and a
+    non-scalar it reads is refused. Loader config fields get the same walk.
 
-13. **`functools.wraps` / `__wrapped__` ARE tracked**: Functions decorated with `@functools.wraps` are properly fingerprinted using bytecode hashing. Since `inspect.getsource()` follows the `__wrapped__` chain and returns the original function's source, we detect `__wrapped__` and use `marshal.dumps(__code__)` to hash the wrapper's bytecode instead. This correctly captures decorator logic changes while closure analysis still tracks the wrapped function.
+    Tests: `test_functools.py::test_function_in_partial_argument_collection_is_walked`,
+    `test_manifest_cache_cli.py::test_value_read_by_partial_argument_function_reruns_stage`,
+    `test_manifest_cache_cli.py::test_value_read_by_loader_config_function_reruns_stage`,
+    `test_manifest_cache_cli.py::test_non_scalar_read_by_bound_function_is_an_error`
 
-    Tests: `test_functools.py::test_decorator_change_triggers_fingerprint_change`, `test_functools.py::test_wrapped_uses_bytecode_not_source`
+13. **StageParams classes fully tracked**: `StageParams` subclasses used in type hints are tracked
+    via `_process_type_hint_dependencies()`. The entire class definition is hashed, including
+    properties, regular methods, and `ClassVar` declarations.
 
-14. **`functools.partial` IS tracked**: Partial objects are specially handled before the `is_user_code()` check. The fingerprint includes:
-    - `partial:<name>.args` - Hash of bound positional arguments
-    - `partial:<name>.kwargs` - Hash of bound keyword arguments
-    - `func:<name>.func` - Hash of the underlying function (if user code)
+    Tests: `test_change_detection.py::test_stageparams_property_change_causes_miss`,
+    `test_change_detection.py::test_stageparams_method_change_causes_miss`,
+    `test_change_detection.py::test_stageparams_class_variable_change_causes_miss`
 
-    This allows Pivot to detect changes to both the partial's bound arguments and the underlying function.
+14. **Builtin types ARE deterministic**: Builtin types (`list`, `dict`, `set`, `tuple`, etc.)
+    used as `default_factory` in Pydantic fields are hashed using their qualified name (for
+    example, `builtin:list`) rather than `id()`.
 
-    Tests: `test_functools.py::test_partial_is_detected`, `test_functools.py::test_partial_args_change_triggers_fingerprint_change`
+    Tests: `test_determinism.py::test_builtin_default_factory_deterministic_across_processes`,
+    `test_determinism.py::test_builtin_type_deterministic`
 
-15. **Instance state not tracked**: For user-defined class instances, only the class definition is hashed, not instance state (attributes, dict contents). Runtime-assigned callbacks on instances or in containers are not detected. Workaround: use module-level variables or explicit deps for mutable configuration.
+    Set and frozenset values are ordered by their canonical form, not by iteration order,
+    which follows `PYTHONHASHSEED`. This covers `StageParams` schema defaults, `default:`
+    values, loader config, `functools.partial` arguments, and the params recorded in the
+    lock file.
 
-16. **Class attributes modified at runtime not tracked**: Class attributes set after class definition (e.g., `Config.callback = func`) are not detected because only the original class source is hashed. Workaround: use module-level variables instead of class attributes for runtime configuration.
+    Tests: `test_determinism.py::test_set_valued_params_are_deterministic_across_hash_seeds`,
+    `test_manifest_cache_cli.py::test_set_valued_params_stay_cached_across_processes`
 
-17. **StageParams classes fully tracked**: `StageParams` subclasses used in type hints are tracked via `_process_type_hint_dependencies()`. The entire class definition is hashed using `inspect.getsource()`, which captures:
-    - `@property` methods
-    - Regular methods
-    - `ClassVar` declarations
+15. **Mutable and nested module collections are refused**: A stage reading a list, dict,
+    set, or a tuple or frozenset containing a non-scalar raises `StageDefinitionError` unless
+    unsafe fingerprinting is explicitly enabled, in which case Pivot warns instead of
+    pretending to track its contents. Exact tuples and frozensets of scalars and compiled
+    regexes are recorded by canonical value.
 
-    Changes to any of these trigger a cache miss.
+    A method bound to an instance is refused the same way (`apply = Scaler(3).apply`,
+    `normal = np.random.default_rng(SEED).normal`): the instance it carries is state no code
+    hash records. A method bound to a module, a class, a scalar or a `logging.Logger`, or a
+    library module's own export such as `np.random.normal`, is recorded by name instead.
 
-    Tests: `test_change_detection.py::test_stageparams_property_change_causes_miss`, `test_change_detection.py::test_stageparams_method_change_causes_miss`, `test_change_detection.py::test_stageparams_class_variable_change_causes_miss`
+    Tests: `test_integration.py::test_non_scalar_module_attribute_raises`,
+    `test_safe_fingerprinting.py::test_immutable_capture_is_tracked_by_value`,
+    `test_safe_fingerprinting.py::test_non_scalar_closure_capture_raises`
 
-18. **Builtin types ARE deterministic**: Builtin types (`list`, `dict`, `set`, `tuple`, etc.) used as `default_factory` in Pydantic fields are hashed using their qualified name (e.g., `builtin:list`) rather than `id()`. This ensures fingerprints are stable across Python sessions. Previously, `id()` was used as a fallback for objects without source code, causing spurious "Code changed" invalidations.
-
-    Tests: `test_determinism.py::test_builtin_default_factory_deterministic_across_processes`, `test_determinism.py::test_builtin_type_deterministic`
-
-19. **Module attribute primitive collections ARE tracked**: Module-level collections (dict, list, tuple, set, frozenset) containing only primitive values (bool, int, float, str, bytes, None) are fingerprinted via JSON serialization. Collections containing non-primitives (custom objects, class instances, numpy arrays) raise a `TypeError` to prevent non-deterministic `repr()` output. The primitive check is recursive, so nested structures like `{"key": [1, 2, {"inner": "value"}]}` are supported.
-
-    Tests: `test_integration.py::test_primitive_collection_module_attr_fingerprinting`, `test_integration.py::test_unsupported_module_attr_type_raises_error`
-
-20. **Manifest cache invalidation is path-scoped**: Watch-mode reloads invalidate only the cached manifests whose source maps include changed paths, leaving unaffected stage manifests intact. Affected stages are recomputed on next fingerprint access and re-cached.
+16. **Manifest cache invalidation is path-scoped**: Watch-mode reloads invalidate only the cached manifests whose source maps include changed paths, leaving unaffected stage manifests intact. Affected stages are recomputed on next fingerprint access and re-cached.
 
     Tests: `test_fingerprint.py::test_invalidate_manifests_for_paths_selective`, `test_fingerprint.py::test_invalidate_manifests_for_paths_recomputes_affected_stage`, `test_fingerprint.py::test_invalidate_manifests_for_paths_cold_start`
 
-21. **Pivot framework excluded from `is_user_code`**: Modules in the `pivot` package are treated as framework code, not user code. This prevents framework internals (e.g., `StageParams`, `Out`, `Dep`) from appearing in manifests when using editable installs where pivot isn't in `site-packages`.
+17. **Pivot framework excluded from `is_user_code`**: `fingerprint.is_library_path` decides what is library code rather than user code: a path under the interpreter's prefix (the stdlib, or a virtualenv), in a `site-packages` or `dist-packages` directory, or in one of pivot's own packages. `pivot`'s directory is the one `fingerprint` itself is loaded from. `pivot_tui`'s are the directories the installed pivot-tui distribution records that hold it: its site directory, and each directory a path line of its `.pth` file adds to `sys.path`. They never come from looking the name up on `sys.path`, so a user's own module or package named `pivot_tui` is user code, and an editable install of pivot-tui that records neither (a `.pth` file that installs an import hook or adds a link tree) leaves `pivot_tui` user code. This keeps framework internals (e.g., `StageParams`, `stage`, `Pipeline`, the TUI) out of manifests under an editable install, where neither package is in `site-packages`. A package installed from a source checkout outside the interpreter's prefix is user code. A namespace package is library code when one of its directories is in `site-packages` or `dist-packages` or in one of pivot's own packages; a directory under the interpreter's prefix alone, as pip's checkout of a `pip install -e git+...` package in `<venv>/src`, leaves a namespace the user shares with it user code.
 
-    Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`
+    Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`, `test_fingerprint.py::test_pivot_tui_installed_from_a_checkout_is_framework`, `test_fingerprint.py::test_pivot_tui_is_pivot_s_package_only_where_the_pivot_tui_distribution_installed_it`, `test_fingerprint.py::test_pivot_tui_pth_file_python_cannot_read_adds_no_directory`, `test_fingerprint.py::test_pivot_tui_pth_file_that_is_not_utf_8_is_read_in_the_locale_s_encoding`, `test_fingerprint.py::test_is_user_code_namespace_package_in_a_library_directory`, `test_fingerprint.py::test_is_user_code_namespace_package_split_with_a_directory_under_the_prefix`, `cli/test_cli_acceptance.py::test_editing_the_user_s_part_of_a_namespace_shared_with_a_pip_checkout_reruns_its_stage`
 
-22. **Unrecognized closure values hashed via `repr()` with guards**: Values in closures that don't match known types (callables, modules, primitives, collections, class instances) are hashed using `repr()` if the repr is deterministic (no `0x` memory addresses) and small (< 10KB). This catches datetime objects, regex patterns, enum values, etc. Non-deterministic or oversized reprs fall back to `_check_mutable_capture`.
+18. **Non-scalar closure values are refused**: Values outside the permitted scalar,
+    one-level immutable collection, and compiled-regex set raise `StageDefinitionError`.
 
-    Tests: `test_fingerprint.py::test_hash_unrecognized_closure_value_deterministic_repr`, `test_fingerprint.py::test_hash_unrecognized_closure_value_memory_address_raises`, `test_fingerprint.py::test_fingerprint_captures_unrecognized_closure_value`
-
-23. **Per-annotation type hint fallback**: When `typing.get_type_hints()` fails (e.g., one unresolvable `TYPE_CHECKING` import kills resolution for all annotations), each annotation string is evaluated individually via `eval()` in the function's global namespace. Resolvable annotations are still tracked; unresolvable ones are skipped.
+19. **Per-annotation type hint fallback**: When `typing.get_type_hints()` fails (e.g., one unresolvable `TYPE_CHECKING` import kills resolution for all annotations), each annotation string is evaluated individually via `eval()` in the function's global namespace. Resolvable annotations are still tracked; unresolvable ones are skipped.
 
     Tests: `test_fingerprint.py::test_resolve_annotations_individually_mixed`
 
-24. **Non-user-code callables silently skipped**: Stdlib/third-party callables captured in closures (e.g., `typing.cast`, `json.dumps`) are skipped rather than hashed. Their `repr()` contains memory addresses (`0x...`) which would trigger false mutable-capture errors. These functions are already tracked via module dependency analysis when accessed as `module.func`.
+20. **Library callables are recorded by name**: A stdlib or third-party function or class read
+    through a global, closure cell, default or partial (`agg = np.mean`,
+    `from numpy import median as agg`) gets an `ext:<binding>` entry holding its definition
+    name (`numpy.mean`); its code is not hashed. Rebinding the name reruns the stage, and a
+    cache hit re-reads the name. In loader config and partial arguments a library function's
+    canonical form is `["external", name]`, since its `repr()` can hold a memory address.
+    Reached through its module (`typing.cast`), a library callable adds no entry.
 
-    Tests: `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`
+    Tests: `test_fingerprint.py::test_stdlib_callable_in_closure_does_not_raise`,
+    `test_manifest_cache_cli.py::test_rebinding_a_library_function_reruns_stage`
 
-25. **Loggers silently skipped**: `logging.Logger` instances captured in closures are skipped. Module-level loggers (`_logger = logging.getLogger(__name__)`) are functionally irrelevant for cache invalidation — their repr can change based on logging configuration.
+21. **Loggers silently skipped**: `logging.Logger` instances captured in closures are skipped. Module-level loggers (`_logger = logging.getLogger(__name__)`) are functionally irrelevant for cache invalidation — their repr can change based on logging configuration.
 
-26. **User-defined generic origins tracked**: For generic types like `MyContainer[int]`, the origin class (`MyContainer`) is now fingerprinted if it's user code. Previously only the type arguments were walked.
+22. **User-defined generic origins tracked**: For generic types like `MyContainer[int]`, the origin class (`MyContainer`) is now fingerprinted if it's user code. Previously only the type arguments were walked.

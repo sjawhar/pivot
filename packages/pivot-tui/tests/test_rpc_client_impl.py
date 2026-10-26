@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
+from helpers import wait_for_socket as _wait_for_socket
 from pivot_tui.rpc_client_impl import RpcError, RpcPivotClient, RpcProtocolError
 from pivot_tui.testing import FakeRpcServer
 
@@ -23,13 +24,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from anyio.abc import SocketListener
-
-
-async def _wait_for_socket(socket_path: Path, timeout: float = 1.0) -> None:
-    with anyio.move_on_after(timeout):
-        while not socket_path.exists():
-            await anyio.sleep(0.01)
-    assert socket_path.exists()
 
 
 @contextlib.asynccontextmanager
@@ -137,11 +131,31 @@ async def test_stages_empty(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_stage_info(tmp_path: Path) -> None:
     async with _connected(tmp_path / "t.sock") as (server, client):
-        server.set_stage_info("train", deps=["input.csv"], outs=["model.pkl"])
+        server.set_stage_info(
+            "train",
+            deps=[{"producer": "input", "key": None}],
+            outs=[{"producer": "train", "key": None}],
+        )
         result = await client.stage_info("train")
         assert result["name"] == "train"
-        assert result["deps"] == ["input.csv"]
-        assert result["outs"] == ["model.pkl"]
+        assert len(result["deps"]) == 1
+        assert len(result["outs"]) == 1
+
+
+@pytest.mark.anyio
+async def test_stage_info_structured_identity(tmp_path: Path) -> None:
+    """stage_info returns ArtifactIdentity instances, not strings."""
+    from pivot.types import ArtifactIdentity
+
+    async with _connected(tmp_path / "t.sock") as (server, client):
+        server.set_stage_info(
+            "train",
+            deps=[{"producer": "input", "key": None}],
+            outs=[{"producer": "train", "key": "metrics"}],
+        )
+        result = await client.stage_info("train")
+        assert result["deps"][0] == ArtifactIdentity("input", None)
+        assert result["outs"][0] == ArtifactIdentity("train", "metrics")
 
 
 # --- explain ---
@@ -170,6 +184,67 @@ async def test_explain(tmp_path: Path) -> None:
         assert result["reason"] == "Code changed"
         assert len(result["code_changes"]) == 1
         assert result["upstream_stale"] == ["prepare"]
+
+
+@pytest.mark.anyio
+async def test_explain_dep_changes_carry_artifact_identity(tmp_path: Path) -> None:
+    """explain() rebuilds dep_changes identities from the {producer, key} wire form."""
+    from pivot.types import ArtifactIdentity, ChangeType
+
+    async with _connected(tmp_path / "t.sock") as (server, client):
+        server.set_explanation(
+            "train",
+            {
+                "stage_name": "train",
+                "will_run": True,
+                "is_forced": False,
+                "reason": "Input dependencies changed",
+                "code_changes": [],
+                "param_changes": [],
+                "dep_changes": [
+                    {
+                        "identity": {"producer": "prepare", "key": "features"},
+                        "old_hash": "aaa",
+                        "new_hash": "bbb",
+                        "change_type": "modified",
+                    }
+                ],
+                "upstream_stale": [],
+            },
+        )
+        result = await client.explain("train")
+
+    dep = result["dep_changes"][0]
+    assert dep["identity"] == ArtifactIdentity("prepare", "features")
+    assert dep["change_type"] == ChangeType.MODIFIED
+
+
+@pytest.mark.anyio
+async def test_explain_rejects_array_identity(tmp_path: Path) -> None:
+    """The wire has one identity encoding; a [producer, key] array is a protocol error."""
+    async with _connected(tmp_path / "t.sock") as (server, client):
+        server.set_explanation(
+            "train",
+            {
+                "stage_name": "train",
+                "will_run": True,
+                "is_forced": False,
+                "reason": "Input dependencies changed",
+                "code_changes": [],
+                "param_changes": [],
+                "dep_changes": [
+                    {
+                        "identity": ["prepare", "features"],
+                        "old_hash": "aaa",
+                        "new_hash": "bbb",
+                        "change_type": "modified",
+                    }
+                ],
+                "upstream_stale": [],
+            },
+        )
+        with pytest.raises(RpcProtocolError, match="expected dict"):
+            await client.explain("train")
 
 
 # --- events_since ---

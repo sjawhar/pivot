@@ -52,7 +52,7 @@ Pivot uses a parallel execution model with warm worker pools for maximum perform
 The Engine uses event-driven orchestration for maximum parallelism:
 
 1. **Stage States** - Each stage has its own state (PENDING → READY → PREPARING → WAITING_ON_LOCK → RUNNING → COMPLETED)
-2. **Scheduler** - `Scheduler` owns stage state, upstream/downstream sets, and mutex decisions
+2. **Scheduler** - `Scheduler` owns stage state, upstream/downstream sets, and resource permits
 3. **Ready Queue** - Engine asks Scheduler for eligible stages
 4. **Event Emission** - StageStarted/StageCompleted events to sinks
 
@@ -94,9 +94,10 @@ During watch mode, the Engine filters filesystem events based on stage state:
 
 ## Worker Pool
 
-Pivot uses `loky.get_reusable_executor()` for warm workers with `spawn` context.
-The Engine wraps it in `WorkerPool`, which also manages a manager-backed output
-queue for log streaming and a shutdown event for the drain thread.
+Pivot uses `loky.get_reusable_executor()` with `spawn` context. `WorkerPool` owns workers and
+the manager process for the Engine lifetime. Each run gets its own manager-backed output queue
+and drain shutdown event, so logs cannot cross run boundaries. A manager that cannot be reached
+when a run starts (it died, or its socket was removed) is replaced then.
 
 ### Why ProcessPoolExecutor?
 
@@ -110,47 +111,74 @@ queue for log streaming and a shutdown event for the drain thread.
 - **Compatibility** - Works on macOS and Linux
 - **Clean state** - Each worker starts fresh without inherited state
 
+### Pool Size
+
+`get_width()` gives the Engine an upper bound from the run's stage graph, capped by
+`core.max_workers`. It limits admission and the workers that the run's first submission starts.
+
+The worker pool starts processes when the run submits work. The run's first submission starts
+the run's resource width: the most of its stages that one replayed schedule runs at once,
+within resource capacities (`Scheduler.resource_width`). The width counts every stage of the
+run, including stages that are cached or skipped later. A `local_grade: 2` limit therefore
+starts at most two workers for an otherwise-wide grade wave, and a chain starts one. The replay
+has a step budget: 10,000 steps plus 8 per stage, dependency and requested resource. Below it
+the width is exact. A run that needs more starts `get_width()`'s pool size, the most workers it
+may hold at once. Random runs of 400 or more stages whose stages each ask for several small
+resources can need more. After the first submission, a dispatch starts a worker when an admitted
+stage finds every live worker busy, or for the scheduler-admissible direct consumer wave of the
+parent it dispatches. For a parent that runs past half the one-shot idle timeout, the pool pings
+idle workers pre-started for that wave. The ping restarts the worker’s idle clock without
+blocking it on the parent. When the parent resolves, pings stop and those workers become
+ordinary idle workers. A run whose stages all skip in the coordinator starts no workers.
+
+For a one-shot Engine, an idle worker exits after the 10-second idle timeout, or occasionally
+after a second one, when loky's worker loses its process-lock race. The timeout is 116 times the
+largest coordinator handoff gap of five 100-stage pandas/NumPy chains, 70.959 to 86.164 ms,
+measured at `3f72f1f2` on a 32-CPU cloud machine, while remaining short compared with
+remote-stage waits. A persistent watch, serve or TUI Engine keeps idle workers alive between its
+runs for a warm next run.
+
+### Textual Startup
+
+Before Textual captures `sys.stderr`, Pivot starts loky's and `multiprocessing`'s resource
+trackers. Textual's captured stream has no valid file descriptor, and those tracker launchers
+need one. Workers can start after the TUI begins and use the already-running trackers.
+
 ### Warm Workers
 
-Workers stay alive between stages, so expensive imports (numpy, pandas) only happen once per worker, not once per stage.
+Workers stay alive across runs in one long-lived Engine, so imports from earlier stages remain
+available. Before a later run reuses workers, Pivot replaces them if a user-code module they
+imported changed. A watch-mode code reload starts the reloaded run's width of fresh workers
+together, so that run starts its stages at once.
 
-## Mutex Handling
+## Stage resources
 
-Mutex groups prevent concurrent execution:
+Stages can reserve scheduler-held resources while they execute:
 
-```yaml
-# pivot.yaml
-stages:
-  train_model_a:
-    python: stages.train_model_a
-    mutex:
-      - gpu
+```python
+@stage(resources={"gpu": 1})
+def train(data: pd.DataFrame) -> Model: ...
 
-  train_model_b:
-    python: stages.train_model_b
-    mutex:
-      - gpu  # Won't run while train_model_a is running
+
+@stage(resources={"cpu": "all"})
+def compact(data: pd.DataFrame) -> pd.DataFrame: ...
 ```
 
-### Exclusive Mutex
+Resource names are case-insensitive. Every scheduled stage, including bare `@stage` functions, holds one `cpu` unit. The `cpu` capacity is the configured worker count (`core.max_workers`), not the pool size, so `cpu: "all"` runs without another stage. Other resources default to capacity 1, which serializes stages sharing that resource.
 
-Use `mutex: ["*"]` to run a stage with no other stages executing concurrently:
+Set a project capacity in `.pivot/config.yaml` or override it for one command:
 
 ```yaml
-stages:
-  database_migration:
-    python: stages.migrate_db
-    mutex:
-      - "*"  # Runs exclusively - no other stages run at the same time
+resources:
+  gpu: 2
 ```
 
-This is useful for stages that require exclusive access to shared resources like databases or file locks.
+```bash
+pivot repro --resources gpu=2
+pivot run --resources gpu=2 report/train
+```
 
-### Implementation
-
-1. Track active mutex groups (including `*` for exclusive)
-2. Before scheduling, check for conflicts
-3. Wait for conflicting stages to complete
+The scheduler acquires every permit immediately before submitting a stage and releases them when it completes. A stage waiting for a resource does not consume a worker. Resource declarations tune concurrency only; they are not part of stage fingerprints.
 
 ## Stage Execution
 
@@ -219,16 +247,18 @@ When all three match the current file's `stat()` result, the cached hash is retu
 
 The fastest check uses monotonic generation counters to detect changes without comparing hashes:
 
-- Each output file has a **generation counter** in StateDB, incremented every time that file is written
+- Each output has a **generation counter** in StateDB, keyed by its artifact identity and incremented every time the output is written
 - When a stage runs, it **records the generation** of each dependency at that moment
 - On next run: if `recorded_generation == current_generation` for all deps → nothing changed → skip
 
-**Example:** Stage `train` depends on `data/clean.csv` (produced by `preprocess`).
+A dependency on one file of a directory output follows its directory's counter, which moves whenever any of its files are written; when it moved, the file's own hash in Tier 2 decides.
 
-1. `preprocess` runs, writes `data/clean.csv` → generation becomes 5
-2. `train` runs, records `dep_generations: {"data/clean.csv": 5}`
-3. Next run: `clean.csv` generation is still 5 → generations match → skip `train`
-4. `preprocess` runs again → `clean.csv` generation becomes 6
+**Example:** Stage `train` depends on `demo/preprocess`'s output.
+
+1. `preprocess` runs and writes its output → generation becomes 5
+2. `train` runs, records `dep_generations: {"demo/preprocess": 5}`
+3. Next run: the generation is still 5 → generations match → skip `train`
+4. `preprocess` runs again → generation becomes 6
 5. Next run: `train` recorded 5, current is 6 → mismatch → fall through to Tier 2
 
 This provides instant O(1) skip detection when nothing has changed.
@@ -282,51 +312,25 @@ Generation counters enable the O(1) skip check. If a stage recorded dependencies
 
 ## Concurrency Safety
 
-Pivot uses a "check-lock-recheck" pattern to prevent TOCTOU (Time-of-Check-Time-of-Use) race conditions in parallel execution.
+Pivot uses a "check-lock-recheck" pattern to prevent TOCTOU (Time-of-Check-Time-of-Use) race conditions between concurrent `pivot` processes on one project.
 
 ### The Problem
 
-Without proper locking, parallel stage execution can race: two processes could both read the lock file, both determine the stage is unchanged, both start executing, and conflict on output writes.
+Without locking, two processes could both read a stage's lock file, both decide the stage must run (or that a missing output must be restored), and conflict on output writes; or one could overwrite an output while another process's stage is reading it.
 
-### The Solution: Execution Locks
+### Artifact Locks
 
-All change detection and cache operations happen inside an execution lock. The lock is acquired before reading the lock file and held through execution and lock file update.
+Each artifact has a lock file under the stage state directory's `locks/`, taken with `flock` (`storage/artifact_lock.py`): READ is `LOCK_SH`, WRITE is `LOCK_EX`. `expand_lock_requests` turns a stage's deps and outs into requests, one per artifact at the strongest mode asked for, and `acquire_many` takes them in sorted key order (no lock-order deadlocks), retrying a non-blocking `flock` until it succeeds.
 
-### Lock Implementation
+| Who | Deps | Outs | Held |
+|-----|------|------|------|
+| A worker running a stage | READ | WRITE | for the whole run, through the lock file write |
+| The coordinator deciding whether a cached stage skips | READ | READ | for the check |
+| The coordinator restoring a cached stage's outputs from the cache | READ | WRITE | for the check and the restore |
 
-Execution locks use PID-based sentinel files with atomic creation via `O_CREAT | O_EXCL`. See `src/pivot/storage/lock.py:execution_lock()`.
+A stage lock is read only after its artifact locks are held, so a waiting process evaluates the state committed by the writer ahead of it.
 
-Key properties:
-
-- **Atomic creation** - `O_CREAT | O_EXCL` guarantees only one process wins
-- **Crash recovery** - Stale locks detected via PID checking
-- **Cross-platform** - Works on Linux and macOS
-- **Visible state** - Lock files can be inspected for debugging
-
-### Design Decision: Simple Locks vs Reader-Writer Locks
-
-Two approaches were considered for TOCTOU prevention:
-
-| Approach | Description | Overhead |
-|----------|-------------|----------|
-| **Simple (chosen)** | Move operations inside existing execution lock | ~0ms |
-| **RWLock** | Separate reader-writer locks per path (like DVC) | Higher |
-
-**Benchmark results** (57-stage pipeline, 10 runs each, warmup excluded):
-
-| Metric | Baseline | With TOCTOU Fix |
-|--------|----------|-----------------|
-| Mean | 8.944s ± 0.333s | 8.899s ± 0.282s |
-| Overhead | - | -0.5% (not significant) |
-
-The simple approach was chosen because:
-
-1. **Zero measurable overhead** - Lock acquisition via `O_CREAT|O_EXCL` is ~μs
-2. **No new dependencies** - Uses existing OS primitives
-3. **Simpler code** - No separate lock coordination layer
-4. **DVC's RWLock has issues** - JSON-based lock file requires full rewrite on every operation; LMDB alternative has global write lock that serializes all lock operations
-
-The RWLock approach would only benefit workloads with many concurrent readers of the same paths, which is rare in practice since Pivot's DAG ensures dependencies complete before dependents run.
+A cached stage's skip check takes READ on its outputs, so it does not wait for the runs reading them as deps: a widely read output is held READ by every running consumer, and WRITE would wait until none is running. When the check finds an output that differs from the lock but is in the cache, it releases its locks, takes WRITE on the outputs, and decides again from the start, since another process may have restored or rebuilt them in between. Locks are never upgraded in place: two processes each holding READ and waiting for WRITE would wait on each other.
 
 ## Multi-Process Safety
 
@@ -354,7 +358,7 @@ This avoids write contention between workers while maintaining consistency.
 
 | Scenario | Result |
 |----------|--------|
-| Two `pivot repro`, same stage | Execution lock prevents concurrent execution |
+| Two `pivot repro`, same stage | WRITE on its outputs lets one run it; the other waits, then finds it cached |
 | Two `pivot repro`, different stages | Both execute independently, writes serialize |
 | `pivot repro --no-commit` + `pivot commit` | Independent operations, no lock needed |
 | Cache writes by both processes | Idempotent (check exists before writing) |
@@ -378,9 +382,19 @@ The engine supports graceful cancellation via a `CancelRequested` event. When se
 2. **Pending stages are skipped** - No new stages are started
 3. **Results include cancellation** - Skipped stages report reason "cancelled"
 
-Cancellation is **stage-level**, not mid-stage. This ensures outputs are always in a consistent state (either fully written or not started).
+This cancellation is **stage-level**, not mid-stage. This ensures outputs are always in a consistent state (either fully written or not started).
 
 In watch mode, the Agent RPC `cancel` command sends a `CancelRequested` event, allowing external tools to stop execution between stages. The TUI also uses this for `Ctrl+C` handling.
+
+### Stopping mid-stage
+
+`Ctrl+C` at a terminal (outside the TUI), and the death of the Pivot process (`SIGKILL`, or `SIGTERM`, which Pivot does not handle outside the `pivot` command's `repro --watch --serve`; that serve mode handles SIGTERM as `Ctrl+C`), stop running stages mid-stage. Each running stage gets `pivot.executor.worker.WorkerTerminated`, a `KeyboardInterrupt`, raised where it is, so its `except KeyboardInterrupt` cleanup, `finally` blocks and context managers run, as they would for `Ctrl+C` in a plain Python program. Then:
+
+- The stage fails and nothing it produced is committed: no output enters the cache and no lock is written, even if the stage caught the exception and returned a value.
+- The worker exits once the stage has unwound, and no later than `worker.TERMINATION_GRACE_S` (10 s) after it was told to stop, whatever the stage does. Before exiting, it kills every process still descended from it. A process that detached (double-forked, a daemon, or orphaned when its parent exited) is not reached; the stage's cleanup must stop it, as it must stop a container, which the Docker daemon runs.
+- Pivot itself (on `Ctrl+C`) waits up to the same 10 s for its workers, then kills any left with their child processes.
+
+A cleanup that must finish therefore has 10 s: remove a container with `docker rm --force`, which takes about a second, not `docker stop`, which waits 10 s for the container by default.
 
 ## Explain Mode
 

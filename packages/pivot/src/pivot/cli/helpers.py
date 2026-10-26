@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import importlib
 import json
 import sys
 from typing import TYPE_CHECKING, Any, cast, override
@@ -12,10 +13,10 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
     from pivot.cli import CliContext
-    from pivot.pipeline.pipeline import Pipeline
-    from pivot.registry import RegistryStageInfo, StageRegistry
+    from pivot.registry import PipelineLike, RegistryStageInfo
+    from pivot.storage.store import WorkspaceStore
 
-from pivot import config, exceptions, path_utils, project, registry
+from pivot import config, exceptions, names, project, registry, types
 from pivot.cli import decorators as cli_decorators
 from pivot.storage import lock, track
 from pivot.types import HashInfo
@@ -30,12 +31,11 @@ class NoPipelineError(exceptions.PivotError):
             "No pipeline definition found.\n"
             "\n"
             "This command requires a pipeline to be defined in one of:\n"
-            "  - pivot.yaml (or pivot.yml)\n"
             "  - pipeline.py"
         )
 
 
-def _get_pipeline() -> Pipeline:
+def get_pipeline() -> PipelineLike:
     """Get Pipeline from context, raising NoPipelineError if not found."""
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is None:
@@ -43,35 +43,47 @@ def _get_pipeline() -> Pipeline:
     return pipeline
 
 
-def get_registry() -> StageRegistry:
-    """Get StageRegistry from Pipeline in context."""
-    return _get_pipeline()._registry  # pyright: ignore[reportPrivateUsage]
-
-
 def list_stages() -> list[str]:
     """List stage names from Pipeline in context."""
-    return _get_pipeline().list_stages()
+    return get_pipeline().list_stages()
 
 
 def get_stage(name: str) -> RegistryStageInfo:
     """Get stage info from Pipeline in context."""
-    return _get_pipeline().get(name)
-
-
-def resolve_external_dependencies() -> None:
-    """Resolve external dependencies on the Pipeline in context."""
-    _get_pipeline().resolve_external_dependencies()
+    return get_pipeline().get_stage(name)
 
 
 def get_all_stages() -> dict[str, RegistryStageInfo]:
     """Get all stages as a dict from Pipeline in context."""
-    pipeline = _get_pipeline()
-    return {name: pipeline.get(name) for name in pipeline.list_stages()}
+    pipeline = get_pipeline()
+    return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
 
 
-def build_dag(validate: bool = True) -> DiGraph[str]:
+def build_dag() -> DiGraph[str]:
     """Build DAG from Pipeline in context."""
-    return _get_pipeline().build_dag(validate=validate)
+    return get_pipeline().build_dag()
+
+
+def get_workspace_store() -> WorkspaceStore | None:
+    """Get a WorkspaceStore for display/path resolution, or None if no pipeline."""
+    store_mod = importlib.import_module("pivot.storage.store")
+
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is None:
+        return None
+    return store_mod.WorkspaceStore(
+        project_root=project.get_project_root(),
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    )
+
+
+def require_workspace_store() -> WorkspaceStore:
+    """Get the WorkspaceStore for the Pipeline in context, raising NoPipelineError if none."""
+    store = get_workspace_store()
+    if store is None:
+        raise NoPipelineError()
+    return store
 
 
 def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any
@@ -108,14 +120,20 @@ def stages_to_list(stages: tuple[str, ...]) -> list[str] | None:
     return list(stages) if stages else None
 
 
-def validate_stages_exist(stages: list[str] | None) -> None:
-    """Validate that specified stages exist in the registry."""
+def resolve_stage_names(stages: list[str] | None) -> list[str] | None:
+    """Resolve bare or pipeline-qualified stage names to registered stage names.
+
+    Raises StageNotFoundError naming every target that matches no registered stage.
+    """
     if not stages:
-        return
-    registered = set(list_stages())
-    unknown = [s for s in stages if s not in registered]
+        return stages
+    registered = list_stages()
+    known = dict.fromkeys(registered)
+    resolved = [names.resolve_stage_name(stage, known) for stage in stages]
+    unknown = [stage for stage, name in zip(stages, resolved, strict=True) if name not in known]
     if unknown:
-        raise exceptions.StageNotFoundError(unknown, available_stages=list(registered))
+        raise exceptions.StageNotFoundError(unknown, available_stages=registered)
+    return resolved
 
 
 class TransferProgress:
@@ -162,26 +180,33 @@ def get_stage_output_info() -> dict[str, HashInfo]:
 
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked and not Pivot's responsibility to restore.
+
+    Uses per-stage state_dir from the registry for lock file lookup.
     """
     result = dict[str, HashInfo]()
-    proj_root = project.get_project_root()
-    state_dir = config.get_state_dir()
+    store = get_workspace_store()
+    if store is None:
+        return result
 
     for stage_name in list_stages():
         stage_info = get_stage(stage_name)
-        cached_paths = {
-            path_utils.canonicalize_artifact_path(str(out.path), proj_root)
-            for out in stage_info["outs"]
-            if out.cache
+        ref_by_identity = {out.identity: out for out in stage_info["outs"]}
+        cached_identities = {
+            out.identity for out in stage_info["outs"] if out.tag is not types.ArtifactTag.METRIC
         }
-        stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+
+        stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
         if lock_data:
-            for out_path, out_hash in lock_data["output_hashes"].items():
-                norm_path = path_utils.canonicalize_artifact_path(out_path, proj_root)
-                if norm_path in cached_paths:
-                    result[norm_path] = out_hash
+            for identity, out_hash in lock_data["output_hashes"].items():
+                if identity not in cached_identities:
+                    continue
+                ref = ref_by_identity.get(identity)
+                if ref is None:
+                    continue
+                resolved = store.resolve_display_path(ref)
+                result[str(resolved)] = out_hash
 
     return result
 

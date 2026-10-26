@@ -9,7 +9,7 @@ from __future__ import annotations
 import inspect
 from typing import TYPE_CHECKING, Literal
 
-from pivot.types import CodeChange, DepChange, ParamChange, StageExplanation
+from pivot.types import ArtifactIdentity, CodeChange, DepChange, ParamChange, StageExplanation
 from pivot_tui.client import (
     CommitResult,
     EngineStatus,
@@ -49,7 +49,9 @@ class MockClient:
         return list[str]()
 
     async def stage_info(self, stage: str) -> StageInfoResult:
-        return StageInfoResult(name=stage, deps=list[str](), outs=list[str]())
+        return StageInfoResult(
+            name=stage, deps=list[ArtifactIdentity](), outs=list[ArtifactIdentity]()
+        )
 
     async def explain(self, stage: str) -> StageExplanation:
         return StageExplanation(
@@ -125,7 +127,9 @@ class MockRpc:
         return list[str]()
 
     async def stage_info(self, stage: str) -> StageInfoResult:
-        return StageInfoResult(name=stage, deps=list[str](), outs=list[str]())
+        return StageInfoResult(
+            name=stage, deps=list[ArtifactIdentity](), outs=list[ArtifactIdentity]()
+        )
 
     async def explain(self, stage: str) -> StageExplanation:
         return StageExplanation(
@@ -192,7 +196,11 @@ def test_pivot_client_is_also_pivot_rpc() -> None:
 def test_response_typed_dicts_constructible() -> None:
     engine_status = EngineStatus(state="idle", running=["a"], pending=["b"])
     commit_result = CommitResult(committed=["a"], failed=["b"])
-    stage_info = StageInfoResult(name="stage", deps=["dep"], outs=["out"])
+    stage_info = StageInfoResult(
+        name="stage",
+        deps=[ArtifactIdentity("dep", None)],
+        outs=[ArtifactIdentity("out", None)],
+    )
     versioned_event = VersionedEvent(version=1, event={"type": "log_line"})
     event_batch = EventBatch(version=1, events=[versioned_event])
     explanation = StageExplanation(

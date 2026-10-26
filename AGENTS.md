@@ -12,18 +12,19 @@
 packages/pivot/src/pivot/
 ├── cli/           # Click commands, decorators, helpers (see cli/AGENTS.md)
 ├── config/        # YAML parsing, validation
-├── dag/           # Dependency graph construction
+├── dag/           # DAG rendering for `pivot dag` (ASCII, DOT, Mermaid)
 ├── engine/        # Execution coordinator, watch mode, RPC server
 ├── executor/      # Worker process execution (see executor/AGENTS.md)
-├── pipeline/      # Pipeline state, lock files
-├── remote/        # S3/remote storage
-├── storage/       # StateDB, cache management (see storage/AGENTS.md)
+├── remote/        # S3 and GCS remote cache storage (see remote/AGENTS.md)
+├── storage/       # StateDB, lock files, cache management (see storage/AGENTS.md)
+├── show/           # selection.py: HEAD/workspace output selection; data.py: decoding, comparison, formatting
+├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot/incremental/directory tags, format inference
+├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection
-├── registry.py    # Stage registration, discovery
-├── stage_def.py   # Stage definition extraction
+├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
+├── stage_def.py   # StageParams, output writing helpers
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
-├── outputs.py     # Out, DirectoryOut, IncrementalOut
-└── types.py       # TypedDicts, enums, type aliases
+└── types.py       # TypedDicts, enums, type aliases, ArtifactIdentity
 
 packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
 ├── client.py          # PivotRpc/PivotClient protocols + TypedDicts
@@ -35,7 +36,6 @@ packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
 ├── types.py           # TUI message types, enums
 ├── widgets/           # Textual widgets (stage list, panels, logs, debug)
 ├── screens/           # Modal screens (help, history, confirm dialogs)
-├── console.py         # Plain-text console output (non-TUI mode)
 └── testing/
     └── fake_server.py # FakeRpcServer test double
 ```
@@ -68,7 +68,7 @@ packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
 ## Core Design
 
 - **Artifact-first**: The DAG emerges from artifact dependencies, not explicit wiring
-- **Pipeline is canonical**: The registry (from `pivot.yaml`/`pipeline.py`) is the single source of truth for stage metadata — deps, outs, cache flags, params. Lock files record execution state (hashes, generations), not stage definitions. Never infer stage properties from lock files.
+- **Pipeline is canonical**: The registry (built from `pipeline.py`) is the single source of truth for stage metadata — deps, outs, tags, params. Lock files record execution state (hashes, generations), not stage definitions. Never infer stage properties from lock files.
 - Per-stage lock files, automatic code fingerprinting, warm worker pools
 - `ProcessPoolExecutor` for true parallelism (GIL would serialize threads)
 - Invalidation is content-addressed: same inputs + same code = same outputs
@@ -85,7 +85,7 @@ Fingerprint checks must be cheap — O(1) shallow/static checks only. No deep re
 - **Soundness risk** (changes could go undetected) → error
 - **Noise risk** (spurious reruns only) → warn
 
-Aggregate all fingerprinting errors before reporting. Don't fail on the first one. Error messages must name the captured variables/types and suggest using `StageParams` or `Dep`.
+Aggregate all fingerprinting errors before reporting. Don't fail on the first one. Error messages must name the captured variables/types and suggest using `StageParams`.
 
 Unsafe fingerprinting is opt-in via a single config flag. Default is strict (error).
 
@@ -110,36 +110,42 @@ Centralize decision logic. The `explain` and `run` paths must use the same skip-
 
 ```bash
 pivot repro                  # Run entire pipeline (DAG-aware)
-pivot repro my_stage         # Run my_stage AND all its dependencies
+pivot repro demo/train       # Run demo/train AND all its dependencies
 pivot repro --watch          # Watch mode - re-run on file changes
 pivot repro --dry-run        # Validate DAG without executing
 
-pivot run my_stage           # Run ONLY my_stage (no dependency resolution)
-pivot run stage1 stage2      # Run specific stages in order (no deps)
+pivot run demo/train         # Run ONLY demo/train (no dependency resolution)
+pivot run demo/a demo/b      # Run specific stages in order (no deps)
 ```
 
 **Key difference:** `repro` resolves dependencies automatically; `run` executes only the named stages.
 
-## Stage Registration
+## Defining Stages and Pipelines
 
-Two methods: `pivot.yaml` (config pointing to functions) or `pipeline.py` (direct `pipeline.register()`).
-
-**Discovery order:** `pivot.yaml` → `pivot.yml` → `pipeline.py`
+`pipeline.py` defines stages with `@stage` and wires them in a `with Pipeline("name") as pipeline:` block; discovery loads it and reads the module variable `pipeline`. Stage names are `<pipeline>/<function>`.
 
 ```python
-def train(
-    params: TrainParams,
-    data: Annotated[DataFrame, Dep("input.csv", CSV())],
-) -> Annotated[DataFrame, Out("output.csv", CSV())]:
-    return data.dropna()
+class TrainParams(StageParams):
+    min_score: float = 0.5
+
+
+@stage
+def train(data: pd.DataFrame, params: TrainParams) -> pd.DataFrame:
+    return data[data["score"] >= params.min_score]
+
+
+with Pipeline("demo") as pipeline:
+    train(pipeline.input("input.csv"), params=TrainParams())
 ```
 
-- **Dependencies**: `Annotated[T, Dep(path, loader)]` on parameters (`loader` is `Reader[R]`)
-- **Outputs**: `Annotated[T, Out(path, loader)]` in TypedDict return type (`loader` is `Writer[W]`)
-- **Incremental Outputs**: `Annotated[T, IncrementalOut(path, loader)]` for bidirectional (loader is `Loader[W, R]`)
-- **Parameters**: `params: MyParams` where `MyParams` extends `StageParams`
-- Stages must be **pure, serializable, module-level functions** (lambdas/closures fail pickling)
-- Config belongs in Pydantic classes, not YAML files
+- **Inputs**: `pipeline.input(name)` reads `data/raw/<name>`; format from the extension (`compose.py` `_infer_format_from_extension`)
+- **Dependencies**: stage parameters that receive handles (or lists/tuples of handles) at the call site; no annotations on parameters. `handle["train.csv"]` on a `directory` output depends on that one file
+- **Outputs**: the return type; format inferred (`DataFrame`→JSONL, `dict`/`list`→YAML, `str`→text) or set with `Annotated[T, loader]`; `TypedDict` for several outputs; `metric`/`plot`/`incremental` tags; `Annotated[dict[str, T], directory]` for a variable set of files. Pivot chooses paths (`data/<pipeline>/<stage>.<ext>`, a directory `data/<pipeline>/<stage>/`)
+- **Parameters**: one `StageParams` subclass per stage, defined beside it; `params.yaml` overrides by stage name
+- **Variants**: Python loops, `pipeline.variant("name")`; composition: imported handles, `Pipeline.include()`
+- Stages must be **pure, module-level functions** (workers receive them by pickling); config belongs in `StageParams`, not module-level collections
+
+User-facing guide: `skills/writing-pivot-stages/SKILL.md`.
 
 ---
 
@@ -203,3 +209,13 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright              
 ```
 
 **Run all quality checks before returning to user or pushing.**
+
+**CI runs the test suite without uv on PATH**, so a test that starts pivot runs `pathlib.Path(sys.executable).parent / "pivot"`. With `CI` set, the wheel smoke test also runs and needs uv's path: run the suite as `PIVOT_TEST_UV="$(command -v uv)" uv run pytest ...`.
+
+**A regression found on main gets a line in `.github/known-regressions`, by PR.** Main then goes red and nothing publishes until the fix's PR deletes the line.
+
+Measure a performance change on one pipeline and on one task with its upstream stages, the scopes people run, with wall time and CPU, against main in the same job. `.github/workflows/benchmark.yaml` does this on every pull request (`benchmarks/run.py`, `benchmarks/compare.py`); it runs pivot with a user's environment, so never pin `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` or `MKL_NUM_THREADS` for a measurement. `run.py` also drops `PIVOT_CACHE_DIR`, so each variant writes its own project's `.pivot/cache` rather than one cache both share.
+
+A scenario's metric fails the benchmark only when both hold: its median change exceeds the scenario's limit in `benchmarks/threshold.json` (the minimum effect), and a bootstrap 95% interval of the median per-rep ratio head/base, with reps paired by their `rep` number (fixed seed, 10,000 resamples), lies entirely above 1. Each limit is three times the largest absolute median change across the A/A runs (the same build on both sides) recorded in `benchmarks/calibration.json`, rounded up to a whole percent, with a two-percent minimum. A recalibration replaces that record rather than extending it. Take four or more new samples, each from its own `workflow_dispatch` run with `base` and `head` set to the same ref, not a re-run attempt: a dispatch run also measures the 1,000-stage projects that pull request runs skip, and GitHub keeps artifacts only for a run's last attempt. Write the record with one `uv run python benchmarks/compare.py --write-calibration benchmarks/calibration.json` call, passing one `--sample SAMPLE RUN ATTEMPT JOB BASE HEAD` per project per run. Then run `uv run python benchmarks/compare.py --derive-threshold --calibration benchmarks/calibration.json > benchmarks/threshold.json` once over the whole record.
+
+The job runs compare.py and threshold.json from the merge commit, so a PR that edits either one sets its own verdict; review changes under benchmarks/ as changes to the gate.

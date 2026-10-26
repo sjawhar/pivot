@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import inspect
 import json
+import typing
 from typing import TYPE_CHECKING
 
 import pandas
 import pytest
 
+from pivot import loaders
+from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import data
+from pivot.show import selection as selection_module
 from pivot.types import (
+    ArtifactIdentity,
+    ArtifactRef,
+    ArtifactTag,
     ChangeType,
     DataDiffResult,
     DataFileFormat,
@@ -18,6 +26,8 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from pivot.compose import Pipeline
 
 # =============================================================================
 # Format Detection Tests
@@ -78,6 +88,60 @@ def test_load_dataframe_jsonl(tmp_path: Path) -> None:
 
     assert len(df) == 2
     assert df.iloc[0]["name"] == "alice"
+
+
+def test_dataframe_jsonl_metadata_is_excluded_from_data_readers(tmp_path: Path) -> None:
+    jsonl_file = tmp_path / "pivot.jsonl"
+    frame = pandas.DataFrame(
+        {
+            "timestamp": pandas.to_datetime(pandas.Series(["2024-03-04 12:34:56.123456789", None])),
+            "value": [1, 2],
+        }
+    )
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+
+    loaded = data.load_dataframe(jsonl_file)
+
+    pandas.testing.assert_frame_equal(loaded, frame)
+    assert data.get_schema(jsonl_file) == {
+        "timestamp": "datetime64[ns]",
+        "value": "int64",
+    }
+    assert data.get_row_count(jsonl_file) == 2
+
+
+def test_dataframe_jsonl_schema_and_count_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jsonl_file = tmp_path / "large.jsonl"
+    frame = pandas.DataFrame(
+        {
+            "timestamp": pandas.to_datetime(pandas.Series(["2024-03-04 12:34:56.123456789"] * 101)),
+            "value": list(range(101)),
+        }
+    )
+    loaders.DataFrameJSONL().save(frame, jsonl_file)
+    original_load = loaders.DataFrameJSONL.load
+
+    def load_without_full_read(
+        self: loaders.DataFrameJSONL, path: Path, *, max_rows: int | None = None
+    ) -> pandas.DataFrame:
+        if max_rows is None:
+            raise AssertionError("schema must not load the full JSONL artifact")
+        assert max_rows == 100
+        return original_load(self, path, max_rows=max_rows)
+
+    monkeypatch.setattr(loaders.DataFrameJSONL, "load", load_without_full_read)
+    assert data.get_schema(jsonl_file) == {
+        "timestamp": "datetime64[ns]",
+        "value": "int64",
+    }
+
+    def fail_load(*args: object, **kwargs: object) -> pandas.DataFrame:
+        raise AssertionError("row count must stream JSONL without loading it")
+
+    monkeypatch.setattr(loaders.DataFrameJSONL, "load", fail_load)
+    assert data.get_row_count(jsonl_file) == 101
 
 
 def test_load_dataframe_unsupported(tmp_path: Path) -> None:
@@ -469,7 +533,7 @@ def test_diff_data_files_new_file(tmp_path: Path) -> None:
     new_file = tmp_path / "data.csv"
     new_file.write_text("id,name\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(None, new_file, "data.csv")
+    result = data.diff_data_files(None, new_file, "data.csv", change_type=ChangeType.ADDED)
 
     assert result["old_rows"] is None
     assert result["new_rows"] == 2
@@ -484,11 +548,42 @@ def test_diff_data_files_deleted_file(tmp_path: Path) -> None:
     old_file = tmp_path / "data.csv"
     old_file.write_text("id,name\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(old_file, None, "data.csv")
+    result = data.diff_data_files(old_file, None, "data.csv", change_type=ChangeType.REMOVED)
 
     assert result["old_rows"] == 2
     assert result["new_rows"] is None
     assert result["summary_only"] is True
+
+
+@pytest.mark.parametrize(
+    ("new_text", "change_type", "new_rows", "new_cols"),
+    [
+        pytest.param("id\n1\n2\n3\n", ChangeType.MODIFIED, 3, ["id"], id="modified"),
+        pytest.param(None, ChangeType.REMOVED, None, None, id="removed"),
+    ],
+)
+def test_diff_data_files_reports_an_unreadable_old_side_as_unknown(
+    tmp_path: Path,
+    new_text: str | None,
+    change_type: ChangeType,
+    new_rows: int | None,
+    new_cols: list[str] | None,
+) -> None:
+    """An old side that exists but could not be read keeps its change type, with unknown
+    counts and no schema changes, and its text summary says the HEAD rows are unknown."""
+    new_file = None
+    if new_text is not None:
+        new_file = tmp_path / "data.csv"
+        new_file.write_text(new_text)
+
+    result = data.diff_data_files(None, new_file, "data.csv", change_type=change_type)
+
+    assert result["change_type"] == change_type
+    assert (result["old_rows"], result["new_rows"]) == (None, new_rows)
+    assert (result["old_cols"], result["new_cols"]) == (None, new_cols)
+    assert result["schema_changes"] == []
+    rows_line = "  Rows: unknown -> 3" if new_rows else "  Rows: unknown (removed)"
+    assert data.format_diff_summary(result) == f"data.csv:\n{rows_line}"
 
 
 def test_diff_data_files_reorder_only(tmp_path: Path) -> None:
@@ -498,7 +593,7 @@ def test_diff_data_files_reorder_only(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n3,charlie\n")
     new_file.write_text("id,name\n3,charlie\n1,alice\n2,bob\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv")
+    result = data.diff_data_files(old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED)
 
     assert result["reorder_only"] is True
     assert result["row_changes"] == []
@@ -511,7 +606,9 @@ def test_diff_data_files_with_key(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n")
     new_file.write_text("id,name\n1,alice\n2,bobby\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=["id"])
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["id"]
+    )
 
     assert result["reorder_only"] is False
     assert len(result["row_changes"]) == 1
@@ -526,7 +623,9 @@ def test_diff_data_files_missing_key_column_old(tmp_path: Path) -> None:
     new_file.write_text("id,name,extra\n1,alice,x\n")
 
     with pytest.raises(data.DataError, match="Key column.*not in old file"):
-        data.diff_data_files(old_file, new_file, "data.csv", key_columns=["extra"])
+        data.diff_data_files(
+            old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["extra"]
+        )
 
 
 def test_diff_data_files_missing_key_column_new(tmp_path: Path) -> None:
@@ -537,7 +636,9 @@ def test_diff_data_files_missing_key_column_new(tmp_path: Path) -> None:
     new_file.write_text("id,name\n1,alice\n")
 
     with pytest.raises(data.DataError, match="Key column.*not in new file"):
-        data.diff_data_files(old_file, new_file, "data.csv", key_columns=["extra"])
+        data.diff_data_files(
+            old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=["extra"]
+        )
 
 
 def test_diff_data_files_large_file_summary_only(
@@ -552,7 +653,9 @@ def test_diff_data_files_large_file_summary_only(
     # Monkeypatch the size threshold to trigger large file path
     monkeypatch.setattr(data, "_MAX_IN_MEMORY_SIZE", 1)
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None)
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=None
+    )
 
     assert result["summary_only"] is True
     assert result["row_changes"] == []
@@ -572,7 +675,9 @@ def test_diff_data_files_positional_diff(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,alice\n2,bob\n")
     new_file.write_text("id,name\n1,alice\n2,bobby\n3,carol\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None)
+    result = data.diff_data_files(
+        old_file, new_file, "data.csv", change_type=ChangeType.MODIFIED, key_columns=None
+    )
 
     assert result["reorder_only"] is False
     assert result["summary_only"] is False
@@ -591,7 +696,14 @@ def test_diff_data_files_positional_truncation(tmp_path: Path) -> None:
     old_file.write_text("id,name\n1,a\n2,b\n3,c\n4,d\n5,e\n")
     new_file.write_text("id,name\n1,x\n2,y\n3,z\n4,w\n5,v\n")
 
-    result = data.diff_data_files(old_file, new_file, "data.csv", key_columns=None, max_rows=2)
+    result = data.diff_data_files(
+        old_file,
+        new_file,
+        "data.csv",
+        change_type=ChangeType.MODIFIED,
+        key_columns=None,
+        max_rows=2,
+    )
 
     assert result["truncated"] is True
     # Should only have 2 changes due to max_rows
@@ -646,34 +758,81 @@ def test_diff_data_hashes_change(
 
 
 # =============================================================================
-# Workspace Hash Tests
+# Workspace Selection Tests
 # =============================================================================
 
 
-def test_get_data_hashes_from_workspace(
-    tmp_path: Path,
-    set_project_root: Path,
+def _select(targets: list[str]) -> selection_module.DataSelection:
+    selection = selection_module.select_data_files(targets)
+    assert selection is not None
+    return selection
+
+
+def test_select_data_files_hashes_a_workspace_output(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Get hashes from workspace files."""
-    data_file = tmp_path / "data.csv"
-    data_file.write_text("id,name\n1,alice\n")
+    """A registered data output present in the workspace is hashed and its file recorded."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
+    output = mock_discovery.root / "data" / "process_data.csv"
+    output.parent.mkdir(parents=True)
+    output.write_text("id,name\n1,alice\n")
 
-    result = data.get_data_hashes_from_workspace(["data.csv"])
+    selection = _select(["process_data"])
 
-    assert "data.csv" in result
-    assert result["data.csv"] is not None
-    assert len(result["data.csv"]) == 16  # xxhash64 produces 16 hex chars
+    assert len(selection["workspace_hashes"]["data/process_data.csv"]) == 16  # xxhash64 hex
+    assert selection["workspace_paths"] == {"data/process_data.csv": output}
 
 
-def test_get_data_hashes_from_workspace_missing_file(
-    tmp_path: Path,
-    set_project_root: Path,
+def test_select_data_files_leaves_a_missing_workspace_output_absent(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Missing file returns None hash."""
-    result = data.get_data_hashes_from_workspace(["nonexistent.csv"])
+    """A registered output missing from the workspace has no workspace hash and no path."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
 
-    assert "nonexistent.csv" in result
-    assert result["nonexistent.csv"] is None
+    selection = _select(["data/process_data.csv"])
+
+    assert selection["head_hashes"] == {"data/process_data.csv": None}
+    assert selection["workspace_hashes"] == {}
+    assert selection["workspace_paths"] == {}
+
+
+def test_select_data_files_expands_a_path_directory_output(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory output contributes a hash for each data file, not one for the directory."""
+    _register_stage(
+        mock_discovery,
+        "results",
+        [_ref("results", None, ArtifactTag.DATA, loaders.PathOnly())],
+    )
+    _mock_head_lock(monkeypatch, None)
+    directory = mock_discovery.root / "data" / "results.dat"
+    directory.mkdir(parents=True)
+    (directory / "one.csv").write_text("id\n1\n")
+    (directory / "notes.yaml").write_text("n: 1\n")
+
+    selection = _select(["."])
+
+    assert list(selection["workspace_hashes"]) == ["data/results.dat/one.csv"]
+
+
+def test_select_data_files_warns_about_a_target_that_names_no_output(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A path that is no stage output is named in a warning and not compared."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
+    (mock_discovery.root / "loose.csv").write_text("id\n1\n")
+
+    selection = _select(["loose.csv"])
+
+    assert selection["head_hashes"] == {}
+    assert selection["workspace_hashes"] == {}
+    assert "No CSV, JSON or JSONL stage output matches 'loose.csv'" in caplog.text
 
 
 # =============================================================================
@@ -685,6 +844,7 @@ def test_format_diff_summary_basic(tmp_path: Path) -> None:
     """Format basic diff summary."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=110,
         old_cols=["id", "name"],
@@ -713,6 +873,7 @@ def test_format_diff_summary_reorder_only() -> None:
     """Format reorder-only summary."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=100,
         old_cols=["id", "name"],
@@ -735,6 +896,7 @@ def test_format_diff_table_json() -> None:
     diffs = [
         DataDiffResult(
             path="data.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=10,
             new_rows=10,
             old_cols=["id"],
@@ -765,6 +927,7 @@ def test_format_diff_table_plain_output() -> None:
     diffs = [
         DataDiffResult(
             path="data.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=100,
             new_rows=150,
             old_cols=["id", "name"],
@@ -777,6 +940,7 @@ def test_format_diff_table_plain_output() -> None:
         ),
         DataDiffResult(
             path="train.csv",
+            change_type=ChangeType.MODIFIED,
             old_rows=50,
             new_rows=50,
             old_cols=["x", "y"],
@@ -893,67 +1057,67 @@ def test_restore_data_from_cache_symlink_blocked(
 
 
 # =============================================================================
-# Numpy Encoder Tests
+# JSON encoding of diff values
 # =============================================================================
 
 
-def test_numpy_encoder_integer() -> None:
+def test_json_default_integer() -> None:
     """Encode numpy integer types."""
     import numpy
 
-    result = json.dumps({"value": numpy.int64(42)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.int64(42)}, default=data.json_default)
     assert json.loads(result) == {"value": 42}
 
 
-def test_numpy_encoder_floating() -> None:
-    """Encode numpy floating types (float32 needs custom encoder, float64 is native)."""
+def test_json_default_floating() -> None:
+    """Encode numpy floating types (float32 needs the default, float64 is native)."""
     import numpy
 
-    # numpy.float32 needs custom encoder (numpy.float64 serializes natively)
-    result = json.dumps({"value": numpy.float32(3.14)}, cls=data._NumpyEncoder)
+    # numpy.float32 needs the default (numpy.float64 serializes natively)
+    result = json.dumps({"value": numpy.float32(3.14)}, default=data.json_default)
     parsed = json.loads(result)
     assert abs(parsed["value"] - 3.14) < 0.001
 
 
-def test_numpy_encoder_bool() -> None:
+def test_json_default_bool() -> None:
     """Encode numpy boolean types."""
     import numpy
 
-    result = json.dumps({"value": numpy.bool_(True)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.bool_(True)}, default=data.json_default)
     assert json.loads(result) == {"value": True}
 
 
-def test_numpy_encoder_array() -> None:
+def test_json_default_array() -> None:
     """Encode numpy arrays."""
     import numpy
 
-    result = json.dumps({"value": numpy.array([1, 2, 3])}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": numpy.array([1, 2, 3])}, default=data.json_default)
     assert json.loads(result) == {"value": [1, 2, 3]}
 
 
-def test_numpy_encoder_timestamp() -> None:
+def test_json_default_timestamp() -> None:
     """Encode pandas Timestamp."""
-    result = json.dumps({"value": pandas.Timestamp("2024-01-01")}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.Timestamp("2024-01-01")}, default=data.json_default)
     parsed = json.loads(result)
     assert "2024-01-01" in parsed["value"]
 
 
-def test_numpy_encoder_timedelta() -> None:
+def test_json_default_timedelta() -> None:
     """Encode pandas Timedelta."""
-    result = json.dumps({"value": pandas.Timedelta(days=1)}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.Timedelta(days=1)}, default=data.json_default)
     parsed = json.loads(result)
     assert "1 day" in parsed["value"]
 
 
-def test_numpy_encoder_pandas_na() -> None:
+def test_json_default_pandas_na() -> None:
     """Encode pandas.NA as None."""
-    result = json.dumps({"value": pandas.NA}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.NA}, default=data.json_default)
     assert json.loads(result) == {"value": None}
 
 
-def test_numpy_encoder_nat() -> None:
+def test_json_default_nat() -> None:
     """Encode NaT as None."""
-    result = json.dumps({"value": pandas.NaT}, cls=data._NumpyEncoder)
+    result = json.dumps({"value": pandas.NaT}, default=data.json_default)
     assert json.loads(result) == {"value": None}
 
 
@@ -1038,6 +1202,7 @@ def test_format_diff_summary_removed_file() -> None:
     """Format summary for removed file."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.REMOVED,
         old_rows=50,
         new_rows=None,
         old_cols=["id", "name"],
@@ -1059,6 +1224,7 @@ def test_format_diff_summary_added_file() -> None:
     """Format summary for added file."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.ADDED,
         old_rows=None,
         new_rows=100,
         old_cols=None,
@@ -1080,6 +1246,7 @@ def test_format_diff_summary_with_schema_changes() -> None:
     """Format summary with various schema changes."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=100,
         old_cols=["id", "old_col", "modified_col"],
@@ -1118,6 +1285,7 @@ def test_format_diff_summary_with_row_changes() -> None:
     """Format summary with row changes."""
     result = DataDiffResult(
         path="data.csv",
+        change_type=ChangeType.MODIFIED,
         old_rows=100,
         new_rows=105,
         old_cols=["id", "name"],
@@ -1235,248 +1403,156 @@ def test_get_schema_unsupported(tmp_path: Path) -> None:
 
 
 # =============================================================================
-# Registry Integration Tests (with mocking)
+# select_data_files HEAD-side Tests (registered stages, mocked git HEAD)
 # =============================================================================
 
 
-def test_get_data_outputs_from_stages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Get data outputs from mocked cli_helpers."""
-    from pivot import loaders, outputs, project
-    from pivot.cli import helpers as cli_helpers
+def _register_stage(test_pipeline: PipelineLike, name: str, outs: list[ArtifactRef]) -> None:
+    def _stage_func() -> None:
+        pass
 
-    # Mock project root
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
-
-    # Define mock stage info
-    stage_info: dict[str, dict[str, object]] = {
-        "process_data": {
-            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-            "deps": [],
-            "func": lambda: None,
-            "params": None,
-        },
-        "train_model": {
-            "outs": [
-                outputs.Out("model.pkl", loader=loaders.PathOnly()),
-                outputs.Metric("metrics.json"),
-            ],
-            "deps": [],
-            "func": lambda: None,
-            "params": None,
-        },
-    }
-    default_stage: dict[str, object] = {
-        "outs": [],
-        "deps": [],
-        "func": lambda: None,
-        "params": None,
-    }
-
-    def mock_list_stages() -> list[str]:
-        return ["process_data", "train_model"]
-
-    def mock_get_stage(name: str) -> dict[str, object]:
-        return stage_info.get(name, default_stage)
-
-    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
-    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
-
-    result = data.get_data_outputs_from_stages()
-
-    # Only CSV files should be included (not metrics, not pkl)
-    assert "process_data" in result
-    assert result["process_data"] == "output.csv"
-    assert "train_model" not in result  # model.pkl is unknown format
+    pipeline = typing.cast("Pipeline", test_pipeline)
+    pipeline._registry._stages[name] = RegistryStageInfo(
+        func=_stage_func,
+        name=name,
+        deps={},
+        outs=outs,
+        incremental_inputs={},
+        params=None,
+        resources={},
+        variant=None,
+        signature=inspect.signature(_stage_func),
+        fingerprint={"_code": "fake_hash"},
+        params_arg_name=None,
+        state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
+        code_deps=[],
+        input_paths={},
+        unsafe_fingerprint=False,
+    )
 
 
-def test_get_data_hashes_from_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Get data hashes from mocked cli_helpers and git HEAD."""
-    from pivot import git, loaders, outputs, project
-    from pivot.cli import helpers as cli_helpers
+def _ref(
+    stage: str, key: str | None, tag: ArtifactTag, fmt: loaders.Writer[typing.Any]
+) -> ArtifactRef:
+    return ArtifactRef(
+        identity=ArtifactIdentity(stage, key), format=fmt, python_type=object, tag=tag
+    )
 
-    # Mock project root
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    # Define mock stage info
-    stage_info: dict[str, dict[str, object]] = {
-        "process_data": {
-            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-            "deps": [],
-            "func": lambda: None,
-            "params": None,
-        },
-    }
-    default_stage: dict[str, object] = {
-        "outs": [],
-        "deps": [],
-        "func": lambda: None,
-        "params": None,
-    }
+def _register_csv_stage(test_pipeline: PipelineLike) -> None:
+    """Register process_data with one CSV output, written by pivot to data/process_data.csv."""
+    _register_stage(
+        test_pipeline,
+        "process_data",
+        [_ref("process_data", None, ArtifactTag.DATA, loaders.CSV())],
+    )
 
-    def mock_list_stages() -> list[str]:
-        return ["process_data"]
 
-    def mock_get_stage(name: str) -> dict[str, object]:
-        return stage_info.get(name, default_stage)
+def _mock_head_lock(monkeypatch: pytest.MonkeyPatch, content: bytes | None) -> None:
+    from pivot import git
 
-    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
-    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
+    files = {} if content is None else {".pivot/stages/process_data.lock": content}
 
-    # Mock git.read_files_from_head to return a lock file
-    lock_content = """
+    def _read_files_from_head(paths: list[str]) -> dict[str, bytes]:
+        return files
+
+    monkeypatch.setattr(git, "read_files_from_head", _read_files_from_head)
+
+
+def test_select_data_files_only_includes_data_outputs_at_head(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CSV/JSON data outputs are diffable; metric, plot and unknown-format outputs are not."""
+    _register_csv_stage(mock_discovery)
+    _register_stage(
+        mock_discovery,
+        "train_model",
+        [
+            _ref("train_model", "model", ArtifactTag.DATA, loaders.Pickle()),
+            _ref("train_model", "score", ArtifactTag.METRIC, loaders.JSON()),
+            _ref("train_model", "chart", ArtifactTag.PLOT, loaders.MatplotlibFigure()),
+        ],
+    )
+    _mock_head_lock(monkeypatch, None)
+
+    result = _select(["."])["head_hashes"]
+
+    assert result == {"data/process_data.csv": None}
+
+
+def test_select_data_files_reads_head_hash(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HEAD lock's hash is returned under the output's workspace path."""
+    _register_csv_stage(mock_discovery)
+    lock_content = b"""
 code_manifest:
   func:main: abc123
 params: {}
 deps: []
 outs:
-  - path: output.csv
-    hash: deadbeef
+  - key: null
+    hash: deadbeef00000000
+    tag: data
 """
+    _mock_head_lock(monkeypatch, lock_content)
 
-    def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/stages/process_data.lock": lock_content}
+    result = _select(["."])["head_hashes"]
 
-    monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
-
-    result = data.get_data_hashes_from_head()
-
-    assert "output.csv" in result
-    assert result["output.csv"] == "deadbeef"
+    assert result == {"data/process_data.csv": "deadbeef00000000"}
 
 
-def test_get_data_hashes_from_head_no_lock_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_select_data_files_head_no_lock_file(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handle missing lock file gracefully."""
-    from pivot import git, loaders, outputs, project
-    from pivot.cli import helpers as cli_helpers
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    result = _select(["."])["head_hashes"]
 
-    def mock_list_stages() -> list[str]:
-        return ["process_data"]
-
-    def mock_get_stage(name: str) -> dict[str, object]:
-        return {
-            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-            "deps": [],
-            "func": lambda: None,
-            "params": None,
-        }
-
-    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
-    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
-
-    # No lock file found
-    def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {}
-
-    monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
-
-    result = data.get_data_hashes_from_head()
-
-    assert "output.csv" in result
-    assert result["output.csv"] is None  # No hash available
+    assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_invalid_yaml(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_select_data_files_head_invalid_yaml(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handle invalid YAML in lock file gracefully."""
-    from pivot import git, loaders, outputs, project
-    from pivot.cli import helpers as cli_helpers
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, b"invalid: yaml: content: [")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    result = _select(["."])["head_hashes"]
 
-    def mock_list_stages() -> list[str]:
-        return ["process_data"]
-
-    def mock_get_stage(name: str) -> dict[str, object]:
-        return {
-            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-            "deps": [],
-            "func": lambda: None,
-            "params": None,
-        }
-
-    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
-    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
-
-    # Invalid YAML
-    def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/stages/process_data.lock": "invalid: yaml: content: ["}
-
-    monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
-
-    result = data.get_data_hashes_from_head()
-
-    assert "output.csv" in result
-    assert result["output.csv"] is None  # Couldn't parse
+    assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_missing_outs_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_select_data_files_head_missing_outs_key(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handle lock file missing outs key."""
-    from pivot import git, loaders, outputs, project
-    from pivot.cli import helpers as cli_helpers
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, b"fingerprint: abc123\n")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    result = _select(["."])["head_hashes"]
 
-    def mock_list_stages() -> list[str]:
-        return ["process_data"]
-
-    def mock_get_stage(name: str) -> dict[str, object]:
-        return {
-            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-            "deps": [],
-            "func": lambda: None,
-            "params": None,
-        }
-
-    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
-    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
-
-    # Lock file without outs key
-    def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/stages/process_data.lock": "fingerprint: abc123\n"}
-
-    monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
-
-    result = data.get_data_hashes_from_head()
-
-    assert result["output.csv"] is None
+    assert result == {"data/process_data.csv": None}
 
 
-def test_get_data_hashes_from_head_outs_not_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_select_data_files_head_outs_not_list(
+    mock_discovery: PipelineLike,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handle lock file where outs is not a list."""
-    from pivot import git, loaders, outputs, project
-    from pivot.cli import helpers as cli_helpers
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, b"outs: not_a_list\n")
 
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    result = _select(["."])["head_hashes"]
 
-    def mock_list_stages() -> list[str]:
-        return ["process_data"]
-
-    def mock_get_stage(name: str) -> dict[str, object]:
-        return {
-            "outs": [outputs.Out("output.csv", loader=loaders.PathOnly())],
-            "deps": [],
-            "func": lambda: None,
-            "params": None,
-        }
-
-    monkeypatch.setattr(cli_helpers, "list_stages", mock_list_stages)
-    monkeypatch.setattr(cli_helpers, "get_stage", mock_get_stage)
-
-    # Lock file with outs as string instead of list
-    def mock_read_files(paths: list[str]) -> dict[str, str | None]:
-        return {".pivot/stages/process_data.lock": "outs: not_a_list\n"}
-
-    monkeypatch.setattr(git, "read_files_from_head", mock_read_files)
-
-    result = data.get_data_hashes_from_head()
-
-    assert result["output.csv"] is None
+    assert result == {"data/process_data.csv": None}

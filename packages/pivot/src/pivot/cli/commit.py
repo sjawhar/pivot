@@ -19,8 +19,10 @@ def commit_command(ctx: click.Context, stages: tuple[str, ...]) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    stage_names = list(stages) if stages else None
-    committed, failed = commit.commit_stages(stage_names)
+    stage_names = cli_helpers.resolve_stage_names(list(stages) if stages else None)
+    committed, failed = commit.commit_stages(
+        cli_helpers.get_pipeline(), stage_names, warn_left_out_symlinks=not quiet
+    )
 
     if not quiet:
         if committed:

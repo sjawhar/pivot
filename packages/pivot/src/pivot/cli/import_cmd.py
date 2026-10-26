@@ -11,7 +11,9 @@ from pivot.cli import decorators as cli_decorators
 @click.argument("repo_url")
 @click.argument("path")
 @click.option("--rev", default="main", help="Git ref to import from (branch, tag, commit)")
-@click.option("--out", default=None, help="Local output path (default: same as source path)")
+@click.option(
+    "--out", default=None, help="Local output path (default: the artifact's name, '/' for ':')"
+)
 @click.option("--force", is_flag=True, help="Overwrite existing files")
 @click.option("--no-download", is_flag=True, help="Create .pvt metadata without downloading")
 def import_cmd(

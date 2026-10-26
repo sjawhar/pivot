@@ -17,18 +17,61 @@ Responsibilities retained by Engine:
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING
 
+from pivot import project
+from pivot import types as pivot_types
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import StageExecutionState
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Callable
 
     import networkx as nx
 
-__all__ = ["WatchCoordinator"]
+    from pivot.registry import RegistryStageInfo
+    from pivot.storage.store import WorkspaceStore
+
+__all__ = ["WatchCoordinator", "build_artifact_paths", "get_watch_paths"]
+
+
+def build_artifact_paths(
+    stages: dict[str, RegistryStageInfo],
+    store: WorkspaceStore,
+) -> dict[pathlib.Path, pivot_types.ArtifactIdentity]:
+    """Resolve every pipeline artifact identity to its workspace path."""
+    paths = dict[pathlib.Path, pivot_types.ArtifactIdentity]()
+    output_identities = set[pivot_types.ArtifactIdentity]()
+
+    for info in stages.values():
+        for out in info["outs"]:
+            path = project.normalize_path(store.resolve_display_path(out))
+            paths[path] = out.identity
+            output_identities.add(out.identity)
+
+    for info in stages.values():
+        for dep in info["deps"].values():
+            if pivot_types.source_identity(dep) in output_identities:
+                continue
+            path = project.normalize_path(store.checkout(dep))
+            paths[path] = dep.identity
+
+    return paths
+
+
+def get_watch_paths(
+    project_root: pathlib.Path,
+    artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity],
+) -> list[pathlib.Path]:
+    """Watch project sources plus existing artifact paths outside the project."""
+    root = project.normalize_path(project_root)
+    paths = {root}
+    for path in artifact_paths:
+        if path.is_relative_to(root) or not path.exists():
+            continue
+        paths.add(path if path.is_dir() else path.parent)
+    return sorted(paths)
 
 
 class WatchCoordinator:
@@ -40,17 +83,97 @@ class WatchCoordinator:
     """
 
     _graph: nx.DiGraph[str]
+    _artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity]
+    _resolved_output_paths: dict[tuple[pathlib.Path, str], list[pivot_types.ArtifactIdentity]]
+    _resolved_input_paths: dict[pathlib.Path, list[pivot_types.ArtifactIdentity]]
 
-    def __init__(self, graph: nx.DiGraph[str]) -> None:
+    def __init__(
+        self,
+        graph: nx.DiGraph[str],
+        artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity],
+    ) -> None:
         self._graph = graph
+        self._artifact_paths = artifact_paths
+        self._rebuild_resolved_path_indexes()
+
+    def _rebuild_resolved_path_indexes(self) -> None:
+        """Rebuild the input and output aliases used for physical watch paths."""
+        self._resolved_input_paths = dict[pathlib.Path, list[pivot_types.ArtifactIdentity]]()
+        self._resolved_output_paths = dict[
+            tuple[pathlib.Path, str], list[pivot_types.ArtifactIdentity]
+        ]()
+        for artifact_path, identity in self._artifact_paths.items():
+            if engine_graph.get_producer(self._graph, identity) is None:
+                self._resolved_input_paths.setdefault(
+                    artifact_path.resolve(), list[pivot_types.ArtifactIdentity]()
+                ).append(identity)
+                continue
+            key = (artifact_path.parent.resolve(), artifact_path.name)
+            self._resolved_output_paths.setdefault(
+                key, list[pivot_types.ArtifactIdentity]()
+            ).append(identity)
+
+    def _refresh_resolved_path_indexes_for(self, path: pathlib.Path) -> None:
+        """Refresh aliases after a symlink or watched directory changes."""
+        if path.is_symlink() or path.is_dir():
+            self._rebuild_resolved_path_indexes()
 
     @property
     def graph(self) -> nx.DiGraph[str]:
         return self._graph
 
-    @graph.setter
-    def graph(self, g: nx.DiGraph[str]) -> None:
-        self._graph = g
+    @property
+    def artifact_paths(self) -> dict[pathlib.Path, pivot_types.ArtifactIdentity]:
+        """Filesystem paths resolved for the graph's artifact identities."""
+        return self._artifact_paths
+
+    def resolve_identity(self, path: pathlib.Path) -> pivot_types.ArtifactIdentity | None:
+        """Resolve a filesystem event path to the matching artifact identity."""
+        self._refresh_resolved_path_indexes_for(path)
+        outputs = self._matching_resolved_output_identities(path)
+        if outputs:
+            return outputs[0]
+        current = project.normalize_path(path)
+        while True:
+            identity = self._artifact_paths.get(current)
+            if identity is not None:
+                return identity
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
+
+    def _matching_identities(self, path: pathlib.Path) -> list[pivot_types.ArtifactIdentity]:
+        """Return identities whose resolved paths contain a filesystem event path."""
+        current = project.normalize_path(path)
+        identities = list[pivot_types.ArtifactIdentity]()
+        while True:
+            identity = self._artifact_paths.get(current)
+            if identity is not None:
+                identities.append(identity)
+            parent = current.parent
+            if parent == current:
+                return identities
+            current = parent
+
+    def _matching_resolved_input_identities(
+        self, path: pathlib.Path
+    ) -> list[pivot_types.ArtifactIdentity]:
+        resolved_path = path.resolve()
+        identities = list[pivot_types.ArtifactIdentity]()
+        current = resolved_path
+        while True:
+            identities.extend(self._resolved_input_paths.get(current, []))
+            parent = current.parent
+            if parent == current:
+                return identities
+            current = parent
+
+    def _matching_resolved_output_identities(
+        self, path: pathlib.Path
+    ) -> list[pivot_types.ArtifactIdentity]:
+        """Return output identities by resolved parent directory and logical leaf name."""
+        return self._resolved_output_paths.get((path.parent.resolve(), path.name), [])
 
     def should_filter_path(
         self,
@@ -58,40 +181,46 @@ class WatchCoordinator:
         *,
         get_stage_state: Callable[[str], StageExecutionState],
     ) -> bool:
-        """Check if a path change should be filtered (produced by an executing stage).
-
-        Returns True if the path's producer stage is currently between
-        PREPARING and COMPLETED (exclusive) — i.e., PREPARING, WAITING_ON_LOCK,
-        or RUNNING.
-        """
-        producer = engine_graph.get_producer(self._graph, path)
+        """Check if a path change should be filtered (produced by an executing stage)."""
+        identity = self.resolve_identity(path)
+        if identity is None:
+            return False
+        producer = engine_graph.get_producer(self._graph, identity)
         if producer is None:
             return False
         state = get_stage_state(producer)
         return StageExecutionState.PREPARING <= state < StageExecutionState.COMPLETED
 
     def get_affected_stages(self, paths: list[pathlib.Path]) -> list[str]:
-        """Get all stages affected by the given path changes (including downstream).
-
-        Deduplicates across paths. Returns a sorted list for deterministic ordering.
-        """
+        """Get all stages affected by the changed paths, including downstream."""
         affected = set[str]()
         for path in paths:
-            consumers = engine_graph.get_consumers(self._graph, path)
-            affected.update(consumers)
-            for stage in consumers:
-                downstream = engine_graph.get_downstream_stages(self._graph, stage)
-                affected.update(downstream)
+            self._refresh_resolved_path_indexes_for(path)
+            output_identities = set(self._matching_resolved_output_identities(path))
+            if output_identities:
+                identities = output_identities
+            else:
+                logical_identities = set(self._matching_identities(path))
+                identities = logical_identities.copy()
+                if all(
+                    engine_graph.get_producer(self._graph, identity) is None
+                    for identity in logical_identities
+                ):
+                    identities.update(self._matching_resolved_input_identities(path))
+            for identity in identities:
+                consumers = engine_graph.get_consumers(self._graph, identity)
+                affected.update(consumers)
+                for stage in consumers:
+                    affected.update(engine_graph.get_downstream_stages(self._graph, stage))
         return sorted(affected)
 
     def get_producer(self, path: pathlib.Path) -> str | None:
         """Get the stage that produces a given artifact path."""
-        return engine_graph.get_producer(self._graph, path)
+        identity = self.resolve_identity(path)
+        if identity is None:
+            return None
+        return engine_graph.get_producer(self._graph, identity)
 
     def should_restart_workers(self, *, parallel: bool) -> bool:
-        """Decide whether worker pool should restart after code/config change.
-
-        Workers should restart to pick up reloaded code, but only when
-        running in parallel mode (sequential mode has no persistent pool).
-        """
+        """Decide whether a parallel reload replaces its workers before its re-run."""
         return parallel

@@ -7,20 +7,20 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
-from pivot import config, exceptions, path_utils, project, registry
+from pivot import config, exceptions, project, registry, types
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
-from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
 from pivot.storage import lock
 from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
+
+    from pivot.remote import protocol
 
 
 VerifyStatus = Literal["passed", "failed"]
@@ -79,29 +79,87 @@ def _get_stage_lock_hashes(
         return {}, {}
 
     # Filter non-cached outputs — they're git-tracked, not in cache
-    project_root = project.get_project_root()
-    cached_paths = {
-        path_utils.canonicalize_artifact_path(str(out.path), project_root)
-        for out in stage_info["outs"]
-        if out.cache
+    workspace_store = cli_helpers.get_workspace_store()
+    output_refs = {types.identity_key(out.identity): out for out in stage_info["outs"]}
+    cached_identity_keys = {
+        identity_key
+        for identity_key, out in output_refs.items()
+        if out.tag is not types.ArtifactTag.METRIC
     }
-    cached_output_hashes: dict[str, HashInfo] = {
-        path: h
-        for path, h in lock_data["output_hashes"].items()
-        if path_utils.canonicalize_artifact_path(path, project_root) in cached_paths
-    }
+    cached_output_hashes: dict[str, HashInfo] = {}
+    for identity, hash_info in lock_data["output_hashes"].items():
+        identity_key = types.identity_key(identity)
+        if identity_key in cached_identity_keys:
+            if workspace_store is not None and identity_key in output_refs:
+                display_path = workspace_store.resolve_display_path(output_refs[identity_key])
+                resolved_path = project.to_relative_path(display_path)
+            else:
+                resolved_path = identity_key
+            cached_output_hashes[resolved_path] = hash_info
+
+    # Key deps by workspace path: upstream stage outputs at their output path,
+    # raw inputs at their input binding (data/raw/<name> by default).
+    stage_names = set(cli_helpers.list_stages())
+    dep_refs = {ref.identity: ref for ref in stage_info["deps"].values()}
+    dep_hashes = dict[str, HashInfo]()
+    for identity, hash_info in lock_data["dep_hashes"].items():
+        ref = dep_refs.get(identity)
+        if workspace_store is None or ref is None:
+            dep_hashes[types.identity_key(identity)] = hash_info
+            continue
+        dep_path = (
+            workspace_store.resolve_display_path(ref)
+            if identity.producer in stage_names
+            else workspace_store.checkout(ref)
+        )
+        dep_hashes[project.to_relative_path(dep_path)] = hash_info
 
     return (
         _extract_file_hashes(cached_output_hashes),
-        _extract_file_hashes(lock_data["dep_hashes"]),
+        _extract_file_hashes(dep_hashes),
     )
+
+
+def _get_stage_missing_workspace_files(
+    stage_name: str,
+    project_root: pathlib.Path,
+) -> list[str]:
+    """Get output workspace files that are missing from disk for a non-stale stage.
+
+    Returns list of relative paths for output files that don't exist on disk.
+    Excludes metric outputs (git-tracked, not workspace files).
+    """
+    output_hashes, _ = _get_stage_lock_hashes(stage_name)
+    missing = list[str]()
+    for rel_path in output_hashes:
+        if not (project_root / rel_path).exists():
+            missing.append(rel_path)
+    return missing
+
+
+def _get_stage_misplaced_directory_outputs(stage_name: str) -> list[str]:
+    """Get the paths of a stage's directory outputs that hold something other than a directory.
+
+    ``pivot commit`` records whatever sits at an output's path, so a file there can carry a
+    valid lock and cache entry while every consumer of the directory fails to read it.
+    """
+    stage_info = cli_helpers.get_stage(stage_name)
+    workspace_store = cli_helpers.require_workspace_store()
+    misplaced = list[str]()
+    for out in stage_info["outs"]:
+        if out.tag is not types.ArtifactTag.DIRECTORY:
+            continue
+        path = workspace_store.resolve_display_path(out)
+        if path.exists() and not path.is_dir():
+            misplaced.append(project.to_relative_path(path))
+    return misplaced
 
 
 def _get_stage_missing_hashes(
     stage_name: str,
     local_hashes: set[str],
     allow_missing: bool,
-    project_root: Path,
+    project_root: pathlib.Path,
 ) -> dict[str, list[str]]:
     """Get hashes missing from local cache for a stage.
 
@@ -131,7 +189,7 @@ def _get_stage_missing_hashes(
     return hash_to_paths
 
 
-def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
+def _create_remote_if_needed(allow_missing: bool) -> protocol.RemoteStorage | None:
     """Create remote connection if allow_missing mode requires it."""
     if not allow_missing:
         return None
@@ -151,14 +209,37 @@ def _create_remote_if_needed(allow_missing: bool) -> remote_mod.S3Remote | None:
     return remote
 
 
+def _status_from_explanations(
+    explanations: list[types.StageExplanation],
+) -> list[PipelineStatusInfo]:
+    """Convert rich explanations to verification status, retaining changed dep identities."""
+    statuses = list[PipelineStatusInfo]()
+    for explanation in explanations:
+        reason = explanation["reason"]
+        if reason == "Input dependencies changed" and explanation["dep_changes"]:
+            changed = ", ".join(
+                types.identity_key(change["identity"]) for change in explanation["dep_changes"]
+            )
+            reason = f"{reason}: {changed}"
+        statuses.append(
+            PipelineStatusInfo(
+                name=explanation["stage_name"],
+                status=(PipelineStatus.STALE if explanation["will_run"] else PipelineStatus.CACHED),
+                reason=reason,
+                upstream_stale=explanation["upstream_stale"],
+            )
+        )
+    return statuses
+
+
 def _verify_stages(
     pipeline_status: list[PipelineStatusInfo],
-    cache_dir: Path,
+    cache_dir: pathlib.Path,
     allow_missing: bool,
 ) -> tuple[bool, list[StageVerifyInfo]]:
     """Verify all stages and return pass/fail status with details.
 
-    Batches all S3 existence checks into a single call for performance.
+    Batches all remote existence checks into a single call for performance.
     """
     remote = _create_remote_if_needed(allow_missing)
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
@@ -177,7 +258,7 @@ def _verify_stages(
         stage_hash_to_paths[stage_info["name"]] = hash_to_paths
         all_missing_hashes.update(hash_to_paths.keys())
 
-    # Phase 2: Single batched S3 existence check for all hashes
+    # Phase 2: Single batched remote existence check for all hashes
     remote_exists = dict[str, bool]()
     if all_missing_hashes and remote is not None:
         try:
@@ -205,8 +286,21 @@ def _verify_stages(
             )
             continue
 
+        misplaced = _get_stage_misplaced_directory_outputs(stage_name)
+        if misplaced:
+            results.append(
+                StageVerifyInfo(
+                    name=stage_name,
+                    status="failed",
+                    reason=f"Not a directory, but a directory output: {', '.join(misplaced)}",
+                    missing_files=[],
+                )
+            )
+            continue
+
         hash_to_paths = stage_hash_to_paths[stage_name]
 
+        # Determine missing files based on mode
         # Determine missing files based on mode
         if not hash_to_paths:
             missing_files = list[str]()
@@ -221,6 +315,13 @@ def _verify_stages(
         else:
             # Without allow_missing, all locally missing hashes are failures
             missing_files = [p for paths in hash_to_paths.values() for p in paths]
+        # Check workspace output files exist on disk (even if hash is in cache)
+        # This catches the case where outputs were deleted from the workspace
+        # but the hash is still in the local cache.
+        if not missing_files and not allow_missing:
+            missing_workspace = _get_stage_missing_workspace_files(stage_name, project_root)
+            if missing_workspace:
+                missing_files = missing_workspace
 
         # Create result based on whether any files are missing
         if missing_files:
@@ -289,9 +390,7 @@ def verify(
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    # Validate stages exist
-    stages_list = cli_helpers.stages_to_list(stages)
-    cli_helpers.validate_stages_exist(stages_list)
+    stages_list = cli_helpers.resolve_stage_names(cli_helpers.stages_to_list(stages))
 
     # Check if any stages are registered
     all_stages = cli_helpers.get_all_stages()
@@ -300,14 +399,16 @@ def verify(
 
     cache_dir = config.get_cache_dir()
 
-    # Get pipeline status (uses default state directory internally)
-    pipeline_status, _ = status_mod.get_pipeline_status(
+    # Get rich explanations so lock-only dependency mismatches identify the
+    # producer artifact in verification output.
+    explanations = status_mod.get_pipeline_explanations(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=cli_helpers.get_registry(),
+        pipeline=cli_helpers.get_pipeline(),
         allow_missing=allow_missing,
     )
+    pipeline_status = _status_from_explanations(explanations)
 
     if not pipeline_status:
         raise click.ClickException("No stages to verify.")

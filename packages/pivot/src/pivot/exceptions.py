@@ -1,3 +1,4 @@
+import pathlib
 from difflib import get_close_matches
 from typing import override
 
@@ -42,16 +43,16 @@ class SecurityValidationError(PivotError):
     """
 
 
-class OutputDuplicationError(ValidationError):
-    """Raised when two stages produce the same output."""
-
-
-class OverlappingOutputPathsError(ValidationError):
-    """Raised when output paths overlap (one is parent/child of another)."""
-
-
 class InvalidPathError(ValidationError):
     """Raised when a path is invalid (e.g., resolves outside project root)."""
+
+
+class OutputPathConflictError(ValidationError):
+    """Raised when two outputs resolve to the same workspace path, or one lies inside another."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Rename a stage, pipeline or output so each output has its own path"
 
 
 class DAGError(PivotError):
@@ -72,19 +73,43 @@ class DependencyNotFoundError(DAGError):
     _stage: str
     _dep: str
     _available: list[str]
+    _input_path: pathlib.Path | None
+    _input_path_display: str | None
 
     def __init__(
         self,
         stage: str,
         dep: str,
         available_outputs: list[str] | None = None,
+        input_path: pathlib.Path | None = None,
+        input_path_display: str | None = None,
     ) -> None:
         self._stage = stage
         self._dep = dep
         self._available = available_outputs or []
-        super().__init__(
-            f"Stage '{stage}' depends on '{dep}' which is not produced by any stage and does not exist on disk"
-        )
+        self._input_path = input_path
+        self._input_path_display = input_path_display
+        if input_path is None:
+            message = (
+                f"Stage '{stage}' depends on '{dep}' which is not produced by any stage "
+                + "and does not exist on disk"
+            )
+        else:
+            display_path = input_path_display or str(input_path)
+            message = (
+                f"Stage '{stage}' depends on input '{dep}' (path {display_path}), "
+                + "which does not exist"
+            )
+        super().__init__(message)
+
+    @property
+    def stage(self) -> str:
+        return self._stage
+
+    @property
+    def input_path(self) -> pathlib.Path | None:
+        """The missing input's filesystem path; None for a missing stage output."""
+        return self._input_path
 
     @override
     def format_user_message(self) -> str:
@@ -98,8 +123,42 @@ class DependencyNotFoundError(DAGError):
         return "Ensure the file exists or is produced by another stage"
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[str, str, list[str]]]:
-        return (self.__class__, (self._stage, self._dep, self._available))
+    def __reduce__(
+        self,
+    ) -> tuple[type, tuple[str, str, list[str], pathlib.Path | None, str | None]]:
+        return (
+            self.__class__,
+            (self._stage, self._dep, self._available, self._input_path, self._input_path_display),
+        )
+
+
+class MultipleDependencyError(DAGError):
+    """Raised when multiple dependencies are missing."""
+
+    _errors: list[DependencyNotFoundError]
+
+    def __init__(self, errors: list[DependencyNotFoundError]) -> None:
+        self._errors = errors
+        super().__init__(f"{len(errors)} missing dependency error(s)")
+
+    @property
+    def errors(self) -> list[DependencyNotFoundError]:
+        return self._errors
+
+    @override
+    def format_user_message(self) -> str:
+        lines = [f"{len(self._errors)} missing dependency error(s):"]
+        for err in self._errors:
+            lines.append(f"  - {err.format_user_message()}")
+        return "\n".join(lines)
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Ensure all dependency files exist or are produced by other stages"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[list[DependencyNotFoundError]]]:
+        return (self.__class__, (self._errors,))
 
 
 class StageNotFoundError(DAGError):
@@ -154,18 +213,6 @@ class ExecutionError(PivotError):
     """Raised when pipeline execution fails."""
 
 
-class DVCCompatError(PivotError):
-    """Base class for DVC compatibility errors."""
-
-
-class ExportError(DVCCompatError):
-    """Raised when stage export to DVC format fails."""
-
-
-class DVCImportError(DVCCompatError):
-    """Raised when dvc.yaml import fails."""
-
-
 class CacheError(PivotError):
     """Base class for cache-related errors."""
 
@@ -179,7 +226,30 @@ class CacheRestoreError(CacheError):
 
 
 class UncachedIncrementalOutputError(CacheError):
-    """Raised when an IncrementalOut file exists but is not in cache."""
+    """Raised when an incremental output exists without a cache entry."""
+
+
+class CacheModeCollisionError(CacheError):
+    """A HARDLINK/SYMLINK checkout shares the cache object's own permissions and found it
+    already recorded with the wrong executable bit, with no COPY fallback available.
+
+    This happens when two files with identical content disagree on their executable bit (the
+    cache key is content-only) or when a cache object was populated by a path that does not
+    know a file's intended executable bit (e.g. `pivot pull`, which downloads by hash alone).
+    Pivot never changes a published cache object, so only a private copy, or the object deleted
+    and published again from bytes that carry the right bit, can give the file its bit.
+    """
+
+    @override
+    def get_suggestion(self) -> str:
+        return (
+            "Add CheckoutMode.COPY to checkout_modes (cache: checkout_mode: [..., copy] in "
+            ".pivot/config.yaml) so checkout can fall back to a private, correctly-permissioned "
+            "copy instead of sharing the cache object's own permissions; or delete the cache "
+            "object the error names, then re-run what produced the file (`pivot repro --force "
+            "<stage>`, `pivot track --force <path>`) to publish it with the right bit; until it "
+            "is published again, any workspace file symlinked to it is broken"
+        )
 
 
 class ParamsError(PivotError):
@@ -271,7 +341,7 @@ class InvalidRemoteURLError(RemoteError):
 
     @override
     def get_suggestion(self) -> str:
-        return "Use format: s3://bucket/path, gs://bucket/path, or /local/path"
+        return "Use format: s3://bucket/prefix or gs://bucket/prefix"
 
 
 class RemoteTransferError(RemoteError):
@@ -334,9 +404,13 @@ class ProjectNotInitializedError(InitError):
         return "Run 'pivot init' in your project root to initialize Pivot"
 
 
+class PipelineConfigError(PivotError):
+    """Raised when pipeline configuration is invalid."""
+
+
 class PipelineNotFoundError(PivotError):
-    """Raised when no pipeline is found (no pivot.yaml or pipeline.py)."""
+    """Raised when no pipeline is found (no pipeline.py)."""
 
     @override
     def get_suggestion(self) -> str:
-        return "Create pivot.yaml or pipeline.py to define your pipeline"
+        return "Create pipeline.py to define your pipeline"

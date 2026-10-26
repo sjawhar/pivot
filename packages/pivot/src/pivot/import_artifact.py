@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
+import os
 import pathlib
+import shlex
+import tempfile
 from typing import TYPE_CHECKING, TypedDict, cast
 
 import aiohttp
 import yaml
 
-from pivot import exceptions, project
+from pivot import exceptions, project, types
 from pivot.remote import config as remote_config
-from pivot.remote import git_archive, github
-from pivot.remote import storage as remote_storage
+from pivot.remote import git_archive, github, protocol
 from pivot.storage import cache, track
 from pivot.storage import lock as storage_lock
 
@@ -37,6 +40,31 @@ class ImportResult(TypedDict):
     pvt_path: str
     data_path: str
     downloaded: bool
+
+
+async def _download_verified(remote_url: str, file_hash: str, data_path: pathlib.Path) -> int:
+    """Download ``file_hash`` to ``data_path`` only if its content matches; return its size.
+
+    The file is downloaded to a temp file in the destination directory and moved over
+    ``data_path`` after its hash is checked, so a corrupt remote copy leaves any existing
+    file (the last good import) untouched.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=data_path.parent, prefix=f".{data_path.name}.", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp_path = pathlib.Path(tmp_name)
+    try:
+        await protocol.open_remote(remote_url).download_file(file_hash, tmp_path)
+        actual_hash, _ = cache.hash_file(tmp_path)
+        if actual_hash != file_hash:
+            raise exceptions.RemoteError(f"Hash mismatch: expected {file_hash}, got {actual_hash}")
+        size = tmp_path.stat().st_size
+        os.replace(tmp_path, data_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+    return size
 
 
 def _maybe_token(repo_url: str, token: str | None) -> str | None:
@@ -111,7 +139,13 @@ async def read_remote_config(
     remotes = {str(k): str(v) for k, v in remotes_data.items()}
 
     default_remote = config_data.get("default_remote")
-    if not isinstance(default_remote, str):
+    if default_remote is not None and not isinstance(default_remote, str):
+        # Warn-first: the source config is a saved input outside this repo.
+        logger.warning(
+            "Remote config default_remote in %s must be a remote name, got %r; ignoring it",
+            repo_url,
+            default_remote,
+        )
         default_remote = None
     if default_remote is None:
         if len(remotes) == 1:
@@ -123,9 +157,43 @@ async def read_remote_config(
         raise exceptions.RemoteError(f"Default remote '{default_remote}' not found in config")
 
     url = str(remotes[default_remote])
-    _ = remote_config.validate_s3_url(url)
+    _ = remote_config.validate_remote_url(url)
     logger.info("Using source remote: %s", url)
     return url
+
+
+async def _list_github_lock_paths(
+    owner: str,
+    repo: str,
+    directory: str,
+    rev: str,
+    token: str | None,
+    session: aiohttp.ClientSession | None,
+) -> list[str] | None:
+    """List lock files under directory, relative to it, descending into pipeline dirs.
+
+    The contents API lists a single level, and pipeline-prefixed stage names
+    (``smoke/total``) keep their lock files in subdirectories.
+    """
+    entries = await github.list_directory(owner, repo, directory, rev, token, session=session)
+    if entries is None:
+        return None
+    lock_paths = [
+        entry["name"]
+        for entry in entries
+        if entry["type"] == "file" and entry["name"].endswith(".lock")
+    ]
+    subdirs = [entry["name"] for entry in entries if entry["type"] == "dir"]
+    nested = await asyncio.gather(
+        *[
+            _list_github_lock_paths(owner, repo, f"{directory}/{d}", rev, token, session)
+            for d in subdirs
+        ]
+    )
+    for subdir, sub_paths in zip(subdirs, nested, strict=True):
+        if sub_paths is not None:
+            lock_paths.extend(f"{subdir}/{p}" for p in sub_paths)
+    return lock_paths
 
 
 async def list_remote_lock_files(
@@ -137,13 +205,8 @@ async def list_remote_lock_files(
 ) -> list[str]:
     if github.is_github_url(repo_url):
         owner, repo = github.parse_github_url(repo_url)
-        entries = await github.list_directory(
-            owner,
-            repo,
-            ".pivot/stages",
-            rev,
-            _maybe_token(repo_url, token),
-            session=session,
+        entries = await _list_github_lock_paths(
+            owner, repo, ".pivot/stages", rev, _maybe_token(repo_url, token), session
         )
     else:
         entries = await _run_blocking(
@@ -156,12 +219,8 @@ async def list_remote_lock_files(
     if entries is None:
         raise exceptions.RemoteError("Remote repo has no .pivot/stages directory")
 
-    stage_names = list[str]()
-    for entry in [str(e) for e in entries]:
-        name = pathlib.Path(entry).name
-        if not name.endswith(".lock"):
-            continue
-        stage_names.append(name[: -len(".lock")])
+    # Entries are relative to .pivot/stages, so nested paths are pipeline-prefixed names
+    stage_names = [entry.removesuffix(".lock") for entry in entries if entry.endswith(".lock")]
 
     if not stage_names:
         raise exceptions.RemoteError("Remote repo has no lock files")
@@ -192,21 +251,54 @@ async def read_remote_lock_file(
     return data
 
 
-def _entry_size(entry: OutEntry) -> int:
+def _entry_size(entry: OutEntry, identity: str) -> int:
     if "size" in entry:
         return int(entry["size"])
     if "manifest" in entry:
         return sum(int(m["size"]) for m in entry["manifest"])
-    entry_path = entry["path"] if "path" in entry else "unknown"
-    logger.warning("Lock entry '%s' has no size information", entry_path)
+    logger.warning("Lock entry '%s' has no size information", identity)
     return 0
 
 
-def _iter_manifest_paths(entry: OutEntry) -> list[tuple[str, DirManifestEntry]]:
+def _iter_manifest_paths(
+    identity: types.ArtifactIdentity, entry: OutEntry
+) -> list[tuple[str, DirManifestEntry]]:
+    """Each file of a directory output, named as a stage depending on it names it."""
     if "manifest" not in entry:
         return []
-    base = entry["path"].rstrip("/")
-    return [(f"{base}/{m['relpath']}", m) for m in entry["manifest"]]
+    return [
+        (types.identity_key(types.directory_file_identity(identity, m["relpath"])), m)
+        for m in entry["manifest"]
+    ]
+
+
+def _renamed_message(old_name: str, directory: str, relpath: str, new_name: str) -> str:
+    return (
+        f"'{old_name}' is the old name of file '{relpath}' of directory output "
+        + f"'{directory}'; it is now '{new_name}'"
+    )
+
+
+def _refuse_old_directory_file_name(
+    pvt_path: pathlib.Path, source: track.ImportSource, rev: str
+) -> None:
+    """Refuse an import recorded as ``stage/path``, the name of a file of a directory output
+    before it became ``stage:path``; the error gives the command that re-imports it."""
+    prefix = f"{source['stage']}/"
+    if not source["path"].startswith(prefix):
+        return
+    relpath = source["path"].removeprefix(prefix)
+    new_name = types.identity_key(
+        types.directory_file_identity(types.ArtifactIdentity(source["stage"], None), relpath)
+    )
+    out = project.to_relative_path(track.get_data_path(pvt_path))
+    command = shlex.join(
+        ["pivot", "import", source["repo"], new_name, "--rev", rev, "--out", out, "--force"]
+    )
+    raise exceptions.PivotError(
+        _renamed_message(source["path"], source["stage"], relpath, new_name)
+        + f". Re-import it: {command}"
+    )
 
 
 async def resolve_remote_path(
@@ -244,27 +336,33 @@ async def _resolve_remote_path_with_session(
 
     matches = list[tuple[str, str, str, int]]()
     available = set[str]()
+    renamed: str | None = None
 
     for stage, lock_data in zip(stage_names, lock_datas, strict=True):
         if lock_data is None:
             continue
         for entry in lock_data["outs"]:
-            available.add(entry["path"])
-            for full_path, _ in _iter_manifest_paths(entry):
-                available.add(full_path)
+            entry_identity = types.ArtifactIdentity(stage, entry["key"])
+            identity = types.identity_key(entry_identity)
+            manifest_paths = _iter_manifest_paths(entry_identity, entry)
+            available.add(identity)
+            available.update(full_path for full_path, _ in manifest_paths)
 
-            if entry["path"] == path:
+            if identity == path:
                 if "manifest" in entry:
+                    file_example = types.identity_key(
+                        types.directory_file_identity(entry_identity, "{filename}")
+                    )
                     message = (
                         "Cannot import directory output "
                         + f"'{path}'. Import individual files instead, "
-                        + f"e.g., '{path.rstrip('/')}/{{filename}}'"
+                        + f"e.g., '{file_example}'"
                     )
                     raise exceptions.PivotError(message)
-                matches.append((stage, path, entry["hash"], _entry_size(entry)))
+                matches.append((stage, path, entry["hash"], _entry_size(entry, identity)))
                 continue
 
-            for full_path, manifest_entry in _iter_manifest_paths(entry):
+            for full_path, manifest_entry in manifest_paths:
                 if full_path == path:
                     matches.append(
                         (
@@ -274,6 +372,11 @@ async def _resolve_remote_path_with_session(
                             int(manifest_entry["size"]),
                         )
                     )
+                elif f"{identity}/{manifest_entry['relpath']}" == path:
+                    renamed = _renamed_message(path, identity, manifest_entry["relpath"], full_path)
+
+    if not matches and renamed is not None:
+        raise exceptions.PivotError(renamed)
 
     if not matches:
         max_shown = 10
@@ -286,12 +389,15 @@ async def _resolve_remote_path_with_session(
         else:
             available_list = "(none)"
         raise exceptions.PivotError(
-            f"Path '{path}' not found in remote outputs. Available outputs: {available_list}"
+            f"Artifact '{path}' not found in remote outputs. Available outputs: {available_list}"
         )
 
     if len(matches) > 1:
         stages = ", ".join(sorted({stage for stage, _, _, _ in matches}))
-        raise exceptions.PivotError(f"Path '{path}' is produced by multiple stages: {stages}")
+        raise exceptions.PivotError(
+            f"'{path}' names more than one output (of stage {stages}); "
+            + "the source pipeline must rename one"
+        )
 
     stage, matched_path, hash_, size = matches[0]
     return ResolvedImport(
@@ -319,7 +425,7 @@ async def import_artifact(
     if project_root is None:
         project_root = project.get_project_root()
 
-    dest = out if out is not None else path
+    dest = out if out is not None else path.replace(":", "/")
     data_path = project.normalize_path(dest, base=project_root)
     if not data_path.is_relative_to(project_root.absolute()):
         raise exceptions.PivotError(
@@ -341,16 +447,8 @@ async def import_artifact(
     downloaded = False
     file_size = resolved["size"]
     if not no_download:
-        remote = remote_storage.S3Remote(resolved["remote_url"])
-        await remote.download_file(resolved["hash"], data_path)
+        file_size = await _download_verified(resolved["remote_url"], resolved["hash"], data_path)
         downloaded = True
-        actual_hash, _ = cache.hash_file(data_path)
-        if actual_hash != resolved["hash"]:
-            data_path.unlink(missing_ok=True)
-            raise exceptions.RemoteError(
-                f"Downloaded file hash mismatch: expected {resolved['hash']}, got {actual_hash}"
-            )
-        file_size = data_path.stat().st_size
 
     source = track.ImportSource(
         repo=repo_url,
@@ -391,11 +489,12 @@ class UpdateResult(TypedDict):
     path: str
 
 
-async def check_for_update(pvt_data: track.PvtData) -> UpdateCheck:
+async def check_for_update(pvt_path: pathlib.Path, pvt_data: track.PvtData) -> UpdateCheck:
     """Check if import has updates. Resolves current ref, compares to rev_lock."""
     if "source" not in pvt_data:
         raise exceptions.PivotError("Not an import")
     source = pvt_data["source"]
+    _refuse_old_directory_file_name(pvt_path, source, source["rev"])
     rev_lock = await _resolve_ref(source["repo"], source["rev"], None)
     if rev_lock is None:
         raise exceptions.RemoteError(f"Cannot resolve ref '{source['rev']}' from {source['repo']}")
@@ -417,6 +516,7 @@ async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -
     source = pvt_data["source"]
     rev = new_rev if new_rev is not None else source["rev"]
     old_rev = source["rev_lock"]
+    _refuse_old_directory_file_name(pvt_path, source, rev)
 
     # Re-resolve at new/current rev
     resolved = await resolve_remote_path(source["repo"], source["path"], rev, None)
@@ -427,16 +527,8 @@ async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -
 
     file_size = resolved["size"]
     if need_download:
-        remote = remote_storage.S3Remote(resolved["remote_url"])
-        await remote.download_file(resolved["hash"], data_path)
-        actual_hash, _ = cache.hash_file(data_path)
-        if actual_hash != resolved["hash"]:
-            data_path.unlink(missing_ok=True)
-            raise exceptions.RemoteError(
-                f"Hash mismatch: expected {resolved['hash']}, got {actual_hash}"
-            )
+        file_size = await _download_verified(resolved["remote_url"], resolved["hash"], data_path)
         downloaded = True
-        file_size = data_path.stat().st_size
     elif data_path.exists():
         file_size = data_path.stat().st_size
 

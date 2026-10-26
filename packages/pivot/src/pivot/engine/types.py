@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
     from anyio.streams.memory import MemoryObjectSendStream
 
-    from pivot.types import CompletionType, OnError, StageExplanation
+    from pivot.types import ArtifactIdentity, CompletionType, OnError, StageExplanation
 
 __all__ = [
     "StageExecutionState",
@@ -81,10 +81,16 @@ class DataArtifactChanged(TypedDict):
 
 
 class CodeOrConfigChanged(TypedDict):
-    """Python files or pivot.yaml/pipeline.py changed."""
+    """Python files or pipeline.py changed.
+
+    ``data_paths`` are the other files the same watch batch changed. It is empty when the
+    engine replays reloads it deferred during a run, whose batches' data files it already
+    handled.
+    """
 
     type: Literal["code_or_config_changed"]
     paths: list[str]
+    data_paths: list[str]
 
 
 class RunRequested(TypedDict):
@@ -101,6 +107,7 @@ class RunRequested(TypedDict):
     single_stage: bool
     parallel: bool
     max_workers: int | None
+    resource_capacity: dict[str, int]
     no_commit: bool
     on_error: OnError
     cache_dir: pathlib.Path | None
@@ -136,7 +143,7 @@ class EngineStateChanged(TypedDict):
 
 
 class PipelineReloaded(TypedDict):
-    """Registry was reloaded, DAG structure may have changed."""
+    """The pipeline was reloaded, or became invalid or valid again; ``error`` says why it is invalid."""
 
     type: Literal["pipeline_reloaded"]
     seq: NotRequired[int]
@@ -161,9 +168,9 @@ class StageStarted(TypedDict):
 
 
 class OutputChangeSummary(TypedDict):
-    """Summary of output changes for a single output file."""
+    """Summary of output changes for a single output artifact."""
 
-    path: str
+    identity: ArtifactIdentity
     change_type: str | None  # "added", "modified", "removed", "unchanged", or None if unknown
     output_type: str  # "out", "metric", "plot"
     old_hash: str | None

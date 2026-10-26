@@ -2,160 +2,113 @@
 
 from __future__ import annotations
 
-import contextlib
 import pathlib
-import sys
 from typing import TYPE_CHECKING
 
 from conftest import isolated_pivot_dir
 from pivot import cli
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
     from click.testing import CliRunner
 
 
-def _write_stages_py(content: str) -> None:
-    """Write a stages.py file with the given content."""
-    pathlib.Path("stages.py").write_text(content)
+def _write_input(content: str = "data") -> None:
+    """Write the pipeline's raw input at the path ``pipeline.input("input.txt")`` reads."""
+    raw_dir = pathlib.Path("data", "raw")
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "input.txt").write_text(content)
 
 
-def _write_pivot_yaml(stages_config: str) -> None:
-    """Write a pivot.yaml file with the given stages config."""
-    pathlib.Path("pivot.yaml").write_text(stages_config)
+def _write_pipeline(content: str) -> None:
+    pathlib.Path("pipeline.py").write_text(content)
 
 
-@contextlib.contextmanager
-def _cli_isolated_filesystem(runner: CliRunner, tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
-    """Set up isolated filesystem with sys.path for stage imports.
+# Common pipeline definitions
+_PROCESS_PIPELINE = """\
+from __future__ import annotations
 
-    This context manager:
-    1. Creates an isolated filesystem via isolated_pivot_dir (includes .pivot and .git)
-    2. Adds the directory to sys.path so 'stages' module can be imported
-    3. Cleans up sys.path and cached modules on exit
-    """
-    with isolated_pivot_dir(runner, tmp_path) as path:
-        sys.path.insert(0, str(path))
-        # Clear any cached stages module
-        if "stages" in sys.modules:
-            del sys.modules["stages"]
-        try:
-            yield path
-        finally:
-            if str(path) in sys.path:
-                sys.path.remove(str(path))
-            if "stages" in sys.modules:
-                del sys.modules["stages"]
+from pivot.compose import Pipeline, stage
 
 
-# Common stage code snippets
-_PROCESS_STAGE = """\
-import pathlib
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs
+@stage
+def process(input_file: str) -> str:
+    return "done"
 
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
 
-def process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
 """
 
-_PROCESS_STAGE_V1 = """\
-import pathlib
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs
+_PROCESS_PIPELINE_V1 = """\
+from __future__ import annotations
 
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+from pivot.compose import Pipeline, stage
 
-def process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("v1")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+@stage
+def process(input_file: str) -> str:
+    return "v1"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
 """
 
-_PROCESS_STAGE_V2 = """\
-import pathlib
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs
+_PROCESS_PIPELINE_V2 = """\
+from __future__ import annotations
 
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+from pivot.compose import Pipeline, stage
 
-def process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("v2 - different code")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+@stage
+def process(input_file: str) -> str:
+    return "v2 - different code"
+
+
+with Pipeline("test") as pipeline:
+    process(pipeline.input("input.txt"))
 """
 
-_PROCESS_STAGE_WRITER = """\
-import pathlib
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs
+_STAGES_A_B_PIPELINE = """\
+from __future__ import annotations
 
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+from pivot.compose import Pipeline, stage
 
-def process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("done")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+@stage
+def stage_a(input_file: str) -> str:
+    return "a"
+
+
+@stage
+def stage_b(input_file: str) -> str:
+    return "b"
+
+
+with Pipeline("test") as pipeline:
+    raw = pipeline.input("input.txt")
+    stage_a(raw)
+    stage_b(raw)
 """
 
-_STAGES_A_B = """\
-import pathlib
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs
+_TRAIN_PIPELINE_TEMPLATE = """\
+from __future__ import annotations
 
-class _ATxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+from pivot import StageParams
+from pivot.compose import Pipeline, stage
 
-class _BTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
 
-def stage_a(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _ATxtOutputs:
-    _ = input_file
-    return _ATxtOutputs(output=pathlib.Path("a.txt"))
-
-def stage_b(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _BTxtOutputs:
-    _ = input_file
-    return _BTxtOutputs(output=pathlib.Path("b.txt"))
-"""
-
-_TRAIN_STAGE = """\
-import pathlib
-from typing import Annotated, TypedDict
-from pivot import loaders, outputs, stage_def
-
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-class TrainParams(stage_def.StageParams):
+class TrainParams(StageParams):
     learning_rate: float = 0.01
 
-def train(
-    params: TrainParams,
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    _ = params
-    pathlib.Path("output.txt").write_text("done")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+
+@stage
+def train(input_file: str, params: TrainParams) -> str:
+    return "done"
+
+
+with Pipeline("test") as pipeline:
+    train(pipeline.input("input.txt"), params=TrainParams(learning_rate=LEARNING_RATE))
 """
 
 
@@ -174,7 +127,7 @@ def test_explain_flag_in_help(runner: CliRunner) -> None:
 
 def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain with no pipeline errors with appropriate message."""
-    with _cli_isolated_filesystem(runner, tmp_path):
+    with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["repro", "--explain"])
 
         assert result.exit_code != 0
@@ -184,14 +137,9 @@ def test_explain_no_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
 
 def test_explain_flag_works(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain produces output for stages."""
-    with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path("input.txt").write_text("data")
-        _write_stages_py(_PROCESS_STAGE)
-        _write_pivot_yaml("""\
-stages:
-  process:
-    python: stages.process
-""")
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_PROCESS_PIPELINE)
 
         result = runner.invoke(cli.cli, ["repro", "--explain"])
 
@@ -202,20 +150,13 @@ stages:
 
 def test_explain_specific_stages(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain can target specific stages."""
-    with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path("input.txt").write_text("data")
-        _write_stages_py(_STAGES_A_B)
-        _write_pivot_yaml("""\
-stages:
-  stage_a:
-    python: stages.stage_a
-  stage_b:
-    python: stages.stage_b
-""")
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_STAGES_A_B_PIPELINE)
 
         result = runner.invoke(cli.cli, ["repro", "--explain", "stage_a"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "stage_a" in result.output
         assert "stage_b" not in result.output
 
@@ -227,54 +168,80 @@ stages:
 
 def test_explain_shows_code_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain shows code changes when code differs."""
-    # Skip this test for now - testing code change detection requires proper multiprocessing
-    # setup which is complex in isolated CLI tests. The core behavior is tested elsewhere.
-    import pytest
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_PROCESS_PIPELINE_V1)
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, f"First run failed: {first.output}"
 
-    pytest.skip("Code change detection requires multiprocessing setup - tested in unit tests")
+        _write_pipeline(_PROCESS_PIPELINE_V2)
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
+
+        assert result.exit_code == 0, result.output
+        assert "WILL RUN" in result.output
+        assert "Code Changes:" in result.output, "Should list the changed stage code"
 
 
 def test_explain_shows_param_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain shows param changes when params differ."""
-    # Skip this test for now - testing param change detection requires prior execution
-    # which is complex in isolated CLI tests due to multiprocessing. Tested in unit tests.
-    import pytest
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_TRAIN_PIPELINE_TEMPLATE.replace("LEARNING_RATE", "0.01"))
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, f"First run failed: {first.output}"
 
-    pytest.skip("Param change detection requires prior execution - tested in unit tests")
+        _write_pipeline(_TRAIN_PIPELINE_TEMPLATE.replace("LEARNING_RATE", "0.02"))
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
+
+        assert result.exit_code == 0, result.output
+        assert "WILL RUN" in result.output
+        assert "Param Changes:" in result.output, "Should list the changed param"
+        assert "learning_rate" in result.output
+        assert "0.02" in result.output
 
 
 def test_explain_shows_dep_changes(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain shows dependency changes when deps differ."""
-    # Skip this test for now - testing dep change detection requires prior execution
-    # which is complex in isolated CLI tests due to multiprocessing. Tested in unit tests.
-    import pytest
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input("original")
+        _write_pipeline(_PROCESS_PIPELINE)
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, f"First run failed: {first.output}"
 
-    pytest.skip("Dep change detection requires prior execution - tested in unit tests")
+        _write_input("modified")
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
+
+        assert result.exit_code == 0, result.output
+        assert "WILL RUN" in result.output
+        assert "Dependency Changes:" in result.output, "Should list the changed input"
+        assert "input.txt" in result.output
 
 
 def test_explain_shows_unchanged(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain shows stages as unchanged when nothing differs."""
-    # Skip this test for now - testing unchanged detection requires prior execution
-    # which is complex in isolated CLI tests due to multiprocessing. Tested in unit tests.
-    import pytest
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_PROCESS_PIPELINE)
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, f"First run failed: {first.output}"
 
-    pytest.skip("Unchanged detection requires prior execution - tested in unit tests")
+        result = runner.invoke(cli.cli, ["repro", "--explain"])
+
+        assert result.exit_code == 0, result.output
+        assert "SKIP" in result.output
+        assert "WILL RUN" not in result.output
+        assert "0 will run, 1 unchanged" in result.output
 
 
 def test_explain_shows_no_previous_run(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain shows 'No previous run' for never-run stages."""
-    with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path("input.txt").write_text("data")
-        _write_stages_py(_PROCESS_STAGE)
-        _write_pivot_yaml("""\
-stages:
-  process:
-    python: stages.process
-""")
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_PROCESS_PIPELINE)
 
         result = runner.invoke(cli.cli, ["repro", "--explain"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "No previous run" in result.output
 
 
@@ -285,18 +252,13 @@ stages:
 
 def test_explain_short_flag(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro -e short flag works like --explain."""
-    with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path("input.txt").write_text("data")
-        _write_stages_py(_PROCESS_STAGE)
-        _write_pivot_yaml("""\
-stages:
-  process:
-    python: stages.process
-""")
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_PROCESS_PIPELINE)
 
         result = runner.invoke(cli.cli, ["repro", "-e"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "process" in result.output
         assert "WILL RUN" in result.output
 
@@ -308,14 +270,9 @@ stages:
 
 def test_explain_unknown_stage_errors(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """repro --explain with unknown stage shows error."""
-    with _cli_isolated_filesystem(runner, tmp_path):
-        pathlib.Path("input.txt").write_text("data")
-        _write_stages_py(_PROCESS_STAGE)
-        _write_pivot_yaml("""\
-stages:
-  process:
-    python: stages.process
-""")
+    with isolated_pivot_dir(runner, tmp_path):
+        _write_input()
+        _write_pipeline(_PROCESS_PIPELINE)
 
         result = runner.invoke(cli.cli, ["repro", "--explain", "nonexistent"])
 

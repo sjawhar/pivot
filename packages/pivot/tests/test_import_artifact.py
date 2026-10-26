@@ -10,6 +10,7 @@ import xxhash
 import yaml
 
 from pivot import exceptions, import_artifact
+from pivot.remote import keys
 from pivot.remote import storage as remote_mod
 from pivot.storage import track
 
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
+    """Build a schema-v2 remote lock with identity-addressed outputs."""
     data = {
         "code_manifest": {"stage": "hash"},
         "params": {},
@@ -36,14 +38,19 @@ def _config_bytes(remote_url: str) -> bytes:
     return yaml.safe_dump(data).encode()
 
 
+def _github_files(*names: str) -> list[dict[str, str]]:
+    return [{"name": name, "type": "file"} for name in names]
+
+
 def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
     repo_url = "https://github.com/org/repo"
     remote_url = "s3://bucket/prefix"
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
-                "hash": "abc123",
+                "key": None,
+                "tag": "data",
+                "hash": "abc1230000000000",
             }
         ]
     )
@@ -52,7 +59,7 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -74,26 +81,25 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
     )
     read_file.side_effect = _read_file
 
-    resolved = asyncio.run(
-        import_artifact.resolve_remote_path(repo_url, "data/output.csv", "main", None)
-    )
+    resolved = asyncio.run(import_artifact.resolve_remote_path(repo_url, "train", "main", None))
 
     assert resolved["stage"] == "train"
-    assert resolved["path"] == "data/output.csv"
-    assert resolved["hash"] == "abc123"
+    assert resolved["path"] == "train"
+    assert resolved["hash"] == "abc1230000000000"
     assert resolved["size"] == 0
     assert resolved["remote_url"] == remote_url
     assert resolved["rev_lock"] == "deadbeef"
 
 
-def test_resolve_remote_path_ambiguous(mocker: MockerFixture) -> None:
+def test_resolve_remote_path_identity_disambiguates_stages(mocker: MockerFixture) -> None:
     repo_url = "https://github.com/org/repo"
     remote_url = "s3://bucket/prefix"
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
-                "hash": "abc123",
+                "key": None,
+                "tag": "data",
+                "hash": "abc1230000000000",
             }
         ]
     )
@@ -102,7 +108,7 @@ def test_resolve_remote_path_ambiguous(mocker: MockerFixture) -> None:
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock", "eval.lock"]
+    list_directory.return_value = _github_files("train.lock", "eval.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -124,8 +130,12 @@ def test_resolve_remote_path_ambiguous(mocker: MockerFixture) -> None:
     )
     read_file.side_effect = _read_file
 
-    with pytest.raises(exceptions.PivotError, match="train"):
-        asyncio.run(import_artifact.resolve_remote_path(repo_url, "data/output.csv", "main", None))
+    # Artifact identities include their producer stage, so same-key outputs are unambiguous.
+    resolved = asyncio.run(import_artifact.resolve_remote_path(repo_url, "train", "main", None))
+
+    assert resolved["stage"] == "train"
+    assert resolved["path"] == "train"
+    assert resolved["hash"] == "abc1230000000000"
 
 
 def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
@@ -134,8 +144,9 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
-                "hash": "abc123",
+                "key": None,
+                "tag": "data",
+                "hash": "abc1230000000000",
             }
         ]
     )
@@ -144,7 +155,7 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -167,7 +178,7 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
     read_file.side_effect = _read_file
 
     with pytest.raises(exceptions.PivotError, match="Available outputs"):
-        asyncio.run(import_artifact.resolve_remote_path(repo_url, "data/missing.csv", "main", None))
+        asyncio.run(import_artifact.resolve_remote_path(repo_url, "missing", "main", None))
 
 
 def test_read_remote_config_success(mocker: MockerFixture) -> None:
@@ -198,7 +209,8 @@ async def test_import_artifact_creates_pvt(
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": file_hash,
             }
         ]
@@ -208,7 +220,7 @@ async def test_import_artifact_creates_pvt(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -230,23 +242,23 @@ async def test_import_artifact_creates_pvt(
     )
     read_file.side_effect = _read_file
 
-    key = remote_mod._hash_to_key("test-prefix/", file_hash)
+    key = keys.hash_to_key("test-prefix/", file_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key, Body=content)
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         return_value=remote_mod.S3Remote(remote_url),
     )
 
     result = await import_artifact.import_artifact(
         repo_url,
-        "data/output.csv",
+        "train",
         rev="main",
         project_root=tmp_path,
     )
 
-    data_path = tmp_path / "data" / "output.csv"
+    data_path = tmp_path / "train"
     pvt_path = track.get_pvt_path(data_path)
     assert pathlib.Path(result["data_path"]) == data_path
     assert pathlib.Path(result["pvt_path"]) == pvt_path
@@ -256,6 +268,8 @@ async def test_import_artifact_creates_pvt(
     assert pvt_data is not None
     assert pvt_data["hash"] == file_hash
     assert "source" in pvt_data
+    assert pvt_data["source"]["stage"] == "train"
+    assert pvt_data["source"]["path"] == "train"
     assert pvt_data["source"]["remote"] == remote_url
     assert pvt_data["size"] == len(content), "Size should come from downloaded file"
 
@@ -268,7 +282,8 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": file_hash,
             }
         ]
@@ -278,7 +293,7 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -301,7 +316,7 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
     read_file.side_effect = _read_file
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         side_effect=AssertionError("S3Remote should not be instantiated"),
     )
@@ -309,20 +324,23 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
     result = asyncio.run(
         import_artifact.import_artifact(
             repo_url,
-            "data/output.csv",
+            "train",
             rev="main",
             project_root=tmp_path,
             no_download=True,
         )
     )
 
-    data_path = tmp_path / "data" / "output.csv"
+    data_path = tmp_path / "train"
     pvt_path = track.get_pvt_path(data_path)
     assert pathlib.Path(result["data_path"]) == data_path
     assert pathlib.Path(result["pvt_path"]) == pvt_path
     assert result["downloaded"] is False
     assert not data_path.exists()
-    assert pvt_path.exists()
+    pvt_data = track.read_pvt_file(pvt_path)
+    assert pvt_data is not None
+    assert "source" in pvt_data
+    assert pvt_data["source"]["path"] == "train"
 
 
 async def test_import_artifact_force_overwrites(
@@ -338,7 +356,8 @@ async def test_import_artifact_force_overwrites(
     lock_bytes = _lock_bytes(
         outs=[
             {
-                "path": "data/output.csv",
+                "key": None,
+                "tag": "data",
                 "hash": file_hash,
             }
         ]
@@ -348,7 +367,7 @@ async def test_import_artifact_force_overwrites(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
-    list_directory.return_value = ["train.lock"]
+    list_directory.return_value = _github_files("train.lock")
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
@@ -370,26 +389,26 @@ async def test_import_artifact_force_overwrites(
     )
     read_file.side_effect = _read_file
 
-    key = remote_mod._hash_to_key("test-prefix/", file_hash)
+    key = keys.hash_to_key("test-prefix/", file_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key, Body=content)
 
     mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         return_value=remote_mod.S3Remote(remote_url),
     )
 
-    data_path = tmp_path / "data" / "output.csv"
+    data_path = tmp_path / "train"
     data_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.write_text("old")
     track.write_pvt_file(
         track.get_pvt_path(data_path),
-        track.PvtData(path="output.csv", hash="old", size=3),
+        track.PvtData(path="train", hash="old", size=3),
     )
 
     result = await import_artifact.import_artifact(
         repo_url,
-        "data/output.csv",
+        "train",
         rev="main",
         project_root=tmp_path,
         force=True,

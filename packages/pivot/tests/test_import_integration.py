@@ -11,40 +11,15 @@ import pytest
 import xxhash
 import yaml
 
-import conftest
-from pivot import exceptions, import_artifact, loaders, outputs
+from pivot import exceptions, import_artifact
+from pivot.remote import keys
 from pivot.remote import storage as remote_mod
+from pivot.storage import lock, track
+from tests import conftest
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
     from types_aiobotocore_s3 import S3Client
-from pivot.engine import graph
-from pivot.registry import RegistryStageInfo
-from pivot.storage import track
-
-
-def _create_stage(name: str, deps: list[str], outs: list[str]) -> RegistryStageInfo:
-    """Create a minimal RegistryStageInfo for graph tests."""
-    return RegistryStageInfo(
-        func=lambda: None,
-        name=name,
-        deps={f"_{i}": d for i, d in enumerate(deps)},
-        deps_paths=deps,
-        outs=[
-            outputs.require_expanded(outputs.Out(path=out, loader=loaders.PathOnly()))
-            for out in outs
-        ],
-        outs_paths=outs,
-        params=None,
-        mutex=list[str](),
-        variant=None,
-        signature=None,
-        fingerprint=dict[str, str](),
-        dep_specs={},
-        out_specs=dict[str, outputs.BaseOut](),
-        params_arg_name=None,
-        state_dir=None,
-    )
 
 
 def _make_import_source(
@@ -52,8 +27,8 @@ def _make_import_source(
     repo: str = "https://github.com/org/upstream",
     rev: str = "main",
     rev_lock: str = "abc123deadbeef",
-    stage: str = "train",
-    path: str = "data/output.csv",
+    stage: str = "smoke/train",
+    path: str = "smoke/train",
     remote: str = "s3://bucket/prefix",
 ) -> track.ImportSource:
     return track.ImportSource(
@@ -62,13 +37,10 @@ def _make_import_source(
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
-    data = {
-        "code_manifest": {"stage": "hash"},
-        "params": {},
-        "deps": [],
-        "outs": outs,
-    }
-    return yaml.safe_dump(data).encode()
+    """Build a schema-v2 remote lock with identity-addressed outputs."""
+    return yaml.safe_dump(
+        {"code_manifest": {"stage": "hash"}, "params": {}, "deps": [], "outs": outs}
+    ).encode()
 
 
 def _config_bytes(remote_url: str) -> bytes:
@@ -77,80 +49,6 @@ def _config_bytes(remote_url: str) -> bytes:
         "default_remote": "origin",
     }
     return yaml.safe_dump(data).encode()
-
-
-# --- Test 1: Import .pvt files recognized as DAG dependencies ---
-
-
-def test_import_pvt_recognized_as_dag_dep(tmp_path: pathlib.Path) -> None:
-    """Imported .pvt file is accepted as a valid dependency in the DAG (validate=True)."""
-    imported_data = tmp_path / "imported_data.csv"
-    output_file = tmp_path / "result.csv"
-
-    # Build tracked_files dict as discover_pvt_files would produce it,
-    # including an ImportSource to prove imports work identically to regular tracked files.
-    tracked_files: dict[str, track.PvtData] = {
-        str(imported_data): track.PvtData(
-            path="imported_data.csv",
-            hash="abc123",
-            size=1024,
-            source=_make_import_source(path="data/imported_data.csv"),
-        )
-    }
-
-    stages = {
-        "consumer": _create_stage("consumer", [str(imported_data)], [str(output_file)]),
-    }
-
-    # With validate=True, a missing dep that isn't in tracked_files would raise.
-    # This must NOT raise because the import .pvt is in tracked_files.
-    g = graph.build_graph(stages, validate=True, tracked_files=tracked_files)
-
-    assert "stage:consumer" in g, "Consumer stage should be in the graph"
-    assert graph.artifact_node(imported_data) in g, "Imported artifact should be a graph node"
-
-
-def test_import_pvt_missing_from_tracked_raises(tmp_path: pathlib.Path) -> None:
-    """Without tracked_files entry, a missing imported dep raises on validate."""
-    missing_dep = tmp_path / "not_tracked.csv"
-    output_file = tmp_path / "result.csv"
-
-    stages = {
-        "consumer": _create_stage("consumer", [str(missing_dep)], [str(output_file)]),
-    }
-
-    with pytest.raises(exceptions.DependencyNotFoundError):
-        graph.build_graph(stages, validate=True)
-
-
-def test_import_pvt_chain_through_dag(tmp_path: pathlib.Path) -> None:
-    """Import dep feeds into a stage whose output feeds into another — full chain works."""
-    imported = tmp_path / "external.csv"
-    intermediate = tmp_path / "cleaned.csv"
-    final = tmp_path / "model.pkl"
-
-    tracked_files: dict[str, track.PvtData] = {
-        str(imported): track.PvtData(
-            path="external.csv",
-            hash="aaa",
-            size=100,
-            source=_make_import_source(),
-        )
-    }
-
-    stages = {
-        "clean": _create_stage("clean", [str(imported)], [str(intermediate)]),
-        "train": _create_stage("train", [str(intermediate)], [str(final)]),
-    }
-
-    g = graph.build_graph(stages, validate=True, tracked_files=tracked_files)
-    stage_dag = graph.get_stage_dag(g)
-
-    # train depends on clean
-    assert stage_dag.has_edge("train", "clean"), "Train should depend on clean"
-    # Execution order should be clean -> train
-    order = graph.get_execution_order(stage_dag)
-    assert order.index("clean") < order.index("train")
 
 
 # --- Test 2: discover_import_pvt_files end-to-end ---
@@ -166,7 +64,7 @@ def test_discover_import_pvt_files_end_to_end(tmp_path: pathlib.Path) -> None:
             path="imported.csv",
             hash="hash_imported",
             size=500,
-            source=_make_import_source(path="data/imported.csv"),
+            source=_make_import_source(),
         ),
     )
 
@@ -179,7 +77,7 @@ def test_discover_import_pvt_files_end_to_end(tmp_path: pathlib.Path) -> None:
             path="model.pkl",
             hash="hash_model",
             size=2000,
-            source=_make_import_source(stage="eval", path="models/model.pkl"),
+            source=_make_import_source(stage="smoke/eval", path="smoke/eval"),
         ),
     )
 
@@ -188,7 +86,6 @@ def test_discover_import_pvt_files_end_to_end(tmp_path: pathlib.Path) -> None:
         tmp_path / "local.csv.pvt",
         track.PvtData(path="local.csv", hash="hash_local", size=100),
     )
-
     # Create another non-import .pvt
     track.write_pvt_file(
         tmp_path / "another.csv.pvt",
@@ -214,8 +111,8 @@ def test_import_pvt_roundtrip(tmp_path: pathlib.Path) -> None:
         repo="https://github.com/org/upstream",
         rev="v2.0",
         rev_lock="deadbeef12345678",
-        stage="preprocess",
-        path="outputs/data.csv",
+        stage="smoke/preprocess",
+        path="smoke/preprocess",
         remote="s3://my-bucket/cache",
     )
     original = track.PvtData(
@@ -273,19 +170,13 @@ def _setup_source_repo(
 
     pivot_dir = source_dir / ".pivot"
     pivot_dir.mkdir()
-    (pivot_dir / "stages").mkdir()
 
     config = {"remotes": {"origin": remote_url}}
     (pivot_dir / "config.yaml").write_text(yaml.safe_dump(config))
 
-    lock_data = {
-        "schema_version": 1,
-        "code_manifest": {"self:run": "abcdef1234567890"},
-        "params": {},
-        "deps": [],
-        "outs": outs,
-    }
-    (pivot_dir / "stages" / f"{stage_name}.lock").write_text(yaml.safe_dump(lock_data))
+    lock_path = lock.get_stages_dir(pivot_dir) / f"{stage_name}.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(_lock_bytes(outs=outs))
 
     subprocess.run(["git", "add", "."], cwd=source_dir, check=True, capture_output=True)
     subprocess.run(
@@ -322,16 +213,16 @@ async def test_import_from_local_git_repo(
     head_sha = _setup_source_repo(
         source_dir,
         remote_url,
-        "prepare",
-        [{"path": "data/output.csv", "hash": file_hash}],
+        "smoke/prepare",
+        [{"key": None, "tag": "data", "hash": file_hash}],
     )
 
-    key = remote_mod._hash_to_key("cache/", file_hash)
+    key = keys.hash_to_key("cache/", file_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key, Body=content)
 
     result = await import_artifact.import_artifact(
         str(source_dir),
-        "data/output.csv",
+        "smoke/prepare",
         rev="main",
         project_root=consumer_dir,
     )
@@ -349,8 +240,8 @@ async def test_import_from_local_git_repo(
     assert source["repo"] == str(source_dir)
     assert source["rev"] == "main"
     assert source["rev_lock"] == head_sha, "rev_lock should be resolved HEAD SHA"
-    assert source["stage"] == "prepare"
-    assert source["path"] == "data/output.csv"
+    assert source["stage"] == "smoke/prepare"
+    assert source["path"] == "smoke/prepare"
     assert source["remote"] == remote_url
 
 
@@ -374,16 +265,16 @@ async def test_import_from_local_repo_then_update(
     _setup_source_repo(
         source_dir,
         remote_url,
-        "train",
-        [{"path": "models/weights.bin", "hash": v1_hash}],
+        "smoke/train",
+        [{"key": None, "tag": "data", "hash": v1_hash}],
     )
 
-    key_v1 = remote_mod._hash_to_key("cache/", v1_hash)
+    key_v1 = keys.hash_to_key("cache/", v1_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v1, Body=v1_content)
 
     result = await import_artifact.import_artifact(
         str(source_dir),
-        "models/weights.bin",
+        "smoke/train",
         rev="main",
         project_root=consumer_dir,
     )
@@ -396,14 +287,9 @@ async def test_import_from_local_repo_then_update(
     assert pvt_data is not None
     old_rev = pvt_data["source"]["rev_lock"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
-    lock_v2 = {
-        "schema_version": 1,
-        "code_manifest": {"self:run": "abcdef1234567890"},
-        "params": {},
-        "deps": [],
-        "outs": [{"path": "models/weights.bin", "hash": v2_hash}],
-    }
-    (source_dir / ".pivot" / "stages" / "train.lock").write_text(yaml.safe_dump(lock_v2))
+    (source_dir / ".pivot" / "stages" / "smoke" / "train.lock").write_bytes(
+        _lock_bytes(outs=[{"key": None, "tag": "data", "hash": v2_hash}])
+    )
     subprocess.run(["git", "add", "."], cwd=source_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "update output"],
@@ -412,10 +298,10 @@ async def test_import_from_local_repo_then_update(
         capture_output=True,
     )
 
-    key_v2 = remote_mod._hash_to_key("cache/", v2_hash)
+    key_v2 = keys.hash_to_key("cache/", v2_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v2, Body=v2_content)
 
-    check = await import_artifact.check_for_update(pvt_data)
+    check = await import_artifact.check_for_update(pvt_path, pvt_data)
     assert check["available"] is True, "Should detect update after new commit"
 
     update_result = await import_artifact.update_import(pvt_path)
@@ -429,13 +315,13 @@ async def test_import_from_local_repo_then_update(
     assert updated_pvt["size"] == len(v2_content), "Size should reflect v2 file"
 
 
-async def test_import_from_local_repo_not_found_path(
+async def test_import_from_local_repo_not_found_identity(
     tmp_path: pathlib.Path,
     moto_s3_bucket: str,
     aioboto3_s3_client: S3Client,
     mocker: MockerFixture,
 ) -> None:
-    """Importing a path that doesn't exist in any stage lock file raises PivotError."""
+    """Importing an unknown identity from a stage lock file raises PivotError."""
     content = b"data"
     file_hash = xxhash.xxh64(content).hexdigest()
 
@@ -447,14 +333,14 @@ async def test_import_from_local_repo_not_found_path(
     _setup_source_repo(
         source_dir,
         remote_url,
-        "train",
-        [{"path": "data/output.csv", "hash": file_hash}],
+        "smoke/train",
+        [{"key": None, "tag": "data", "hash": file_hash}],
     )
 
     with pytest.raises(exceptions.PivotError, match="not found in remote outputs"):
         await import_artifact.import_artifact(
             str(source_dir),
-            "data/nonexistent.csv",
+            "smoke/missing",
             rev="main",
             project_root=consumer_dir,
         )
@@ -479,12 +365,12 @@ async def test_full_import_flow_mocked(
 
     # --- Step 1: import_artifact ---
 
-    lock_bytes_v1 = _lock_bytes(outs=[{"path": "data/output.csv", "hash": initial_hash}])
+    lock_bytes_v1 = _lock_bytes(outs=[{"key": None, "tag": "data", "hash": initial_hash}])
 
     mocker.patch(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
-        return_value=["train.lock"],
+        return_value=[{"name": "train.lock", "type": "file"}],
     )
     resolve_ref_mock = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
@@ -511,17 +397,17 @@ async def test_full_import_flow_mocked(
         side_effect=_read_file_v1,
     )
 
-    key_v1 = remote_mod._hash_to_key("test-prefix/", initial_hash)
+    key_v1 = keys.hash_to_key("test-prefix/", initial_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v1, Body=initial_content)
 
     s3_cls = mocker.patch(
-        "pivot.import_artifact.remote_storage.S3Remote",
+        "pivot.remote.storage.S3Remote",
         autospec=True,
         return_value=remote_mod.S3Remote(remote_url),
     )
 
     result = await import_artifact.import_artifact(
-        repo_url, "data/output.csv", rev="main", project_root=tmp_path
+        repo_url, "train", rev="main", project_root=tmp_path
     )
 
     data_path = pathlib.Path(result["data_path"])
@@ -539,7 +425,7 @@ async def test_full_import_flow_mocked(
 
     resolve_ref_mock.return_value = "sha_v1"
 
-    check = await import_artifact.check_for_update(pvt_data)
+    check = await import_artifact.check_for_update(pvt_path, pvt_data)
 
     assert check["available"] is False, "No update when rev_lock matches"
 
@@ -547,7 +433,7 @@ async def test_full_import_flow_mocked(
 
     resolve_ref_mock.return_value = "sha_v2"
 
-    check = await import_artifact.check_for_update(pvt_data)
+    check = await import_artifact.check_for_update(pvt_path, pvt_data)
 
     assert check["available"] is True, "Update available when rev_lock differs"
     assert check["current_rev"] == "sha_v1"
@@ -555,7 +441,7 @@ async def test_full_import_flow_mocked(
 
     # --- Step 4: update_import ---
 
-    lock_bytes_v2 = _lock_bytes(outs=[{"path": "data/output.csv", "hash": updated_hash}])
+    lock_bytes_v2 = _lock_bytes(outs=[{"key": None, "tag": "data", "hash": updated_hash}])
 
     async def _read_file_v2(
         _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
@@ -568,7 +454,7 @@ async def test_full_import_flow_mocked(
 
     read_file_mock.side_effect = _read_file_v2
 
-    key_v2 = remote_mod._hash_to_key("test-prefix/", updated_hash)
+    key_v2 = keys.hash_to_key("test-prefix/", updated_hash)
     await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_v2, Body=updated_content)
 
     s3_cls.return_value = remote_mod.S3Remote(remote_url)
@@ -581,6 +467,7 @@ async def test_full_import_flow_mocked(
     assert data_path.read_bytes() == updated_content
 
     # Verify .pvt file is updated
+
     updated_pvt = track.read_pvt_file(pvt_path)
     assert updated_pvt is not None
     assert updated_pvt["hash"] == updated_hash

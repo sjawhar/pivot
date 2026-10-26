@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+import anyio
+import pytest
+import watchfiles
 
 from pivot.engine import sources, types
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 # =============================================================================
 # OneShotSource
@@ -13,8 +21,6 @@ from pivot.engine import sources, types
 
 async def test_async_oneshot_source_emits_run_requested() -> None:
     """OneShotSource emits a single RunRequested event."""
-    import anyio
-
     from pivot.engine.sources import OneShotSource
     from pivot.engine.types import InputEvent
 
@@ -77,8 +83,6 @@ async def test_async_filesystem_source_set_watch_paths() -> None:
 
 async def test_async_filesystem_source_emits_code_changed_for_py_files(tmp_path: Path) -> None:
     """FilesystemSource emits code_or_config_changed for .py files."""
-    import anyio
-
     from pivot.engine.sources import FilesystemSource
     from pivot.engine.types import InputEvent
 
@@ -114,6 +118,24 @@ async def test_async_filesystem_source_emits_code_changed_for_py_files(tmp_path:
     assert len(code_events) >= 1, "Should emit code_or_config_changed for .py files"
 
 
+async def test_async_filesystem_source_stops_promptly_when_cancelled(tmp_path: Path) -> None:
+    """Cancelling FilesystemSource.run returns at once, not when watchfiles' 5 s wait times out."""
+    import time
+
+    from pivot.engine.sources import FilesystemSource
+    from pivot.engine.types import InputEvent
+
+    send, _recv = anyio.create_memory_object_stream[InputEvent](10)
+    source = FilesystemSource(watch_paths=[tmp_path], debounce_ms=100)
+    start = 0.0
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        await anyio.sleep(0.3)
+        start = time.monotonic()
+        tg.cancel_scope.cancel()
+    assert time.monotonic() - start < 1.0, "the watcher stops when its source is cancelled"
+
+
 async def test_async_filesystem_source_set_watch_paths_signals_stop_event() -> None:
     """FilesystemSource.set_watch_paths() signals stop event when running."""
     from pivot.engine.sources import FilesystemSource
@@ -121,8 +143,6 @@ async def test_async_filesystem_source_set_watch_paths_signals_stop_event() -> N
     source = FilesystemSource(watch_paths=[Path("/tmp/a")])
 
     # Simulate running state
-    import anyio
-
     source._running = True
     source._stop_event = anyio.Event()
 
@@ -149,8 +169,6 @@ async def test_async_filesystem_source_set_watch_paths_no_op_when_not_running() 
 
 async def test_async_filesystem_source_restarts_after_set_watch_paths(tmp_path: Path) -> None:
     """FilesystemSource restarts and watches new paths after set_watch_paths() called."""
-    import anyio
-
     from pivot.engine.sources import FilesystemSource
     from pivot.engine.types import InputEvent
 
@@ -200,3 +218,44 @@ async def test_async_filesystem_source_restarts_after_set_watch_paths(tmp_path: 
     assert len(events_received) >= 1, "Should receive event for file in new watch path"
     data_events = [e for e in events_received if e["type"] == "data_artifact_changed"]
     assert len(data_events) >= 1, "Should emit data_artifact_changed for .txt file"
+
+
+def test_is_code_or_config_ignores_pivot_yaml() -> None:
+    assert sources._is_code_or_config("pipeline.py") is True
+    assert sources._is_code_or_config("pivot.yaml") is False
+    assert sources._is_code_or_config("pivot.yml") is False
+
+
+async def _helper_one_batch(
+    *_paths: object, debounce: int, stop_event: anyio.Event
+) -> AsyncGenerator[set[tuple[watchfiles.Change, str]]]:
+    """Stands in for ``watchfiles.awatch``: one batch with a code and a data file, then waits."""
+    yield {
+        (watchfiles.Change.modified, "/project/pipeline.py"),
+        (watchfiles.Change.modified, "/project/data/input.csv"),
+    }
+    await stop_event.wait()
+
+
+async def test_filesystem_source_sends_one_event_for_a_mixed_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch with a code file and a data file becomes one CodeOrConfigChanged carrying the
+    data file, and no DataArtifactChanged."""
+    monkeypatch.setattr(watchfiles, "awatch", _helper_one_batch)
+    send, recv = anyio.create_memory_object_stream[types.InputEvent](10)
+    source = sources.FilesystemSource(watch_paths=[Path("/project")], debounce_ms=50)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        with anyio.fail_after(5):
+            event = await recv.receive()
+        await anyio.wait_all_tasks_blocked()
+        assert event == types.CodeOrConfigChanged(
+            type="code_or_config_changed",
+            paths=["/project/pipeline.py"],
+            data_paths=["/project/data/input.csv"],
+        )
+        with pytest.raises(anyio.WouldBlock):
+            recv.receive_nowait()
+        tg.cancel_scope.cancel()

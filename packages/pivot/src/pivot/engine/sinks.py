@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -9,8 +11,8 @@ import rich.live
 import rich.markup
 import rich.text
 
-from pivot.engine.types import StageCompleted
-from pivot.types import DisplayCategory, categorize_stage_result
+from pivot.engine.types import LogLine, StageCompleted
+from pivot.types import LOSSY_OUTPUT_PHRASE, DisplayCategory, categorize_stage_result
 
 if TYPE_CHECKING:
     from pivot.engine.types import OutputEvent
@@ -83,6 +85,20 @@ def _categorize(event: StageCompleted) -> DisplayCategory:
     return categorize_stage_result(event["status"])
 
 
+@dataclasses.dataclass
+class _StageWarnings:
+    """A stage's ``WARNING:`` lines for the report.
+
+    Pivot's own output-write warnings are always kept and print first. The stage's own
+    warnings are counted per distinct line (in first-seen order); the report shows the
+    first ``_MAX_LOG_LINES_PER_STAGE`` distinct lines and counts the rest.
+    """
+
+    stage: dict[str, int] = dataclasses.field(default_factory=dict[str, int])
+    lossy_outputs: list[str] = dataclasses.field(default_factory=list[str])
+    dropped: int = 0
+
+
 def _print_completions(
     console: rich.console.Console,
     events: list[StageCompleted],
@@ -90,13 +106,19 @@ def _print_completions(
     total: int,
     max_name_width: int,
     stage_logs: dict[str, list[str]] | None = None,
+    stage_warnings: dict[str, _StageWarnings] | None = None,
 ) -> None:
-    """Print buffered completions sorted by index with skip collapsing."""
+    """Print buffered completions sorted by index with skip collapsing.
+
+    A failed stage shows its captured output; any other stage shows the ``WARNING:``
+    lines in ``stage_warnings`` (pass None when those already streamed).
+    """
     if not events:
         return
 
     sorted_events = sorted(events, key=lambda e: e["index"])
     logs = stage_logs or {}
+    warnings_by_stage = stage_warnings or {}
 
     i = 0
     while i < len(sorted_events):
@@ -151,20 +173,62 @@ def _print_completions(
                 if event["reason"]:
                     for detail in _format_error_detail(event["reason"], total=total):
                         console.print(detail)
+            elif event["stage"] in warnings_by_stage:
+                buffered = warnings_by_stage[event["stage"]]
+                stage_lines = [
+                    line if count == 1 else f"{line} (×{count})"
+                    for line, count in buffered.stage.items()
+                ]
+                for warning_line in [*buffered.lossy_outputs, *stage_lines]:
+                    escaped = rich.markup.escape(warning_line)
+                    console.print(f"          [yellow]{escaped}[/yellow]")
+                if buffered.dropped:
+                    console.print(
+                        f"          [yellow]… {buffered.dropped} more warnings "
+                        + "(run with --show-output)[/yellow]"
+                    )
             i += 1
 
 
 _MAX_LOG_LINES_PER_STAGE = 50
 
 
+def _buffer_log_line(
+    event: LogLine,
+    stage_logs: dict[str, list[str]],
+    stage_warnings: dict[str, _StageWarnings],
+) -> None:
+    """Keep a stage's output for a failure report and its warnings for every report.
+
+    Warnings have their own buffer: output writes log them after the stage's own output,
+    which can already fill the log buffer.
+    """
+    line = event["line"]
+    buf = stage_logs.setdefault(event["stage"], [])
+    if len(buf) < _MAX_LOG_LINES_PER_STAGE:
+        buf.append(line)
+    if not line.startswith("WARNING:"):
+        return
+    buffered = stage_warnings.setdefault(event["stage"], _StageWarnings())
+    if LOSSY_OUTPUT_PHRASE in line and line.startswith("WARNING: Stage '"):
+        buffered.lossy_outputs.append(line)
+    elif line in buffered.stage:
+        buffered.stage[line] += 1
+    elif len(buffered.stage) < _MAX_LOG_LINES_PER_STAGE:
+        buffered.stage[line] = 1
+    else:
+        buffered.dropped += 1
+
+
 class StaticConsoleSink:
-    """Pipe/CI sink: buffers completions, prints sorted report on close."""
+    """Pipe/CI sink: buffers completions, prints a sorted report when each run ends."""
 
     _console: rich.console.Console
     _show_output: bool
     _max_name_width: int
     _completion_buffer: list[StageCompleted]
     _stage_logs: dict[str, list[str]]
+    _stage_warnings: dict[str, _StageWarnings]
     _total: int
 
     def __init__(self, *, console: rich.console.Console, show_output: bool = False) -> None:
@@ -173,6 +237,7 @@ class StaticConsoleSink:
         self._max_name_width = 0
         self._completion_buffer = list[StageCompleted]()
         self._stage_logs = dict[str, list[str]]()
+        self._stage_warnings = dict[str, _StageWarnings]()
         self._total = 0
 
     async def handle(self, event: OutputEvent) -> None:
@@ -186,11 +251,9 @@ class StaticConsoleSink:
                 self._max_name_width = max(self._max_name_width, len(event["stage"]))
                 self._completion_buffer.append(event)
             case "log_line":
-                # Always buffer for failed-stage output; stream if --show-output
+                # Buffer for the report; stream if --show-output
                 stage = event["stage"]
-                buf = self._stage_logs.setdefault(stage, [])
-                if len(buf) < _MAX_LOG_LINES_PER_STAGE:
-                    buf.append(event["line"])
+                _buffer_log_line(event, self._stage_logs, self._stage_warnings)
                 if self._show_output:
                     line = rich.markup.escape(event["line"])
                     if event["is_stderr"]:
@@ -203,18 +266,31 @@ class StaticConsoleSink:
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")
+            case "engine_state_changed":
+                # ACTIVE starts a run and IDLE ends one; each run gets its own report.
+                self._finish_run()
             case _:
                 pass
 
-    async def close(self) -> None:
-        """Print sorted completion report."""
+    def _finish_run(self) -> None:
+        """Print the buffered run's sorted report and reset per-run state."""
         _print_completions(
             self._console,
             self._completion_buffer,
             total=self._total,
             max_name_width=self._max_name_width,
             stage_logs=self._stage_logs,
+            stage_warnings=None if self._show_output else self._stage_warnings,
         )
+        self._max_name_width = 0
+        self._completion_buffer.clear()
+        self._stage_logs.clear()
+        self._stage_warnings.clear()
+        self._total = 0
+
+    async def close(self) -> None:
+        """Print the report of a run that has not ended yet."""
+        self._finish_run()
 
 
 class _LiveRenderable:
@@ -232,7 +308,7 @@ class _LiveRenderable:
 
 
 class LiveConsoleSink:
-    """TTY sink with live pinned status area. Completions print on close."""
+    """TTY sink with live pinned status area. Completions print when each run ends."""
 
     _console: rich.console.Console
     _show_output: bool
@@ -242,6 +318,7 @@ class LiveConsoleSink:
     _max_name_width: int
     _completion_buffer: list[StageCompleted]
     _stage_logs: dict[str, list[str]]
+    _stage_warnings: dict[str, _StageWarnings]
     _total: int
     _live: rich.live.Live | None
 
@@ -256,6 +333,7 @@ class LiveConsoleSink:
         self._max_name_width = 0
         self._completion_buffer = list[StageCompleted]()
         self._stage_logs = dict[str, list[str]]()
+        self._stage_warnings = dict[str, _StageWarnings]()
         self._total = 0
         self._live = None
 
@@ -325,10 +403,14 @@ class LiveConsoleSink:
     def _ensure_live(self) -> None:
         if self._live is not None:
             return
+        # While the live area is drawn, stderr writes (the CLI's log records) must print above
+        # it, or the next redraw erases them. rich swaps sys.stderr for that while live; only do
+        # it when stderr is the terminal, so `2>file` keeps every record in the file.
         self._live = rich.live.Live(
             self._build_live_renderable(),
             console=self._console,
             refresh_per_second=1,
+            redirect_stderr=sys.stderr.isatty(),
         )
         self._live.start()
 
@@ -356,9 +438,7 @@ class LiveConsoleSink:
                 self._update_live()
             case "log_line":
                 stage = event["stage"]
-                buf = self._stage_logs.setdefault(stage, [])
-                if len(buf) < _MAX_LOG_LINES_PER_STAGE:
-                    buf.append(event["line"])
+                _buffer_log_line(event, self._stage_logs, self._stage_warnings)
                 if self._show_output:
                     line = rich.markup.escape(event["line"])
                     if event["is_stderr"]:
@@ -371,20 +451,38 @@ class LiveConsoleSink:
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")
+            case "engine_state_changed":
+                # ACTIVE starts a run and IDLE ends one; each run gets its own display.
+                self._finish_run()
             case _:
                 pass
 
-    async def close(self) -> None:
+    def _finish_run(self) -> None:
+        """Stop the live area, print the run's sorted report, and reset per-run state."""
         if self._live is not None:
             self._live.update(rich.text.Text(""))
             self._live.stop()
+            self._live = None
         _print_completions(
             self._console,
             self._completion_buffer,
             total=self._total,
             max_name_width=self._max_name_width,
             stage_logs=self._stage_logs,
+            stage_warnings=None if self._show_output else self._stage_warnings,
         )
+        self._running.clear()
+        self._completed_count = 0
+        self._category_counts.clear()
+        self._max_name_width = 0
+        self._completion_buffer.clear()
+        self._stage_logs.clear()
+        self._stage_warnings.clear()
+        self._total = 0
+
+    async def close(self) -> None:
+        """Report a run that has not ended yet."""
+        self._finish_run()
 
 
 class ResultCollectorSink:

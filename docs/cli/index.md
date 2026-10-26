@@ -7,17 +7,17 @@ Complete reference for all Pivot command-line commands.
 | Task | Command |
 |------|---------|
 | Run pipeline | `pivot repro` |
-| Run specific stages + deps | `pivot repro stage1 stage2` |
-| Run single stage (no deps) | `pivot run stage` |
+| Run specific stages + deps | `pivot repro pipeline/stage1 pipeline/stage2` |
+| Run single stage (no deps) | `pivot run pipeline/stage` |
 | Run with live output | `pivot repro --show-output` |
 | See what would run | `pivot repro -n` |
 | Understand why stage runs | `pivot status --explain stage` |
 | List all stages | `pivot list` |
 | Show stage status | `pivot status` |
 | Visualize DAG | `pivot dag` |
-| Compare data files | `pivot diff output.csv` |
+| Compare data files | `pivot diff data/demo/clean.jsonl` |
 | Verify reproducibility | `pivot verify` |
-| Import from remote repo | `pivot import REPO_URL PATH` |
+| Import from remote repo | `pivot import REPO_URL ARTIFACT --out PATH` |
 | Update imported artifacts | `pivot update` |
 | Push outputs to remote | `pivot push` |
 | Fetch to local cache | `pivot fetch` |
@@ -36,6 +36,29 @@ All commands support:
 | `--verbose` / `-v` | Show detailed output |
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
+
+**Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
+current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
+project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
+`../data/x.csv`.
+
+An absolute path that reaches the project through a symlink outside it counts as the place it
+points to in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch`, `pull` and `track`. The
+symlink can point to the project root, to one of its ancestors, or to a directory inside the
+project: from a `link -> project` symlink, `link/data/x.csv` names `data/x.csv`. A symlink
+inside the project is not followed: from `project/dlink -> data`, `dlink/x.csv` matches no
+output in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch` and `pull`, so give the path it
+points to, `data/x.csv`. `track` tracks a file through such a symlink, with a warning that the
+file is inside a symlinked directory.
+
+`pivot get` refuses every absolute path ("Path traversal not allowed in target").
+`pivot check-ignore` keeps a path under a symlink as typed, so a pattern anchored to the project
+root, such as `data/*.tmp`, does not match it. Give those two the path relative to the project
+root.
+
+A path that leaves the project, including `link/../x.csv`, is refused by `checkout`, `push`,
+`fetch`, `pull` and `track` (`resolves outside project root`) and matches no output in
+`diff`, `repro` and `dag`.
 
 ---
 
@@ -61,7 +84,7 @@ pivot repro [STAGES...] [OPTIONS]
 
 **Arguments:**
 
-- `STAGES` - Stage names to run (optional, runs all if not specified)
+- `STAGES` - Stage names (`pipeline/stage`) or output identities to run (optional, runs all if not specified)
 
 **Options:**
 
@@ -77,13 +100,14 @@ pivot repro [STAGES...] [OPTIONS]
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure (default) |
 | `--keep-going` / `-k` | Continue running stages after failures; skip only downstream dependents |
 | `--serve` | Start RPC server for agent control (requires --watch) |
-| `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
+| `--allow-uncached-incremental` | Allow running stages with incremental output files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
 | `--allow-missing` | Allow missing dep files if tracked (only affects --dry-run) |
-| `--all` | Run all stages (ignore target filtering) |
+| `--all` | Run across all pipelines in the project |
 
 **Examples:**
 
@@ -92,7 +116,7 @@ pivot repro [STAGES...] [OPTIONS]
 pivot repro
 
 # Run specific stages and their dependencies
-pivot repro train evaluate
+pivot repro demo/train demo/evaluate
 
 # See what would run
 pivot repro --dry-run
@@ -102,6 +126,9 @@ pivot repro --watch
 
 # Continue after failures
 pivot repro --keep-going
+
+# Allow two stages that request gpu to run together
+pivot repro --resources gpu=2
 ```
 
 ---
@@ -116,7 +143,7 @@ pivot run STAGES... [OPTIONS]
 
 **Arguments:**
 
-- `STAGES` - Stage names to run (required, at least one)
+- `STAGES` - Stage names to run (required, at least one), qualified by pipeline (`demo/train`)
 
 **Options:**
 
@@ -128,22 +155,24 @@ pivot run STAGES... [OPTIONS]
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
 | `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure |
 | `--keep-going` / `-k` | Continue running stages after failures |
-| `--allow-uncached-incremental` | Allow running stages with IncrementalOut files not in cache |
+| `--allow-uncached-incremental` | Allow running stages with incremental output files not in cache |
 | `--checkout-missing` | Restore tracked files from cache before running |
+| `--all` | Run across all pipelines in the project |
 
 **Examples:**
 
 ```bash
 # Run a single stage (no dependencies)
-pivot run train
+pivot run demo/train
 
 # Run multiple stages in order
-pivot run preprocess train
+pivot run demo/preprocess demo/train
 
 # Stop immediately on failure
-pivot run preprocess train --fail-fast
+pivot run demo/preprocess demo/train --fail-fast
 ```
 
 ---
@@ -164,7 +193,7 @@ pivot list [OPTIONS]
 |--------|-------------|
 | `--json` | Output as JSON |
 | `--deps` | Show stage dependencies |
-| `--all` | List all stages (ignore target filtering) |
+| `--all` | List stages across all pipelines in the project |
 
 ---
 
@@ -192,7 +221,7 @@ pivot status [STAGES...] [OPTIONS]
 | `--remote-only` | Show only remote status |
 | `--remote` / `-r` | Include remote sync status |
 | `--check-imports` | Check for import updates (requires network) |
-| `--all` | Show all stages (ignore target filtering) |
+| `--all` | Show status across all pipelines in the project |
 
 ---
 
@@ -210,7 +239,7 @@ Without arguments, commits all stale stages. With stage names, unconditionally c
 
 | Option | Description |
 |--------|-------------|
-| `--all` | Commit all stages |
+| `--all` | Commit across all pipelines in the project |
 
 ---
 
@@ -251,22 +280,6 @@ pivot show [RUN_ID] [OPTIONS]
 
 ---
 
-### `pivot export`
-
-Export pipeline to DVC YAML format.
-
-```bash
-pivot export [STAGES...] [OPTIONS]
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--output` / `-o PATH` | Output path (default: `dvc.yaml`) |
-
----
-
 ### `pivot dag`
 
 Visualize the pipeline DAG.
@@ -289,7 +302,7 @@ Shows the dependency graph of artifacts (default) or stages. Without targets, sh
 | `--mermaid` | Output Mermaid format |
 | `--md` | Output Mermaid wrapped in markdown |
 | `--stages` | Show stages as nodes (default: artifacts) |
-| `--all` | Show all stages (ignore target filtering) |
+| `--all` | Show the DAG across all pipelines in the project |
 
 **Examples:**
 
@@ -298,7 +311,7 @@ Shows the dependency graph of artifacts (default) or stages. Without targets, sh
 pivot dag
 
 # Show DAG for specific stage and its dependencies
-pivot dag train
+pivot dag demo/train
 
 # Output as Mermaid diagram
 pivot dag --mermaid
@@ -321,6 +334,9 @@ pivot verify [STAGES...] [OPTIONS]
 ```
 
 Checks that all stages are cached (code, params, deps match lock files) and output files exist locally or on remote. Use in CI pre-merge gates to ensure pipeline is reproducible.
+
+For a directory output, `pivot verify` also checks that the workspace path is a directory. A file
+at that path fails verification.
 
 **Arguments:**
 
@@ -346,7 +362,7 @@ Checks that all stages are cached (code, params, deps match lock files) and outp
 pivot verify
 
 # Verify specific stages
-pivot verify train evaluate
+pivot verify demo/train demo/evaluate
 
 # CI gate: allow missing local files if on remote
 pivot verify --allow-missing
@@ -398,9 +414,12 @@ pivot checkout [TARGETS...] [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
-| `--force` / `-f` | Overwrite existing files |
-| `--only-missing` | Only restore files that don't exist on disk |
+| `--force` / `-f` | Overwrite existing files when every required cache object is available; otherwise refuse without changing the workspace file |
+| `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files and empty directories; if a file differs from the target, or an extra file or directory exists, replaces the directory when every such file is pivot's own earlier output (its content is in the cache; an extra empty directory holds nothing to lose), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite |
 | `--all` | Checkout all targets (ignore target filtering) |
+
+Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
+counts separately.
 
 ---
 
@@ -429,13 +448,13 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 
 ```bash
 # Get file from specific commit
-pivot get model.pkl --rev abc123
+pivot get data/demo/train.jsonl --rev abc123
 
 # Get stage output from branch
-pivot get train --rev feature-branch
+pivot get demo/train --rev feature-branch
 
 # Get with custom output path
-pivot get model.pkl --rev v1.0 --output old_model.pkl
+pivot get data/demo/train.jsonl --rev v1.0 --output old_train.jsonl
 ```
 
 ---
@@ -495,7 +514,7 @@ pivot plots show [TARGETS...] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--output` / `-o PATH` | Output HTML path (default: `pivot_plots/index.html`) |
+| `--output` / `-o PATH` | Output HTML path (default: `.pivot/plots/index.html`, ignored by git). Image paths are relative to the HTML file. |
 | `--open` | Open browser after rendering |
 
 ---
@@ -568,7 +587,19 @@ pivot diff TARGETS... [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Data files to compare (required)
+- `TARGETS` - Stage outputs to compare (required): a stage name, or a path at, inside or above a
+  stage output. `.` compares every output. A directory output compares its CSV, JSON, and JSONL
+  files one by one, and a path inside it compares the files at or below that path. A target that
+  names no CSV, JSON, or JSONL file is named in a warning and not compared. An output that moved
+  to a new path since git HEAD is compared as removed at its old path and added at its new one; a
+  path that holds a file at git HEAD and a directory in the workspace, or the reverse, is named
+  in a warning with both kinds and not compared.
+
+Each `--json` entry carries `change_type`: `added`, `removed` or `modified`. A kind change has
+no entry, only its warning. When git HEAD's side of an entry is not in the local cache, as in a
+fresh clone, the entry keeps its change type with that side's rows and columns `null`. A warning
+names the path and says to run `pivot fetch`, which fills the cache without touching the
+workspace, so the next diff compares that entry; every other entry is compared as usual.
 
 **Options:**
 
@@ -586,13 +617,13 @@ pivot diff TARGETS... [OPTIONS]
 
 ```bash
 # Interactive TUI mode
-pivot diff output.csv
+pivot diff data/demo/clean.jsonl
 
 # Key-based row matching
-pivot diff output.csv --key id,timestamp
+pivot diff data/demo/clean.jsonl --key id,timestamp
 
 # JSON output for scripting
-pivot diff output.csv --json
+pivot diff data/demo/clean.jsonl --json
 ```
 
 ---
@@ -656,7 +687,7 @@ pivot pull [TARGETS...] [OPTIONS]
 | `--dry-run` / `-n` | Show what would be pulled |
 | `--jobs` / `-j N` | Parallel download jobs |
 | `--force` / `-f` | Overwrite existing workspace files |
-| `--only-missing` | Only restore files that don't exist in workspace |
+| `--only-missing` | Only restore files that don't exist in workspace (the default without `--force`). A directory is replaced when every changed or extra file is pivot's own earlier output (an extra empty directory holds nothing to lose), and refused (naming the files) when one holds a local change the cache lacks |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--all` | Pull all stages (ignore target filtering) |
 
@@ -689,38 +720,40 @@ pivot fetch [TARGETS...] [OPTIONS]
 
 ### `pivot import`
 
-Import an artifact from a remote Pivot repository.
+Import a stage output from another Pivot repository.
 
 ```bash
-pivot import REPO_URL PATH [OPTIONS]
+pivot import REPO_URL ARTIFACT --out PATH [OPTIONS]
 ```
 
 **Arguments:**
 
-- `REPO_URL` - URL of the remote Pivot repository
-- `PATH` - Path to the artifact within the remote repository
+- `REPO_URL` - URL of the source Pivot repository (HTTPS, SSH, or `file://`)
+- `ARTIFACT` - Identity of the output in the source repo: `pipeline/stage` for a single-output stage, `pipeline/stage:key` for one field of a multi-output stage, as printed by `pivot list --deps` there. A directory output is imported one file at a time: `pipeline/stage:path`, or `pipeline/stage:key/path` for a `TypedDict` field
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--rev REV` | Git ref to import from (branch, tag, commit; default: main) |
-| `--out PATH` | Local output path (default: same as source path) |
+| `--out PATH` | Local path to write the file to (without it, the artifact's name with `/` for `:`, so `prep/split:test` writes `prep/split/test`) |
 | `--force` | Overwrite existing files |
 | `--no-download` | Create .pvt metadata without downloading |
 
 **Examples:**
 
 ```bash
-# Import a model from another repo
-pivot import https://github.com/org/ml-models model.pkl
+# Import a single-output stage's result
+pivot import https://github.com/org/ml-models training/train --out data/raw/model.pkl
 
-# Import from a specific tag
-pivot import https://github.com/org/data data.csv --rev v1.0
+# Import one field of a multi-output stage, from a tag
+pivot import https://github.com/org/data prep/split:test --rev v1.0 --out data/raw/test.csv
 
-# Create metadata only (download later with pivot pull)
-pivot import https://github.com/org/data data.csv --no-download
+# Create metadata only (download later with pivot update)
+pivot import https://github.com/org/data prep/split:test --out data/raw/test.csv --no-download
 ```
+
+The imported file is tracked by a `.pvt` sidecar next to it; read it in a pipeline with `pipeline.input("model.pkl")`.
 
 ---
 
@@ -877,18 +910,18 @@ pivot config unset default_remote
 | Key | Description | Default |
 |-----|-------------|---------|
 | `cache.dir` | Cache directory | `.pivot/cache` |
-| `cache.checkout_mode` | Checkout mode order | `hardlink,symlink,copy` |
-| `core.max_workers` | Parallel workers (-1 = all CPUs) | `-2` |
+| `cache.checkout_mode` | Checkout mode order; a hard link refused because the cache object is at the filesystem's link limit makes a copy instead | `hardlink,symlink,copy` |
+| `core.max_workers` | Most parallel workers (-1 = all CPUs); a run starts fewer when fewer of its stages can run at once | `-2` |
 | `core.run_history_retention` | Keep last N runs | `100` |
 | `core.state_dir` | State directory | `.pivot` |
+| `resources` | Scheduler resource capacities | `{}` |
 | `remote.jobs` | Parallel transfer jobs | `20` |
 | `remote.retries` | Transfer retry count | `10` |
 | `remote.connect_timeout` | Connection timeout (seconds) | `30` |
 | `watch.debounce` | Watch debounce (milliseconds) | `300` |
 | `display.precision` | Float display precision | `5` |
-| `diff.max_rows` | Max rows for data diff | `10000` |
+| `diff.max_rows` | Max rows for diff | `10000` |
 | `default_remote` | Default remote name | (none) |
-| `remotes.<name>` | Remote URL (S3) | (none) |
 
 ---
 
@@ -910,29 +943,6 @@ pivot init [OPTIONS]
 
 ---
 
-### `pivot import-dvc`
-
-Import DVC pipeline and convert to Pivot format.
-
-```bash
-pivot import-dvc [OPTIONS]
-```
-
-Reads `dvc.yaml` (and optionally `dvc.lock`, `params.yaml`) and generates `pivot.yaml` with migration notes for manual review.
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--input` / `-i PATH` | Path to dvc.yaml (default: auto-detect) |
-| `--output` / `-o PATH` | Output path for pivot.yaml (default: pivot.yaml) |
-| `--params` / `-p PATH` | Path to params.yaml (default: auto-detect) |
-| `--notes` / `-n PATH` | Path for migration notes (default: .pivot/migration-notes.md) |
-| `--force` / `-f` | Overwrite existing files |
-| `--dry-run` | Show what would be generated without writing files |
-
----
-
 ## Utilities
 
 ### `pivot doctor`
@@ -949,6 +959,8 @@ pivot doctor [OPTIONS]
 |--------|-------------|
 | `--json` | Output as JSONL |
 | `--remote` | Also check remote connectivity |
+
+Configuration errors identify the invalid key and value and state the required format.
 
 ---
 
@@ -979,29 +991,13 @@ pivot completion fish | source
 
 ---
 
-### `pivot schema`
-
-Output JSON Schema for pivot.yaml configuration.
-
-```bash
-pivot schema [OPTIONS]
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--indent N` | JSON indentation (0 for compact) |
-
----
-
 ### `pivot fingerprint`
 
 Manage function fingerprinting cache.
 
 #### `pivot fingerprint reset`
 
-Reset cached function fingerprints. Use after encountering stale cache issues or when troubleshooting unexpected stage re-runs.
+Reset cached function fingerprints and cached stage manifests. Use after encountering stale cache issues or when troubleshooting unexpected stage re-runs.
 
 ```bash
 pivot fingerprint reset

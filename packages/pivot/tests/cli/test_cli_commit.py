@@ -3,43 +3,51 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
-from helpers import register_test_stage
-from pivot import cli, executor, loaders, outputs
-from pivot.storage import lock
+from conftest import isolated_pivot_dir
+from pivot import cli, compose, executor, types
+from pivot.storage import cache, lock
 
 if TYPE_CHECKING:
     import click.testing
-    import pytest
-
-    from pivot.pipeline.pipeline import Pipeline
 
 
 # =============================================================================
-# Module-level TypedDicts and Stage Functions for annotation-based registration
+# Module-level stage functions (required for pickling)
 # =============================================================================
 
 
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+@compose.stage
+def process(input_file: str) -> str:
+    return "done"
 
 
-class _ATxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+@compose.stage
+def stage_a() -> str:
+    return "output a"
 
 
-def _helper_process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("done")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+_OUTPUT_REL = pathlib.Path("data", "test", "process.txt")
 
 
-def _helper_stage_a() -> _ATxtOutputs:
-    pathlib.Path("a.txt").write_text("output a")
-    return _ATxtOutputs(output=pathlib.Path("a.txt"))
+def _register_process(pipeline: compose.Pipeline) -> None:
+    raw_dir = pipeline.root / "data" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "input.txt").write_text("data")
+    with pipeline:
+        process(pipeline.input("input.txt", t=str))
+
+
+def _process_lock(pipeline: compose.Pipeline) -> lock.StageLock:
+    return lock.StageLock("test/process", lock.get_stages_dir(pipeline.state_dir))
+
+
+def _cache_file_count(pipeline: compose.Pipeline) -> int:
+    files_dir = pipeline.state_dir / "cache" / "files"
+    if not files_dir.exists():
+        return 0
+    return sum(1 for f in files_dir.glob("*/*") if cache.is_valid_hash(f.parent.name + f.name))
 
 
 # =============================================================================
@@ -49,13 +57,13 @@ def _helper_stage_a() -> _ATxtOutputs:
 
 def test_commit_empty_pipeline(runner: click.testing.CliRunner, tmp_path: pathlib.Path) -> None:
     """commit command with no stages reports nothing to commit."""
-    from conftest import isolated_pivot_dir
-
     with isolated_pivot_dir(runner, tmp_path):
-        pathlib.Path("pivot.yaml").write_text("stages: {}")
+        pathlib.Path("pipeline.py").write_text(
+            "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
+        )
         result = runner.invoke(cli.cli, ["commit"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "Nothing to commit" in result.output
 
 
@@ -65,36 +73,33 @@ def test_commit_empty_pipeline(runner: click.testing.CliRunner, tmp_path: pathli
 
 
 def test_commit_no_args_commits_stale_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """commit with no args commits stages whose output exists but has no lock."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
     # Create output on disk manually (simulating a --no-commit run)
-    (tmp_path / "output.txt").write_text("done")
+    output_path = mock_discovery.root / _OUTPUT_REL
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("done")
 
     result = runner.invoke(cli.cli, ["commit"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "Committed 1 stage(s)" in result.output
-    assert "process" in result.output
+    assert "test/process" in result.output
 
     # Verify production lock was written with output hashes
-    state_dir = tmp_path / ".pivot"
-    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    stage_lock = _process_lock(mock_discovery)
     assert stage_lock.path.exists(), "Production lock should be written"
     lock_data = stage_lock.read()
     assert lock_data is not None, "Lock data should be readable"
-    assert len(lock_data["output_hashes"]) == 1, "Lock should have exactly one output hash"
-    out_key = next(iter(lock_data["output_hashes"]))
-    assert out_key.endswith("output.txt"), (
-        f"Output hash key should be for output.txt, got: {out_key}"
+    assert list(lock_data["output_hashes"]) == [types.ArtifactIdentity("test/process", None)], (
+        "Lock should record exactly the stage's single output"
     )
-    assert lock_data["output_hashes"][out_key]["hash"], "Output hash should not be empty"
+    out_hash = next(iter(lock_data["output_hashes"].values()))
+    assert out_hash["hash"], "Output hash should not be empty"
 
 
 # =============================================================================
@@ -103,34 +108,43 @@ def test_commit_no_args_commits_stale_stages(
 
 
 def test_commit_specific_stage_unconditionally_commits(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """commit <stage> re-commits even when lock already matches."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
     # Run normally to create lock
     executor.run(pipeline=mock_discovery)
 
-    # Verify lock exists after normal run and record its mtime
-    state_dir = tmp_path / ".pivot"
-    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    stage_lock = _process_lock(mock_discovery)
     assert stage_lock.path.exists(), "Lock should exist after normal run"
 
     # Explicit commit <stage> should re-commit even though lock matches
-    result = runner.invoke(cli.cli, ["commit", "process"])
+    result = runner.invoke(cli.cli, ["commit", "test/process"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "Committed 1 stage(s)" in result.output
-    assert "process" in result.output
+    assert "test/process" in result.output
 
     # Verify lock was actually re-written (not just left from previous run)
     lock_data = stage_lock.read()
     assert lock_data is not None, "Lock data should be readable after re-commit"
     assert lock_data["output_hashes"], "Lock should have output hashes after re-commit"
+
+
+def test_commit_bare_stage_name_resolves(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """commit accepts a bare stage name in a single-pipeline project (names.py design)."""
+    _register_process(mock_discovery)
+    executor.run(pipeline=mock_discovery)
+
+    result = runner.invoke(cli.cli, ["commit", "process"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert "Committed 1 stage(s)" in result.output
 
 
 # =============================================================================
@@ -139,14 +153,11 @@ def test_commit_specific_stage_unconditionally_commits(
 
 
 def test_commit_skips_unchanged_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """commit with no args skips stages whose lock already matches."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
     # Run normally - creates lock and caches outputs
     executor.run(pipeline=mock_discovery)
@@ -164,26 +175,23 @@ def test_commit_skips_unchanged_stages(
 
 
 def test_commit_errors_on_missing_output(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """commit <stage> exits non-zero when output file doesn't exist on disk."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
-    # Don't create output.txt on disk - it's missing
+    # Don't create the output on disk - it's missing
 
-    result = runner.invoke(cli.cli, ["commit", "process"])
+    result = runner.invoke(cli.cli, ["commit", "test/process"])
 
     assert result.exit_code == 1, f"Expected exit code 1, got: {result.exit_code}\n{result.output}"
     assert "Failed 1 stage(s)" in result.output
 
     # Verify no lock was written
-    state_dir = tmp_path / ".pivot"
-    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
-    assert not stage_lock.path.exists(), "Lock should NOT be written when output is missing"
+    assert not _process_lock(mock_discovery).path.exists(), (
+        "Lock should NOT be written when output is missing"
+    )
 
 
 # =============================================================================
@@ -191,38 +199,29 @@ def test_commit_errors_on_missing_output(
 # =============================================================================
 
 
-def test_commit_after_no_commit_run(
-    mock_discovery: Pipeline,
+def test_commit_after_no_commit_run_writes_lock(
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Run with --no-commit, then pivot commit writes lock and caches outputs."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    """Run with --no-commit, then pivot commit writes the lock."""
+    _register_process(mock_discovery)
 
     # Run with --no-commit
     executor.run(pipeline=mock_discovery, no_commit=True)
 
     # Output should exist on disk
-    assert (tmp_path / "output.txt").exists(), "Output should exist after --no-commit run"
+    assert (mock_discovery.root / _OUTPUT_REL).exists(), "Output should exist after --no-commit run"
 
     # Production lock should NOT exist
-    state_dir = tmp_path / ".pivot"
-    stage_lock = lock.StageLock("process", lock.get_stages_dir(state_dir))
+    stage_lock = _process_lock(mock_discovery)
     assert not stage_lock.path.exists(), "Lock should NOT exist after --no-commit run"
-
-    # Cache should NOT have files yet (--no-commit skips cache)
-    files_dir = state_dir / "cache" / "files"
-    cache_files_before = list(files_dir.rglob("*")) if files_dir.exists() else []
-    cache_file_count_before = sum(1 for f in cache_files_before if f.is_file())
 
     # Now run pivot commit
     result = runner.invoke(cli.cli, ["commit"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "Committed 1 stage(s)" in result.output
-    assert "process" in result.output
+    assert "test/process" in result.output
 
     # Verify production lock was written
     assert stage_lock.path.exists(), "Lock should be written after commit"
@@ -230,9 +229,25 @@ def test_commit_after_no_commit_run(
     assert lock_data is not None, "Lock data should be readable"
     assert lock_data["output_hashes"], "Lock should have output hashes"
 
+
+def test_commit_after_no_commit_run_caches_outputs(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """Run with --no-commit, then pivot commit caches outputs."""
+    _register_process(mock_discovery)
+
+    # Run with --no-commit (--no-commit skips the cache)
+    executor.run(pipeline=mock_discovery, no_commit=True)
+    cache_file_count_before = _cache_file_count(mock_discovery)
+
+    result = runner.invoke(cli.cli, ["commit"])
+    assert result.exit_code == 0, f"Failed: {result.output}"
+
     # Verify cache now has files (commit caches outputs)
-    cache_files_after = [f for f in files_dir.rglob("*") if f.is_file()]
-    assert len(cache_files_after) > cache_file_count_before, "Cache should have files after commit"
+    assert _cache_file_count(mock_discovery) > cache_file_count_before, (
+        "Cache should have files after commit"
+    )
 
 
 # =============================================================================
@@ -241,14 +256,11 @@ def test_commit_after_no_commit_run(
 
 
 def test_commit_after_no_commit_makes_subsequent_run_skip(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After --no-commit + commit, a normal run should skip (unchanged)."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
     # Run with --no-commit
     executor.run(pipeline=mock_discovery, no_commit=True)
@@ -260,8 +272,8 @@ def test_commit_after_no_commit_makes_subsequent_run_skip(
 
     # Now run normally - should skip because commit recorded the state
     results = executor.run(pipeline=mock_discovery)
-    assert results["process"]["status"] == "cached", (
-        f"Stage should skip after commit, got: {results['process']}"
+    assert results["test/process"]["status"] == "cached", (
+        f"Stage should skip after commit, got: {results['test/process']}"
     )
 
 
@@ -271,13 +283,12 @@ def test_commit_after_no_commit_makes_subsequent_run_skip(
 
 
 def test_commit_unknown_stage_errors(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """commit with unknown stage name errors with helpful message."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    with mock_discovery:
+        stage_a()
 
     result = runner.invoke(cli.cli, ["commit", "nonexistent_stage"])
 

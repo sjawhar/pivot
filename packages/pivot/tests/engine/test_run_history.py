@@ -8,6 +8,7 @@ import pytest
 
 from pivot import config
 from pivot.engine import sinks, sources
+from pivot.engine.engine import Engine
 from pivot.storage import state as state_mod
 from tests import helpers
 
@@ -15,23 +16,19 @@ if TYPE_CHECKING:
     import pathlib
 
     from pivot.engine import engine
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 
-def _helper_stage_func(params: None) -> dict[str, str]:
-    """Simple stage with no deps or outputs for testing."""
+def _helper_stage_func() -> dict[str, str]:
+    """Simple stage with no deps for testing."""
     return {"result": "success"}
 
 
 @pytest.fixture
-def registered_stage(test_pipeline: Pipeline) -> str:
+def registered_stage(test_pipeline: PipelineLike, set_project_root: pathlib.Path) -> str:
     """Register a simple stage for testing."""
-    helpers.register_test_stage(
-        func=_helper_stage_func,
-        name="history_test",
-        pipeline=test_pipeline,
-    )
-    return "history_test"
+    helpers.register_test_stage(_helper_stage_func, name="history_test", pipeline=test_pipeline)
+    return "test/history_test"
 
 
 @pytest.mark.anyio
@@ -42,14 +39,11 @@ async def test_engine_writes_run_history(
     test_engine: engine.Engine,
 ) -> None:
     """Engine writes run history after execution."""
-    # Set up paths
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
-    monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
-    # Run the stage
     collector = sinks.ResultCollectorSink()
     test_engine.add_sink(collector)
     test_engine.add_source(
@@ -65,8 +59,7 @@ async def test_engine_writes_run_history(
 
     assert registered_stage in results
 
-    # Verify run history was written
-    with state_mod.StateDB(state_dir / "state.db") as state_db:
+    with state_mod.StateDB(state_dir) as state_db:
         runs = state_db.list_runs(limit=1)
 
     assert len(runs) >= 1
@@ -89,9 +82,7 @@ async def test_engine_run_history_contains_stage_records(
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
-    monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
-    # Run the stage
     collector = sinks.ResultCollectorSink()
     test_engine.add_sink(collector)
     test_engine.add_source(
@@ -104,8 +95,7 @@ async def test_engine_run_history_contains_stage_records(
     )
     await test_engine.run(exit_on_completion=True)
 
-    # Verify run history contains stage record
-    with state_mod.StateDB(state_dir / "state.db") as state_db:
+    with state_mod.StateDB(state_dir) as state_db:
         runs = state_db.list_runs(limit=1)
 
     assert len(runs) >= 1
@@ -124,16 +114,13 @@ async def test_engine_writes_run_cache_entry(
     registered_stage: str,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    test_pipeline: Pipeline,
+    test_pipeline: PipelineLike,
 ) -> None:
     """Engine writes run cache entries for successful stages."""
-    from pivot.engine.engine import Engine
-
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
-    monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
 
     # First run - executes the stage
     async with Engine(pipeline=test_pipeline) as engine1:
@@ -164,5 +151,4 @@ async def test_engine_writes_run_cache_entry(
         await engine2.run(exit_on_completion=True)
         results = await collector2.get_results()
 
-    # Should be skipped due to cache
     assert results[registered_stage]["reason"] != "", "Stage should have a skip reason"

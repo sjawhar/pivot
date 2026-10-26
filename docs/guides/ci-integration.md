@@ -27,7 +27,7 @@ The `verify` command checks that all stages are cached (code, params, and deps m
 pivot verify
 
 # Verify specific stages
-pivot verify train evaluate
+pivot verify demo/train demo/evaluate
 
 # Allow outputs to exist only on remote (not locally)
 pivot verify --allow-missing
@@ -66,16 +66,16 @@ The `--json` flag produces structured output for programmatic consumption:
   "passed": false,
   "stages": [
     {
-      "name": "preprocess",
+      "name": "demo/preprocess",
       "status": "passed",
       "reason": "",
       "missing_files": []
     },
     {
-      "name": "train",
+      "name": "demo/train",
       "status": "failed",
-      "reason": "Missing files: model.pkl",
-      "missing_files": ["model.pkl"]
+      "reason": "Missing files: data/demo/train.jsonl",
+      "missing_files": ["data/demo/train.jsonl"]
     }
   ]
 }
@@ -99,7 +99,7 @@ pivot status --json --remote
 pivot status --json --explain
 ```
 
-The JSON output includes a `stages` array with status (`cached` or `stale`), a `tracked_files` array, and a `suggestions` list. With `--explain`, each stage entry includes `will_run`, `code_changes`, `param_changes`, `dep_changes`, and `upstream_stale` fields.
+The JSON output includes a `stages` array with status (`cached` or `stale`), a `tracked_files` array, and a `suggestions` list. With `--explain`, each stage entry includes `will_run`, `code_changes`, `param_changes`, `dep_changes`, and `upstream_stale` fields. Each `dep_changes` entry names its artifact as `"identity": {"producer": ..., "key": ...}`, with `key` null for an input or a single-output stage.
 
 ### Quiet Mode
 
@@ -107,7 +107,7 @@ For scripts that only need an exit code:
 
 ```bash
 # Exit 0 if clean, exit 1 if stale stages or modified tracked files
-pivot status --quiet
+pivot --quiet status
 ```
 
 ## GitHub Actions Example
@@ -148,8 +148,14 @@ jobs:
         run: pivot verify --allow-missing
 
       - name: Check tracked files
-        run: pivot status --quiet
+        run: pivot --quiet status
 ```
+
+If a stage's params hold a secret (`pydantic.SecretStr` and friends), the lock file
+records a digest keyed by the project's secret key. Set `PIVOT_SECRET_KEY` in CI to the
+key the lock files were written with (the contents of a developer's `.pivot/secret.key`,
+stored as a CI secret); without it, CI makes its own key and those stages show as stale.
+See [secret parameters](../concepts/parameters.md#secret-parameters).
 
 ### Post-Merge Cache Push
 
@@ -184,6 +190,6 @@ Common causes:
 
 ## Related
 
-- [Remote Storage](remote-storage.md) — configuring S3 remotes for `push`/`pull`
+- [Remote Storage](remote-storage.md) — configuring S3 and GCS remotes for `push`/`pull`
 - [Caching & Skip Detection](../concepts/caching.md) — how Pivot decides what to re-run
 - [Fingerprinting](../concepts/fingerprinting.md) — how code changes are detected

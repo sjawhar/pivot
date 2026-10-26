@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
+import os
+import socket
+import threading
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
 import anyio
+import anyio.to_thread
 import pytest
 
-from helpers import wait_for_socket
+from pivot.compose import Pipeline
 from pivot.engine.agent_rpc import (
     AgentRpcHandler,
     AgentRpcSource,
@@ -23,20 +28,26 @@ from pivot.engine.agent_rpc import (
 )
 from pivot.engine.engine import Engine
 from pivot.engine.types import EventSource, InputEvent, OutputEvent, StageStarted
-from pivot.types import DataDiffResult
+from pivot.types import ChangeType, DataDiffResult
+from tests import helpers
+
+
+def _helper_valid_stage() -> dict[str, int]:
+    return {"value": 1}
+
 
 _diff_expected: DataDiffResult | None = None
 
 
-def _helper_commit_stages_train_eval() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_train_eval(_pipeline: object) -> tuple[list[str], list[str]]:
     return (["train", "eval"], ["broken_stage"])
 
 
-def _helper_commit_stages_empty() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_empty(_pipeline: object) -> tuple[list[str], list[str]]:
     return (list[str](), list[str]())
 
 
-def _helper_commit_stages_stage_a() -> tuple[list[str], list[str]]:
+def _helper_commit_stages_stage_a(_pipeline: object) -> tuple[list[str], list[str]]:
     return (["stage_a"], [])
 
 
@@ -75,7 +86,7 @@ async def test_agent_rpc_source_accepts_connections(tmp_path: Path) -> None:
         tg.start_soon(source.run, send)
 
         # Wait for server to start
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         # Connect and send run command
         async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -99,6 +110,87 @@ async def test_agent_rpc_source_accepts_connections(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_source_signals_ready_once_listening(tmp_path: Path) -> None:
+    """``ready`` is set only once the socket accepts connections, so a client can connect."""
+    import functools
+    import threading
+
+    socket_path = tmp_path / "agent.sock"
+    ready = threading.Event()
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+    source = AgentRpcSource(socket_path=socket_path, ready=ready)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(functools.partial(source.run, send))
+        with anyio.fail_after(5):
+            while not ready.is_set():
+                await anyio.sleep(0.01)
+        connection = await anyio.connect_unix(str(socket_path))
+        await connection.aclose()
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_client_eof_is_not_an_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Readiness probes may connect and close without creating an ERROR traceback."""
+    socket_path = tmp_path / "agent.sock"
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+
+        with caplog.at_level("ERROR"):
+            connection = await anyio.connect_unix(str(socket_path))
+            await connection.aclose()
+            await anyio.sleep(0.05)
+
+        tg.cancel_scope.cancel()
+
+    assert not any(
+        record.name == "pivot.engine.agent_rpc" and record.levelname == "ERROR"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_closed_engine_send_still_logs_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A closed engine event stream is an internal error, not a client disconnect."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](1)
+    await recv.aclose()
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path)
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+
+        with caplog.at_level("ERROR"):
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                request = {"jsonrpc": "2.0", "method": "run", "id": 1}
+                await conn.send(json.dumps(request).encode() + b"\n")
+                with contextlib.suppress(
+                    anyio.EndOfStream,
+                    anyio.ClosedResourceError,
+                    anyio.BrokenResourceError,
+                ):
+                    await conn.receive(4096)
+            await anyio.sleep(0.05)
+
+        tg.cancel_scope.cancel()
+
+    assert any(
+        record.name == "pivot.engine.agent_rpc" and record.levelname == "ERROR"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_cancel_command(tmp_path: Path) -> None:
     """AgentRpcSource emits CancelRequested for cancel method."""
     socket_path = tmp_path / "agent.sock"
@@ -109,7 +201,7 @@ async def test_agent_rpc_source_cancel_command(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {"jsonrpc": "2.0", "method": "cancel", "id": 2}
@@ -140,7 +232,7 @@ async def test_agent_rpc_source_run_with_params(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {
@@ -168,6 +260,33 @@ async def test_agent_rpc_source_run_with_params(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_source_carries_configured_resource_capacity(tmp_path: Path) -> None:
+    """An RPC-triggered run keeps the capacity supplied by serve mode."""
+    socket_path = tmp_path / "agent.sock"
+    send, recv = anyio.create_memory_object_stream[InputEvent](10)
+    event: InputEvent | None = None
+
+    async with anyio.create_task_group() as tg:
+        source = AgentRpcSource(socket_path=socket_path, resource_capacity={"gpu": 2})
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {"jsonrpc": "2.0", "method": "run", "id": 4}
+            await conn.send(json.dumps(request).encode() + b"\n")
+            response = json.loads((await conn.receive(4096)).decode())
+            assert response.get("result") == "accepted"
+
+        event = await recv.receive()
+        tg.cancel_scope.cancel()
+
+    assert event is not None
+    assert event["type"] == "run_requested"
+    if event["type"] == "run_requested":
+        assert event["resource_capacity"] == {"gpu": 2}
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_unknown_method(tmp_path: Path) -> None:
     """AgentRpcSource returns error for unknown methods."""
     socket_path = tmp_path / "agent.sock"
@@ -177,7 +296,7 @@ async def test_agent_rpc_source_unknown_method(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {"jsonrpc": "2.0", "method": "unknown", "id": 4}
@@ -202,7 +321,7 @@ async def test_agent_rpc_source_invalid_json(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             await conn.send(b"not valid json\n")
@@ -227,7 +346,7 @@ async def test_agent_rpc_source_notification_no_response(tmp_path: Path) -> None
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             # Notification: no id field
@@ -262,7 +381,7 @@ async def test_agent_rpc_source_cleans_stale_socket(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         # Should be able to connect despite stale file
         async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -287,13 +406,135 @@ async def test_agent_rpc_source_socket_permissions(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         # Check socket permissions (should be 0o600 = owner read/write only)
         mode = socket_path.stat().st_mode & 0o777
         assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"
 
         tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_cancelled_while_binding_leaves_no_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serve mode's stop cancels the engine's task group, which can land while the listener
+    binds; anyio binds in a worker thread it abandons on cancellation. The socket is still
+    removed."""
+    path = tmp_path / "agent.sock"
+    bound = threading.Event()
+    release = threading.Event()
+    original = socket.socket.bind
+
+    def _bind_then_wait(self: socket.socket, address: str) -> None:
+        original(self, address)
+        bound.set()
+        release.wait(10)
+
+    monkeypatch.setattr(socket.socket, "bind", _bind_then_wait)
+    send, _receive = anyio.create_memory_object_stream[InputEvent](10)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(AgentRpcSource(socket_path=path).run, send)
+        await anyio.to_thread.run_sync(bound.wait, 10)
+        tg.cancel_scope.cancel()
+        release.set()
+    await anyio.sleep(0.5)
+
+    assert not path.exists(), "a source cancelled while binding left its socket behind"
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_cancelled_before_binding_a_long_path_binds_nowhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source cancelled before its bind runs creates no socket anywhere, even when its
+    address names a directory descriptor that the cancellation closed and something reused."""
+    project = tmp_path.joinpath(*["nested-directory"] * 8)
+    project.mkdir(parents=True)
+    path = project / "agent.sock"
+    assert len(os.fsencode(path)) > 108, "the path must go through a directory descriptor"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+    original = socket.socket.bind
+
+    def _wait_then_bind(self: socket.socket, address: str) -> None:
+        entered.set()
+        release.wait(10)
+        original(self, address)
+
+    monkeypatch.setattr(socket.socket, "bind", _wait_then_bind)
+    send, _receive = anyio.create_memory_object_stream[InputEvent](10)
+    releaser = threading.Timer(0.5, release.set)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(AgentRpcSource(socket_path=path).run, send)
+        await anyio.to_thread.run_sync(entered.wait, 10)
+        releaser.start()
+        tg.cancel_scope.cancel()
+    # The process goes on opening files as it shuts down; the lowest free descriptor is reused.
+    reused = os.open(elsewhere, os.O_PATH | os.O_DIRECTORY)
+    try:
+        await anyio.to_thread.run_sync(release.wait, 10)
+        await anyio.sleep(0.5)
+    finally:
+        os.close(reused)
+
+    created = sorted(p.name for p in elsewhere.iterdir())
+    assert not created, f"a cancelled bind created {created} in an unrelated directory"
+    assert not path.exists(), "a source cancelled before binding left its socket behind"
+
+
+@pytest.mark.anyio
+async def test_agent_rpc_source_checks_its_socket_while_still_listening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stopping source removes the socket only if it is the one it bound, and checks while it
+    still listens. Its socket then keeps its inode, so a newer serve that replaces the path at
+    that moment is given another inode number and keeps its socket."""
+    path = tmp_path / "agent.sock"
+    armed = threading.Event()
+    seen = dict[str, object]()
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    originals = {name: getattr(os, name) for name in ("stat", "lstat", "unlink")}
+
+    def _replace_on_first_touch(
+        name: str, target: object, *args: object, **kwargs: object
+    ) -> object:
+        if (
+            armed.is_set()
+            and not seen
+            and isinstance(target, (str, os.PathLike))
+            and os.fspath(target) == str(path)
+        ):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                seen["listening"] = client.connect_ex(str(path)) == 0
+            originals["unlink"](path)
+            replacement.bind(str(path))
+            replacement.listen()
+            seen["inode"] = originals["lstat"](path).st_ino
+        return originals[name](target, *args, **kwargs)
+
+    for name in originals:
+        monkeypatch.setattr(os, name, functools.partial(_replace_on_first_touch, name))
+    send, _receive = anyio.create_memory_object_stream[InputEvent](10)
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(AgentRpcSource(socket_path=path).run, send)
+            await helpers.wait_for_socket(path)
+            armed.set()
+            tg.cancel_scope.cancel()
+
+        assert seen, "the stopping source never touched its socket path"
+        assert seen["listening"], (
+            "the source checked its socket after closing its listener, when a replacement can "
+            + "be given the freed inode number"
+        )
+        assert path.exists(), "the stopping source removed the replacement's socket"
+        assert path.lstat().st_ino == seen["inode"]
+    finally:
+        replacement.close()
 
 
 def test_agent_rpc_source_conforms_to_protocol() -> None:
@@ -376,7 +617,7 @@ async def test_agent_rpc_source_handles_status_query(tmp_path: Path) -> None:
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(source.run, send)
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             async with await anyio.connect_unix(str(socket_path)) as conn:
                 # Send status query
@@ -395,6 +636,65 @@ async def test_agent_rpc_source_handles_status_query(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_rpc_sends_artifact_identities_as_objects(tmp_path: Path) -> None:
+    """Identities inside events and explanations use stage_info's {producer, key} form."""
+    from pivot import types
+
+    buffer = EventBuffer(max_events=10)
+    buffer.handle_sync(
+        StageStarted(
+            type="stage_started",
+            seq=0,
+            stage="train",
+            index=1,
+            total=1,
+            run_id="run",
+            explanation=types.StageExplanation(
+                stage_name="train",
+                will_run=True,
+                is_forced=False,
+                reason="Input dependencies changed",
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[
+                    types.DepChange(
+                        identity=types.ArtifactIdentity("prepare", "features"),
+                        old_hash="aaa",
+                        new_hash="bbb",
+                        change_type=types.ChangeType.MODIFIED,
+                    )
+                ],
+                upstream_stale=[],
+            ),
+        )
+    )
+    socket_path = tmp_path / "agent.sock"
+    handler = AgentRpcHandler(engine=MagicMock(), event_buffer=buffer)
+    source = AgentRpcSource(socket_path=socket_path, handler=handler)
+    send, _recv = anyio.create_memory_object_stream[InputEvent](1)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(source.run, send)
+        await helpers.wait_for_socket(socket_path)
+        async with await anyio.connect_unix(str(socket_path)) as conn:
+            request = {
+                "jsonrpc": "2.0",
+                "method": "events_since",
+                "params": {"version": 0},
+                "id": 1,
+            }
+            await conn.send(json.dumps(request).encode() + b"\n")
+            response = json.loads((await conn.receive(65536)).decode())
+        tg.cancel_scope.cancel()
+
+        event = response["result"]["events"][0]["event"]
+        assert event["explanation"]["dep_changes"][0]["identity"] == {
+            "producer": "prepare",
+            "key": "features",
+        }
+
+
+@pytest.mark.anyio
 async def test_agent_rpc_source_rejects_oversized_messages(tmp_path: Path) -> None:
     """AgentRpcSource rejects messages larger than 1MB to prevent memory exhaustion."""
     socket_path = tmp_path / "agent.sock"
@@ -404,7 +704,7 @@ async def test_agent_rpc_source_rejects_oversized_messages(tmp_path: Path) -> No
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             # Send message larger than 1MB
@@ -440,7 +740,7 @@ async def test_agent_rpc_source_handles_concurrent_connections(tmp_path: Path) -
         tg.start_soon(source.run, send)
         tg.start_soon(collect_events)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         # Connect two clients simultaneously
         async def send_command(client_id: int) -> None:
@@ -480,7 +780,7 @@ async def test_agent_rpc_handler_stages_query_without_pipeline(tmp_path: Path) -
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(source.run, send)
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             async with await anyio.connect_unix(str(socket_path)) as conn:
                 # Query stages when no pipeline is set
@@ -508,14 +808,8 @@ async def test_rpc_run_invalid_stage_returns_error(
     (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / ".pivot").mkdir()
 
-    from pivot.pipeline.pipeline import Pipeline
-
     pipeline = Pipeline("test", root=tmp_path)
-
-    def my_stage() -> None:
-        pass
-
-    pipeline.register(my_stage, name="valid_stage")
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
 
     async with Engine(pipeline=pipeline) as eng:
         handler = AgentRpcHandler(engine=eng)
@@ -540,6 +834,40 @@ async def test_rpc_run_invalid_stage_returns_error(
         message = error.get("message")
         assert isinstance(message, str)
         assert "nonexistent_stage" in message
+
+
+@pytest.mark.anyio
+async def test_rpc_run_on_invalid_pipeline_returns_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RPC run while the pipeline is invalid is refused with the reason, not accepted."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    (tmp_path / ".pivot").mkdir()
+
+    pipeline = Pipeline("test", root=tmp_path)
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
+
+    async with Engine(pipeline=pipeline) as eng:
+        eng._pipeline_error = "Stage 'test/valid_stage': captures non-scalar variable 'X'"
+        source = AgentRpcSource(
+            socket_path=tmp_path / "test.sock", handler=AgentRpcHandler(engine=eng)
+        )
+        send, recv = anyio.create_memory_object_stream[InputEvent](16)
+
+        response = await source._handle_request(
+            {"jsonrpc": "2.0", "method": "run", "params": {"force": True}, "id": 1}, send
+        )
+
+        assert response is not None
+        assert "error" in response
+        error = response["error"]
+        assert error["code"] == -32003
+        assert "Pipeline invalid" in error["message"]
+        assert "captures non-scalar variable 'X'" in error["message"]
+        with pytest.raises(anyio.WouldBlock):
+            recv.receive_nowait()
 
 
 @pytest.mark.anyio
@@ -569,7 +897,7 @@ async def test_agent_rpc_source_connection_timeout() -> None:
             source = AgentRpcSource(socket_path=socket_path)
             tg.start_soon(source.run, send)
 
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             # Connect but don't send anything (idle connection)
             async with await anyio.connect_unix(str(socket_path)) as conn:
@@ -600,6 +928,9 @@ async def test_agent_rpc_source_accepts_new_connections_after_handler_exception(
         """
 
         _call_count: int
+        starting: bool = False
+        reloading: bool = False
+        pipeline_error: str | None = None
 
         def __init__(self) -> None:
             self._call_count = 0
@@ -624,7 +955,7 @@ async def test_agent_rpc_source_accepts_new_connections_after_handler_exception(
         source = AgentRpcSource(socket_path=socket_path, handler=handler)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         # First connection: triggers exception in handler
         with anyio.move_on_after(2.0):
@@ -1068,7 +1399,7 @@ async def test_agent_rpc_source_empty_lines_ignored(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             # Send message with empty lines
@@ -1096,7 +1427,7 @@ async def test_agent_rpc_source_message_at_size_boundary(tmp_path: Path) -> None
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             # Create message just under limit (accounting for JSON structure)
@@ -1139,7 +1470,7 @@ async def test_agent_rpc_source_run_empty_stages_list(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {
@@ -1173,14 +1504,8 @@ async def test_agent_rpc_source_run_stages_with_empty_string(tmp_path: Path) -> 
 
     Edge case: Empty string is not a valid stage name.
     """
-    from pivot.pipeline.pipeline import Pipeline
-
     pipeline = Pipeline("test", root=tmp_path)
-
-    def my_stage() -> None:
-        pass
-
-    pipeline.register(my_stage, name="valid_stage")
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
 
     async with Engine(pipeline=pipeline) as eng:
         handler = AgentRpcHandler(engine=eng)
@@ -1214,7 +1539,7 @@ async def test_agent_rpc_source_run_force_invalid_type(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             # Send force as string instead of boolean
@@ -1251,7 +1576,7 @@ async def test_agent_rpc_source_set_on_error_fail(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {
@@ -1280,7 +1605,7 @@ async def test_agent_rpc_source_set_on_error_keep_going(tmp_path: Path) -> None:
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {
@@ -1309,7 +1634,7 @@ async def test_agent_rpc_source_set_on_error_invalid_mode(tmp_path: Path) -> Non
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {
@@ -1340,7 +1665,7 @@ async def test_agent_rpc_source_set_on_error_missing_mode(tmp_path: Path) -> Non
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {"jsonrpc": "2.0", "method": "set_on_error", "params": {}, "id": 4}
@@ -1366,7 +1691,7 @@ async def test_agent_rpc_source_set_on_error_non_string_mode(tmp_path: Path) -> 
         source = AgentRpcSource(socket_path=socket_path)
         tg.start_soon(source.run, send)
 
-        await wait_for_socket(socket_path)
+        await helpers.wait_for_socket(socket_path)
 
         async with await anyio.connect_unix(str(socket_path)) as conn:
             request = {"jsonrpc": "2.0", "method": "set_on_error", "params": {"mode": 123}, "id": 5}
@@ -1435,8 +1760,7 @@ async def test_handler_commit_dispatches_to_commit_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query calls commit_stages and returns committed/failed lists."""
-    mock_engine = MagicMock()
-    handler = AgentRpcHandler(engine=mock_engine)
+    handler = AgentRpcHandler(engine=Engine(pipeline=Pipeline("test", root=tmp_path)))
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
@@ -1457,8 +1781,7 @@ async def test_handler_commit_empty_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handler commit query returns empty lists when nothing to commit."""
-    mock_engine = MagicMock()
-    handler = AgentRpcHandler(engine=mock_engine)
+    handler = AgentRpcHandler(engine=Engine(pipeline=Pipeline("test", root=tmp_path)))
 
     monkeypatch.setattr(
         "pivot.executor.commit.commit_stages",
@@ -1468,6 +1791,24 @@ async def test_handler_commit_empty_result(
     result = cast("CommitResult", await handler.handle_query("commit"))
     assert result["committed"] == [], "Should return empty committed list"
     assert result["failed"] == [], "Should return empty failed list"
+
+
+@pytest.mark.anyio
+async def test_handler_commit_uses_the_engine_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit runs on the engine's pipeline; the server thread has no Click context."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    (tmp_path / ".pivot").mkdir()
+    pipeline = Pipeline("test", root=tmp_path)
+    helpers.register_test_stage(_helper_valid_stage, name="valid_stage", pipeline=pipeline)
+
+    async with Engine(pipeline=pipeline) as eng:
+        result = cast("CommitResult", await AgentRpcHandler(engine=eng).handle_query("commit"))
+
+    assert result["committed"] + result["failed"] == ["test/valid_stage"]
 
 
 @pytest.mark.anyio
@@ -1483,7 +1824,7 @@ async def test_rpc_commit_via_socket(
         _helper_commit_stages_stage_a,
     )
 
-    async with Engine() as engine:
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
         handler = AgentRpcHandler(engine=engine)
         source = AgentRpcSource(socket_path=socket_path, handler=handler)
 
@@ -1491,7 +1832,7 @@ async def test_rpc_commit_via_socket(
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(source.run, send)
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             async with await anyio.connect_unix(str(socket_path)) as conn:
                 request = {"jsonrpc": "2.0", "method": "commit", "id": 1}
@@ -1515,7 +1856,7 @@ async def test_rpc_commit_propagates_error(
     """Commit query propagates errors from commit_stages — server closes connection."""
     socket_path = tmp_path / "agent.sock"
 
-    def _raise() -> tuple[list[str], list[str]]:
+    def _raise(_pipeline: object) -> tuple[list[str], list[str]]:
         raise RuntimeError("No pipeline loaded")
 
     monkeypatch.setattr(
@@ -1523,7 +1864,7 @@ async def test_rpc_commit_propagates_error(
         _raise,
     )
 
-    async with Engine() as engine:
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
         handler = AgentRpcHandler(engine=engine)
         source = AgentRpcSource(socket_path=socket_path, handler=handler)
 
@@ -1531,7 +1872,7 @@ async def test_rpc_commit_propagates_error(
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(source.run, send)
-            await wait_for_socket(socket_path)
+            await helpers.wait_for_socket(socket_path)
 
             async with await anyio.connect_unix(str(socket_path)) as conn:
                 request = {"jsonrpc": "2.0", "method": "commit", "id": 1}
@@ -1546,6 +1887,43 @@ async def test_rpc_commit_propagates_error(
             tg.cancel_scope.cancel()
 
 
+@pytest.mark.anyio
+async def test_rpc_query_pivot_error_gets_an_error_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PivotError from a query handler is a JSON-RPC error with its message, not a drop."""
+    from pivot import exceptions
+
+    socket_path = tmp_path / "agent.sock"
+
+    def _raise(_pipeline: object) -> tuple[list[str], list[str]]:
+        raise exceptions.PivotError("Stage 'test/s': fingerprinting failed: captures 'X'")
+
+    monkeypatch.setattr("pivot.executor.commit.commit_stages", _raise)
+
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
+        source = AgentRpcSource(socket_path=socket_path, handler=AgentRpcHandler(engine=engine))
+        send, _ = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await helpers.wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                await conn.send(
+                    json.dumps({"jsonrpc": "2.0", "method": "commit", "id": 1}).encode() + b"\n"
+                )
+                response = json.loads((await conn.receive(4096)).decode())
+                assert response["error"]["code"] == -32603
+                assert (
+                    response["error"]["message"]
+                    == "Stage 'test/s': fingerprinting failed: captures 'X'"
+                )
+
+            tg.cancel_scope.cancel()
+
+
 # =============================================================================
 # diff_output Query
 # =============================================================================
@@ -1555,6 +1933,7 @@ def _make_diff_result(path: str = "output.csv") -> DataDiffResult:
     """Create a minimal DataDiffResult for testing."""
     return DataDiffResult(
         path=path,
+        change_type=ChangeType.MODIFIED,
         old_rows=10,
         new_rows=12,
         old_cols=["a", "b"],
@@ -1644,16 +2023,15 @@ async def test_handler_diff_output_invalid_new_hash_type() -> None:
 
 
 @pytest.mark.anyio
-async def test_handler_diff_output_null_hashes(
+async def test_handler_diff_output_null_old_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """diff_output works with null hashes (file added/removed cases)."""
+    """diff_output restores only the side whose hash the request names (an added file)."""
     mock_engine = MagicMock()
     handler = AgentRpcHandler(engine=mock_engine)
 
     expected = _make_diff_result("new_file.csv")
 
-    # restore_data_from_cache should NOT be called for null hashes
     restore_calls = list[str]()
 
     def _mock_restore(rel_path: str, file_hash: str) -> Path | None:
@@ -1665,6 +2043,7 @@ async def test_handler_diff_output_null_hashes(
         "pivot.show.data.diff_data_files",
         _helper_diff_data_files,
     )
+    monkeypatch.setattr("pathlib.Path.unlink", _helper_path_unlink)
 
     _diff_expected = expected
     try:
@@ -1672,14 +2051,25 @@ async def test_handler_diff_output_null_hashes(
             "DataDiffResult",
             await handler.handle_query(
                 "diff_output",
-                {"path": "new_file.csv", "old_hash": None, "new_hash": None},
+                {"path": "new_file.csv", "old_hash": None, "new_hash": "def4560000000000"},
             ),
         )
     finally:
         _diff_expected = None
 
     assert result["path"] == "new_file.csv", "Should return correct path"
-    assert restore_calls == [], "Should not call restore for null hashes"
+    assert restore_calls == ["def4560000000000"], "Should restore only the named side"
+
+
+@pytest.mark.anyio
+async def test_handler_diff_output_refuses_a_request_naming_neither_hash() -> None:
+    """A request naming neither hash names no file to compare, so it is refused."""
+    handler = AgentRpcHandler(engine=MagicMock())
+
+    with pytest.raises(ValueError, match="old_hash or new_hash must be given"):
+        await handler.handle_query(
+            "diff_output", {"path": "out.csv", "old_hash": None, "new_hash": None}
+        )
 
 
 @pytest.mark.anyio
@@ -1703,7 +2093,7 @@ async def test_handler_diff_output_max_rows_default(
 
     await handler.handle_query(
         "diff_output",
-        {"path": "out.csv", "old_hash": None, "new_hash": None},
+        {"path": "out.csv", "old_hash": None, "new_hash": "def4560000000000"},
     )
 
     assert captured_kwargs.get("max_rows") == 50, "Default max_rows should be 50"
@@ -1730,7 +2120,117 @@ async def test_handler_diff_output_custom_max_rows(
 
     await handler.handle_query(
         "diff_output",
-        {"path": "out.csv", "old_hash": None, "new_hash": None, "max_rows": 100},
+        {"path": "out.csv", "old_hash": None, "new_hash": "def4560000000000", "max_rows": 100},
     )
 
     assert captured_kwargs.get("max_rows") == 100, "Should use custom max_rows"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("old_hash", "new_hash", "change_type"),
+    [
+        pytest.param(None, "def4560000000000", ChangeType.ADDED, id="added"),
+        pytest.param("abc1230000000000", None, ChangeType.REMOVED, id="removed"),
+        pytest.param("abc1230000000000", "def4560000000000", ChangeType.MODIFIED, id="modified"),
+    ],
+)
+async def test_handler_diff_output_passes_the_change_type_its_hashes_name(
+    monkeypatch: pytest.MonkeyPatch,
+    old_hash: str | None,
+    new_hash: str | None,
+    change_type: ChangeType,
+) -> None:
+    """A request naming only a new hash is an added file, only an old hash a removed file, and
+    both a modified file, whether or not either object is in the cache."""
+    handler = AgentRpcHandler(engine=MagicMock())
+    captured_kwargs = dict[str, object]()
+
+    def _mock_diff(
+        old_path: object, new_path: object, path_display: str, **kwargs: object
+    ) -> DataDiffResult:
+        captured_kwargs.update(kwargs)
+        return _make_diff_result(path_display)
+
+    monkeypatch.setattr("pivot.show.data.restore_data_from_cache", _helper_restore_data_none)
+    monkeypatch.setattr("pivot.show.data.diff_data_files", _mock_diff)
+
+    await handler.handle_query(
+        "diff_output", {"path": "out.csv", "old_hash": old_hash, "new_hash": new_hash}
+    )
+
+    assert captured_kwargs.get("change_type") == change_type, captured_kwargs
+
+
+def test_encode_wire_writes_numpy_scalars_as_python_values() -> None:
+    """A diff result's row values can be numpy integers, floats and bools; the RPC writes them
+    as plain JSON numbers and booleans instead of dropping the connection."""
+    import numpy
+
+    from pivot.engine import agent_rpc
+
+    message = {
+        "old_values": {"n": numpy.int64(2), "x": numpy.float64(0.5), "ok": numpy.bool_(True)}
+    }
+
+    wire = json.loads(agent_rpc._encode_wire(message))
+
+    assert wire == {"old_values": {"n": 2, "x": 0.5, "ok": True}}
+    assert [type(value) for value in wire["old_values"].values()] == [int, float, bool]
+
+
+@pytest.mark.anyio
+async def test_rpc_diff_output_answers_a_modified_file_with_a_datetime_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A modified file's rows can hold timestamps; the reply writes them as text, as
+    `pivot diff --json` does, instead of dropping the connection."""
+    import shutil
+
+    import pandas
+
+    from pivot import config, loaders
+    from pivot.storage import cache
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
+    hashes = list[str]()
+    for rows in (2, 3):
+        frame = pandas.DataFrame({"v": range(1, rows + 1)})
+        frame["when"] = pandas.Timestamp("2024-01-01") + pandas.to_timedelta(frame["v"], unit="D")
+        source = tmp_path / f"stamp{rows}.jsonl"
+        loaders.DataFrameJSONL().save(frame, source)
+        file_hash, _ = cache.hash_file(source)
+        cached = cache.get_cache_path(cache_dir / "files", file_hash)
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, cached)
+        hashes.append(file_hash)
+    socket_path = tmp_path / "agent.sock"
+    request = {
+        "jsonrpc": "2.0",
+        "method": "diff_output",
+        "params": {"path": "data/d/stamp.jsonl", "old_hash": hashes[0], "new_hash": hashes[1]},
+        "id": 1,
+    }
+
+    reply = b""
+    async with Engine(pipeline=Pipeline("test", root=tmp_path)) as engine:
+        source = AgentRpcSource(socket_path=socket_path, handler=AgentRpcHandler(engine=engine))
+        send, _ = anyio.create_memory_object_stream[InputEvent](10)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(source.run, send)
+            await helpers.wait_for_socket(socket_path)
+
+            async with await anyio.connect_unix(str(socket_path)) as conn:
+                await conn.send(json.dumps(request).encode() + b"\n")
+                while not reply.endswith(b"\n"):
+                    reply += await conn.receive(65536)
+
+            tg.cancel_scope.cancel()
+
+    result = json.loads(reply)["result"]
+    assert (result["change_type"], result["old_rows"], result["new_rows"]) == ("modified", 2, 3)
+    assert [change["new_values"] for change in result["row_changes"]] == [
+        {"v": 3, "when": "2024-01-04 00:00:00"}
+    ]

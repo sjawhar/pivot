@@ -4,7 +4,7 @@ import pathlib
 
 import click
 
-from pivot import config, project
+from pivot import config, names, project, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -54,21 +54,27 @@ def _normalize_cli_targets(
     project_root = project.get_project_root()
 
     for target in targets:
-        if known_stages is not None and target in known_stages:
-            normalized.append(target)
-            continue
+        if known_stages is not None:
+            identity = types.identity_from_key(target)
+            stage_name = names.resolve_stage_name(identity.producer, dict.fromkeys(known_stages))
+            if stage_name in known_stages:
+                normalized.append(
+                    types.identity_key(types.ArtifactIdentity(stage_name, identity.key))
+                )
+                continue
 
         original = target
         target_path = pathlib.Path(target)
         if target_path.suffix == ".pvt":
             target = str(track.get_data_path(target_path))
 
-        normalized_path = project.normalize_path(target, base=pathlib.Path.cwd())
-
-        if not normalized_path.is_relative_to(project_root):
+        relative = project.relative_within(
+            project.normalize_path(target, base=pathlib.Path.cwd()), project_root
+        )
+        if relative is None:
             raise click.ClickException(f"Target '{original}' resolves outside project root")
 
-        normalized.append(str(normalized_path))
+        normalized.append(str(project_root / relative))
 
     return tuple(normalized)
 
@@ -97,7 +103,7 @@ def push(
 
     cache_dir = config.get_cache_dir()
     state_dir = config.get_state_dir()
-    s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
+    remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
@@ -127,13 +133,13 @@ def push(
     # Remote hash tracking is project-level (not per-stage), so use the
     # project-level StateDB regardless of --all mode.
     with (
-        state.StateDB(config.get_state_db_path()) as state_db,
+        state.StateDB(config.get_state_dir()) as state_db,
         cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
     ):
         result = transfer.push(
             cache_dir,
             state_dir,
-            s3_remote,
+            remote_storage,
             state_db,
             resolved_name,
             targets_list,
@@ -186,7 +192,7 @@ def fetch(
 
     cache_dir = config.get_cache_dir()
     state_dir = config.get_state_dir()
-    s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
+    remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
@@ -212,13 +218,13 @@ def fetch(
         return
 
     with (
-        state.StateDB(config.get_state_db_path()) as state_db,
+        state.StateDB(config.get_state_dir()) as state_db,
         cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
     ):
         result = transfer.pull(
             cache_dir,
             state_dir,
-            s3_remote,
+            remote_storage,
             state_db,
             resolved_name,
             targets_list,
@@ -288,7 +294,7 @@ def pull(
 
     cache_dir = config.get_cache_dir()
     state_dir = config.get_state_dir()
-    s3_remote, resolved_name = transfer.create_remote_from_name(remote_name)
+    remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
@@ -316,13 +322,13 @@ def pull(
 
     # Step 1: Fetch from remote to cache
     with (
-        state.StateDB(config.get_state_db_path()) as state_db,
+        state.StateDB(config.get_state_dir()) as state_db,
         cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
     ):
         fetch_result = transfer.pull(
             cache_dir,
             state_dir,
-            s3_remote,
+            remote_storage,
             state_db,
             resolved_name,
             targets_list,

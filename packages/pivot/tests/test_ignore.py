@@ -150,24 +150,14 @@ def test_comments_and_blank_lines(tmp_path: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_pivot_yaml_never_ignored(tmp_path: pathlib.Path) -> None:
-    """pivot.yaml should never be ignored regardless of patterns."""
+def test_pipeline_py_never_ignored(tmp_path: pathlib.Path) -> None:
+    """pipeline.py should never be ignored regardless of patterns."""
     pivotignore = tmp_path / ".pivotignore"
-    pivotignore.write_text("pivot.yaml\n*.yaml\n")
+    pivotignore.write_text("pipeline.py\n*.py\n")
 
     filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
 
-    assert not filter_instance.is_ignored("pivot.yaml")
-
-
-def test_pivot_yml_never_ignored(tmp_path: pathlib.Path) -> None:
-    """pivot.yml should never be ignored regardless of patterns."""
-    pivotignore = tmp_path / ".pivotignore"
-    pivotignore.write_text("pivot.yml\n*.yml\n")
-
-    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
-
-    assert not filter_instance.is_ignored("pivot.yml")
+    assert not filter_instance.is_ignored("pipeline.py")
 
 
 def test_pivot_dir_never_ignored(tmp_path: pathlib.Path) -> None:

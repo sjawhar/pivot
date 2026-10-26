@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import anyio  # type: ignore[reportMissingImports] - runtime dependency
 
+from pivot_tui import unix_socket
+
 if TYPE_CHECKING:
     from anyio.abc import SocketListener, SocketStream, TaskGroup
 
@@ -73,6 +75,7 @@ class FakeRpcServer:
     _explanations: dict[str, dict[str, object]]
     _stage_infos: dict[str, dict[str, object]]
     _error_for_method: dict[str, tuple[int, str]]
+    _delay_for_method: dict[str, float]
     _on_error_mode: str
     _run_requests: list[dict[str, object]]
     _diff_results: dict[str, dict[str, object]]
@@ -87,6 +90,7 @@ class FakeRpcServer:
         self._explanations = dict[str, dict[str, object]]()
         self._stage_infos = dict[str, dict[str, object]]()
         self._error_for_method = dict[str, tuple[int, str]]()
+        self._delay_for_method = dict[str, float]()
         self._committed = list[str]()
         self._failed = list[str]()
         self._on_error_mode = "fail"
@@ -118,7 +122,9 @@ class FakeRpcServer:
     def set_explanation(self, stage: str, explanation: dict[str, object]) -> None:
         self._explanations[stage] = dict(explanation)
 
-    def set_stage_info(self, stage: str, deps: list[str], outs: list[str]) -> None:
+    def set_stage_info(
+        self, stage: str, deps: list[dict[str, object]], outs: list[dict[str, object]]
+    ) -> None:
         self._stage_infos[stage] = {"name": stage, "deps": list(deps), "outs": list(outs)}
 
     def set_commit_result(self, committed: list[str], failed: list[str] | None = None) -> None:
@@ -134,6 +140,10 @@ class FakeRpcServer:
     def clear_error(self, method: str) -> None:
         _ = self._error_for_method.pop(method, None)
 
+    def delay_reply(self, method: str, seconds: float) -> None:
+        """Hold every reply to ``method`` for ``seconds``, like an engine still starting."""
+        self._delay_for_method[method] = seconds
+
     async def start(self, socket_path: Path) -> None:
         if self._task_group is not None:
             raise RuntimeError("Server already started")
@@ -141,7 +151,7 @@ class FakeRpcServer:
         with contextlib.suppress(OSError):
             if socket_path.exists():
                 socket_path.unlink()
-        self._listener = await anyio.create_unix_listener(socket_path)
+        self._listener = await unix_socket.create_unix_listener(socket_path)
         self._task_group = anyio.create_task_group()
         task_group = self._task_group
         assert task_group is not None
@@ -226,6 +236,9 @@ class FakeRpcServer:
             return self._json_rpc_error(-32600, "Invalid Request", None, force=True)
 
         method, params, request_id = validated
+
+        if method in self._delay_for_method:
+            await anyio.sleep(self._delay_for_method[method])
 
         injected = self._error_for_method.get(method)
         if injected is not None:

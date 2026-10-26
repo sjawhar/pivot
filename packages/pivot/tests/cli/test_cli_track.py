@@ -1,89 +1,47 @@
 from __future__ import annotations
 
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+import os
+import shutil
+from typing import TYPE_CHECKING, TypedDict
 
 from conftest import isolated_pivot_dir
-from helpers import register_test_stage
-from pivot import cli, loaders, outputs
-from pivot.storage import track
+from pivot import cli, compose, config
+from pivot.storage import cache, track
 
 if TYPE_CHECKING:
+    import pathlib
+
     import click.testing
     import pytest
 
-    from pivot.pipeline.pipeline import Pipeline
-
 # =============================================================================
-# Output TypedDicts for annotation-based stages
+# Module-level stage functions (required for pickling)
 # =============================================================================
 
 
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
+class _TrainOutputs(TypedDict):
+    model: str
+    metrics: str
 
 
-class _OutputsDir(TypedDict):
-    output_dir: Annotated[pathlib.Path, outputs.Out("outputs/", loaders.PathOnly())]
+@compose.stage
+def process(input_file: str) -> str:
+    return "done"
 
 
-class _ModelPkl(TypedDict):
-    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+@compose.stage
+def train() -> str:
+    return "model"
 
 
-class _OutputsLinkDir(TypedDict):
-    output_dir: Annotated[pathlib.Path, outputs.Out("outputs_link/", loaders.PathOnly())]
+@compose.stage
+def train_multi() -> _TrainOutputs:
+    return {"model": "m", "metrics": "x"}
 
 
-class _Link1Csv(TypedDict):
-    link: Annotated[pathlib.Path, outputs.Out("link1.csv", loaders.PathOnly())]
-
-
-class _ModelLinkPkl(TypedDict):
-    model: Annotated[pathlib.Path, outputs.Out("data/model_link.pkl", loaders.PathOnly())]
-
-
-class _RealDataCsv(TypedDict):
-    data: Annotated[pathlib.Path, outputs.Out("real/data.csv", loaders.PathOnly())]
-
-
-# =============================================================================
-# Module-level helper functions
-# =============================================================================
-
-
-def _helper_process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("done")
-    return {"output": pathlib.Path("output.txt")}
-
-
-def _train_outputs_dir() -> _OutputsDir:
-    pathlib.Path("outputs").mkdir(exist_ok=True)
-    return {"output_dir": pathlib.Path("outputs")}
-
-
-def _train_model_pkl() -> _ModelPkl:
-    pathlib.Path("model.pkl").write_bytes(b"model")
-    return {"model": pathlib.Path("model.pkl")}
-
-
-def _process_outputs_link() -> _OutputsLinkDir:
-    return {"output_dir": pathlib.Path("outputs_link")}
-
-
-def _produce_link1() -> _Link1Csv:
-    return {"link": pathlib.Path("link1.csv")}
-
-
-def _train_model_link() -> _ModelLinkPkl:
-    return {"model": pathlib.Path("data/model_link.pkl")}
-
-
-def _process_real_data() -> _RealDataCsv:
-    return {"data": pathlib.Path("real/data.csv")}
+def _output_path(root: pathlib.Path, stage_name: str) -> pathlib.Path:
+    """Workspace path pivot assigns to a single-output str stage."""
+    return root / "data" / "test" / f"{stage_name}.txt"
 
 
 # =============================================================================
@@ -92,15 +50,11 @@ def _process_real_data() -> _RealDataCsv:
 
 
 def test_track_single_file(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track one file creates .pvt file."""
-    _ = mock_discovery
-
-    data_file = tmp_path / "data.txt"
+    data_file = mock_discovery.root / "data.txt"
     data_file.write_text("tracked content")
 
     result = runner.invoke(cli.cli, ["track", "data.txt"])
@@ -109,7 +63,7 @@ def test_track_single_file(
     assert "Tracked: data.txt" in result.output
 
     # .pvt file should exist
-    pvt_path = tmp_path / "data.txt.pvt"
+    pvt_path = mock_discovery.root / "data.txt.pvt"
     assert pvt_path.exists()
 
     # Read and verify .pvt content
@@ -117,20 +71,15 @@ def test_track_single_file(
     assert pvt_data is not None
     assert pvt_data["path"] == "data.txt"
     assert "hash" in pvt_data
-    assert "size" in pvt_data
+    assert pvt_data["size"] == len("tracked content")
 
 
 def test_track_directory(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track directory creates .pvt file with manifest."""
-    _ = mock_discovery
-
-    # Create directory with files
-    data_dir = tmp_path / "data_dir"
+    data_dir = mock_discovery.root / "data_dir"
     data_dir.mkdir()
     (data_dir / "file1.txt").write_text("content1")
     (data_dir / "file2.txt").write_text("content2")
@@ -140,8 +89,7 @@ def test_track_directory(
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "Tracked: data_dir" in result.output
 
-    # .pvt file should exist
-    pvt_path = tmp_path / "data_dir.pvt"
+    pvt_path = mock_discovery.root / "data_dir.pvt"
     assert pvt_path.exists()
 
     # Read and verify .pvt content includes manifest
@@ -152,23 +100,20 @@ def test_track_directory(
 
 
 def test_track_force_overwrites(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--force updates existing .pvt file."""
-    _ = mock_discovery
-
-    data_file = tmp_path / "data.txt"
+    data_file = mock_discovery.root / "data.txt"
     data_file.write_text("original content")
 
     # First track
     result = runner.invoke(cli.cli, ["track", "data.txt"])
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
 
-    pvt_data_original = track.read_pvt_file(tmp_path / "data.txt.pvt")
-    original_hash = pvt_data_original["hash"] if pvt_data_original else ""
+    pvt_data_original = track.read_pvt_file(mock_discovery.root / "data.txt.pvt")
+    assert pvt_data_original is not None
+    original_hash = pvt_data_original["hash"]
 
     # Modify file
     data_file.write_text("modified content")
@@ -176,27 +121,63 @@ def test_track_force_overwrites(
     # Track again with --force
     result = runner.invoke(cli.cli, ["track", "--force", "data.txt"])
 
-    assert result.exit_code == 0
-    pvt_data_updated = track.read_pvt_file(tmp_path / "data.txt.pvt")
+    assert result.exit_code == 0, result.output
+    pvt_data_updated = track.read_pvt_file(mock_discovery.root / "data.txt.pvt")
     assert pvt_data_updated is not None
     # Hash should be different due to modified content
     assert pvt_data_updated["hash"] != original_hash
 
 
-def test_track_already_tracked_suggests_force(
-    mock_discovery: Pipeline,
+def test_track_force_keeps_a_non_executable_object_and_checkout_copies_the_script(
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache object never changes once published, even one an older pivot (or `pivot pull`)
+    cached non-executable for bytes a tracked directory holds as an executable: a symlink
+    checkout of another file with those bytes reads its mode through the object's name.
+    `pivot track --force` keeps the object, and checkout gives the script its executable bit
+    with a private copy."""
+    data_dir = mock_discovery.root / "tools"
+    data_dir.mkdir()
+    script = data_dir / "run.sh"
+    script.write_text("#!/bin/sh\necho hi\n")
+    script.chmod(0o755)
+
+    result = runner.invoke(cli.cli, ["track", "tools"])
+    assert result.exit_code == 0, result.output
+
+    pvt_data = track.read_pvt_file(mock_discovery.root / "tools.pvt")
+    assert pvt_data is not None and "manifest" in pvt_data
+    entry_hash = next(e["hash"] for e in pvt_data["manifest"] if e["relpath"] == "run.sh")
+
+    # Simulate an object an older pivot cached non-executable for the same bytes.
+    cache_dir = config.get_cache_dir() / "files"
+    cache_path = cache.get_cache_path(cache_dir, entry_hash)
+    os.chmod(cache_path, 0o444)
+    inode = cache_path.stat().st_ino
+
+    result = runner.invoke(cli.cli, ["track", "--force", "tools"])
+    assert result.exit_code == 0, result.output
+    assert cache_path.stat().st_ino == inode
+    assert cache_path.stat().st_mode & 0o777 == 0o444
+
+    shutil.rmtree(data_dir)
+    result = runner.invoke(cli.cli, ["checkout", "tools"])
+    assert result.exit_code == 0, result.output
+    assert os.access(script, os.X_OK)
+    assert not script.is_symlink() and script.stat().st_ino != inode
+
+
+def test_track_already_tracked_suggests_force(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
 ) -> None:
     """Already tracked error suggests --force."""
-    _ = mock_discovery
-
-    data_file = tmp_path / "data.txt"
-    data_file.write_text("content")
+    (mock_discovery.root / "data.txt").write_text("content")
 
     # First track
-    runner.invoke(cli.cli, ["track", "data.txt"])
+    first = runner.invoke(cli.cli, ["track", "data.txt"])
+    assert first.exit_code == 0, first.output
 
     # Try to track again without --force
     result = runner.invoke(cli.cli, ["track", "data.txt"])
@@ -211,10 +192,8 @@ def test_track_already_tracked_suggests_force(
 
 
 def test_track_path_traversal_rejected(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rejects paths with ../ components."""
     _ = mock_discovery
@@ -228,16 +207,11 @@ def test_track_path_traversal_rejected(
 
 
 def test_track_broken_symlink_rejected(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rejects broken symlinks with clear error message."""
-    _ = mock_discovery
-
-    # Create broken symlink
-    broken_link = tmp_path / "broken_link"
+    broken_link = mock_discovery.root / "broken_link"
     broken_link.symlink_to("nonexistent_target")
 
     result = runner.invoke(cli.cli, ["track", "broken_link"])
@@ -248,25 +222,27 @@ def test_track_broken_symlink_rejected(
 
 
 def test_track_overlap_with_stage_output_rejected(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rejects paths that overlap with declared stage outputs."""
-    (tmp_path / "input.txt").write_text("input")
+    raw_dir = mock_discovery.root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "input.txt").write_text("input")
+    with mock_discovery:
+        process(mock_discovery.input("input.txt", t=str))
 
-    # Register a stage with output
-    register_test_stage(_helper_process, name="process")
-
-    # Create the output file
-    (tmp_path / "output.txt").write_text("output")
+    # Create the stage's output file where pivot writes it
+    output = _output_path(mock_discovery.root, "process")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("output")
 
     # Try to track the stage output
-    result = runner.invoke(cli.cli, ["track", "output.txt"])
+    result = runner.invoke(cli.cli, ["track", "data/test/process.txt"])
 
-    assert result.exit_code != 0
+    assert result.exit_code != 0, result.output
     assert "stage output" in result.output.lower() or "overlap" in result.output.lower()
+    assert not (output.parent / "process.txt.pvt").exists()
 
 
 # =============================================================================
@@ -275,15 +251,11 @@ def test_track_overlap_with_stage_output_rejected(
 
 
 def test_track_echoes_user_path_in_output(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track echoes the path as user provided it."""
-    _ = mock_discovery
-
-    (tmp_path / "data.csv").write_text("a,b\n1,2")
+    (mock_discovery.root / "data.csv").write_text("a,b\n1,2")
 
     result = runner.invoke(cli.cli, ["track", "./data.csv"])
 
@@ -291,14 +263,12 @@ def test_track_echoes_user_path_in_output(
     # Output shows what user typed
     assert "Tracked: ./data.csv" in result.output
     # .pvt file should be created with normalized name
-    assert (tmp_path / "data.csv.pvt").exists()
+    assert (mock_discovery.root / "data.csv.pvt").exists()
 
 
 def test_track_file_not_found_error(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track nonexistent file shows clear error."""
     _ = mock_discovery
@@ -310,24 +280,20 @@ def test_track_file_not_found_error(
 
 
 def test_track_multiple_files(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Track multiple files at once."""
-    _ = mock_discovery
-
-    (tmp_path / "file1.txt").write_text("content1")
-    (tmp_path / "file2.txt").write_text("content2")
+    (mock_discovery.root / "file1.txt").write_text("content1")
+    (mock_discovery.root / "file2.txt").write_text("content2")
 
     result = runner.invoke(cli.cli, ["track", "file1.txt", "file2.txt"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "Tracked: file1.txt" in result.output
     assert "Tracked: file2.txt" in result.output
-    assert (tmp_path / "file1.txt.pvt").exists()
-    assert (tmp_path / "file2.txt.pvt").exists()
+    assert (mock_discovery.root / "file1.txt.pvt").exists()
+    assert (mock_discovery.root / "file2.txt.pvt").exists()
 
 
 # =============================================================================
@@ -336,24 +302,20 @@ def test_track_multiple_files(
 
 
 def test_track_symlink_to_stage_output_file_rejected(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking symlink that points to stage output file is rejected."""
-
-    # Create stage output file
-    (tmp_path / "model.pkl").write_bytes(b"model")
-
-    # Register stage with this file as output
-    register_test_stage(_train_model_pkl, name="train")
+    with mock_discovery:
+        train()
+    output = _output_path(mock_discovery.root, "train")
+    output.parent.mkdir(parents=True)
+    output.write_text("model")
 
     # Create symlink pointing to the stage output
-    (tmp_path / "model_link.pkl").symlink_to("model.pkl")
+    (mock_discovery.root / "model_link.txt").symlink_to(output)
 
-    # Try to track the symlink
-    result = runner.invoke(cli.cli, ["track", "model_link.pkl"])
+    result = runner.invoke(cli.cli, ["track", "model_link.txt"])
 
     assert result.exit_code != 0, "Should reject symlink to stage output"
     assert "overlap" in result.output.lower() or "output" in result.output.lower(), (
@@ -363,25 +325,20 @@ def test_track_symlink_to_stage_output_file_rejected(
 
 
 def test_track_symlink_to_stage_output_directory_rejected(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Tracking symlink that points to stage output directory is rejected."""
+    """Tracking symlink that points to a multi-output stage's output directory is rejected."""
+    with mock_discovery:
+        train_multi()
+    # Multi-output stage writes data/test/train_multi/<key>.<ext>
+    output_dir = mock_discovery.root / "data" / "test" / "train_multi"
+    output_dir.mkdir(parents=True)
+    (output_dir / "model.txt").write_text("m")
+    (output_dir / "metrics.txt").write_text("x")
 
-    # Create stage output directory
-    output_dir = tmp_path / "outputs"
-    output_dir.mkdir()
-    (output_dir / "results.txt").write_text("data")
+    (mock_discovery.root / "output_link").symlink_to(output_dir)
 
-    # Register stage with directory as output (outputs/)
-    register_test_stage(_train_outputs_dir, name="process")
-
-    # Create symlink pointing to the output directory
-    (tmp_path / "output_link").symlink_to("outputs")
-
-    # Try to track the symlink
     result = runner.invoke(cli.cli, ["track", "output_link"])
 
     assert result.exit_code != 0, "Should reject symlink to stage output directory"
@@ -389,26 +346,21 @@ def test_track_symlink_to_stage_output_directory_rejected(
 
 
 def test_track_file_inside_symlinked_stage_output_rejected(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Tracking file inside symlinked directory that's a stage output is rejected."""
-
-    # Create actual directory with files
-    real_dir = tmp_path / "real_outputs"
+    """Tracking file inside a real directory that a stage's output dir links to is rejected."""
+    with mock_discovery:
+        train()
+    real_dir = mock_discovery.root / "real_outputs"
     real_dir.mkdir()
-    (real_dir / "model.pkl").write_bytes(b"model")
+    (real_dir / "train.txt").write_text("model")
+    # Stage outputs live under data/test, which is a symlink to real_outputs
+    (mock_discovery.root / "data").mkdir()
+    (mock_discovery.root / "data" / "test").symlink_to(real_dir)
 
-    # Create symlink to directory
-    (tmp_path / "outputs_link").symlink_to("real_outputs")
-
-    # Register stage with symlinked path as output
-    register_test_stage(_process_outputs_link, name="train")
-
-    # Try to track file via the real path
-    result = runner.invoke(cli.cli, ["track", "real_outputs/model.pkl"])
+    # Try to track the output via the real path
+    result = runner.invoke(cli.cli, ["track", "real_outputs/train.txt"])
 
     assert result.exit_code != 0, "Should detect overlap through symlink aliasing"
     assert "overlap" in result.output.lower() or "output" in result.output.lower(), (
@@ -417,52 +369,41 @@ def test_track_file_inside_symlinked_stage_output_rejected(
 
 
 def test_track_symlink_aliasing_same_file_different_paths(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking same file via different symlink paths detects aliasing."""
+    with mock_discovery:
+        train()
+    real_file = mock_discovery.root / "real_data.txt"
+    real_file.write_text("data")
 
-    # Create real file
-    (tmp_path / "real_data.csv").write_text("data")
+    # The stage output is one symlink to the real file; link2 is another
+    output = _output_path(mock_discovery.root, "train")
+    output.parent.mkdir(parents=True)
+    output.symlink_to(real_file)
+    (mock_discovery.root / "link2.txt").symlink_to(real_file)
 
-    # Create two symlinks to same file
-    (tmp_path / "link1.csv").symlink_to("real_data.csv")
-    (tmp_path / "link2.csv").symlink_to("real_data.csv")
+    result = runner.invoke(cli.cli, ["track", "link2.txt"])
 
-    # Register stage with one symlink as output
-    register_test_stage(_produce_link1, name="produce")
-
-    # Try to track the other symlink (points to same file)
-    result = runner.invoke(cli.cli, ["track", "link2.csv"])
-
-    assert result.exit_code != 0, "Should detect that link2 and link1 point to same file"
+    assert result.exit_code != 0, "Should detect that link2 and the output point to same file"
     assert "overlap" in result.output.lower() or "output" in result.output.lower()
 
 
 def test_track_parent_directory_with_symlinked_stage_output(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tracking parent directory when child is symlinked stage output is rejected."""
+    with mock_discovery:
+        train()
+    output = _output_path(mock_discovery.root, "train")
+    output.parent.mkdir(parents=True)
+    real_file = output.parent / "real_model.txt"
+    real_file.write_text("model")
+    output.symlink_to(real_file)
 
-    # Create directory structure
-    parent_dir = tmp_path / "data"
-    parent_dir.mkdir()
-    real_file = parent_dir / "real_model.pkl"
-    real_file.write_bytes(b"model")
-
-    # Create symlink inside parent directory
-    symlink = parent_dir / "model_link.pkl"
-    symlink.symlink_to("real_model.pkl")
-
-    # Register stage with symlink as output
-    register_test_stage(_train_model_link, name="train")
-
-    # Try to track parent directory (contains stage output)
+    # Try to track the parent directory (contains the stage output)
     result = runner.invoke(cli.cli, ["track", "data"])
 
     assert result.exit_code != 0, "Should reject tracking directory containing stage output"
@@ -470,28 +411,24 @@ def test_track_parent_directory_with_symlinked_stage_output(
 
 
 def test_track_with_normalized_vs_resolved_paths(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Error messages show both normalized and resolved paths for debugging."""
-
-    # Create nested directory structure with symlink
-    (tmp_path / "real").mkdir()
-    (tmp_path / "real/data.csv").write_text("data")
-    (tmp_path / "link_to_real").symlink_to("real")
-
-    # Register stage with real path
-    register_test_stage(_process_real_data, name="process")
+    with mock_discovery:
+        process(mock_discovery.input("input.txt", t=str))
+    output = _output_path(mock_discovery.root, "process")
+    output.parent.mkdir(parents=True)
+    output.write_text("data")
+    (mock_discovery.root / "link_to_real").symlink_to(output.parent)
 
     # Try to track via symlinked path
-    result = runner.invoke(cli.cli, ["track", "link_to_real/data.csv"])
+    result = runner.invoke(cli.cli, ["track", "link_to_real/process.txt"])
 
     assert result.exit_code != 0, "Should detect overlap via symlink"
     # Both paths should appear in error for clarity
     assert "link_to_real" in result.output, "Should show user's path"
-    assert "real" in result.output, "Should show resolved path"
+    assert "data/test/process.txt" in result.output, "Should show resolved path"
 
 
 # =============================================================================
@@ -518,7 +455,8 @@ def test_track_force_works_without_pipeline(
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         (cwd / "data.csv").write_text("a,b,c\n1,2,3\n")
         # First track
-        runner.invoke(cli.cli, ["track", "data.csv"])
+        first = runner.invoke(cli.cli, ["track", "data.csv"])
+        assert first.exit_code == 0, first.output
         # Update and re-track with --force
         (cwd / "data.csv").write_text("a,b,c\n4,5,6\n")
         result = runner.invoke(cli.cli, ["track", "--force", "data.csv"])
@@ -529,7 +467,7 @@ def test_track_force_works_without_pipeline(
 
 
 # =============================================================================
-# CWD-Relative Path Resolution Tests (RED - failing until feature implemented)
+# CWD-Relative Path Resolution Tests
 # =============================================================================
 
 

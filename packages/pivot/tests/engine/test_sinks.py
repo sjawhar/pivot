@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import sys
 import time
 from io import StringIO
+from typing import TYPE_CHECKING, TextIO, cast, override
 
 import anyio
 import pytest
+import rich.file_proxy
 import rich.live
 from rich.console import Console
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+from pivot import types
 from pivot.engine import engine as engine_mod
 from pivot.engine import sinks
 from pivot.engine.types import (
     EngineDiagnostic,
+    EngineState,
+    EngineStateChanged,
     LogLine,
     OutputEvent,
     SinkState,
@@ -37,6 +48,31 @@ def _helper_render_renderable(renderable: object) -> str:
     console = Console(file=output, force_terminal=False, no_color=True)
     console.print(renderable)
     return output.getvalue()
+
+
+def _helper_engine_state(state: EngineState) -> EngineStateChanged:
+    return EngineStateChanged(type="engine_state_changed", seq=0, state=state)
+
+
+def _helper_started(stage: str, *, index: int, total: int, run_id: str) -> StageStarted:
+    return StageStarted(
+        type="stage_started", seq=0, stage=stage, index=index, total=total, run_id=run_id
+    )
+
+
+def _helper_completed(stage: str, *, index: int, total: int, run_id: str) -> StageCompleted:
+    return StageCompleted(
+        type="stage_completed",
+        seq=index,
+        stage=stage,
+        status=StageStatus.RAN,
+        reason="",
+        duration_ms=100.0,
+        index=index,
+        total=total,
+        run_id=run_id,
+        input_hash=None,
+    )
 
 
 # =============================================================================
@@ -584,6 +620,156 @@ async def test_static_sink_ignores_log_lines_when_show_output_disabled() -> None
     assert output.getvalue() == "", "Should ignore log lines when show_output=False"
 
 
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_reports_worker_warnings_of_a_stage_that_ran(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """Warnings a stage logged reach the report; its other output stays hidden."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sink_type(console=console, show_output=False)
+
+    for line in ("progress 50%", "WARNING: Stage 'train' wrote its YAML output lossily"):
+        await sink.handle(LogLine(type="log_line", seq=0, stage="train", line=line, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert "WARNING: Stage 'train' wrote its YAML output lossily" in result
+    assert result.index("train") < result.index("WARNING:"), "warning prints under its stage"
+    assert "progress 50%" not in result
+
+
+async def test_sink_does_not_repeat_streamed_warnings() -> None:
+    """With --show-output the warning already streamed; the report does not print it twice."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sinks.StaticConsoleSink(console=console, show_output=True)
+
+    await sink.handle(
+        LogLine(type="log_line", seq=0, stage="train", line="WARNING: lossy", is_stderr=True)
+    )
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=1,
+            stage="train",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    assert output.getvalue().count("WARNING: lossy") == 1
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_always_reports_lossy_output_warnings_after_many_stage_warnings(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """Pivot's own output-write warning is never lost behind the stage's warnings."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=400)
+    sink = sink_type(console=console, show_output=False)
+
+    for i in range(60):
+        await sink.handle(
+            LogLine(
+                type="log_line",
+                seq=i,
+                stage="noisy",
+                line=f"WARNING: skipping malformed row {i}",
+                is_stderr=True,
+            )
+        )
+    lossy = (
+        f"WARNING: Stage 'noisy' wrote its DataFrameJSONL output {types.LOSSY_OUTPUT_PHRASE}: "
+        + "DataFrameJSONL cannot write column 'price'"
+    )
+    await sink.handle(LogLine(type="log_line", seq=60, stage="noisy", line=lossy, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=61,
+            stage="noisy",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    result = output.getvalue()
+    assert lossy in result
+    assert "WARNING: skipping malformed row 49" in result
+    assert "WARNING: skipping malformed row 50" not in result
+    assert "… 10 more warnings (run with --show-output)" in result
+    assert result.index("skipping malformed row 49") < result.index("… 10 more warnings")
+    assert result.index(lossy) < result.index("skipping malformed row 0"), "lossy prints first"
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_collapses_repeated_stage_warnings_with_a_count(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """matplotlib logs the same findfont line hundreds of times; the report prints it once."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=400)
+    sink = sink_type(console=console, show_output=False)
+
+    repeated = "WARNING: findfont: Font family 'Montserrat' not found."
+    for i in range(300):
+        await sink.handle(
+            LogLine(type="log_line", seq=i, stage="plot", line=repeated, is_stderr=True)
+        )
+    lossy = (
+        f"WARNING: Stage 'plot' wrote its YAML output {types.LOSSY_OUTPUT_PHRASE}: "
+        + "YAML output must contain plain data; got DataFrame at root."
+    )
+    await sink.handle(LogLine(type="log_line", seq=300, stage="plot", line=lossy, is_stderr=True))
+    await sink.handle(
+        StageCompleted(
+            type="stage_completed",
+            seq=301,
+            stage="plot",
+            status=StageStatus.RAN,
+            reason="",
+            duration_ms=100.0,
+            index=1,
+            total=1,
+            run_id="test-run",
+            input_hash=None,
+        )
+    )
+    await sink.close()
+
+    warning_lines = [line.strip() for line in output.getvalue().splitlines() if "WARNING:" in line]
+    assert warning_lines == [lossy, f"{repeated} (×300)"]
+    assert "more warnings" not in output.getvalue()
+
+
 async def test_static_sink_log_lines_stream_before_completions() -> None:
     """Log lines print in real-time, completions print on close."""
     output = StringIO()
@@ -643,6 +829,26 @@ async def test_static_sink_prints_engine_diagnostics() -> None:
     assert "Engine diagnostic" in result, "Should include diagnostic prefix"
     assert "Scheduler delay" in result, "Should include diagnostic message"
     assert "Loop blocked" in result, "Should include diagnostic detail"
+
+
+async def test_static_sink_reports_each_watch_run_separately() -> None:
+    """Piped watch output prints each run's report when that run ends, not all at exit."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.StaticConsoleSink(console=console)
+    reports = list[str]()
+
+    for run_id in ("run-1", "run-2"):
+        await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+        await sink.handle(_helper_started("demo/a", index=1, total=1, run_id=run_id))
+        await sink.handle(_helper_completed("demo/a", index=1, total=1, run_id=run_id))
+        await sink.handle(_helper_engine_state(EngineState.IDLE))
+        reports.append(output.getvalue())
+    await sink.close()
+
+    assert reports[0].count("demo/a") == 1, "first run's report prints when it ends"
+    assert reports[1].count("demo/a") == 2, "second run prints its own report"
+    assert output.getvalue() == reports[1], "close prints nothing already reported"
 
 
 # =============================================================================
@@ -917,6 +1123,112 @@ async def test_live_sink_live_renderable_shows_progress() -> None:
     await sink.close()
 
     assert "1/3" in rendered, "Live renderable should include progress counts"
+
+
+async def test_live_sink_reports_each_watch_run_separately() -> None:
+    """Each watch run shows its own progress and prints its own report when it ends."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True)
+    sink = sinks.LiveConsoleSink(console=console)
+    reports = list[str]()
+    rendered = ""
+
+    for run_id in ("run-1", "run-2"):
+        await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+        for index, stage in enumerate(("demo/a", "demo/b"), start=1):
+            await sink.handle(_helper_started(stage, index=index, total=2, run_id=run_id))
+            await sink.handle(_helper_completed(stage, index=index, total=2, run_id=run_id))
+        rendered = _helper_render_renderable(
+            sink._build_live_group()  # type: ignore[reportPrivateUsage] - testing live renderable
+        )
+        await sink.handle(_helper_engine_state(EngineState.IDLE))
+        reports.append(output.getvalue())
+    await sink.close()
+
+    assert "2/2 (100%)" in rendered, "second run's progress counts only that run"
+    assert "2 ran" in rendered, "second run's summary counts only that run"
+    assert rendered.count("demo/a") == 1, "second run lists each stage once"
+    assert reports[0].count("demo/a") == 1, "first run's report prints when it ends"
+    assert reports[1].count("demo/a") == 2, "second run prints its own report"
+    assert output.getvalue() == reports[1], "close prints nothing already reported"
+
+
+class _TtyStringIO(StringIO):
+    """In-memory stream that reports itself as a terminal."""
+
+    @override
+    def isatty(self) -> bool:
+        return True
+
+
+@contextlib.contextmanager
+def _helper_cli_logging(monkeypatch: pytest.MonkeyPatch, stderr: StringIO) -> Iterator[None]:
+    """Install the CLI's root logging handler with ``stderr`` as the process stderr."""
+    from pivot import cli
+
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    for handler in saved_handlers:
+        root.removeHandler(handler)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    try:
+        cli._setup_logging(verbose=False, quiet=False)
+        yield
+    finally:
+        for handler in root.handlers[:]:
+            root.removeHandler(handler)
+        for handler in saved_handlers:
+            root.addHandler(handler)
+        root.setLevel(saved_level)
+
+
+async def test_live_sink_prints_log_records_through_live_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With stderr on the terminal, a log record during a run prints above the live area.
+
+    Writing it straight to the terminal lets the next live redraw overwrite the line, so a
+    deferred reload's 'Pipeline invalid' message vanished in watch mode.
+    """
+    output = StringIO()
+    console = Console(file=output, force_terminal=True, no_color=True, width=100)
+    sink = sinks.LiveConsoleSink(console=console)
+    stderr = _TtyStringIO()
+    with _helper_cli_logging(monkeypatch, stderr):
+        (handler,) = logging.getLogger().handlers
+        stream_handler = cast("logging.StreamHandler[TextIO]", handler)
+        await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+        await sink.handle(_helper_started("demo/a", index=1, total=1, run_id="run-1"))
+        assert isinstance(stream_handler.stream, rich.file_proxy.FileProxy), (
+            "log records go through the live console while it is drawn"
+        )
+        logging.getLogger("pivot.engine.engine").error("Pipeline invalid - waiting for fix")
+        await sink.handle(_helper_engine_state(EngineState.IDLE))
+        assert stream_handler.stream is stderr, "log records go back to stderr when the run ends"
+        await sink.close()
+
+    assert "Pipeline invalid - waiting for fix" in output.getvalue()
+    assert stderr.getvalue() == ""
+
+
+async def test_live_sink_keeps_log_records_on_redirected_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With stderr redirected to a file (``2>watch.log``), every log record stays in that file."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=True, no_color=True, width=100)
+    sink = sinks.LiveConsoleSink(console=console)
+    stderr = StringIO()
+    with _helper_cli_logging(monkeypatch, stderr):
+        await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+        await sink.handle(_helper_started("demo/a", index=1, total=1, run_id="run-1"))
+        logging.getLogger("pivot.engine.engine").info("Code/config changed - reloading pipeline")
+        await sink.handle(_helper_engine_state(EngineState.IDLE))
+        await sink.close()
+
+    assert "Code/config changed - reloading pipeline" in stderr.getvalue()
+    assert "Code/config changed" not in output.getvalue()
 
 
 # =============================================================================

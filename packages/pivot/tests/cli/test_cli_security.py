@@ -11,7 +11,7 @@ from pivot.storage import cache, track
 if TYPE_CHECKING:
     import click.testing
 
-    from pivot.pipeline.pipeline import Pipeline
+    from pivot.registry import PipelineLike
 
 
 # =============================================================================
@@ -236,7 +236,7 @@ def test_pvt_file_yaml_invalid_type_rejected(tmp_path: pathlib.Path) -> None:
 
 def test_directory_track_processes_valid_files(
     runner: click.testing.CliRunner,
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Track on directory processes valid regular files."""
     # Create directory with valid file
@@ -253,7 +253,7 @@ def test_directory_track_processes_valid_files(
 
 def test_directory_track_creates_pvt_file(
     runner: click.testing.CliRunner,
-    mock_discovery: Pipeline,
+    mock_discovery: PipelineLike,
 ) -> None:
     """Track on directory creates .pvt file with manifest."""
     # Create directory with files

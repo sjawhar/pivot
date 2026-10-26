@@ -1,22 +1,23 @@
 from __future__ import annotations
 
-import pathlib
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
 import pytest
 
-from helpers import register_test_stage
-from pivot import exceptions, executor, explain, loaders, outputs, status
+from pivot import exceptions, executor, explain, status
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, track
 from pivot.storage import state as state_mod
 from pivot.types import RemoteStatus, StageExplanation
+from tests import helpers
 
 if TYPE_CHECKING:
+    import pathlib
+
     from pytest_mock import MockerFixture
 
-    from pivot.pipeline import pipeline as pipeline_mod
+    from pivot.registry import PipelineLike as Pipeline
 
 # =============================================================================
 # Note: Tests use set_project_root fixture from conftest.py which patches
@@ -25,17 +26,21 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
-# =============================================================================
-# Output TypedDicts for annotation-based stages
-# =============================================================================
+def _helper_stage_a(input_file: str) -> str:
+    _ = input_file
+    return "output a"
 
 
-class _StageAOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+def _helper_stage_b(a_file: str) -> str:
+    _ = a_file
+    return "output b"
 
 
-class _StageBOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+def _helper_register_two_stages() -> None:
+    stage_a = helpers.register_test_stage(
+        _helper_stage_a, name="stage_a", deps={"input_file": "input.txt"}
+    )
+    helpers.register_test_stage(_helper_stage_b, name="stage_b", deps={"a_file": stage_a})
 
 
 # =============================================================================
@@ -43,32 +48,16 @@ class _StageBOutputs(TypedDict):
 # =============================================================================
 
 
-def _helper_stage_a(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _StageAOutputs:
-    _ = input_file  # deps tracked but not loaded in this simple test
-    pathlib.Path("a.txt").write_text("output a")
-    return {"output": pathlib.Path("a.txt")}
-
-
-def _helper_stage_b(
-    a_file: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
-) -> _StageBOutputs:
-    _ = a_file  # deps tracked but not loaded in this simple test
-    pathlib.Path("b.txt").write_text("output b")
-    return {"output": pathlib.Path("b.txt")}
-
-
 def test_pipeline_status_all_cached(
     set_project_root: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: Pipeline,
 ) -> None:
     """All stages should show cached after successful run."""
     (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
-    register_test_stage(_helper_stage_a, name="stage_a")
+    helpers.register_test_stage(_helper_stage_a, name="stage_a", deps={"input_file": "input.txt"})
 
     monkeypatch.chdir(set_project_root)
     executor.run(pipeline=test_pipeline)
@@ -77,106 +66,104 @@ def test_pipeline_status_all_cached(
         None,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=test_pipeline._registry,
+        pipeline=test_pipeline,
     )
 
     assert len(results) == 1
-    assert results[0]["name"] == "stage_a"
+    assert results[0]["name"] == "test/stage_a"
     assert results[0]["status"] == "cached"
     assert results[0]["reason"] == ""
 
 
 def test_pipeline_status_some_stale(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+    set_project_root: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Stages with changed code should show stale."""
     (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
-    register_test_stage(_helper_stage_a, name="stage_a")
+    helpers.register_test_stage(_helper_stage_a, name="stage_a", deps={"input_file": "input.txt"})
 
     all_stages = test_pipeline.snapshot()
     results, _ = status.get_pipeline_status(
         None,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=test_pipeline._registry,
+        pipeline=test_pipeline,
     )
 
     assert len(results) == 1
-    assert results[0]["name"] == "stage_a"
+    assert results[0]["name"] == "test/stage_a"
     assert results[0]["status"] == "stale"
     assert results[0]["reason"] == "No previous run"
 
 
 def test_pipeline_status_upstream_stale(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+    set_project_root: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Stage should be marked stale if upstream is stale."""
     (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
+    _helper_register_two_stages()
 
     all_stages = test_pipeline.snapshot()
     results, _ = status.get_pipeline_status(
         None,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=test_pipeline._registry,
+        pipeline=test_pipeline,
     )
 
     assert len(results) == 2
 
-    stage_a = next(s for s in results if s["name"] == "stage_a")
-    stage_b = next(s for s in results if s["name"] == "stage_b")
+    stage_a = next(s for s in results if s["name"] == "test/stage_a")
+    stage_b = next(s for s in results if s["name"] == "test/stage_b")
 
     assert stage_a["status"] == "stale"
     assert stage_a["reason"] == "No previous run"
 
     assert stage_b["status"] == "stale"
-    assert "stage_a" in stage_b["upstream_stale"]
+    assert "test/stage_a" in stage_b["upstream_stale"]
 
 
 def test_pipeline_status_specific_stages(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
+    set_project_root: pathlib.Path, test_pipeline: Pipeline
 ) -> None:
     """Should only return status for specified stages."""
     (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
+    _helper_register_two_stages()
 
     all_stages = test_pipeline.snapshot()
     results, _ = status.get_pipeline_status(
-        ["stage_a"],
+        ["test/stage_a"],
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=test_pipeline._registry,
+        pipeline=test_pipeline,
     )
 
     assert len(results) == 1
-    assert results[0]["name"] == "stage_a"
+    assert results[0]["name"] == "test/stage_a"
 
 
 def test_pipeline_status_uses_per_stage_state_dir(
     set_project_root: pathlib.Path,
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: Pipeline,
     mocker: MockerFixture,
 ) -> None:
     """get_pipeline_status passes each stage's state_dir, not the global one."""
     (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "input.txt").write_text("data")
 
-    register_test_stage(_helper_stage_a, name="stage_a")
+    helpers.register_test_stage(_helper_stage_a, name="stage_a", deps={"input_file": "input.txt"})
 
     all_stages = test_pipeline.snapshot()
 
     # Override stage_a's state_dir to a custom path
     custom_state_dir = set_project_root / "custom" / ".pivot"
-    all_stages["stage_a"]["state_dir"] = custom_state_dir
+    all_stages["test/stage_a"]["state_dir"] = custom_state_dir
 
     # Mock get_stage_explanation and capture calls via autospec (binds positional
     # args to parameter names, so the assertion doesn't break if the signature
@@ -186,7 +173,7 @@ def test_pipeline_status_uses_per_stage_state_dir(
         "get_stage_explanation",
         autospec=True,
         return_value=StageExplanation(
-            stage_name="stage_a",
+            stage_name="test/stage_a",
             will_run=True,
             is_forced=False,
             reason="mocked",
@@ -201,7 +188,7 @@ def test_pipeline_status_uses_per_stage_state_dir(
         None,
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=test_pipeline._registry,
+        pipeline=test_pipeline,
     )
 
     mock_explain.assert_called_once()
@@ -288,10 +275,10 @@ def test_tracked_directory_clean(set_project_root: pathlib.Path) -> None:
     (data_dir / "file1.txt").write_text("content1")
     (data_dir / "file2.txt").write_text("content2")
 
-    dir_hash, manifest = cache.hash_directory(data_dir)
-    total_size = sum(entry["size"] for entry in manifest)
+    dir_hash = cache.hash_directory(data_dir)
+    total_size = sum(entry["size"] for entry in dir_hash["manifest"])
 
-    pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
+    pvt_data = track.PvtData(path="data", hash=dir_hash["hash"], size=total_size)
     track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
 
     results = status.get_tracked_files_status(set_project_root)
@@ -309,10 +296,10 @@ def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
     data_dir.mkdir()
     (data_dir / "file1.txt").write_text("content1")
 
-    dir_hash, manifest = cache.hash_directory(data_dir)
-    total_size = sum(entry["size"] for entry in manifest)
+    dir_hash = cache.hash_directory(data_dir)
+    total_size = sum(entry["size"] for entry in dir_hash["manifest"])
 
-    pvt_data = track.PvtData(path="data", hash=dir_hash, size=total_size)
+    pvt_data = track.PvtData(path="data", hash=dir_hash["hash"], size=total_size)
     track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
 
     (data_dir / "file1.txt").write_text("modified content")
@@ -418,13 +405,13 @@ def test_remote_status_with_local_hashes(tmp_path: pathlib.Path, mocker: MockerF
 
 
 def test_suggestions_stale_stages() -> None:
-    """Should suggest run when stages are stale."""
+    """Should suggest repro (runs the whole DAG without arguments) when stages are stale."""
     suggestions = status.get_suggestions(
         stale_count=3, modified_count=0, push_count=0, pull_count=0
     )
 
     assert len(suggestions) == 1
-    assert "pivot run" in suggestions[0]
+    assert "pivot repro" in suggestions[0]
     assert "3 stale stages" in suggestions[0]
 
 
@@ -470,6 +457,36 @@ def test_suggestions_pull_files() -> None:
     assert "3 files" in suggestions[0]
 
 
+def test_suggestions_missing_outputs_with_remote_suggests_pull_first() -> None:
+    """Outputs missing from the cache in a clone with a remote: pull before re-running."""
+    suggestions = status.get_suggestions(
+        stale_count=2,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_outputs_count=2,
+        remote_configured=True,
+    )
+
+    assert suggestions[0] == "Run `pivot pull` to restore outputs of 2 stages from the remote"
+    assert "pivot repro" in suggestions[1]
+
+
+def test_suggestions_missing_outputs_without_remote_omits_pull() -> None:
+    """Without a remote there is nothing to pull from; only repro applies."""
+    suggestions = status.get_suggestions(
+        stale_count=2,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_outputs_count=2,
+        remote_configured=False,
+    )
+
+    assert len(suggestions) == 1
+    assert "pivot repro" in suggestions[0]
+
+
 def test_suggestions_multiple() -> None:
     """Should generate multiple suggestions when needed."""
     suggestions = status.get_suggestions(
@@ -493,20 +510,13 @@ def test_suggestions_none_needed() -> None:
 # =============================================================================
 
 
-class _TestStageOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("test_output.txt", loaders.PathOnly())]
-
-
-def _helper_test_stage(
-    input_file: Annotated[pathlib.Path, outputs.Dep("test_input.txt", loaders.PathOnly())],
-) -> _TestStageOutputs:
-    pathlib.Path("test_output.txt").write_text("output")
-    return _TestStageOutputs(output=pathlib.Path("test_output.txt"))
+def _helper_test_stage(input_file: str) -> str:
+    return f"output:{input_file}"
 
 
 def test_get_pipeline_status_uses_provided_graph(
     set_project_root: pathlib.Path,
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: Pipeline,
 ) -> None:
     """get_pipeline_status uses provided graph instead of building one."""
     from pivot.engine import graph as engine_graph
@@ -514,7 +524,9 @@ def test_get_pipeline_status_uses_provided_graph(
     (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "test_input.txt").write_text("data")
 
-    register_test_stage(_helper_test_stage, name="test_stage")
+    helpers.register_test_stage(
+        _helper_test_stage, name="test_stage", deps={"input_file": "test_input.txt"}
+    )
 
     # Build graph externally (simulating Engine)
     all_stages = test_pipeline.snapshot()
@@ -522,26 +534,26 @@ def test_get_pipeline_status_uses_provided_graph(
 
     # Call status with provided graph
     results, returned_graph = status.get_pipeline_status(
-        stages=["test_stage"],
+        stages=["test/test_stage"],
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=test_pipeline._registry,
+        pipeline=test_pipeline,
         graph=external_graph,
     )
 
     # Verify it found the stage
     assert len(results) == 1
-    assert results[0]["name"] == "test_stage"
+    assert results[0]["name"] == "test/test_stage"
 
     # Verify returned graph is a stage-only DAG (not the bipartite graph)
-    assert "test_stage" in returned_graph.nodes()
-    # Bipartite graph would have "stage:test_stage", not "test_stage"
-    assert "stage:test_stage" not in returned_graph.nodes()
+    assert "test/test_stage" in returned_graph.nodes()
+    # Bipartite graph would have "stage:test/test_stage", not "test/test_stage"
+    assert "stage:test/test_stage" not in returned_graph.nodes()
 
 
 def test_get_pipeline_explanations_uses_provided_graph(
     set_project_root: pathlib.Path,
-    test_pipeline: pipeline_mod.Pipeline,
+    test_pipeline: Pipeline,
 ) -> None:
     """get_pipeline_explanations uses provided graph instead of building one."""
     from pivot.engine import graph as engine_graph
@@ -549,7 +561,9 @@ def test_get_pipeline_explanations_uses_provided_graph(
     (set_project_root / ".git").mkdir(exist_ok=True)
     (set_project_root / "test_input.txt").write_text("data")
 
-    register_test_stage(_helper_test_stage, name="test_stage")
+    helpers.register_test_stage(
+        _helper_test_stage, name="test_stage", deps={"input_file": "test_input.txt"}
+    )
 
     # Build graph externally (simulating Engine)
     all_stages = test_pipeline.snapshot()
@@ -557,116 +571,16 @@ def test_get_pipeline_explanations_uses_provided_graph(
 
     # Call explanations with provided graph
     explanations = status.get_pipeline_explanations(
-        stages=["test_stage"],
+        stages=["test/test_stage"],
         single_stage=False,
         all_stages=all_stages,
-        stage_registry=test_pipeline._registry,
+        pipeline=test_pipeline,
         graph=external_graph,
     )
 
     # Verify it found the stage
     assert len(explanations) == 1
-    assert explanations[0]["stage_name"] == "test_stage"
+    assert explanations[0]["stage_name"] == "test/test_stage"
 
 
-# =============================================================================
-# what_if_changed Tests
-# =============================================================================
-
-
-def test_what_if_changed_single_path(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
-) -> None:
-    """what_if_changed returns affected stages for a single path."""
-    (set_project_root / ".git").mkdir(exist_ok=True)
-    (set_project_root / "input.txt").write_text("data")
-
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
-
-    # input.txt affects stage_a, which in turn affects stage_b
-    all_stages = test_pipeline.snapshot()
-    affected = status.what_if_changed([pathlib.Path("input.txt")], all_stages=all_stages)
-
-    assert "stage_a" in affected
-    assert "stage_b" in affected, "Should include downstream stages"
-
-
-def test_what_if_changed_intermediate_path(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
-) -> None:
-    """what_if_changed returns only downstream stages for intermediate artifact."""
-    (set_project_root / ".git").mkdir(exist_ok=True)
-    (set_project_root / "input.txt").write_text("data")
-
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
-
-    # a.txt is output of stage_a, input to stage_b
-    all_stages = test_pipeline.snapshot()
-    affected = status.what_if_changed([pathlib.Path("a.txt")], all_stages=all_stages)
-
-    assert "stage_a" not in affected, "stage_a produces a.txt, doesn't consume it"
-    assert "stage_b" in affected, "stage_b consumes a.txt"
-
-
-def test_what_if_changed_unknown_path(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
-) -> None:
-    """what_if_changed returns empty list for unknown paths."""
-    (set_project_root / ".git").mkdir(exist_ok=True)
-    (set_project_root / "input.txt").write_text("data")
-
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    all_stages = test_pipeline.snapshot()
-    affected = status.what_if_changed([pathlib.Path("unknown.txt")], all_stages=all_stages)
-
-    assert affected == []
-
-
-def test_what_if_changed_multiple_paths(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
-) -> None:
-    """what_if_changed returns union of affected stages for multiple paths."""
-    (set_project_root / ".git").mkdir(exist_ok=True)
-    (set_project_root / "input.txt").write_text("data")
-
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
-
-    # Both paths affect different parts of the pipeline
-    all_stages = test_pipeline.snapshot()
-    affected = status.what_if_changed(
-        [
-            pathlib.Path("input.txt"),  # affects stage_a -> stage_b
-            pathlib.Path("a.txt"),  # affects stage_b
-        ],
-        all_stages=all_stages,
-    )
-
-    assert "stage_a" in affected
-    assert "stage_b" in affected
-
-
-def test_what_if_changed_with_provided_graph(
-    set_project_root: pathlib.Path, test_pipeline: pipeline_mod.Pipeline
-) -> None:
-    """what_if_changed uses provided graph instead of building one."""
-    from pivot.engine import graph as engine_graph
-
-    (set_project_root / ".git").mkdir(exist_ok=True)
-    (set_project_root / "input.txt").write_text("data")
-
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    # Build graph externally
-    all_stages = test_pipeline.snapshot()
-    external_graph = engine_graph.build_graph(all_stages)
-
-    # Call with provided graph
-    affected = status.what_if_changed(
-        [pathlib.Path("input.txt")], all_stages=all_stages, graph=external_graph
-    )
-
-    assert "stage_a" in affected
+# `what_if_changed` path semantics are owned by Task 3 (Copilot finding 2853197734).

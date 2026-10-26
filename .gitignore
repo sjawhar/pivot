@@ -283,7 +283,6 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,windows,macos,python,git,visualstudiocode
 
-/benchmarks
 *.code-workspace
 
 # Pivot project state
@@ -293,3 +292,9 @@ $RECYCLE.BIN/
 # Sisyphus session state (plans, notepads, drafts)
 .sisyphus/*
 !.sisyphus/rules/
+
+# OhMyOpenCode session state
+.omo/
+
+# Agent worktrees and jj workspaces kept inside the checkout
+/.worktrees/

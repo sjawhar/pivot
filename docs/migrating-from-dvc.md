@@ -1,356 +1,182 @@
 # Migrating from DVC
 
-This guide helps you migrate an existing DVC pipeline to Pivot.
+This guide ports a DVC pipeline to Pivot. A port is complete when the project
+has no `dvc.yaml`, no `dvc.lock`, no `.dvc/`, no `import dvc.api`, and no stage
+that opens a file itself. A half-ported pipeline, with Pivot stages that still
+read `params.yaml` or pass file paths around, gets the drawbacks of both tools
+and the change detection of neither.
 
-## Key Differences
+## How DVC concepts map to Pivot
 
-| Feature | DVC | Pivot |
-|---------|-----|-------|
-| Pipeline definition | `dvc.yaml` | `pivot.yaml` |
-| Parameters | `params.yaml` | Python `StageParams` classes |
-| Code tracking | Manual `deps:` on `.py` files | Automatic code fingerprinting |
-| Stage execution | Shell commands | Python functions |
-| Lock file | Single `dvc.lock` | Per-stage `.pivot/stages/*.lock` |
-| Cache | `.dvc/cache/` | `.pivot/cache/` |
+| DVC | Pivot |
+|-----|-------|
+| `dvc.yaml` stage with `cmd: python script.py` | A `@stage` function |
+| `deps:` listing data files | Function parameters that receive handles |
+| `deps:` listing `.py` files | Nothing: Pivot fingerprints the function and the helpers it calls |
+| `outs:` paths | The function's return value; Pivot chooses the path |
+| A path written by one stage and read by another | A handle passed from one stage call to the next |
+| Raw data tracked with `dvc add` | `data/raw/<name>`, declared with `pipeline.input("<name>")` |
+| `params.yaml` + `params:` + `dvc.api.params_show()` | One `StageParams` subclass per stage, passed at the call site |
+| `metrics:` | `Annotated[dict, metric]` on the return type |
+| `plots:` | `Annotated[Figure, plot]` on the return type |
+| `foreach` / `matrix` stages | A Python loop in the `with Pipeline` block, optionally inside `pipeline.variant(name)` |
+| `vars:` and `${...}` interpolation | Python values in `pipeline.py` and `StageParams` fields |
+| Several `dvc.yaml` files | Several `pipeline.py` files; one imports another's handles |
+| `dvc.lock` | Per-stage lock files in `.pivot/stages/` |
+| `dvc remote add` / `dvc push` / `dvc pull` | `pivot config set remotes.<name>` / `pivot push` / `pivot pull` |
+| `dvc repro`, `dvc status`, `dvc dag` | `pivot repro`, `pivot status`, `pivot dag` |
+| `dvc metrics show`, `dvc plots show`, `dvc params diff` | `pivot metrics show`, `pivot plots show`, `pivot params diff` |
 
-## Concept Mapping
+## A worked example
 
-### Stages
+### Before: DVC
 
-**DVC:**
 ```yaml
 # dvc.yaml
 stages:
-  preprocess:
-    cmd: python scripts/preprocess.py
+  prepare:
+    cmd: python src/prepare.py
     deps:
-      - data/raw.csv
-      - scripts/preprocess.py
-    outs:
-      - data/processed.csv
-```
-
-**Pivot:**
-```yaml
-# pivot.yaml
-stages:
-  preprocess:
-    python: scripts.preprocess.run
-    deps:
-      raw: data/raw.csv
-    outs:
-      processed: data/processed.csv
-```
-
-```python
-# scripts/preprocess.py
-from typing import Annotated, TypedDict
-
-import pandas
-from pivot import loaders, outputs
-
-
-class PreprocessOutputs(TypedDict):
-    processed: Annotated[pandas.DataFrame, outputs.Out("data/processed.csv", loaders.CSV())]
-
-
-def run(
-    raw: Annotated[pandas.DataFrame, outputs.Dep("data/raw.csv", loaders.CSV())],
-) -> PreprocessOutputs:
-    df = raw.dropna()
-    return {"processed": df}
-```
-
-Note: Pivot automatically tracks code changes. You don't need to list `.py` files in deps.
-
-### Parameters
-
-**DVC:**
-```yaml
-# params.yaml
-train:
-  learning_rate: 0.01
-  epochs: 100
-```
-
-```yaml
-# dvc.yaml
-stages:
-  train:
-    cmd: python train.py
+      - data/raw/runs.csv
+      - src/prepare.py
     params:
-      - train.learning_rate
-      - train.epochs
-```
-
-**Pivot:**
-```python
-# train.py
-from pivot.stage_def import StageParams
-
-
-class TrainParams(StageParams):
-    learning_rate: float = 0.01
-    epochs: int = 100
-
-
-def train(params: TrainParams, ...):
-    print(f"LR: {params.learning_rate}")
-    ...
-```
-
-```yaml
-# pivot.yaml
-stages:
-  train:
-    python: train.train
-    params:
-      learning_rate: 0.05  # Override defaults
-```
-
-Benefits:
-- Type checking and IDE support
-- Validation at parse time
-- Parameter changes detected via fingerprinting
-
-### Metrics and Plots
-
-**DVC:**
-```yaml
-# dvc.yaml
-stages:
-  train:
-    cmd: python train.py
-    metrics:
-      - metrics.json:
-          cache: false
-    plots:
-      - plots/loss.png
-```
-
-**Pivot:**
-```python
-class TrainOutputs(TypedDict):
-    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
-    metrics: Annotated[dict, outputs.Metric("metrics.json")]
-    plot: Annotated[pathlib.Path, outputs.Plot("plots/loss.png", loaders.PathOnly())]
-```
-
-```yaml
-# pivot.yaml
-stages:
-  train:
-    python: train.train
+      - prepare.min_score
     outs:
-      model: model.pkl
-    metrics:
-      metrics: metrics.json
-    plots:
-      plot: plots/loss.png
+      - data/prepared.csv
+  summarize:
+    foreach: [headline, all]
+    do:
+      cmd: python src/summarize.py ${item}
+      deps:
+        - data/prepared.csv
+        - src/summarize.py
+      params:
+        - summarize
+      metrics:
+        - metrics/${item}.json:
+            cache: false
 ```
 
-### Remote Storage
+```python
+# src/summarize.py
+import json
+import sys
 
-**DVC:**
+import dvc.api
+import pandas as pd
+
+subset = sys.argv[1]
+params = dvc.api.params_show()["summarize"]
+df = pd.read_csv("data/prepared.csv")
+if subset == "headline":
+    df = df[df["agent"].isin(params["headline_agents"])]
+json.dump({"runs": len(df), "mean": df["score"].mean()}, open(f"metrics/{subset}.json", "w"))
+```
+
+### After: Pivot
+
+```python
+# pipeline.py
+from typing import Annotated
+
+import pandas as pd
+
+from pivot import Pipeline, StageParams, metric, stage
+
+
+class PrepareParams(StageParams):
+    min_score: float = 0.0
+
+
+@stage
+def prepare(runs: pd.DataFrame, params: PrepareParams) -> pd.DataFrame:
+    return runs[runs["score"] >= params.min_score]
+
+
+class SummarizeParams(StageParams):
+    agents: list[str] | None = None
+
+
+@stage
+def summarize(runs: pd.DataFrame, params: SummarizeParams) -> Annotated[dict, metric]:
+    if params.agents is not None:
+        runs = runs[runs["agent"].isin(params.agents)]
+    return {"runs": len(runs), "mean": float(runs["score"].mean())}
+
+
+with Pipeline("report") as pipeline:
+    runs = pipeline.input("runs.csv")
+    prepared = prepare(runs, params=PrepareParams(min_score=0.1))
+    subsets = {"headline": ["gpt", "claude"], "all": None}
+    for name, agents in subsets.items():
+        with pipeline.variant(name):
+            summarize(prepared, params=SummarizeParams(agents=agents))
+```
+
 ```bash
-dvc remote add -d myremote s3://mybucket/cache
-dvc push
-dvc pull
+mkdir -p data/raw
+printf 'agent,score\ngpt,0.5\nclaude,0.7\nother,0.05\nother,0.3\n' > data/raw/runs.csv
+pivot repro
+pivot metrics show
 ```
 
-**Pivot:**
+What changed:
+
+- The script's top-level code became a function. `sys.argv` became a
+  `StageParams` field, and the `foreach` became a loop with
+  `pipeline.variant()`, giving stages `report/summarize@headline` and
+  `report/summarize@all`.
+- `pd.read_csv`, `json.dump` and every path are gone. The stage receives a
+  DataFrame and returns a dict; Pivot writes `metrics/report/summarize@all.yaml`.
+- `dvc.api.params_show()` and the shared `params.yaml` section became one
+  `StageParams` class per stage, defined beside it. The variant-specific values
+  are passed at the call site.
+- `src/*.py` no longer appears as a dependency: editing `summarize` or a
+  helper it calls re-runs it.
+
+## Porting steps
+
+1. **Inputs.** Move every file that no stage produces under `data/raw/` and
+   declare it with `pipeline.input("<file name>")`. Files from other projects
+   go under `data/external/` (`pipeline.input(name, external=True)`).
+2. **Stages.** For each DVC stage, write a `@stage` function: one parameter per
+   data dependency, return the outputs (a `TypedDict` for several). Delete the
+   file reads and writes from the body.
+3. **Parameters.** For each stage, define a `StageParams` subclass beside it
+   with the values that stage reads from `params.yaml`, with the current
+   values as defaults or passed at the call site. YAML anchors become ordinary
+   Python values.
+4. **Wiring.** In `pipeline.py`, call the stages inside
+   `with Pipeline("<name>") as pipeline:`, passing handles where DVC had
+   matching `outs`/`deps` paths. Replace `foreach`/`matrix` with loops.
+5. **Check.** `pivot list` shows every expected stage; `pivot repro` runs them;
+   compare the outputs with the DVC outputs.
+6. **Remove DVC.** Delete `dvc.yaml`, `dvc.lock`, `.dvc/`, `.dvcignore`,
+   the `params.yaml` sections the stages no longer read, and the `dvc`
+   dependency. Configure the remote:
+
 ```bash
 pivot config set remotes.origin s3://mybucket/cache
 pivot config set default_remote origin
 pivot push
-pivot pull
 ```
-
-## Migration Steps
-
-### Step 1: Create pivot.yaml
-
-Convert your `dvc.yaml` to `pivot.yaml`:
-
-```yaml
-# pivot.yaml
-stages:
-  preprocess:
-    python: scripts.preprocess.run
-    deps:
-      raw: data/raw.csv
-    outs:
-      processed: data/processed.csv
-
-  train:
-    python: scripts.train.run
-    deps:
-      data: data/processed.csv
-    outs:
-      model: models/model.pkl
-    metrics:
-      metrics: metrics.json
-```
-
-### Step 2: Convert Scripts to Functions
-
-Transform shell-command scripts into Python functions:
-
-**Before (scripts/preprocess.py):**
-```python
-import pandas as pd
-
-df = pd.read_csv("data/raw.csv")
-df = df.dropna()
-df.to_csv("data/processed.csv", index=False)
-```
-
-**After (scripts/preprocess.py):**
-```python
-from typing import Annotated, TypedDict
-
-import pandas
-from pivot import loaders, outputs
-
-
-class PreprocessOutputs(TypedDict):
-    processed: Annotated[pandas.DataFrame, outputs.Out("data/processed.csv", loaders.CSV())]
-
-
-def run(
-    raw: Annotated[pandas.DataFrame, outputs.Dep("data/raw.csv", loaders.CSV())],
-) -> PreprocessOutputs:
-    df = raw.dropna()
-    return {"processed": df}
-```
-
-### Step 3: Convert Parameters to StageParams
-
-**Before (params.yaml + train.py):**
-```python
-import yaml
-
-with open("params.yaml") as f:
-    params = yaml.safe_load(f)["train"]
-
-lr = params["learning_rate"]
-```
-
-**After (train.py):**
-```python
-from pivot.stage_def import StageParams
-
-
-class TrainParams(StageParams):
-    learning_rate: float = 0.01
-    epochs: int = 100
-
-
-def run(params: TrainParams, ...):
-    lr = params.learning_rate
-    ...
-```
-
-### Step 4: Configure Remote
-
-```bash
-# Copy remote URL from DVC
-dvc remote list
-# myremote  s3://mybucket/cache
-
-# Configure in Pivot
-pivot config set remotes.origin s3://mybucket/cache
-pivot config set default_remote origin
-```
-
-### Step 5: Run and Verify
-
-```bash
-# Run pipeline
-pivot repro
-
-# Compare outputs with DVC
-diff data/processed.csv data/processed.csv.dvc_backup
-```
-
-### Step 6: Export for Validation (Optional)
-
-Pivot can export back to DVC format for validation:
-
-```bash
-pivot export
-
-# Should show nothing needs to run
-dvc repro --dry
-```
-
-## Running Side-by-Side
-
-During migration, you can run both tools:
-
-```bash
-# Run with Pivot
-pivot repro
-
-# Validate outputs match DVC
-pivot export
-dvc repro --dry  # Should show nothing to run
-```
-
-## Export Command
-
-Export Pivot pipeline to DVC format:
-
-```bash
-# Generate dvc.yaml
-pivot export
-
-# Custom output path
-pivot export --output my-pipeline.yaml
-
-# Export specific stages
-pivot export preprocess train
-```
-
-## Limitations of Export
-
-The export captures:
-
-- Stage commands (as Python function calls)
-- Dependencies
-- Outputs (with cache/persist settings)
-- Metrics and plots
-
-Not exported:
-
-- Automatic code fingerprinting (DVC doesn't support this)
-- Mutex groups
-- Pydantic parameter types (exported as plain values)
 
 ## FAQs
 
-### Do I need to migrate all at once?
+### Can I keep `params.yaml`?
 
-No. You can migrate stage by stage. As long as output paths match, downstream DVC stages can consume Pivot outputs.
+Only as an override file. Pivot reads `params.yaml` at the project root keyed by
+qualified stage name (`report/prepare: {min_score: 0.2}`) and applies it on top
+of the values in code; stages never read it themselves. The values belong in
+`StageParams`.
 
-### What about my existing cache?
+### What about my existing DVC cache?
 
-Pivot uses a different cache format. You'll need to re-run stages to populate the Pivot cache. Your DVC cache remains intact.
+Pivot has its own cache. Run `pivot repro` once to populate it; the DVC cache
+is not used.
 
-### Can I use params.yaml with Pivot?
+### Where do module-level config dicts go?
 
-Pivot supports `params.yaml` for overrides, but the primary source should be Python `StageParams` classes. This gives you type checking and IDE support.
-
-### What about dvc plots and metrics?
-
-Pivot has equivalent `Metric` and `Plot` output types. The workflow is similar:
-
-```bash
-# DVC
-dvc metrics show
-dvc plots show
-
-# Pivot
-pivot metrics show
-pivot plots show
-```
+Into `StageParams`. A stage may read a module-level `bool`, `int`, `float`,
+`str`, `bytes` or `None`; reading any other module-level value (a dict of
+settings, a list of agents, a tuple of columns) is an error.

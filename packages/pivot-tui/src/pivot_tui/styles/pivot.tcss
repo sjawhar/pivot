@@ -1,3 +1,13 @@
+/* Why the watched pipeline is invalid; shown until a reload loads a good pipeline */
+#pipeline-error {
+    display: none;
+    height: auto;
+    max-height: 10;
+    padding: 0 1;
+    background: $error;
+    color: $text;
+}
+
 #main-split {
     height: 1fr;
 }

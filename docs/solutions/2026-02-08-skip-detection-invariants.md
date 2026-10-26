@@ -33,10 +33,16 @@ If **any** of these fail, the generation check returns `False` and execution fal
 `StageLock.is_changed_with_lock_data()` compares the full lock file state:
 - Code manifest (fingerprint of stage function + helper functions)
 - Parameters (effective params after overrides)
+- Parameters compare by canonical JSON encoding, so values with different serialized types invalidate
+  a stage even when Python considers them equal.
 - Dependency hashes (content hashes of all input files/directories)
 - Output path list (detect added/removed outputs)
 
 This requires hashing all dependency files, hence O(n) in the number/size of dependencies.
+The coordinator reads the stage lock only after holding the stage's artifact locks, so a waiting
+run evaluates the state committed by the writer ahead of it. It takes READ on the outputs to
+decide, and WRITE (released READ first, then decided again) only to restore one from the cache;
+see `docs/architecture/execution.md` ("Artifact Locks").
 
 ### Tier 3: Run Cache Lookup
 
@@ -82,26 +88,22 @@ Lock files and StateDB use different path semantics:
 
 ## Manifest Cache
 
-Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → hash) are cached in StateDB under the `sm:` prefix, along with source maps that record which source files contributed to the manifest.
+Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → hash) are cached in StateDB under the `sm:` prefix, along with source maps that record which source files contributed to the manifest. The key names the stage function by its identity (`fingerprint.function_identity`: module, qualname, project-relative source file, code hash, closure cell values and default values) as well as the stage name, because two `pipeline.py` files can declare the same pipeline name and so register the same stage name with different functions, and one factory (`make_stage(2)`, `make_stage(5)`) builds functions that differ only in a closure cell. The same identity decides whether `Pipeline.include()` sees one stage reached twice or two stages under one name. A source map holds the files of the functions walked plus the file of every project module loaded when the manifest was computed: a manifest records values bound in other modules' namespaces (`settings.FACTOR`, `from settings import FACTOR`, a module rebinding an imported helper), and an edit to any of those modules must invalidate the entry. An entry also records every live value the walk read: each global, closure cell, default argument, `module.NAME` attribute, partial argument, class in type hints and pydantic schema (field defaults included), as a path from the stage function and a token for what was found there. A value computed at import from the environment, a settings file or the date changes without touching any source file, so the cache saves only the walk: a hit requires every recorded file's content digest to be unchanged and every recorded read to give its token again (one dict, cell or attribute read per entry; a schema hash is computed once per class per process). The source map and the function-hash cache (`fp:`) record a file by its content, not its mtime, size and inode, which an edit can keep (two writes inside one kernel timestamp tick, or a tool that restores the mtime); each file is read once per `fingerprint.fingerprint_pass()`. Manifests computed with unsafe-capture warnings are never cached. `pivot fingerprint reset` clears both `fp:` and `sm:` entries.
 
 **Flush boundaries** (where pending manifest cache writes are committed to StateDB):
-- After discovery (`discovery.py` — when stages are found via `pivot.yaml`/`pipeline.py`)
-- After YAML config load
-- After module load
+- After discovery loads `pipeline.py` (`discovery.py`)
 - In watch mode, before reload
 
 **Selective invalidation in watch mode:** When a source file changes, the engine uses a reverse index to find which manifest cache entries depend on that file, and invalidates only those entries. This avoids re-fingerprinting all stages when only one source file changed. The reverse index is built by scanning all `sm:` entries' source maps.
 
 ## Safe Fingerprinting
 
-Pivot fingerprints stage functions by hashing their AST and the ASTs of any helper functions they call. Closures that capture **mutable** variables (lists, dicts, instances) are problematic because their runtime state isn't tracked by the AST hash — a change to a captured list won't trigger re-execution.
+Pivot fingerprints stage functions by hashing their AST and the ASTs of any helper functions they call. A module-level `bool`, `int`, `float`, `str`, `bytes` or `None` that a stage reads is recorded by value (`const:` keys), so editing it re-runs the stage. So is a `tuple` or `frozenset` whose members are all such scalars (frozenset members sort by canonical JSON text, never by `hash()`, which is seeded per process) and a compiled regex (its full pattern and flags; its `repr` truncates the pattern at 200 characters). Any other module-level value a stage reads (list, dict, set, a tuple holding a non-scalar, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`) is not safely trackable: its contents can change without the AST changing. A library function or class it reads is recorded by name (`ext:` keys).
 
-By default, mutable closure captures raise `StageDefinitionError` with a message explaining the issue and suggesting alternatives (StageParams or Dep inputs).
+By default, such captures raise `StageDefinitionError` with a message that names the variable and suggests moving it into `StageParams`.
 
 **Escape hatches:**
-- Config: `core.unsafe_fingerprinting: true` in `pivot.yaml`
+- Config: `core.unsafe_fingerprinting: true` in `.pivot/config.yaml` (`pivot config set core.unsafe_fingerprinting true`)
 - Environment: `PIVOT_UNSAFE_FINGERPRINTING=1`
 
-When enabled, mutable captures produce a warning instead of an error. This is unsafe because it can lead to silent wrong outputs — the captured value may change without triggering re-execution.
-
-Immutable captures (strings, numbers, tuples, frozen dataclasses, frozensets) are always allowed since they can't change after creation.
+When enabled, these captures produce a warning instead of an error. This is unsafe because it can lead to silent wrong outputs: the captured value may change without triggering re-execution. A stage whose fingerprint needed the downgrade (`RegistryStageInfo.unsafe_fingerprint`, copied to `WorkerStageInfo`) is kept out of the run cache: the worker neither looks it up nor files the result, and `pivot commit` does not file it either.

@@ -1,21 +1,53 @@
 from __future__ import annotations
 
 import abc
+import collections.abc as collections_abc
 import dataclasses
+import datetime
+import itertools
 import json
+import math
+import operator
 import os
 import pathlib
 import pickle
+import shutil
 import tempfile
-from typing import TYPE_CHECKING, Any, Literal, override
+import warnings
+from typing import TYPE_CHECKING, Any, Literal, cast, override
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from matplotlib.figure import Figure
 
+import numpy
 import pandas
 import yaml
+
+
+class LossyOutputWarning(UserWarning):
+    """An output was written in Pivot's old form because the exact form cannot hold it.
+
+    The old form loses or garbles the value (unreadable YAML tags, epoch-millisecond
+    timestamps, stringified cells). A later release will refuse these values.
+    """
+
+
+class _NotPlainDataError(TypeError):
+    """A YAML output value that ``yaml.safe_load`` could not read back."""
+
+
+_YAML_SCALAR_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    datetime.date,
+    datetime.datetime,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,11 +93,12 @@ class Loader[W, R = W](Writer[W], Reader[R], abc.ABC):
     def empty(self) -> R:
         """Return an empty instance of the loaded type.
 
-        Used for IncrementalOut on first run when no previous output exists.
-        Override in loaders that support IncrementalOut (JSON, CSV, YAML).
+        Used by an incremental output on its first run.
+        Override in loaders that support an empty value (JSON, CSV, YAML).
         """
         raise NotImplementedError(
-            f"{type(self).__name__} cannot provide an empty instance. For IncrementalOut, use a loader with a known empty value (JSON, CSV, YAML)."
+            f"{type(self).__name__} cannot provide an empty instance. "
+            + "Use an incremental output loader with a known empty value (JSON, CSV, YAML)."
         )
 
 
@@ -83,6 +116,9 @@ class CSV[T](Loader[T, T]):
 
     @override
     def load(self, path: pathlib.Path) -> T:
+        # pandas writes a zero-column frame as a bare line break, which read_csv rejects.
+        if path.stat().st_size <= 2 and not path.read_bytes().strip():
+            return self.empty()
         result = pandas.read_csv(  # pyright: ignore[reportUnknownMemberType] - pandas read_csv has complex overloads
             path,
             index_col=self.index_col,
@@ -110,7 +146,7 @@ class JSON[T](Loader[T, T]):
 
     Args:
         indent: JSON indentation (default 2, None for compact).
-        empty_factory: Callable returning empty value for IncrementalOut first run.
+        empty_factory: Callable returning the first-run value for an incremental output.
             Defaults to dict. Use list for list types: JSON(empty_factory=list).
     """
 
@@ -134,12 +170,15 @@ class JSON[T](Loader[T, T]):
 
 @dataclasses.dataclass(frozen=True)
 class YAML[T](Loader[T, T]):
-    """YAML file loader.
+    """YAML file loader that writes values ``yaml.safe_load`` reads back.
 
-    Generic type parameter indicates the expected type for type checking.
+    Numpy scalars and arrays are converted to equivalent Python values. Any other
+    Python object (a DataFrame, a dataclass, a NumPy temporal or extended-precision
+    value, a non-scalar key) is written as before, with Python-specific ``!!python/*``
+    tags that no Pivot reader can load, and raises ``LossyOutputWarning``.
 
     Args:
-        empty_factory: Callable returning empty value for IncrementalOut first run.
+        empty_factory: Callable returning the first-run value for an incremental output.
             Defaults to dict. Use list for list types: YAML(empty_factory=list).
     """
 
@@ -152,8 +191,66 @@ class YAML[T](Loader[T, T]):
 
     @override
     def save(self, data: T, path: pathlib.Path) -> None:
-        with open(path, "w") as f:
-            yaml.dump(data, f, default_flow_style=False)
+        def plain(value: object, location: str) -> object:
+            if value is pandas.NaT or value is pandas.NA:
+                return None
+            if isinstance(value, (numpy.datetime64, numpy.timedelta64)):
+                raise _NotPlainDataError(
+                    f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
+                    + "Convert NumPy temporal values explicitly."
+                )
+            if isinstance(value, numpy.ndarray):
+                if value.dtype.kind in "mM":
+                    raise _NotPlainDataError(
+                        f"YAML output must contain plain data; got {value.dtype} array at {location}. "
+                        + "Convert NumPy temporal values explicitly."
+                    )
+                return plain(value.tolist(), location)
+            if isinstance(value, numpy.generic):
+                unwrapped = value.item()
+                if isinstance(unwrapped, numpy.generic):
+                    raise _NotPlainDataError(
+                        f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
+                        + "Convert extended-precision NumPy values explicitly."
+                    )
+                return plain(unwrapped, location)
+            if type(value) in _YAML_SCALAR_TYPES:
+                return value
+            if isinstance(value, collections_abc.Mapping):
+                mapping = cast("collections_abc.Mapping[object, object]", value)
+                plain_mapping = dict[object, object]()
+                for key, item in mapping.items():
+                    plain_key = plain(key, f"{location} key")
+                    if type(plain_key) not in _YAML_SCALAR_TYPES:
+                        raise _NotPlainDataError(
+                            f"YAML output must contain plain data; got {type(key).__name__} key "
+                            + f"at {location}. Use str, int, float or bool keys."
+                        )
+                    plain_mapping[plain_key] = plain(item, f"{location}[{key!r}]")
+                return plain_mapping
+            if isinstance(value, (list, tuple)):
+                items = cast("list[object] | tuple[object, ...]", value)
+                return [plain(item, f"{location}[{index}]") for index, item in enumerate(items)]
+            raise _NotPlainDataError(
+                f"YAML output must contain plain data; got {type(value).__name__} at {location}. "
+                + "Convert DataFrames with .to_dict() and dataclasses with dataclasses.asdict()."
+            )
+
+        try:
+            content = yaml.safe_dump(plain(data, "root"), default_flow_style=False)
+        except _NotPlainDataError as not_plain:
+            try:
+                content = yaml.dump(data, default_flow_style=False)
+            except (TypeError, yaml.YAMLError) as e:
+                raise TypeError(str(not_plain)) from e
+            warnings.warn(
+                f"{not_plain} It was written with Python-specific YAML tags; a later release "
+                + "will refuse it.",
+                LossyOutputWarning,
+                stacklevel=2,
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
 
     @override
     def empty(self) -> T:
@@ -164,12 +261,14 @@ class YAML[T](Loader[T, T]):
 class Text(Loader[str, str]):
     """Plain text file loader.
 
-    Saves atomically via temp file + rename to prevent corruption.
+    Line endings round-trip exactly: neither load nor save translates ``\\r``,
+    ``\\r\\n`` or ``\\n``. Saves atomically via temp file + rename to prevent corruption.
     """
 
     @override
     def load(self, path: pathlib.Path) -> str:
-        return path.read_text()
+        with path.open(newline="") as f:
+            return f.read()
 
     @override
     def save(self, data: str, path: pathlib.Path) -> None:
@@ -180,7 +279,7 @@ class Text(Loader[str, str]):
 
         fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".txt.tmp")
         try:
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", newline="") as f:
                 f.write(data)
             os.rename(tmp_path_str, path)
         except Exception:
@@ -237,35 +336,433 @@ class JSONL(Loader[list[dict[str, Any]], list[dict[str, Any]]]):
         return []
 
 
+_DATAFRAME_METADATA_KEY = "__pivot_dataframe_metadata__"
+_DATAFRAME_METADATA_VERSION = 1
+_DATAFRAME_METADATA_FIELDS = frozenset({"version", "columns", "temporal_columns"})
+
+
+def _json_default(value: object) -> object:
+    """Convert the non-JSON scalars pandas hands back from object columns."""
+    if value is pandas.NaT:
+        return None
+    if isinstance(value, numpy.ndarray):
+        return value.tolist()
+    if isinstance(value, numpy.generic):
+        return value.item()
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, datetime.timedelta):
+        return pandas.Timedelta(value).isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _replace_nonfinite(value: object) -> object:
+    """Map NaN/inf anywhere inside a nested value to None (JSON has no NaN)."""
+    if isinstance(value, (numpy.ndarray, numpy.generic)):
+        value = cast("object", value.tolist())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        items = cast("list[object] | tuple[object, ...]", value)
+        return [_replace_nonfinite(item) for item in items]
+    if isinstance(value, dict):
+        mapping = cast("dict[object, object]", value)
+        return {key: _replace_nonfinite(item) for key, item in mapping.items()}
+    return value
+
+
+_OUT_OF_NANOSECOND_RANGE = "value outside the nanosecond range"
+
+
+def _as_nanoseconds(series: pandas.Series[Any]) -> pandas.Series[Any]:
+    """Convert a datetime or timedelta column to nanosecond resolution, or raise TypeError.
+
+    A ``datetime64[us]`` 9999-12-31 overflows the nanosecond range; numpy's own cast
+    wraps it silently to an unrelated date, so pandas' checked conversion is required.
+    """
+    try:
+        return series.dt.as_unit("ns")
+    except (pandas.errors.OutOfBoundsDatetime, pandas.errors.OutOfBoundsTimedelta) as e:
+        raise TypeError(f"{_OUT_OF_NANOSECOND_RANGE}: {e}") from e
+
+
+def _iso_datetime_texts(series: pandas.Series[Any], suffix: str = "") -> list[str]:
+    """JSON texts for a naive datetime64 column: quoted ISO 8601 with nanoseconds, NaT as null.
+
+    ISO texts contain only digits, "-", ":", "T", "." and the suffix, so they need no escaping.
+    """
+    values = series.to_numpy(dtype="datetime64[ns]")
+    texts: list[str] = numpy.datetime_as_string(values, unit="ns").tolist()
+    return ["null" if text == "NaT" else f'"{text}{suffix}"' for text in texts]
+
+
+def _encode_jsonl_column(
+    series: pandas.Series[Any], encoder: json.JSONEncoder
+) -> tuple[list[str], str, dict[str, object] | None]:
+    """Encode one column: its JSON value texts, the dtype as written, and temporal metadata."""
+    dtype = series.dtype
+    if pandas.api.types.is_float_dtype(dtype):
+        if isinstance(dtype, numpy.dtype) and dtype.itemsize > numpy.dtype("float64").itemsize:
+            raise TypeError(f"unsupported extended-precision floating dtype {dtype}")
+        # repr() is the shortest text that parses back to the identical float;
+        # pandas.to_json rounds to at most 15 significant digits.
+        floats: list[float] = series.to_numpy(dtype="float64", na_value=math.nan).tolist()
+        return [repr(v) if math.isfinite(v) else "null" for v in floats], str(dtype), None
+    if isinstance(dtype, numpy.dtype) and dtype.kind in "iu":
+        return series.astype(str).tolist(), str(dtype), None
+    if isinstance(dtype, numpy.dtype) and dtype.kind == "b":
+        return numpy.where(series.to_numpy(), "true", "false").tolist(), str(dtype), None
+    if pandas.api.types.is_object_dtype(dtype) and pandas.api.types.infer_dtype(
+        series, skipna=True
+    ) in ("date", "datetime"):
+        try:
+            series = pandas.Series(pandas.to_datetime(series))
+        except pandas.errors.OutOfBoundsDatetime as e:
+            # A subclass of ValueError: catch it first so a 9999-12-31 names its real cause.
+            raise TypeError(f"{_OUT_OF_NANOSECOND_RANGE}: {e}") from e
+        except ValueError as e:
+            # Mixed UTC offsets, or naive and aware values together, have no single dtype.
+            raise TypeError(f"datetime values with no single timezone: {e}") from e
+        dtype = series.dtype
+    if isinstance(dtype, pandas.DatetimeTZDtype):
+        # Values are ISO UTC text; metadata must rebuild the original zone semantics.
+        series = _as_nanoseconds(series)
+        timezone = str(dtype.tz)
+        try:
+            reconstructed_dtype = pandas.DatetimeTZDtype(tz=timezone)
+        except (KeyError, TypeError, ValueError) as e:
+            raise TypeError(f"cannot round-trip timezone {timezone!r}") from e
+        if str(reconstructed_dtype.tz) != timezone:
+            raise TypeError(f"cannot round-trip timezone {timezone!r}")
+        for timestamp in series.dropna():
+            original_offset = timestamp.utcoffset()
+            reconstructed_offset = timestamp.tz_convert(reconstructed_dtype.tz).utcoffset()
+            if original_offset != reconstructed_offset:
+                raise TypeError(f"cannot round-trip timezone {timezone!r}")
+        metadata: dict[str, object] = {"kind": "datetime", "timezone": timezone}
+        return (
+            _iso_datetime_texts(series.dt.tz_convert("UTC").dt.tz_localize(None), suffix="Z"),
+            str(dtype),
+            metadata,
+        )
+    if pandas.api.types.is_datetime64_dtype(dtype):
+        return (
+            _iso_datetime_texts(_as_nanoseconds(series)),
+            str(dtype),
+            {"kind": "datetime", "timezone": None},
+        )
+    if pandas.api.types.is_timedelta64_dtype(dtype):
+        deltas = cast("list[pandas.Timedelta]", _as_nanoseconds(series).tolist())
+        return (
+            ["null" if delta is pandas.NaT else f'"{delta.isoformat()}"' for delta in deltas],
+            str(dtype),
+            {"kind": "timedelta"},
+        )
+    missing: list[bool] = series.isna().tolist()
+    cells = [
+        None if is_missing else cell
+        for cell, is_missing in zip(cast("list[object]", series.tolist()), missing, strict=True)
+    ]
+    encoded = list[str]()
+    for cell in cells:
+        try:
+            encoded.append(encoder.encode(cell))
+        except ValueError:
+            encoded.append(encoder.encode(_replace_nonfinite(cell)))
+    return encoded, str(dtype), None
+
+
+def _restore_temporal_jsonl_column(
+    series: pandas.Series[Any], metadata: collections_abc.Mapping[str, object]
+) -> pandas.Series[Any]:
+    """Restore a writer-marked temporal column; never infer temporal dtypes from strings."""
+    kind = metadata["kind"]
+    if kind == "timedelta":
+        return pandas.Series(pandas.to_timedelta(series))
+    if kind != "datetime":
+        raise ValueError(f"Unsupported DataFrameJSONL temporal metadata kind: {kind!r}")
+    timezone = metadata["timezone"]
+    if timezone is None:
+        return pandas.Series(pandas.to_datetime(series, format="ISO8601"))
+    if not isinstance(timezone, str):
+        raise ValueError(f"Invalid DataFrameJSONL timezone metadata: {timezone!r}")
+    parsed = pandas.to_datetime(series, format="ISO8601", utc=True)
+    return pandas.Series(parsed.dt.tz_convert(timezone))
+
+
+# Columns as (label, dtype) in order; a label is an int when its entry says "label": "int".
+_JsonlHeader = tuple[list[tuple[str | int, str]], dict[str, collections_abc.Mapping[str, object]]]
+
+
+def _parse_jsonl_header(record: object, path: pathlib.Path) -> _JsonlHeader | None:
+    """Return the columns and temporal metadata of a header record, or None for a data row.
+
+    Only a record with exactly the header's shape is the header: one key, the reserved
+    name, holding exactly ``version``, ``columns`` and ``temporal_columns``. Any other
+    first record, including a row of a column with the reserved name, is data.
+    """
+    if not isinstance(record, dict):
+        return None
+    outer = cast("dict[object, object]", record)
+    if set(outer) != {_DATAFRAME_METADATA_KEY}:
+        return None
+    raw_metadata = outer[_DATAFRAME_METADATA_KEY]
+    if not isinstance(raw_metadata, dict):
+        return None
+    metadata = cast("dict[object, object]", raw_metadata)
+    if metadata.keys() != _DATAFRAME_METADATA_FIELDS:
+        return None
+    if metadata["version"] != _DATAFRAME_METADATA_VERSION:
+        raise ValueError(f"Unsupported DataFrameJSONL metadata version at {path}")
+    raw_columns = metadata["columns"]
+    if not isinstance(raw_columns, list):
+        raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
+    columns = list[tuple[str | int, str]]()
+    for raw_column in cast("list[object]", raw_columns):
+        column = cast("dict[object, object]", raw_column) if isinstance(raw_column, dict) else {}
+        name = column.get("name")
+        dtype = column.get("dtype")
+        label_type = column.get("label", "str")
+        if (
+            not isinstance(name, str)
+            or not isinstance(dtype, str)
+            or label_type not in ("str", "int")
+        ):
+            raise ValueError(f"Invalid DataFrameJSONL column metadata at {path}")
+        columns.append((int(name) if label_type == "int" else name, dtype))
+    raw_temporal = metadata["temporal_columns"]
+    if not isinstance(raw_temporal, dict):
+        raise ValueError(f"Invalid DataFrameJSONL temporal metadata at {path}")
+    temporal_columns = dict[str, collections_abc.Mapping[str, object]]()
+    for name, column_metadata in cast("dict[object, object]", raw_temporal).items():
+        if not isinstance(name, str) or not isinstance(column_metadata, dict):
+            raise ValueError(f"Invalid DataFrameJSONL temporal column metadata at {path}")
+        temporal_columns[name] = cast("collections_abc.Mapping[str, object]", column_metadata)
+    return columns, temporal_columns
+
+
+def _write_text_atomically(path: pathlib.Path, chunks: collections_abc.Iterable[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(chunks)
+        os.rename(tmp_path_str, path)
+    except Exception:
+        tmp_path = pathlib.Path(tmp_path_str)
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+_PICK_ANOTHER_FORMAT = (
+    "or pick another format for this output, e.g. Annotated[pd.DataFrame, Pickle()]."
+)
+
+
+def _write_old_jsonl_format(
+    data: pandas.DataFrame, path: pathlib.Path, message: str, error: Exception
+) -> None:
+    """Write the headerless pandas JSONL Pivot wrote before, with a warning.
+
+    A value the old writer also refused is still refused.
+    """
+    try:
+        content = data.to_json(lines=True, orient="records")
+    except (TypeError, ValueError, OverflowError):
+        raise TypeError(message) from error
+    warnings.warn(
+        f"{message} It was written in the old headerless format (dates as epoch "
+        + "milliseconds, other cells as pandas renders them); a later release will refuse it.",
+        LossyOutputWarning,
+        stacklevel=3,
+    )
+    _write_text_atomically(path, [content])
+
+
 @dataclasses.dataclass(frozen=True)
 class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
     """JSONL (JSON Lines) file loader that returns a pandas DataFrame.
 
-    Uses pandas.read_json with lines=True for efficient loading.
-    Saves atomically via temp file + rename.
+    One JSON object per row; the index is not written. The first line is a
+    ``{"__pivot_dataframe_metadata__": ...}`` JSON object recording every column's
+    name and dtype, in order, plus how temporal columns were written. A non-Pivot
+    JSONL reader sees that explicit metadata record followed by normal row records;
+    it can skip the first line to read the data rows unchanged. Only a first line
+    with exactly the header's shape is read as the header, so a column may have any
+    name, including ``__pivot_dataframe_metadata__``.
+
+    A file without the header (written by another tool, or by Pivot before the
+    header existed) loads exactly as ``pandas.read_json(path, lines=True,
+    orient="records", convert_dates=False)`` reads it, pandas' float parser included,
+    so external inputs give the same values they always did. The exactness below
+    applies to files Pivot writes with the header.
+
+    - a zero-row frame keeps its columns and dtypes; str and int column labels
+      come back with their type.
+
+    - floats: written as the shortest exact text, read back bit-identical
+      (NaN and +/-inf are written as ``null`` and read back as NaN).
+    - ``datetime.date``/``datetime`` objects and ``datetime64`` columns: written as
+      ISO 8601 with nanoseconds and restored only when the metadata marks the
+      column temporal. Original tz-aware dtype zones are retained.
+    - ``timedelta64`` columns: written as ISO 8601 durations and restored from
+      metadata, including all-null columns.
+    - strings remain strings, including ISO-shaped strings.
+
+    A frame the exact format cannot hold is written in the old headerless pandas
+    format with a ``LossyOutputWarning`` naming the column or label: ``Decimal``,
+    ``set``, ``bytes`` or other object cells, a timezone that cannot be rebuilt from
+    its name, datetimes with mixed UTC offsets, a date outside the nanosecond range,
+    a label that is neither str nor int, or an int and a str label with the same text.
+    A frame that format also cannot hold raises ``TypeError``. Saves atomically via
+    temp file + rename.
     """
 
     @override
-    def load(self, path: pathlib.Path) -> pandas.DataFrame:
-        return pandas.read_json(path, lines=True, orient="records", convert_dates=False)
+    def load(self, path: pathlib.Path, *, max_rows: int | None = None) -> pandas.DataFrame:
+        """Load all rows, or at most ``max_rows`` data records after the metadata header."""
+        with path.open() as f:
+            first_line = f.readline()
+        header: _JsonlHeader | None = None
+        if first_line.strip():
+            try:
+                first_record = cast("object", json.loads(first_line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON at {path}:1: {e}") from e
+            header = _parse_jsonl_header(first_record, path)
+        if header is None:
+            return pandas.read_json(
+                path, lines=True, orient="records", convert_dates=False, nrows=max_rows
+            )
+        records = list[object]()
+        with path.open() as f:
+            next(f)
+            for line_num, line in enumerate(f, 2):
+                if not line.strip():
+                    continue
+                try:
+                    records.append(cast("object", json.loads(line)))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
+                if max_rows is not None and len(records) >= max_rows:
+                    break
+        columns, temporal_columns = header
+        labels = [label for label, _ in columns]
+        if not records:
+            # No row records carry the keys, so the header alone gives the schema.
+            return pandas.DataFrame(
+                {
+                    label: pandas.Series([], dtype=pandas.api.types.pandas_dtype(dtype))
+                    for label, dtype in columns
+                }
+            )
+        frame = pandas.DataFrame(records)
+        names = [str(label) for label in labels]
+        if list(frame.columns) != names:
+            raise ValueError(
+                f"DataFrameJSONL rows at {path} have columns {list(frame.columns)}, "
+                + f"but the metadata header declares {names}"
+            )
+        for name, metadata in temporal_columns.items():
+            frame[name] = _restore_temporal_jsonl_column(frame[name], metadata)
+        for name, (_, dtype) in zip(names, columns, strict=True):
+            # An all-null float column has only nulls in its rows; restore its dtype.
+            float_dtype = pandas.api.types.pandas_dtype(dtype)
+            if pandas.api.types.is_float_dtype(float_dtype):
+                frame[name] = frame[name].astype(float_dtype)
+        frame.columns = pandas.Index(labels)
+        return frame
+
+    def row_count(self, path: pathlib.Path) -> int:
+        """Count data records, skipping the metadata header on the first line."""
+        count = 0
+        with path.open() as f:
+            for line_num, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                if line_num == 1:
+                    try:
+                        record = cast("object", json.loads(line))
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Invalid JSON at {path}:{line_num}: {e}") from e
+                    if _parse_jsonl_header(record, path) is not None:
+                        continue
+                count += 1
+        return count
 
     @override
     def save(self, data: pandas.DataFrame, path: pathlib.Path) -> None:
         if not isinstance(data, pandas.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
             raise TypeError(f"DataFrameJSONL save expects DataFrame, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
+        if not data.columns.is_unique:
+            duplicated = sorted({str(c) for c in data.columns[data.columns.duplicated()]})
+            raise ValueError(
+                f"DataFrameJSONL requires unique column names, duplicated: {duplicated}"
+            )
 
-        path.parent.mkdir(parents=True, exist_ok=True)
+        encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"), default=_json_default)
+        names = list[str]()
+        column_schema = list[dict[str, str]]()
+        # Stubs type labels as str; at runtime a label is any hashable. tolist() turns
+        # numpy integer labels into Python ints.
+        for label in cast("list[object]", data.columns.tolist()):
+            if isinstance(label, int) and not isinstance(label, bool):
+                names.append(str(label))
+                column_schema.append({"name": names[-1], "label": "int"})
+            elif isinstance(label, str):
+                names.append(label)
+                column_schema.append({"name": label})
+            else:
+                message = (
+                    f"DataFrameJSONL cannot write column label {label!r} "
+                    + f"({type(label).__name__}): labels must be str or int. Rename the "
+                    + f"column, {_PICK_ANOTHER_FORMAT}"
+                )
+                _write_old_jsonl_format(data, path, message, TypeError(message))
+                return
+        if len(set(names)) != len(names):
+            colliding = sorted({name for name in names if names.count(name) > 1})
+            message = (
+                f"DataFrameJSONL cannot write column labels {colliding}: an int and a str "
+                + f"label share the same JSON key. Rename one, {_PICK_ANOTHER_FORMAT}"
+            )
+            _write_old_jsonl_format(data, path, message, TypeError(message))
+            return
 
-        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                data.to_json(f, lines=True, orient="records")
-            os.rename(tmp_path_str, path)
-        except Exception:
-            tmp_path = pathlib.Path(tmp_path_str)
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
+        keys = list[str]()
+        columns = list[list[str]]()
+        temporal_columns = dict[str, dict[str, object]]()
+        for position, (string_name, schema) in enumerate(zip(names, column_schema, strict=True)):
+            try:
+                column, written_dtype, temporal_metadata = _encode_jsonl_column(
+                    data.iloc[:, position], encoder
+                )
+            except TypeError as e:
+                message = (
+                    f"DataFrameJSONL cannot write column {string_name!r}: {e}. Convert it to "
+                    + f"str/int/float/bool/list/dict values, {_PICK_ANOTHER_FORMAT}"
+                )
+                _write_old_jsonl_format(data, path, message, e)
+                return
+            columns.append(column)
+            keys.append(encoder.encode(string_name) + ":")
+            schema["dtype"] = written_dtype
+            if temporal_metadata is not None:
+                temporal_columns[string_name] = temporal_metadata
+
+        metadata = {
+            _DATAFRAME_METADATA_KEY: {
+                "version": _DATAFRAME_METADATA_VERSION,
+                "columns": column_schema,
+                "temporal_columns": temporal_columns,
+            }
+        }
+        rows = (
+            "{" + ",".join(map(operator.add, keys, cells)) + "}\n"
+            for cells in zip(*columns, strict=True)
+        )
+        _write_text_atomically(path, itertools.chain([encoder.encode(metadata) + "\n"], rows))
 
     @override
     def empty(self) -> pandas.DataFrame:
@@ -276,14 +773,21 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
 class Pickle[T](Loader[T, T]):
     """Pickle file loader for arbitrary Python objects.
 
-    WARNING: Loading pickle files from untrusted sources is a security risk.
-    Pickle can execute arbitrary code during deserialization.
+    Warning:
+        Pickle executes code during deserialization. Treat every Pickle artifact
+        from a cache or remote as trusted code: anyone who can write that
+        storage can execute code on a machine that loads it.
     """
 
     protocol: int = pickle.HIGHEST_PROTOCOL
 
     @override
     def load(self, path: pathlib.Path) -> T:
+        warnings.warn(
+            "Loading a Pickle artifact can execute arbitrary code. Treat any cache or remote that supplied it as trusted code.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         with open(path, "rb") as f:
             return pickle.load(f)  # type: ignore[return-value] - pickle returns Any, user specifies T
 
@@ -295,10 +799,13 @@ class Pickle[T](Loader[T, T]):
 
 @dataclasses.dataclass(frozen=True)
 class PathOnly(Loader[pathlib.Path, pathlib.Path]):
-    """No-op loader that returns the path itself for manual loading.
+    """Loader that hands paths to the stage instead of loading content.
 
-    Use when you need custom loading logic that doesn't fit standard loaders.
-    The save() method validates the file exists (user must create it manually).
+    On load, returns the artifact's path; it may be a file or a directory.
+    On save, takes ownership of the file or directory the stage returned by
+    moving it to the output path pivot chose. The stage writes its result
+    anywhere outside the project (e.g. under ``tempfile.mkdtemp()``) and
+    returns that path; it must not reuse the path afterwards.
     """
 
     @override
@@ -307,9 +814,16 @@ class PathOnly(Loader[pathlib.Path, pathlib.Path]):
 
     @override
     def save(self, data: pathlib.Path, path: pathlib.Path) -> None:
-        _ = data  # PathOnly doesn't save data; just validates file exists
-        if not path.exists():
-            raise FileNotFoundError(f"Output file not created: {path}")
+        if not data.exists():
+            raise FileNotFoundError(f"Stage returned path {data}, which does not exist")
+        if data.resolve() == path.resolve():
+            return
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(
+                f"Cannot move returned path {data} to {path}: the output path already exists"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(data, path)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -344,3 +858,31 @@ class MatplotlibFigure(Writer["Figure"]):
             )
         finally:
             plt.close(data)
+
+
+def format_extension(fmt: object) -> str:
+    """Map loader type to file extension.
+
+    Args:
+        fmt: A loader instance (CSV, JSON, YAML, etc.)
+
+    Returns:
+        File extension without the dot (e.g., "csv", "json", "pkl")
+    """
+    match fmt:
+        case DataFrameJSONL():
+            return "jsonl"
+        case CSV():
+            return "csv"
+        case YAML():
+            return "yaml"
+        case JSON():
+            return "json"
+        case Text():
+            return "txt"
+        case Pickle():
+            return "pkl"
+        case MatplotlibFigure():
+            return "png"
+        case _:
+            return "dat"

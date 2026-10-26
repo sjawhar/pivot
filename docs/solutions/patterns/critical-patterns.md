@@ -33,8 +33,9 @@ def test_rpc_source_accepts_connections(): ...
 # ALSO: E2E test for the complete CLI path
 def test_serve_mode_cli_responds_to_status_query(tmp_path):
     """E2E test: exercises actual CLI, not just components."""
-    # 1. Start actual CLI command
-    proc = subprocess.Popen(["uv", "run", "pivot", "run", "--watch", "--serve"], ...)
+    # 1. Start actual CLI command: the pivot beside the interpreter running pytest, not PATH's
+    pivot_bin = str(pathlib.Path(sys.executable).parent / "pivot")
+    proc = subprocess.Popen([pivot_bin, "repro", "--watch", "--serve"], ...)
 
     # 2. Exercise through public interface
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -119,8 +120,8 @@ def _find_pipeline_dir_for_stage(info, project_root) -> str | None:
         current = current.parent
 ```
 
-**Why:** `state_dir` is about state storage location (`.pivot/`), not source code location. These coincide for single-pipeline projects but diverge when sub-pipelines share a project root via `root=project.get_project_root()`. The stage function's source file is the reliable indicator of which pipeline directory a stage belongs to.
+**Why:** `state_dir` is about state storage location (`.pivot/`), not source code location. These coincide for single-pipeline projects but diverge when several pipelines share one project root. The stage function's source file is a reliable indicator of which directory a stage's code lives in.
 
-**Placement/Context:** Any code that needs to determine which pipeline a stage came from — output index writing, logging, error messages. Use `inspect.getfile(func)` and walk up to find the nearest `pipeline.py`/`pivot.yaml`, never `state_dir`.
+**Placement/Context:** Any code that needs to determine which pipeline a stage came from — logging, error messages. In the compositional API the pipeline name is the prefix of the stage name (`<pipeline>/<stage>`); use it. When you need the source directory, use `inspect.getfile(func)` and walk up to the nearest `pipeline.py`, never `state_dir`.
 
 **Documented in:** `docs/solutions/logic-errors/output-index-state-dir-shared-root-20260206.md`

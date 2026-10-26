@@ -4,10 +4,11 @@ import enum
 import os
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 import click
+import pydantic
 
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -87,6 +88,32 @@ def _sanitize_url(url: str) -> str:
     return urlunparse(parsed._replace(netloc=netloc))
 
 
+def _find_invalid_remote(
+    remotes: dict[object, object],
+) -> tuple[object, object, str]:
+    """Return the first remote entry that fails the configuration validator."""
+    from pivot.config import models
+
+    for name, remote in remotes.items():
+        try:
+            models.PivotConfig.model_validate({"remotes": {name: remote}})
+        except pydantic.ValidationError as error:
+            detail = error.errors()[0]
+            return name, remote, detail["msg"].removeprefix("Value error, ")
+    raise AssertionError("invalid remotes mapping contains no invalid entry")
+
+
+def _format_config_validation_error(error: pydantic.ValidationError) -> str:
+    """Format a config validation error for the doctor command's user-facing boundary."""
+    detail = error.errors()[0]
+    location = ".".join(str(part) for part in detail["loc"])
+    value = detail["input"]
+    if location == "remotes" and isinstance(value, dict) and value:
+        name, remote, message = _find_invalid_remote(cast("dict[object, object]", value))
+        return f"Invalid config remotes.{name}: {remote!r}; {message}"
+    return f"Invalid config {location}: {value!r}; expected {detail['msg'].removeprefix('Value error, ')}"
+
+
 def _relative_path(path: pathlib.Path, project_root: pathlib.Path) -> str:
     """Return path relative to project root, or absolute if outside."""
     try:
@@ -117,32 +144,9 @@ def _check_project_root() -> tuple[DoctorCheckEvent, pathlib.Path | None]:
 
 
 def _check_pipeline_config(project_root: pathlib.Path | None) -> DoctorCheckEvent:
-    """Check pivot.yaml/yml exists and is valid."""
+    """Check pipeline.py exists."""
     if project_root is None:
         return _skipped_check("pipeline_config")
-
-    import yaml
-
-    for name in ("pivot.yaml", "pivot.yml"):
-        config_path = project_root / name
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    config: object = yaml.safe_load(f)
-                # Handle scalar YAML (e.g., just a string) which isn't a valid config
-                if isinstance(config, dict):
-                    config_dict = cast("dict[str, Any]", config)
-                    stages_raw: object = config_dict.get("stages", {})
-                else:
-                    stages_raw = {}
-                stage_count = (
-                    len(cast("dict[str, Any]", stages_raw)) if isinstance(stages_raw, dict) else 0
-                )
-                return _check_event(
-                    "pipeline_config", CheckStatus.OK, name, {"stages": stage_count}
-                )
-            except Exception as e:
-                return _check_event("pipeline_config", CheckStatus.ERROR, name, {"error": str(e)})
 
     # Check for pipeline.py
     pipeline_py = project_root / "pipeline.py"
@@ -153,7 +157,7 @@ def _check_pipeline_config(project_root: pathlib.Path | None) -> DoctorCheckEven
         "pipeline_config",
         CheckStatus.WARN,
         "not found",
-        {"searched": ["pivot.yaml", "pivot.yml", "pipeline.py"]},
+        {"searched": ["pipeline.py"]},
     )
 
 
@@ -254,8 +258,7 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
     for name, url in remotes.items():
         sanitized_url = _sanitize_url(url)
         try:
-            # Validate S3 URL format
-            remote_config.validate_s3_url(url)
+            remote_config.validate_remote_url(url)
             results.append(
                 _check_event(f"remote:{name}", CheckStatus.OK, sanitized_url, {"valid": True})
             )
@@ -339,7 +342,10 @@ def doctor(ctx: click.Context, as_json: bool, check_remote: bool) -> None:
     checks.append(project_check)
 
     checks.append(_check_pipeline_config(project_root))
-    checks.append(_check_cache_directory(project_root))
+    try:
+        checks.append(_check_cache_directory(project_root))
+    except pydantic.ValidationError as e:
+        raise click.ClickException(_format_config_validation_error(e)) from e
     checks.append(_check_git_repository(project_root))
 
     if check_remote:

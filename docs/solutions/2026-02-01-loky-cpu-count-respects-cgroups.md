@@ -43,11 +43,12 @@ Use `loky.cpu_count()` which reads cgroup CPU limits:
 ```python
 import loky
 
-def compute_max_workers(stage_count: int, override: int | None = None) -> int:
-    """Compute worker count respecting container limits."""
-    cpu_count = loky.cpu_count() or 1  # Container-aware
-    max_workers = override if override is not None else cpu_count
-    return max(1, min(max_workers, stage_count))
+from pivot import config
+def configured_worker_count(override: int | None = None) -> int:
+    """Return a container-aware worker cap."""
+    cpu_count = loky.cpu_count() or 1
+    max_workers = override if override is not None else config.get_max_workers()
+    return max(1, max_workers if max_workers >= 0 else cpu_count + max_workers)
 ```
 
 loky inspects multiple cgroup interfaces:

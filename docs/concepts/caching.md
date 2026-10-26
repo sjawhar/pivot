@@ -8,21 +8,37 @@ fast as possible.
 ## Content-Addressable Cache
 
 Every output file is hashed with `xxhash64` and stored under
-`.pivot/cache/<hash[:2]>/<hash[2:]>` (a two-level directory structure using
-the first two hex characters as a prefix). The per-stage lock file records a
-manifest mapping each output path to its content hash.
+`.pivot/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure
+using the first two hex characters as a prefix). The per-stage lock file
+records each output's content hash.
 
 ```
 .pivot/
   cache/
-    a1/
-      b2c3d4e5f6g7h8    # cached file (content-addressed)
-    ...
+    files/
+      a1/
+        b2c3d4e5f6g7h8     # cached file (content-addressed)
+        .pivot_cache.lock  # lock file pivot keeps in each prefix directory
+      ...
   stages/
-    clean.lock             # lock file for "clean" stage
-    train.lock             # lock file for "train" stage
-  state.db                 # LMDB database
+    demo/
+      clean.lock           # lock file for stage "demo/clean"
+      train.lock           # lock file for stage "demo/train"
+  state.lmdb/              # LMDB database
 ```
+
+Each prefix directory also holds a `.pivot_cache.lock` file, and while a file
+or directory is being cached a `.pivot_tmp_*` entry; in `symlink` checkout
+mode, each cached directory tree has a `<hash>.verified` marker and may have
+a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
+`.pivot_tmp_*` entries a killed process leaves (at most once an hour per
+prefix directory). Do not delete these files while pivot runs.
+
+A cache several machines share (a `cache.dir` on a network filesystem) needs
+file locks that work across those machines: NFSv4, or NFSv3 with its lock
+manager. With locks local to each machine (NFS mounted `nolock` or with
+`local_lock`, Lustre with `localflock`), pivot on one machine can delete or
+change files another machine is still writing into the cache.
 
 Because the cache is content-addressed:
 
@@ -40,8 +56,8 @@ successful run:
 |-----------------|----------|
 | `code_manifest` | [Fingerprint](fingerprinting.md) dict (key → hash) |
 | `params` | Serialised [parameters](parameters.md) dict |
-| `dep_hashes` | Input file hashes (path → xxhash64) |
-| `output_hashes` | Output file hashes (path → xxhash64) |
+| `deps` | One entry per input: producer, key, content hash |
+| `outs` | One entry per output: key, project-relative POSIX path, content hash |
 
 This is the ground truth for "what did the stage look like last time it
 ran?" The skip algorithm compares current state against these fields.
@@ -55,8 +71,8 @@ to more expensive checks only when needed.
 ### Tier 1: Generation Tracking — O(1)
 
 StateDB maintains a monotonic **generation counter** for every output
-file. When a stage runs and produces `output.csv`, the generation for
-that path is incremented. The stage also records the generation of each
+file. When a stage runs and produces `data/demo/clean.jsonl`, the generation
+for that file is incremented. The stage also records the generation of each
 dependency at the time it ran.
 
 On the next run, the worker checks: "are my dependency generations the
@@ -71,7 +87,8 @@ changed, the stage is skipped immediately.
 If generation tracking can't confirm a skip (first run, StateDB cleared,
 generations diverged), the worker falls through to a full comparison:
 
-1. Recompute the code fingerprint manifest
+1. Recompute the code fingerprint manifest, including call-site input wiring
+   (parameter bindings, collection kind and order, and every input's declared path)
 2. Serialise current parameters
 3. Hash all dependency files (xxhash64, with StateDB-cached results)
 4. Compare all three against the lock file
@@ -85,10 +102,10 @@ If tier 2 says the stage *should* run (something changed), there's one
 more chance to skip. Pivot computes an **input hash** from the
 combination of:
 
-- Code fingerprint
+- Code fingerprint (including call-site input wiring)
 - Current parameters
 - Dependency hashes
-- Output path specs
+- Output specs (identities and formats)
 
 This input hash is looked up in the run cache
 (`runcache:<stage>:<input_hash>` in StateDB). If a previous run with
@@ -123,7 +140,8 @@ restored.
 
 ## File Change Detection
 
-Pivot uses a two-level strategy for detecting file changes:
+Pivot uses a two-level strategy for detecting file changes in dependencies and
+outputs Pivot committed:
 
 1. **Stat check** — compare `(mtime_ns, size, inode)` against the
    StateDB cache. If all three match, reuse the cached hash (no I/O).
@@ -132,11 +150,16 @@ Pivot uses a two-level strategy for detecting file changes:
 
 This gives O(1) skip detection for unchanged files while remaining
 correct when files do change (content hash is the source of truth).
+The fast path cannot detect an edit that preserves the size, inode, and
+mtime, such as a tool that restores the original mtime. Pivot detects the
+file after its metadata changes. Run `pivot repro --force <stage>` to rewrite
+the stage's output.
 
 ## Checkout Modes
 
 When restoring outputs from cache, Pivot supports three strategies,
-tried in order of preference:
+tried in order of preference. The same order links each stage output to
+its cache entry after the stage runs, and when a skipped stage restores it:
 
 | Mode | How it works | Trade-off |
 |------|-------------|-----------|
@@ -144,8 +167,10 @@ tried in order of preference:
 | `symlink` | Symbolic link to cache file | Zero copy, visibly a link |
 | `copy` | Full file copy | Safe but uses disk space |
 
-The default order is `hardlink → symlink → copy`. Configure it in
-`.pivot/config.yaml`:
+The default order is `hardlink → symlink → copy`. A hard link refused because
+the cache object already has as many links as the filesystem allows (65,000 on
+ext4) makes that file a copy, even when `symlink` comes next or `copy` is not
+in the order. Configure the order in `.pivot/config.yaml`:
 
 ```yaml
 cache:
@@ -178,17 +203,21 @@ Restore tracked files and stage outputs from cache:
 
 ```
 $ pivot checkout                   # restore all
-$ pivot checkout train             # restore specific stage outputs
-$ pivot checkout --only-missing    # skip files that already exist
+$ pivot checkout demo/train        # restore specific stage outputs
+$ pivot checkout --only-missing    # restore only missing files; never overwrite edits
 $ pivot checkout --force           # overwrite existing files
 ```
+
+With `--force`, Pivot checks the required local cache objects before replacing an
+existing file. If any object is missing, it names the missing hash and leaves
+the workspace file unchanged.
 
 ### `pivot commit`
 
 Record current outputs in lock files and cache without re-running:
 
 ```
-$ pivot commit train
+$ pivot commit demo/train
 ```
 
 ## Relationship to Other Concepts

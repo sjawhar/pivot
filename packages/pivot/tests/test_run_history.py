@@ -10,7 +10,7 @@ import pytest
 
 from pivot import run_history
 from pivot.storage import state
-from pivot.types import DepEntry, StageStatus
+from pivot.types import DeferredWrites, DepEntry, DirHash, StageStatus
 
 if TYPE_CHECKING:
     import pathlib
@@ -38,8 +38,8 @@ def test_compute_input_hash_deterministic() -> None:
     """Input hash should be deterministic for same inputs."""
     code_manifest = {"self:func": "abc123"}
     params: dict[str, object] = {"lr": 0.01}
-    deps = [DepEntry(path="data.csv", hash="def456")]
-    out_specs = [("model.pkl", True)]
+    deps = [DepEntry(producer="data.csv", key=None, hash="def456")]
+    out_specs = [("train:model", True)]
 
     hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
     hash2 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
@@ -50,8 +50,8 @@ def test_compute_input_hash_different_for_different_inputs() -> None:
     """Input hash should differ when inputs change."""
     code_manifest = {"self:func": "abc123"}
     params: dict[str, object] = {"lr": 0.01}
-    deps = [DepEntry(path="data.csv", hash="def456")]
-    out_specs = [("model.pkl", True)]
+    deps = [DepEntry(producer="data.csv", key=None, hash="def456")]
+    out_specs = [("train:model", True)]
 
     hash1 = run_history.compute_input_hash(code_manifest, params, deps, out_specs)
 
@@ -67,25 +67,25 @@ def test_compute_input_hash_different_for_different_inputs() -> None:
     hash4 = run_history.compute_input_hash(
         code_manifest,
         params,
-        [DepEntry(path="data.csv", hash="changed")],
+        [DepEntry(producer="data.csv", key=None, hash="changed")],
         out_specs,
     )
     assert hash1 != hash4
 
     # Change output cache flag (Out -> Metric conversion)
-    hash5 = run_history.compute_input_hash(code_manifest, params, deps, [("model.pkl", False)])
+    hash5 = run_history.compute_input_hash(code_manifest, params, deps, [("train:model", False)])
     assert hash1 != hash5, "Cache flag change should produce different hash"
 
 
 def test_compute_input_hash_order_independent_for_deps() -> None:
     """Input hash should be order-independent for deps and output specs."""
     deps_a = [
-        DepEntry(path="a.csv", hash="aaa"),
-        DepEntry(path="b.csv", hash="bbb"),
+        DepEntry(producer="a.csv", key=None, hash="aaa"),
+        DepEntry(producer="b.csv", key=None, hash="bbb"),
     ]
     deps_b = [
-        DepEntry(path="b.csv", hash="bbb"),
-        DepEntry(path="a.csv", hash="aaa"),
+        DepEntry(producer="b.csv", key=None, hash="bbb"),
+        DepEntry(producer="a.csv", key=None, hash="aaa"),
     ]
 
     hash_a = run_history.compute_input_hash({}, {}, deps_a, [])
@@ -154,6 +154,27 @@ def test_serialize_deserialize_run_cache_entry() -> None:
     assert deserialized["output_hashes"][0]["path"] == "model.pkl"
 
 
+@pytest.mark.parametrize(
+    "output_hash",
+    [
+        DirHash(hash="aaaaaaaaaaaaaaa0", manifest=[], empty_dirs=["bundle/classifier_source"]),
+        DirHash(hash="aaaaaaaaaaaaaaa1", manifest=[]),
+    ],
+    ids=["with-empty-dirs", "without-empty-dirs"],
+)
+def test_run_cache_entry_keeps_directory_empty_dirs(output_hash: DirHash) -> None:
+    """A run-cache restore rebuilds a directory output from its entry, so the entry carries
+    the output's empty directories; one without any carries no empty_dirs field."""
+    entry = run_history.RunCacheEntry(
+        run_id="20250110_143000_abc12345",
+        output_hashes=[run_history.output_hash_to_entry("data/out", output_hash)],
+    )
+
+    deserialized = run_history.deserialize_run_cache_entry(run_history.serialize_to_bytes(entry))
+
+    assert run_history.entry_to_output_hash(deserialized["output_hashes"][0]) == output_hash
+
+
 def test_deserialize_run_manifest_missing_keys() -> None:
     """Deserialization should raise ValueError for missing required keys."""
     incomplete = json.dumps({"run_id": "test", "started_at": ""}).encode()
@@ -196,7 +217,7 @@ def test_deserialize_run_cache_entry_missing_keys() -> None:
 
 def test_state_db_write_read_run(tmp_path: pathlib.Path) -> None:
     """StateDB should write and read run manifests."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         manifest = run_history.RunManifest(
             run_id="20250110_143000_abc12345",
             started_at="2025-01-10T14:30:00+00:00",
@@ -222,14 +243,14 @@ def test_state_db_write_read_run(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_read_nonexistent_run(tmp_path: pathlib.Path) -> None:
     """StateDB should return None for nonexistent run."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         result = db.read_run("nonexistent")
         assert result is None
 
 
 def test_state_db_list_runs_ordering(tmp_path: pathlib.Path) -> None:
     """StateDB should list runs in reverse chronological order."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Write runs with different timestamps
         for i in range(3):
             manifest = run_history.RunManifest(
@@ -252,7 +273,7 @@ def test_state_db_list_runs_ordering(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_list_runs_limit(tmp_path: pathlib.Path) -> None:
     """StateDB should respect limit parameter."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         for i in range(5):
             manifest = run_history.RunManifest(
                 run_id=f"2025011{i}_143000_abc12345",
@@ -270,7 +291,7 @@ def test_state_db_list_runs_limit(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_runs(tmp_path: pathlib.Path) -> None:
     """StateDB should prune old runs beyond retention limit."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Write 5 runs
         for i in range(5):
             manifest = run_history.RunManifest(
@@ -296,7 +317,7 @@ def test_state_db_prune_runs(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_runs_no_op_when_under_limit(tmp_path: pathlib.Path) -> None:
     """StateDB prune should do nothing when under limit."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         manifest = run_history.RunManifest(
             run_id="20250110_143000_abc12345",
             started_at="",
@@ -319,14 +340,25 @@ def test_state_db_prune_runs_no_op_when_under_limit(tmp_path: pathlib.Path) -> N
 # =============================================================================
 
 
+def _seed_run_cache(
+    db: state.StateDB, stage_name: str, input_hash: str, entry: run_history.RunCacheEntry
+) -> None:
+    """Write a run cache entry through the coordinator's deferred-write path."""
+    db.apply_deferred_writes(
+        stage_name,
+        [],
+        DeferredWrites(run_cache_input_hash=input_hash, run_cache_entry=entry),
+    )
+
+
 def test_state_db_run_cache_write_lookup(tmp_path: pathlib.Path) -> None:
     """StateDB should write and lookup run cache entries."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         entry = run_history.RunCacheEntry(
             run_id="20250110_143000_abc12345",
             output_hashes=[run_history.OutputHashEntry(path="out.txt", hash="abc")],
         )
-        db.write_run_cache("my_stage", "input_hash_123", entry)
+        _seed_run_cache(db, "my_stage", "input_hash_123", entry)
 
         result = db.lookup_run_cache("my_stage", "input_hash_123")
         assert result is not None
@@ -336,14 +368,14 @@ def test_state_db_run_cache_write_lookup(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_run_cache_lookup_nonexistent(tmp_path: pathlib.Path) -> None:
     """StateDB should return None for nonexistent run cache entry."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         result = db.lookup_run_cache("nonexistent", "nonexistent")
         assert result is None
 
 
 def test_state_db_run_cache_different_stages(tmp_path: pathlib.Path) -> None:
     """Run cache entries for different stages should be independent."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         entry1 = run_history.RunCacheEntry(
             run_id="run1",
             output_hashes=[run_history.OutputHashEntry(path="out1.txt", hash="hash1")],
@@ -354,8 +386,8 @@ def test_state_db_run_cache_different_stages(tmp_path: pathlib.Path) -> None:
         )
 
         # Same input hash, different stages
-        db.write_run_cache("stage1", "same_input_hash", entry1)
-        db.write_run_cache("stage2", "same_input_hash", entry2)
+        _seed_run_cache(db, "stage1", "same_input_hash", entry1)
+        _seed_run_cache(db, "stage2", "same_input_hash", entry2)
 
         result1 = db.lookup_run_cache("stage1", "same_input_hash")
         result2 = db.lookup_run_cache("stage2", "same_input_hash")
@@ -368,12 +400,12 @@ def test_state_db_run_cache_different_stages(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_run_cache_overwrite(tmp_path: pathlib.Path) -> None:
     """Writing to same run cache key should overwrite."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         entry1 = run_history.RunCacheEntry(run_id="run1", output_hashes=[])
         entry2 = run_history.RunCacheEntry(run_id="run2", output_hashes=[])
 
-        db.write_run_cache("stage", "input_hash", entry1)
-        db.write_run_cache("stage", "input_hash", entry2)
+        _seed_run_cache(db, "stage", "input_hash", entry1)
+        _seed_run_cache(db, "stage", "input_hash", entry2)
 
         result = db.lookup_run_cache("stage", "input_hash")
         assert result is not None
@@ -382,13 +414,13 @@ def test_state_db_run_cache_overwrite(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_run_cache(tmp_path: pathlib.Path) -> None:
     """Run cache pruning should remove entries referencing invalid run_ids."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Create cache entries with different run_ids
         entry1 = run_history.RunCacheEntry(run_id="valid_run", output_hashes=[])
         entry2 = run_history.RunCacheEntry(run_id="orphan_run", output_hashes=[])
 
-        db.write_run_cache("stage1", "hash1", entry1)
-        db.write_run_cache("stage2", "hash2", entry2)
+        _seed_run_cache(db, "stage1", "hash1", entry1)
+        _seed_run_cache(db, "stage2", "hash2", entry2)
 
         # Prune with only valid_run as valid
         deleted = db.prune_run_cache({"valid_run"})
@@ -402,7 +434,7 @@ def test_state_db_prune_run_cache(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_runs_also_prunes_cache(tmp_path: pathlib.Path) -> None:
     """Pruning runs should also prune run cache entries referencing deleted runs."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Create 3 runs
         for i in range(3):
             manifest = run_history.RunManifest(
@@ -419,7 +451,7 @@ def test_state_db_prune_runs_also_prunes_cache(tmp_path: pathlib.Path) -> None:
                 run_id=f"2025011{i}_143000_abc12345",
                 output_hashes=[],
             )
-            db.write_run_cache(f"stage{i}", f"hash{i}", entry)
+            _seed_run_cache(db, f"stage{i}", f"hash{i}", entry)
 
         # Prune to keep only 1 run (most recent: 20250112_143000_abc12345)
         deleted = db.prune_runs(retention=1)

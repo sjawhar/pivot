@@ -35,7 +35,7 @@ class ImportSource(TypedDict):
     rev_lock: str  # Resolved commit SHA
     stage: str  # Source stage name (auto-discovered)
     path: str  # Path within source repo
-    remote: str  # Source's S3 remote URL
+    remote: str  # Source's remote URL (s3:// or gs://)
 
 
 class PvtData(TypedDict):
@@ -46,11 +46,12 @@ class PvtData(TypedDict):
     size: int  # Total size (file or sum of directory)
     num_files: NotRequired[int]  # For directories only
     manifest: NotRequired[list[DirManifestEntry]]  # For directories only
+    empty_dirs: NotRequired[list[str]]  # For directories holding any (see DirHash)
     source: NotRequired[ImportSource]  # Import source metadata
 
 
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
-_VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "source"})
+_VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "empty_dirs", "source"})
 _REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
 
 
@@ -63,6 +64,8 @@ def is_pvt_data(data: object) -> TypeGuard[PvtData]:
         return False
     if not all(key in _VALID_KEYS for key in str_data):
         return False
+    if "empty_dirs" in str_data and not _is_empty_dirs(str_data):
+        return False
     if "source" in str_data:
         source = str_data["source"]
         if not isinstance(source, dict):
@@ -73,6 +76,19 @@ def is_pvt_data(data: object) -> TypeGuard[PvtData]:
         if not all(isinstance(source_dict[k], str) for k in _REQUIRED_SOURCE_KEYS):
             return False
     return True
+
+
+def _is_empty_dirs(data: dict[str, object]) -> bool:
+    """Whether a .pvt's empty_dirs is a list of safe relpaths beside a manifest."""
+    value = data["empty_dirs"]
+    return (
+        "manifest" in data
+        and isinstance(value, list)
+        and all(
+            isinstance(relpath, str) and relpath != "" and not has_path_traversal(relpath)
+            for relpath in cast("list[object]", value)
+        )
+    )
 
 
 def has_path_traversal(path: str) -> bool:
@@ -165,6 +181,9 @@ def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:
     """Convert PvtData to HashInfo format for cache operations."""
     from pivot.types import DirHash, FileHash
 
-    if "manifest" in pvt_data:
-        return DirHash(hash=pvt_data["hash"], manifest=pvt_data["manifest"])
-    return FileHash(hash=pvt_data["hash"])
+    if "manifest" not in pvt_data:
+        return FileHash(hash=pvt_data["hash"])
+    dir_hash = DirHash(hash=pvt_data["hash"], manifest=pvt_data["manifest"])
+    if "empty_dirs" in pvt_data and pvt_data["empty_dirs"]:
+        dir_hash["empty_dirs"] = pvt_data["empty_dirs"]
+    return dir_hash

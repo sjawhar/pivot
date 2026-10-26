@@ -2,44 +2,27 @@
 date: 2026-02-02
 category: design-patterns
 tags: [pathlib, path-resolution, symlinks, cross-platform, brainstorming]
-module: pipeline
-symptoms: [verbose-paths, stage-reuse, dvc-migration]
+module: storage
+symptoms: [symlink-escape, cross-platform-paths, input-bindings]
 ---
 
 # Path Resolution Design Patterns in Python
 
 ## Problem
 
-When designing a pipeline framework where stages can be reused across different pipeline directories, how should paths in annotations be resolved? The goal is to allow simple relative paths like `Dep("data/raw.csv")` that resolve differently depending on which pipeline registers the stage.
+Pipeline code contains almost no paths: stage outputs are placed by `WorkspaceStore._resolve_output_path` (`storage/store.py`) at `data/<pipeline>/<stage>.<ext>`, and inputs are bound by `pipeline.input(name, path=...)` (default `data/raw/<name>`). The remaining questions are how those paths are normalized, where they are resolved, and how symlinks are treated.
 
 ## Key Design Decisions
 
-### 1. Implicit vs Explicit Path Prefix
+### 1. Paths Are Relative to the Project Root
 
-**Implicit (chosen):** Infer prefix from `pipeline.root` (directory containing `pipeline.py`)
-```python
-# eval_pipeline/horizon/pipeline.py
-pipeline = Pipeline("horizon")  # root inferred from __file__
-Dep("data/raw.csv")  # → eval_pipeline/horizon/data/raw.csv
-```
-
-**Explicit alternative:** User specifies prefix manually
-```python
-pipeline = Pipeline("horizon", path_prefix="eval_pipeline/horizon/")
-```
-
-**Tradeoff:** Implicit follows DVC convention (familiar to target users) but adds "magic". Explicit is clearer but more verbose.
+Input bindings and output locations are relative to the project root (the top-most directory containing `.pivot/`), not to the directory of the `pipeline.py` that declared them. Two pipelines in different directories that both call `pipeline.input("scores.csv")` read the same `data/raw/scores.csv`; binding the same input name to two different paths is an error (`Input binding conflict`).
 
 ### 2. Where Resolution Happens
 
-**Bad:** Threading `pipeline_root` through multiple layers (Pipeline → Registry → stage_def)
-- Spreads the feature across many files
-- Hard to understand and maintain
+**Bad:** Threading roots and prefixes through multiple layers (Pipeline → Registry → stage_def).
 
-**Good:** Resolve entirely in `Pipeline.register()`
-- Extract annotation paths, resolve them, pass as overrides
-- Registry and stage_def remain unchanged
-- Feature contained in one place
+**Good:** One place maps an artifact identity to a path. `WorkspaceStore` resolves both input bindings and output identities; the registry, DAG and lock files only ever hold identities (`ArtifactIdentity(producer, key)`).
 
 ### 3. Symlinks: resolve() vs normpath()
 
@@ -73,12 +56,9 @@ normalize_to_posix("foo\\bar/baz") # → "foo/bar/baz"
 
 | Layer | Format | Why |
 |-------|--------|-----|
-| Annotations | Pipeline-relative | Simple, reusable |
-| RegistryStageInfo | Project-relative | Consistent for DAG building |
-| Lock files | Project-relative | Portable, git-trackable |
-| Execution | Absolute | No ambiguity at runtime |
-
-Resolution happens once at registration time. All downstream code sees project-relative paths.
+| `pipeline.input(path=...)` bindings | Project-relative | Simple, portable |
+| RegistryStageInfo, DAG, lock files | Artifact identities, no paths | Paths are derived, not stored |
+| Execution | Absolute (from `WorkspaceStore`) | No ambiguity at runtime |
 
 ## Code Patterns
 
@@ -143,7 +123,7 @@ Path validation has two distinct phases with different responsibilities:
 ## Prevention
 
 When designing path resolution:
-1. Decide early: implicit vs explicit prefix
+1. Keep paths out of the registry: store identities, derive paths in one place (`WorkspaceStore`)
 2. Keep resolution in one layer, don't thread through multiple modules
 3. Use `normpath` not `resolve` if symlinks should be preserved
 4. Never call `.resolve()`, `.exists()`, or `.is_symlink()` on artifact paths at registration time — see invariant above

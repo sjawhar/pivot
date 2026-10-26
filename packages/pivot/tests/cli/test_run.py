@@ -3,96 +3,84 @@
 from __future__ import annotations
 
 import json
-import pathlib
 import sys
-from typing import TYPE_CHECKING, Annotated, TypedDict
+from typing import TYPE_CHECKING
 
-from helpers import register_test_stage
-from pivot import cli, loaders, outputs
+import pytest
+
+from pivot import cli, compose
 
 if TYPE_CHECKING:
+    import pathlib
+
     import click.testing
-    import pytest
-
-    from pivot.pipeline.pipeline import Pipeline
 
 # =============================================================================
-# Module-level TypedDicts and Stage Functions for annotation-based registration
+# Module-level stage functions (required for pickling)
 # =============================================================================
 
 
-class _StageAOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("a.txt", loaders.PathOnly())]
+@compose.stage
+def stage_a() -> str:
+    return "a"
 
 
-class _StageBOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("b.txt", loaders.PathOnly())]
+@compose.stage
+def stage_b(dep: str) -> str:
+    return "b"
 
 
-class _StageCOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("c.txt", loaders.PathOnly())]
+@compose.stage
+def process(input_file: str) -> str:
+    return "done"
 
 
-class _OutputTxtOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("output.txt", loaders.PathOnly())]
-
-
-def _helper_stage_a() -> _StageAOutputs:
-    pathlib.Path("a.txt").write_text("a")
-    return _StageAOutputs(output=pathlib.Path("a.txt"))
-
-
-def _helper_stage_b(
-    dep: Annotated[pathlib.Path, outputs.Dep("a.txt", loaders.PathOnly())],
-) -> _StageBOutputs:
-    _ = dep
-    pathlib.Path("b.txt").write_text("b")
-    return _StageBOutputs(output=pathlib.Path("b.txt"))
-
-
-def _helper_stage_c(
-    dep: Annotated[pathlib.Path, outputs.Dep("b.txt", loaders.PathOnly())],
-) -> _StageCOutputs:
-    _ = dep
-    pathlib.Path("c.txt").write_text("c")
-    return _StageCOutputs(output=pathlib.Path("c.txt"))
-
-
-def _helper_process(
-    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
-) -> _OutputTxtOutputs:
-    _ = input_file
-    pathlib.Path("output.txt").write_text("done")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
-
-
-class _FailingOutputs(TypedDict):
-    output: Annotated[pathlib.Path, outputs.Out("failing.txt", loaders.PathOnly())]
-
-
-def _helper_failing_stage() -> _FailingOutputs:
+@compose.stage
+def failing() -> str:
     raise RuntimeError("Intentional failure")
 
 
-def _helper_printing_stage() -> _OutputTxtOutputs:
+@compose.stage
+def printer() -> str:
     sys.stdout.write("Processing data...\n")
     sys.stdout.flush()
-    pathlib.Path("output.txt").write_text("done")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+    return "done"
 
 
-def _helper_stderr_stage() -> _OutputTxtOutputs:
+@compose.stage
+def warner() -> str:
     sys.stderr.write("Warning: something happened\n")
     sys.stderr.flush()
-    pathlib.Path("output.txt").write_text("done")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+    return "done"
 
 
-def _helper_quiet_stage() -> _OutputTxtOutputs:
+@compose.stage
+def quiet() -> str:
     sys.stdout.write("This should not appear\n")
     sys.stdout.flush()
-    pathlib.Path("output.txt").write_text("done")
-    return _OutputTxtOutputs(output=pathlib.Path("output.txt"))
+    return "done"
+
+
+def _output(pipeline: compose.Pipeline, stage_name: str) -> pathlib.Path:
+    return pipeline.root / "data" / "test" / f"{stage_name}.txt"
+
+
+def _register_a(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        stage_a()
+
+
+def _register_a_b(pipeline: compose.Pipeline) -> None:
+    with pipeline:
+        stage_b(stage_a())
+
+
+def _register_process(pipeline: compose.Pipeline) -> None:
+    raw_dir = pipeline.root / "data" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "input.txt").write_text("data")
+    with pipeline:
+        process(pipeline.input("input.txt", t=str))
 
 
 # =============================================================================
@@ -101,13 +89,11 @@ def _helper_quiet_stage() -> _OutputTxtOutputs:
 
 
 def test_run_requires_stage_argument(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run without arguments errors with usage message."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
     result = runner.invoke(cli.cli, ["run"])
 
@@ -116,59 +102,65 @@ def test_run_requires_stage_argument(
 
 
 def test_run_executes_single_stage(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run STAGE executes only that stage."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
+    _register_a_b(mock_discovery)
+
+    result = runner.invoke(cli.cli, ["run", "test/stage_a"])
+
+    assert result.exit_code == 0, f"Failed: {result.output}"
+    assert _output(mock_discovery, "stage_a").read_text() == "a"
+    # stage_b should NOT run (no dependency resolution)
+    assert not _output(mock_discovery, "stage_b").exists()
+
+
+def test_run_bare_stage_name_resolves(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+) -> None:
+    """run accepts a bare stage name in a single-pipeline project (names.py design)."""
+    _register_a_b(mock_discovery)
 
     result = runner.invoke(cli.cli, ["run", "stage_a"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    assert (tmp_path / "a.txt").exists()
-    # stage_b should NOT run (no dependency resolution)
-    assert not (tmp_path / "b.txt").exists()
+    assert _output(mock_discovery, "stage_a").read_text() == "a"
 
 
 def test_run_executes_multiple_stages_in_order(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run STAGE1 STAGE2 executes stages in specified order."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
+    _register_a_b(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "stage_a", "stage_b"])
+    result = runner.invoke(cli.cli, ["run", "test/stage_a", "test/stage_b"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    assert (tmp_path / "a.txt").exists()
-    assert (tmp_path / "b.txt").exists()
+    assert _output(mock_discovery, "stage_a").exists()
+    assert _output(mock_discovery, "stage_b").exists()
 
 
 def test_run_does_not_resolve_dependencies(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run STAGE does not automatically run dependencies."""
+    _register_a_b(mock_discovery)
     # Create the dependency file manually
-    (tmp_path / "a.txt").write_text("manual")
-    register_test_stage(_helper_stage_a, name="stage_a")
-    register_test_stage(_helper_stage_b, name="stage_b")
+    a_out = _output(mock_discovery, "stage_a")
+    a_out.parent.mkdir(parents=True, exist_ok=True)
+    a_out.write_text("manual")
 
     # Run only stage_b - should NOT run stage_a
-    result = runner.invoke(cli.cli, ["run", "stage_b"])
+    result = runner.invoke(cli.cli, ["run", "test/stage_b"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     # stage_a should not have been re-run (file still has "manual" content)
-    assert (tmp_path / "a.txt").read_text() == "manual"
-    assert (tmp_path / "b.txt").exists()
+    assert a_out.read_text() == "manual"
+    assert _output(mock_discovery, "stage_b").exists()
 
 
 # =============================================================================
@@ -177,13 +169,11 @@ def test_run_does_not_resolve_dependencies(
 
 
 def test_run_unknown_stage_errors(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run with unknown stage name errors with helpful message."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
     result = runner.invoke(cli.cli, ["run", "nonexistent_stage"])
 
@@ -192,36 +182,34 @@ def test_run_unknown_stage_errors(
 
 
 def test_run_default_fails_fast(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run defaults to fail-fast mode - stops on first failure."""
-    register_test_stage(_helper_failing_stage, name="failing")
-    register_test_stage(_helper_stage_a, name="stage_a")
+    with mock_discovery:
+        failing()
+        stage_a()
 
     # Run failing then stage_a - default fail-fast should stop
-    result = runner.invoke(cli.cli, ["run", "failing", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", "test/failing", "test/stage_a"])
 
-    assert result.exit_code == 0
-    assert "failing" in result.output and "FAILED" in result.output
+    # Exit 1 on failure: #452 commit 378abd0 made run return non-zero on stage failure
+    assert result.exit_code == 1, result.output
+    assert "test/failing" in result.output and "FAILED" in result.output
 
 
 def test_run_fail_fast_option_accepted(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --fail-fast option is accepted and affects execution mode."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
     # Verify --fail-fast is accepted without error
-    result = runner.invoke(cli.cli, ["run", "--fail-fast", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", "--fail-fast", "test/stage_a"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
-    assert (tmp_path / "a.txt").exists()
+    assert _output(mock_discovery, "stage_a").exists()
 
 
 # =============================================================================
@@ -230,21 +218,22 @@ def test_run_fail_fast_option_accepted(
 
 
 def test_run_force_reruns_cached_stages(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --force re-runs stages even if cached."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
     # First run
-    result = runner.invoke(cli.cli, ["run", "stage_a"])
-    assert result.exit_code == 0
+    result = runner.invoke(cli.cli, ["run", "test/stage_a"])
+    assert result.exit_code == 0, result.output
 
     # Second run with force - should re-run (not skip)
-    result = runner.invoke(cli.cli, ["run", "--force", "stage_a"])
-    assert result.exit_code == 0
+    result = runner.invoke(cli.cli, ["run", "--force", "--json", "test/stage_a"])
+    assert result.exit_code == 0, result.output
+    events = [json.loads(line) for line in result.output.strip().split("\n") if line]
+    completes = [e for e in events if e["type"] == "stage_complete"]
+    assert [e["status"] for e in completes] == ["ran"], "--force must re-run, not skip"
 
 
 # =============================================================================
@@ -253,15 +242,13 @@ def test_run_force_reruns_cached_stages(
 
 
 def test_run_tui_log_cannot_use_with_json(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --tui-log cannot be used with --json."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--tui-log", "test.log", "--json", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", "--tui-log", "test.log", "--json", "test/stage_a"])
 
     assert result.exit_code != 0
     assert "--tui-log" in result.output
@@ -269,31 +256,26 @@ def test_run_tui_log_cannot_use_with_json(
 
 
 def test_run_tui_and_json_mutually_exclusive(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--tui and --json are mutually exclusive."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--tui", "--json", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", "--tui", "--json", "test/stage_a"])
 
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output.lower()
 
 
 def test_run_tui_log_requires_tui(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--tui-log requires --tui flag."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--tui-log", "log.jsonl", "process"])
+    result = runner.invoke(cli.cli, ["run", "--tui-log", "log.jsonl", "test/process"])
 
     assert result.exit_code != 0
     assert "--tui-log requires --tui" in result.output
@@ -305,9 +287,6 @@ def test_run_help_includes_tui_flag(
 ) -> None:
     """--tui flag appears in help text."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".pivot").mkdir()
-        pathlib.Path(".git").mkdir()
-
         result = runner.invoke(cli.cli, ["run", "--help"])
 
     assert result.exit_code == 0
@@ -322,17 +301,15 @@ def test_run_help_includes_tui_flag(
 
 
 def test_run_json_output_streams_jsonl(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --json streams JSONL output."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--json", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", "--json", "test/stage_a"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # Check that output is valid JSONL (multiple JSON lines)
     lines = [ln for ln in result.output.strip().split("\n") if ln]
     assert len(lines) > 0
@@ -341,34 +318,29 @@ def test_run_json_output_streams_jsonl(
 
 
 def test_run_json_flag_accepted(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--json flag should work without --tui (plain is now default)."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--json", "process"])
+    result = runner.invoke(cli.cli, ["run", "--json", "test/process"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # JSONL output should start with schema version
     assert '"type": "schema_version"' in result.output
 
 
 def test_run_jsonl_flag_accepted(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--jsonl flag works and streams JSONL output."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--jsonl", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", "--jsonl", "test/stage_a"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     lines = [ln for ln in result.output.strip().split("\n") if ln]
     assert len(lines) > 0
     for line in lines:
@@ -381,9 +353,6 @@ def test_run_help_shows_jsonl(
 ) -> None:
     """run help shows --jsonl flag with JSONL description."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".pivot").mkdir()
-        pathlib.Path(".git").mkdir()
-
         result = runner.invoke(cli.cli, ["run", "--help"])
 
     assert result.exit_code == 0
@@ -392,24 +361,21 @@ def test_run_help_shows_jsonl(
 
 
 def test_run_uses_plain_mode_by_default(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Plain text output is the default (no --tui flag needed)."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
     # Run without any display flags
-    result = runner.invoke(cli.cli, ["run", "process"])
+    result = runner.invoke(cli.cli, ["run", "test/process"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     # Plain mode shows stage status in simple text format
     # (not JSONL format which has "type":)
     assert '"type":' not in result.output
     # Should contain stage name in output
-    assert "process" in result.output.lower()
+    assert "test/process" in result.output
 
 
 # =============================================================================
@@ -418,17 +384,16 @@ def test_run_uses_plain_mode_by_default(
 
 
 def test_run_no_commit_option_accepted(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """run --no-commit option is accepted."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--no-commit", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", "--no-commit", "test/stage_a"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
+    assert _output(mock_discovery, "stage_a").exists()
 
 
 # =============================================================================
@@ -436,102 +401,53 @@ def test_run_no_commit_option_accepted(
 # =============================================================================
 
 
-def test_run_does_not_have_single_stage_option(
-    mock_discovery: Pipeline,
+@pytest.mark.parametrize(
+    "option",
+    [
+        pytest.param("--single-stage", id="single_stage"),
+        pytest.param("--dry-run", id="dry_run"),
+        pytest.param("--explain", id="explain"),
+        pytest.param("--watch", id="watch"),
+        pytest.param("--allow-missing", id="allow_missing"),
+    ],
+)
+def test_run_does_not_have_repro_only_option(
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
+    option: str,
 ) -> None:
-    """run does not have --single-stage option (it's always single-stage)."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    """run does not have repro-only options (run is always single-stage)."""
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "--single-stage", "stage_a"])
+    result = runner.invoke(cli.cli, ["run", option, "test/stage_a"])
 
     assert result.exit_code != 0
-    assert "No such option" in result.output or "no such option" in result.output.lower()
-
-
-def test_run_does_not_have_dry_run_option(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run does not have --dry-run option (use repro instead)."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    result = runner.invoke(cli.cli, ["run", "--dry-run", "stage_a"])
-
-    assert result.exit_code != 0
-    assert "No such option" in result.output or "no such option" in result.output.lower()
-
-
-def test_run_does_not_have_explain_option(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run does not have --explain option (use repro instead)."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    result = runner.invoke(cli.cli, ["run", "--explain", "stage_a"])
-
-    assert result.exit_code != 0
-    assert "No such option" in result.output or "no such option" in result.output.lower()
-
-
-def test_run_does_not_have_watch_option(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run does not have --watch option (use repro instead)."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    result = runner.invoke(cli.cli, ["run", "--watch", "stage_a"])
-
-    assert result.exit_code != 0
-    assert "No such option" in result.output or "no such option" in result.output.lower()
-
-
-def test_run_does_not_have_allow_missing_option(
-    mock_discovery: Pipeline,
-    runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run does not have --allow-missing option (use repro instead)."""
-    register_test_stage(_helper_stage_a, name="stage_a")
-
-    result = runner.invoke(cli.cli, ["run", "--allow-missing", "stage_a"])
-
-    assert result.exit_code != 0
-    assert "No such option" in result.output or "no such option" in result.output.lower()
+    assert "no such option" in result.output.lower()
 
 
 def test_run_tui_with_tui_log_validation_passes(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--tui --tui-log passes validation (log path is writable)."""
-    (tmp_path / "input.txt").write_text("data")
-    register_test_stage(_helper_process, name="process")
+    _register_process(mock_discovery)
 
-    log_path = tmp_path / "tui.jsonl"
+    log_path = mock_discovery.root / "tui.jsonl"
 
     # This will attempt to run TUI which fails in non-TTY test environment,
     # but it should NOT fail on validation errors about --tui-log
-    result = runner.invoke(cli.cli, ["run", "--tui", "--tui-log", str(log_path), "process"])
+    result = runner.invoke(cli.cli, ["run", "--tui", "--tui-log", str(log_path), "test/process"])
 
     # Should NOT have validation errors
     assert "--tui-log requires --tui" not in result.output
     assert "Cannot write to" not in result.output
     # The log file should have been created during validation (touch())
     assert log_path.exists()
+    # The TUI event poller thread must not outlive the command.
+    import threading
+
+    live_pollers = [t for t in threading.enumerate() if "poller" in t.name and t.is_alive()]
+    assert live_pollers == []
 
 
 # =============================================================================
@@ -540,52 +456,53 @@ def test_run_tui_with_tui_log_validation_passes(
 
 
 def test_run_show_output_mutually_exclusive_with_tui(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output and --tui are mutually exclusive."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "stage_a", "--show-output", "--tui"])
+    result = runner.invoke(cli.cli, ["run", "test/stage_a", "--show-output", "--tui"])
 
     assert result.exit_code != 0
     assert "--show-output and --tui are mutually exclusive" in result.output
 
 
 def test_run_show_output_mutually_exclusive_with_json(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output and --json are mutually exclusive."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["run", "stage_a", "--show-output", "--json"])
+    result = runner.invoke(cli.cli, ["run", "test/stage_a", "--show-output", "--json"])
 
     assert result.exit_code != 0
     assert "--show-output and --jsonl/--json are mutually exclusive" in result.output
 
 
 def test_run_show_output_mutually_exclusive_with_quiet(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output and --quiet are mutually exclusive."""
-    register_test_stage(_helper_stage_a, name="stage_a")
+    _register_a(mock_discovery)
 
-    result = runner.invoke(cli.cli, ["--quiet", "run", "stage_a", "--show-output"])
+    result = runner.invoke(cli.cli, ["--quiet", "run", "test/stage_a", "--show-output"])
 
     assert result.exit_code != 0
     assert "--show-output and --quiet are mutually exclusive" in result.output
 
 
 def test_run_show_output_streams_stage_logs(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output streams stage stdout to terminal."""
-    register_test_stage(_helper_printing_stage, name="printer")
+    with mock_discovery:
+        printer()
 
-    result = runner.invoke(cli.cli, ["run", "printer", "--show-output"])
+    result = runner.invoke(cli.cli, ["run", "test/printer", "--show-output"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "printer" in result.output
@@ -593,13 +510,14 @@ def test_run_show_output_streams_stage_logs(
 
 
 def test_run_show_output_streams_stderr(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
     """--show-output streams stderr with red formatting."""
-    register_test_stage(_helper_stderr_stage, name="warner")
+    with mock_discovery:
+        warner()
 
-    result = runner.invoke(cli.cli, ["run", "warner", "--show-output"])
+    result = runner.invoke(cli.cli, ["run", "test/warner", "--show-output"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "warner" in result.output
@@ -607,13 +525,14 @@ def test_run_show_output_streams_stderr(
 
 
 def test_run_without_show_output_hides_logs(
-    mock_discovery: Pipeline,
+    mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
     """Default behavior (no --show-output) doesn't show stage logs."""
-    register_test_stage(_helper_quiet_stage, name="quiet")
+    with mock_discovery:
+        quiet()
 
-    result = runner.invoke(cli.cli, ["run", "quiet"])
+    result = runner.invoke(cli.cli, ["run", "test/quiet"])
 
     assert result.exit_code == 0, f"Failed: {result.output}"
     assert "This should not appear" not in result.output
