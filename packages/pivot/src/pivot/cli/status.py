@@ -35,12 +35,21 @@ from pivot.types import (
 @click.option(
     "--explain", "-e", is_flag=True, help="Show detailed breakdown of why stages would run"
 )
-@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    help="Output as JSON. Writes one document to stdout; notes go to stderr.",
+)
 @click.option("--stages-only", is_flag=True, help="Show only pipeline status")
 @click.option("--tracked-only", is_flag=True, help="Show only tracked files")
 @click.option("--remote-only", is_flag=True, help="Show only remote status")
 @click.option("--remote", "-r", is_flag=True, help="Include remote sync status")
-@click.option("--check-imports", is_flag=True, help="Check for import updates (requires network)")
+@click.option(
+    "--check-imports",
+    is_flag=True,
+    help="Check for import updates (requires network). JSON adds an imports field.",
+)
 @click.pass_context
 def status(
     ctx: click.Context,

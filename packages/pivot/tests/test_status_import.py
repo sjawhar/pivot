@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
@@ -136,6 +137,44 @@ def test_status_import_network_error(tmp_path: pathlib.Path, mocker: MockerFixtu
     assert len(results) == 1, "Should have one import result"
     assert results[0].status is ImportCheckStatus.ERROR
     assert "Network unreachable" in results[0].error
+
+
+def test_status_import_empty_error_names_type_in_warning(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture, mocker: MockerFixture
+) -> None:
+    """An import check error without a message logs its exception type."""
+    pvt_data = track.PvtData(
+        path="model.pkl",
+        hash="ccc",
+        size=300,
+        source=track.ImportSource(
+            repo="https://github.com/org/repo",
+            rev="main",
+            rev_lock="abc123def456",
+            stage="train",
+            path="models/model.pkl",
+            remote="s3://bucket/cache",
+        ),
+    )
+    mocker.patch.object(
+        track,
+        "discover_import_pvt_files",
+        autospec=True,
+        return_value={str(tmp_path / "models" / "model.pkl"): pvt_data},
+    )
+    mocker.patch.object(
+        import_artifact,
+        "check_for_update",
+        new=AsyncMock(side_effect=TimeoutError()),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="pivot.status"):
+        results = status.get_import_status(tmp_path)
+
+    assert results[0].error == "TimeoutError"
+    assert [record.getMessage() for record in caplog.records] == [
+        "Failed to check import models/model.pkl: TimeoutError"
+    ]
 
 
 # =============================================================================

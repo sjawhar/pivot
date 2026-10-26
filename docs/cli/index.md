@@ -215,12 +215,12 @@ pivot status [STAGES...] [OPTIONS]
 |--------|-------------|
 | `--verbose` / `-v` | Show all stages, not just stale |
 | `--explain` / `-e` | Show detailed breakdown of why stages would run |
-| `--json` | Output as one JSON document on standard output; notes go to standard error |
+| `--json` | Output as JSON. Writes one document to stdout; notes go to stderr. |
 | `--stages-only` | Show only pipeline status |
 | `--tracked-only` | Show only tracked files |
 | `--remote-only` | Show only remote status |
 | `--remote` / `-r` | Include remote sync status |
-| `--check-imports` | Check for import updates (requires network); with `--json`, an `imports` array |
+| `--check-imports` | Check for import updates (requires network). JSON adds an `imports` field. |
 | `--all` | Show status across all pipelines in the project |
 
 ---

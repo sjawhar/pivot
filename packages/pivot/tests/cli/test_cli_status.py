@@ -817,8 +817,9 @@ def test_status_remote_without_remotes_still_shows_local_sections(
         result = runner.invoke(cli.cli, ["status", "--remote"])
 
     assert result.exit_code == 0, result.output
-    assert "No remotes configured" in result.output
-    assert "Tracked Files" in result.output
+    assert "No remotes configured" in result.stdout
+    assert "Tracked Files" in result.stdout
+    assert "No remotes configured" not in result.stderr
 
 
 def test_status_remote_json_without_remotes_notes_it_on_stderr(
@@ -833,6 +834,20 @@ def test_status_remote_json_without_remotes_notes_it_on_stderr(
     assert result.exit_code == 0, result.output
     assert "remote" not in json.loads(result.stdout), result.stdout
     assert "No remotes configured" in result.stderr
+
+
+def test_status_quiet_remote_json_without_remotes_writes_only_json(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--quiet --remote --json omits the missing-remote note and preserves one JSON document."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["--quiet", "status", "--remote", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert "remote" not in json.loads(result.stdout), result.stdout
 
 
 def test_status_quiet_remote_without_remotes_prints_nothing(
