@@ -21,7 +21,7 @@ import sysconfig
 import time
 import urllib.request
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import boto3
 import pytest
@@ -960,43 +960,60 @@ def _dirout_clone_after_teammate_rerun(
     return clone, env
 
 
-@pytest.mark.parametrize(
-    ("set_default", "remote_args"),
-    [
-        pytest.param(True, (), id="default"),
-        pytest.param(False, ("--remote", "origin"), id="named"),
-    ],
-)
-def test_get_restores_tracked_file_from_configured_remote(
-    tmp_path: pathlib.Path,
-    moto_services: dict[str, str],
-    set_default: bool,
-    remote_args: tuple[str, ...],
-) -> None:
-    """get retrieves an uncached tracked file from the default or named remote."""
-    endpoint = moto_services["s3"]
+class _MotoS3Client(Protocol):
+    """The boto3 S3 client calls these tests make; boto3 ships no stubs."""
+
+    def create_bucket(self, **kwargs: object) -> object: ...
+
+    def put_object(self, **kwargs: object) -> object: ...
+
+
+def _moto_bucket(endpoint: str, prefix: str) -> tuple[dict[str, str], str, _MotoS3Client]:
+    """Make a bucket on the moto S3 server at ``endpoint``. Returns the env that points pivot at
+    that server, the bucket's name, and a client that plants objects in the bucket."""
     env = _env(
         AWS_ENDPOINT_URL=endpoint,
         AWS_ACCESS_KEY_ID="x",
         AWS_SECRET_ACCESS_KEY="x",
         AWS_DEFAULT_REGION="us-east-1",
     )
-    bucket = f"get-{uuid.uuid4().hex[:8]}"
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        region_name="us-east-1",
-        aws_access_key_id="x",
-        aws_secret_access_key="x",
+    bucket = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    s3 = cast(
+        "_MotoS3Client",
+        boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id="x",
+            aws_secret_access_key="x",
+        ),
     )
-    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+    s3.create_bucket(Bucket=bucket)
+    return env, bucket, s3
 
+
+@pytest.mark.parametrize(
+    ("extra_config", "remote_args"),
+    [
+        pytest.param((("default_remote", "origin"),), (), id="default"),
+        pytest.param((), ("--remote", "origin"), id="named"),
+    ],
+)
+def test_get_restores_tracked_file_from_configured_remote(
+    tmp_path: pathlib.Path,
+    moto_services: dict[str, str],
+    extra_config: tuple[tuple[str, str], ...],
+    remote_args: tuple[str, ...],
+) -> None:
+    """get retrieves an uncached tracked file from the default or the named remote, not from the
+    remote configured first."""
+    env, bucket, _ = _moto_bucket(moto_services["s3"], "get")
     root = _project(tmp_path, {".gitignore": "artifact.txt\n", "artifact.txt": "from remote\n"})
+    # backup comes first and has no bucket, so only default_remote or --remote can pick origin
+    _ok(_pivot(root, "config", "set", "remotes.backup", "s3://unused-bucket/cache"))
     _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
-    if set_default:
-        _ok(_pivot(root, "config", "set", "default_remote", "origin"))
-    else:
-        _ok(_pivot(root, "config", "set", "remotes.backup", "s3://unused-bucket/cache"))
+    for key, value in extra_config:
+        _ok(_pivot(root, "config", "set", key, value))
     _ok(_pivot(root, "track", "artifact.txt"))
     file_hash, _ = cache.hash_file(root / "artifact.txt")
     _ok(_pivot(root, "push", "--remote", "origin", env=env))
@@ -1098,33 +1115,18 @@ def test_get_names_missing_remote_configuration(tmp_path: pathlib.Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "remote_body",
+    ("remote_body", "reason"),
     [
-        pytest.param(None, id="missing"),
-        pytest.param(b"corrupt remote bytes", id="corrupt"),
+        pytest.param(None, "Remote cache file not found", id="missing"),
+        pytest.param(b"corrupt remote bytes", "Hash mismatch", id="corrupt"),
     ],
 )
 def test_get_leaves_no_output_or_cache_after_failed_remote_download(
-    tmp_path: pathlib.Path, moto_services: dict[str, str], remote_body: bytes | None
+    tmp_path: pathlib.Path, moto_services: dict[str, str], remote_body: bytes | None, reason: str
 ) -> None:
-    """get rejects a missing or corrupt remote object without leaving local state."""
-    endpoint = moto_services["s3"]
-    env = _env(
-        AWS_ENDPOINT_URL=endpoint,
-        AWS_ACCESS_KEY_ID="x",
-        AWS_SECRET_ACCESS_KEY="x",
-        AWS_DEFAULT_REGION="us-east-1",
-    )
-    bucket = f"get-failed-{uuid.uuid4().hex[:8]}"
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        region_name="us-east-1",
-        aws_access_key_id="x",
-        aws_secret_access_key="x",
-    )
-    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
-
+    """get rejects a missing or corrupt remote object, naming the backend's reason, without
+    leaving local state."""
+    env, bucket, s3 = _moto_bucket(moto_services["s3"], "get-failed")
     root = _project(tmp_path, {".gitignore": "artifact.txt\n", "artifact.txt": "expected bytes\n"})
     _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
     _ok(_pivot(root, "config", "set", "default_remote", "origin"))
@@ -1132,7 +1134,7 @@ def test_get_leaves_no_output_or_cache_after_failed_remote_download(
     file_hash, _ = cache.hash_file(root / "artifact.txt")
     if remote_body is not None:
         _ok(_pivot(root, "push", env=env))
-        s3.put_object(  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+        s3.put_object(
             Bucket=bucket,
             Key=keys.hash_to_key("cache/", file_hash),
             Body=remote_body,
@@ -1147,15 +1149,14 @@ def test_get_leaves_no_output_or_cache_after_failed_remote_download(
     out = proc.stdout + proc.stderr
 
     assert proc.returncode == 1, out
-    assert "failed to download from remote" in out
+    assert f"failed to download from remote: {reason}" in out, out
     assert not (root / "artifact.txt").exists()
     assert not cached_path.exists()
 
 
-def test_get_reports_prior_cache_restore_when_remote_is_unconfigured(
-    tmp_path: pathlib.Path,
-) -> None:
-    """get reports both a cache hit and a later remote configuration error."""
+def _tracked_pair_with_second_uncached(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A project tracking first.txt and second.txt, both deleted from the workspace and
+    second.txt also deleted from the cache."""
     root = _project(
         tmp_path,
         {
@@ -1167,10 +1168,17 @@ def test_get_reports_prior_cache_restore_when_remote_is_unconfigured(
     _ok(_pivot(root, "track", "first.txt", "second.txt"))
     second_hash, _ = cache.hash_file(root / "second.txt")
     _commit(root, "track files")
-
     (root / "first.txt").unlink()
     (root / "second.txt").unlink()
     cache.get_cache_path(root / ".pivot" / "cache" / "files", second_hash).unlink()
+    return root
+
+
+def test_get_reports_prior_cache_restore_when_remote_is_unconfigured(
+    tmp_path: pathlib.Path,
+) -> None:
+    """get reports both a cache hit and a later remote configuration error."""
+    root = _tracked_pair_with_second_uncached(tmp_path)
 
     proc = _pivot(root, "get", "--rev", "HEAD", "first.txt", "second.txt")
     out = proc.stdout + proc.stderr
@@ -1205,27 +1213,6 @@ def _bad_s3_env(tmp_path: pathlib.Path, extra: dict[str, str]) -> dict[str, str]
     return env
 
 
-def _tracked_pair_with_second_uncached(tmp_path: pathlib.Path) -> pathlib.Path:
-    """A project with an S3 remote, tracking first.txt and second.txt, both deleted from the
-    workspace and second.txt also deleted from the cache."""
-    root = _project(
-        tmp_path,
-        {
-            ".gitignore": "first.txt\nsecond.txt\n",
-            "first.txt": "first\n",
-            "second.txt": "second\n",
-        },
-    )
-    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://bucket-a/cache"))
-    _ok(_pivot(root, "track", "first.txt", "second.txt"))
-    second_hash, _ = cache.hash_file(root / "second.txt")
-    _commit(root, "track files")
-    (root / "first.txt").unlink()
-    (root / "second.txt").unlink()
-    cache.get_cache_path(root / ".pivot" / "cache" / "files", second_hash).unlink()
-    return root
-
-
 @pytest.mark.parametrize("bad_env", _BAD_S3_ENVS)
 def test_get_reports_prior_cache_restore_when_the_remote_backend_cannot_start(
     tmp_path: pathlib.Path, bad_env: dict[str, str]
@@ -1233,6 +1220,7 @@ def test_get_reports_prior_cache_restore_when_the_remote_backend_cannot_start(
     """A remote whose S3 client cannot start fails only the target that needs it: the earlier
     cache restore is still reported."""
     root = _tracked_pair_with_second_uncached(tmp_path)
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://bucket-a/cache"))
 
     proc = _pivot(
         root, "get", "--rev", "HEAD", "first.txt", "second.txt", env=_bad_s3_env(tmp_path, bad_env)
@@ -1254,6 +1242,7 @@ def test_pull_reports_a_remote_backend_that_cannot_start_as_a_remote_error(
     """pull shows an S3 client that cannot start as a pivot remote error with its tip, not as
     the raw botocore exception."""
     root = _tracked_pair_with_second_uncached(tmp_path)
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://bucket-a/cache"))
 
     proc = _pivot(root, "pull", "second.txt", env=_bad_s3_env(tmp_path, bad_env))
     out = proc.stdout + proc.stderr
@@ -1264,11 +1253,274 @@ def test_pull_reports_a_remote_backend_that_cannot_start_as_a_remote_error(
     assert not (root / "second.txt").exists()
 
 
-def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
+_EXEC_DIR_PIPELINE = """\
+import os
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def tools() -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp())
+    (out / "notes.txt").write_text("plain")
+    script = out / "run.sh"
+    script.write_text("#!/bin/sh\\necho run\\n")
+    os.chmod(script, 0o755)
+    return out
+
+
+with Pipeline("x") as pipeline:
+    tools()
+"""
+
+# The same directory output with no executable file.
+_PLAIN_DIR_PIPELINE = _EXEC_DIR_PIPELINE.replace("    os.chmod(script, 0o755)\n", "")
+
+
+def _tools_output_hash(root: pathlib.Path) -> dict[str, Any]:
+    return yaml.safe_load((root / ".pivot" / "stages" / "x" / "tools.lock").read_text())["outs"][0]
+
+
+def _plant_unmarked_tree(files_dir: pathlib.Path, output_hash: dict[str, Any]) -> pathlib.Path:
+    """Build by hand the unmarked SYMLINK cache tree of a directory output that hardlink mode left
+    without one, each file copied from its own cache object. Returns the tree."""
+    tree = cache.get_cache_path(files_dir, output_hash["hash"])
+    assert not tree.exists(), "hardlink mode should build no tree"
+    tree.mkdir(parents=True)
+    for entry in output_hash["manifest"]:
+        (tree / entry["relpath"]).write_bytes(
+            cache.get_cache_path(files_dir, entry["hash"]).read_bytes()
+        )
+    return tree
+
+
+def _executable_tools_only_on_remote(
+    tmp_path: pathlib.Path, s3_endpoint: str
+) -> tuple[pathlib.Path, dict[str, str]]:
+    """A project with a tracked first.txt and the x/tools directory output, whose run.sh is
+    executable, pushed and committed, then removed from the workspace, x/tools' files also
+    removed from the cache. Returns the root and the env that points pivot at the remote."""
+    env, bucket, _ = _moto_bucket(s3_endpoint, "exec")
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _EXEC_DIR_PIPELINE,
+            ".gitignore": "/data/\n__pycache__/\nfirst.txt\n",
+            "first.txt": "first\n",
+        },
+    )
+    _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(root, "repro", env=env))
+    _ok(_pivot(root, "track", "first.txt"))
+    _ok(_pivot(root, "push", env=env))
+    _commit(root, "v1")
+    files_dir = root / ".pivot" / "cache" / "files"
+    for entry in _tools_output_hash(root)["manifest"]:
+        cache.get_cache_path(files_dir, entry["hash"]).unlink()
+    shutil.rmtree(root / "data" / "x")
+    (root / "first.txt").unlink()
+    return root, env
+
+
+def test_get_reports_earlier_targets_when_the_downloaded_output_cannot_be_linked(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """An object get downloads has no executable bit, so with --checkout-mode hardlink an
+    executable member cannot be linked: that output fails with the reason, and the target
+    restored before it is still reported."""
+    root, env = _executable_tools_only_on_remote(tmp_path, moto_services["s3"])
+
+    proc = _pivot(
+        root, "get", "--rev", "HEAD", "--checkout-mode", "hardlink", "first.txt", "x/tools", env=env
+    )
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "tools.dat - failed to restore from remote: Cache object" in out, out
+    assert "needs isexec=True" in out, out
+    assert "Tip: Add CheckoutMode.COPY to checkout_modes" in out, out
+    assert not (root / "data" / "x" / "tools.dat").exists()
+
+
+def test_get_reports_earlier_targets_when_a_pulled_output_cannot_be_linked(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """The same refusal when `pivot pull` downloaded the objects: get restores from the cache,
+    fails that output with the reason, and still reports the target restored before it."""
+    root, env = _executable_tools_only_on_remote(tmp_path, moto_services["s3"])
+    _ok(_pivot(root, "pull", "x/tools", env=env))
+    shutil.rmtree(root / "data" / "x")
+
+    proc = _pivot(
+        root, "get", "--rev", "HEAD", "--checkout-mode", "hardlink", "first.txt", "x/tools", env=env
+    )
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "tools.dat - failed to restore from cache: Cache object" in out, out
+    assert "needs isexec=True" in out, out
+    assert "Tip: Add CheckoutMode.COPY to checkout_modes" in out, out
+    assert not (root / "data" / "x" / "tools.dat").exists()
+
+
+def test_get_reports_earlier_targets_when_an_unmarked_tree_member_is_unreadable(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An unmarked SYMLINK cache tree that holds every recorded file at its recorded size, one
-    with stale bytes, is checked by content before a restore links it into the workspace."""
+    """An unmarked SYMLINK cache tree with a member this user cannot read cannot be checked, so
+    it is not used: the output is restored file by file from its cache objects, and every
+    target is reported."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _PLAIN_DIR_PIPELINE,
+            ".gitignore": "/data/\n__pycache__/\nfirst.txt\n",
+            "first.txt": "first\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    _ok(_pivot(root, "track", "first.txt"))
+    _commit(root, "v1")
+    tree = _plant_unmarked_tree(root / ".pivot" / "cache" / "files", _tools_output_hash(root))
+    unreadable = tree / "notes.txt"
+    unreadable.chmod(0)
+    shutil.rmtree(root / "data" / "x")
+    (root / "first.txt").unlink()
+    tools = root / "data" / "x" / "tools.dat"
+
+    try:
+        proc = _pivot(
+            root, "get", "--rev", "HEAD", "--checkout-mode", "symlink", "first.txt", "x/tools"
+        )
+        linked_the_tree = tools.is_symlink()
+    finally:
+        unreadable.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 0, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "tools.dat (from cache)" in out, out
+    assert not linked_the_tree, "the unchecked tree must not be linked into the workspace"
+    assert (tools / "notes.txt").read_text() == "plain"
+
+
+def test_get_reports_earlier_targets_when_a_downloaded_output_cannot_be_written(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A target whose objects download but whose directory this user cannot write fails with the
+    reason, and the target restored before it is still reported."""
+    env, bucket, _ = _moto_bucket(moto_services["s3"], "readonly")
+    root = _project(
+        tmp_path,
+        {
+            ".gitignore": "first.txt\nout/second.txt\n",
+            "first.txt": "first\n",
+            "out/second.txt": "second\n",
+        },
+    )
+    _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(root, "track", "first.txt", "out/second.txt"))
+    second_hash, _ = cache.hash_file(root / "out" / "second.txt")
+    _ok(_pivot(root, "push", env=env))
+    _commit(root, "track files")
+    (root / "first.txt").unlink()
+    (root / "out" / "second.txt").unlink()
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", second_hash).unlink()
+    out_dir = root / "out"
+    out_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
+
+    try:
+        proc = _pivot(root, "get", "--rev", "HEAD", "first.txt", "out/second.txt", env=env)
+    finally:
+        out_dir.chmod(stat.S_IRWXU)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "second.txt - failed to restore from remote: [Errno 13] Permission denied" in out, out
+    assert not (out_dir / "second.txt").exists()
+
+
+def test_get_reports_earlier_targets_when_a_target_directory_cannot_be_created(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A target whose directory cannot be made, because a file holds its name, fails with the
+    reason, and the target restored before it is still reported."""
+    root = _project(
+        tmp_path,
+        {
+            ".gitignore": "first.txt\nsub/second.txt\n",
+            "first.txt": "first\n",
+            "sub/second.txt": "second\n",
+        },
+    )
+    _ok(_pivot(root, "track", "first.txt", "sub/second.txt"))
+    _commit(root, "track files")
+    (root / "first.txt").unlink()
+    shutil.rmtree(root / "sub")
+    (root / "sub").write_text("a file where the directory was\n")
+
+    proc = _pivot(root, "get", "--rev", "HEAD", "first.txt", "sub/second.txt")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "second.txt - cannot create its directory: [Errno 17] File exists" in out, out
+
+
+def test_get_reports_earlier_targets_when_a_tracked_file_records_an_invalid_hash(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A committed .pvt whose hash is not a cache key fails that target with the reason, and
+    the target restored before it is still reported."""
+    root = _project(tmp_path, {".gitignore": "first.txt\n", "first.txt": "first\n"})
+    _ok(_pivot(root, "track", "first.txt"))
+    (root / "bad.txt.pvt").write_text(
+        yaml.safe_dump({"path": "bad.txt", "hash": "z" * 16, "size": 1}, sort_keys=False)
+    )
+    _commit(root, "track files")
+    (root / "first.txt").unlink()
+
+    proc = _pivot(root, "get", "--rev", "HEAD", "first.txt", "bad.txt")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "bad.txt - failed to restore from cache: Hash contains invalid characters" in out, out
+
+
+def test_get_refuses_an_unknown_remote_name_before_restoring_anything(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An explicit --remote that names no configured remote fails at once, even when every
+    target is in the cache and the remote would never be opened."""
+    root = _project(tmp_path, {".gitignore": "artifact.txt\n", "artifact.txt": "cached\n"})
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://bucket-a/cache"))
+    _ok(_pivot(root, "track", "artifact.txt"))
+    _commit(root, "track artifact")
+    (root / "artifact.txt").unlink()
+
+    proc = _pivot(root, "get", "--remote", "orign", "--rev", "HEAD", "artifact.txt")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Remote 'orign' not found" in out, out
+    assert not (root / "artifact.txt").exists()
+
+
+def _unmarked_shards_tree_with_stale_member(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:
+    """A project whose d/shards output is gone from the workspace and whose unmarked SYMLINK
+    cache tree holds every recorded file at its recorded size, 0.txt with stale bytes. Returns
+    the root and 0.txt's recorded hash."""
     root = _project(
         tmp_path,
         {
@@ -1282,16 +1534,20 @@ def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
         "outs"
     ][0]
     cache_dir = root / ".pivot" / "cache" / "files"
-    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
-    assert not tree.exists(), "hardlink mode should build no tree"
-    tree.mkdir(parents=True)
-    for entry in output_hash["manifest"]:
-        (tree / entry["relpath"]).write_bytes(
-            cache.get_cache_path(cache_dir, entry["hash"]).read_bytes()
-        )
+    tree = _plant_unmarked_tree(cache_dir, output_hash)
     (tree / "0.txt").write_text("xx")  # stale, the size of "11"
+    shutil.rmtree(root / "data" / "d" / "shards.dat")
+    stale_entry = next(e for e in output_hash["manifest"] if e["relpath"] == "0.txt")
+    return root, stale_entry["hash"]
+
+
+def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An unmarked SYMLINK cache tree that holds every recorded file at its recorded size, one
+    with stale bytes, is checked by content before a restore links it into the workspace."""
+    root, _ = _unmarked_shards_tree_with_stale_member(tmp_path)
     shards = root / "data" / "d" / "shards.dat"
-    shutil.rmtree(shards)
 
     proc = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards")
 
@@ -1306,30 +1562,9 @@ def test_symlink_checkout_through_an_unrepairable_stale_tree_writes_nothing(
     """An unmarked SYMLINK tree with a stale member whose own cache object is gone cannot be
     repaired: checkout fails and leaves the workspace without the output, rather than linking
     the stale bytes."""
-    root = _project(
-        tmp_path,
-        {
-            "pipeline.py": _DIROUT_PIPELINE,
-            "data/raw/t.csv": "a,b\n5,6\n7,8\n",
-            ".gitignore": "/data/d/\n__pycache__/\n",
-        },
-    )
-    _ok(_pivot(root, "repro"))
-    output_hash = yaml.safe_load((root / ".pivot" / "stages" / "d" / "shards.lock").read_text())[
-        "outs"
-    ][0]
-    cache_dir = root / ".pivot" / "cache" / "files"
-    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
-    tree.mkdir(parents=True)
-    for entry in output_hash["manifest"]:
-        (tree / entry["relpath"]).write_bytes(
-            cache.get_cache_path(cache_dir, entry["hash"]).read_bytes()
-        )
-    (tree / "0.txt").write_text("xx")  # stale, the size of "11"
-    stale_entry = next(e for e in output_hash["manifest"] if e["relpath"] == "0.txt")
-    cache.get_cache_path(cache_dir, stale_entry["hash"]).unlink()
+    root, stale_hash = _unmarked_shards_tree_with_stale_member(tmp_path)
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", stale_hash).unlink()
     shards = root / "data" / "d" / "shards.dat"
-    shutil.rmtree(shards)
 
     proc = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards")
 
@@ -1417,21 +1652,7 @@ def test_documented_get_from_a_specific_remote_example_runs(
     assert example is not None, "the example is gone from docs/cli/index.md"
     argv = shlex.split(example.group(1))[1:]
 
-    endpoint = moto_services["s3"]
-    env = _env(
-        AWS_ENDPOINT_URL=endpoint,
-        AWS_ACCESS_KEY_ID="x",
-        AWS_SECRET_ACCESS_KEY="x",
-        AWS_DEFAULT_REGION="us-east-1",
-    )
-    bucket = f"docs-{uuid.uuid4().hex[:8]}"
-    boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        region_name="us-east-1",
-        aws_access_key_id="x",
-        aws_secret_access_key="x",
-    ).create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+    env, bucket, _ = _moto_bucket(moto_services["s3"], "docs")
     root = _project(tmp_path, {"pipeline.py": _DEMO_TRAIN_PIPELINE, ".gitignore": "/data/\n"})
     _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
     _ok(_pivot(root, "repro", env=env))

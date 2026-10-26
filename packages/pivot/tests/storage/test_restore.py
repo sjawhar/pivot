@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import multiprocessing
+import os
 import queue
 from typing import TYPE_CHECKING, cast
 
@@ -9,6 +11,7 @@ import yaml
 
 from pivot import exceptions, project
 from pivot.cli import checkout
+from pivot.remote import sync as transfer
 from pivot.storage import cache, restore
 from pivot.types import FileHash
 
@@ -17,6 +20,11 @@ if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
+    from pivot.remote.protocol import RemoteStorage
+
+
+def _helper_unused_remote() -> RemoteStorage:
+    raise AssertionError("this restore must not open the remote")
 
 
 def _hold_checkout_restore(
@@ -85,6 +93,7 @@ def _get_while_checkout_restores(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        remote_factory=_helper_unused_remote,
     )
     result_queue.put(("get", result["status"]))
 
@@ -325,6 +334,7 @@ def test_restore_targets_from_revision_invalid_rev(
             stage_targets={},
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
+            remote_factory=_helper_unused_remote,
         )
 
 
@@ -350,6 +360,7 @@ def test_restore_targets_from_revision_output_with_multiple_targets(
             stage_targets={},
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
+            remote_factory=_helper_unused_remote,
         )
 
 
@@ -377,6 +388,7 @@ def test_restore_targets_from_revision_git_file(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -408,6 +420,7 @@ def test_restore_targets_from_revision_skip_existing(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -439,6 +452,7 @@ def test_restore_targets_from_revision_force_overwrite(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -487,6 +501,7 @@ def test_restore_targets_from_revision_output_with_stage(
         },
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert success
@@ -499,8 +514,11 @@ def test_restore_targets_from_revision_output_with_stage(
 # =============================================================================
 
 
-def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Returns error message when file not in cache, git, or remote."""
+def test_restore_file_cache_miss_reports_the_remote_error(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracked file in neither the cache nor git reaches the remote step, whose error names
+    what is wrong with the remote: here, that none is configured."""
     repo_path, commit = git_repo
 
     # Create a .pvt file that references a hash not in cache
@@ -513,7 +531,7 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
 
     cache_dir = repo_path / ".pivot" / "cache"
 
-    messages, _ = restore.restore_targets_from_revision(
+    messages, success = restore.restore_targets_from_revision(
         targets=["data.csv"],
         rev=sha[:7],
         output=None,
@@ -521,12 +539,14 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=lambda: transfer.create_remote_from_name(None)[0],
     )
 
-    # Function returns multiple messages: errors, blank line, summary
-    assert any("not in local cache" in msg for msg in messages), (
-        "Should have error about cache miss"
-    )
+    assert not success
+    assert any(
+        "data.csv - failed to download from remote: No remotes configured." in msg
+        for msg in messages
+    ), messages
     assert any("Failed to restore" in msg for msg in messages), "Should have failure summary"
 
 
@@ -561,6 +581,7 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -653,9 +674,53 @@ def test_restore_file_force_keeps_existing_output_until_cache_swap(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        remote_factory=_helper_unused_remote,
     )
 
     assert result["status"] is restore.RestoreStatus.RESTORED
+    assert target.read_text() == "cached content"
+
+
+def test_restore_file_labels_a_retried_cache_restore_from_cache(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache restore that fails once is retried by the remote step; with nothing to download,
+    a retry that succeeds is reported as from the cache, not from the remote."""
+    repo_path, commit = git_repo
+    (repo_path / "README").write_text("not the restored file")
+    commit("initial")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    cache_dir = repo_path / ".pivot" / "cache"
+    file_hash = "0123456789abcdef"
+    cache_path = cache.get_cache_path(cache_dir / "files", file_hash)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("cached content")
+    target = repo_path / "data" / "out.txt"
+    real_link = os.link
+    failed = list[str]()
+
+    def _link_failing_once(src: pathlib.Path, dst: pathlib.Path) -> None:
+        if not failed:
+            failed.append(str(dst))
+            raise OSError(errno.EIO, "injected I/O error", str(dst))
+        real_link(src, dst)
+
+    monkeypatch.setattr(os, "link", _link_failing_once)
+
+    result = restore.restore_file(
+        rel_path="data/out.txt",
+        output_hash=FileHash(hash=file_hash),
+        rev="HEAD",
+        dest_path=target,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.HARDLINK],
+        force=False,
+        remote_factory=_helper_unused_remote,
+    )
+
+    assert failed, "the first hard link should have failed"
+    assert result["status"] is restore.RestoreStatus.RESTORED, result["message"]
+    assert result["message"] == f"Restored: {target} (from cache)"
     assert target.read_text() == "cached content"
 
 
@@ -724,6 +789,7 @@ def test_restore_directory_from_cache_with_manifest(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert success, f"Expected success, got messages: {messages}"

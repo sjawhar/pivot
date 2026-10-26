@@ -233,6 +233,13 @@ def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> None:
         cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
 
 
+def _reason(error: exceptions.PivotError | OSError) -> str:
+    """``error``'s message, followed on the next line by the tip a pivot error carries."""
+    if isinstance(error, exceptions.PivotError) and (tip := error.get_suggestion()):
+        return f"{error}\n  Tip: {tip}"
+    return str(error)
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -241,9 +248,14 @@ def restore_file(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
-    remote_factory: Callable[[], RemoteStorage] | None = None,
+    *,
+    remote_factory: Callable[[], RemoteStorage],
 ) -> RestoreResult:
-    """Restore a single file from revision and return its result."""
+    """Restore a single file from revision and return its result.
+
+    Tries the local cache, then git, then downloads the cache objects the output still misses
+    from the remote ``remote_factory`` opens; it is called only when that download is needed.
+    """
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
 
@@ -255,20 +267,24 @@ def restore_file(
         )
 
     # Ensure parent directory exists before any restore strategy
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return RestoreResult(
+            status=RestoreStatus.ERROR,
+            path=path_str,
+            message=f"Error: {dest_path} - cannot create its directory: {e}",
+        )
 
     # Strategy 1: Try local cache (if hash available)
     if output_hash is not None:
-        # For directories with manifest, restore_from_cache checks each file in manifest.
-        # For files, we check if the single cached file exists first.
-        should_try_cache = True
-        if "manifest" not in output_hash:
-            file_hash = output_hash["hash"]
-            cached_path = cache.get_cache_path(files_dir, file_hash)
-            should_try_cache = cached_path.exists()
-
-        if should_try_cache:
-            try:
+        try:
+            # For directories with manifest, restore_from_cache checks each file in manifest.
+            # For files, we check if the single cached file exists first.
+            should_try_cache = True
+            if "manifest" not in output_hash:
+                should_try_cache = cache.get_cache_path(files_dir, output_hash["hash"]).exists()
+            if should_try_cache:
                 success = cache.restore_from_cache(
                     dest_path,
                     output_hash,
@@ -282,8 +298,9 @@ def restore_file(
                         path=path_str,
                         message=f"Restored: {dest_path} (from cache)",
                     )
-            except OSError as e:
-                logger.debug(f"Cache restore failed for {rel_path}: {e}")
+        except (exceptions.PivotError, OSError) as e:
+            # Strategy 3 retries this restore, and reports the error if it happens again
+            logger.debug(f"Cache restore failed for {rel_path}: {e}")
 
     # Strategy 2: Try git fallback
     content = git.read_file_from_revision(rel_path, rev)
@@ -302,14 +319,17 @@ def restore_file(
                 message=f"Error: {dest_path} - failed to write from git: {e}",
             )
 
-    # Strategy 3: Download missing cache objects from the configured remote, then restore.
-    if output_hash is not None and remote_factory is not None:
-        missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
-        if missing_hashes:
-            try:
-                remote_storage = remote_factory()
+    # Strategy 3: Download the cache objects the output still misses from the remote, then
+    # restore from the cache. Any failure is this target's error, so the targets already
+    # restored are still reported.
+    if output_hash is not None:
+        source = "cache"
+        try:
+            missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
+            if missing_hashes:
+                source = "remote"
                 download_results = asyncio.run(
-                    remote_storage.download_batch(
+                    remote_factory().download_batch(
                         [
                             (file_hash, cache.get_cache_path(files_dir, file_hash))
                             for file_hash in missing_hashes
@@ -317,21 +337,14 @@ def restore_file(
                         readonly=True,
                     )
                 )
-            except exceptions.RemoteError as e:
-                return RestoreResult(
-                    status=RestoreStatus.ERROR,
-                    path=path_str,
-                    message=f"Error: {dest_path} - failed to download from remote: {e}",
-                )
-            for result in download_results:
-                if not result["success"]:
-                    error = result["error"] if "error" in result else "unknown error"
-                    return RestoreResult(
-                        status=RestoreStatus.ERROR,
-                        path=path_str,
-                        message=f"Error: {dest_path} - failed to download from remote: {error}",
-                    )
-        try:
+                for result in download_results:
+                    if not result["success"]:
+                        error = result["error"] if "error" in result else "unknown error"
+                        return RestoreResult(
+                            status=RestoreStatus.ERROR,
+                            path=path_str,
+                            message=f"Error: {dest_path} - failed to download from remote: {error}",
+                        )
             success = cache.restore_from_cache(
                 dest_path,
                 output_hash,
@@ -339,28 +352,34 @@ def restore_file(
                 checkout_modes=checkout_modes,
                 state_dir=config.get_state_dir(),
             )
-        except OSError as e:
+        except exceptions.RemoteError as e:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
                 path=path_str,
-                message=f"Error: {dest_path} - failed to write from remote: {e}",
+                message=f"Error: {dest_path} - failed to download from remote: {_reason(e)}",
+            )
+        except (exceptions.PivotError, OSError) as e:
+            return RestoreResult(
+                status=RestoreStatus.ERROR,
+                path=path_str,
+                message=f"Error: {dest_path} - failed to restore from {source}: {_reason(e)}",
             )
         if success:
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
-                message=f"Restored: {dest_path} (from remote)",
+                message=f"Restored: {dest_path} (from {source})",
             )
         return RestoreResult(
             status=RestoreStatus.ERROR,
             path=path_str,
-            message=f"Error: {dest_path} - failed to restore downloaded remote content",
+            message=f"Error: {dest_path} - failed to restore from {source}",
         )
 
     return RestoreResult(
         status=RestoreStatus.ERROR,
         path=path_str,
-        message=f"Error: {dest_path} - not in local cache, git, or remote",
+        message=f"Error: {dest_path} - not in git at {rev}, and no hash is recorded for it",
     )
 
 
@@ -372,7 +391,8 @@ def restore_targets_from_revision(
     stage_targets: Mapping[str, StageTarget],
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
-    remote_factory: Callable[[], RemoteStorage] | None = None,
+    *,
+    remote_factory: Callable[[], RemoteStorage],
 ) -> tuple[list[str], bool]:
     """Restore targets from a git revision.
 
@@ -397,10 +417,9 @@ def restore_targets_from_revision(
             raise exceptions.GetError("--output/-o can only be used with a single output")
 
     results = list[RestoreResult]()
-    if remote_factory is not None:
-        # Resolves the remote and builds its backend once per call, not once per target that
-        # misses the cache
-        remote_factory = functools.cache(remote_factory)
+    # Resolves the remote and builds its backend once per call, not once per target that misses
+    # the cache
+    open_remote = functools.cache(remote_factory)
 
     for target_info in target_infos:
         for rel_path in target_info["paths"]:
@@ -415,7 +434,7 @@ def restore_targets_from_revision(
                 cache_dir=cache_dir,
                 checkout_modes=checkout_modes,
                 force=force,
-                remote_factory=remote_factory,
+                remote_factory=open_remote,
             )
             results.append(result)
 

@@ -263,7 +263,7 @@ def fetch(
     "--checkout-mode",
     type=click.Choice(["symlink", "hardlink", "copy"]),
     default=None,
-    help="Checkout mode for restoration (default: project config or hardlink)",
+    help="Checkout mode (default: cache.checkout_mode, else hardlink, symlink, copy)",
 )
 @click.pass_context
 def pull(

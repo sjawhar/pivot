@@ -105,7 +105,8 @@ When multiple `pivot` processes share the same StateDB:
   soon as its name exists. A restore or commit checks every unmarked tree member's path, content
   hash, size and executable bit, plus its directories, under the tree's exclusive `<tree>.lock`;
   it repairs mismatches in place from the files' own cache objects, then marks the tree. A tree
-  it cannot repair is not used: a restore goes file by file, a commit fails.
+  it cannot check or repair (a file's object is absent, or this user cannot read or write the
+  tree) is not used: a restore goes file by file, a commit fails.
   `<tree>.layout-checked`, the mark pivot 0.3.4 also gave partial trees, is not trusted.
 
 ## Path Storage

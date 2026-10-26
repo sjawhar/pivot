@@ -830,6 +830,18 @@ def _mark_tree(cache_dir_path: pathlib.Path) -> None:
         )
 
 
+def _tree_file_holds(
+    path: pathlib.Path, path_stat: os.stat_result, entry: DirManifestEntry
+) -> bool:
+    """Whether a tree file, ``path_stat`` its ``os.lstat``, is a regular file holding ``entry``'s
+    bytes: its recorded size and content hash. Hashes the file only once the cheap checks pass."""
+    return (
+        stat.S_ISREG(path_stat.st_mode)
+        and path_stat.st_size == entry["size"]
+        and hash_file(path)[0] == entry["hash"]
+    )
+
+
 def _tree_matches(
     cache_dir_path: pathlib.Path, output_hash: DirHash, scanned: tuple[list[str], list[str]]
 ) -> bool:
@@ -856,11 +868,8 @@ def _tree_matches(
     for entry in manifest:
         tree_file = cache_dir_path / entry["relpath"]
         found_stat = os.lstat(tree_file)
-        if (
-            not stat.S_ISREG(found_stat.st_mode)
-            or found_stat.st_size != entry["size"]
-            or bool(found_stat.st_mode & stat.S_IXUSR) != entry["isexec"]
-            or hash_file(tree_file)[0] != entry["hash"]
+        if bool(found_stat.st_mode & stat.S_IXUSR) != entry["isexec"] or not _tree_file_holds(
+            tree_file, found_stat, entry
         ):
             return False
     return True
@@ -878,8 +887,8 @@ def _ensure_tree_complete(
     copying, leaving files missing or cut short under a name a restore trusts. The check, the
     repair and the mark run under the tree's exclusive lock, so two repairers never change the
     tree's directory modes under each other. Returns False, the tree unmarked, when the tree
-    differs and cannot be repaired: a file's object is absent, or this user cannot write the
-    tree or take its lock.
+    differs and cannot be repaired, or cannot be checked: a file's object is absent, or this user
+    cannot read the tree, write it or take its lock.
     """
     marker = _tree_layout_marker(cache_dir_path)
     if marker.exists():
@@ -900,17 +909,17 @@ def _ensure_tree_complete(
                 fd = None
         if marker.exists():
             return True
-        scanned = _scan_entries(cache_dir_path)
-        if not _tree_matches(cache_dir_path, output_hash, scanned):
-            if fd is None:
-                return False
-            try:
+        try:
+            scanned = _scan_entries(cache_dir_path)
+            if not _tree_matches(cache_dir_path, output_hash, scanned):
+                if fd is None:
+                    return False
                 _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
                 _repair_tree_dir_layout(cache_dir_path, output_hash, scanned)
                 if not _repair_tree_dir_files(cache_dir_path, output_hash["manifest"], cache_dir):
                     return False
-            except PermissionError:  # another user's tree
-                return False
+        except PermissionError:  # another user's tree, or one with a file this user cannot read
+            return False
         _mark_tree(cache_dir_path)
         return True
     finally:
@@ -942,11 +951,7 @@ def _repair_tree_dir_files(
         except FileNotFoundError:
             pass
         else:
-            if (
-                stat.S_ISREG(target_stat.st_mode)
-                and target_stat.st_size == entry["size"]
-                and hash_file(target)[0] == entry["hash"]
-            ):
+            if _tree_file_holds(target, target_stat, entry):
                 continue
         wrong.append((entry, target))
     if not wrong:
@@ -1139,7 +1144,10 @@ def _resolve_checkout_modes(
 def missing_cache_objects(
     output_hash: HashInfo, cache_dir: pathlib.Path, checkout_modes: list[CheckoutMode]
 ) -> list[str]:
-    """Return hashes required to restore an output that are absent from the cache."""
+    """Return hashes required to restore an output that are absent from the cache.
+
+    With SYMLINK first, an existing whole-directory tree for a directory output is checked, and
+    repaired and marked if it can be, before it is trusted (``_ensure_tree_complete``)."""
     if is_dir_hash(output_hash):
         tree_path = get_cache_path(cache_dir, output_hash["hash"])
         if (
@@ -1348,10 +1356,10 @@ def _store_directory(
             # never changes, so this branch never revisits an existing tree directory above.
             if not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
                 raise exceptions.CacheRestoreError(
-                    f"Cache tree {cache_dir_path} differs from what its hash records and cannot "
-                    + "be repaired (a file's cache object is missing, or another user owns it); "
-                    + "remove the tree, or have its owner remove it, to let this commit publish "
-                    + "it again"
+                    f"Cache tree {cache_dir_path} differs from what its hash records, or cannot "
+                    + "be read, and cannot be repaired (a file's cache object is missing, or "
+                    + "another user owns it); remove the tree, or have its owner remove it, to "
+                    + "let this commit publish it again"
                 )
 
             _clear_path(path)
@@ -1527,11 +1535,11 @@ def _restore_directory_from_cache(
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
     if symlink_fast_path and not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
-        # Same check as _store_directory. A tree this user cannot repair is not used: the
-        # output is restored file by file from the objects instead, if they are cached.
+        # Same check as _store_directory. A tree this user cannot check or repair is not used:
+        # the output is restored file by file from the objects instead, if they are cached.
         logger.warning(
-            "Cache tree %s differs from what its hash records and cannot be repaired; "
-            + "restoring %s file by file",
+            "Cache tree %s differs from what its hash records, or cannot be read, and cannot be "
+            + "repaired; restoring %s file by file",
             cache_dir_path,
             path,
         )

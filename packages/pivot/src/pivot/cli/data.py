@@ -10,6 +10,7 @@ from pivot import config, discovery, exceptions, project, registry
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
+from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
@@ -156,7 +157,7 @@ def diff(
     "--checkout-mode",
     type=click.Choice(["symlink", "hardlink", "copy"]),
     default=None,
-    help="Checkout mode for restoration (default: project config or hardlink)",
+    help="Checkout mode (default: cache.checkout_mode, else hardlink, symlink, copy)",
 )
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
 def get(
@@ -178,6 +179,9 @@ def get(
       pivot get --rev abc123 train                # Get all outputs from stage
     """
     cache_dir = config.get_cache_dir()
+    if remote_name is not None:
+        # Checked now, so a misspelt name fails even when no target needs the remote
+        remote_config.get_remote_url(remote_name)
 
     checkout_modes = (
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
