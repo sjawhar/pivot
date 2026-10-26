@@ -582,6 +582,9 @@ def run_tui_with_engine(
     engine_thread = threading.Thread(
         target=contextvars.copy_context().run, args=(engine_thread_target,), daemon=True
     )
+    # A ContextVar does not cross into a new thread, so this one runs with no invocation
+    # record: it only polls events. A thread added here that reads project state copies the
+    # context as the engine thread above does.
     poller_thread = threading.Thread(
         target=poller_thread_target, name=POLLER_THREAD_NAME, daemon=True
     )

@@ -297,6 +297,10 @@ class FunctionIdentity(TypedDict):
 def _producing_state_dir() -> pathlib.Path | None:
     """The state directory a cache entry produced now belongs to, or None when it has none.
 
+    The rule for every cache here: a pending entry belongs to the state directory of the
+    invocation that produced it, and a flush writes it there and never resolves a directory
+    again.
+
     Read where the entry is produced, never where it is written. A CLI invocation resolves
     its state directory once and every producer of that invocation, the engine thread of a
     TUI session included, reads that one; a library caller reads the configured value of the
