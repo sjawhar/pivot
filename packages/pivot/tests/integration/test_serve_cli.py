@@ -803,9 +803,13 @@ def test_stopping_first_live_serve_keeps_replacement_socket(
             deadline = time.monotonic() + 30
             response: dict[str, object] | None = None
             while response is None and procs[-1].poll() is None and time.monotonic() < deadline:
-                if index and socket_path.exists() and socket_path.lstat().st_ino == first_inode:
-                    time.sleep(0.1)
-                    continue
+                # The replacement serve removes the first serve's socket before it binds its own,
+                # so the path can vanish between two reads. Read it once; a missing path means
+                # the replacement has not bound yet.
+                with contextlib.suppress(FileNotFoundError):
+                    if index and socket_path.lstat().st_ino == first_inode:
+                        time.sleep(0.1)
+                        continue
                 try:
                     response = send_rpc(pathlib.Path(".pivot", "agent.sock"), "status")
                 except (ConnectionRefusedError, FileNotFoundError):
