@@ -4,6 +4,7 @@ import functools
 import logging
 import os
 import pathlib
+import shlex
 from typing import TYPE_CHECKING, NotRequired, TypedDict, TypeGuard, cast
 
 import yaml
@@ -87,14 +88,15 @@ def _is_count(value: object) -> bool:
 
 
 @functools.cache
-def _warn_old_format(pvt_path: str, data_path: str) -> None:
-    """Warn once per process for each directory .pvt an older pivot wrote."""
+def _warn_old_format(pvt_path: pathlib.Path) -> None:
+    """Warn once per process for each directory .pvt an older pivot wrote, naming the command
+    that converts it as typed from the working directory."""
     logger.warning(
         "%s was written by an older pivot, with its files listed inside it; pivot reads that "
         + "list as the directory's listing. Run `pivot track --force %s` to convert it to a "
         + ".pvt and a committed .pvt.listing file",
-        pvt_path,
-        data_path,
+        os.path.relpath(pvt_path),
+        shlex.quote(os.path.relpath(get_data_path(pvt_path))),
     )
 
 
@@ -176,7 +178,7 @@ def _load_pvt(pvt_path: pathlib.Path) -> tuple[PvtData, listing.DirListing | Non
         return None
     parsed = parse_pvt(data)
     if parsed is not None and parsed[1] is not None:
-        _warn_old_format(str(pvt_path), str(get_data_path(pvt_path)))
+        _warn_old_format(pvt_path)
     return parsed
 
 
@@ -246,11 +248,16 @@ def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:
 
 
 def tracked_members(
-    data_path: pathlib.Path, pvt_data: PvtData, cache_dir: pathlib.Path | None
+    data_path: pathlib.Path,
+    pvt_data: PvtData,
+    cache_dir: pathlib.Path | None,
+    *,
+    strict: bool = False,
 ) -> listing.DirListing:
     """A tracked directory's listing: its committed ``<path>.pvt.listing``; else, for a .pvt an
-    older pivot wrote, the listing it holds inline; else the cache's object at its hash.
-    Raises ``CorruptListingError`` or ``ListingMissingError``."""
+    older pivot wrote, the listing it holds inline; else the cache's object at its hash
+    (``listing.read``, which ``strict`` passes on). Raises ``CorruptListingError`` or
+    ``ListingMissingError``."""
     from pivot.types import is_dir_hash
 
     record = pvt_to_hash_info(pvt_data)
@@ -261,4 +268,4 @@ def tracked_members(
         parsed = _load_pvt(pvt_path)
         if parsed is not None and parsed[1] is not None and parsed[0]["hash"] == record["hash"]:
             return parsed[1]
-    return listing.read(committed, record, cache_dir)
+    return listing.read(committed, record, cache_dir, strict=strict)

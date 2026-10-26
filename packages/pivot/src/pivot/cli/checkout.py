@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import enum
 import functools
+import logging
 import os
 import pathlib
 from typing import TYPE_CHECKING, Literal, NamedTuple
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
+
+logger = logging.getLogger(__name__)
 
 
 class RestoreOutcome(NamedTuple):
@@ -88,7 +91,7 @@ def _get_stage_output_info(
 
         stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-        lock_data = stage_lock.read()
+        lock_data = stage_lock.read(cache_dir=cache_dir)
         if lock_data:
             for identity, out_hash in lock_data["output_hashes"].items():
                 if identity not in cached_identities:
@@ -179,9 +182,8 @@ def _restore_path_sync(
     Raises:
         click.ClickException: For immediate failures (path traversal, unknown target,
             "already exists" without --force). Cache misses return ("missing", name)
-            instead of raising.
-        exceptions.CorruptListingError: A directory's listing does not hash to its record;
-            nothing is written.
+            instead of raising, as does a directory whose committed listing cannot be used
+            while the cache lacks its copy (logged, naming the file); nothing is written.
     """
     with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
@@ -214,6 +216,9 @@ def _restore_path_locked(
         try:
             members = expected.read_members()
         except exceptions.ListingMissingError:
+            return RestoreOutcome("missing", path.name, missing_files=total)
+        except exceptions.CorruptListingError as e:
+            logger.warning("Cannot restore %s: %s. %s", path, e, e.REMEDY)
             return RestoreOutcome("missing", path.name, missing_files=total)
     if path.exists():
         match behavior:

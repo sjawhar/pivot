@@ -252,7 +252,9 @@ class OutputFormat(enum.StrEnum):
 # Two representations exist for different purposes:
 #
 #   StorageLockData   On-disk YAML format. Uses project-relative identity keys
-#                     and list-based deps/outs (stable YAML output).
+#                     and list-based deps/outs (stable YAML output). A lock file holds a
+#                     directory's hash under ``listing`` (lock._DIR_HASH_KEY); this type
+#                     holds it under ``hash``, as it holds a file's.
 #
 #   LockData          In-memory format. Uses ArtifactIdentity keys
 #                     and dict-based deps/outs (O(1) lookups by identity).

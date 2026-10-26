@@ -661,17 +661,14 @@ def check_uncached_incremental_outputs(
     uncached = list[tuple[str, str]]()
     default_state_dir = config.get_state_dir()
     workspace = store_mod.WorkspaceStore(project.get_project_root(), "", {})
+    cache_dir = config.get_cache_dir() / "files"
 
     for stage_name in execution_order:
         stage_info = all_stages[stage_name]
         stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-        lock_data = stage_lock.read()
-        # A lock an older pivot wrote reads as missing; its incremental output still carries
-        # over once (worker._prior_outputs), so it is recorded, not uncached.
-        output_hashes = (
-            lock_data["output_hashes"] if lock_data else stage_lock.read_old_format_file_outputs()
-        )
+        lock_data = stage_lock.read(cache_dir=cache_dir)
+        output_hashes = lock_data["output_hashes"] if lock_data else {}
 
         for out in stage_info["outs"]:
             if out.tag is not types.ArtifactTag.INCREMENTAL:

@@ -61,13 +61,15 @@ def read_locks(
     stage_names: Iterable[str],
     all_stages: dict[str, registry.RegistryStageInfo],
     default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path | None,
 ) -> dict[str, LockData | None]:
-    """Read each named stage's lock once; None for a stage that has not run."""
+    """Read each named stage's lock once; None for a stage that has not run. ``cache_dir``
+    receives the listings a lock an older pivot wrote holds (``StageLock.read``)."""
     locks = dict[str, LockData | None]()
     for stage_name in stage_names:
         locks[stage_name] = lock.StageLock(
             stage_name, stages_dir(all_stages[stage_name], default_state_dir)
-        ).read()
+        ).read(cache_dir=cache_dir)
     return locks
 
 
@@ -83,14 +85,17 @@ def producer_output_hashes(
     deps: Iterable[types.ArtifactRef],
     stages_dirs: Mapping[str, pathlib.Path],
     cache_dir: pathlib.Path | None,
+    unreadable: dict[ArtifactIdentity, str] | None = None,
 ) -> dict[ArtifactIdentity, HashInfo]:
     """Merge the locked output hashes of already-read producer locks (by stage name).
 
     A dependency in ``deps`` on one file of a directory output finds that file's hash in the
     directory's listing: its producer's committed listing file (in ``stages_dirs``), else the
     cache's object. A listing is read only for such a dependency, once per directory, so a
-    fresh clone needs no pull. A directory whose listing neither holds leaves its files to be
-    hashed on disk; a listing that does not hash to its record raises CorruptListingError.
+    fresh clone needs no pull. A directory whose listing neither holds, or whose committed
+    listing cannot be used (``listing.read``), leaves its files to be hashed on disk; for the
+    latter, ``unreadable`` receives why, naming the file, by each file dependency on it: it is
+    the consumer's problem, not every stage's.
     """
     hashes = dict[ArtifactIdentity, HashInfo]()
     for lock_data in locks.values():
@@ -108,6 +113,10 @@ def producer_output_hashes(
         try:
             members = listing.read(committed, record, cache_dir)
         except exceptions.ListingMissingError:
+            continue
+        except exceptions.CorruptListingError as e:
+            if unreadable is not None:
+                unreadable.update(dict.fromkeys(files, str(e)))
             continue
         for entry in members["files"]:
             file_identity = types.directory_file_identity(directory, entry["relpath"])
@@ -194,13 +203,16 @@ def get_stage_explanation(
     tracked_files: dict[str, track.PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
     producer_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
+    unreadable_listings: Mapping[ArtifactIdentity, str] | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
     ``lock_data`` is the stage's lock, already read by the caller (None when the stage has
     not run). A stage is stale when repro will rewrite its lock by running it or restoring
     from the run cache; it is cached when its lock already matches and repro at most
-    restores outputs.
+    restores outputs. ``unreadable_listings`` says, by file dependency, why the listing that
+    would give its hash cannot be used (``producer_output_hashes``); a missing dependency's
+    reason names it.
     """
     if lock_data is None:
         return StageExplanation(
@@ -278,7 +290,17 @@ def get_stage_explanation(
             if param_changes:
                 reasons.append("Params changed")
             if missing_deps:
-                reasons.append(f"Missing deps: {', '.join(missing_deps)}")
+                unreadable_by_key = {
+                    types.identity_key(identity): problem
+                    for identity, problem in (unreadable_listings or {}).items()
+                }
+                shown = [
+                    f"{dep_key} ({unreadable_by_key[dep_key]})"
+                    if dep_key in unreadable_by_key
+                    else dep_key
+                    for dep_key in missing_deps
+                ]
+                reasons.append(f"Missing deps: {', '.join(shown)}")
             if unreadable_deps:
                 reasons.append(f"Unreadable deps: {', '.join(unreadable_deps)}")
             return StageExplanation(

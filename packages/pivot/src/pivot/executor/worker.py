@@ -795,7 +795,9 @@ def _execute_stage(
                     output_queue.put_nowait(
                         StateChange(kind=OutputMessageKind.STATE, stage=stage_name, state="running")
                     )
-                lock_data = production_lock.read(warn_old_format=False)
+                lock_data = production_lock.read(
+                    cache_dir=store_cache_dir(store), warn_old_format=False
+                )
 
                 with state.StateDB(state_dir, readonly=True) as state_db:
                     outputs_unusable: str | None = None
@@ -962,7 +964,7 @@ def _execute_stage(
                         stage_info["params_arg_name"],
                         stage_info["collection_params"],
                         stage_info["incremental_inputs"],
-                        _prior_outputs(lock_data, production_lock, stage_info),
+                        None if lock_data is None else lock_data["output_hashes"],
                         state_dir,
                         project_state_dir,
                         project_root,
@@ -994,7 +996,7 @@ def _execute_stage(
                     }
                 if no_commit:
                     output_hashes = _hash_output_paths(
-                        output_paths, cache_dir=_store_cache_dir(store)
+                        output_paths, cache_dir=store_cache_dir(store)
                     )
                 else:
                     output_hashes = _commit_outputs_with_store(
@@ -1324,7 +1326,7 @@ def _check_skip_or_run(
     return "unchanged", "", input_hash, decision["run_cache_allowed"]
 
 
-def _store_cache_dir(store: store_mod.Store) -> pathlib.Path | None:
+def store_cache_dir(store: store_mod.Store) -> pathlib.Path | None:
     """The cache object root whose symlinks count as directory content for ``store``."""
     return store.cache_dir if isinstance(store, store_mod.WorkspaceStore) else None
 
@@ -1646,8 +1648,8 @@ def _prepare_incremental_inputs(
 ) -> dict[str, Any]:
     """Restore previous incremental outputs and load them for the stage call.
 
-    ``prior_outputs`` are the output hashes the stage's last run recorded (``_prior_outputs``),
-    or None when it has none.
+    ``prior_outputs`` are the output hashes the stage's last run recorded, or None when it has
+    none.
     """
     if not incremental_inputs:
         return {}
@@ -2095,20 +2097,6 @@ def input_listing_paths(
     }
 
 
-def _prior_outputs(
-    lock_data: LockData | None, production_lock: lock.StageLock, stage_info: WorkerStageInfo
-) -> Mapping[types.ArtifactIdentity, HashInfo] | None:
-    """The output hashes an incremental stage continues from: its lock's, or, when its lock is
-    in an older pivot's format (``StageLock.read`` reads it as missing), the file outputs that
-    lock records, so its accumulated output carries over once. None when it has no prior run.
-    """
-    if lock_data is not None:
-        return lock_data["output_hashes"]
-    if not stage_info["incremental_inputs"]:
-        return None
-    return production_lock.read_old_format_file_outputs() or None
-
-
 def _commit_lock_and_build_deferred(
     stage_info: WorkerStageInfo,
     lock_data: LockData,
@@ -2133,7 +2121,7 @@ def _commit_lock_and_build_deferred(
         lock_data,
         hashed_dirs=hashed_dirs,
         input_paths=input_listing_paths(stage_info["deps"], store),
-        cache_dir=_store_cache_dir(store),
+        cache_dir=store_cache_dir(store),
     )
     return _build_deferred_writes(
         stage_info,

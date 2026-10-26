@@ -106,14 +106,16 @@ def get_pvt_data_from_revision(
     return _parse_pvt_data_from_bytes(content)
 
 
-def _listing_from_revision(rel_path: str, rev: str, record: DirHash) -> listing.DirListing | None:
-    """A directory's committed listing file at a git revision, checked against ``record``;
-    None when the revision has no such file."""
+def _listing_from_revision(
+    rel_path: str, rev: str, record: DirHash, cache_dir: pathlib.Path | None
+) -> listing.DirListing | None:
+    """A directory's listing by its committed file at a git revision, else the cache's object
+    in ``cache_dir`` (``listing.read_found``); None when neither holds it."""
     content = git.read_file_from_revision(rel_path, rev)
-    if content is None:
+    try:
+        return listing.read_found(content, f"{rel_path} at revision {rev}", record, cache_dir)
+    except exceptions.ListingMissingError:
         return None
-    source = f"{rel_path} at revision {rev}"
-    return listing.parse(listing.check(content, record, source), record, source)
 
 
 def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
@@ -138,8 +140,12 @@ def resolve_targets(
     targets: Sequence[str],
     rev: str,
     stage_targets: Mapping[str, StageTarget],
+    cache_dir: pathlib.Path | None = None,
 ) -> list[TargetInfo]:
-    """Resolve targets to TargetInfo: a target in ``stage_targets`` is a stage, others are files."""
+    """Resolve targets to TargetInfo: a target in ``stage_targets`` is a stage, others are files.
+
+    A directory's listing is read from the revision, else from the cache object in
+    ``cache_dir`` (``<cache.dir>/files``)."""
     proj_root = project.get_project_root()
     results = list[TargetInfo]()
 
@@ -178,7 +184,7 @@ def resolve_targets(
                     listing_rel = listing.output_listing_path(
                         stages_rel, types.ArtifactIdentity(stage_name, key)
                     ).as_posix()
-                    found = _listing_from_revision(listing_rel, rev, hash_info)
+                    found = _listing_from_revision(listing_rel, rev, hash_info, cache_dir)
                     if found is not None:
                         members[path] = found
             if not hashes:
@@ -208,7 +214,10 @@ def resolve_targets(
             pvt_members = dict[str, listing.DirListing]()
             if is_dir_hash(pvt_hash):
                 found = inline_members or _listing_from_revision(
-                    pvt_rel_path + listing.SUFFIX, rev, pvt_hash
+                    listing.tracked_listing_path(pathlib.Path(pvt_rel_path)).as_posix(),
+                    rev,
+                    pvt_hash,
+                    cache_dir,
                 )
                 if found is not None:
                     pvt_members[rel_target] = found
@@ -427,7 +436,7 @@ def restore_targets_from_revision(
         raise exceptions.RevisionNotFoundError(f"Cannot resolve revision: '{rev}'")
 
     # Resolve targets
-    target_infos = resolve_targets(targets, rev, stage_targets)
+    target_infos = resolve_targets(targets, rev, stage_targets, cache_dir / "files")
 
     # Validate -o usage
     if output is not None:

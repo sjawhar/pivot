@@ -8,7 +8,7 @@ import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
-from pivot import config, git, loaders, project, registry, types
+from pivot import config, exceptions, git, loaders, project, registry, types
 from pivot.show import common
 from pivot.show import data as data_module
 from pivot.storage import cache, listing, lock
@@ -251,16 +251,17 @@ def _select_outputs(
 
 def _head_listing(at_head: _HeadListing, record: types.DirHash) -> listing.DirListing | None:
     """A directory's listing at git HEAD: the inline one an older pivot's lock held, else its
-    committed listing file there, checked against ``record``, else the cache's object; None
-    when none holds it."""
+    committed listing file there or the cache's object (``listing.read_found``); None when
+    none holds it."""
     if not isinstance(at_head, str):
         return at_head
-    rel_path = at_head
-    content = git.read_file_from_revision(rel_path, "HEAD")
-    if content is None:
-        return cache.cached_listing(config.get_cache_dir() / "files", record)
-    source = f"{rel_path} at HEAD"
-    return listing.parse(listing.check(content, record, source), record, source)
+    content = git.read_file_from_revision(at_head, "HEAD")
+    try:
+        return listing.read_found(
+            content, f"{at_head} at HEAD", record, config.get_cache_dir() / "files"
+        )
+    except exceptions.ListingMissingError:
+        return None
 
 
 def _head_members(output: _DiffOutput, prefixes: frozenset[str] | None) -> dict[str, str | None]:

@@ -2,8 +2,10 @@
 
 StageLock provides persistent lock files (.lock) for change detection,
 storing fingerprints, params, and hashes to detect when re-runs are needed.
-A lock records a directory by ``DirHash`` (hash, size, file count); the directory's listing is
-committed beside the lock (``storage/listing.py``), and ``StageLock.write`` writes both.
+A lock records a directory by its listing's hash, its total size and its file count
+(``listing``, ``size``, ``nfiles``); the directory's listing is committed beside the lock
+(``storage/listing.py``), and ``StageLock.write`` writes both. A lock an older pivot wrote is
+read as it is (``StageLock.read``).
 
 For runtime mutual exclusion during concurrent execution, see
 ``pivot.storage.artifact_lock`` which uses flock-based artifact locks.
@@ -18,7 +20,7 @@ import os
 import pathlib
 import posixpath
 import re
-from typing import TYPE_CHECKING, NamedTuple, TypeGuard, cast, override
+from typing import TYPE_CHECKING, NamedTuple, cast, override
 
 import yaml
 
@@ -50,6 +52,11 @@ _VALID_VARIANT_NAME = re.compile(r"[a-zA-Z0-9_.-]+")
 _MAX_STAGE_NAME_LEN = 200  # Leave room for ".lock" suffix within filesystem NAME_MAX (255)
 _REQUIRED_LOCK_KEYS = frozenset({"code_manifest", "params", "deps", "outs"})
 _LOCK_SUFFIX = ".lock"
+_DIR_HASH_KEY = "listing"
+"""The key a lock entry records a directory's hash under; a file's is ``hash``. Every released
+pivot reads an entry that has a ``hash`` and no inline ``manifest`` as one file, and would
+restore a directory's listing in the directory's place; finding no ``hash``, it refuses the
+lock instead, and decides the stage afresh."""
 
 SCHEMA_VERSION = 3
 STAGES_REL_PATH = ".pivot/stages"
@@ -105,20 +112,6 @@ class UnsafeLockPath:
         return f"{self.field}: {self.value!r} is not a project-relative POSIX path"
 
 
-def is_lock_data(data: object) -> TypeGuard[StorageLockData]:
-    """Validate that parsed YAML has the storage format's shape, field by field.
-
-    A lock that fails is treated as missing by every caller ("no lock = needs re-run"), so a
-    hand-edited or partially written lock makes the stage stale instead of crashing a reader
-    or letting status and repro disagree. The first failing field is logged at debug.
-    """
-    error = lock_data_error(data)
-    if error is not None:
-        logger.debug("Lock data rejected: %s", error)
-        return False
-    return True
-
-
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -149,15 +142,31 @@ def _is_str_mapping(value: object, *, str_values: bool) -> bool:
 
 
 def _entry_error(raw: object, field: str, list_key: str) -> str | UnsafeLockPath | None:
-    """Check one ``deps`` or ``outs`` entry against DepEntry / OutEntry."""
+    """Check one ``deps`` or ``outs`` entry as a lock file holds it: a file's hash under
+    ``hash``, a directory's under ``listing`` (``_DIR_HASH_KEY``) beside its size and file
+    count."""
     if not isinstance(raw, dict):
         return field
     entry = cast("dict[str, object]", raw)
     # Every recorded hash is a cache key (cache.get_cache_path). Null and empty hashes come
     # from stages never executed locally (e.g. pulled with incomplete state); a hand-edited
     # short or non-hex one would otherwise fail every restore instead of meaning stale.
-    if not cache.is_valid_hash(entry.get("hash")):
-        return f"{field}.hash"
+    if _DIR_HASH_KEY in entry:
+        if "hash" in entry:
+            return f"{field}.hash"
+        if not cache.is_valid_hash(entry[_DIR_HASH_KEY]):
+            return f"{field}.{_DIR_HASH_KEY}"
+        if not _is_count(entry.get("nfiles")):
+            return f"{field}.nfiles"
+        if not _is_count(entry.get("size")):
+            return f"{field}.size"
+    else:
+        if not cache.is_valid_hash(entry.get("hash")):
+            return f"{field}.hash"
+        if "nfiles" in entry:
+            return f"{field}.nfiles"
+        if "size" in entry and not _is_count(entry["size"]):
+            return f"{field}.size"
     if list_key == "deps" and not _is_nonempty_str(entry.get("producer")):
         return f"{field}.producer"
     if "key" not in entry or not (entry["key"] is None or isinstance(entry["key"], str)):
@@ -168,22 +177,17 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | UnsafeLockPath
         and (error := _path_error(entry["path"], f"{field}.path"))
     ):
         return error
-    if "nfiles" in entry:
-        if not _is_count(entry["nfiles"]):
-            return f"{field}.nfiles"
-        if not _is_count(entry.get("size")):
-            return f"{field}.size"
-    elif "size" in entry and not _is_count(entry["size"]):
-        return f"{field}.size"
     return None
 
 
 def lock_data_error(data: object) -> str | UnsafeLockPath | None:
-    """Return the first reason parsed data cannot safely be consumed as a lock, or None.
+    """Return the first reason a parsed lock file cannot safely be consumed, or None.
 
-    The reason is the first field that breaks StorageLockData, or an ``UnsafeLockPath`` for a
-    recorded path that is not project-relative POSIX form. Extra top-level keys are allowed for
-    forward compatibility.
+    The reason is the first field that breaks this format, or an ``UnsafeLockPath`` for a
+    recorded path that is not project-relative POSIX form. A lock that fails is treated as
+    missing by every caller ("no lock = needs re-run"), so a hand-edited or partially written
+    lock makes the stage stale instead of crashing a reader or letting status and repro
+    disagree. Extra top-level keys are allowed for forward compatibility.
     """
     if not isinstance(data, dict):
         return "<document>"
@@ -208,27 +212,71 @@ def lock_data_error(data: object) -> str | UnsafeLockPath | None:
     return None
 
 
-def _is_old_format(data: object) -> bool:
-    """Whether parsed YAML is a lock an older pivot wrote: a mapping with the lock keys whose
-    ``schema_version`` is not this pivot's."""
+def _from_document(document: object) -> StorageLockData:
+    """A lock file's data, ``lock_data_error`` having passed it, with each directory's hash
+    under ``hash`` as ``StorageLockData`` holds it."""
+    data = dict(cast("dict[str, object]", document))
+    for list_key in ("deps", "outs"):
+        data[list_key] = [
+            {("hash" if key == _DIR_HASH_KEY else key): value for key, value in entry.items()}
+            for entry in cast("list[dict[str, object]]", data[list_key])
+        ]
+    renamed: object = data
+    return cast("StorageLockData", renamed)
+
+
+def _to_document(data: StorageLockData) -> dict[str, object]:
+    """``data`` as its lock file holds it: each directory's hash under ``listing``."""
+
+    def entry(item: DepEntry | OutEntry) -> dict[str, object]:
+        if "nfiles" not in item:
+            return dict(item)
+        return {(_DIR_HASH_KEY if key == "hash" else key): value for key, value in item.items()}
+
+    return {
+        **data,
+        "deps": [entry(item) for item in data["deps"]],
+        "outs": [entry(item) for item in data["outs"]],
+    }
+
+
+def _schema_version(data: object) -> int | None:
+    """The ``schema_version`` of parsed YAML that has every lock key: 0 when it names none,
+    None when it is not such a mapping or the version is not an integer."""
     if not isinstance(data, dict):
-        return False
+        return None
     document = cast("dict[object, object]", data)
-    return (
-        document.keys() >= _REQUIRED_LOCK_KEYS and document.get("schema_version") != SCHEMA_VERSION
-    )
+    if not document.keys() >= _REQUIRED_LOCK_KEYS:
+        return None
+    version = document.get("schema_version", 0)
+    return cast("int", version) if _is_int(version) else None
+
+
+def _is_old_format(data: object) -> bool:
+    """Whether parsed YAML is a lock an older pivot wrote, listing each directory's files inside
+    it: a mapping with the lock keys whose ``schema_version`` is below this pivot's."""
+    version = _schema_version(data)
+    return version is not None and version < SCHEMA_VERSION
 
 
 @functools.cache
-def _warn_old_format(path: str, mtime_ns: int) -> None:
-    """Warn once per process for each old lock, as it is on disk (``mtime_ns``)."""
+def _warn_format_once(path: str, mtime_ns: int, older: bool) -> None:
+    """Warn once per process for each lock in another pivot's format, as it is on disk
+    (``mtime_ns``)."""
     del mtime_ns
-    logger.warning(
-        "%s was written by an older pivot; pivot reads it as missing, so its stage is decided "
-        + "afresh (it runs, or its run-cache entry restores it) and the lock is rewritten. An "
-        + "incremental stage keeps the output this lock records",
-        path,
-    )
+    if older:
+        logger.warning(
+            "%s was written by an older pivot; pivot reads it as it is, and writes it in this "
+            + "pivot's format, with a listing file beside it for each directory it records, the "
+            + "next time its stage's lock is written",
+            path,
+        )
+    else:
+        logger.warning(
+            "%s was written by a newer pivot; this pivot cannot read it and reads it as missing, "
+            + "so its stage is decided afresh",
+            path,
+        )
 
 
 class CommittedLock(NamedTuple):
@@ -239,21 +287,56 @@ class CommittedLock(NamedTuple):
     listings: dict[str | None, listing.DirListing]
 
 
-def _convert_old_entry(raw: object) -> tuple[object, listing.DirListing | None] | None:
-    """An older pivot's lock entry as this format's, and its inline listing if it is a
-    directory; None when the inline listing is malformed."""
-    if not isinstance(raw, dict):
-        return raw, None
-    entry = cast("dict[str, object]", raw)
-    if "manifest" not in entry:
-        return entry, None
-    members = listing.from_inline(entry["manifest"], entry.get("empty_dirs", []))
-    if members is None:
-        return None
-    record = listing.record_of(members, listing.encode(members))
-    converted = {k: v for k, v in entry.items() if k not in ("manifest", "empty_dirs")}
-    converted.update(hash=record["hash"], size=record["size"], nfiles=record["nfiles"])
-    return converted, members
+class _ConvertedLock(NamedTuple):
+    """An older pivot's lock as this format's document, with the listings it held inline."""
+
+    document: dict[str, object]
+    output_listings: dict[str | None, listing.DirListing]  # by output key
+    listing_bytes: dict[str, bytes]  # every inline listing's bytes, by directory hash
+
+
+def _convert_old(data: object) -> _ConvertedLock | None:
+    """An older pivot's lock (``_is_old_format``) as this format's document: each directory
+    entry, which lists its files inline, becomes the record of its listing (the listing's hash,
+    its total size and its file count). None when an inline listing is malformed or names a
+    path outside its directory; the document still has to pass ``lock_data_error``."""
+    old = cast("dict[str, object]", data)
+    document: dict[str, object] = {**old, "schema_version": SCHEMA_VERSION}
+    output_listings = dict[str | None, listing.DirListing]()
+    listing_bytes = dict[str, bytes]()
+    for list_key in ("deps", "outs"):
+        entries = old[list_key]
+        if not isinstance(entries, list):
+            return None
+        converted = list[object]()
+        for raw in cast("list[object]", entries):
+            if not isinstance(raw, dict):
+                converted.append(raw)
+                continue
+            entry = cast("dict[str, object]", raw)
+            if "manifest" not in entry:
+                converted.append(entry)
+                continue
+            members = listing.from_inline(entry["manifest"], entry.get("empty_dirs", []))
+            if members is None:
+                return None
+            data_bytes = listing.encode(members)
+            record = listing.record_of(members, data_bytes)
+            new_entry = {
+                key: value
+                for key, value in entry.items()
+                if key not in ("hash", "manifest", "empty_dirs", "size")
+            }
+            new_entry.update(
+                {_DIR_HASH_KEY: record["hash"], "size": record["size"], "nfiles": record["nfiles"]}
+            )
+            converted.append(new_entry)
+            listing_bytes[record["hash"]] = data_bytes
+            key = entry.get("key")
+            if list_key == "outs" and (key is None or isinstance(key, str)):
+                output_listings[key] = members
+        document[list_key] = converted
+    return _ConvertedLock(document, output_listings, listing_bytes)
 
 
 def parse_committed(document: object) -> CommittedLock | UnsafeLockPath | None:
@@ -264,39 +347,19 @@ def parse_committed(document: object) -> CommittedLock | UnsafeLockPath | None:
     (the hash of its listing) and its listing is returned beside the data. None when the
     document is not a lock; an ``UnsafeLockPath`` when it records a path outside its project.
     """
-    if not _is_old_format(document):
-        error = lock_data_error(document)
-        if isinstance(error, UnsafeLockPath):
-            return error
-        if error is not None:
-            return None
-        return CommittedLock(cast("StorageLockData", document), {})
-    old = cast("dict[str, object]", document)
     listings = dict[str | None, listing.DirListing]()
-    converted: dict[str, object] = {**old, "schema_version": SCHEMA_VERSION}
-    for list_key in ("deps", "outs"):
-        entries = old[list_key]
-        if not isinstance(entries, list):
+    if _is_old_format(document):
+        converted = _convert_old(document)
+        if converted is None:
             return None
-        new_entries = list[object]()
-        for raw in cast("list[object]", entries):
-            result = _convert_old_entry(raw)
-            if result is None:
-                return None
-            new_entry, members = result
-            new_entries.append(new_entry)
-            if list_key == "outs" and members is not None:
-                key = cast("dict[str, object]", new_entry).get("key")
-                if key is None or isinstance(key, str):
-                    listings[key] = members
-        converted[list_key] = new_entries
-    document_now: object = converted
-    error = lock_data_error(document_now)
+        document = converted.document
+        listings = converted.output_listings
+    error = lock_data_error(document)
     if isinstance(error, UnsafeLockPath):
         return error
-    if error is not None or not is_lock_data(document_now):
+    if error is not None:
         return None
-    return CommittedLock(document_now, listings)
+    return CommittedLock(_from_document(document), listings)
 
 
 def _record_dir_fields(entry: DepEntry | OutEntry, hash_info: HashInfo) -> None:
@@ -457,64 +520,64 @@ class StageLock:
             logger.warning("Failed to parse lock file %s: %s", self.path, e)
             return None
 
-    def read(self, *, warn_old_format: bool = True) -> LockData | None:
+    def read(
+        self, *, cache_dir: pathlib.Path | None = None, warn_old_format: bool = True
+    ) -> LockData | None:
         """Read lock file, converting storage format to internal format.
 
-        A lock an older pivot wrote is read as missing, so its stage runs once and the lock is
-        rewritten; ``warn_old_format`` logs that, once per process for each such lock. A worker
-        reads without it: the process that dispatched the stage has already warned.
+        A lock an older pivot wrote is read as it is (``_convert_old``): each directory it
+        lists inline becomes the record of its listing, and that listing is put in the cache
+        at ``cache_dir`` (``listing.store_object``), where every listing read finds it, since no
+        listing file is committed beside such a lock. Nothing reruns or restores differently
+        because of the format alone; the stage's next lock write writes this format. A lock a
+        newer pivot wrote is read as missing. ``warn_old_format`` logs either, once per process
+        for each such lock; a worker reads without it, since the process that dispatched the
+        stage has already warned.
         """
         data = self._load()
         if data is None:
             return None
-        if _is_old_format(data):
-            if warn_old_format:
-                try:
-                    mtime_ns = self.path.stat().st_mtime_ns
-                except FileNotFoundError:
-                    return None
-                _warn_old_format(str(self.path), mtime_ns)
-            return None
-        if not is_lock_data(data):
-            error = lock_data_error(data)
-            assert error is not None
-            if isinstance(error, UnsafeLockPath):
+        version = _schema_version(data)
+        converted = None
+        if version is not None and version < SCHEMA_VERSION:
+            converted = _convert_old(data)
+            if converted is not None:
+                data = converted.document
+        error = lock_data_error(data)
+        if error is not None:
+            if version is not None and version > SCHEMA_VERSION:
+                if warn_old_format:
+                    self._warn_format(older=False)
+            elif isinstance(error, UnsafeLockPath):
                 logger.warning(
                     "Lock file %s failed validation: %s; treating it as missing",
                     self.path,
                     error,
                 )
             else:
-                logger.debug("Lock file %s failed validation; treating it as missing", self.path)
+                logger.debug(
+                    "Lock file %s failed validation at %s; treating it as missing",
+                    self.path,
+                    error,
+                )
             return None
-        return _convert_from_storage_format(data, stage_name=self.stage_name)
+        if converted is not None:
+            if warn_old_format:
+                self._warn_format(older=True)
+            if cache_dir is not None:
+                for directory_hash, listing_data in converted.listing_bytes.items():
+                    try:
+                        listing.store_object(cache_dir, directory_hash, listing_data)
+                    except OSError as e:
+                        logger.debug("Could not cache a listing %s holds: %s", self.path, e)
+        return _convert_from_storage_format(_from_document(data), stage_name=self.stage_name)
 
-    def read_old_format_file_outputs(self) -> dict[ArtifactIdentity, FileHash]:
-        """The file outputs a lock an older pivot wrote records, by identity; empty for any
-        other lock.
-
-        An incremental stage reads its prior output from these, once, when its lock is in an
-        old format: running it from nothing instead would drop what it accumulated.
-        """
-        data = self._load()
-        if not _is_old_format(data):
-            return {}
-        outs = cast("dict[object, object]", data)["outs"]
-        found = dict[ArtifactIdentity, FileHash]()
-        if not isinstance(outs, list):
-            return found
-        for raw in cast("list[object]", outs):
-            if not isinstance(raw, dict):
-                continue
-            entry = cast("dict[str, object]", raw)
-            key = entry.get("key")
-            file_hash = entry.get("hash")
-            if "manifest" in entry or not (key is None or isinstance(key, str)):
-                continue
-            if not cache.is_valid_hash(file_hash):
-                continue
-            found[ArtifactIdentity(self.stage_name, key)] = FileHash(hash=cast("str", file_hash))
-        return found
+    def _warn_format(self, *, older: bool) -> None:
+        try:
+            mtime_ns = self.path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return
+        _warn_format_once(str(self.path), mtime_ns, older)
 
     def output_listing_path(self, identity: ArtifactIdentity) -> pathlib.Path:
         """Where the listing of this stage's directory output ``identity`` is committed."""
@@ -613,7 +676,9 @@ class StageLock:
 
         # Serialize before changing a stable listing path.  If YAML cannot represent the lock,
         # the existing lock and the listings it names must remain a matching set.
-        serialized = yaml.dump(storage_data, Dumper=yaml_config.Dumper, sort_keys=False)
+        serialized = yaml.dump(
+            _to_document(storage_data), Dumper=yaml_config.Dumper, sort_keys=False
+        )
 
         written = list[pathlib.Path]()
         for item in to_write:

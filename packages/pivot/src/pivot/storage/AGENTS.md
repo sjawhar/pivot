@@ -113,19 +113,30 @@ When multiple `pivot` processes share the same StateDB:
   from the files' own cache objects, then marks it. A tree it cannot repair is not used: a
   restore goes file by file, a commit fails.
 - The object at a directory's hash under `files/` is its listing (`listing.store_object`),
-  read-only like every object. `listing.read` takes a committed listing file first and this
-  object second, and refuses bytes that do not hash to the recorded directory hash.
+  read-only like every object. Every listing read follows one rule (`listing._resolve`): a
+  committed listing (workspace file, or a file at a git revision) that hashes to the recorded
+  directory hash is taken; one that does not, or cannot be read, falls back to this object with
+  one warning naming it, and is refused only when the object is absent too, or at once with
+  `strict` (`pivot verify`).
 
 ## Lock and Listing Files
 
-- A lock records a directory as `{hash, size, nfiles}`; `StageLock.write` writes each directory
-  output's listing (`listing.output_listing_path`) and each directory input's
-  (`listing.input_listing_path`) before the lock, leaving a file that already holds the bytes
-  untouched. It is the one writer of lock and listing files (Task 2.2 of the BET-36 plan moves
-  that call to the coordinator).
-- A lock whose `schema_version` is not `lock.SCHEMA_VERSION` reads as missing, with one warning
-  per process; `StageLock.read_old_format_file_outputs` gives an incremental stage its prior
-  file outputs from such a lock once.
+- A lock records a directory as `{listing, size, nfiles}` on disk (`StorageLockData` holds the
+  listing's hash under `hash`, as for a file; `lock._from_document`/`_to_document` convert). The
+  key is not `hash` so that every released pivot, which reads an entry with a `hash` and no
+  inline `manifest` as one file, refuses the lock instead of restoring a listing as a file.
+  Run-cache keys hold `run_history._DIRECTORY_RECORD` for the same reason.
+- `StageLock.write` writes each directory output's listing (`listing.output_listing_path`) and
+  each directory input's (`listing.input_listing_path`) before the lock, leaving a file that
+  already holds the bytes untouched. It is the one writer of lock and listing files (Task 2.2
+  of the BET-36 plan moves that call to the coordinator).
+- A lock whose `schema_version` is below `lock.SCHEMA_VERSION` (an older pivot's, listing a
+  directory's files inline) is read as it is, with one warning per process: `StageLock.read`
+  converts each inline listing to its record and stores the listing in the cache it is given,
+  where every listing read finds it. Pass the cache to every `read`. A newer pivot's lock reads
+  as missing.
+- `pivot init` writes `*.listing -merge` into `.gitattributes`, so a merge conflicts on a
+  listing instead of producing bytes that hash to neither side.
 
 ## Path Storage
 

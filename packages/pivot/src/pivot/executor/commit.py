@@ -130,7 +130,7 @@ def commit_stages(
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
             out_paths = [types.identity_key(out.identity) for out in stage_outs]
             production_lock = lock.StageLock(stage_name, stages_dir)
-            previous_lock = production_lock.read()
+            previous_lock = production_lock.read(cache_dir=worker.store_cache_dir(store))
             # A run that imported code the fingerprint misses marked its lock; committing the
             # same outputs keeps that mark, so the stage is still not reusable.
             code_manifest = skip.carry_uncovered_import(

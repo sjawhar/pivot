@@ -81,6 +81,33 @@ def _get_all_stage_outputs() -> dict[str, pathlib.Path]:
     return outputs_resolved
 
 
+def _tracking_files(data_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """The files tracking ``data_path`` writes, or for a file removes: its .pvt and listing."""
+    pvt_path = track_mod.get_pvt_path(data_path)
+    return pvt_path, listing.tracked_listing_path(pvt_path)
+
+
+def _tracking_file_collision(
+    path: pathlib.Path, existing_tracked: dict[str, track_mod.PvtData], project_root: pathlib.Path
+) -> str | None:
+    """Why tracking ``path`` would collide with another tracked path, or None.
+
+    A collision is ``path`` being the .pvt or listing file pivot keeps for another tracked
+    path, or one of ``path``'s own being another tracked path: tracking would overwrite or
+    remove it. Any other name, ``.pvt`` or ``.pvt.listing`` endings included, can be tracked.
+    """
+    for tracked in existing_tracked:
+        other = pathlib.Path(tracked)
+        if other == path:
+            continue
+        shown = project.to_relative_path(other, project_root)
+        if path in _tracking_files(other):
+            return f"it is the file pivot keeps to record the tracked path '{shown}'"
+        if other in _tracking_files(path):
+            return f"tracking it writes the file '{shown}', which is itself a tracked path"
+    return None
+
+
 def _track_single_path(
     path_str: str,
     cache_dir: pathlib.Path,
@@ -121,12 +148,9 @@ def _track_single_path(
     if not path.exists():
         raise click.ClickException(f"Path not found: {path_str}")
 
-    # A .pvt or listing file beside a tracked path would collide with the files tracking writes
-    if path.name.endswith((".pvt", ".pvt" + listing.SUFFIX)):
-        raise click.ClickException(
-            f"Cannot track '{path_str}': a name ending in '.pvt' or '.pvt{listing.SUFFIX}' is "
-            + "the name of the file pivot writes to record a tracked path; rename it"
-        )
+    collision = _tracking_file_collision(path, existing_tracked, project_root)
+    if collision is not None:
+        raise click.ClickException(f"Cannot track '{path_str}': {collision}; rename one of them")
 
     # Check if tracking file inside symlinked directory
     warning: str | None = None

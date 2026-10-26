@@ -375,14 +375,67 @@ def check(data: bytes, record: DirHash, source: pathlib.Path | str) -> CheckedBy
 
 
 @functools.cache
-def _warn_stale(committed: str, record_hash: str) -> None:
-    """Warn once per process for each committed listing a read had to pass over."""
+def _warn_stale(problem: str) -> None:
+    """Warn once per process for each committed listing a read had to pass over, naming what
+    puts it right."""
     logger.warning(
-        "%s does not hash to the directory hash %s its lock or .pvt records; using the cache's "
-        + "copy of that listing. A stage run or `pivot track --force` rewrites the file; "
-        + "`git checkout` restores the committed one",
-        committed,
-        record_hash,
+        "%s; using the cache's copy of that listing. %s",
+        problem,
+        exceptions.CorruptListingError.REMEDY,
+    )
+
+
+def _resolve(
+    found: bytes | None,
+    source: pathlib.Path | str | None,
+    record: DirHash,
+    cache_dir: pathlib.Path | None,
+    *,
+    strict: bool,
+    problem: exceptions.CorruptListingError | None = None,
+) -> tuple[CheckedBytes, pathlib.Path | str]:
+    """The checked bytes of ``record``'s listing and the name ``parse`` gives where they came
+    from, by the one rule every reader follows.
+
+    ``found`` is the committed listing's bytes (at ``source``: a workspace file, or a file at
+    a git revision), None when there is none; ``problem`` says why a file there could not be
+    read. Committed bytes that hash to ``record`` are taken. Bytes that do not, or a file that
+    cannot be read, are passed over for the cache object at ``record``'s hash, which is checked
+    and never changes, with one warning naming the file: a shared input listing that a later
+    run of another stage moved on, a lock reverted without its listing, a merge, or a run
+    interrupted between writing the listing and the lock. Only when the cache lacks that object
+    too is the committed file refused. ``strict`` refuses it at once, for ``pivot verify``: a
+    fresh clone has no cache to fall back on.
+    """
+    if found is not None:
+        assert source is not None, "committed bytes come from a named file"
+        try:
+            return check(found, record, source), source
+        except exceptions.CorruptListingError as e:
+            problem = e
+    if problem is not None and strict:
+        raise problem
+    cached = None if cache_dir is None else cache.get_cache_path(cache_dir, record["hash"])
+    if cached is not None:
+        try:
+            data = check(cached.read_bytes(), record, cached)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise exceptions.CorruptListingError(f"{cached}: cannot be read ({e})") from e
+        else:
+            if problem is not None:
+                _warn_stale(str(problem))
+            return data, f"cache object {record['hash']}"
+    if problem is not None:
+        raise problem
+    where = list[str]() if source is None else [str(source)]
+    if cached is not None:
+        where.append(f"the cache object {cached}")
+    raise exceptions.ListingMissingError(
+        f"No listing for directory {record['hash']}: neither {' nor '.join(where)} exists"
+        if where
+        else f"No listing for directory {record['hash']}: no listing file and no cache"
     )
 
 
@@ -393,46 +446,21 @@ def _read_located(
     *,
     strict: bool = False,
 ) -> tuple[CheckedBytes, pathlib.Path | str]:
-    """The checked listing bytes and the name ``parse`` gives where they came from.
-
-    The committed file is taken when it hashes to ``record``. When it does not, the cache
-    object at ``record``'s hash, which is checked and never changes, is taken instead with one
-    warning naming the committed file: a shared input listing that a later run of another stage
-    moved on, a lock reverted without its listing, or a run interrupted between writing the
-    listing and the lock. Only when the cache lacks that object too is the committed file
-    refused. ``strict`` refuses it at once, for ``pivot verify``: a fresh clone has no cache
-    to fall back on.
-    """
-    mismatch: exceptions.CorruptListingError | None = None
+    """``_resolve`` for the listing file at ``committed`` in the workspace. A path that cannot
+    be read (a directory, no permission) is treated as a file that does not hash to its record,
+    naming the path."""
+    found: bytes | None = None
+    problem: exceptions.CorruptListingError | None = None
     if committed is not None:
         try:
-            return check(committed.read_bytes(), record, committed), committed
+            found = committed.read_bytes()
         except FileNotFoundError:
             pass
-        except exceptions.CorruptListingError as e:
-            if strict:
-                raise
-            mismatch = e
-    cached = None if cache_dir is None else cache.get_cache_path(cache_dir, record["hash"])
-    if cached is not None:
-        try:
-            data = check(cached.read_bytes(), record, cached)
-        except FileNotFoundError:
-            pass
-        else:
-            if mismatch is not None:
-                _warn_stale(str(committed), record["hash"])
-            return data, f"cache object {record['hash']}"
-    if mismatch is not None:
-        raise mismatch
-    where = list[str]() if committed is None else [str(committed)]
-    if cached is not None:
-        where.append(f"the cache object {cached}")
-    raise exceptions.ListingMissingError(
-        f"No listing for directory {record['hash']}: neither {' nor '.join(where)} exists"
-        if where
-        else f"No listing for directory {record['hash']}: no listing file and no cache"
-    )
+        except OSError as e:
+            problem = exceptions.CorruptListingError(
+                f"{committed}: cannot be read ({e.strerror or e})"
+            )
+    return _resolve(found, committed, record, cache_dir, strict=strict, problem=problem)
 
 
 def read_bytes(
@@ -442,7 +470,7 @@ def read_bytes(
     *,
     strict: bool = False,
 ) -> CheckedBytes:
-    """The bytes of the listing ``record`` names, checked against its hash (``_read_located``)."""
+    """The bytes of the listing ``record`` names, checked against its hash (``_resolve``)."""
     return _read_located(committed, record, cache_dir, strict=strict)[0]
 
 
@@ -468,9 +496,23 @@ def read(
     *,
     strict: bool = False,
 ) -> DirListing:
-    """The listing ``record`` names (see ``_read_located``), parsed."""
+    """The listing ``record`` names, by the workspace file at ``committed`` or the cache
+    (``_resolve``), parsed."""
     data, source = _read_located(committed, record, cache_dir, strict=strict)
     return parse(data, record, source)
+
+
+def read_found(
+    found: bytes | None,
+    source: str,
+    record: DirHash,
+    cache_dir: pathlib.Path | None,
+) -> DirListing:
+    """The listing ``record`` names, by committed bytes read from elsewhere (``found``, a file
+    at a git revision or in another repository, named ``source``; None when there is none) or
+    the cache (``_resolve``), parsed."""
+    data, where = _resolve(found, source, record, cache_dir, strict=False)
+    return parse(data, record, where)
 
 
 def write(path: pathlib.Path, data: bytes) -> None:

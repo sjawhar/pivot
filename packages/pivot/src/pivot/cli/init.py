@@ -36,6 +36,29 @@ _GITIGNORE_CONTENT = """\
 !/stages/**
 """
 
+# A listing's bytes must hash to the record in its lock or .pvt, so git must never merge two
+# listings line by line (the result would hash to neither side's record): a merge that changes
+# one on both sides conflicts instead, beside its lock, and both are taken from one side.
+_GITATTRIBUTES_LINE = "*.listing -merge"
+_GITATTRIBUTES_CONTENT = f"""\
+# Pivot listing files: never merge one line by line; take it and its lock from one side
+{_GITATTRIBUTES_LINE}
+"""
+
+
+def _ensure_gitattributes(path: pathlib.Path) -> bool:
+    """Add the listing merge rule to the project's .gitattributes; whether the file was created
+    (an existing one keeps its lines and gains the rule if it lacks it)."""
+    try:
+        existing = path.read_text()
+    except FileNotFoundError:
+        path.write_text(_GITATTRIBUTES_CONTENT)
+        return True
+    if _GITATTRIBUTES_LINE not in (line.strip() for line in existing.splitlines()):
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        path.write_text(existing + separator + _GITATTRIBUTES_CONTENT)
+    return False
+
 
 @cli_decorators.pivot_command(auto_discover=False)
 @click.option(
@@ -82,6 +105,8 @@ def init(ctx: click.Context, force: bool) -> None:
         pivotignore_path.write_text(pivotignore_content)
         created_pivotignore = True
 
+    created_gitattributes = _ensure_gitattributes(pathlib.Path.cwd() / ".gitattributes")
+
     if not quiet:
         click.echo("Initialized Pivot project.")
         click.echo()
@@ -91,6 +116,8 @@ def init(ctx: click.Context, force: bool) -> None:
         click.echo("  .pivot/.gitignore")
         if created_pivotignore:
             click.echo("  .pivotignore")
+        if created_gitattributes:
+            click.echo("  .gitattributes")
         click.echo()
         click.echo("Next steps:")
         click.echo("  1. Create pipeline.py to define your pipeline stages")

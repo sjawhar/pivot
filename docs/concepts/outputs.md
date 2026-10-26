@@ -138,14 +138,23 @@ restore, in every checkout mode.
 
 ### Listing files
 
-A lock file records a directory by its hash, its total size and its file count
-(`hash`, `size`, `nfiles`). The directory's members are in its *listing*, a text
-file committed beside the lock: one line per file
-(`<hash> <size> <x|-> <path>`, `x` when its owner may execute it) and one per
-deepest empty directory (`- - - <path>/`), sorted by path. The directory hash is
-the hash of the listing's bytes, so a change to one file of a 1,000-file output
-is one changed line in its listing and one in its lock. Each listing is also
-kept in the cache, at the directory's hash, and pushed and pulled with it.
+A lock file records a directory by its listing's hash, its total size and its
+file count (`listing`, `size`, `nfiles`), and a file by its `hash`. The
+directory's members are in its *listing*, a text file committed beside the
+lock: one line per file (`<hash> <size> <x|-> <path>`, `x` when its owner may
+execute it) and one per deepest empty directory (`- - - <path>/`), sorted by
+path. The directory hash is the hash of the listing's bytes, so a change to one
+file of a 1,000-file output changes one line of its listing and the `listing`
+line of its lock, and the lock's `size` line too when the file's size changes.
+A stage that reads the whole directory records it the same way, so its lock
+changes the same lines. Each listing is also kept in the cache, at the
+directory's hash, and pushed and pulled with it.
+
+Pivot 0.5.10 and earlier read a directory record that lists no files inside it
+as one file's hash. Finding no `hash` in a `listing` record, they treat the lock
+as missing and run its stage again, rather than write the listing where the
+directory belongs; run-cache entries are kept apart from theirs for the same
+reason.
 
 | Directory | Listing file |
 |---|---|
@@ -163,19 +172,35 @@ repro` warns, naming each one, when git ignores a lock or listing file it just
 wrote, and `pivot track` does the same for a `.pvt` and its listing.
 
 A listing file whose bytes do not hash to the directory hash its lock or `.pvt`
-records (hand-edited, left behind by a lock put back without it, or a shared
-input listing another stage has since rewritten) is passed over for the cache's
-copy of that listing, with one warning naming the file. `pivot verify` refuses
-such a file, naming it, since a fresh clone has no cache to fall back on; so does
-every command when the cache lacks that copy. `pivot repro --force <stage>`,
-`pivot track --force <path>` or `git checkout -- <file>` puts it right.
+records (hand-edited, left behind by a lock put back without it, merged line by
+line, or a shared input listing another stage has since rewritten), or that
+cannot be read, is passed over for the cache's copy of that listing, with one
+warning naming the file. `pivot verify` refuses such a file, naming it, since a
+fresh clone has no cache to fall back on, and so does a command that needs the
+listing's content when the cache lacks that copy (`checkout` of that output,
+`get --rev`); `pivot status` marks the stages that need it, and `pivot pull`
+fetches the copy a remote holds. `pivot repro --force <stage>` or `pivot track
+--force <path>` rewrites the file, and `git checkout <the revision its lock or
+.pvt came from> -- <file>` restores the one committed with it; `git checkout --
+<file>` alone changes nothing when git itself holds the stale file.
 
-A lock file an earlier Pivot wrote (one that lists a directory's files inside
-it) is read as missing, with one warning naming it: its stage is decided afresh
-and its lock rewritten. An incremental stage's output carries over from it once.
-A directory `.pvt` an earlier Pivot wrote is read as it is, its inline file list
-standing in for the listing, with one warning; `pivot track --force <path>`
-converts it.
+`pivot init` writes `*.listing -merge` into `.gitattributes`, so git never
+merges a listing line by line: when both branches of a merge changed a
+directory, its listing conflicts beside its conflicted lock. Take both from one
+side (`git checkout --ours -- .pivot/stages`, or `--theirs`, then `git add`), or
+settle the inputs and run `pivot repro`, which writes the lock and listings
+afresh; then commit. In a project made before this, add the line to
+`.gitattributes` yourself.
+
+A lock file an earlier Pivot wrote (any `schema_version` below 3; one that
+records a directory lists the directory's files inside it) is read as it is,
+with one warning naming it: each directory it lists stands for its listing, and
+that listing goes into the cache, so nothing reruns or restores differently
+because of the lock's format. The next time its stage's lock is written, it is
+written in this format, with its listing files. A lock a newer Pivot wrote is
+read as missing. A directory `.pvt` an earlier Pivot wrote is read as it is, its
+inline file list standing in for the listing, with one warning; `pivot track
+--force <path>` converts it.
 
 A symlink inside a directory artifact is not stored: it is left out of the
 listing and does not come back on restore. When a stage writes the artifact,

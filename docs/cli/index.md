@@ -395,9 +395,10 @@ pivot track PATHS... [OPTIONS]
 
 Creates a `.pvt` sidecar for a file. For a directory it also creates
 `<path>.pvt.listing`, the committed listing of its files and empty directories;
-commit both files. `track` refuses targets ending in `.pvt` or `.pvt.listing`,
-which would collide with these sidecars. It warns when git ignores either
-sidecar.
+commit both files. `track` refuses a target that is the `.pvt` or listing file
+of another tracked path, or whose own `.pvt` or listing file would be another
+tracked path, naming that path; any other name can be tracked, one ending in
+`.pvt` or `.pvt.listing` included. It warns when git ignores either sidecar.
 
 ---
 
@@ -944,6 +945,11 @@ pivot init [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--force` / `-f` | Overwrite existing .pivot/.gitignore |
+
+Writes `.pivot/.gitignore`, a `.pivotignore` if there is none, and the line
+`*.listing -merge` into `.gitattributes` (created if absent), so git never
+merges a listing line by line (see
+[Listing files](../concepts/outputs.md#listing-files)).
 
 ---
 

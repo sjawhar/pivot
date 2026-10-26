@@ -60,14 +60,18 @@ def _blob_hashes(
 
     ``read_members`` reads a directory's listing (its committed listing file, else the cache's
     object). A listing the local cache lacks is stored from the committed file, so push sends
-    it. A directory whose listing neither holds gives its listing object alone: a pull fetches
-    it first, then names the files.
+    it. A directory whose listing neither holds, or whose committed listing cannot be used and
+    the cache lacks, gives its listing object alone: a pull fetches it first, then names the
+    files.
     """
     if not is_dir_hash(hash_info):
         return {hash_info["hash"]}
     try:
         members = read_members(hash_info)
     except exceptions.ListingMissingError:
+        return {hash_info["hash"]}
+    except exceptions.CorruptListingError as e:
+        logger.warning("%s; only the cache's copy of that listing is transferred", e)
         return {hash_info["hash"]}
     if not cache.get_cache_path(files_dir, hash_info["hash"]).exists():
         listing.store_object(files_dir, hash_info["hash"], listing.encode(members))
@@ -112,7 +116,7 @@ def _get_file_hash_from_stages(
         for stage_name, stage_info in all_stages.items():
             stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
             stages_dir = lock.get_stages_dir(stage_state_dir)
-            lock_data = lock.StageLock(stage_name, stages_dir).read()
+            lock_data = lock.StageLock(stage_name, stages_dir).read(cache_dir=files_dir)
             if lock_data is None:
                 continue
             non_cached_paths = {
@@ -146,7 +150,7 @@ def _get_file_hash_from_stages(
             non_cached_paths = set[str]()
 
         stage_lock = lock.StageLock(stage_name, stages_dir)
-        lock_data = stage_lock.read()
+        lock_data = stage_lock.read(cache_dir=files_dir)
         if lock_data is None:
             continue
 
@@ -242,7 +246,7 @@ def get_target_hashes(
                     stage_lock = None
 
                 if stage_lock is not None:
-                    lock_data = stage_lock.read()
+                    lock_data = stage_lock.read(cache_dir=files_dir)
                     if lock_data is not None:
                         for out_path, out_hash in lock_data["output_hashes"].items():
                             if types.identity_key(out_path) not in non_cached_paths:

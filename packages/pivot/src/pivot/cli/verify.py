@@ -14,7 +14,7 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import listing, lock
+from pivot.storage import listing, lock, track
 from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -45,27 +45,36 @@ def _object_hashes(
     hash_info: HashInfo,
     committed: pathlib.Path,
     files_dir: pathlib.Path,
-    *,
-    shared_input: bool = False,
 ) -> dict[str, str]:
     """The cache objects an output or dependency at ``path`` needs, by workspace path.
 
     A directory needs its listing object (keyed by the directory's path) and each file's
-    object, named by its listing (``committed``, else the cache's object). A committed output
-    listing that does not hash to its record is refused, naming it: a fresh clone would have
-    no cache to restore from. A shared input listing may have moved on since this lock was
-    written, so it falls back to this lock's immutable cache object.
+    object, named by its listing (``committed``, else the cache's object). A committed listing
+    that does not hash to its record, or cannot be read, is refused (CorruptListingError,
+    naming it): a fresh clone would have no cache to restore from.
     """
     result = {path: hash_info["hash"]}
     if not is_dir_hash(hash_info):
         return result
     try:
-        members = listing.read(committed, hash_info, files_dir, strict=not shared_input)
+        members = listing.read(committed, hash_info, files_dir, strict=True)
     except exceptions.ListingMissingError:
         return result
     for entry in members["files"]:
         result[str(pathlib.Path(path) / entry["relpath"])] = entry["hash"]
     return result
+
+
+def _check_tracked_listing(data_path: pathlib.Path, files_dir: pathlib.Path) -> None:
+    """Refuse a tracked directory's committed ``.pvt.listing`` that does not hash to its
+    ``.pvt``'s record or cannot be read (CorruptListingError, naming it)."""
+    pvt_data = track.read_pvt_file(track.get_pvt_path(data_path))
+    if pvt_data is None or "nfiles" not in pvt_data:
+        return
+    try:
+        track.tracked_members(data_path, pvt_data, files_dir, strict=True)
+    except exceptions.ListingMissingError:
+        return
 
 
 def _get_stage_lock_hashes(
@@ -75,18 +84,19 @@ def _get_stage_lock_hashes(
 
     Returns (output_hashes, dep_hashes) where each is {path: hash}.
 
-    For both outputs and deps, a directory contributes its listing object and its files.
-    Non-cached outputs (e.g. Metric with cache=False) are excluded —
-    they are git-tracked, not in cache.
+    For both outputs and deps, a directory contributes its listing object and its files; a
+    tracked directory a dep names has its ``.pvt.listing`` checked too. Non-cached outputs
+    (e.g. Metric with cache=False) are excluded — they are git-tracked, not in cache. Raises
+    CorruptListingError, naming the file, for a listing that cannot be used.
     """
     stage_info = cli_helpers.get_stage(stage_name)
     default_state_dir = config.get_state_dir()
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+    files_dir = config.get_cache_dir() / "files"
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-    lock_data = stage_lock.read()
+    lock_data = stage_lock.read(cache_dir=files_dir)
     if lock_data is None:
         return {}, {}
-    files_dir = config.get_cache_dir() / "files"
 
     # Filter non-cached outputs — they're git-tracked, not in cache
     workspace_store = cli_helpers.get_workspace_store()
@@ -132,14 +142,10 @@ def _get_stage_lock_hashes(
             committed = listing.input_listing_path(
                 stage_lock.stages_dir, workspace_store.input_relpath(ref)
             )
+            if is_dir_hash(hash_info):
+                _check_tracked_listing(project.normalize_path(dep_path), files_dir)
         dep_hashes.update(
-            _object_hashes(
-                project.to_relative_path(dep_path),
-                hash_info,
-                committed,
-                files_dir,
-                shared_input=identity.producer not in all_stages,
-            )
+            _object_hashes(project.to_relative_path(dep_path), hash_info, committed, files_dir)
         )
 
     return output_hashes, dep_hashes
@@ -270,16 +276,22 @@ def _verify_stages(
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
     project_root = project.get_project_root()
 
-    # Phase 1: Collect missing hashes from all non-stale stages
+    # Phase 1: Collect missing hashes from all non-stale stages. A listing that cannot be used
+    # fails its own stage, naming the file, and no other.
     stage_hash_to_paths = dict[str, dict[str, list[str]]]()
+    listing_problems = dict[str, str]()
     all_missing_hashes = set[str]()
 
     for stage_info in pipeline_status:
         if stage_info["status"] == PipelineStatus.STALE:
             continue
-        hash_to_paths = _get_stage_missing_hashes(
-            stage_info["name"], local_hashes, allow_missing, project_root
-        )
+        try:
+            hash_to_paths = _get_stage_missing_hashes(
+                stage_info["name"], local_hashes, allow_missing, project_root
+            )
+        except exceptions.CorruptListingError as e:
+            listing_problems[stage_info["name"]] = f"{e}. {e.REMEDY}"
+            continue
         stage_hash_to_paths[stage_info["name"]] = hash_to_paths
         all_missing_hashes.update(hash_to_paths.keys())
 
@@ -323,9 +335,19 @@ def _verify_stages(
             )
             continue
 
+        if stage_name in listing_problems:
+            results.append(
+                StageVerifyInfo(
+                    name=stage_name,
+                    status="failed",
+                    reason=listing_problems[stage_name],
+                    missing_files=[],
+                )
+            )
+            continue
+
         hash_to_paths = stage_hash_to_paths[stage_name]
 
-        # Determine missing files based on mode
         # Determine missing files based on mode
         if not hash_to_paths:
             missing_files = list[str]()

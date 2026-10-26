@@ -69,6 +69,7 @@ from pivot.storage import cache, listing, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
+    ArtifactIdentity,
     ArtifactTag,
     CodeChange,
     DepChange,
@@ -125,12 +126,14 @@ def _get_explanations_in_parallel(
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
-    locks = explain.read_locks(execution_order, all_stages, default_state_dir)
+    locks = explain.read_locks(execution_order, all_stages, default_state_dir, store.cache_dir)
+    unreadable = dict[ArtifactIdentity, str]()
     producer_hashes = explain.producer_output_hashes(
         locks,
         (ref for name in execution_order for ref in all_stages[name]["deps"].values()),
         {name: explain.stages_dir(all_stages[name], default_state_dir) for name in locks},
         store.cache_dir,
+        unreadable,
     )
     explanations_by_name = dict[str, StageExplanation]()
 
@@ -156,6 +159,7 @@ def _get_explanations_in_parallel(
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
                 producer_hashes=producer_hashes,
+                unreadable_listings=unreadable,
             )
             futures[future] = stage_name
 

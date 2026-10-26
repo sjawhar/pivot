@@ -1,6 +1,6 @@
 import pathlib
 from difflib import get_close_matches
-from typing import override
+from typing import ClassVar, override
 
 # Fuzzy matching constants
 _FUZZY_CUTOFF = 0.6
@@ -253,15 +253,20 @@ class CacheModeCollisionError(CacheError):
 
 
 class CorruptListingError(CacheError):
-    """A directory listing is malformed, or its bytes do not hash to the directory hash its
-    lock or ``.pvt`` records. The message names the file."""
+    """A directory listing is malformed or cannot be read, or its bytes do not hash to the
+    directory hash its lock or ``.pvt`` records. The message names the file."""
+
+    REMEDY: ClassVar[str] = (
+        "`pivot repro --force <stage>` rewrites a stage's listing and `pivot track --force "
+        + "<path>` a tracked directory's; `git checkout <the revision its lock or .pvt came "
+        + "from> -- <file>` restores the one committed with it"
+    )
+    """What puts the file right. The listing may be stale in git's index as well (a lock put
+    back without it, a merge), so ``git checkout -- <file>`` alone can change nothing."""
 
     @override
     def get_suggestion(self) -> str:
-        return (
-            "Restore the listing file from git (`git checkout -- <file>`), or rerun the stage "
-            "that wrote it (`pivot repro --force <stage>`, `pivot track --force <path>`)"
-        )
+        return f"`pivot pull` fetches the cache's copy of a listing a remote holds. {self.REMEDY}"
 
 
 class ListingMissingError(CacheError):

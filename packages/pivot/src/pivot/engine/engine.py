@@ -169,6 +169,15 @@ class _MissingDependencyRun:
         )
 
 
+def _file_identity(path: pathlib.Path) -> tuple[int, int, int] | None:
+    """``path``'s (inode, mtime, size), or None when it does not exist."""
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return (info.st_ino, info.st_mtime_ns, info.st_size)
+
+
 def _merge_run_requests(earlier: RunRequested, later: RunRequested) -> RunRequested:
     """One request that runs everything ``earlier`` and ``later`` would run.
 
@@ -1252,6 +1261,10 @@ class Engine:
                 state_dbs[stage_state_dir] = state_mod.StateDB(stage_state_dir)
             return state_dbs[stage_state_dir]
 
+        # The lock and listing files as they stand before this run, so the run names each one
+        # it writes that git ignores, whatever path wrote it (a run, a run-cache restore).
+        committed_before = self._committed_files(execution_order, all_stages, project_root)
+
         try:
             # Ensure default StateDB exists before skip checks
             _get_state_db(default_state_dir)
@@ -1500,7 +1513,7 @@ class Engine:
             ended_at=ended_at,
             retention=retention,
         )
-        self._warn_ignored_committed_files(results, all_stages, project_root)
+        self._warn_ignored_committed_files(committed_before, project_root)
 
         # Materialize presentation symlinks for successful stages
         from pivot.storage import presentation
@@ -1866,7 +1879,7 @@ class Engine:
         def _read_lock() -> LockData | None:
             stages_dir = lock.get_stages_dir(stage_state_dir)
             stage_lock = lock.StageLock(stage_name, stages_dir)
-            return stage_lock.read()
+            return stage_lock.read(cache_dir=worker.store_cache_dir(store))
 
         lock_data = await anyio.to_thread.run_sync(_read_lock)
         if lock_data is None:
@@ -2173,7 +2186,7 @@ class Engine:
             )
             lock_data = lock.StageLock(
                 stage_name, lock.get_stages_dir(worker_info["state_dir"])
-            ).read()
+            ).read(cache_dir=store.cache_dir)
             return explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
@@ -2414,18 +2427,15 @@ class Engine:
             state_db.write_run(manifest)
             state_db.prune_runs(retention)
 
-    def _warn_ignored_committed_files(
+    def _committed_files(
         self,
-        results: dict[str, executor_core.ExecutionSummary],
+        stage_names: list[str],
         all_stages: dict[str, RegistryStageInfo],
         project_root: pathlib.Path,
-    ) -> None:
-        """Warn once per run when git ignores a lock or listing file this run wrote.
-
-        A project made before `pivot init` wrote `!/stages/**` into `.pivot/.gitignore` can
-        hide them under a root pattern such as `lib/` or `build/`.
-        """
-        from pivot import git
+    ) -> dict[pathlib.Path, tuple[int, int, int] | None]:
+        """The lock and listing files ``stage_names`` record, each with its (inode, mtime,
+        size), or None when absent. A lock or listing is written by an atomic replace, so a
+        file whose stat changes was written."""
         from pivot.storage import listing, lock
 
         default_state_dir = config.get_state_dir()
@@ -2435,10 +2445,8 @@ class Engine:
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
         )
-        written = list[pathlib.Path]()
-        for name, summary in results.items():
-            if summary["status"] != StageStatus.RAN:
-                continue
+        files = dict[pathlib.Path, tuple[int, int, int] | None]()
+        for name in stage_names:
             stage_info = all_stages.get(name)
             if stage_info is None:
                 continue
@@ -2454,8 +2462,29 @@ class Engine:
                 for ref in stage_info["deps"].values()
                 if ref.tag is types.ArtifactTag.INPUT
             )
-            written.extend(path for path in candidates if path.exists())
-        ignored = git.ignored_paths(project_root, sorted(set(written)))
+            for path in candidates:
+                files[path] = _file_identity(path)
+        return files
+
+    def _warn_ignored_committed_files(
+        self,
+        before: dict[pathlib.Path, tuple[int, int, int] | None],
+        project_root: pathlib.Path,
+    ) -> None:
+        """Warn once per run when git ignores a lock or listing file this run wrote: one of
+        ``before`` whose stat changed (``_committed_files``).
+
+        A project made before `pivot init` wrote `!/stages/**` into `.pivot/.gitignore` can
+        hide them under a root pattern such as `lib/` or `build/`.
+        """
+        from pivot import git
+
+        written = [
+            path
+            for path, identity in before.items()
+            if (now := _file_identity(path)) is not None and now != identity
+        ]
+        ignored = git.ignored_paths(project_root, sorted(written))
         if ignored:
             _logger.warning(
                 "git ignores %s, which pivot just wrote and which must be committed: add "

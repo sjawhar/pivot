@@ -150,10 +150,12 @@ and a thread native code starts outside `_thread`:
   fingerprint, as it records any output; run `pivot repro` without
   `--no-commit` for a stage that imports dynamically;
 - a result cached by an earlier Pivot version: if its static fingerprint is
-  unchanged, it may be reused because `_CACHE_SCHEMA_VERSION` keys only the
-  state.lmdb caches, not the lock. A stage whose static walk reaches a user
-  class method or a user module gains entries in its manifest, so it reruns
-  once as Code changed after the upgrade. That accepted one-time rerun writes
+  unchanged, its lock, which Pivot reads as it is, lets it be reused, because
+  `_CACHE_SCHEMA_VERSION` keys only the state.lmdb caches, not the lock (an
+  earlier version's run-cache entries are never reused: their keys differ). A
+  stage whose static walk reaches a user class method or a user module gains
+  entries in its manifest, so it reruns once as Code changed after the
+  upgrade. That accepted one-time rerun writes
   the current manifest; later runs reuse it until code or inputs change. Run
   `pivot repro --force <stage>` once to re-check a stage you know imports
   dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns

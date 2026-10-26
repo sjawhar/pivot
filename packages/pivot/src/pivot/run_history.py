@@ -4,7 +4,7 @@ import datetime
 import hashlib
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from pivot.types import (
     ArtifactTag,
@@ -67,6 +67,13 @@ class OutputHashEntry(TypedDict):
     nfiles: NotRequired[int]
 
 
+# Part of every run-cache key (compute_input_hash). An older pivot reads a run-cache output that
+# lists no files inline as one file, so it would restore a directory's listing in the
+# directory's place; keyed apart, it never finds an entry this pivot wrote, nor this pivot one
+# an older pivot wrote.
+_DIRECTORY_RECORD = "listing"
+
+
 def output_hash_to_entry(path: str, oh: HashInfo) -> OutputHashEntry:
     """Convert internal HashInfo to serializable OutputHashEntry."""
     entry = OutputHashEntry(path=path, hash=oh["hash"])
@@ -77,14 +84,8 @@ def output_hash_to_entry(path: str, oh: HashInfo) -> OutputHashEntry:
 
 
 def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash | None:
-    """Convert serialized OutputHashEntry back to internal HashInfo.
-
-    None for an entry an older pivot filed for a directory, with its files listed inline: its
-    hash is not a directory hash this pivot computes, so the entry cannot be used. None too for
-    a directory entry without its size, which no pivot writes.
-    """
-    if "manifest" in cast("Mapping[str, object]", entry):
-        return None
+    """Convert serialized OutputHashEntry back to internal HashInfo; None for a directory entry
+    without its size, which no pivot writes."""
     if "nfiles" in entry:
         if "size" not in entry:
             return None
@@ -116,6 +117,7 @@ def compute_input_hash(
         "params": params,
         "deps": sorted([(d["producer"], d["key"], d["hash"]) for d in deps]),
         "out_specs": sorted(out_specs),
+        "directories": _DIRECTORY_RECORD,
     }
     content = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode()).hexdigest()[:16]
