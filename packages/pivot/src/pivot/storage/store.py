@@ -11,7 +11,7 @@ from pivot.storage import cache, ownership
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Generator, Iterable, Mapping
 
 
 @runtime_checkable
@@ -144,7 +144,6 @@ class WorkspaceStore:
     _pipeline_name: str
     _input_bindings: dict[str, str]
     _path_map: dict[str, types.ArtifactIdentity]
-    _ignored_pvt_paths_by_output: dict[str, set[pathlib.Path]]
     _cache_dir: pathlib.Path | None
     _checkout_modes: list[config.CheckoutMode] | None
 
@@ -161,7 +160,6 @@ class WorkspaceStore:
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
         self._path_map = {}
-        self._ignored_pvt_paths_by_output = {}
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
         self._checkout_modes = checkout_modes
 
@@ -208,22 +206,33 @@ class WorkspaceStore:
     def refuse_output_replacements(
         self,
         refs: Iterable[types.ArtifactRef],
-        ignored_pvt_paths: set[pathlib.Path] | None = None,
+        members: Mapping[types.ArtifactRef, ownership.StageMembers] | None = None,
+        *,
+        claim_unparsed: bool = False,
     ) -> None:
-        """Fail before replacing these outputs removes a tracked path or `.pvt` sidecar."""
+        """Fail before replacing these outputs removes a user's tracked path or `.pvt` sidecar.
+
+        ``members`` gives each output's ``*.pvt`` files that are the stage's own
+        (``ownership.find_output_overlaps``).
+        """
+        replacements = list[ownership.Replacement]()
+        members_by_path = dict[pathlib.Path, ownership.StageMembers]()
+        for ref in refs:
+            path = ownership.normalized(self._resolve_output_path(ref))
+            replacements.append(ownership.stage_output(path, ref.identity.producer))
+            if members is not None and ref in members:
+                members_by_path[path] = members[ref]
         ownership.refuse_output_replacements(
             self._project_root,
-            [self._resolve_output_path(ref) for ref in refs],
-            ignored_pvt_paths,
+            replacements,
+            lambda path: members_by_path.get(path, {}),
+            claim_unparsed=claim_unparsed,
         )
 
     def prepare_output(
-        self, ref: types.ArtifactRef, *, ignored_pvt_paths: set[pathlib.Path] | None = None
+        self, ref: types.ArtifactRef, *, members: ownership.StageMembers | None = None
     ) -> pathlib.Path:
-        output_path = self._resolve_output_path(ref)
-        ignored = ignored_pvt_paths or set[pathlib.Path]()
-        self.refuse_output_replacements([ref], ignored)
-        self._ignored_pvt_paths_by_output[str(output_path)] = ignored
+        self.refuse_output_replacements([ref], None if members is None else {ref: members})
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             cache.remove_output(path)
@@ -240,11 +249,14 @@ class WorkspaceStore:
         *,
         state_dir: pathlib.Path | None = None,
         warn_left_out_symlinks: bool = True,
+        members: ownership.StageMembers | None = None,
     ) -> types.HashInfo:
         """Hash a written output once and, unless it is a metric, place it in the cache.
 
         ``warn_left_out_symlinks`` logs the warning naming the symlinks a directory output
-        leaves out; a quiet command turns it off.
+        leaves out; a quiet command turns it off. A commit records what is on disk as the
+        stage's output, so a ``*.pvt`` Pivot cannot parse counts as the stage's; ``members``
+        adds the ones the stage itself wrote in this run.
         """
         output_hash: types.HashInfo
         if path.is_dir():
@@ -258,12 +270,10 @@ class WorkspaceStore:
             file_hash, _ = cache.hash_file(path, None)
             output_hash = types.FileHash(hash=file_hash)
         if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
-            # A freshly prepared stage output can legitimately produce a `.pvt`-named member;
-            # every other sidecar remains protected immediately before cache linking.
-            ignored = self._ignored_pvt_paths_by_output.pop(
-                str(self._resolve_output_path(ref)), None
+            # Linking to the cache replaces each workspace file (symlink mode: the directory)
+            self.refuse_output_replacements(
+                [ref], None if members is None else {ref: members}, claim_unparsed=True
             )
-            self.refuse_output_replacements([ref], ignored)
             cache.store_hashed_output(
                 path,
                 output_hash,
@@ -280,13 +290,21 @@ class WorkspaceStore:
         *,
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[config.CheckoutMode] | None = None,
+        recorded_hash: types.HashInfo | None = None,
     ) -> bool:
+        """Restore an output to ``output_hash``, refusing first if that would remove a user file.
+
+        ``recorded_hash`` is the hash the stage's lock records now, when it differs from the
+        restored one (a run-cache restore): ``*.pvt`` members either records are the stage's.
+        """
         if self._cache_dir is None:
             return False
         if ref.tag is types.ArtifactTag.METRIC:
             return False
-        self.refuse_output_replacements([ref])
         output_path = self._resolve_output_path(ref)
+        self.refuse_output_replacements(
+            [ref], {ref: ownership.recorded_members(output_path, output_hash, recorded_hash)}
+        )
         return cache.restore_from_cache(
             output_path,
             output_hash,

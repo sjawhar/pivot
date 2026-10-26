@@ -396,6 +396,30 @@ async def test_import_artifact_refuses_destination_inside_any_pipeline_output(
 
 
 @pytest.mark.parametrize("no_download", [False, True])
+async def test_import_artifact_refuses_when_a_pipeline_fails_to_load(
+    tmp_path: pathlib.Path, mocker: MockerFixture, no_download: bool
+) -> None:
+    """A pipeline.py that fails to load may declare the destination as an output, so the import
+    refuses, naming that file, and writes nothing."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "pipeline.py").write_text('raise RuntimeError("broken pipeline")\n')
+    _helper_mock_resolved_import(mocker)
+
+    with pytest.raises(exceptions.PivotError, match=r"Failed to load pipeline .*other"):
+        await import_artifact.import_artifact(
+            "https://github.com/org/source",
+            "source/build",
+            out="data/raw/imported.txt",
+            no_download=no_download,
+            project_root=tmp_path,
+        )
+
+    assert not (tmp_path / "data" / "raw" / "imported.txt").exists()
+    assert not (tmp_path / "data" / "raw" / "imported.txt.pvt").exists()
+
+
+@pytest.mark.parametrize("no_download", [False, True])
 async def test_import_artifact_force_updates_an_import_saved_inside_an_output(
     tmp_path: pathlib.Path,
     mocker: MockerFixture,
@@ -431,7 +455,10 @@ async def test_import_artifact_force_updates_an_import_saved_inside_an_output(
     pvt_data = track.read_pvt_file(pvt_path)
     assert pvt_data is not None
     assert pvt_data["hash"] == "abc1230000000000"
-    assert "overlaps with stage output" in caplog.text
+    assert (
+        "'data/b/tree/imported.txt' was imported inside a stage output: it is inside output "
+        + "'data/b/tree' of stage 'b/tree'"
+    ) in caplog.text
     if no_download:
         assert not (tmp_path / "data" / "b" / "tree" / "imported.txt").exists()
     else:

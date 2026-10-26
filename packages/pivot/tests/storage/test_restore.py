@@ -504,8 +504,8 @@ def test_restore_targets_from_revision_output_with_stage(
 def test_restore_targets_from_revision_force_refuses_output_holding_tracked_file(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, output_arg: pathlib.Path | None
 ) -> None:
-    """`pivot get --force` refuses before it removes a tracked file in a stage output or an
-    explicit relative `--output` destination."""
+    """`pivot get --force` refuses before it removes a tracked file in a stage output or in an
+    explicit `--output` destination (relative to the working directory)."""
     repo_path, commit = git_repo
     cache_dir = repo_path / ".pivot" / "cache"
     source = repo_path / "cached-stage-output"
@@ -532,6 +532,7 @@ def test_restore_targets_from_revision_force_refuses_output_holding_tracked_file
     (repo_path / ".pivot" / "stages" / "tree.lock").write_text(yaml.dump(lock_content))
     sha = commit("add lock")
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
     destination = (
         repo_path / output_arg if output_arg is not None else repo_path / "data" / "b" / "tree"
     )
@@ -565,7 +566,8 @@ def test_restore_targets_from_revision_force_refuses_output_holding_tracked_file
 def test_restore_file_target_force_relative_output_refuses_tracked_directory(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A relative `pivot get --force -o` cannot replace a directory holding tracked input."""
+    """A relative `pivot get --force -o` (from the working directory) cannot replace a directory
+    holding tracked input."""
     repo_path, commit = git_repo
     source = repo_path / "source.txt"
     source.write_text("source data")
@@ -578,6 +580,7 @@ def test_restore_file_target_force_relative_output_refuses_tracked_directory(
     )
     sha = commit("add tracked source")
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
     destination = repo_path / "data" / "b" / "tree"
     saved = destination / "saved.txt"
     saved.parent.mkdir(parents=True)

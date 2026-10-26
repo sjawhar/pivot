@@ -18,7 +18,7 @@ from pivot.storage import cache, lock, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Collection, Mapping
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
@@ -112,6 +112,8 @@ def _restore_path_sync(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None = None,
+    *,
+    is_stage_output: bool = False,
 ) -> RestoreOutcome:
     """Restore a file or directory from cache (sync version).
 
@@ -123,12 +125,19 @@ def _restore_path_sync(
 
     Raises:
         click.ClickException: For immediate failures (path traversal, unknown target,
-            "already exists" without --force). Cache misses return ("missing", name)
-            instead of raising.
+            "already exists" without --force, a stage output that holds user-owned files).
+            Cache misses return ("missing", name) instead of raising.
     """
     with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
-            path, output_hash, cache_dir, checkout_modes, behavior, state_dir, lock_token
+            path,
+            output_hash,
+            cache_dir,
+            checkout_modes,
+            behavior,
+            state_dir,
+            lock_token,
+            is_stage_output=is_stage_output,
         )
 
 
@@ -140,6 +149,8 @@ def _restore_path_locked(
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None,
     lock_token: str | None,
+    *,
+    is_stage_output: bool = False,
 ) -> RestoreOutcome:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
     total = _file_count(output_hash)
@@ -196,6 +207,17 @@ def _restore_path_locked(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
+    # Only a restore over an existing stage output removes anything (--force, or an
+    # --only-missing swap): refuse it if a user's tracked file or sidecar is there
+    if is_stage_output and (path.exists() or path.is_symlink()):
+        try:
+            ownership.refuse_output_replacements(
+                project.get_project_root(),
+                [ownership.stage_output(path)],
+                lambda output_path: ownership.recorded_members(output_path, output_hash),
+            )
+        except exceptions.OutputOwnershipError as e:
+            raise click.ClickException(str(e)) from e
     success = cache.restore_from_cache(
         path,
         output_hash,
@@ -217,6 +239,8 @@ async def _checkout_files_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
+    *,
+    stage_output_paths: Collection[str] = (),
 ) -> list[RestoreOutcome]:
     """Restore files in parallel and return what each restore did.
 
@@ -239,6 +263,7 @@ async def _checkout_files_async(
                     checkout_modes,
                     behavior,
                     state_dir,
+                    is_stage_output=abs_path_str in stage_output_paths,
                 )
             outcomes.append(outcome)
             if callback:
@@ -374,10 +399,6 @@ async def _checkout_main_async(
     if targets:
         unique_targets = _dedupe_targets(targets)
         files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
-        ownership.refuse_output_replacements(
-            project.get_project_root(),
-            [pathlib.Path(path) for path in files if path in stage_outputs],
-        )
         return await _checkout_files_async(
             files,
             cache_dir,
@@ -385,13 +406,11 @@ async def _checkout_main_async(
             behavior,
             callback,
             state_dir=state_dir,
+            # A tracked target restores its own file, never a stage output's replacement
+            stage_output_paths={path for path in stage_outputs if path not in tracked_files},
         )
     else:
         # Checkout all tracked files and stage outputs
-        ownership.refuse_output_replacements(
-            project.get_project_root(),
-            [pathlib.Path(path) for path in stage_outputs],
-        )
         tracked_as_hashes: dict[str, HashInfo] = {
             path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
         }
@@ -424,6 +443,7 @@ async def _checkout_main_async(
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
+                stage_output_paths=stage_outputs.keys(),
             )
         )
         tracked, outputs = await asyncio.gather(t1, t2)

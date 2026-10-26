@@ -1734,6 +1734,7 @@ async def test_reload_bringing_in_owning_pipeline_keeps_tracked_file_and_sidecar
             assert pvt_path.exists()
             assert (
                 "Warning: tracked path 'data/b/tree/saved.txt' "
-                + "(sidecar 'data/b/tree/saved.txt.pvt') overlaps stage output 'data/b/tree'"
+                + "(sidecar 'data/b/tree/saved.txt.pvt') is inside output 'data/b/tree' "
+                + "of stage 'b/tree'"
             ) in caplog.text
             tg.cancel_scope.cancel()

@@ -1108,12 +1108,9 @@ class Engine:
         )
         # Warn once per run about a tracked file saved inside one of these outputs before track
         # refused that; the store fails the stage before it would remove the file
-        output_paths = [
-            store.resolve_display_path(out)
-            for stage_info in all_stages.values()
-            for out in stage_info["outs"]
-        ]
-        for warning in ownership.saved_input_warnings(project_root, output_paths):
+        for warning in ownership.saved_input_warnings(
+            project_root, all_stages, store, config.get_state_dir()
+        ):
             _logger.warning(warning)
         runnable, dep_errors = engine_graph.get_runnable_stages(
             all_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
@@ -1521,6 +1518,8 @@ class Engine:
                 cache_dir=cache_dir / "files",
                 stages=all_stages,
             )
+        except pivot_exceptions.OutputOwnershipError as exc:
+            _logger.warning("Presentation symlinks skipped: %s", exc)
         except Exception:
             _logger.debug("Presentation layer failed", exc_info=True)
 

@@ -48,14 +48,17 @@ def present(
     )
 
     links = dict[pathlib.Path, pathlib.Path]()
-    for _stage_name, info in stages.items():
+    replacements = list[ownership.Replacement]()
+    for stage_name, info in stages.items():
         for out in info["outs"]:
             ref_path = _ref_path(refs_dir, out)
             if ref_path.exists() or ref_path.is_symlink():
-                links[ws.resolve_display_path(out)] = ref_path
+                display_path = ws.resolve_display_path(out)
+                links[display_path] = ref_path
+                replacements.append(ownership.stage_output(display_path, stage_name))
 
     # Replacing a display path removes what is there: refuse before any is replaced
-    ownership.refuse_output_replacements(project_root, list(links))
+    ownership.refuse_output_replacements(project_root, replacements)
     for display_path, ref_path in links.items():
         _ensure_symlink(display_path, ref_path)
 

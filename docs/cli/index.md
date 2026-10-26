@@ -40,7 +40,7 @@ All commands support:
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
 project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
-`../data/x.csv`.
+`../data/x.csv`. `pivot get --output` reads its path from the current directory.
 
 An absolute path that reaches the project through a symlink outside it counts as the place it
 points to in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch`, `pull` and `track`. The
@@ -396,15 +396,20 @@ pivot track PATHS... [OPTIONS]
 Creates `.pvt` manifest files for tracking files outside of stage outputs.
 
 `pivot track` loads every pipeline in the project and refuses a new path that overlaps a
-declared output of any of them, including pipelines this directory does not select. A file
-tracked or imported inside an output before this check stays where it is: `pivot status` and
-`pivot repro` (with `--all` for another pipeline's output) warn once per run naming it, `pivot
-track --force` updates it in place with the same warning, and any stage write, restore, commit or
-checkout that would remove a tracked or imported file and its `.pvt` sidecar fails before changing
-anything. A stage that explicitly returns a directory member named `.pvt` can write that member;
-every other `.pvt` under the output is protected. Move the file and its `.pvt` sidecar outside the
-output (for example under `data/raw/`). The check finds a sidecar beside its file, where Pivot
-writes it; a hand-edited `.pvt` elsewhere whose `path` points into an output is not protected.
+declared output of any of them, including pipelines this directory does not select, and names
+the stage that writes that output. A `pipeline.py` that fails to load makes `pivot track` and
+`pivot import` refuse until it is fixed; one that loads but defines no Pivot pipeline declares no
+outputs. A file tracked or imported inside an output before this check stays where it is:
+`pivot status` and `pivot repro` (with `--all` for another pipeline's output) warn once per run
+naming it, `pivot track --force` updates it in place with the same warning, and any stage write,
+restore, commit, forced checkout or forced `pivot get` that would remove it or its `.pvt` sidecar
+fails before changing anything. Move the file and its `.pvt` sidecar outside the output (for
+example under `data/raw/`). The check finds a sidecar beside its file, where Pivot writes it; a
+hand-edited `.pvt` elsewhere whose `path` points into an output is not protected.
+
+A stage may return a directory member named `*.pvt`. Pivot treats such a file as the stage's
+when the stage's lock or current run records it at that path, and every other `.pvt` under an
+output as a user's sidecar.
 
 ---
 
@@ -432,8 +437,9 @@ pivot checkout [TARGETS...] [OPTIONS]
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
 
-Checkout refuses before it replaces a stage output that contains a tracked file or `.pvt`
-sidecar, even with `--force`.
+A checkout that would replace an existing stage output holding a tracked file or `.pvt` sidecar
+(`--force`, or an `--only-missing` directory swap) refuses for that output and restores the
+rest. Without `--force`, checkout never replaces an existing output, so it refuses nothing new.
 
 ---
 
@@ -456,7 +462,7 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 | `--rev` / `-r REV` | Git revision (SHA, branch, tag) - required |
 | `--output` / `-o PATH` | Output path (single file only) |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
-| `--force` / `-f` | Overwrite existing files |
+| `--force` / `-f` | Overwrite existing files. Refuses, before changing anything, when the replaced path is a stage output or an `--output` path that holds a tracked file or `.pvt` sidecar; a tracked file restored to its own path is always overwritten |
 
 **Examples:**
 
@@ -467,7 +473,7 @@ pivot get data/demo/train.jsonl --rev abc123
 # Get stage output from branch
 pivot get demo/train --rev feature-branch
 
-# Get with custom output path
+# Get with custom output path (relative to the current directory)
 pivot get data/demo/train.jsonl --rev v1.0 --output old_train.jsonl
 ```
 

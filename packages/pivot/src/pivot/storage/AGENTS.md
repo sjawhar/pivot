@@ -113,23 +113,41 @@ When multiple `pivot` processes share the same StateDB:
 - Pivot replaces only what it owns. A tracked file, an imported file and their `.pvt` sidecars
   are the user's, even when one sits inside a stage output.
 - Every path that removes or replaces a stage output in the workspace calls
-  `ownership.refuse_output_replacements` (through `WorkspaceStore.refuse_output_replacements`
-  inside the store) before it removes anything: a stage's output write
-  (`WorkspaceStore.prepare_outputs`, all of a stage's outputs at once), a restore, a commit, an
-  incremental output's restore, `pivot checkout`, `pivot get --force` (including `-o`) and the
-  presentation layer. It raises `OutputOwnershipError` naming each file. Add the call to any new
-  path that removes an output.
-- The check looks only where a replacement reaches: every `*.pvt` under a real output directory,
-  parsed or not, and the sidecars of the output and of each directory above it. A stage that
-  explicitly returns a directory member named `.pvt` gives its exact path to the store as a
-  generated member, so that member can be committed; every other `.pvt` is protected. The check
-  never walks the project. So it does not see a `.pvt` outside an output whose `path` field names
-  a file inside it. Pivot never writes one (`track`, `import` and `update` write the data file's
-  own name), and catching a hand-edited one would need a project-wide walk on every output write.
+  `ownership.refuse_output_replacements` before it removes anything and raises
+  `OutputOwnershipError` naming each file. A stage's output write checks all of the stage's
+  outputs first (`worker._write_outputs_with_store` → `WorkspaceStore.refuse_output_replacements`),
+  then each one again in `WorkspaceStore.prepare_output` just before clearing it. Also checked:
+  `WorkspaceStore.restore_from_cache` (generation, lock and run-cache restores),
+  `WorkspaceStore.commit` (the stage's own commit and `pivot commit`), an incremental output's
+  restore, `pivot checkout` and `pivot pull` (in `_restore_path_locked`, only when a restore
+  replaces an existing stage output: `--force`, or an `--only-missing` swap), `pivot get --force`
+  and the presentation layer. Add the call to any new path that removes an output.
+- `pivot get --force` of a tracked or git file to its own path is that file's own restore and is
+  not checked; a stage output restored to its own path is; an `--output` path (relative to the
+  working directory) is checked as a destination the user named.
+- The check looks only where a replacement reaches: the sidecar beside the output and beside each
+  directory above it (one that does not parse counts; one that parses counts when it names that
+  path), and every `*.pvt` under a real output directory. It never walks the project, so it does
+  not see a `.pvt` outside an output whose `path` field names a file inside it. Pivot never writes
+  one (`track`, `import` and `update` write the data file's own name), and catching a hand-edited
+  one would need a project-wide walk on every output write.
+- A stage may return a directory member named `*.pvt`. One is the stage's own when the stage
+  records it (`ownership.StageMembers`): the lock's output hash, the hash a restore writes, or this
+  run's return value. At a recorded path, a `.pvt` that does not parse is the stage's, and one that
+  parses is the stage's only if its content is a recorded one; a `.pvt` at any other path is the
+  user's. A commit records what is on disk, so it also gives the stage every `.pvt` that does not
+  parse. `status` and the engine read the lock for this only when an output holds a `*.pvt`.
+- The check runs when a command starts replacing an output, not again just before each removal,
+  for a restore, a symlink-mode commit, checkout, `get --force` and presentation; a sidecar created
+  inside an output during that window is not seen. That is acceptable because `track` and
+  `import` refuse to create a sidecar inside an output, so only a hand-made file can appear there.
 - `track` and `import` load every pipeline (`discovery.declared_outputs`, as `--all` discovers
-  them) and refuse a new path overlapping any declared output. Re-tracking (`track --force`) or
-  re-importing (`import --force`) a path already saved there warns and updates it in place.
-  `status` and the engine warn, once per run, about a sidecar already inside an output they load.
+  them) and refuse a new path overlapping any declared output, naming the stage. A `pipeline.py`
+  that fails to load fails them; one that loads but defines no Pivot pipeline declares nothing. A
+  `pipeline.py` in a directory discovery excludes (`venv/`, `node_modules/`, …) is not counted;
+  the store's check still protects its outputs. Re-tracking (`track --force`) or re-importing
+  (`import --force`) a path already saved there warns and updates it in place. `status` and the
+  engine warn, once per run, about a sidecar already inside an output they load.
 
 ## Path Storage
 

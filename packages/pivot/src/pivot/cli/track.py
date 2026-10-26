@@ -22,7 +22,7 @@ class TrackResult(TypedDict):
 def _track_single_path(
     path_str: str,
     cache_dir: pathlib.Path,
-    stage_outputs_resolved: dict[str, pathlib.Path],
+    stage_outputs: dict[str, ownership.DeclaredOutput],
     existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
     *,
@@ -74,30 +74,22 @@ def _track_single_path(
 
     # Check for overlap with stage outputs (resolve paths to detect symlink aliasing)
     try:
-        user_resolved = path.resolve()
+        overlap = ownership.find_declared_overlap(path, stage_outputs, project_root)
     except OSError as e:
         raise click.ClickException(repr(e)) from e
-
-    for out_norm, out_resolved in stage_outputs_resolved.items():
-        if not ownership.paths_overlap(user_resolved, out_resolved):
-            continue
-        # Provide helpful error showing both normalized and resolved if different
-        if str(user_resolved) != abs_path_str or str(out_resolved) != out_norm:
-            # Symlink aliasing detected
-            overlap = (
-                f"'{path_str}' (resolves to '{user_resolved}') overlaps with stage output "
-                + f"'{out_norm}' (resolves to '{out_resolved}')"
-            )
-        else:
-            overlap = f"'{path_str}' overlaps with stage output '{out_norm}'"
+    if overlap is not None:
         if not already_tracked:
-            raise click.ClickException(f"Cannot track {overlap}")
+            raise click.ClickException(
+                f"Cannot track '{path_str}': {overlap}, and that stage replaces its output when "
+                + "it runs. Move it outside every stage output (for example under data/raw/) "
+                + "and track it there."
+            )
         # A file tracked there before this check existed: update it, and warn, as status does
         warnings.append(
-            f"Warning: {overlap}. Move it and its .pvt sidecar outside the output (for "
-            + "example under data/raw/); until then Pivot refuses to replace that output."
+            f"Warning: '{path_str}' is tracked inside a stage output: {overlap}. Move it and "
+            + "its .pvt sidecar outside every stage output (for example under data/raw/); until "
+            + "then Pivot refuses to replace that output."
         )
-        break
     warning = "\n".join(warnings) if warnings else None
 
     # Hash and cache

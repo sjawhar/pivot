@@ -439,23 +439,25 @@ async def import_artifact(
         raise exceptions.PivotError(f"'{pvt_path}' already exists. Use --force to overwrite.")
 
     # Any pipeline's output, loaded or not: running it would remove the import and its sidecar
-    resolved_destination = data_path.resolve()
-    for output, resolved_output in discovery.declared_outputs(project_root).items():
-        if not ownership.paths_overlap(resolved_destination, resolved_output):
-            continue
-        overlap = f"'{data_path}' overlaps with stage output '{output}'"
+    overlap = ownership.find_declared_overlap(
+        data_path, discovery.declared_outputs(project_root), project_root
+    )
+    shown = project.relative_within(data_path, project_root) or data_path
+    if overlap is not None:
         if not pvt_path.exists():
             raise exceptions.OutputOwnershipError(
-                f"Cannot import to {overlap}. "
-                + "Import to a path outside every stage output, such as data/raw/."
+                f"Cannot import to '{shown}': {overlap}, and that stage replaces its output "
+                + "when it runs. Import to a path outside every stage output (for example under "
+                + "data/raw/)."
             )
         # An import made there before this check existed: update it, and warn, as status does
         logger.warning(
-            "%s. Move it and its .pvt sidecar outside the output (for example under data/raw/); "
-            + "until then Pivot refuses to replace that output.",
+            "'%s' was imported inside a stage output: %s. Move it and its .pvt sidecar outside "
+            + "every stage output (for example under data/raw/); until then Pivot refuses to "
+            + "replace that output.",
+            shown,
             overlap,
         )
-        break
 
     if force and data_path.exists() and data_path.is_dir():
         raise exceptions.PivotError("Cannot overwrite directory with import")

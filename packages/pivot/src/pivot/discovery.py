@@ -18,6 +18,7 @@ import cloudpickle
 
 from pivot import exceptions, fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
+from pivot.storage import ownership
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
@@ -31,6 +32,10 @@ PIPELINE_PY_NAME: Final = "pipeline.py"
 
 class DiscoveryError(Exception):
     """Error during pipeline discovery."""
+
+
+class NotPivotPipelineError(DiscoveryError):
+    """A pipeline.py whose ``pipeline`` variable is not a Pivot pipeline: it declares nothing."""
 
 
 # Import machinery is process-global. This session record is the narrow ownership boundary:
@@ -552,10 +557,10 @@ def _load_pipeline_from_module(
                 required = sorted(get_protocol_members(PipelineLike))
                 missing = [attr for attr in required if not hasattr(pipeline_obj, attr)]
                 if missing:
-                    raise DiscoveryError(
+                    raise NotPivotPipelineError(
                         f"{path} defines 'pipeline' but it's missing required methods: {missing}"
                     )
-                raise DiscoveryError(
+                raise NotPivotPipelineError(
                     f"{path} defines 'pipeline' but it doesn't satisfy the Pipeline interface "
                     + f"(got {type(pipeline_obj).__name__})"
                 )
@@ -602,15 +607,20 @@ def _discover_all_pipelines(
                 raise DiscoveryError(f"Pipeline {path} called sys.exit({e.code})") from e
             logger.warning(f"--all: pipeline {path} called sys.exit({e.code}), skipping")
             continue
+        except NotPivotPipelineError as e:
+            # A module named pipeline.py whose `pipeline` is not a Pivot pipeline declares no
+            # stage and no output, so even strict discovery (track, import) skips it
+            _log_skipped_module(
+                strict, f"--all: failed to load pipeline from {path}, skipping ({e})"
+            )
+            continue
         except Exception as e:
             if strict:
                 raise DiscoveryError(f"Failed to load pipeline from {path}: {e}") from e
             logger.warning(f"--all: failed to load pipeline from {path}, skipping ({e})")
             continue
         if pipeline is None:
-            if strict:
-                raise DiscoveryError(f"Pipeline {path} does not define a 'pipeline' variable")
-            logger.warning(f"--all: failed to load pipeline from {path}, skipping")
+            _log_skipped_module(strict, f"--all: failed to load pipeline from {path}, skipping")
             continue
         # A pipeline name names .pivot/stages/<name>/ and data/<name>/, so two files
         # declaring one name would silently share stages, locks and outputs. A file that
@@ -716,13 +726,24 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
     return results
 
 
-def declared_outputs(project_root: pathlib.Path) -> dict[str, pathlib.Path]:
-    """Map every output declared by every pipeline in the project to its resolved path.
+def _log_skipped_module(strict: bool, message: str) -> None:
+    """Log a pipeline.py that declares no Pivot pipeline: a warning for ``--all``, quiet for the
+    strict discovery ``track`` and ``import`` run, where such a module is no problem."""
+    if strict:
+        logger.debug(message)
+    else:
+        logger.warning(message)
+
+
+def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.DeclaredOutput]:
+    """Map every output declared by every pipeline in the project to where it resolves and the
+    stage that writes it.
 
     Pipelines are discovered as ``--all`` discovers them, so an output of a pipeline the command
-    did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them.
-    Keys are the normalized workspace paths; values are resolved, to catch a path that reaches an
-    output through a symlink.
+    did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them. A
+    ``pipeline.py`` that fails to load fails this call; one that loads but defines no Pivot
+    pipeline declares nothing. Keys are the normalized workspace paths; resolved paths catch a
+    path that reaches an output through a symlink.
 
     Raises:
         exceptions.ValidationError: Naming every output path that cannot be resolved, or the
@@ -740,16 +761,19 @@ def declared_outputs(project_root: pathlib.Path) -> dict[str, pathlib.Path]:
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
     )
-    normalized = {
-        str(workspace.resolve_display_path(out))
+    stage_by_path = {
+        str(workspace.resolve_display_path(out)): stage_name
         for stage_name in pipeline.list_stages()
         for out in pipeline.get_stage(stage_name)["outs"]
     }
-    resolved = dict[str, pathlib.Path]()
+    resolved = dict[str, ownership.DeclaredOutput]()
     errors = list[str]()
-    for path in sorted(normalized):
+    for path in sorted(stage_by_path):
         try:
-            resolved[path] = project.resolve_path_for_comparison(path, "stage output")
+            resolved[path] = ownership.DeclaredOutput(
+                resolved=project.resolve_path_for_comparison(path, "stage output"),
+                stage=stage_by_path[path],
+            )
         except (PermissionError, RuntimeError, OSError) as exc:
             errors.append(f"  - {path}: {exc}")
     if errors:

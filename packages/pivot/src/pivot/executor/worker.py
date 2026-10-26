@@ -55,7 +55,7 @@ from pivot import (
     stage_def,
     types,
 )
-from pivot.storage import artifact_lock, cache, lock, state
+from pivot.storage import artifact_lock, cache, lock, ownership, state
 from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
@@ -902,6 +902,9 @@ def _execute_stage(
                             store,
                             state_db,
                             state_dir=project_state_dir,
+                            recorded_hashes=(
+                                lock_data["output_hashes"] if lock_data is not None else None
+                            ),
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -943,7 +946,7 @@ def _execute_stage(
 
                 covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
                 with _track_stage_imports(covered_modules) as stage_imports:
-                    output_paths = _run_stage_function_with_store(
+                    written = _run_stage_function_with_store(
                         stage_info["func"],
                         stage_name,
                         output_queue,
@@ -960,6 +963,7 @@ def _execute_stage(
                         project_state_dir,
                         project_root,
                     )
+                output_paths = written["paths"]
                 # A @no_fingerprint stage declares its code as files (`code_deps`); that
                 # declaration is its contract, so its imports are not checked.
                 uncovered = (
@@ -991,7 +995,7 @@ def _execute_stage(
                     )
                 else:
                     output_hashes = _commit_outputs_with_store(
-                        output_paths, store, project_state_dir
+                        output_paths, store, project_state_dir, written["pvt_members"]
                     )
                     for ref, path in output_paths.items():
                         file_hash_entries.extend(
@@ -1200,6 +1204,7 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: Literal[False] = False,
     file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    recorded_hashes: dict[types.ArtifactIdentity, HashInfo] | None = None,
 ) -> bool: ...
 
 
@@ -1214,6 +1219,7 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: Literal[True],
     file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    recorded_hashes: dict[types.ArtifactIdentity, HashInfo] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -1227,11 +1233,14 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: bool = False,
     file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    recorded_hashes: dict[types.ArtifactIdentity, HashInfo] | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
     ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file
     restored from the cache, so the next check finds it without reading it.
+    ``recorded_hashes`` are the lock's hashes when ``output_hashes`` differ from them (a
+    run-cache restore); the ``*.pvt`` members either records are the stage's own.
     """
     unavailable = list[types.ArtifactRef]()
     empty_dirs_unrecorded = list[types.ArtifactRef]()
@@ -1261,7 +1270,16 @@ def restore_outputs_to_hashes(
                     to_restore.append(ref)
                     if not restore:
                         continue
-                    if store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
+                    if store.restore_from_cache(
+                        ref,
+                        expected_hash,
+                        state_dir=state_dir,
+                        recorded_hash=(
+                            recorded_hashes.get(ref.identity)
+                            if recorded_hashes is not None
+                            else None
+                        ),
+                    ):
                         outputs_restored = True
                         if file_hash_entries is not None:
                             file_hash_entries.extend(
@@ -1550,13 +1568,32 @@ def _check_output_value(
     return value
 
 
+class WrittenOutputs(TypedDict):
+    """A stage's written outputs, and in each directory output the ``*.pvt`` files it wrote."""
+
+    paths: dict[types.ArtifactRef, pathlib.Path]
+    pvt_members: dict[types.ArtifactRef, ownership.StageMembers]
+
+
+def _returned_pvt_members(
+    store: store_mod.WorkspaceStore, ref: types.ArtifactRef, members: Any
+) -> set[pathlib.Path]:
+    """The ``*.pvt`` paths a directory output's checked ``(path, value)`` pairs write."""
+    output_path = ownership.normalized(store.resolve_display_path(ref))
+    return {
+        output_path / relpath
+        for relpath, _ in cast("list[tuple[str, Any]]", members)
+        if relpath.endswith(".pvt")
+    }
+
+
 def _write_outputs_with_store(
     output_values: dict[types.ArtifactRef, Any],
     store: store_mod.Store,
     project_root: pathlib.Path,
     dependency_paths: collections_abc.Collection[pathlib.Path] = (),
     previous_output_hashes: dict[types.ArtifactIdentity, HashInfo] | None = None,
-) -> dict[types.ArtifactRef, pathlib.Path]:
+) -> WrittenOutputs:
     """Write a stage's outputs once every one of them has passed its checks.
 
     A refused value (a directory output's key, a PathOnly path inside the project) fails the
@@ -1566,51 +1603,45 @@ def _write_outputs_with_store(
         ref: _check_output_value(ref, value, project_root, dependency_paths)
         for ref, value in output_values.items()
     }
-    ignored_pvt_by_ref = dict[types.ArtifactRef, set[pathlib.Path]]()
+    returned = dict[types.ArtifactRef, set[pathlib.Path]]()
+    members = dict[types.ArtifactRef, ownership.StageMembers]()
     if isinstance(store, store_mod.WorkspaceStore):
         for ref, value in checked.items():
             if ref.tag is not types.ArtifactTag.DIRECTORY:
                 continue
-            expected_hash = (
+            # A `*.pvt` the lock records, or one this run returns, is the stage's own: one Pivot
+            # cannot parse is replaced, one that parses only if the lock recorded its content
+            recorded = (
                 previous_output_hashes.get(ref.identity)
                 if previous_output_hashes is not None
                 else None
             )
-            previous_members = (
-                {entry["relpath"]: entry["hash"] for entry in expected_hash["manifest"]}
-                if expected_hash is not None and "manifest" in expected_hash
-                else {}
-            )
-            for relpath, _ in cast("list[tuple[str, Any]]", value):
-                if not relpath.endswith(".pvt"):
-                    continue
-                candidate = store.resolve_display_path(ref) / relpath
-                if not candidate.exists() or (
-                    relpath in previous_members
-                    and cache.hash_file(candidate)[0] == previous_members[relpath]
-                ):
-                    ignored_pvt_by_ref.setdefault(ref, set[pathlib.Path]()).add(candidate)
-        ignored_pvt_paths = set[pathlib.Path]()
-        for paths in ignored_pvt_by_ref.values():
-            ignored_pvt_paths.update(paths)
+            returned[ref] = _returned_pvt_members(store, ref, value)
+            members[ref] = ownership.recorded_members(store.resolve_display_path(ref), recorded)
+            for path in returned[ref]:
+                members[ref].setdefault(path, frozenset())
         # Check all workspace outputs first, so an ownership refusal changes none of the stage's
         # previous outputs. Each output is prepared immediately before its writer runs, preserving
         # sibling outputs if that writer raises.
-        store.refuse_output_replacements(checked, ignored_pvt_paths)
-    return {
-        ref: _write_output_with_store(ref, value, store, ignored_pvt_by_ref.get(ref))
+        store.refuse_output_replacements(checked, members)
+    paths = {
+        ref: _write_output_with_store(ref, value, store, members.get(ref))
         for ref, value in checked.items()
     }
+    return WrittenOutputs(
+        paths=paths,
+        pvt_members={ref: dict.fromkeys(written) for ref, written in returned.items() if written},
+    )
 
 
 def _write_output_with_store(
     ref: types.ArtifactRef,
     value: Any,
     store: store_mod.Store,
-    ignored_pvt_paths: set[pathlib.Path] | None = None,
+    members: ownership.StageMembers | None = None,
 ) -> pathlib.Path:
     if isinstance(store, store_mod.WorkspaceStore):
-        output_path = store.prepare_output(ref, ignored_pvt_paths=ignored_pvt_paths)
+        output_path = store.prepare_output(ref, members=members)
     else:
         output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
@@ -1723,7 +1754,9 @@ def _prepare_incremental_inputs(
                 + "to reset this incremental output."
             )
         output_path = store.resolve_display_path(ref)
-        store.refuse_output_replacements([ref])
+        store.refuse_output_replacements(
+            [ref], {ref: ownership.recorded_members(output_path, output_hash)}
+        )
         cache.remove_output(output_path)
         if not store.restore_from_cache(
             ref,
@@ -1756,7 +1789,7 @@ def _run_stage_function_with_store(
     state_dir: pathlib.Path,
     project_state_dir: pathlib.Path,
     project_root: pathlib.Path,
-) -> dict[types.ArtifactRef, pathlib.Path]:
+) -> WrittenOutputs:
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
         _QueueWriter(stage_name, output_queue, is_stderr=True, ring_buffer=ring_buffer),
@@ -1828,13 +1861,19 @@ def _commit_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
     project_state_dir: pathlib.Path,
+    written_members: dict[types.ArtifactRef, ownership.StageMembers] | None = None,
 ) -> dict[str, HashInfo]:
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if isinstance(store, store_mod.WorkspaceStore):
-            output_hash = store.commit(ref, path, state_dir=project_state_dir)
+            output_hash = store.commit(
+                ref,
+                path,
+                state_dir=project_state_dir,
+                members=written_members.get(ref) if written_members is not None else None,
+            )
         else:
             output_hash = store.commit(ref, path)
         output_hashes[types.identity_key(ref.identity)] = output_hash
@@ -2256,6 +2295,7 @@ def _try_skip_via_run_cache_with_store(
     state_db: state.StateDB,
     *,
     state_dir: pathlib.Path,
+    recorded_hashes: dict[types.ArtifactIdentity, HashInfo] | None = None,
 ) -> RunCacheSkipResult | None:
     """Restore all cached outputs from a matching run-cache entry."""
     if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
@@ -2281,6 +2321,7 @@ def _try_skip_via_run_cache_with_store(
         state_dir=state_dir,
         report_changes=True,
         file_hash_entries=restored_entries,
+        recorded_hashes=recorded_hashes,
     )
     if not restoration.available:
         return None

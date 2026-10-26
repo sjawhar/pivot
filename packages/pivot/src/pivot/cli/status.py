@@ -66,13 +66,12 @@ def status(
     project_root = project.get_project_root()
     if pipeline is not None and not quiet:
         # Warn, refusing nothing, about a tracked file saved in an output before track refused it
-        workspace = cli_helpers.require_workspace_store()
-        output_paths = [
-            workspace.resolve_display_path(out)
-            for stage_info in cli_helpers.get_all_stages().values()
-            for out in stage_info["outs"]
-        ]
-        for warning in ownership.saved_input_warnings(project_root, output_paths):
+        for warning in ownership.saved_input_warnings(
+            project_root,
+            cli_helpers.get_all_stages(),
+            cli_helpers.require_workspace_store(),
+            config.get_state_dir(),
+        ):
             click.echo(warning, err=True)
     resolved_cache_dir = config.get_cache_dir()
 

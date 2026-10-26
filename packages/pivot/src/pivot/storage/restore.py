@@ -351,6 +351,65 @@ def restore_file(
     )
 
 
+def _current_output_hashes(stage_target: StageTarget) -> dict[str, HashInfo]:
+    """The hashes the stage's current lock records, by workspace path relative to the root."""
+    lock_data = lock.StageLock(
+        stage_target["stage_name"], lock.get_stages_dir(stage_target["state_dir"])
+    ).read()
+    if lock_data is None:
+        return {}
+    recorded_paths = (
+        lock_data["output_paths"]
+        if "output_paths" in lock_data
+        else dict[types.ArtifactIdentity, str]()
+    )
+    hashes = dict[str, HashInfo]()
+    for identity, output_hash in lock_data["output_hashes"].items():
+        path = recorded_paths.get(identity) or stage_target["paths_by_key"].get(identity.key)
+        if path is not None:
+            hashes[path] = output_hash
+    return hashes
+
+
+def _refuse_forced_replacements(
+    proj_root: pathlib.Path,
+    target_infos: list[TargetInfo],
+    output: pathlib.Path | None,
+    stage_targets: Mapping[str, StageTarget],
+) -> None:
+    """Fail before ``--force`` replaces a path holding a user's tracked file or sidecar.
+
+    A tracked or git file restored to its own path is that file's own restore and is not
+    checked. A stage output restored to its own path is checked with the stage's own ``*.pvt``
+    members, as the revision's and the current lock record them. An ``--output`` path is
+    checked as a destination the user named.
+    """
+    replacements = list[ownership.Replacement]()
+    members = dict[pathlib.Path, ownership.StageMembers]()
+    for target_info in target_infos:
+        current = (
+            _current_output_hashes(stage_targets[target_info["original_target"]])
+            if target_info["target_type"] is TargetType.STAGE
+            else {}
+        )
+        for rel_path in target_info["paths"]:
+            own_path = proj_root / rel_path
+            dest_path = output if output is not None else own_path
+            if not (dest_path.exists() or dest_path.is_symlink()):
+                continue
+            if dest_path != own_path:
+                replacements.append(ownership.destination(dest_path))
+            elif target_info["target_type"] is TargetType.STAGE:
+                stage_name = stage_targets[target_info["original_target"]]["stage_name"]
+                replacements.append(ownership.stage_output(dest_path, stage_name))
+                members[ownership.normalized(dest_path)] = ownership.recorded_members(
+                    dest_path, target_info["hashes"].get(rel_path), current.get(rel_path)
+                )
+    ownership.refuse_output_replacements(
+        proj_root, replacements, lambda path: members.get(path, {})
+    )
+
+
 def restore_targets_from_revision(
     targets: Sequence[str],
     rev: str,
@@ -362,10 +421,13 @@ def restore_targets_from_revision(
 ) -> tuple[list[str], bool]:
     """Restore targets from a git revision.
 
+    A relative ``output`` is relative to the working directory.
+
     Returns:
         Tuple of (messages, success) where success is False if any files failed.
     """
     proj_root = project.get_project_root()
+    output_path = pathlib.Path(os.path.abspath(output)) if output is not None else None
 
     # Validate revision exists
     commit_sha = git.resolve_revision(rev)
@@ -382,30 +444,16 @@ def restore_targets_from_revision(
         if len(target_infos[0]["paths"]) != 1:
             raise exceptions.GetError("--output/-o can only be used with a single output")
 
-    # Only --force replaces an existing stage output; check the complete replacement set first,
-    # including an explicitly named `pivot get --output` destination.
+    # Only --force replaces an existing path; check every one before any is replaced
     if force:
-        ownership.refuse_output_replacements(
-            proj_root,
-            [
-                project.normalize_path(output, base=proj_root)
-                if output is not None
-                else proj_root / path
-                for target_info in target_infos
-                for path in target_info["paths"]
-            ],
-        )
+        _refuse_forced_replacements(proj_root, target_infos, output_path, stage_targets)
 
     results = list[RestoreResult]()
 
     for target_info in target_infos:
         for rel_path in target_info["paths"]:
             output_hash = target_info["hashes"].get(rel_path)
-            dest_path = (
-                project.normalize_path(output, base=proj_root)
-                if output is not None
-                else proj_root / rel_path
-            )
+            dest_path = output_path if output_path is not None else proj_root / rel_path
 
             result = restore_file(
                 rel_path=rel_path,
