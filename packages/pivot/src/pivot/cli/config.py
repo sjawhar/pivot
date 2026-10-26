@@ -74,6 +74,9 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         _raise_for_non_string_state_dir(config.load_config_file(config.get_local_config_path()))
         merged = config.get_merged_config()
         data = merged.model_dump()
+        # As `config get cache.dir` shows it: an unset value is this invocation's
+        # `<state dir>/cache`, which the process-wide merged config does not hold.
+        data["cache"]["dir"], _ = config.get_config_value("cache.dir")
 
     if output_json:
         click.echo(json.dumps(data, indent=2))

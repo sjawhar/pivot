@@ -235,6 +235,32 @@ if __name__ == "__main__":
     main()
 """
 
+# Fingerprints a pipeline, edits the value, then loads the pipeline again and fingerprints it
+# again, with no flush that closes the readonly lookup database between the two loads.
+_FINGERPRINTS_AFTER_A_NEW_LOAD_CALLER = """\
+import os
+import pathlib
+import sys
+
+
+def main() -> None:
+    os.chdir(sys.argv[1])
+
+    from pivot import discovery
+
+    pipeline = discovery.discover_pipeline()
+    for name in pipeline.list_stages():
+        pipeline.ensure_fingerprint(name)
+    pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
+    pipeline = discovery.discover_pipeline()
+    for name in pipeline.list_stages():
+        pipeline.ensure_fingerprint(name)
+
+
+if __name__ == "__main__":
+    main()
+"""
+
 
 def _reload_pipeline(count: int) -> str:
     """A pipeline of ``count`` independent stages that reports the start of its import."""
@@ -455,3 +481,20 @@ def test_direct_fingerprints_of_one_pipeline_use_the_state_dir_it_loaded_with(
     )
     assert _cached_keys(root / "libstate", b"sm:") == 2, ran.stdout + ran.stderr
     assert _cached_keys(root / "libstate", b"fp:") == 4, ran.stdout + ran.stderr
+
+
+def test_a_pipeline_loaded_after_an_edit_reads_and_fills_the_new_state_dir_s_caches(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The fingerprint caches are read where a miss would file its entry: the first pipeline's
+    directory holds what its lookups found there, and the second pipeline, loaded after the
+    edit, finds nothing in `otherstate` and so fills it with entries of its own."""
+    home, root = _project(tmp_path, "libstate")
+    (root / "pipeline.py").write_text(_TWO_INDEPENDENT_STAGES)
+
+    ran = _run_library_caller(tmp_path, home, root, _FINGERPRINTS_AFTER_A_NEW_LOAD_CALLER)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    for state_dir in ("libstate", "otherstate"):
+        assert _cached_keys(root / state_dir, b"sm:") == 2, (state_dir, ran.stderr)
+        assert _cached_keys(root / state_dir, b"fp:") == 4, (state_dir, ran.stderr)

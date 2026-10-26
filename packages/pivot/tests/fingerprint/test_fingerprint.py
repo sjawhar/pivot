@@ -2101,7 +2101,7 @@ def test_persistent_cache_full_roundtrip(tmp_path, monkeypatch):
 
     # Patch project root and state db path
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     # Reset fingerprint module state
     fingerprint._pending_ast_writes.clear()
@@ -2202,7 +2202,8 @@ def test_graceful_degradation_when_statedb_unavailable(tmp_path, monkeypatch):
     # Patch to simulate StateDB unavailable (init throws)
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr(
-        "pivot.config.io.get_state_dir",
+        fingerprint,
+        "_producing_state_dir",
         lambda: tmp_path / "nonexistent" / "deeply" / "nested",
     )
 
@@ -2258,7 +2259,7 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
     with state.StateDB(db_path) as db:
         pass
 
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     # Reset fingerprint module state
     fingerprint._pending_ast_writes.clear()
@@ -2717,7 +2718,7 @@ def test_manifest_cache_hit(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     # Reset fingerprint state
     fingerprint._pending_ast_writes.clear()
@@ -2779,7 +2780,7 @@ def test_manifest_cache_miss_on_source_change(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._pending_ast_writes.clear()
     fingerprint._pending_manifest_writes.clear()
@@ -2851,7 +2852,7 @@ def test_manifest_cache_miss_on_file_deleted(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._pending_ast_writes.clear()
     fingerprint._pending_manifest_writes.clear()
@@ -2922,7 +2923,7 @@ def test_manifest_cache_non_file_backed_function(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._pending_ast_writes.clear()
     fingerprint._pending_manifest_writes.clear()
@@ -3012,7 +3013,8 @@ def test_flush_manifest_cache_failure_restores_pending(tmp_path, monkeypatch):
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory")
     monkeypatch.setattr(
-        "pivot.config.io.get_state_dir",
+        fingerprint,
+        "_producing_state_dir",
         lambda: blocker / "subdir",
     )
 
@@ -3046,7 +3048,7 @@ def test_try_manifest_cache_hit_corrupted_json(tmp_path, monkeypatch):
         db.put_raw(key, b"NOT VALID JSON {{{")
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3174,7 +3176,7 @@ def test_try_manifest_cache_hit_non_dict_json(tmp_path, monkeypatch):
         db.put_raw(key, b"[1, 2, 3]")  # Valid JSON, but not a dict
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3202,7 +3204,7 @@ def test_try_manifest_cache_hit_missing_m_or_s_keys(tmp_path, monkeypatch):
         db.put_raw(key, b'{"m": {"self:x": "hash"}}')  # Missing "s" key
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3230,7 +3232,7 @@ def test_try_manifest_cache_hit_empty_sources_forces_recompute(tmp_path, monkeyp
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{}}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3267,7 +3269,7 @@ def test_try_manifest_cache_hit_source_entry_not_a_digest(tmp_path, monkeypatch)
         )
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3296,7 +3298,7 @@ def test_try_manifest_cache_hit_path_traversal_blocked(tmp_path, monkeypatch):
         db.put_raw(key, b'{"m":{"self:x":"hash"},"s":{"/etc/passwd":"0123456789abcdef"},"r":[]}')
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3351,7 +3353,7 @@ def test_manifest_cache_flush_persists_to_statedb(tmp_path, monkeypatch):
 
     # Patch project root and state db path
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     # Reset fingerprint module state
     fingerprint._pending_manifest_writes.clear()
@@ -3412,7 +3414,7 @@ def test_invalidate_manifests_for_paths_selective(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     key_a = fingerprint._make_manifest_cache_key("stage_a", _cached_stage)
     key_b = fingerprint._make_manifest_cache_key("stage_b", _cached_stage)
@@ -3458,7 +3460,7 @@ def test_invalidate_manifests_for_paths_cold_start(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint.invalidate_manifests_for_paths([tmp_path / "missing.py"])
 
@@ -3475,7 +3477,7 @@ def test_invalidate_manifests_for_paths_recomputes_affected_stage(tmp_path, monk
         pass
 
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: db_path)
 
     fingerprint._pending_manifest_writes.clear()
     fingerprint._hash_function_ast_cache.clear()
@@ -3553,7 +3555,7 @@ def same_stat_project(
     with state_mod.StateDB(state_dir):
         pass
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: state_dir)
+    monkeypatch.setattr(fingerprint, "_producing_state_dir", lambda: state_dir)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     fingerprint._pending_manifest_writes.clear()
     fingerprint._pending_ast_writes.clear()

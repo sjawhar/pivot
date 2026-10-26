@@ -192,6 +192,8 @@ _schema_hash_cache: weakref.WeakKeyDictionary[type, str] = weakref.WeakKeyDictio
 # readonly StateDB and fingerprinting should complete during discovery.
 _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
+# The state directory `_state_db` belongs to: the producing directory of its last lookup.
+_state_db_dir: pathlib.Path | None = None
 
 # Pending cache writes, each filed under the state directory of the run that produced it
 # (`_producing_state_dir`). A flush writes every entry to the directory it is filed under and
@@ -305,29 +307,33 @@ def _producing_state_dir() -> pathlib.Path | None:
     session included, reads that one. A library caller has no invocation, so each library entry
     point that produces entries holds a record of its own (``state_dir.entry_invocation``):
     an engine run, discovery, a pipeline's load and each ``Pipeline.ensure_fingerprint``. A
-    pipeline's fingerprints and runs start from the directory it resolved when it loaded, so a
-    ``core.state_dir`` edited afterwards, by a stage or by the caller, moves none of its
-    entries. Only a low-level call outside every entry point (``get_stage_fingerprint`` or
-    ``get_stage_fingerprint_cached`` by hand) reads and resolves the configuration again for
-    each entry: correct, and slow. An unreadable or unusable configuration leaves the entry
-    unfiled, and the caches are best effort, so it is dropped.
+    pipeline's fingerprints and runs start from the resolution it made when it loaded, an
+    unusable value included, so a ``core.state_dir`` edited afterwards, by a stage or by the
+    caller, moves none of its entries, and the record answers every entry without reading the
+    configuration. Only a low-level call outside every entry point (``get_stage_fingerprint``
+    or ``get_stage_fingerprint_cached`` by hand) reads and resolves the configuration again for
+    each entry: correct, and slow. An unreadable or unusable value (other than ``''``, which
+    falls back to ``.pivot``) leaves the entry unfiled, and the caches are best effort, so it
+    is dropped. Nothing is created here: the StateDB that reads or writes the entries creates
+    the directory (``state_dir.make_state_dir``).
     """
-    try:
-        from pivot.config import io
+    from pivot import project, state_dir
 
-        return io.get_state_dir()
+    try:
+        return state_dir.locate_state_dir(project.get_project_root())
     except Exception:
-        # ConfigError (unusable value), ProjectNotInitializedError, OSError (creation), etc.
+        # ConfigError (unusable value), ProjectNotInitializedError, UnicodeDecodeError, etc.
         return None
 
 
 def _close_state_db() -> None:
     """Close the readonly StateDB; the next lookup opens it again."""
-    global _state_db, _state_db_init_attempted
+    global _state_db, _state_db_init_attempted, _state_db_dir
     if _state_db is not None:
         _state_db.close()
         _state_db = None
     _state_db_init_attempted = False
+    _state_db_dir = None
 
 
 def flush_and_close() -> None:
@@ -349,20 +355,27 @@ atexit.register(flush_and_close)
 
 
 def _get_state_db() -> "StateDB | None":
-    """Get readonly StateDB for fingerprint caching (graceful degradation).
+    """Get the readonly StateDB of the state directory entries are produced for now.
+
+    Lookups read the directory where a miss files its new entry (``_producing_state_dir``).
+    When that directory changes, as for a pipeline loaded after an edit of ``core.state_dir``,
+    the handle is closed and the new directory's opened, so no handle outlives the resolution
+    it was opened for. One that fails to open is not tried again until the directory changes
+    or the caches flush (graceful degradation).
 
     Not thread-safe, but fingerprinting runs single-threaded per process
     (see comment at line 33). Workers use separate memory spaces.
     """
-    global _state_db, _state_db_init_attempted
+    global _state_db, _state_db_init_attempted, _state_db_dir
+    state_dir = _producing_state_dir()
+    if state_dir != _state_db_dir:
+        _close_state_db()
+        _state_db_dir = state_dir
     if _state_db is not None:
         return _state_db
-    if _state_db_init_attempted:
-        return None  # Already tried and failed
+    if _state_db_init_attempted or state_dir is None:
+        return None  # Already tried and failed, or no directory to read
     _state_db_init_attempted = True
-    state_dir = _producing_state_dir()
-    if state_dir is None:
-        return None
     try:
         from pivot.storage import state
 

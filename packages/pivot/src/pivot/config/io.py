@@ -179,15 +179,19 @@ def _default_cache_dir() -> str:
 def get_merged_config() -> models.PivotConfig:
     """Load and merge configs: defaults < global < local.
 
-    A global ``core.state_dir`` is left out, so the merged config is the one in effect. An
-    unset ``cache.dir`` is ``<state dir>/cache``. Results are cached to avoid repeated disk I/O
-    within a single command. Call clear_config_cache() to reset (e.g., in tests).
+    A global ``core.state_dir`` is left out, so the merged config is the one in effect. Results
+    are cached to avoid repeated disk I/O within a single command. Call clear_config_cache() to
+    reset (e.g., in tests). The cache is process-wide, so it holds nothing derived from the state
+    directory: an unset ``cache.dir`` keeps the model default and stays out of
+    ``cache.model_fields_set``, and the cache in effect is then ``<state dir>/cache``, derived
+    from the current state-directory record where it is used (``locate_cache_dir``).
     """
     global _merged_config_cache
     if _merged_config_cache is not None:
         return _merged_config_cache
 
     defaults = models.PivotConfig.get_default().model_dump()
+    del defaults["cache"]["dir"]
 
     global_data = load_config_file(config_files.get_global_config_path())
     unset_nested(global_data, ["core", "state_dir"])
@@ -196,14 +200,14 @@ def get_merged_config() -> models.PivotConfig:
     local_data = load_config_file(get_local_config_path())
     merged = deep_merge(merged, local_data)
 
-    if all(
-        config_files.get_nested(data, ["cache", "dir"]) is config_files.NOT_FOUND
-        for data in (global_data, local_data)
-    ):
-        merged["cache"]["dir"] = _default_cache_dir()
-
     _merged_config_cache = models.PivotConfig.model_validate(merged)
     return _merged_config_cache
+
+
+def _configured_cache_dir() -> str | None:
+    """``cache.dir`` as a config file sets it, or None when unset (``get_merged_config``)."""
+    cache = get_merged_config().cache
+    return cache.dir if "dir" in cache.model_fields_set else None
 
 
 def clear_config_cache() -> None:
@@ -324,15 +328,25 @@ def get_run_history_retention() -> int:
 
 
 def _effective_cache_dir() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
-    """Resolve the effective cache without creating state or cache directories."""
+    """Resolve the effective cache without creating state or cache directories.
+
+    ``PIVOT_CACHE_DIR``, then a configured ``cache.dir``, each as given. Unset, the cache is
+    ``<state dir>/cache`` of the state directory this record resolved, derived here at each use
+    and never stored, so a pipeline loaded after an edit of ``core.state_dir`` keeps its cache
+    objects beside its locks.
+    """
     root = project.get_project_root()
-    env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
-    configured = pathlib.Path(env_cache or get_merged_config().cache.dir)
-    cache_dir = configured if configured.is_absolute() else root / configured
-    cache_dir = pathlib.Path(os.path.realpath(cache_dir))
+    configured = os.environ.get("PIVOT_CACHE_DIR", "").strip() or _configured_cache_dir()
     state_dir = state_dir_mod.state_dir_or_default(root)
-    stages_dir = state_dir / "stages"
     fallback_cache_dir = state_dir / "cache"
+    if configured is None:
+        cache_dir = fallback_cache_dir
+    else:
+        cache_dir = pathlib.Path(configured)
+        if not cache_dir.is_absolute():
+            cache_dir = root / cache_dir
+    cache_dir = pathlib.Path(os.path.realpath(cache_dir))
+    stages_dir = state_dir / "stages"
     if (
         cache_dir == stages_dir
         or cache_dir.is_relative_to(stages_dir)

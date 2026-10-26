@@ -873,8 +873,10 @@ class Engine:
         cache entry it produces in one directory, whatever a stage of the run, or the caller
         since the load, writes to ``core.state_dir``.
         """
-        pipeline_state_dirs = None if self._pipeline is None else self._pipeline.resolved_state_dirs
         try:
+            pipeline_state_dirs = (
+                None if self._pipeline is None else self._pipeline.resolved_state_dirs
+            )
             with state_dir_mod.entry_invocation(pipeline_state_dirs):
                 self._require_pipeline()
 

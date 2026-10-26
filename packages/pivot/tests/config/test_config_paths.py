@@ -4,7 +4,7 @@ import pathlib
 import pydantic
 import pytest
 
-from pivot import config, config_files, project
+from pivot import config, config_files, exceptions, project
 from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
 from pivot.exceptions import ConfigError
@@ -230,6 +230,47 @@ def test_state_dir_lookup_outside_invocation_never_reuses_an_answer_from_other_b
     assert state_dir_mod.state_dir_for(project_root) == project_root / "betaa"
     assert config_file.read_text() == first
     assert state_dir_mod.state_dir_for(project_root) == project_root / "alpha"
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [("''", exceptions.EmptyStateDirError), ("5", ConfigError), ("[unclosed", ConfigError)],
+    ids=["empty", "integer", "invalid-yaml"],
+)
+def test_a_record_keeps_an_unusable_value_and_reads_the_config_once(
+    project_root: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    error: type[ConfigError],
+) -> None:
+    """Inside one record a value that cannot be used is read once: every later lookup raises
+    the same error again, and every fallback (`''` to `.pivot`) answers from the record."""
+    (project_root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {value}\n")
+    read = config_files.read_config_file_value
+    reads = list[pathlib.Path]()
+
+    def _counted(path: pathlib.Path, key: str) -> tuple[bool, object]:
+        reads.append(path)
+        return read(path, key)
+
+    monkeypatch.setattr(config_files, "read_config_file_value", _counted)
+    token = state_dir_mod.begin_invocation(report=False)
+    try:
+        messages = set[str]()
+        for _ in range(3):
+            with pytest.raises(ConfigError) as caught:
+                state_dir_mod.state_dir_for(project_root)
+            assert caught.type is error
+            messages.add(str(caught.value))
+        default = project_root / ".pivot"
+        assert state_dir_mod.state_dir_or_default(project_root) == default
+        if error is exceptions.EmptyStateDirError:
+            assert state_dir_mod.locate_state_dir(project_root) == default
+    finally:
+        state_dir_mod.end_invocation(token)
+
+    assert len(messages) == 1, messages
+    assert reads == [project_root / ".pivot" / "config.yaml"]
 
 
 # --- Error handling tests ---

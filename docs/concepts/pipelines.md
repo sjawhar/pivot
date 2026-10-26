@@ -147,6 +147,12 @@ and output formats, params, resources, variant and fingerprint settings; the
 error names the first difference and the source files. A pipeline cannot include
 itself.
 
+A pipeline resolves `core.state_dir` when it loads, and its stages, runs and
+caches all use that directory. So `include()` refuses a pipeline loaded before an
+edit of `core.state_dir` (or of a symbolic link it names) into one loaded after
+it: the error names both directories. Load both pipelines after the edit. The
+pipelines of one `pivot` command, or of one discovery, always share one directory.
+
 ## State and Cache Layout
 
 `core.state_dir` selects the state directory and defaults to `.pivot`. The `.pivot/` marker stays

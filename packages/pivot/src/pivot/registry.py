@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from inspect import Signature
 
     from networkx import DiGraph
+
+    from pivot.state_dir import StateDirResolution
 logger = logging.getLogger(__name__)
 
 
@@ -209,7 +211,7 @@ class PipelineLike(Protocol):
     def state_dir(self) -> pathlib.Path: ...
 
     @property
-    def resolved_state_dirs(self) -> Mapping[pathlib.Path, pathlib.Path]: ...
+    def resolved_state_dirs(self) -> Mapping[pathlib.Path, StateDirResolution]: ...
 
     @property
     def input_bindings(self) -> dict[str, str]: ...
