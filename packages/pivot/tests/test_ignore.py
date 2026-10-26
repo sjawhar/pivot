@@ -362,6 +362,27 @@ def test_trailing_backslash_is_part_of_a_file_name(tmp_path: pathlib.Path) -> No
     assert not filter_instance.is_ignored("tmp\\")
 
 
+def test_gitignore_backslash_escapes_cover_project_and_user_patterns(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Project and user patterns retain gitignore backslash escapes."""
+    project_ignore = tmp_path / ".pivotignore"
+    user_ignore = tmp_path / "user_pivotignore"
+    project_ignore.write_text("\\!keep\ntrailing\\ \ndata\\raw\\*\n")
+    user_ignore.write_text("\\#user.txt\n")
+
+    filter_instance = ignore.IgnoreFilter(
+        project_root=tmp_path,
+        user_ignore_path=user_ignore,
+    )
+
+    assert filter_instance.is_ignored("sub/!keep")
+    assert filter_instance.is_ignored("trailing ")
+    assert not filter_instance.is_ignored("data/raw/file.txt")
+    assert filter_instance.is_ignored("dataraw*")
+    assert filter_instance.is_ignored("sub/#user.txt")
+
+
 def test_normalizes_unicode_nfc(tmp_path: pathlib.Path) -> None:
     """Should normalize Unicode to NFC form for consistent matching."""
     pivotignore = tmp_path / ".pivotignore"
