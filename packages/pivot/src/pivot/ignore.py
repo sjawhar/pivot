@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import pathlib
@@ -320,18 +321,14 @@ class IgnoreFilter:
     def _normalize_path(self, path: str | pathlib.Path) -> str:
         """Normalize path: Unicode NFC, relative to project root (a backslash stays in a name)."""
         path_obj = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
-        path_str = str(path_obj)
 
         # Convert absolute paths to relative (for watch mode which receives absolute paths)
         if self._project_root is not None and path_obj.is_absolute():
-            try:
-                rel_path = path_obj.relative_to(self._project_root)
-                path_str = str(rel_path)
-            except ValueError:
-                pass  # Path not under project root, use as-is
+            with contextlib.suppress(ValueError):  # Path not under project root, use as-is
+                path_obj = path_obj.relative_to(self._project_root)
 
         # Normalize Unicode to NFC (handles macOS NFD vs composed characters)
-        return unicodedata.normalize("NFC", path_str)
+        return unicodedata.normalize("NFC", str(path_obj))
 
     def _is_protected(self, path_str: str) -> bool:
         """Check if path is protected (should never be ignored)."""
@@ -356,6 +353,6 @@ class IgnoreFilter:
                 return path_obj.is_dir()
         except OSError:
             pass
-        # Check original path for a trailing slash (pathlib strips it during normalization)
+        # Check original path for trailing slash (pathlib strips it during normalization)
         original = path if isinstance(path, str) else str(path)
         return original.endswith("/")
