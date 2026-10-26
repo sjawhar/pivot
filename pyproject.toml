@@ -108,7 +108,7 @@ filterwarnings = [
 line-length = 100
 target-version = "py313"
 src = ["packages/pivot/src", "packages/pivot/tests", "packages/pivot-tui/src", "packages/pivot-tui/tests", "benchmarks"]
-exclude = ["experiments"]
+extend-exclude = ["experiments"]
 
 [tool.ruff.lint]
 select = [
