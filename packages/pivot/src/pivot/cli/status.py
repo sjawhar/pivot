@@ -248,7 +248,6 @@ def status(
 
 
 def _import_status_json(info: status_mod.ImportStatusInfo) -> ImportStatusJson:
-    """One import check as JSON, with null for each field its status leaves empty."""
     match info.status:
         case status_mod.ImportCheckStatus.UP_TO_DATE:
             json_status = "up_to_date"
