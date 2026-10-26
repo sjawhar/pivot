@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
-_INODE_PREFIX = b"inode:"  # File identity (st_dev, st_ino) -> its latest hash: key
+_INODE_PREFIX = b"inode:"  # File identity (st_dev, st_ino) -> hash: key of one path with it
 _GEN_PREFIX = b"gen:"  # Output generation counters (identity-based)
 _DEP_PREFIX = b"dep:"  # Stage dependency generations (identity-based)
 _REMOTE_PREFIX = b"remote:"  # Remote index entries
@@ -134,8 +134,10 @@ def _open_env(lmdb_path: pathlib.Path) -> lmdb.Environment:
     against any writer; ``StateDB`` refuses it to a writer. A lock file this process cannot
     write as well (another user's database, a read-only filesystem) raises PermissionError:
     LMDB would open without it there, and a reader no writer can see is not protected from
-    one, so the caller reads files instead (``open_readonly``). Any other failure (a damaged
-    or missing database) raises as LMDB reports it.
+    one, so the caller reads files instead (``open_readonly``). Any other failure raises as
+    LMDB reports it, a damaged database included, except a damaged database whose data and
+    lock files this process can write neither: the lock-file check comes first, so that one
+    raises the PermissionError above.
     """
     try:
         return lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, max_spare_txns=0)
@@ -277,8 +279,9 @@ def _make_key_file_identity(dev: int, inode: int) -> bytes:
     A file-hash entry is keyed by the path the file was read at, so a replica of a project
     (`cp -al`, or a copy that hard-links pivot's read-only outputs) finds no entry for its own
     paths, though its files are the very inodes the copied entries describe. The index maps
-    each inode to the key of the file-hash entry last written for it (a hint for one path per
-    inode), and a lookup that misses by path follows it.
+    each inode to the key of one file-hash entry written for it (a hint for one path per
+    inode, not always the last written: a batch that writes P, Q, P for one inode leaves Q),
+    and a lookup that misses by path follows it.
 
     The identity lookup is never weaker than a path lookup at the recorded path. It serves
     another path's entry only when (1) that entry matches this file's stat exactly as a path
@@ -1220,22 +1223,27 @@ def open_readonly(state_dir: pathlib.Path, *, create: bool = True) -> Generator[
 
     A database whose lock file this user cannot write cannot register a reader against a
     writer (``_open_env``), so its cache is not used: the caller reads files instead, as it
-    would with no database. Only that permission case yields None; a damaged database still
-    raises. Opening creates a database where there is none, unless ``create`` is False.
+    would with no database. Only that permission case yields None. A damaged database raises,
+    except where this user can write neither its data file nor its lock file: that is the
+    permission case, found first, so it yields None too. Opening creates a database where
+    there is none, unless ``create`` is False. The caller's own errors propagate with no
+    context from the open.
     """
     if not create and not (state_dir / "state.lmdb").exists():
         yield None
         return
+    state_db: StateDB | None
     try:
         state_db = StateDB(state_dir, readonly=True)
     except (PermissionError, lmdb.ReadonlyError) as error:
         logger.debug("Reading files without the state database in %s: %s", state_dir, error)
-        yield None
-        return
+        state_db = None
     except OSError as error:
         if error.errno != errno.EROFS:
             raise
         logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        state_db = None
+    if state_db is None:
         yield None
         return
     with state_db:
@@ -1262,6 +1270,10 @@ def write_back_file_hashes(
     """
     if not entries or not (state_dir / "state.lmdb").exists():
         return
+    # A write-back can land after a concurrent `pivot repro` recorded a newer entry for one of
+    # these paths: it puts back the stat it read and drops the index entry of the inode repro
+    # recorded. Both then fail the next lookup's stat match, so that file is read once more; no
+    # wrong hash is served.
     try:
         with StateDB(state_dir, write_timeout=timeout) as state_db:
             state_db.save_file_hash_entries(entries)

@@ -263,6 +263,28 @@ def test_a_state_database_whose_lock_file_is_read_only_is_not_used(
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes through any file mode")
+def test_an_error_in_the_callers_body_carries_no_context_from_the_open(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When the database is not used, `open_readonly` yields None after it has handled its own
+    PermissionError, so an error the caller's `with` body raises does not show that error as
+    its context ("During handling of the above exception")."""
+    state_dir = _helper_new_state_dir(tmp_path)
+    modes = _helper_read_only(state_dir, lock_writable=False)
+    try:
+        with (
+            pytest.raises(ValueError, match="the caller's own error") as raised,
+            state.open_readonly(state_dir) as state_db,
+        ):
+            assert state_db is None
+            raise ValueError("the caller's own error")
+    finally:
+        for path, mode in modes.items():
+            path.chmod(mode)
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through any file mode")
 def test_a_state_database_on_a_read_only_filesystem_is_not_used(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

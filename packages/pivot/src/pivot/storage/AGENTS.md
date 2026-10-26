@@ -34,7 +34,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | Prefix | Purpose |
 |--------|---------|
 | `hash:` | File content hashes (keyed by the absolute path as given, `os.fsencode(os.path.abspath(path))`; the value's `(mtime_ns, size, dev, inode)` comes from `stat()`, which follows symlinks. No ctime: a new hard link changes it, so every hardlink checkout or hard-linked replica would invalidate its entries) |
-| `inode:` | Identity index: `(st_dev, st_ino)` → the `hash:` key last written for that inode. A hint; a lookup serves that entry only if it matches the file's stat and its path, stat'ed at lookup time, still names the same device and inode with the same change time |
+| `inode:` | Identity index: `(st_dev, st_ino)` → the `hash:` key of one path recorded with that inode (not always the last written: one batch that writes P, Q, P for an inode leaves Q). A hint; a lookup serves that entry only if it matches the file's stat and its path, stat'ed at lookup time, still names the same device and inode with the same change time |
 | `gen:` | Output generation counters (keyed by artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (`stage:dep_identity` → generation; one file of a directory output records its directory's identity) |
 | `runcache:` | Run cache entries (`stage:input_hash` → output hashes) |
