@@ -242,7 +242,7 @@ def test_cache_object_key_gives_the_resolved_answer(tmp_path: pathlib.Path, kind
     link = tmp_path / "work" / "member.bin"
     link.parent.mkdir()
     make(tmp_path, cache_dir, link, _CONTENT)
-    cache_root = os.path.realpath(cache_dir)
+    cache_root = cache.resolve_cache_root(cache_dir)
 
     found_key = cache._cache_object_key(link, cache_root)
     found_symlink_hash = cache._get_symlink_cache_hash(link, cache_dir)
@@ -263,7 +263,7 @@ def test_checkout_link_is_settled_without_resolving_the_path(
     cache_dir = tmp_path / "cache" / "files"
     link = tmp_path / "member.bin"
     _direct(tmp_path, cache_dir, link, _CONTENT)
-    cache_root = os.path.realpath(cache_dir)
+    cache_root = cache.resolve_cache_root(cache_dir)
 
     def no_realpath(path: object, *, strict: bool = False) -> str:
         raise AssertionError(f"realpath({path!r}) called")
@@ -456,7 +456,7 @@ def test_object_paths_resolve_as_before(tmp_path: pathlib.Path, kind: str) -> No
     cache_dir = tmp_path / "cache" / "files"
     link = tmp_path / "member.bin"
     make(tmp_path, cache_dir, link, _CONTENT)
-    cache_root = os.path.realpath(cache_dir)
+    cache_root = cache.resolve_cache_root(cache_dir)
     own = cache.get_cache_path(cache_dir, _helper_key(_CONTENT))
     other = _helper_object(cache_dir, b"another object\n")
 
@@ -495,7 +495,7 @@ def test_a_cache_directory_repointed_between_commands_is_resolved_again(
     assert after["manifest"] == []
     assert _helper_resolved_key(link, cache_dir) is None
     assert link.resolve() != own.resolve()
-    assert not cache._links_to_object(link, own, os.path.realpath(cache_dir))
+    assert not cache._links_to_object(link, own, cache.resolve_cache_root(cache_dir))
 
 
 def test_a_member_link_ending_in_a_loop_inside_the_cache_is_left_out(
@@ -627,7 +627,7 @@ def test_links_to_object_answers_as_resolve_for_a_member_looping_through_its_obj
     member = restored / looped["relpath"]
     obj = cache.get_cache_path(cache_dir, looped["hash"])
     loop_back(member, obj)
-    cache_root = os.path.realpath(cache_dir)
+    cache_root = cache.resolve_cache_root(cache_dir)
 
     assert os.readlink(member) == os.path.join(cache_root, obj.parent.name, obj.name)
     assert member.resolve() != obj.resolve(), "resolve() stops at a different link in each"
@@ -715,3 +715,66 @@ def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Pat
 
     assert sorted(p.name for p in tree.iterdir()) == [e["relpath"] for e in output_hash["manifest"]]
     assert tree.with_name(f"{tree.name}.verified").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches any directory")
+def test_hash_directory_raises_for_a_member_link_into_an_unsearchable_prefix_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """walk_artifact_members: "PermissionError propagates: a partial hash would be wrong". A
+    symlink checkout's member link whose object this user cannot stat (its two-character
+    directory lost search permission, as in a shared cache another user owns) raises, as the
+    base raised from ``Path.is_file()``; it is not left out of the manifest as a user symlink."""
+    cache_dir = tmp_path / "cache" / "files"
+    source = tmp_path / "source"
+    source.mkdir()
+    for index in range(3):
+        (source / f"f{index}.txt").write_text(f"{index}\n")
+    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    assert is_dir_hash(output_hash)
+    restored = tmp_path / "restored"
+    assert cache.restore_from_cache(
+        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
+    assert all(member.is_symlink() for member in restored.iterdir())
+    prefix = cache.get_cache_path(cache_dir, output_hash["manifest"][0]["hash"]).parent
+    os.chmod(prefix, 0)
+    try:
+        with pytest.raises(PermissionError):
+            result = cache.hash_directory(
+                restored, cache_dir=cache_dir, warn_left_out_symlinks=True
+            )
+            pytest.fail(f"recorded {[e['relpath'] for e in result['manifest']]}")
+    finally:
+        os.chmod(prefix, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches any directory")
+def test_hash_directory_raises_for_member_links_in_a_listable_unsearchable_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory inside the artifact this user can list but not search (mode r--): its member
+    links cannot be read, so the hash raises, as the base raised from ``Path.is_symlink()``; the
+    links are not left out of the manifest as user symlinks."""
+    cache_dir = tmp_path / "cache" / "files"
+    source = tmp_path / "source"
+    (source / "sub").mkdir(parents=True)
+    for index in range(2):
+        (source / "sub" / f"f{index}.txt").write_text(f"{index}\n")
+    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    assert is_dir_hash(output_hash)
+    restored = tmp_path / "restored"
+    assert cache.restore_from_cache(
+        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
+    sub = restored / "sub"
+    assert all(member.is_symlink() for member in sub.iterdir())
+    os.chmod(sub, 0o400)
+    try:
+        with pytest.raises(PermissionError):
+            result = cache.hash_directory(
+                restored, cache_dir=cache_dir, warn_left_out_symlinks=True
+            )
+            pytest.fail(f"recorded {[e['relpath'] for e in result['manifest']]}")
+    finally:
+        os.chmod(sub, 0o755)

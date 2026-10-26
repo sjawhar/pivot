@@ -269,7 +269,7 @@ def _workspace_members(
     result = dict[str, tuple[str, pathlib.Path]]()
     files = list[tuple[str, os.DirEntry[str]]]()
     left_out = list[pathlib.Path]()
-    cache_root = os.path.realpath(cache_dir)
+    cache_root = cache.resolve_cache_root(cache_dir)
     cache.walk_artifact_members(os.fspath(location), "", cache_root, files, [], left_out)
     for relpath, entry in files:
         file_path = pathlib.Path(entry.path)
