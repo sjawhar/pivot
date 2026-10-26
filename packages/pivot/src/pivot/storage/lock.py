@@ -225,8 +225,8 @@ def _warn_old_format(path: str, mtime_ns: int) -> None:
     del mtime_ns
     logger.warning(
         "%s was written by an older pivot; pivot reads it as missing, so its stage is decided "
-        + "afresh (it runs, or its run-cache entry restores it) and the lock is rewritten (an "
-        + "incremental output it records carries over)",
+        + "afresh (it runs, or its run-cache entry restores it) and the lock is rewritten. An "
+        + "incremental stage keeps the output this lock records",
         path,
     )
 
@@ -386,15 +386,17 @@ def _ensure_identity_keys(
 def _hashed_directory(
     record: DirHash,
     hashed_dirs: Mapping[str, listing.HashedDirectory],
+    committed: pathlib.Path,
     cache_dir: pathlib.Path | None,
 ) -> tuple[bytes, listing.DirListing]:
-    """The listing bytes and members of directory ``record``: the caller's, else the cache's
-    object, checked against ``record``."""
+    """The listing bytes and members of directory ``record``: the caller's, else the committed
+    file or the cache's object (``listing.read_bytes``), checked against ``record``. A run-cache
+    hit or an output already on disk records a directory this run did not list."""
     if record["hash"] in hashed_dirs:
         hashed = hashed_dirs[record["hash"]]
         return hashed["data"], hashed["listing"]
-    data = listing.read_bytes(None, record, cache_dir)
-    return data, listing.parse(data, record, f"cache object {record['hash']}")
+    data = listing.read_bytes(committed, record, cache_dir)
+    return data, listing.parse(data, record, committed)
 
 
 def _recorded_paths(
@@ -548,10 +550,11 @@ class StageLock:
         for identity, hash_info in normalized_outs.items():
             if not is_dir_hash(hash_info):
                 continue
-            data_bytes, members = _hashed_directory(hash_info, hashed_dirs, cache_dir)
+            target = self.output_listing_path(identity)
+            data_bytes, members = _hashed_directory(hash_info, hashed_dirs, target, cache_dir)
             to_write.append(
                 _ListingWrite(
-                    target=self.output_listing_path(identity),
+                    target=target,
                     record=hash_info,
                     data=data_bytes,
                     members=members,
@@ -566,10 +569,11 @@ class StageLock:
         for identity, hash_info in _ensure_identity_keys(data["dep_hashes"]).items():
             if not is_dir_hash(hash_info) or identity not in input_paths:
                 continue
-            data_bytes, members = _hashed_directory(hash_info, hashed_dirs, cache_dir)
+            target = listing.input_listing_path(self.stages_dir, input_paths[identity])
+            data_bytes, members = _hashed_directory(hash_info, hashed_dirs, target, cache_dir)
             to_write.append(
                 _ListingWrite(
-                    target=listing.input_listing_path(self.stages_dir, input_paths[identity]),
+                    target=target,
                     record=hash_info,
                     data=data_bytes,
                     members=members,

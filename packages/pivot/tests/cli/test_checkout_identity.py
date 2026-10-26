@@ -263,11 +263,12 @@ def test_checkout_directory_output_reads_committed_listing_without_cache_listing
     assert (output_path / "part-2.txt").read_text() == "second"
 
 
-def test_checkout_directory_output_refuses_corrupt_committed_listing(
+def test_checkout_directory_output_refuses_an_edited_committed_listing_the_cache_cannot_replace(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
-    output_path, committed, _ = _helper_directory_output(mock_discovery)
+    output_path, committed, cache_object = _helper_directory_output(mock_discovery)
     committed.write_bytes(committed.read_bytes().replace(b" 5 - part-1.txt", b" 6 - part-1.txt"))
+    cache_object.unlink()
 
     result = runner.invoke(cli.cli, ["checkout", "bundle"])
 
@@ -275,6 +276,19 @@ def test_checkout_directory_output_refuses_corrupt_committed_listing(
     assert str(committed) in result.output
     assert "not to the directory hash" in result.output
     assert not output_path.exists()
+
+
+def test_checkout_directory_output_reads_the_cache_copy_of_an_edited_committed_listing(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    output_path, committed, _ = _helper_directory_output(mock_discovery)
+    committed.write_bytes(committed.read_bytes().replace(b" 5 - part-1.txt", b" 6 - part-1.txt"))
+
+    result = runner.invoke(cli.cli, ["checkout", "bundle"])
+
+    assert result.exit_code == 0, result.output
+    assert (output_path / "part-1.txt").read_text() == "first"
+    assert str(committed) in result.output, result.output
 
 
 def test_checkout_all_uses_merged_pipeline_paths(

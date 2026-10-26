@@ -24,7 +24,7 @@ from pivot import (
     skip,
     status,
 )
-from pivot.storage import listing, lock, track
+from pivot.storage import cache, listing, lock, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactIdentity,
@@ -948,13 +948,16 @@ def test_producer_output_hashes_leaves_the_file_to_hash_when_no_listing_exists(
     assert produced["file_identity"] not in hashes
 
 
-def test_producer_output_hashes_refuses_a_committed_listing_edited_after_the_run(
+def test_producer_output_hashes_refuses_an_edited_committed_listing_the_cache_cannot_replace(
     mock_discovery: compose.Pipeline,
 ) -> None:
-    """A committed listing whose bytes no longer hash to the lock's record is refused."""
+    """A committed listing whose bytes no longer hash to the lock's record is refused when the
+    cache holds no object at that record's hash to read instead."""
     produced = _run_directory_pipeline(mock_discovery.root)
     committed = produced["committed_listing"]
-    committed.write_bytes(committed.read_bytes().replace(_BETA_HASH.encode(), b"0" * 16))
+    original = committed.read_bytes()
+    committed.write_bytes(original.replace(_BETA_HASH.encode(), b"0" * 16))
+    cache.get_cache_path(produced["cache_dir"], listing.digest(original)).unlink()
 
     with pytest.raises(exceptions.CorruptListingError, match="its bytes hash to"):
         explain.producer_output_hashes(
@@ -1117,15 +1120,16 @@ def test_find_tracked_hash_not_in_listing(
     )
 
 
-def test_find_tracked_hash_refuses_a_committed_listing_edited_after_tracking(
+def test_find_tracked_hash_refuses_an_edited_committed_listing_the_cache_cannot_replace(
     mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
 ) -> None:
-    """A committed listing whose bytes no longer hash to the .pvt's record is refused, naming it."""
+    """A committed listing whose bytes no longer hash to the .pvt's record is refused, naming
+    it, when the cache holds no object at that record's hash to read instead."""
     tracked = _track_corpus(mock_discovery.root, runner)
     committed = mock_discovery.root / "corpus.pvt.listing"
-    committed.write_bytes(
-        committed.read_bytes().replace(_B_CSV_HASH.encode(), _A_CSV_HASH.encode())
-    )
+    original = committed.read_bytes()
+    committed.write_bytes(original.replace(_B_CSV_HASH.encode(), _A_CSV_HASH.encode()))
+    cache.get_cache_path(tracked["cache_dir"], listing.digest(original)).unlink()
 
     with pytest.raises(exceptions.CorruptListingError, match=r"corpus\.pvt\.listing: its bytes"):
         explain._find_tracked_hash(

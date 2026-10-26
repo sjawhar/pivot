@@ -2429,6 +2429,12 @@ class Engine:
         from pivot.storage import listing, lock
 
         default_state_dir = config.get_state_dir()
+        pipeline = self._require_pipeline()
+        store = store_mod.WorkspaceStore(
+            project_root=project_root,
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
+        )
         written = list[pathlib.Path]()
         for name, summary in results.items():
             if summary["status"] != StageStatus.RAN:
@@ -2440,9 +2446,14 @@ class Engine:
                 registry.get_stage_state_dir(stage_info, default_state_dir)
             )
             candidates = [lock.StageLock(name, stages_dir).path]
-            for out in stage_info["outs"]:
-                with contextlib.suppress(exceptions.InvalidPathError):
-                    candidates.append(listing.output_listing_path(stages_dir, out.identity))
+            candidates.extend(
+                listing.output_listing_path(stages_dir, out.identity) for out in stage_info["outs"]
+            )
+            candidates.extend(
+                listing.input_listing_path(stages_dir, store.input_relpath(ref))
+                for ref in stage_info["deps"].values()
+                if ref.tag is types.ArtifactTag.INPUT
+            )
             written.extend(path for path in candidates if path.exists())
         ignored = git.ignored_paths(project_root, sorted(set(written)))
         if ignored:

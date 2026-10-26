@@ -991,6 +991,30 @@ def test_lock_writes_listings_for_directory_deps_and_outs_before_the_lock(tmp_pa
     assert listing.read(input_listing, hashed["record"], None) == hashed["listing"]
 
 
+def test_lock_rewrite_reads_a_directory_it_did_not_hash_from_the_committed_listing(
+    tmp_path: Path,
+) -> None:
+    """A run-cache hit records a directory this run did not list, and the cache may have lost
+    its listing object: the lock writer takes the committed listing beside the lock."""
+    identity = _id("p/stage")
+    hashed = _hashed_directory(
+        [DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=100, isexec=False)]
+    )
+    data = LockData(
+        code_manifest={}, params={}, dep_hashes={}, output_hashes={identity: hashed["record"]}
+    )
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.write(data, hashed_dirs={hashed["record"]["hash"]: hashed})
+    stage_lock.path.unlink()
+
+    written = stage_lock.write(data, cache_dir=tmp_path / "empty-cache" / "files")
+
+    assert written == [stage_lock.output_listing_path(identity), stage_lock.path]
+    loaded = stage_lock.read()
+    assert loaded is not None
+    assert loaded["output_hashes"][identity] == hashed["record"]
+
+
 def test_written_lock_records_directory_size_file_count_and_listing(tmp_path: Path) -> None:
     """A directory output records only its hash, total size, and file count in its lock."""
     entry = DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=100, isexec=False)

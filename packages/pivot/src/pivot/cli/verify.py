@@ -51,15 +51,16 @@ def _object_hashes(
     """The cache objects an output or dependency at ``path`` needs, by workspace path.
 
     A directory needs its listing object (keyed by the directory's path) and each file's
-    object, named by its listing (``committed``, else the cache's object). A shared input
-    listing may have moved on since this lock was written, so it falls back to this lock's
-    immutable cache object when the committed file's hash differs.
+    object, named by its listing (``committed``, else the cache's object). A committed output
+    listing that does not hash to its record is refused, naming it: a fresh clone would have
+    no cache to restore from. A shared input listing may have moved on since this lock was
+    written, so it falls back to this lock's immutable cache object.
     """
     result = {path: hash_info["hash"]}
     if not is_dir_hash(hash_info):
         return result
     try:
-        members = listing.read(committed, hash_info, files_dir, fallback_on_mismatch=shared_input)
+        members = listing.read(committed, hash_info, files_dir, strict=not shared_input)
     except exceptions.ListingMissingError:
         return result
     for entry in members["files"]:

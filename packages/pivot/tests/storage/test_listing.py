@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 
@@ -170,22 +171,32 @@ def test_read_falls_back_to_the_cache_object_at_the_directory_hash(
     assert listing.read(None, record, cache_dir) == listing.decode(data)
 
 
-def test_a_shared_input_listing_falls_back_to_its_lock_hash_cache_object(
-    tmp_path: pathlib.Path,
+def test_a_listing_that_does_not_match_its_record_falls_back_to_the_cache_object_unless_strict(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A shared input listing a later run moved on, or a lock reverted without its listing,
+    reads the immutable cache object at the record's hash, warning once; `pivot verify` reads
+    strictly, since a fresh clone has no cache to fall back on."""
     old_data = f"{_A} 1 - a.txt\n".encode()
     record = _helper_record(old_data, size=1, nfiles=1)
     cache_dir = tmp_path / "files"
-    listing.store_object(cache_dir, record["hash"], old_data)
     committed = tmp_path / "=inputs" / "data.listing"
     committed.parent.mkdir()
     committed.write_bytes(f"{_A} 1 - b.txt\n".encode())
 
-    with pytest.raises(exceptions.CorruptListingError):
+    with pytest.raises(exceptions.CorruptListingError, match=r"data\.listing"):
         listing.read(committed, record, cache_dir)
-    assert listing.read(committed, record, cache_dir, fallback_on_mismatch=True) == listing.decode(
-        old_data
-    )
+
+    listing.store_object(cache_dir, record["hash"], old_data)
+    with caplog.at_level(logging.WARNING):
+        first = listing.read(committed, record, cache_dir)
+        second = listing.read(committed, record, cache_dir)
+    with pytest.raises(exceptions.CorruptListingError, match=r"data\.listing"):
+        listing.read(committed, record, cache_dir, strict=True)
+
+    assert first == second == listing.decode(old_data)
+    warnings = [r.getMessage() for r in caplog.records if "data.listing" in r.getMessage()]
+    assert len(warnings) == 1, warnings
 
 
 def test_store_object_refuses_bytes_that_do_not_hash_to_the_directory_hash(

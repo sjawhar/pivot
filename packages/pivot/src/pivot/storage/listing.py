@@ -23,6 +23,8 @@ UTF-8; an empty directory's ``/`` goes inside the quotes. The listing is always 
 
 from __future__ import annotations
 
+import functools
+import logging
 import os
 import re
 from typing import TYPE_CHECKING, NewType, TypedDict, cast
@@ -35,6 +37,8 @@ from pivot.types import ArtifactIdentity, DirHash, DirManifestEntry
 
 if TYPE_CHECKING:
     import pathlib
+
+logger = logging.getLogger(__name__)
 
 SUFFIX = ".listing"
 INPUTS_DIR = "=inputs"
@@ -347,19 +351,34 @@ def check(data: bytes, record: DirHash, source: pathlib.Path | str) -> CheckedBy
     return CheckedBytes(data)
 
 
+@functools.cache
+def _warn_stale(committed: str, record_hash: str) -> None:
+    """Warn once per process for each committed listing a read had to pass over."""
+    logger.warning(
+        "%s does not hash to the directory hash %s its lock or .pvt records; using the cache's "
+        + "copy of that listing. A stage run or `pivot track --force` rewrites the file; "
+        + "`git checkout` restores the committed one",
+        committed,
+        record_hash,
+    )
+
+
 def _read_located(
     committed: pathlib.Path | None,
     record: DirHash,
     cache_dir: pathlib.Path | None,
     *,
-    fallback_on_mismatch: bool = False,
+    strict: bool = False,
 ) -> tuple[CheckedBytes, pathlib.Path | str]:
-    """The checked listing bytes and source path.
+    """The checked listing bytes and the name ``parse`` gives where they came from.
 
-    A shared pipeline-input listing can name a newer version of the input than the lock being
-    checked. Its caller sets ``fallback_on_mismatch`` to use the immutable cache object for this
-    lock's hash instead. Output and tracked listings stay strict: a mismatched committed file is
-    corruption a fresh clone cannot recover from.
+    The committed file is taken when it hashes to ``record``. When it does not, the cache
+    object at ``record``'s hash, which is checked and never changes, is taken instead with one
+    warning naming the committed file: a shared input listing that a later run of another stage
+    moved on, a lock reverted without its listing, or a run interrupted between writing the
+    listing and the lock. Only when the cache lacks that object too is the committed file
+    refused. ``strict`` refuses it at once, for ``pivot verify``: a fresh clone has no cache
+    to fall back on.
     """
     mismatch: exceptions.CorruptListingError | None = None
     if committed is not None:
@@ -368,15 +387,19 @@ def _read_located(
         except FileNotFoundError:
             pass
         except exceptions.CorruptListingError as e:
-            if not fallback_on_mismatch:
+            if strict:
                 raise
             mismatch = e
     cached = None if cache_dir is None else cache.get_cache_path(cache_dir, record["hash"])
     if cached is not None:
         try:
-            return check(cached.read_bytes(), record, cached), f"cache object {record['hash']}"
+            data = check(cached.read_bytes(), record, cached)
         except FileNotFoundError:
             pass
+        else:
+            if mismatch is not None:
+                _warn_stale(str(committed), record["hash"])
+            return data, f"cache object {record['hash']}"
     if mismatch is not None:
         raise mismatch
     where = list[str]() if committed is None else [str(committed)]
@@ -394,10 +417,10 @@ def read_bytes(
     record: DirHash,
     cache_dir: pathlib.Path | None,
     *,
-    fallback_on_mismatch: bool = False,
+    strict: bool = False,
 ) -> CheckedBytes:
-    """The bytes of the listing ``record`` names, checked against its hash."""
-    return _read_located(committed, record, cache_dir, fallback_on_mismatch=fallback_on_mismatch)[0]
+    """The bytes of the listing ``record`` names, checked against its hash (``_read_located``)."""
+    return _read_located(committed, record, cache_dir, strict=strict)[0]
 
 
 def parse(data: CheckedBytes, record: DirHash, source: pathlib.Path | str) -> DirListing:
@@ -420,12 +443,10 @@ def read(
     record: DirHash,
     cache_dir: pathlib.Path | None,
     *,
-    fallback_on_mismatch: bool = False,
+    strict: bool = False,
 ) -> DirListing:
-    """The listing ``record`` names (see ``read_bytes``), parsed."""
-    data, source = _read_located(
-        committed, record, cache_dir, fallback_on_mismatch=fallback_on_mismatch
-    )
+    """The listing ``record`` names (see ``_read_located``), parsed."""
+    data, source = _read_located(committed, record, cache_dir, strict=strict)
     return parse(data, record, source)
 
 

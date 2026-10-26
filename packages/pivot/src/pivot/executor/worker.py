@@ -1245,7 +1245,7 @@ def restore_outputs_to_hashes(
                     continue
                 members = None
                 if is_dir_hash(expected_hash):
-                    with contextlib.suppress(exceptions.ListingMissingError):
+                    try:
                         members = (
                             listing.read(
                                 listing_lock.output_listing_path(ref.identity),
@@ -1255,6 +1255,12 @@ def restore_outputs_to_hashes(
                             if listing_lock is not None
                             else store.cached_listing(expected_hash)
                         )
+                    except exceptions.ListingMissingError:
+                        pass
+                    except exceptions.CorruptListingError as e:
+                        # The output cannot be restored from this listing: the stage runs,
+                        # which rewrites it.
+                        logger.warning("%s", e)
                 if (members is not None or not is_dir_hash(expected_hash)) and (
                     store.cache_contains(ref, expected_hash, members)
                 ):

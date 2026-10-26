@@ -434,14 +434,17 @@ def test_checkout_default_refuses_edited_directory_and_force_overwrites(
     assert (data_dir / "a.txt").read_text() == "one\n"
 
 
-def test_checkout_force_refuses_committed_listing_that_does_not_match_pvt(
+def test_checkout_force_refuses_an_edited_committed_listing_the_cache_cannot_replace(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
-    """A committed listing whose bytes differ from the .pvt hash is refused before any write."""
+    """A committed listing whose bytes differ from the .pvt hash, with no cache object at that
+    hash to read instead, is refused before any write."""
     data_dir = _helper_track_directory(project.get_project_root())
     (data_dir / "a.txt").write_text("one EDITED\n")
     committed = listing.tracked_listing_path(track.get_pvt_path(data_dir))
-    committed.write_bytes(committed.read_bytes().replace(b" 4 - b.txt", b" 5 - b.txt"))
+    original = committed.read_bytes()
+    committed.write_bytes(original.replace(b" 4 - b.txt", b" 5 - b.txt"))
+    cache.get_cache_path(config.get_cache_dir() / "files", listing.digest(original)).unlink()
 
     result = runner.invoke(cli.cli, ["checkout", "--force", "data/ext"])
 

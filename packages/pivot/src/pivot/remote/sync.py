@@ -69,7 +69,8 @@ def _blob_hashes(
         members = read_members(hash_info)
     except exceptions.ListingMissingError:
         return {hash_info["hash"]}
-    listing.store_object(files_dir, hash_info["hash"], listing.encode(members))
+    if not cache.get_cache_path(files_dir, hash_info["hash"]).exists():
+        listing.store_object(files_dir, hash_info["hash"], listing.encode(members))
     return {hash_info["hash"], *(entry["hash"] for entry in members["files"])}
 
 

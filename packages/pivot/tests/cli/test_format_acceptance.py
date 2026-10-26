@@ -179,23 +179,64 @@ def test_a_directory_is_recorded_by_hash_with_one_committed_listing_per_director
 
 
 def test_a_hand_edited_listing_is_refused_naming_it(tmp_path: pathlib.Path) -> None:
-    """The listing's bytes must hash to the directory hash its lock records."""
+    """The listing's bytes must hash to the directory hash its lock records. `pivot verify`
+    refuses one that does not, naming it. A checkout with the cache's copy of the listing uses
+    that copy and names the file; without it, the checkout refuses and restores nothing."""
     root = _helper_tree_project(tmp_path)
     listing_file = root / _OUTPUT_LISTING
     assert listing_file.is_file(), "the output's listing must be committed beside its lock"
     listing_file.write_bytes(listing_file.read_bytes().replace(b" 1 - a.txt", b" 2 - a.txt"))
+    out = _helper_entry(root, "t/copy", "outs", "tree")
+    out_dir = root / str(out["path"])
 
     verified = _pivot(root, "verify")
-    out_dir = root / str(_helper_entry(root, "t/copy", "outs", "tree")["path"])
     shutil.rmtree(out_dir)
-    checked_out = _pivot(root, "checkout")
+    from_cache = _pivot(root, "checkout")
+    restored = out_dir.is_dir()
+    shutil.rmtree(out_dir)
+    tree_hash = str(out["hash"])
+    (root / ".pivot" / "cache" / "files" / tree_hash[:2] / tree_hash[2:]).unlink()
+    refused = _pivot(root, "checkout")
 
-    for proc in (verified, checked_out):
-        out = proc.stdout + proc.stderr
-        assert proc.returncode != 0, out
-        assert str(_OUTPUT_LISTING) in out, out
-        assert "hash" in out, out
+    for proc in (verified, refused):
+        output = proc.stdout + proc.stderr
+        assert proc.returncode != 0, output
+        assert str(_OUTPUT_LISTING) in output and "hash" in output, output
+    assert from_cache.returncode == 0, from_cache.stdout + from_cache.stderr
+    assert str(_OUTPUT_LISTING) in from_cache.stderr, from_cache.stderr
+    assert restored, "a checkout restores from the cache's copy of the listing"
     assert not out_dir.exists(), "checkout must restore nothing from a refused listing"
+
+    rerun = _pivot(root, "repro")
+    assert rerun.returncode == 0, rerun.stdout + rerun.stderr
+    assert "Traceback" not in rerun.stdout + rerun.stderr, rerun.stdout + rerun.stderr
+    _helper_assert_tree(out_dir)
+    assert listing_file.read_bytes() == _TREE_LISTING, "the stage run rewrites the listing"
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+
+
+def test_a_lock_put_back_without_its_listings_is_read_through_the_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A lock reverted without its listing files (or a run interrupted between writing them)
+    names directory hashes its listing files no longer hold. Pivot reads the cache's copies,
+    naming the files, instead of failing every run until someone deletes them."""
+    root = _helper_tree_project(tmp_path)
+    lock_path = root / ".pivot" / "stages" / "t" / "copy.lock"
+    first_lock = lock_path.read_bytes()
+    corpus = root / "data" / "raw" / "corpus"
+    (corpus / "a.txt").write_bytes(b"b")
+    _ok(_pivot(root, "repro"))
+    (corpus / "a.txt").write_bytes(b"a")
+    lock_path.write_bytes(first_lock)
+
+    repro = _pivot(root, "repro", "t/copy")
+
+    out = repro.stdout + repro.stderr
+    assert repro.returncode == 0, out
+    assert "1 cached" in out, out
+    assert str(_OUTPUT_LISTING) in repro.stderr, out
+    _helper_assert_tree(root / str(_helper_entry(root, "t/copy", "outs", "tree")["path"]))
 
 
 # =============================================================================
@@ -301,7 +342,8 @@ def test_an_ordinary_old_lock_warns_once_is_decided_afresh_and_is_rewritten(
     repro = _pivot(root, "repro")
     assert repro.returncode == 0, repro.stdout + repro.stderr
     assert (repro.stdout + repro.stderr).count(_OLD_FORMAT) == 1, repro.stdout + repro.stderr
-    assert "cached" in repro.stdout or "ran" in repro.stdout, repro.stdout
+    summary = repro.stdout + repro.stderr
+    assert "1 ran, 0 cached" in summary or "0 ran, 1 cached" in summary, summary
     assert yaml.safe_load(lock_path.read_text())["schema_version"] == 3
     assert _OLD_FORMAT not in _ok(_pivot(root, "status"))
 
@@ -409,6 +451,24 @@ def test_repro_warns_when_git_ignores_a_lock_or_listing_it_wrote(tmp_path: pathl
     assert ".pivot/stages/lib/make.lock" in out, out
     assert ".pivot/stages/lib/make=tree.listing" in out, out
     assert "!/stages/**" in out, out
+
+
+def test_repro_warns_when_git_ignores_the_listing_of_a_directory_input_it_wrote(
+    tmp_path: pathlib.Path,
+) -> None:
+    """In a project made before `!/stages/**` existed, a root pattern such as `*.listing` hides
+    the input listing pivot writes for a directory input, as well as output listings."""
+    root = _project(tmp_path, {"pipeline.py": _TREE_PIPELINE, ".gitignore": "*.listing\n"})
+    gitignore = root / ".pivot" / ".gitignore"
+    gitignore.write_text(gitignore.read_text().replace("!/stages/**\n", ""))
+    _helper_write_tree(root / "data" / "raw" / "corpus")
+
+    repro = _pivot(root, "repro")
+
+    out = repro.stdout + repro.stderr
+    assert repro.returncode == 0, out
+    assert str(_INPUT_LISTING) in out, out
+    assert str(_OUTPUT_LISTING) in out, out
 
 
 _COLLIDE_PIPELINE = """\

@@ -43,7 +43,6 @@ Example::
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import enum
 import logging
 import os
@@ -456,15 +455,14 @@ def find_orphaned_lock_files(
     for stage_name, stage_info in all_stages.items():
         stages_dir = explain.stages_dir(stage_info, default_state_dir)
         registered_stages.setdefault(stages_dir, set[str]()).add(stage_name)
-        for out in stage_info["outs"]:
-            with contextlib.suppress(exceptions.InvalidPathError):
-                registered_listings.add(listing.output_listing_path(stages_dir, out.identity))
+        registered_listings.update(
+            listing.output_listing_path(stages_dir, out.identity) for out in stage_info["outs"]
+        )
         for ref in stage_info["deps"].values():
             if ref.tag is ArtifactTag.INPUT:
-                with contextlib.suppress(exceptions.InvalidPathError):
-                    registered_listings.add(
-                        listing.input_listing_path(stages_dir, store.input_relpath(ref))
-                    )
+                registered_listings.add(
+                    listing.input_listing_path(stages_dir, store.input_relpath(ref))
+                )
     orphaned = set[str]()
     for state_dir in state_dirs:
         stages_dir = lock.get_stages_dir(state_dir)

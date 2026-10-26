@@ -154,13 +154,21 @@ kept in the cache, at the directory's hash, and pushed and pulled with it.
 | A tracked directory | `<path>.pvt.listing`, beside its `.pvt` |
 
 In a file name, every byte of the key or path other than a letter, digit, `_`,
-`.`, `@` or `-` is written `%XX`. Commit listing files with the lock files.
-`pivot init` writes `!/stages/**` into `.pivot/.gitignore`, so a root
-`.gitignore` pattern such as `lib/` or `build/` cannot hide them; `pivot repro`
-warns, naming each one, when git ignores a lock or listing file it just wrote,
-and `pivot track` does the same for a `.pvt` and its listing. A command that
-reads a listing refuses one whose bytes do not hash to the recorded directory
-hash, naming the file.
+`.`, `@` or `-` is written `%XX`; a name that would then be longer than 255
+bytes is written `~` and the xxhash64 of the key or path instead (for a tracked
+directory, `.~<hash>.pvt.listing` beside its `.pvt`). Commit listing files with
+the lock files. `pivot init` writes `!/stages/**` into `.pivot/.gitignore`, so a
+root `.gitignore` pattern such as `lib/` or `build/` cannot hide them; `pivot
+repro` warns, naming each one, when git ignores a lock or listing file it just
+wrote, and `pivot track` does the same for a `.pvt` and its listing.
+
+A listing file whose bytes do not hash to the directory hash its lock or `.pvt`
+records (hand-edited, left behind by a lock put back without it, or a shared
+input listing another stage has since rewritten) is passed over for the cache's
+copy of that listing, with one warning naming the file. `pivot verify` refuses
+such a file, naming it, since a fresh clone has no cache to fall back on; so does
+every command when the cache lacks that copy. `pivot repro --force <stage>`,
+`pivot track --force <path>` or `git checkout -- <file>` puts it right.
 
 A lock file an earlier Pivot wrote (one that lists a directory's files inside
 it) is read as missing, with one warning naming it: its stage is decided afresh
