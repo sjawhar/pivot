@@ -222,9 +222,16 @@ decorator accepts module-level functions and `functools.wraps` /
 helper that imports a user module in its body, and a helper that uses
 `importlib.import_module` or `__import__`.
 
-A `functools.cache` or `functools.lru_cache` decorator above the mark keeps
-the record by name. A decorator with a body of its own above the mark adds
-that body to the fingerprint. The marked function below it stays a name.
+The fingerprint walk never reads the body of a marked function. A decorator
+above the mark is user code: Pivot adds the decorator's own code to the
+fingerprint and records the marked function inside it by name, also when
+`functools.cache` wraps that decorator. A library wrapper directly above the
+mark (`functools.cache`, `functools.lru_cache`, `contextlib.contextmanager`)
+keeps the record by name. Without a mark below it, a `functools.wraps`
+decorator is fingerprinted as in earlier versions: Pivot does not see what
+its own lines read through a module (`settings.FACTOR`), or its body when
+`functools.cache` wraps it. A stage cannot carry the mark, also below another
+decorator.
 
 Pivot does not walk code that only a marked helper calls. If that code
 imports a user module in its body, the run-time check counts the import,

@@ -316,13 +316,22 @@ lambda, a nested function, a `functools.partial`, a helper that imports a
 user module in its body, and a helper that uses `importlib.import_module` or
 `__import__`. Import the module at the top of the helper's file instead.
 
-A `functools.cache` or `functools.lru_cache` decorator above the mark keeps
-the record by name. Pivot reads the wrapper and finds the marked function
-behind it. A decorator with a body of its own above the mark adds that body
-to the fingerprint. The marked function below it stays a name.
+The fingerprint walk never reads the body of a marked function. A decorator
+above the mark is user code: Pivot adds the decorator's own code to the
+fingerprint and records the marked function inside it by name. This is also
+true when `functools.cache` wraps that decorator. A library wrapper directly
+above the mark (`functools.cache`, `functools.lru_cache`,
+`contextlib.contextmanager`) keeps the record by name.
 
-A stage cannot carry `@fingerprint_by_name`. Use `@no_fingerprint()` to opt
-a stage out of AST fingerprinting.
+Without a mark below it, Pivot fingerprints a `functools.wraps` decorator as
+in earlier versions. It follows `__wrapped__` to the wrapped function, so it
+does not see what the decorator's own lines read through a module (for
+example `settings.FACTOR`), or the decorator's body when `functools.cache`
+wraps the decorator.
+
+A stage cannot carry `@fingerprint_by_name`: Pipeline refuses a stage with
+the mark above `@stage`, below it, or below another decorator. Use
+`@no_fingerprint()` to opt a stage out of AST fingerprinting.
 
 Pivot does not walk code that only a marked helper calls. If that code
 imports a user module in its body, the run-time check counts the import, and

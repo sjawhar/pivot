@@ -43,10 +43,18 @@ def fingerprint_by_name[F: Callable[..., object]](func: F) -> F:
     and the stage warns and reruns each run. Move that import to the top of
     its module to clear it.
 
-    A `functools.cache` or `functools.lru_cache` decorator above the mark
-    keeps the record by name. A decorator with a body of its own above the
-    mark adds that body to the fingerprint. The marked function below it
-    stays a name.
+    The fingerprint walk never reads the body of a marked function. A
+    decorator above the mark is user code: Pivot adds the decorator's own
+    code to the fingerprint and records the marked function inside it by
+    name, also when `functools.cache` wraps that decorator. A library wrapper
+    directly above the mark (`functools.cache`, `functools.lru_cache`,
+    `contextlib.contextmanager`) keeps the record by name. Without a mark
+    below it, a `functools.wraps` decorator is fingerprinted as in earlier
+    versions: Pivot does not see what its own lines read through a module
+    (`settings.FACTOR`), or its body when `functools.cache` wraps it.
+
+    A stage cannot carry the mark: Pipeline refuses a stage with the mark
+    anywhere on its `__wrapped__` chain.
 
     Soundness is the user's choice: if a marked helper can change a stage's
     output, Pivot does not see the change.

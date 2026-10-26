@@ -765,7 +765,7 @@ def _read_step(owner: Any, step: str) -> Any:
                 module = _body_import_module(arg)
                 return _UNREAD if module is None else module
             case "u":
-                return inspect.unwrap(owner, stop=fingerprinted_by_name)
+                return inspect.unwrap(owner, stop=_stop_at_mark)
             case "pf":
                 return owner.func
             case "pa":
@@ -1147,11 +1147,17 @@ def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
 
 
 def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
-    """Parse `func`'s own source, without following a functools.wraps chain."""
+    """Parse `func`'s own source, without following a functools.wraps chain.
+
+    None for a wrapper without code of its own (functools.cache): it has no source of its own.
+    """
     code = getattr(func, "__code__", None)
-    target: object = (
-        code if hasattr(func, "__wrapped__") and isinstance(code, types.CodeType) else func
-    )
+    if hasattr(func, "__wrapped__"):
+        if not isinstance(code, types.CodeType):
+            return None
+        target: object = code
+    else:
+        target = func
     try:
         return ast.parse(textwrap.dedent(inspect.getsource(target)))
     except (OSError, TypeError, SyntaxError):
@@ -1159,10 +1165,14 @@ def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
 
 
 def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
-    """Parse the source `inspect.getsource(func)` returns: for a functools.wraps wrapper, the
-    function at the end of its `__wrapped__` chain."""
+    """Parse the source `inspect.getsource(func)` returns, stopped above a mark
+    (`_source_object`): for a functools.wraps wrapper, the function at the end of its
+    `__wrapped__` chain, or the user decorator above a marked function on that chain."""
+    target = _source_object(func)
+    if target is None:
+        return None
     try:
-        return ast.parse(textwrap.dedent(inspect.getsource(func)))
+        return ast.parse(textwrap.dedent(inspect.getsource(target)))
     except (OSError, TypeError, SyntaxError):
         return None
 
@@ -1226,8 +1236,8 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     if is_user_code(func):
         tree = _source_tree(func)
         # The refusals read the source `inspect.getsource` returns, which follows a
-        # functools.wraps chain to the wrapped function, as on main; the body-import walk below
-        # reads the wrapper's own source.
+        # functools.wraps chain to the wrapped function, as on main, and stops at the user
+        # decorator above a mark; the body-import walk below reads the wrapper's own source.
         check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
         if check_tree is not None:
             _check_dynamic_name_access(func, check_tree)
@@ -1246,9 +1256,9 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
             return manifest
         # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
         # getclosurevars rejects it. The function it wraps reads the module values, so walk
-        # that function's globals, nonlocals and defaults instead. The unwrap stops at a marked
-        # function, and the walk does not enter it.
-        unwrapped = inspect.unwrap(func, stop=fingerprinted_by_name)
+        # that function's globals, nonlocals and defaults instead. The unwrap stops at a user
+        # decorator above a mark, which the walk enters, or at the mark, which it does not.
+        unwrapped = inspect.unwrap(func, stop=_stop_at_mark)
         if unwrapped is not func and inspect.isfunction(unwrapped):
             _record_read(func, "u")
             if not fingerprinted_by_name(unwrapped):
@@ -1428,7 +1438,8 @@ def _user_member_value(value: Any) -> Any:
 
     A member the walk records by name (`_recorded_by_name`) is returned before any unwrap, so
     a marked `@contextmanager` or `@functools.cache` helper held as a class attribute keeps its
-    name in the manifest. Each unwrap below stops at a marked function.
+    name in the manifest. Each unwrap below stops at a user decorator above a mark, or at the
+    mark (`_stop_at_mark`).
     """
     if _recorded_by_name(value):
         return value
@@ -1437,7 +1448,7 @@ def _user_member_value(value: Any) -> Any:
     if inspect.isfunction(value):
         if _written_in_user_source(value):
             return value
-        unwrapped = inspect.unwrap(value, stop=fingerprinted_by_name)
+        unwrapped = inspect.unwrap(value, stop=_stop_at_mark)
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
         return _UNREAD
@@ -1446,7 +1457,7 @@ def _user_member_value(value: Any) -> Any:
     if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
-        unwrapped = inspect.unwrap(value, stop=fingerprinted_by_name)
+        unwrapped = inspect.unwrap(value, stop=_stop_at_mark)
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
     if hasattr(value, "__get__") and _is_user_class_instance(value):
@@ -2129,11 +2140,16 @@ def _attributes_read(func: Callable[..., Any], chain: str) -> list[str]:
     """Each attribute `func` reads directly on the value it reaches as `chain`, in source order.
 
     For `chain` "settings", `settings.AGG(...)` and `settings.Config.SCALE` give `AGG` and
-    `Config`; what is read on `Config` is found from the chain "settings.Config".
+    `Config`; what is read on `Config` is found from the chain "settings.Config". The source
+    read stops above a mark (`_source_object`), so a user decorator above a marked function
+    gives the attributes its own lines read.
     """
+    target = _source_object(func)
+    if target is None:
+        return []
     prefix = f"{chain}."
     found = dict[str, None]()
-    for owner, path in ast_utils.extract_module_attr_usage(func):
+    for owner, path in ast_utils.extract_module_attr_usage(target):
         expression = f"{owner}.{path}"
         if expression.startswith(prefix):
             found[expression.removeprefix(prefix).split(".", 1)[0]] = None
@@ -2465,7 +2481,7 @@ def _process_bound_values(
         _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
     elif (
         callable(value)
-        and inspect.isfunction(inspect.unwrap(value, stop=fingerprinted_by_name))
+        and inspect.isfunction(inspect.unwrap(value, stop=_stop_at_mark))
         and is_user_code(value)
     ):
         _process_callable_dependency(binding_ref, value, manifest, visited)
@@ -2506,10 +2522,22 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
         hints = None  # Not in cache and can't be cached
 
     if hints is None:
-        try:
-            hints = typing.get_type_hints(func)
-        except Exception:
-            hints = _resolve_annotations_individually(func)
+        marked = _mark_below(func)
+        if marked is not None and getattr(func, "__annotations__", None) is getattr(
+            marked, "__annotations__", None
+        ):
+            # `functools.wraps` copied these annotations from the marked function below `func`:
+            # they are that function's type hints, which the walk does not read.
+            hints = dict[str, Any]()
+        else:
+            try:
+                # With a mark below, resolve in `func`'s own globals: by default
+                # `get_type_hints` follows `__wrapped__` to the globals at the end of the chain.
+                hints = typing.get_type_hints(
+                    func, globalns=None if marked is None else getattr(func, "__globals__", {})
+                )
+            except Exception:
+                hints = _resolve_annotations_individually(func)
         # Cache result if function is weakly referenceable
         with contextlib.suppress(TypeError):
             _get_type_hints_cache[func] = hints
@@ -2934,7 +2962,7 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         # 0. A function the walk records by name (`_recorded_by_name`) gets a hash of that
         # name. Its body is not read.
         if _recorded_by_name(func):
-            return xxhash.xxh64(f"by-name:{_library_name(func)}".encode()).hexdigest()
+            return _by_name_hash(func)
 
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
         # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
@@ -3060,11 +3088,19 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
             return _hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
 
+        # `inspect.getsource` follows `__wrapped__` with no stop, so the read takes the object
+        # `_source_object` gives: the end of the chain, as on main, or the code of the user
+        # decorator above a mark. Where the read would reach the mark, the hash is of the name.
+        target = _source_object(func)
+        if target is None:
+            return _by_name_hash(func)
         _t_source = metrics.start()
         try:
-            source = inspect.getsource(func)
+            source = inspect.getsource(target)
         except (OSError, TypeError):
             metrics.end("fingerprint.inspect_getsource", _t_source)
+            if isinstance(target, types.CodeType):
+                return _hash_code_object(target)
             if hasattr(func, "__code__"):
                 # Marshal captures constants as well as bytecode, so `x + 1` and `x + 999`
                 # differ. Remove embedded source paths before hashing to keep it portable.
@@ -3153,9 +3189,9 @@ def _recorded_by_name(obj: Any) -> bool:
 
     That is a marked function, a method bound to one, and a library wrapper object without
     Python code of its own (functools.cache, lru_cache) whose `__wrapped__` chain reaches a
-    marked function through such wrappers only. `inspect.getsource` and the walk of a C-level
-    wrapper follow `__wrapped__` into the marked function, so such a wrapper gets the record of
-    the marked function. A Python function on the chain (a functools.wraps decorator) or an
+    marked function through such wrappers only. Behind such a wrapper the source read and the
+    walk stop at the marked function (`_stop_at_mark`), so the wrapper gets the record of the
+    marked function. A Python function on the chain (a functools.wraps decorator) or an
     instance of a user class is user code: the walk records its code.
     """
     if fingerprinted_by_name(obj):
@@ -3181,6 +3217,52 @@ def _recorded_by_name(obj: Any) -> bool:
         if inspect.isfunction(current) or isinstance(current, (type, types.ModuleType)):
             return False
         seen.add(id(current))
+
+
+def _mark_below(obj: Any) -> Any:
+    """The first marked function on `obj`'s `__wrapped__` chain below `obj`, or None."""
+    if isinstance(obj, type) or not hasattr(obj, "__wrapped__"):
+        return None
+    below = inspect.unwrap(obj.__wrapped__, stop=fingerprinted_by_name)
+    return below if fingerprinted_by_name(below) else None
+
+
+def _stop_at_mark(obj: Any) -> bool:
+    """Where an unwrap that leads to code stops: a marked function, or a user decorator above one.
+
+    A user decorator is a function compiled from user source (a `functools.wraps` wrapper)
+    with a marked function below it. The mark covers only the marked function, so the walk
+    reads such a decorator's own code where it would otherwise follow `__wrapped__` into the
+    mark. A library wrapper (a `contextlib.contextmanager` helper, `functools.cache`) is not a
+    stop. Without a mark on the chain nothing stops, and the unwrap goes to the end, as on main.
+    """
+    if fingerprinted_by_name(obj):
+        return True
+    return inspect.isfunction(obj) and _mark_below(obj) is not None and _written_in_user_source(obj)
+
+
+def _source_object(func: Any) -> Any:
+    """What a read of `func`'s source parses, or None where that read would reach a mark.
+
+    `inspect.getsource` follows `__wrapped__` to the end of the chain with no stop. Without a
+    mark on the chain this returns that end, so the read is the one main makes. With a mark,
+    the unwrap stops at `_stop_at_mark`: for a user decorator above the mark this returns the
+    decorator's code object, whose own lines `inspect.getsource` reads (a code object has no
+    `__wrapped__`); for the mark itself it returns None. No source read reaches a marked body.
+    """
+    if _recorded_by_name(func):
+        return None
+    target = inspect.unwrap(func, stop=_stop_at_mark)
+    if fingerprinted_by_name(target):
+        return None
+    if _stop_at_mark(target):
+        return target.__code__
+    return target
+
+
+def _by_name_hash(func: Any) -> str:
+    """The code hash of a function the walk records by name: a hash of that name."""
+    return xxhash.xxh64(f"by-name:{_library_name(func)}".encode()).hexdigest()
 
 
 def is_user_code(obj: Any) -> bool:

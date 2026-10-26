@@ -853,6 +853,18 @@ class Pipeline:
         reason = lock.stage_name_error(qualified_name)
         if reason is not None:
             raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
+        # Refuse a stage with @fingerprint_by_name anywhere on its `__wrapped__` chain (this
+        # @stage wrapper, the function @stage received, and each function below that one),
+        # before any read of the stage: the mark is for helpers, and a stage's own code is
+        # fingerprinted.
+        if fingerprint.fingerprinted_by_name(
+            inspect.unwrap(stage_wrapper, stop=fingerprint.fingerprinted_by_name)
+        ):
+            self._validation_errors.append(
+                f"{qualified_name}: @fingerprint_by_name marks a helper, not a stage. "
+                + "Use @no_fingerprint() to opt a stage out of AST fingerprinting."
+            )
+            return self._error_handle()
         output_specs = _analyze_return_type(original_func, qualified_name)
 
         sig = inspect.signature(original_func)
@@ -862,13 +874,7 @@ class Pipeline:
             bound.apply_defaults()
         except TypeError as exc:
             self._validation_errors.append(f"{stage_name}: {exc}")
-            dummy_input = _InputNode(
-                name="__error__",
-                python_type=None,
-                path="__error__",
-                format=loaders_mod.PathOnly(),
-            )
-            return ArtifactHandle(self, dummy_input, None, object)
+            return self._error_handle()
 
         for parameter in sig.parameters.values():
             if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
@@ -974,16 +980,6 @@ class Pipeline:
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
 
-        # Refuse a stage marked with @fingerprint_by_name: that mark is for helpers, not stages.
-        if fingerprint.fingerprinted_by_name(stage_wrapper) or fingerprint.fingerprinted_by_name(
-            original_func
-        ):
-            msg = (
-                f"{qualified_name}: @fingerprint_by_name marks a helper, not a stage. "
-                "Use @no_fingerprint() to opt a stage out of AST fingerprinting."
-            )
-            self._validation_errors.append(msg)
-
         # Read @no_fingerprint marks from this @stage wrapper, never from the shared function:
         # functools.wraps copies marks set below @stage, and marks set above land here directly.
         node = _StageNode(
@@ -1016,6 +1012,16 @@ class Pipeline:
             output_key=None,
             python_type=dict,
         )
+
+    def _error_handle(self) -> ArtifactHandle:
+        """A placeholder handle for a stage call refused with a validation error."""
+        dummy_input = _InputNode(
+            name="__error__",
+            python_type=None,
+            path="__error__",
+            format=loaders_mod.PathOnly(),
+        )
+        return ArtifactHandle(self, dummy_input, None, object)
 
     def previous(self, key: str | None = None) -> Any:
         """Mark a parameter as this stage call's prior incremental output."""

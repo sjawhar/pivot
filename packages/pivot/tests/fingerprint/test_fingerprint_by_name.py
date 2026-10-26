@@ -3,8 +3,10 @@
 """Tests for @fingerprint_by_name: a helper recorded by name only."""
 
 import ast
+import contextlib
 import functools
 import importlib
+import inspect
 import json
 import linecache
 import os
@@ -13,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import types
+import typing
 
 import cloudpickle
 import pytest
@@ -634,6 +637,8 @@ _HELD_HELPER = {
     "@fingerprint_by_name\n@contextlib.contextmanager\ndef member():\n    yield 'v1'\n",
     "cache": "import functools\n\nfrom pivot import fingerprint_by_name\n\n\n"
     "@fingerprint_by_name\n@functools.cache\ndef member(x):\n    return x * 2\n",
+    "contextmanager_above_the_mark": "import contextlib\n\nfrom pivot import fingerprint_by_name"
+    "\n\n\n@contextlib.contextmanager\n@fingerprint_by_name\ndef member():\n    yield 'v1'\n",
 }
 
 _HELD_STAGE = """\
@@ -848,41 +853,6 @@ def test_marked_stage_is_refused(module_dir: pathlib.Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pickling: pickle-by-value decision unchanged
-# ---------------------------------------------------------------------------
-
-
-def test_pickle_by_value_decision_unchanged_for_marked_helper(
-    module_dir: pathlib.Path,
-) -> None:
-    """The pickle-by-value decision for a marked helper's module is the same
-    with and without the mark. It fails if the decision becomes per function.
-    """
-    import cloudpickle
-
-    _write(
-        module_dir / "fbnhelp_pbv.py",
-        "from pivot import fingerprint_by_name\n\n"
-        "@fingerprint_by_name\n"
-        "def helper():\n"
-        "    return 'test'\n",
-    )
-    _import_fresh("fbnhelp_pbv")
-    marked_registered = "fbnhelp_pbv" in cloudpickle.list_registry_pickle_by_value()
-
-    _write(
-        module_dir / "fbnhelp_pbv.py",
-        "def helper():\n    return 'test'\n",
-    )
-    _import_fresh("fbnhelp_pbv")
-    unmarked_registered = "fbnhelp_pbv" in cloudpickle.list_registry_pickle_by_value()
-
-    assert marked_registered == unmarked_registered, (
-        "pickle-by-value decision must be the same with and without the mark"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Context manager body change in direct use (not class attribute)
 # ---------------------------------------------------------------------------
 
@@ -938,14 +908,21 @@ _REPO = pathlib.Path(__file__).resolve().parents[4]
 _UNCOVERED = "imported user modules its fingerprint does not cover"
 
 
-def _run(project: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    project: pathlib.Path, *args: str, extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
     }
     return subprocess.run(
-        [str(_PIVOT), *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
+        [str(_PIVOT), *args],
+        cwd=project,
+        env={**env, **(extra or {})},
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
 
 
@@ -983,8 +960,10 @@ def _flat(text: str) -> str:
 
 
 def _edit(path: pathlib.Path, old: str, new: str) -> None:
+    """Replace `old` once. `old` and `new` differ in length, so no stale bytecode is used."""
     text = path.read_text()
     assert text.count(old) == 1, f"{path}: {old!r}"
+    assert len(old) != len(new)
     path.write_text(text.replace(old, new))
 
 
@@ -1913,3 +1892,571 @@ def test_discovery_pickles_a_module_with_a_marked_helper_by_value_as_without_the
             discovery.discover_pipeline(project_root=tmp_path / "empty")
             sys.modules.pop(module, None)
     assert found == {"marked": True, "plain": True}, found
+
+
+# ---------------------------------------------------------------------------------------------
+# A stage with the mark anywhere on its `__wrapped__` chain is refused.
+# ---------------------------------------------------------------------------------------------
+
+_STAGE_BELOW_DECORATOR = """\
+import functools
+import pathlib
+
+from pivot import fingerprint_by_name
+from pivot.compose import Pipeline, stage
+
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@stage
+{decorators}@fingerprint_by_name
+def bad_stage() -> str:
+    return "oops"
+
+
+with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
+    bad_stage()
+"""
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_a_stage_marked_below_user_decorators_is_refused(
+    module_dir: pathlib.Path, depth: int
+) -> None:
+    """Pipeline refuses a stage with `@fingerprint_by_name` anywhere on its `__wrapped__` chain,
+    with the message a stage marked directly gets. A `functools.wraps` decorator between
+    `@stage` and the mark copies the mark's `__dict__` entry, which names the function below
+    it, so each function on the chain is asked, at any depth. Without the refusal the walk
+    records the stage's own body by name only, and an edit to that body leaves the stage
+    cached with an old output."""
+    module = f"rk_r3a_stage_{depth}"
+    _write(
+        module_dir / f"{module}.py",
+        _STAGE_BELOW_DECORATOR.format(decorators="@traced\n" * depth),
+    )
+    with pytest.raises(exceptions.StageDefinitionError, match="marks a helper, not a stage"):
+        _fresh(module)
+
+
+# ---------------------------------------------------------------------------------------------
+# The manifest-cache replay of step "u" stops where the walk stops.
+# ---------------------------------------------------------------------------------------------
+
+_REPLAY_HELPER = """\
+import functools
+
+from pivot import fingerprint_by_name
+
+K = 1
+
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _impl() -> str:
+    return f"k{K}"
+
+
+_inner = traced(_impl)
+helper = fingerprint_by_name(_inner)
+start = functools.cache(traced(helper))
+"""
+
+_REPLAY_PIPELINE = """\
+from pivot import Pipeline, stage
+
+from rk_r3b_ext import h
+
+
+@stage
+def s(text: str) -> str:
+    return f"{h.start()}:{len(text)}\\n"
+
+
+with Pipeline("mr") as pipeline:
+    s(pipeline.input("in.txt", t=str))
+"""
+
+
+def test_removing_the_mark_behind_a_cache_and_a_decorator_reruns_after_a_manifest_cache_hit(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The helper's file is outside the project root, so each new process takes the manifest
+    cache and replays the recorded reads. The stage reaches a marked helper through
+    `functools.cache` and a `functools.wraps` decorator. Removing the mark reruns the stage
+    once. After that, a change to a value the helper reads reruns the stage with the new
+    output."""
+    ext = tmp_path / "ext"
+    _write(ext / "rk_r3b_ext" / "__init__.py", "")
+    _write(ext / "rk_r3b_ext" / "h.py", _REPLAY_HELPER)
+    extra = {"PYTHONPATH": str(ext)}
+    project = tmp_path / "project"
+    _write(project / "pipeline.py", _REPLAY_PIPELINE)
+    _write(project / "data" / "raw" / "in.txt", "alpha beta\ngamma\n")
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    init = _run(project, "init", extra=extra)
+    assert init.returncode == 0, init.stdout + init.stderr
+    out = project / "data" / "mr" / "s.txt"
+
+    assert _status(_run(project, "repro", "--json", extra=extra), "mr/s")[0] == "ran"
+    assert _status(_run(project, "repro", "--json", extra=extra), "mr/s")[0] == "cached"
+    assert out.read_text() == "k1:17\n"
+
+    _edit(ext / "rk_r3b_ext" / "h.py", "fingerprint_by_name(_inner)", "_inner")
+    assert _status(_run(project, "repro", "--json", extra=extra), "mr/s") == (
+        "ran",
+        "Code changed",
+    )
+    assert _status(_run(project, "repro", "--json", extra=extra), "mr/s")[0] == "cached"
+
+    _edit(ext / "rk_r3b_ext" / "h.py", "K = 1\n", "K = 22\n")
+    assert _status(_run(project, "repro", "--json", extra=extra), "mr/s") == (
+        "ran",
+        "Code changed",
+    )
+    assert out.read_text() == "k22:17\n"
+
+
+def test_the_replay_of_a_cache_over_a_decorator_over_the_mark_reads_what_the_walk_read(
+    module_dir: pathlib.Path,
+) -> None:
+    """A manifest-cache hit replays each read the walk recorded and compares tokens. Behind
+    `functools.cache` the walk's unwrap (step "u") stops at the user decorator above the mark,
+    and the replay stops at the same function, so each recorded read gives its recorded token
+    again while nothing changed."""
+    _write(module_dir / "rk_replay_h.py", _REPLAY_HELPER)
+    _write(
+        module_dir / "rk_replay_s.py",
+        "import rk_replay_h as h\n\n\ndef my_stage():\n    return h.start()\n",
+    )
+    stage = _fresh("rk_replay_h", "rk_replay_s").my_stage
+    reads = list[tuple[tuple[str, ...], str]]()
+    token = fingerprint._recorded_reads.set(reads)
+    try:
+        fingerprint.get_stage_fingerprint(stage)
+    finally:
+        fingerprint._recorded_reads.reset(token)
+    assert any(path[-1] == "u" for path, _ in reads), reads
+    assert fingerprint._recorded_reads_hold(stage, [[list(path), read] for path, read in reads])
+
+
+# ---------------------------------------------------------------------------------------------
+# A user `functools.wraps` decorator directly above the mark: its own lines are read, and the
+# marked body is not.
+# ---------------------------------------------------------------------------------------------
+
+_C1 = {
+    "rk_r3c1_settings.py": "FACTOR = 2\nBASE = 5\nOTHER = 5\n",
+    "rk_r3c1_deco.py": """\
+import functools
+
+import rk_r3c1_settings as settings
+
+
+def scaled(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs) * settings.FACTOR
+
+    return wrapper
+""",
+    "rk_r3c1_h.py": """\
+import rk_r3c1_settings as settings
+from pivot import fingerprint_by_name
+from rk_r3c1_deco import scaled
+
+
+@scaled
+@fingerprint_by_name
+def helper():
+    return settings.BASE
+""",
+    "rk_r3c1_s.py": """\
+import rk_r3c1_h as h
+
+
+def my_stage():
+    return h.helper()
+""",
+}
+_C1_MODULES = ("rk_r3c1_settings", "rk_r3c1_deco", "rk_r3c1_h", "rk_r3c1_s")
+
+
+def test_a_user_decorator_above_the_mark_reads_no_module_attribute_of_the_marked_body(
+    module_dir: pathlib.Path,
+) -> None:
+    """The attributes the walk reads through a module come from the decorator's own lines,
+    never from the marked body below it. An edit that makes the marked body read another
+    module attribute keeps the stage fingerprint."""
+    for rel, text in _C1.items():
+        _write(module_dir / rel, text)
+    first = fingerprint.get_stage_fingerprint(_fresh(*_C1_MODULES).my_stage)
+
+    _edit(module_dir / "rk_r3c1_h.py", "return settings.BASE", "return settings.OTHER")
+    second = fingerprint.get_stage_fingerprint(_fresh(*_C1_MODULES).my_stage)
+    assert second == first, sorted(
+        key for key in set(first) | set(second) if first.get(key) != second.get(key)
+    )
+
+
+def test_a_user_decorator_above_the_mark_adds_its_own_module_reads(
+    module_dir: pathlib.Path,
+) -> None:
+    """A decorator above the mark is user code, and its own lines are in the fingerprint. The
+    decorator multiplies by `settings.FACTOR`, so a change to FACTOR changes the stage
+    fingerprint."""
+    for rel, text in _C1.items():
+        _write(module_dir / rel, text)
+    first = fingerprint.get_stage_fingerprint(_fresh(*_C1_MODULES).my_stage)
+
+    _edit(module_dir / "rk_r3c1_settings.py", "FACTOR = 2\n", "FACTOR = 30\n")
+    second = fingerprint.get_stage_fingerprint(_fresh(*_C1_MODULES).my_stage)
+    assert second != first
+
+
+# ---------------------------------------------------------------------------------------------
+# `functools.cache` above a user `functools.wraps` decorator above the mark: the hash of the
+# cache wrapper and the walk behind it stop at the decorator.
+# ---------------------------------------------------------------------------------------------
+
+_C2 = {
+    "rk_r3c2_deco.py": """\
+import functools
+
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+""",
+    "rk_r3c2_h.py": """\
+import functools
+
+from pivot import fingerprint_by_name
+from rk_r3c2_deco import traced
+
+
+@functools.cache
+@traced
+@fingerprint_by_name
+def start():
+    return 5
+""",
+    "rk_r3c2_s.py": """\
+import rk_r3c2_h as h
+
+
+def my_stage():
+    return h.start()
+""",
+}
+_C2_MODULES = ("rk_r3c2_deco", "rk_r3c2_h", "rk_r3c2_s")
+
+
+def test_a_cache_over_a_user_decorator_over_the_mark_hashes_no_marked_body(
+    module_dir: pathlib.Path,
+) -> None:
+    """The cache wrapper has no code of its own, so its hash is of the source behind it. That
+    read stops at the user decorator above the mark. An edit to the marked body keeps the
+    stage fingerprint."""
+    for rel, text in _C2.items():
+        _write(module_dir / rel, text)
+    first = fingerprint.get_stage_fingerprint(_fresh(*_C2_MODULES).my_stage)
+
+    _edit(module_dir / "rk_r3c2_h.py", "    return 5\n", "    return 2 + 3\n")
+    second = fingerprint.get_stage_fingerprint(_fresh(*_C2_MODULES).my_stage)
+    assert second == first, sorted(
+        key for key in set(first) | set(second) if first.get(key) != second.get(key)
+    )
+
+
+def test_a_cache_over_a_user_decorator_over_the_mark_adds_the_decorator_code(
+    module_dir: pathlib.Path,
+) -> None:
+    """A decorator above the mark is user code, also below `functools.cache`: its own lines
+    are in the fingerprint. An edit to that decorator changes the stage fingerprint."""
+    for rel, text in _C2.items():
+        _write(module_dir / rel, text)
+    first = fingerprint.get_stage_fingerprint(_fresh(*_C2_MODULES).my_stage)
+
+    _edit(
+        module_dir / "rk_r3c2_deco.py",
+        "        return fn(*args, **kwargs)\n",
+        "        return fn(*args, **kwargs) * 2\n",
+    )
+    second = fingerprint.get_stage_fingerprint(_fresh(*_C2_MODULES).my_stage)
+    assert second != first
+
+
+_C1_CACHED_STAGES = {
+    "called": _C1["rk_r3c1_s.py"],
+    "class_member": (
+        "import rk_r3c1_h as h\n\n\nclass Holder:\n    held = h.helper\n\n\n"
+        "def my_stage():\n    holder = Holder()\n    return holder.held()\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("stage", list(_C1_CACHED_STAGES))
+def test_a_cache_over_a_user_decorator_over_the_mark_adds_the_decorator_module_reads(
+    module_dir: pathlib.Path, stage: str
+) -> None:
+    """Behind `functools.cache` the walk enters the user decorator above the mark, as it
+    enters a decorator that the stage reads directly, also when the stage reaches the cache
+    as a class member it never names. The decorator multiplies by `settings.FACTOR`, so a
+    change to FACTOR changes the stage fingerprint, and the marked function stays a name."""
+    files = {
+        **{rel: text for rel, text in _C1.items() if rel != "rk_r3c1_h.py"},
+        "rk_r3c1_h.py": _C1["rk_r3c1_h.py"]
+        .replace("import rk_r3c1_settings", "import functools\n\nimport rk_r3c1_settings")
+        .replace("@scaled\n", "@functools.cache\n@scaled\n"),
+        "rk_r3c1_s.py": _C1_CACHED_STAGES[stage],
+    }
+    for rel, text in files.items():
+        _write(module_dir / rel, text)
+    first = fingerprint.get_stage_fingerprint(_fresh(*_C1_MODULES).my_stage)
+    names = {value for key, value in first.items() if key.startswith("ext:")}
+    assert "rk_r3c1_h.helper" in names, first
+
+    _edit(module_dir / "rk_r3c1_settings.py", "FACTOR = 2\n", "FACTOR = 30\n")
+    second = fingerprint.get_stage_fingerprint(_fresh(*_C1_MODULES).my_stage)
+    assert second != first
+
+
+# ---------------------------------------------------------------------------------------------
+# The type hints and the refusal checks of a user decorator above the mark.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_the_type_hints_a_decorator_copies_from_the_mark_stay_out_of_the_fingerprint(
+    module_dir: pathlib.Path,
+) -> None:
+    """`functools.wraps` copies the marked function's annotations into the decorator. They are
+    the marked function's type hints, so the walk does not read them: an edit to a class that
+    only those hints name keeps the stage fingerprint, as with the mark alone."""
+    _write(module_dir / "rk_hint_cfg.py", "class Cfg:\n    X = 1\n")
+    _write(
+        module_dir / "rk_hint_h.py",
+        "import functools\n\n"
+        "from pivot import fingerprint_by_name\n"
+        "from rk_hint_cfg import Cfg\n\n\n"
+        "def traced(fn):\n"
+        "    @functools.wraps(fn)\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n\n"
+        "    return wrapper\n\n\n"
+        "@traced\n@fingerprint_by_name\n"
+        "def helper(cfg: Cfg | None = None) -> int:\n"
+        "    return 1\n",
+    )
+    _write(
+        module_dir / "rk_hint_s.py",
+        "import rk_hint_h as h\n\n\ndef my_stage():\n    return h.helper()\n",
+    )
+    names = ("rk_hint_cfg", "rk_hint_h", "rk_hint_s")
+    first = fingerprint.get_stage_fingerprint(_fresh(*names).my_stage)
+    assert not [key for key in first if "rk_hint_cfg" in key], first
+
+    _edit(module_dir / "rk_hint_cfg.py", "    X = 1\n", "    X = 22\n")
+    second = fingerprint.get_stage_fingerprint(_fresh(*names).my_stage)
+    assert second == first
+
+
+def test_a_user_decorator_above_the_mark_that_calls_globals_is_refused(
+    module_dir: pathlib.Path,
+) -> None:
+    """The walk's refusals read the decorator's own lines, which the fingerprint holds. A
+    decorator above the mark that calls `globals()` is refused, as any walked function is."""
+    _write(
+        module_dir / "rk_dyn_h.py",
+        "import functools\n\n"
+        "from pivot import fingerprint_by_name\n\n\n"
+        "def traced(fn):\n"
+        "    @functools.wraps(fn)\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        globals()\n"
+        "        return fn(*args, **kwargs)\n\n"
+        "    return wrapper\n\n\n"
+        "@traced\n@fingerprint_by_name\n"
+        "def helper():\n"
+        "    return 1\n",
+    )
+    _write(
+        module_dir / "rk_dyn_s.py",
+        "import rk_dyn_h as h\n\n\ndef my_stage():\n    return h.helper()\n",
+    )
+    stage = _fresh("rk_dyn_h", "rk_dyn_s").my_stage
+    with pytest.raises(exceptions.StageDefinitionError, match=r"uses globals\(\)"):
+        fingerprint.get_stage_fingerprint(stage)
+
+
+# ---------------------------------------------------------------------------------------------
+# No source or type-hint read of the walk reaches a marked function.
+# ---------------------------------------------------------------------------------------------
+
+_SPY_DECO = """\
+import functools
+
+import rk_spy_settings as settings
+
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs) * settings.FACTOR
+
+    return wrapper
+"""
+
+_SPY_HELPER = """\
+import contextlib
+import functools
+
+import rk_spy_settings as settings
+from pivot import fingerprint_by_name
+from rk_spy_cfg import Cfg
+from rk_spy_deco import traced
+
+
+{decorators}
+def target(cfg: Cfg | None = None):
+    {verb} settings.BASE
+"""
+
+_SPY_SHAPES = {
+    "decorator": ("@traced\n@fingerprint_by_name", "return"),
+    "two_decorators": ("@traced\n@traced\n@fingerprint_by_name", "return"),
+    "cache_decorator": ("@functools.cache\n@traced\n@fingerprint_by_name", "return"),
+    "cache": ("@functools.cache\n@fingerprint_by_name", "return"),
+    "contextmanager_above": ("@contextlib.contextmanager\n@fingerprint_by_name", "yield"),
+    "contextmanager_below": ("@fingerprint_by_name\n@contextlib.contextmanager", "yield"),
+    "cache_contextmanager": (
+        "@functools.cache\n@contextlib.contextmanager\n@fingerprint_by_name",
+        "yield",
+    ),
+}
+
+_SPY_STAGES = {
+    "called": "import rk_spy_h as h\n\n\ndef my_stage():\n    return h.target()\n",
+    "class_member": (
+        "import rk_spy_h as h\n\n\nclass Holder:\n    held = h.target\n\n\n"
+        "def my_stage():\n    return Holder.held()\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("stage", list(_SPY_STAGES))
+@pytest.mark.parametrize("shape", list(_SPY_SHAPES))
+def test_no_source_or_hint_read_of_the_walk_reaches_a_marked_function(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch, shape: str, stage: str
+) -> None:
+    """`inspect.getsource` and `typing.get_type_hints` follow `__wrapped__` with no stop. Each
+    object the walk gives them stops above the mark: a user decorator's own code, or no read.
+    No call reaches the marked function, through any wrapper, for a stage that calls the
+    helper or reads it as a class member."""
+    decorators, verb = _SPY_SHAPES[shape]
+    _write(module_dir / "rk_spy_settings.py", "FACTOR = 2\nBASE = 5\n")
+    _write(module_dir / "rk_spy_cfg.py", "class Cfg:\n    X = 1\n")
+    _write(module_dir / "rk_spy_deco.py", _SPY_DECO)
+    _write(module_dir / "rk_spy_h.py", _SPY_HELPER.format(decorators=decorators, verb=verb))
+    _write(module_dir / "rk_spy_s.py", _SPY_STAGES[stage])
+    my_stage = _fresh(
+        "rk_spy_settings", "rk_spy_cfg", "rk_spy_deco", "rk_spy_h", "rk_spy_s"
+    ).my_stage
+
+    sources = list[object]()
+    hinted = list[object]()
+    getsourcelines = inspect.getsourcelines
+    get_type_hints = typing.get_type_hints
+
+    def spy_sourcelines(obj: object) -> object:
+        sources.append(obj)
+        return getsourcelines(obj)
+
+    def spy_type_hints(obj: object, *args: object, **kwargs: object) -> object:
+        hinted.append(obj)
+        return get_type_hints(obj, *args, **kwargs)
+
+    monkeypatch.setattr(inspect, "getsourcelines", spy_sourcelines)
+    monkeypatch.setattr(typing, "get_type_hints", spy_type_hints)
+    fingerprint.get_stage_fingerprint(my_stage)
+    monkeypatch.undo()
+
+    def reaches_mark(obj: object) -> bool:
+        if isinstance(obj, types.CodeType):
+            return False
+        end = inspect.unwrap(obj, stop=fingerprint.fingerprinted_by_name)
+        return fingerprint.fingerprinted_by_name(end)
+
+    assert my_stage in sources, sources
+    assert [obj for obj in sources if reaches_mark(obj)] == []
+    assert [obj for obj in hinted if reaches_mark(obj)] == []
+
+
+# ---------------------------------------------------------------------------------------------
+# The pickle-by-value decision of a module that holds a marked helper.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_the_mark_leaves_the_pickle_by_value_decision_of_its_module_unchanged(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Discovery pickles a project module by value and a module outside the project root by
+    reference. A module that holds a marked helper gets the same decision as the same module
+    without the mark, inside and outside the root."""
+    found = dict[tuple[str, str], bool]()
+    for place in ("inroot", "outroot"):
+        for variant, mark in (("marked", "@fingerprint_by_name\n"), ("plain", "")):
+            case = tmp_path / f"{place}_{variant}"
+            root = case / "root"
+            (root / ".git").mkdir(parents=True)
+            (root / ".pivot").mkdir()
+            home = root if place == "inroot" else case / "ext"
+            module = f"rk_r3d_{place}_{variant}"
+            _write(
+                home / f"{module}.py",
+                "from pivot import fingerprint_by_name\n\n\n"
+                + mark
+                + "def helper() -> str:\n    return 'payload'\n",
+            )
+            _write(
+                root / "pipeline.py",
+                "import pathlib\n\n"
+                + "from pivot.compose import Pipeline, stage\n"
+                + f"from {module} import helper\n\n\n"
+                + "@stage\ndef build() -> str:\n    return helper()\n\n\n"
+                + "with Pipeline('test', root=pathlib.Path(__file__).parent) as pipeline:\n"
+                + "    build()\n",
+            )
+            if place == "outroot":
+                sys.path.insert(0, str(home))
+            try:
+                assert discovery.discover_pipeline(project_root=root) is not None
+                found[(place, variant)] = module in cloudpickle.list_registry_pickle_by_value()
+            finally:
+                discovery.discover_pipeline(project_root=tmp_path / "empty")
+                held = sys.modules.pop(module, None)
+                if held is not None:
+                    with contextlib.suppress(ValueError):
+                        cloudpickle.unregister_pickle_by_value(held)
+                if place == "outroot":
+                    sys.path.remove(str(home))
+    assert found == {
+        ("inroot", "marked"): True,
+        ("inroot", "plain"): True,
+        ("outroot", "marked"): False,
+        ("outroot", "plain"): False,
+    }, found
