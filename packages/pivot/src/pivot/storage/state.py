@@ -311,9 +311,11 @@ def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) ->
     LMDB, or an mtime outside what the unsigned 64-bit field can store, before 1970 or after
     2554 (tmpfs and btrfs keep such times). The cache only saves a later read, so no such
     entry may fail the caller. When a path's previous entry named another inode, that inode's
-    index entry is deleted if it still points there, so the index never outgrows the entries.
+    index entry is deleted if it still points there, and a path written twice in one batch (a
+    worker reads an edited output, then restores it from the run cache as a new inode) is
+    indexed only at its last inode, so the index never outgrows the entries.
     """
-    index = list[tuple[bytes, bytes]]()
+    index = dict[bytes, bytes]()  # file-hash key -> its identity key; a path's last entry wins
     for path, mtime_ns, size, dev, inode, hash_hex in entries:
         key = _make_key_file_hash(path)
         if len(key) > _MAX_KEY_SIZE:
@@ -330,8 +332,8 @@ def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) ->
                 if txn.get(old_index) == key:
                     txn.delete(old_index)
         txn.put(key, _pack_value(mtime_ns, size, dev, inode, hash_hex))
-        index.append((_make_key_file_identity(dev, inode), key))
-    for index_key, key in index:
+        index[key] = _make_key_file_identity(dev, inode)
+    for key, index_key in index.items():
         txn.put(index_key, key)
 
 

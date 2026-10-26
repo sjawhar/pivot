@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from pivot.storage import cache, state
+from pivot.types import DeferredWrites
 
 if TYPE_CHECKING:
     import pathlib
@@ -296,3 +297,61 @@ def test_rewriting_a_path_keeps_its_old_inodes_index_entry_that_names_another_li
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(another, another.stat()) == live_hash
+
+
+def test_an_output_read_then_restored_in_one_batch_leaves_one_index_entry(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A repro that restores an edited output from the run cache reads the edited file,
+    restores the output as a new inode, and the worker hands both entries to the coordinator
+    in one batch (`worker._try_skip_via_run_cache_with_store`). The edited inode keeps no index
+    entry: the index holds one entry, for the restored file, and does not grow with each edit
+    and restore."""
+    state_dir = tmp_path / ".pivot"
+    output = _helper_file(tmp_path / "data" / "out.txt", b"content")
+    output_hash = _helper_record(state_dir, output)
+    os.replace(_helper_file(tmp_path / "data" / "out.edit", b"edited"), output)
+    edited_hash, edited = cache.hash_file(output)
+    restored = _helper_file(tmp_path / "data" / "out.restore", b"content")
+    os.replace(restored, output)
+    batch = cache.deferred_file_hash_entries(
+        [(output, edited, edited_hash), (output, output.stat(), output_hash)]
+    )
+
+    with state.StateDB(state_dir) as state_db:
+        state_db.apply_deferred_writes("syn/make", [], DeferredWrites(file_hash_entries=batch))
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        index = dict(state_db.iter_prefix(b"inode:"))
+        assert state_db.get(output, output.stat()) == output_hash
+    assert edited.st_ino != output.stat().st_ino
+    assert list(index.values()) == [b"hash:" + os.fsencode(output)]
+
+
+def test_a_batch_that_moves_one_link_to_a_new_inode_keeps_the_other_links_hint(
+    tmp_path: pathlib.Path,
+) -> None:
+    """One batch records two links of an inode, Q then P, and then P restored as a new inode.
+    The old inode's index entry stays with Q, which still names it, so a further link of it is
+    served by identity."""
+    state_dir = tmp_path / ".pivot"
+    q = _helper_file(tmp_path / "q" / "f.txt", b"content")
+    p = tmp_path / "p" / "f.txt"
+    p.parent.mkdir()
+    os.link(q, p)
+    content_hash, linked = cache.hash_file(q)
+    restored = _helper_file(tmp_path / "p" / "f.restore", b"content")
+    os.replace(restored, p)
+    batch = cache.deferred_file_hash_entries(
+        [(q, linked, content_hash), (p, linked, content_hash), (p, p.stat(), content_hash)]
+    )
+    with state.StateDB(state_dir) as state_db:
+        state_db.apply_deferred_writes("syn/make", [], DeferredWrites(file_hash_entries=batch))
+    another = tmp_path / "another" / "f.txt"
+    another.parent.mkdir()
+    os.link(q, another)
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        index = dict(state_db.iter_prefix(b"inode:"))
+        assert state_db.get(another, another.stat()) == content_hash
+    assert sorted(index.values()) == sorted([b"hash:" + os.fsencode(q), b"hash:" + os.fsencode(p)])
