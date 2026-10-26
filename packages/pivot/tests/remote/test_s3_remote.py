@@ -38,66 +38,6 @@ def _helper_hash(content: bytes) -> str:
 
 
 # -----------------------------------------------------------------------------
-# RemoteFetcher Protocol Tests (for pivot get --rev)
-# -----------------------------------------------------------------------------
-
-
-def test_set_and_get_default_remote(mocker: MockerFixture) -> None:
-    """set_default_remote sets and get_default_remote retrieves it."""
-    mock_fetcher = mocker.Mock()
-
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(mock_fetcher)
-        assert remote_mod.get_default_remote() is mock_fetcher
-
-        remote_mod.set_default_remote(None)
-        assert remote_mod.get_default_remote() is None
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-def test_fetch_from_remote_no_remote_configured() -> None:
-    """fetch_from_remote returns None when no remote configured."""
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(None)
-        result = remote_mod.fetch_from_remote("abc123def4567890")
-        assert result is None
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-def test_fetch_from_remote_success(mocker: MockerFixture) -> None:
-    """fetch_from_remote returns content when remote fetch succeeds."""
-    mock_fetcher = mocker.Mock()
-    mock_fetcher.fetch.return_value = b"file content"
-
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(mock_fetcher)
-        result = remote_mod.fetch_from_remote("abc123def4567890")
-        assert result == b"file content"
-        mock_fetcher.fetch.assert_called_once_with("abc123def4567890")
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-def test_fetch_from_remote_fetch_error(mocker: MockerFixture) -> None:
-    """fetch_from_remote returns None when remote raises RemoteFetchError."""
-    mock_fetcher = mocker.Mock()
-    mock_fetcher.fetch.side_effect = exceptions.RemoteFetchError("Network error")
-
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(mock_fetcher)
-        result = remote_mod.fetch_from_remote("abc123def4567890")
-        assert result is None
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-# -----------------------------------------------------------------------------
 # S3Remote Initialization Tests
 # -----------------------------------------------------------------------------
 

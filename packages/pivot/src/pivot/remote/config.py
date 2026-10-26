@@ -161,7 +161,8 @@ def get_remote_url(name: str | None = None) -> str:
                 name = next(iter(remotes.keys()))
             else:
                 raise exceptions.RemoteNotFoundError(
-                    "No default remote set and multiple remotes configured. Use -r <name> to specify a remote or 'pivot config set default_remote <name>' to set a default."
+                    "No default remote set and multiple remotes configured. Use --remote <name> "
+                    + "to specify a remote or 'pivot config set default_remote <name>' to set a default."
                 )
 
     if name not in remotes:

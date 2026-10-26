@@ -27,6 +27,7 @@ import xxhash
 import yaml
 
 from pivot import loaders
+from pivot.remote import keys
 from pivot.storage import cache
 
 if TYPE_CHECKING:
@@ -955,6 +956,193 @@ def _dirout_clone_after_teammate_rerun(
 
     subprocess.run(["git", "pull", "-q", "--ff-only"], cwd=clone, check=True)
     return clone, env
+
+
+@pytest.mark.parametrize(
+    ("set_default", "remote_args"),
+    [
+        pytest.param(True, (), id="default"),
+        pytest.param(False, ("--remote", "origin"), id="named"),
+    ],
+)
+def test_get_restores_tracked_file_from_configured_remote(
+    tmp_path: pathlib.Path,
+    moto_services: dict[str, str],
+    set_default: bool,
+    remote_args: tuple[str, ...],
+) -> None:
+    """get retrieves an uncached tracked file from the default or named remote."""
+    endpoint = moto_services["s3"]
+    env = _env(
+        AWS_ENDPOINT_URL=endpoint,
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"get-{uuid.uuid4().hex[:8]}"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    )
+    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    root = _project(tmp_path, {".gitignore": "artifact.txt\n", "artifact.txt": "from remote\n"})
+    _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    if set_default:
+        _ok(_pivot(root, "config", "set", "default_remote", "origin"))
+    else:
+        _ok(_pivot(root, "config", "set", "remotes.backup", "s3://unused-bucket/cache"))
+    _ok(_pivot(root, "track", "artifact.txt"))
+    file_hash, _ = cache.hash_file(root / "artifact.txt")
+    _ok(_pivot(root, "push", "--remote", "origin", env=env))
+    _commit(root, "track artifact")
+
+    (root / "artifact.txt").unlink()
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", file_hash).unlink()
+
+    proc = _pivot(root, "get", *remote_args, "--rev", "HEAD", "artifact.txt", env=env)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "from remote" in proc.stdout
+    assert (root / "artifact.txt").read_text() == "from remote\n"
+    cached_path = cache.get_cache_path(root / ".pivot" / "cache" / "files", file_hash)
+    assert cached_path.read_bytes() == b"from remote\n"
+    assert cached_path.stat().st_mode & 0o777 == 0o444
+
+    (root / "artifact.txt").unlink()
+    unreachable_env = _env(
+        AWS_ENDPOINT_URL="http://127.0.0.1:9",
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    cached_proc = _pivot(
+        root, "get", *remote_args, "--rev", "HEAD", "artifact.txt", env=unreachable_env
+    )
+    assert cached_proc.returncode == 0, cached_proc.stdout + cached_proc.stderr
+    assert "from cache" in cached_proc.stdout
+    assert (root / "artifact.txt").read_text() == "from remote\n"
+
+
+def test_get_restores_directory_output_from_configured_remote(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """get retrieves every uncached file of a directory output from the configured remote."""
+    clone, env = _dirout_clone_after_teammate_rerun(tmp_path, moto_services["s3"])
+    shards = clone / "data" / "d" / "shards.dat"
+    shutil.rmtree(shards)
+
+    proc = _pivot(clone, "get", "--rev", "HEAD", "d/shards", env=env)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "from remote" in proc.stdout
+    assert (shards / "0.txt").read_text() == "11"
+    assert (shards / "1.txt").read_text() == "15"
+
+
+def test_get_names_missing_remote_configuration(tmp_path: pathlib.Path) -> None:
+    """get explains how to configure its remote fallback."""
+    root = _project(tmp_path, {".gitignore": "artifact.txt\n", "artifact.txt": "from remote\n"})
+    _ok(_pivot(root, "track", "artifact.txt"))
+    file_hash, _ = cache.hash_file(root / "artifact.txt")
+    _commit(root, "track artifact")
+
+    (root / "artifact.txt").unlink()
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", file_hash).unlink()
+
+    proc = _pivot(root, "get", "--rev", "HEAD", "artifact.txt")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "No remotes configured." in out
+    assert "pivot config set remotes.<name> <url>" in out
+
+
+@pytest.mark.parametrize(
+    "remote_body",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param(b"corrupt remote bytes", id="corrupt"),
+    ],
+)
+def test_get_leaves_no_output_or_cache_after_failed_remote_download(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], remote_body: bytes | None
+) -> None:
+    """get rejects a missing or corrupt remote object without leaving local state."""
+    endpoint = moto_services["s3"]
+    env = _env(
+        AWS_ENDPOINT_URL=endpoint,
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"get-failed-{uuid.uuid4().hex[:8]}"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    )
+    s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+
+    root = _project(tmp_path, {".gitignore": "artifact.txt\n", "artifact.txt": "expected bytes\n"})
+    _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(root, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(root, "track", "artifact.txt"))
+    file_hash, _ = cache.hash_file(root / "artifact.txt")
+    if remote_body is not None:
+        _ok(_pivot(root, "push", env=env))
+        s3.put_object(  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+            Bucket=bucket,
+            Key=keys.hash_to_key("cache/", file_hash),
+            Body=remote_body,
+        )
+    _commit(root, "track artifact")
+
+    (root / "artifact.txt").unlink()
+    cached_path = cache.get_cache_path(root / ".pivot" / "cache" / "files", file_hash)
+    cached_path.unlink()
+
+    proc = _pivot(root, "get", "--rev", "HEAD", "artifact.txt", env=env)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "failed to download from remote" in out
+    assert not (root / "artifact.txt").exists()
+    assert not cached_path.exists()
+
+
+def test_get_reports_prior_cache_restore_when_remote_is_unconfigured(
+    tmp_path: pathlib.Path,
+) -> None:
+    """get reports both a cache hit and a later remote configuration error."""
+    root = _project(
+        tmp_path,
+        {
+            ".gitignore": "first.txt\nsecond.txt\n",
+            "first.txt": "first\n",
+            "second.txt": "second\n",
+        },
+    )
+    _ok(_pivot(root, "track", "first.txt", "second.txt"))
+    second_hash, _ = cache.hash_file(root / "second.txt")
+    _commit(root, "track files")
+
+    (root / "first.txt").unlink()
+    (root / "second.txt").unlink()
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", second_hash).unlink()
+
+    proc = _pivot(root, "get", "--rev", "HEAD", "first.txt", "second.txt")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "first.txt (from cache)" in out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "No remotes configured." in out
 
 
 def test_pull_replaces_directory_output_after_teammate_rerun(

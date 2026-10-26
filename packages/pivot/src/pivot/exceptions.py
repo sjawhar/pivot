@@ -352,14 +352,6 @@ class RemoteTransferError(RemoteError):
         return "Check network connection and remote permissions"
 
 
-class RemoteFetchError(RemoteError):
-    """Raised when fetching from remote fails."""
-
-    @override
-    def get_suggestion(self) -> str:
-        return "Check network connection and verify the file exists on remote"
-
-
 class RemoteNotConfiguredError(RemoteError):
     """Raised when no remote is configured."""
 

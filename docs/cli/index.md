@@ -440,6 +440,7 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--rev` / `-r REV` | Git revision (SHA, branch, tag) - required |
+| `--remote NAME` | Remote name (uses default if not specified) |
 | `--output` / `-o PATH` | Output path (single file only) |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--force` / `-f` | Overwrite existing files |
@@ -455,6 +456,9 @@ pivot get demo/train --rev feature-branch
 
 # Get with custom output path
 pivot get data/demo/train.jsonl --rev v1.0 --output old_train.jsonl
+
+# Get from a specific remote
+pivot get data/demo/train.jsonl --rev abc123 --remote origin
 ```
 
 ---
