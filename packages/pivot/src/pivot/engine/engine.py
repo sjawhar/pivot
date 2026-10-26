@@ -866,24 +866,29 @@ class Engine:
     async def _run_execution_task(self, event: RunRequested) -> None:
         """Execute a run in a background task within the run task group.
 
-        Handles ACTIVE→IDLE transitions, restart coalescing, and deferred reloads.
+        Handles ACTIVE→IDLE transitions, restart coalescing, and deferred reloads. The run
+        holds a state-directory record unless an invocation already holds one, so a library
+        caller's run reads ``core.state_dir`` once, before its first stage, and every entry
+        the run produces is filed under the directory the run writes its locks and its run
+        manifest to.
         """
         try:
-            self._require_pipeline()
+            with state_dir_mod.run_invocation():
+                self._require_pipeline()
 
-            await self._orchestrate_execution(
-                stages=event["stages"],
-                force=event["force"],
-                single_stage=event["single_stage"],
-                parallel=event["parallel"],
-                max_workers=event["max_workers"],
-                resource_capacity=event["resource_capacity"],
-                no_commit=event["no_commit"],
-                on_error=event["on_error"],
-                cache_dir=event["cache_dir"],
-                allow_uncached_incremental=event["allow_uncached_incremental"],
-                checkout_missing=event["checkout_missing"],
-            )
+                await self._orchestrate_execution(
+                    stages=event["stages"],
+                    force=event["force"],
+                    single_stage=event["single_stage"],
+                    parallel=event["parallel"],
+                    max_workers=event["max_workers"],
+                    resource_capacity=event["resource_capacity"],
+                    no_commit=event["no_commit"],
+                    on_error=event["on_error"],
+                    cache_dir=event["cache_dir"],
+                    allow_uncached_incremental=event["allow_uncached_incremental"],
+                    checkout_missing=event["checkout_missing"],
+                )
         finally:
             self._running_request = None
             pending_reload = self._reload_pending is not None

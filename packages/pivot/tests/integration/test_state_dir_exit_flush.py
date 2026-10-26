@@ -1,5 +1,5 @@
 """A fingerprint-cache entry is written to the state directory of the run that produced it,
-whenever and wherever the flush that writes it runs.
+whenever and wherever the flush that writes it runs, and whenever the value is edited.
 
 A flush runs where the producer no longer does. A TUI session's engine thread keeps
 fingerprinting a reload after the quit has returned from the command, so process exit flushes
@@ -7,6 +7,11 @@ what that thread queued; a library caller flushes at process exit as well, after
 program did next. Neither reads `core.state_dir` again, so a value edited in between takes
 nothing: the session's entries stay in `s1`, the library's in `libstate`, and the edited
 directory is never created.
+
+A run reads the value once, before its first stage, and holds it: the CLI invocation holds it
+for a command, and an engine run with no invocation around it holds it for the run
+(`state_dir.run_invocation`). So a stage that edits `core.state_dir` moves no entry of its own
+run either, including the stages the engine fingerprints only once that stage has finished.
 """
 
 from __future__ import annotations
@@ -53,6 +58,155 @@ def main() -> None:
 
     executor.run(pipeline=discovery.discover_pipeline())
     pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+_CHAIN_PIPELINE = """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def first(value: str) -> str:
+    pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
+    return value.upper()
+
+
+@stage
+def second(value: str) -> str:
+    return value + "-second"
+
+
+with Pipeline("lib") as pipeline:
+    second(first(pipeline.input("input.txt", t=str)))
+"""
+
+_LONGER_CHAIN_PIPELINE = """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+def helper_a(value: str) -> str:
+    return value.upper()
+
+
+def helper_b(value: str) -> str:
+    return value + "b"
+
+
+def helper_c(value: str) -> str:
+    return value + "c"
+
+
+@stage
+def a(value: str) -> str:
+    pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
+    return helper_a(value)
+
+
+@stage
+def b(value: str) -> str:
+    return helper_b(value)
+
+
+@stage
+def c(value: str) -> str:
+    return helper_c(value)
+
+
+with Pipeline("lib") as pipeline:
+    c(b(a(pipeline.input("input.txt", t=str))))
+"""
+
+_RUN_CALLER = """\
+import os
+import sys
+
+
+def main() -> None:
+    os.chdir(sys.argv[1])
+
+    from pivot import discovery, executor
+
+    results = executor.run(pipeline=discovery.discover_pipeline())
+    assert results, results
+    assert all(r["status"] == "ran" for r in results.values()), results
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+_TWO_RUNS_CALLER = """\
+import os
+import pathlib
+import sys
+
+
+def main() -> None:
+    os.chdir(sys.argv[1])
+
+    from pivot import discovery, executor
+
+    pipeline = discovery.discover_pipeline()
+    executor.run(pipeline=pipeline)
+    pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
+    executor.run(pipeline=pipeline, force=True)
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+_TWO_INDEPENDENT_STAGES = """\
+from pivot import Pipeline, stage
+
+
+def helper_first(value: str) -> str:
+    return value.upper()
+
+
+def helper_second(value: str) -> str:
+    return value + "-second"
+
+
+@stage
+def first(value: str) -> str:
+    return helper_first(value)
+
+
+@stage
+def second(value: str) -> str:
+    return helper_second(value)
+
+
+with Pipeline("lib") as pipeline:
+    raw = pipeline.input("input.txt", t=str)
+    first(raw)
+    second(raw)
+"""
+
+_DIRECT_FINGERPRINT_CALLER = """\
+import os
+import pathlib
+import sys
+
+
+def main() -> None:
+    os.chdir(sys.argv[1])
+
+    from pivot import discovery, fingerprint
+
+    pipeline = discovery.discover_pipeline()
+    pipeline.ensure_fingerprint("lib/first")
+    pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
+    pipeline.ensure_fingerprint("lib/second")
+    fingerprint.flush_and_close()
 
 
 if __name__ == "__main__":
@@ -110,6 +264,24 @@ def _cached_keys(state_dir: pathlib.Path, prefix: bytes) -> int:
         return len(list(db.iter_prefix(prefix)))
 
 
+def _run_library_caller(
+    tmp_path: pathlib.Path, home: pathlib.Path, root: pathlib.Path, source: str
+) -> subprocess.CompletedProcess[str]:
+    """Run ``source`` as a program that imports pivot, never ``pivot.cli``, in ``root``."""
+    caller = tmp_path / "caller.py"
+    caller.write_text(source)
+    return subprocess.run(
+        [sys.executable, str(caller), str(root)],
+        cwd=root,
+        env=helpers.cli_env(home),
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=300,
+        check=False,
+    )
+
+
 def _wait_for(
     proc: subprocess.Popen[bytes],
     log: pathlib.Path,
@@ -164,19 +336,8 @@ def test_a_library_caller_that_edits_the_value_before_exit_keeps_its_caches(
     tmp_path: pathlib.Path,
 ) -> None:
     home, root = _project(tmp_path, "libstate")
-    caller = tmp_path / "caller.py"
-    caller.write_text(_LIBRARY_CALLER)
 
-    ran = subprocess.run(
-        [sys.executable, str(caller), str(root)],
-        cwd=root,
-        env=helpers.cli_env(home),
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=300,
-        check=False,
-    )
+    ran = _run_library_caller(tmp_path, home, root, _LIBRARY_CALLER)
 
     assert ran.returncode == 0, ran.stdout + ran.stderr
     assert not (root / "otherstate").exists(), sorted(
@@ -184,3 +345,72 @@ def test_a_library_caller_that_edits_the_value_before_exit_keeps_its_caches(
     )
     assert _cached_keys(root / "libstate", b"sm:") > 0, ran.stdout + ran.stderr
     assert _cached_keys(root / "libstate", b"fp:") > 0, ran.stdout + ran.stderr
+
+
+def test_a_library_run_whose_stage_edits_the_value_keeps_later_entries_in_its_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`first -> second`: the engine fingerprints `second` only once `first` has finished, so
+    the edited value is on disk when `second`'s entries are produced. They belong to the run,
+    which chose `libstate` before `first` ran."""
+    home, root = _project(tmp_path, "libstate")
+    (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
+
+    ran = _run_library_caller(tmp_path, home, root, _RUN_CALLER)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert not (root / "otherstate").exists(), sorted(
+        p.relative_to(root).as_posix() for p in (root / "otherstate").rglob("*")
+    )
+    # One stage manifest for each of the two stages, and the run's manifest, in libstate.
+    assert _cached_keys(root / "libstate", b"sm:") == 2, ran.stdout + ran.stderr
+    assert _cached_keys(root / "libstate", b"run:") == 1, ran.stdout + ran.stderr
+
+
+def test_a_library_run_of_a_longer_chain_keeps_every_entry_in_its_own_state_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`a -> b -> c`, where `a` edits the value: the stages the engine fingerprints after it
+    file their AST hashes and manifests in the run's directory, as 0.5.2 and main do."""
+    home, root = _project(tmp_path, "libstate")
+    (root / "pipeline.py").write_text(_LONGER_CHAIN_PIPELINE)
+
+    ran = _run_library_caller(tmp_path, home, root, _RUN_CALLER)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert not (root / "otherstate").exists(), sorted(
+        p.relative_to(root).as_posix() for p in (root / "otherstate").rglob("*")
+    )
+    counts = {
+        prefix: _cached_keys(root / "libstate", prefix) for prefix in (b"fp:", b"sm:", b"run:")
+    }
+    # Each stage files its own function and its helper, its manifest, and the run files one
+    # manifest of its own.
+    assert counts == {b"fp:": 6, b"sm:": 3, b"run:": 1}, (counts, ran.stdout + ran.stderr)
+
+
+def test_a_library_caller_sees_a_value_edited_between_two_runs(tmp_path: pathlib.Path) -> None:
+    """Each engine run starts its own record, so the second run reads the edited value."""
+    home, root = _project(tmp_path, "libstate")
+
+    ran = _run_library_caller(tmp_path, home, root, _TWO_RUNS_CALLER)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert _cached_keys(root / "libstate", b"run:") == 1, ran.stdout + ran.stderr
+    assert _cached_keys(root / "otherstate", b"run:") == 1, ran.stdout + ran.stderr
+
+
+def test_direct_fingerprinting_sees_a_value_edited_between_two_stages(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Outside a run, the resolution memory answers only for the bytes it parsed."""
+    home, root = _project(tmp_path, "libstate")
+    (root / "pipeline.py").write_text(_TWO_INDEPENDENT_STAGES)
+
+    ran = _run_library_caller(tmp_path, home, root, _DIRECT_FINGERPRINT_CALLER)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert _cached_keys(root / "libstate", b"sm:") == 1, ran.stdout + ran.stderr
+    assert _cached_keys(root / "otherstate", b"sm:") == 1, ran.stdout + ran.stderr
+    assert _cached_keys(root / "libstate", b"fp:") == 2, ran.stdout + ran.stderr
+    assert _cached_keys(root / "otherstate", b"fp:") == 2, ran.stdout + ran.stderr

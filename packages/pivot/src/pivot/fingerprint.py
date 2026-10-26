@@ -297,15 +297,17 @@ class FunctionIdentity(TypedDict):
 def _producing_state_dir() -> pathlib.Path | None:
     """The state directory a cache entry produced now belongs to, or None when it has none.
 
-    The rule for every cache here: a pending entry belongs to the state directory of the
-    invocation that produced it, and a flush writes it there and never resolves a directory
-    again.
+    The rule for every cache here: a pending entry belongs to the state directory of the run
+    that produced it, and a flush writes it there and never resolves a directory again.
 
-    Read where the entry is produced, never where it is written. A CLI invocation resolves
-    its state directory once and every producer of that invocation, the engine thread of a
-    TUI session included, reads that one; a library caller reads the configured value of the
-    run it is in. An unreadable or unusable configuration leaves the entry unfiled, and the
-    caches are best effort, so it is dropped.
+    Read where the entry is produced, never where it is written. A CLI invocation resolves its
+    state directory once and every producer of that invocation, the engine thread of a TUI
+    session included, reads that one. A library caller has no invocation, so an engine run
+    holds a record of its own (``state_dir.run_invocation``): a stage that edits
+    ``core.state_dir`` while the run is dispatching later stages moves no entry of that run.
+    Only a producer outside any run, such as a library caller that fingerprints stages itself,
+    reads the configured value as it is now. An unreadable or unusable configuration leaves the
+    entry unfiled, and the caches are best effort, so it is dropped.
     """
     try:
         from pivot.config import io

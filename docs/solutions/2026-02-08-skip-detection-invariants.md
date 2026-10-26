@@ -95,7 +95,7 @@ Fingerprint manifests (the code_manifest dict mapping `"self:func_name"` → has
 - In watch mode, before reload
 - As each CLI invocation ends (`fingerprint.flush_and_close`, from the `cli` callback's close callbacks). Process exit runs it again for a library caller and for a TUI session whose engine thread fingerprints after that callback.
 
-**Where a pending entry is written:** each entry is filed under the state directory read where it was produced (`fingerprint._producing_state_dir`), and every flush writes it there and resolves no state directory. A flush runs where its producer no longer does, so a `core.state_dir` edited in between never takes the entries of a run that used the previous directory.
+**Where a pending entry is written:** each entry is filed under the state directory read where it was produced (`fingerprint._producing_state_dir`), and every flush writes it there and resolves no state directory. A run reads that directory once, before its first stage: a CLI invocation holds it for the whole command, and an engine run that no invocation covers (a library caller) holds it for the run (`state_dir.run_invocation`). So every entry of one run is filed under one directory, also when a stage of that run edits `core.state_dir` while later stages are still to be fingerprinted. A flush runs where its producer no longer does, so an edit between production and the flush takes no entry either.
 
 **Selective invalidation in watch mode:** When a source file changes, the engine uses a reverse index to find which manifest cache entries depend on that file, and invalidates only those entries. This avoids re-fingerprinting all stages when only one source file changed. The reverse index is built by scanning all `sm:` entries' source maps.
 

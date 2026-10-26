@@ -1,3 +1,4 @@
+import os
 import pathlib
 
 import pydantic
@@ -179,6 +180,23 @@ def test_state_dir_for_reads_the_project_configuration(project_root: pathlib.Pat
     _write_config(project_root, "core:\n  state_dir: custom-state\n")
 
     assert state_dir_mod.state_dir_for(project_root) == project_root / "custom-state"
+
+
+def test_state_dir_lookup_outside_invocation_reads_changed_bytes_with_same_timestamp(
+    project_root: pathlib.Path,
+) -> None:
+    """The lookup memory answers only for identical bytes; size and mtime prove nothing."""
+    config_file = project_root / ".pivot" / "config.yaml"
+    config_file.write_text("core:\n  state_dir: alpha\n")
+    stat = config_file.stat()
+    assert state_dir_mod.state_dir_for(project_root) == project_root / "alpha"
+
+    config_file.write_text("core:\n  state_dir: betaa\n")
+    os.utime(config_file, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    assert config_file.stat().st_size == stat.st_size
+    assert config_file.stat().st_mtime_ns == stat.st_mtime_ns
+    assert state_dir_mod.state_dir_for(project_root) == project_root / "betaa"
 
 
 # --- Error handling tests ---
