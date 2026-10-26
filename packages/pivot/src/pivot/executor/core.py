@@ -586,8 +586,6 @@ def _restore_tracked_file(
 def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
     """Verify all .pvt tracked files exist and warn on hash mismatches.
 
-    This repro/run pre-flight is the one walk that records the .pvt walk's directory memo.
-
     Args:
         project_root: Project root directory.
         checkout_missing: If True, restore missing tracked files from cache before validating.

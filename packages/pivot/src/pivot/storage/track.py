@@ -165,6 +165,7 @@ _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
 _MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
 _MEMO_WRITE_TIMEOUT_S = 1.0
+_MEMO_DB_ERRORS = (exceptions.PivotError, state.StateDBError, RuntimeError, OSError, lmdb.Error)
 _MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
 _MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 _LISTING_VERSION = b"\x01"
@@ -177,7 +178,7 @@ class _Mounts(TypedDict):
     """What ``/proc/self/mountinfo`` says about the memo's allowlist."""
 
     allowed: frozenset[int]  # devices mounted only with an allowlisted type
-    listed: frozenset[int]  # every device the file lists
+    refused: frozenset[int]  # devices mounted with any type off the allowlist
     points: list[tuple[bytes, bytes]]  # (mount point, type), deepest first
 
 
@@ -186,7 +187,7 @@ def _read_mounts() -> _Mounts:
     try:
         lines = _MOUNTINFO.read_bytes().splitlines()
     except OSError:
-        return _Mounts(allowed=frozenset(), listed=frozenset(), points=[])
+        return _Mounts(allowed=frozenset(), refused=frozenset(), points=[])
     allowed = set[int]()
     refused = set[int]()
     points = list[tuple[bytes, bytes]]()
@@ -203,9 +204,7 @@ def _read_mounts() -> _Mounts:
         point = _MOUNTINFO_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), fields[4])
         points.append((point, fstype))
     points.sort(key=lambda mount: len(mount[0]), reverse=True)
-    return _Mounts(
-        allowed=frozenset(allowed - refused), listed=frozenset(allowed | refused), points=points
-    )
+    return _Mounts(allowed=frozenset(allowed - refused), refused=frozenset(refused), points=points)
 
 
 def _device_allowed(mounts: _Mounts, device: int, real_path: str) -> bool:
@@ -217,7 +216,7 @@ def _device_allowed(mounts: _Mounts, device: int, real_path: str) -> bool:
     """
     if device in mounts["allowed"]:
         return True
-    if device in mounts["listed"]:
+    if device in mounts["refused"]:
         return False
     path = os.fsencode(real_path)
     for point, fstype in mounts["points"]:
@@ -328,7 +327,7 @@ def _walk(
             except OSError:
                 continue
             if stat.S_ISDIR(child_stat.st_mode):  # a symlink or file now: not descended
-                stack.append((child, f"{rel}/{name}" if rel else name, child_stat))
+                stack.append((child, os.path.join(rel, name), child_stat))
     return candidates, listings
 
 
@@ -365,7 +364,7 @@ def _read_stored_memo() -> state.PvtDirMemo | None:
             return None
         with state.StateDB(state_dir, readonly=True) as state_db:
             return state_db.read_pvt_dir_memo()
-    except (exceptions.PivotError, state.StateDBError, RuntimeError, OSError, lmdb.Error) as e:
+    except _MEMO_DB_ERRORS as e:
         logger.debug(f"Listing every directory: cannot read the .pvt walk memo: {e}")
         return None
 
@@ -408,7 +407,7 @@ def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]
                 listings,
                 timeout=_MEMO_WRITE_TIMEOUT_S,
             )
-    except (exceptions.PivotError, state.StateDBError, RuntimeError, OSError, lmdb.Error) as e:
+    except _MEMO_DB_ERRORS as e:
         logger.debug(f"Could not record the .pvt walk memo: {e}")
     return found
 
