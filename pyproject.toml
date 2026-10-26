@@ -109,7 +109,7 @@ line-length = 100
 target-version = "py313"
 src = ["packages/pivot/src", "packages/pivot/tests", "packages/pivot-tui/src", "packages/pivot-tui/tests", "benchmarks"]
 # `extend-exclude` keeps ruff's default excludes (.venv, .git, ...); `exclude` would replace them.
-# Outside a git repo ruff ignores .gitignore, so nested agent checkouts are named here too.
+# Outside a git or jj repo ruff ignores .gitignore, so nested agent checkouts are named here too.
 extend-exclude = ["experiments", ".worktrees"]
 
 [tool.ruff.lint]
