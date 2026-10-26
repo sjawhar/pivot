@@ -1136,7 +1136,11 @@ def missing_cache_objects(
     """Return hashes required to restore an output that are absent from the cache."""
     if is_dir_hash(output_hash):
         tree_path = get_cache_path(cache_dir, output_hash["hash"])
-        if checkout_modes[0] == CheckoutMode.SYMLINK and tree_path.exists():
+        if (
+            checkout_modes[0] == CheckoutMode.SYMLINK
+            and tree_path.exists()
+            and _ensure_tree_complete(tree_path, output_hash, cache_dir)
+        ):
             return []
         hashes = [entry["hash"] for entry in output_hash["manifest"]]
     else:

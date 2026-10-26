@@ -1043,6 +1043,40 @@ def test_get_restores_directory_output_from_configured_remote(
     assert (shards / "1.txt").read_text() == "15"
 
 
+def test_get_repairs_partial_directory_cache_tree_from_remote(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """get downloads a missing blob when a stale symlink cache tree exists."""
+    clone, env = _dirout_clone_after_teammate_rerun(tmp_path, moto_services["s3"])
+    _ok(_pivot(clone, "pull", "d/shards", env=env))
+    shards = clone / "data" / "d" / "shards.dat"
+    shutil.rmtree(shards)
+
+    lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "d" / "shards.lock").read_text())
+    output_hash = lock_data["outs"][0]
+    missing_hash = output_hash["manifest"][0]["hash"]
+    cache_dir = clone / ".pivot" / "cache" / "files"
+    cache.get_cache_path(cache_dir, missing_hash).unlink()
+    partial_tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    partial_tree.mkdir(parents=True)
+    (partial_tree / "0.txt").write_text("stale")
+
+    proc = _pivot(
+        clone,
+        "get",
+        "--checkout-mode",
+        "symlink",
+        "--rev",
+        "HEAD",
+        "d/shards",
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (shards / "0.txt").read_text() == "11"
+    assert (shards / "1.txt").read_text() == "15"
+
+
 def test_get_names_missing_remote_configuration(tmp_path: pathlib.Path) -> None:
     """get explains how to configure its remote fallback."""
     root = _project(tmp_path, {".gitignore": "artifact.txt\n", "artifact.txt": "from remote\n"})
