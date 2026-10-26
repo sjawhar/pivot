@@ -16,7 +16,7 @@ from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, identity_key
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
     from pivot.executor import WorkerStageInfo
     from pivot.types import OutputMessage, StageResult
@@ -126,13 +126,30 @@ def _read_output(stage_info: WorkerStageInfo, ref: ArtifactRef) -> str:
     return store.checkout(ref).read_text()
 
 
+@pytest.fixture
+def repo_project_root(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """Make _REPO_ROOT, which holds this file, the project root, so the stages defined here are
+    project files, and keep Pivot's state in tmp_path, never in the checkout.
+
+    The fingerprint cache opens one StateDB per process in the project's state directory. With
+    the checkout as the project root, that left packages/.pivot/state.lmdb in the source tree.
+    Here the test opens its own StateDB under tmp_path and closes it.
+    """
+    monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
+    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: tmp_path / ".pivot")
+    monkeypatch.setattr(fingerprint, "_state_db", None)
+    monkeypatch.setattr(fingerprint, "_state_db_init_attempted", False)
+    yield
+    if fingerprint._state_db is not None:
+        fingerprint._state_db.close()
+
+
+@pytest.mark.usefixtures("repo_project_root")
 def test_no_fingerprint_stage_skips_when_unchanged(
     worker_env: pathlib.Path,
     output_queue: mp.Queue[OutputMessage],
     tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
     fingerprint_map = registry._compute_file_fingerprint(_helper_no_fingerprint_stage, [])
     out = _output_ref("no_fp")
     stage_info = _make_stage_info(
@@ -241,13 +258,12 @@ def test_no_fingerprint_reruns_on_code_deps_change(
     assert result2["reason"] == "Code changed", "Expected Code changed reason"
 
 
+@pytest.mark.usefixtures("repo_project_root")
 def test_no_fingerprint_skip_unrelated_change(
     worker_env: pathlib.Path,
     output_queue: mp.Queue[OutputMessage],
     tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
     fingerprint_map = registry._compute_file_fingerprint(_helper_no_fingerprint_stage, [])
 
     out = _output_ref("no_fp")
@@ -267,13 +283,12 @@ def test_no_fingerprint_skip_unrelated_change(
     assert result2["status"] == "cached", f"Expected skip, got: {result2}"
 
 
+@pytest.mark.usefixtures("repo_project_root")
 def test_no_fingerprint_mixed_pipeline(
     worker_env: pathlib.Path,
     output_queue: mp.Queue[OutputMessage],
     tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
     ast_fingerprint = fingerprint.get_stage_fingerprint_cached(
         "ast_stage", _helper_ast_fingerprint_stage
     )
