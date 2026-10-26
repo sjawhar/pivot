@@ -539,11 +539,11 @@ async def _check_imports_batch(
     results = list[ImportStatusInfo]()
     for (rel_path, _, _), check_or_exc in zip(tasks, checks, strict=True):
         if isinstance(check_or_exc, Exception):
-            logger.warning("Failed to check import %s: %s", rel_path, check_or_exc)
+            # An exception with no message (a bare timeout) is named by its type
+            error = str(check_or_exc) or type(check_or_exc).__name__
+            logger.warning("Failed to check import %s: %s", rel_path, error)
             results.append(
-                ImportStatusInfo(
-                    path=rel_path, status=ImportCheckStatus.ERROR, error=str(check_or_exc)
-                )
+                ImportStatusInfo(path=rel_path, status=ImportCheckStatus.ERROR, error=error)
             )
         else:
             check = cast("import_artifact.UpdateCheck", check_or_exc)

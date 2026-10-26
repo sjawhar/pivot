@@ -605,12 +605,27 @@ class RemoteSyncInfo(TypedDict):
     pull_count: int
 
 
+class ImportStatusJson(TypedDict):
+    """One imported artifact's update check, for status --check-imports --json output.
+
+    The revisions are the first 8 characters of each commit. A field that does not apply to
+    the status is null: both revisions for up_to_date and error, error for the others.
+    """
+
+    path: str
+    status: Literal["up_to_date", "update_available", "error"]
+    current_rev: str | None
+    latest_rev: str | None
+    error: str | None
+
+
 class StatusOutput(TypedDict, total=False):
     """JSON output structure for pivot status command."""
 
     stages: list[PipelineStatusInfo]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
+    imports: list[ImportStatusJson]
     suggestions: list[str]
 
 
@@ -652,6 +667,7 @@ class ExplainOutput(TypedDict, total=False):
     stages: list[ExplainStageJson]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
+    imports: list[ImportStatusJson]
     suggestions: list[str]
 
 

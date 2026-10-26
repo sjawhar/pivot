@@ -97,9 +97,16 @@ pivot status --json --remote
 
 # Detailed explanation of why stages would run
 pivot status --json --explain
+
+# Include the update check of each imported artifact
+pivot status --json --check-imports
 ```
 
 The JSON output includes a `stages` array with status (`cached` or `stale`), a `tracked_files` array, and a `suggestions` list. With `--explain`, each stage entry includes `will_run`, `code_changes`, `param_changes`, `dep_changes`, and `upstream_stale` fields. Each `dep_changes` entry names its artifact as `"identity": {"producer": ..., "key": ...}`, with `key` null for an input or a single-output stage.
+
+With `--check-imports`, an `imports` array holds one entry per imported artifact: `path`, `status` (`up_to_date`, `update_available` or `error`), `current_rev` and `latest_rev` (the first 8 characters of each commit, set for `update_available`), and `error` (the message, set for `error`); a field that does not apply is null.
+
+Standard output holds exactly one JSON document for every option combination, so it can go straight to a JSON parser. Notes such as "No remotes configured" and warnings go to standard error. A failed run (for example `--remote-only` with no remote configured) exits non-zero, with its error on standard error and nothing on standard output.
 
 ### Quiet Mode
 

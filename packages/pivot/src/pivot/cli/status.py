@@ -17,6 +17,7 @@ from pivot.remote import config as remote_config
 from pivot.types import (
     ExplainOutput,
     ExplainStageJson,
+    ImportStatusJson,
     PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
@@ -133,7 +134,8 @@ def status(
                 raise click.ClickException(
                     "No remotes configured. Use `pivot config set remotes.<name> <url>`."
                 ) from None
-            click.echo("No remotes configured")
+            if not quiet:
+                click.echo("No remotes configured", err=output_json)
         except exceptions.RemoteError as e:
             raise click.ClickException(f"Remote error: {e}") from e
 
@@ -189,11 +191,13 @@ def status(
         return
 
     if output_json:
+        imports = [_import_status_json(info) for info in import_statuses] if check_imports else None
         if explain:
             _output_explain_json(
                 pipeline_explanations,
                 tracked_status,
                 remote_status,
+                imports,
                 suggestions,
                 show_stages,
                 show_tracked,
@@ -204,6 +208,7 @@ def status(
                 pipeline_status,
                 tracked_status,
                 remote_status,
+                imports,
                 suggestions,
                 show_stages,
                 show_tracked,
@@ -229,14 +234,33 @@ def status(
                 show_tracked,
             )
 
-    if import_statuses:
-        _print_import_section(import_statuses)
+        if import_statuses:
+            _print_import_section(import_statuses)
+
+
+def _import_status_json(info: status_mod.ImportStatusInfo) -> ImportStatusJson:
+    """One import check as JSON, with null for each field its status leaves empty."""
+    match info.status:
+        case status_mod.ImportCheckStatus.UP_TO_DATE:
+            json_status = "up_to_date"
+        case status_mod.ImportCheckStatus.UPDATE_AVAILABLE:
+            json_status = "update_available"
+        case status_mod.ImportCheckStatus.ERROR:
+            json_status = "error"
+    return ImportStatusJson(
+        path=info.path,
+        status=json_status,
+        current_rev=info.current_rev or None,
+        latest_rev=info.latest_rev or None,
+        error=info.error or None,
+    )
 
 
 def _output_json(
     pipeline_status: list[PipelineStatusInfo],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
+    imports: list[ImportStatusJson] | None,
     suggestions: list[str],
     show_stages: bool,
     show_tracked: bool,
@@ -254,6 +278,9 @@ def _output_json(
     if show_remote and remote_status:
         data["remote"] = remote_status
 
+    if imports is not None:
+        data["imports"] = imports
+
     if suggestions:
         data["suggestions"] = suggestions
 
@@ -264,6 +291,7 @@ def _output_explain_json(
     explanations: list[StageExplanation],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
+    imports: list[ImportStatusJson] | None,
     suggestions: list[str],
     show_stages: bool,
     show_tracked: bool,
@@ -295,6 +323,9 @@ def _output_explain_json(
 
     if show_remote and remote_status:
         data["remote"] = remote_status
+
+    if imports is not None:
+        data["imports"] = imports
 
     if suggestions:
         data["suggestions"] = suggestions
