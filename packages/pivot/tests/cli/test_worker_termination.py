@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import dataclasses
+import errno
 import os
 import pathlib
 import signal
@@ -429,12 +430,13 @@ def test_stop_reaches_the_stage_while_its_thread_waits_for_a_cpu(
         run.assert_workers_and_child_gone()
 
 
-@pytest.mark.parametrize("with_tgkill", [True, False], ids=["tgkill", "no-tgkill"])
-def test_terminate_sends_sigterm(monkeypatch: pytest.MonkeyPatch, with_tgkill: bool) -> None:
-    """``worker.terminate`` sends SIGTERM through tgkill, or through ``os.kill`` where the C
-    library has no tgkill (macOS, musl)."""
-    if not with_tgkill:
-        monkeypatch.setattr(worker, "_tgkill", None)
+@pytest.mark.parametrize("path", ["tgkill", "os-kill"])
+def test_terminate_sends_sigterm(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    """``worker.terminate`` sends SIGTERM through the tgkill system call, or through
+    ``os.kill`` where it knows no tgkill number for the ABI; a process that is gone raises
+    ProcessLookupError, which ``WorkerPool`` ignores."""
+    if path == "os-kill":
+        monkeypatch.setattr(worker, "_tgkill", lambda: None)
     proc = subprocess.Popen(["sleep", "60"])
     try:
         worker.terminate(proc.pid)
@@ -442,3 +444,22 @@ def test_terminate_sends_sigterm(monkeypatch: pytest.MonkeyPatch, with_tgkill: b
     finally:
         proc.kill()
         proc.wait()
+    with pytest.raises(ProcessLookupError):
+        worker.terminate(proc.pid)
+
+
+def test_tgkill_system_call_number_fits_this_architecture() -> None:
+    """The number ``worker._tgkill`` passes to ``syscall()`` for this process's ABI is tgkill's:
+    signal 0 (a check that sends nothing) to this process's own main thread succeeds, and to a
+    thread of another process fails with ESRCH. A wrong number runs another system call."""
+    tgkill = worker._tgkill()
+    abi = getattr(sys.implementation, "_multiarch", None)
+    assert tgkill is not None, f"no tgkill system call number for {abi}"
+    assert tgkill(os.getpid(), os.getpid(), 0) == 0, os.strerror(ctypes.get_errno())
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        assert tgkill(os.getpid(), other.pid, 0) == -1
+        assert ctypes.get_errno() == errno.ESRCH
+    finally:
+        other.kill()
+        other.wait()

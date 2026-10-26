@@ -179,9 +179,14 @@ and load keeps it waiting for a CPU, Linux gives the SIGTERM to an OpenBLAS thre
 the Ctrl-C as well. CPython's C handler there only marks both signals for the main thread, which
 then finds no signal and goes back into the call it was blocked in, such as `time.sleep`: the
 stage never stops, and the SIGKILL after the grace cuts its cleanup off. A signal sent to one
-thread can wake only that thread. glibc has `tgkill` from 2.30; where the C library has none
-(macOS, musl), `os.kill` sends it, and macOS gives a signal sent to a process to its first thread
-that does not block it, the main thread.
+thread can wake only that thread. `worker.terminate` calls the tgkill system call through the C
+library's `syscall()` (glibc and musl both export it), with tgkill's number for the process's
+ABI from `worker._TGKILL_SYSCALLS`: x86-64, i386, arm64, 32-bit ARM, ppc64le, s390x and riscv64,
+each number cited from the Linux v7.0 syscall table. On any other ABI, macOS included, it uses
+`os.kill` and logs that once at debug level. macOS gives a signal sent to a process to its first
+thread that does not block it, the main thread (XNU `get_signalthread`; read from the source, not
+run). `test_tgkill_system_call_number_fits_this_architecture` fails on an ABI whose number is
+wrong.
 
 ## Key Insight
 

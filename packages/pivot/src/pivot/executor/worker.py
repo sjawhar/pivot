@@ -14,6 +14,7 @@ import collections.abc as collections_abc
 import contextlib
 import ctypes
 import dataclasses
+import functools
 import importlib
 import importlib._bootstrap as importlib_bootstrap
 import importlib.util
@@ -498,8 +499,45 @@ class _StopState:
 
 _stop = _StopState()
 
-# glibc has tgkill from version 2.30; macOS's C library and musl have none.
-_tgkill = getattr(ctypes.CDLL(None, use_errno=True), "tgkill", None)
+# tgkill's system call number for each process ABI, keyed by CPython's platform triplet
+# (`sys.implementation._multiarch`; CPython's Misc/platform_triplet.c names them). Each number is
+# the line of Linux v7.0 cited beside it, under https://github.com/torvalds/linux/blob/v7.0/.
+_TGKILL_SYSCALLS = {
+    f"{arch}-linux-{libc}": number
+    for arch, libcs, number in (
+        ("x86_64", ("gnu", "musl"), 234),  # arch/x86/entry/syscalls/syscall_64.tbl#L246
+        ("i386", ("gnu", "musl"), 270),  # arch/x86/entry/syscalls/syscall_32.tbl#L285
+        ("aarch64", ("gnu", "musl"), 131),  # arch/arm64/tools/syscall_64.tbl#L167
+        # arch/arm/tools/syscall.tbl#L286 (EABI, the only ABI these triplets name)
+        ("arm", ("gnueabihf", "gnueabi", "musleabihf", "musleabi"), 268),
+        ("powerpc64le", ("gnu", "musl"), 250),  # arch/powerpc/kernel/syscalls/syscall.tbl#L328
+        ("s390x", ("gnu", "musl"), 241),  # arch/s390/kernel/syscalls/syscall.tbl#L198
+        # scripts/syscall.tbl#L167, riscv's table (scripts/Makefile.asm-headers#L20)
+        ("riscv64", ("gnu", "musl"), 131),
+    )
+    for libc in libcs
+}
+
+
+@functools.cache
+def _tgkill() -> Callable[[int, int, int], int] | None:
+    """``tgkill(tgid, tid, sig)`` through the C library's ``syscall()``, which glibc and musl
+    both export, with tgkill's number for this process's ABI. None where that number is not
+    known (not Linux, or an ABI not in ``_TGKILL_SYSCALLS``), logged once."""
+    abi: object = getattr(sys.implementation, "_multiarch", None)
+    number = _TGKILL_SYSCALLS.get(abi) if isinstance(abi, str) else None
+    if number is None:
+        logger.debug(
+            "No tgkill system call number for %s (machine %s): stopped workers get os.kill",
+            abi,
+            os.uname().machine,
+        )
+        return None
+    syscall = ctypes.CDLL(None, use_errno=True).syscall
+    syscall.restype = ctypes.c_long
+    return lambda tgid, tid, sig: syscall(
+        ctypes.c_long(number), ctypes.c_long(tgid), ctypes.c_long(tid), ctypes.c_long(sig)
+    )
 
 
 def terminate(pid: int) -> None:
@@ -514,15 +552,19 @@ def terminate(pid: int) -> None:
     kills the worker after ``TERMINATION_GRACE_S`` with the stage's cleanup not run. tgkill
     sends the signal to one thread, which alone can take it.
 
-    Without tgkill, ``os.kill`` sends it. macOS gives a signal sent to a process to the first
-    of its threads that does not block it, the main thread; on Linux with musl or a glibc older
-    than 2.30, the race above remains.
+    Where ``_tgkill`` knows no system call number, ``os.kill`` sends it. On macOS that is
+    enough: XNU gives a signal sent to a process to the first of its threads that does not block
+    it ("We attempt to deliver a proc-wide signal to the first thread in the task",
+    ``get_signalthread``, https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c#L1935-L1974),
+    and adds each new thread at the end of that list (bsd/kern/kern_fork.c#L1368), so the main
+    thread comes first. Read from the source, not run on macOS.
     """
-    if _tgkill is None:
+    tgkill = _tgkill()
+    if tgkill is None:
         os.kill(pid, signal.SIGTERM)
         return
     # A process's main thread has the process's id as its thread id.
-    if _tgkill(pid, pid, signal.SIGTERM) != 0:
+    if tgkill(pid, pid, signal.SIGTERM) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
 
