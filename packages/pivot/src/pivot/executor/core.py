@@ -565,8 +565,10 @@ def _restore_tracked_file(
     path: pathlib.Path,
     track_data: track.PvtData,
     cache_dir: pathlib.Path,
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> bool:
-    """Restore a tracked file from cache.
+    """Restore a tracked file from cache, appending each file restored to ``recorded`` for the
+    caller to record in the StateDB (``cache.restore_from_cache``).
 
     Returns True if successfully restored, False if not in cache.
     """
@@ -580,20 +582,8 @@ def _restore_tracked_file(
         cache_dir,
         checkout_modes=checkout_modes,
         state_dir=config.get_state_dir(),
+        recorded=recorded,
     )
-
-
-def restore_missing_tracked_files(project_root: pathlib.Path) -> None:
-    """Restore each tracked file missing from the workspace from the cache.
-
-    Files that exist are neither checked nor touched; a file the cache lacks stays missing for
-    ``verify_tracked_files`` to report.
-    """
-    cache_dir = config.get_cache_dir() / "files"
-    for data_path, track_data in track.discover_pvt_files(project_root).items():
-        path = pathlib.Path(data_path)
-        if not path.exists() and _restore_tracked_file(path, track_data, cache_dir):
-            logger.info(f"Restored tracked file: {data_path}")
 
 
 def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
@@ -632,7 +622,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
-                    if _restore_tracked_file(path, track_data, cache_dir):
+                    if _restore_tracked_file(path, track_data, cache_dir, pending):
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
                         logger.debug(f"Failed to restore tracked file from cache: {data_path}")

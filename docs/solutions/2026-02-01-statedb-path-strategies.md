@@ -38,14 +38,22 @@ def _make_key_output_generation(identity: str) -> bytes:
 | `gen:` | the artifact identity | Stays the same whatever the output's path points to |
 
 The hash key does not follow symlinks. Correctness rests on the entry's value, not the key:
-it holds the `(mtime_ns, size, inode)` of `path.stat()`, which follows symlinks. A link
-pointed at another file stats to another inode, so its entry no longer matches and the file
-is read again. Two links to one file hold two entries and the file is read once for each,
-which costs less than resolving every lookup.
+it holds the `(mtime_ns, size, device, inode)` of `path.stat()`, which follows symlinks. A
+link pointed at another file on the same filesystem stats to another inode. A link pointed at
+another filesystem can find a file with the same inode number, size and mtime_ns (two tmpfs
+mounts, fresh images, block-level clones), so the device is part of the entry too: either way
+the entry no longer matches and the file is read again. Two links to one file hold two
+entries and the file is read once for each, which costs less than resolving every lookup.
+
+The entry holds no ctime. It would catch a rewrite that puts mtime back, but a new hard link
+changes the inode's ctime: every hardlink checkout, and every replica that hard-links pivot's
+files, would invalidate the entries of every file it links.
 
 Earlier keys called `path.resolve()`. That cost more per warm lookup (16.2 µs) than reading
 and hashing a small file cold (8.8 µs), measured on main for BET-36 plan Task 1.10e, and
-`str(...).encode()` failed on a file name that is not UTF-8.
+`str(...).encode()` failed on a file name that is not UTF-8. Moving to the lexical key re-keys
+every path that passes through a symlink, so after an upgrade each such file is read once
+more, until a command that writes the workspace records it.
 
 ## Key Insight
 

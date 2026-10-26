@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 import pathlib
+import stat as stat_mod
 
 import lmdb
 import pytest
+import xxhash
 
+from pivot.cli import checkout as checkout_mod
 from pivot.storage import cache
 from pivot.storage import state as state_mod
+from pivot.types import FileHash
 
 
 def _helper_committed_write_txns(state_dir: pathlib.Path) -> int:
@@ -86,12 +90,13 @@ def _helper_twin_files(directory_a: pathlib.Path, directory_b: pathlib.Path) -> 
         pytest.param(True, id="parent-directory-link"),
     ],
 )
-def test_a_retargeted_link_never_reuses_the_old_targets_hash(
+def test_a_link_retargeted_on_the_same_filesystem_never_reuses_the_old_targets_hash(
     tmp_path: pathlib.Path, link_the_directory: bool
 ) -> None:
     """The key is the path as given, not the file it resolves to. A link (to the file, or to a
-    directory above it) pointed at another file of the same size and mtime still reads the
-    new content: the entry records the inode ``stat`` reaches through the link."""
+    directory above it) pointed at another file of the same size and mtime on this filesystem
+    still reads the new content: the entry records the inode ``stat`` reaches through the link.
+    The next test covers a target on another filesystem, where an inode number can repeat."""
     _helper_twin_files(tmp_path / "a", tmp_path / "b")
     link = tmp_path / "link"
     link.symlink_to(tmp_path / "a" if link_the_directory else tmp_path / "a" / "f.txt")
@@ -109,6 +114,58 @@ def test_a_retargeted_link_never_reuses_the_old_targets_hash(
     )
 
 
+def test_a_link_re_pointed_at_another_filesystem_reads_the_new_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory symlink re-pointed at another filesystem whose file repeats the old file's
+    inode number, size and mtime_ns: only the device tells them apart. CI cannot mount a second
+    filesystem, so the new target's stat is made to repeat the old one's on another device."""
+    _helper_twin_files(tmp_path / "a", tmp_path / "b")
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "a")
+    path = link / "f.txt"
+    old_stat = (tmp_path / "a" / "f.txt").stat()
+    real_stat = pathlib.Path.stat
+
+    def stat_as_another_mount(
+        self: pathlib.Path, *, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        found = real_stat(self, follow_symlinks=follow_symlinks)
+        if self != path or not link.resolve().samefile(tmp_path / "b"):
+            return found
+        visible = list(old_stat)
+        visible[stat_mod.ST_DEV] = old_stat.st_dev + 1
+        hidden = {
+            name: getattr(old_stat, name)
+            for name in (
+                "st_atime",
+                "st_mtime",
+                "st_ctime",
+                "st_atime_ns",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        }
+        return os.stat_result(visible, hidden)
+
+    with state_mod.StateDB(tmp_path / ".pivot") as state_db:
+        first_hash, _ = cache.hash_file(path, state_db)
+        link.unlink()
+        link.symlink_to(tmp_path / "b")
+        monkeypatch.setattr(pathlib.Path, "stat", stat_as_another_mount)
+        second_hash, second_stat = cache.hash_file(path, state_db)
+
+    assert (second_stat.st_ino, second_stat.st_size, second_stat.st_mtime_ns) == (
+        old_stat.st_ino,
+        old_stat.st_size,
+        old_stat.st_mtime_ns,
+    )
+    assert first_hash == xxhash.xxh64(b"aaaa").hexdigest()
+    assert second_hash == xxhash.xxh64(b"bbbb").hexdigest(), (
+        "The old target's hash must not be served for a file on another filesystem"
+    )
+
+
 def test_hash_file_with_pending_collects_instead_of_saving(tmp_path: pathlib.Path) -> None:
     """With ``pending``, a hash read from the file is handed back for the caller to save."""
     path = tmp_path / "data.txt"
@@ -121,3 +178,43 @@ def test_hash_file_with_pending_collects_instead_of_saving(tmp_path: pathlib.Pat
         assert pending == [(path, file_stat, file_hash)]
         state_db.save_many(pending)
         assert state_db.get(path, file_stat) == file_hash
+
+
+def test_a_write_just_after_a_copy_restore_is_not_recorded_as_the_cached_content(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkout records a restored file with the stat of the staged copy, taken before the
+    rename puts it in place (the same inode). A write landing just after the rename then
+    changes the stat, so the entry does not vouch for the written bytes."""
+    content = b"cached"
+    cache_dir = tmp_path / ".pivot" / "cache" / "files"
+    file_hash = xxhash.xxh64(content).hexdigest()
+    cache_object = cache.get_cache_path(cache_dir, file_hash)
+    cache_object.parent.mkdir(parents=True)
+    cache_object.write_bytes(content)
+    target = tmp_path / "out.txt"
+    real_replace = pathlib.Path.replace
+
+    def replace_then_write(self: pathlib.Path, destination: str | os.PathLike[str]) -> pathlib.Path:
+        moved = real_replace(self, destination)
+        if pathlib.Path(destination) == target:
+            target.write_bytes(b"edited")
+        return moved
+
+    monkeypatch.setattr(pathlib.Path, "replace", replace_then_write)
+
+    outcome = checkout_mod._restore_path_sync(
+        target,
+        FileHash(hash=file_hash),
+        cache_dir,
+        [cache.CheckoutMode.COPY],
+        checkout_mod.CheckoutBehavior.ERROR,
+        tmp_path / ".pivot",
+    )
+
+    assert outcome.result == "restored"
+    assert target.read_bytes() == b"edited"
+    with state_mod.StateDB(tmp_path / ".pivot", readonly=True) as state_db:
+        assert state_db.get(target, target.stat()) is None, (
+            "The edited file must be read again, not taken for the cached content"
+        )

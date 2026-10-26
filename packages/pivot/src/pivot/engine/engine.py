@@ -1962,7 +1962,7 @@ class Engine:
 
         deps = stage_info["deps"]
 
-        def _save_file_hashes(entries: list[tuple[str, int, int, int, str]]) -> None:
+        def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
             """Record the file hashes this check read or restored, so the next one reads none."""
             if entries:
                 with state_mod.StateDB(stage_state_dir) as writable_db:
@@ -1971,7 +1971,7 @@ class Engine:
                     )
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
-            file_hash_entries = list[tuple[str, int, int, int, str]]()
+            file_hash_entries = list[types.FileHashEntry]()
             if not restore:
                 checked = worker.restore_outputs_to_hashes(
                     store,

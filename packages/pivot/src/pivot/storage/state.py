@@ -237,17 +237,13 @@ class DatabaseFullError(StateDBError):
 def _make_key_file_hash(path: pathlib.Path) -> bytes:
     """Create the LMDB key for a file-hash entry: the absolute path as given, as bytes.
 
-    Symlinks are not followed: the entry's value holds the (mtime_ns, size, inode) of
-    ``path.stat()``, which follows them, so an entry read through a retargeted link no longer
-    matches and the file is hashed again. ``os.fsencode`` keeps names that are not UTF-8.
+    Symlinks are not followed: the entry's value holds the (mtime_ns, size, device, inode) of
+    ``path.stat()``, which follows them. An entry read through a link retargeted at another
+    file, on this filesystem or on another one (where an inode number can repeat), no longer
+    matches, and the file is hashed again. ``os.fsencode`` keeps names that are not UTF-8.
     Contrast with _make_key_output_generation(), which keys an artifact identity.
     """
     return _HASH_PREFIX + os.fsencode(os.path.abspath(path))
-
-
-def file_hash_key_fits(path: pathlib.Path) -> bool:
-    """Whether ``path`` fits the LMDB key reserved for a file-hash entry."""
-    return len(_make_key_file_hash(path)) <= _MAX_KEY_SIZE
 
 
 def _make_key_output_generation(identity: str) -> bytes:
@@ -300,24 +296,41 @@ def _make_key_ast_hash(
     return key
 
 
-def _pack_value(mtime_ns: int, size: int, inode: int, hash_hex: str) -> bytes:
-    """Pack metadata and hash into binary value."""
-    return struct.pack(">QQQ", mtime_ns, size, inode) + hash_hex.encode("ascii")
+_FILE_HASH_STAT = struct.Struct(">QQQQ")
 
 
-def _unpack_value(data: bytes) -> tuple[int, int, int, str]:
-    """Unpack binary value into metadata and hash."""
-    mtime_ns, size, inode = struct.unpack(">QQQ", data[:24])
-    hash_hex = data[24:].decode("ascii")
-    return mtime_ns, size, inode, hash_hex
+def _pack_value(mtime_ns: int, size: int, dev: int, inode: int, hash_hex: str) -> bytes:
+    """Pack a file's stat fields and hash into a file-hash entry's value.
+
+    The entry holds no ctime: a new hard link changes the inode's ctime, so every hardlink
+    checkout, and every replica that hard-links pivot's files, would invalidate its entries.
+    """
+    return _FILE_HASH_STAT.pack(mtime_ns, size, dev, inode) + hash_hex.encode("ascii")
+
+
+def _unpack_value(data: bytes) -> tuple[int, int, int, int, str]:
+    """Unpack a file-hash entry's value into (mtime_ns, size, dev, inode, hash)."""
+    mtime_ns, size, dev, inode = _FILE_HASH_STAT.unpack(data[: _FILE_HASH_STAT.size])
+    hash_hex = data[_FILE_HASH_STAT.size :].decode("ascii")
+    return mtime_ns, size, dev, inode, hash_hex
 
 
 def _match_cached_hash(value: bytes | None, fs_stat: os.stat_result) -> str | None:
-    """Return cached hash if stored metadata matches fs_stat, else None."""
-    if value is None:
+    """Return the cached hash if the entry's stat fields match ``fs_stat``, else None.
+
+    An entry an earlier pivot wrote, (mtime_ns, size, inode) with no device, reads here with
+    its inode as the device and its hash's first characters as the inode, so it matches no
+    file: the file is read once again and recorded anew.
+    """
+    if value is None or len(value) < _FILE_HASH_STAT.size:
         return None
-    mtime_ns, size, inode, hash_hex = _unpack_value(value)
-    if fs_stat.st_mtime_ns == mtime_ns and fs_stat.st_size == size and fs_stat.st_ino == inode:
+    mtime_ns, size, dev, inode, hash_hex = _unpack_value(value)
+    if (
+        fs_stat.st_mtime_ns == mtime_ns
+        and fs_stat.st_size == size
+        and fs_stat.st_dev == dev
+        and fs_stat.st_ino == inode
+    ):
         return hash_hex
     return None
 
@@ -453,20 +466,8 @@ class StateDB:
         return results
 
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
-        """Cache file metadata and hash."""
-        self._check_closed()
-        self._check_write_allowed()
-        key = _make_key_file_hash(path)
-        if len(key) > _MAX_KEY_SIZE:
-            raise PathTooLongError(
-                f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path}"
-            )
-        value = _pack_value(fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
-        try:
-            with self._write_transaction(timeout=self._write_timeout) as txn:
-                txn.put(key, value)
-        except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+        """Cache file metadata and hash, as ``save_many`` does for one entry."""
+        self.save_many([(path, fs_stat, file_hash)])
 
     def save_many(self, entries: Iterable[tuple[pathlib.Path, os.stat_result, str]]) -> None:
         """Batch save multiple entries atomically.
@@ -484,7 +485,11 @@ class StateDB:
                         logger.debug("Not caching the hash of %s: path too long", path)
                         continue
                     value = _pack_value(
-                        fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash
+                        fs_stat.st_mtime_ns,
+                        fs_stat.st_size,
+                        fs_stat.st_dev,
+                        fs_stat.st_ino,
+                        file_hash,
                     )
                     txn.put(key, value)
         except lmdb.MapFullError as e:
@@ -986,14 +991,6 @@ class StateDB:
                         + f"({len(key)} bytes, max {_MAX_KEY_SIZE}): {identity}"
                     )
 
-        if "file_hash_entries" in deferred:
-            for path_str, _, _, _, _ in deferred["file_hash_entries"]:
-                key = _make_key_file_hash(pathlib.Path(path_str))
-                if len(key) > _MAX_KEY_SIZE:
-                    raise PathTooLongError(
-                        f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
-                    )
-
         try:
             with self._write_transaction(timeout=self._write_timeout) as txn:
                 # Dependency generations (clear old entries first, like record_dep_generations)
@@ -1033,12 +1030,17 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_delete_input_hash']}".encode()
                     )
 
-                # File hash entries
+                # File hash entries; one whose key exceeds LMDB's limit is left out, as
+                # save_many leaves it out: this cache only saves a later hash.
                 if "file_hash_entries" in deferred:
-                    for path_str, mtime_ns, size, inode, hash_hex in deferred["file_hash_entries"]:
+                    for path_str, mtime_ns, size, dev, inode, hash_hex in deferred[
+                        "file_hash_entries"
+                    ]:
                         key = _make_key_file_hash(pathlib.Path(path_str))
-                        value = _pack_value(mtime_ns, size, inode, hash_hex)
-                        txn.put(key, value)
+                        if len(key) > _MAX_KEY_SIZE:
+                            logger.debug("Not caching the hash of %s: path too long", path_str)
+                            continue
+                        txn.put(key, _pack_value(mtime_ns, size, dev, inode, hash_hex))
 
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
