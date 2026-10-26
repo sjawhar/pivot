@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import pathlib
 import signal
-import socket
 import subprocess
 import time
 from typing import TYPE_CHECKING
@@ -15,7 +13,7 @@ import pydantic
 import pytest
 import yaml
 
-from conftest import GitRepo, init_git_repo
+from conftest import GitRepo, init_git_repo, send_rpc
 from pivot import cli, compose, config, exceptions, import_artifact, parameters, project, stage_def
 from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
@@ -752,24 +750,25 @@ with pipeline:
     )
 
     try:
-        for _ in range(100):
-            if socket_path.exists():
-                break
-            time.sleep(0.1)
-        else:
+        # Binding creates the socket file before the listener accepts connections, so this
+        # retries the RPC rather than treating the socket's existence as readiness.
+        response: dict[str, object] | None = None
+        deadline = time.monotonic() + 10
+        while response is None and proc.poll() is None and time.monotonic() < deadline:
+            try:
+                response = send_rpc(socket_path, "status")
+            except (ConnectionRefusedError, FileNotFoundError):
+                time.sleep(0.1)
+        if response is None:
             stdout, stderr = proc.communicate(timeout=1)
             pytest.fail(
-                f"Socket not created within 10s.\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+                f"Serve mode did not answer status within 10s. exit: {proc.poll()}"
+                + f"\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}"
             )
-
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5.0)
-            sock.connect(str(socket_path))
-            sock.sendall(b'{"jsonrpc":"2.0","method":"status","id":1}\n')
-            response = json.loads(sock.recv(1024).decode().strip())
 
         assert "error" not in response, response
         assert "result" in response
+        assert socket_path.is_socket()
     finally:
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
