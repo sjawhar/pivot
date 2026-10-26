@@ -129,6 +129,33 @@ def test_second_signal_during_the_grace_period_still_stops_the_command(
     assert exit_code in (-first, 128 + first), exit_code
 
 
+@pytest.mark.parametrize(
+    "sid",
+    [
+        pytest.param(0, id="kernel-threads"),
+        pytest.param(1, id="init"),
+        pytest.param(None, id="own"),
+    ],
+)
+def test_kill_session_refuses_a_session_no_measured_command_runs_in(
+    monkeypatch: pytest.MonkeyPatch, sid: int | None
+) -> None:
+    killed = list[int]()
+
+    def _members(_sid: int) -> list[int]:
+        return [os.getpid()]
+
+    def _kill(pid: int, _signum: int) -> None:
+        killed.append(pid)
+
+    monkeypatch.setattr(run, "session_members", _members)
+    monkeypatch.setattr(os, "kill", _kill)
+
+    with pytest.raises(ValueError, match="not a measured command's session"):
+        run_test_helpers.kill_session(os.getsid(0) if sid is None else sid)
+    assert not killed, "kill_session signalled a session no measured command runs in"
+
+
 def test_wakeup_pipe_sigterm_before_sigint_decides_the_stop_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
