@@ -667,6 +667,8 @@ def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str 
     For a caller that checks one path: it resolves ``cache_dir`` itself. A caller that checks
     many links resolves the cache directory once and calls ``_symlink_cache_key``.
     """
+    if not path.is_symlink():
+        return None
     try:
         cache_root = os.path.realpath(cache_dir)
     except OSError:  # a relative cache_dir under a working directory that is gone
@@ -892,7 +894,7 @@ def _stage_checkout(
     checkout_mode: CheckoutMode,
     *,
     executable: bool | None,
-    cache_root: str | None = None,
+    cache_root: str | None,
 ) -> None:
     """Create the link or copy of cache_path at tmp_path.
 
@@ -1325,7 +1327,6 @@ def _checkout_with_fallback(
                     CheckoutMode.COPY,
                     executable=executable,
                     staging_path=staging_path,
-                    cache_root=cache_root,
                 )
             if e.errno not in FALLBACK_ERRNO or is_last:
                 raise
