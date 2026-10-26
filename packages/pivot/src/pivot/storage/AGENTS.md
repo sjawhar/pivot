@@ -102,11 +102,11 @@ When multiple `pivot` processes share the same StateDB:
   opened read-only. Lock files are never deleted.
 - A whole-directory SYMLINK tree is built under a temporary name beside its cache name, renamed
   into place, checked, then marked (`<tree>.verified`), because a restore symlinks to a tree as
-  soon as its name exists. A restore or commit checks an unmarked tree (exact files, sizes,
-  executable bits and directories) under the tree's exclusive `<tree>.lock`, repairs it in place
-  from the files' own cache objects, then marks it. A tree it cannot repair is not used: a
-  restore goes file by file, a commit fails. `<tree>.layout-checked`, the mark pivot 0.3.4 also
-  gave partial trees, is not trusted.
+  soon as its name exists. A restore or commit checks every unmarked tree member's path, content
+  hash, size and executable bit, plus its directories, under the tree's exclusive `<tree>.lock`;
+  it repairs mismatches in place from the files' own cache objects, then marks the tree. A tree
+  it cannot repair is not used: a restore goes file by file, a commit fails.
+  `<tree>.layout-checked`, the mark pivot 0.3.4 also gave partial trees, is not trusted.
 
 ## Path Storage
 
